@@ -6,11 +6,11 @@ import "time"
 type PodSecurityState string
 
 const (
-	StateClean            PodSecurityState = "CLEAN"
-	StateSuspicious       PodSecurityState = "SUSPICIOUS"
-	StateRestricted       PodSecurityState = "RESTRICTED"
-	StateQuarantined      PodSecurityState = "QUARANTINED"
-	StatePreservedKilled  PodSecurityState = "PRESERVED_KILLED"
+	StateClean           PodSecurityState = "CLEAN"
+	StateSuspicious      PodSecurityState = "SUSPICIOUS"
+	StateRestricted      PodSecurityState = "RESTRICTED"
+	StateQuarantined     PodSecurityState = "QUARANTINED"
+	StatePreservedKilled PodSecurityState = "PRESERVED_KILLED"
 )
 
 // ValidTransition returns true if moving from one state to the next is allowed.
@@ -42,12 +42,12 @@ func stateOrder() map[PodSecurityState]int {
 
 // StateTransition records a pod moving between security states.
 type StateTransition struct {
-	Timestamp      time.Time        `json:"timestamp"`
-	Pod            PodRef           `json:"pod"`
-	FromState      PodSecurityState `json:"from_state"`
-	ToState        PodSecurityState `json:"to_state"`
-	TriggerType    string           `json:"trigger_type"` // "automated" or "override"
-	Confidence     float64          `json:"confidence"`
-	TriggerEvents  []string         `json:"trigger_events,omitempty"`
-	OperatorID     string           `json:"operator_id,omitempty"`
+	Timestamp     time.Time        `json:"timestamp"`
+	Pod           PodRef           `json:"pod"`
+	FromState     PodSecurityState `json:"from_state"`
+	ToState       PodSecurityState `json:"to_state"`
+	TriggerType   string           `json:"trigger_type"` // "automated" or "override"
+	Confidence    float64          `json:"confidence"`
+	TriggerEvents []string         `json:"trigger_events,omitempty"`
+	OperatorID    string           `json:"operator_id,omitempty"`
 }

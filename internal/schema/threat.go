@@ -21,13 +21,13 @@ type ThreatContext struct {
 
 // ThreatAssessment is the output of the detection engine (rules + baselines + LLM).
 type ThreatAssessment struct {
-	ThreatType        string           `json:"threat_type"`
-	Confidence        ConfidenceScore  `json:"confidence"`
-	RecommendedState  PodSecurityState `json:"recommended_state"`
-	Reasoning         string           `json:"reasoning"`
-	MitreTechniques   []string         `json:"mitre_techniques,omitempty"`
-	KillChainStage    string           `json:"kill_chain_stage,omitempty"`
-	EvidenceToPreserve []string        `json:"evidence_to_preserve,omitempty"`
-	RequestedSubTasks []string         `json:"requested_sub_tasks,omitempty"`
-	Mode              AnalysisMode     `json:"mode"`
+	ThreatType         string           `json:"threat_type"`
+	Confidence         ConfidenceScore  `json:"confidence"`
+	RecommendedState   PodSecurityState `json:"recommended_state"`
+	Reasoning          string           `json:"reasoning"`
+	MitreTechniques    []string         `json:"mitre_techniques,omitempty"`
+	KillChainStage     string           `json:"kill_chain_stage,omitempty"`
+	EvidenceToPreserve []string         `json:"evidence_to_preserve,omitempty"`
+	RequestedSubTasks  []string         `json:"requested_sub_tasks,omitempty"`
+	Mode               AnalysisMode     `json:"mode"`
 }

@@ -40,10 +40,10 @@ type Event struct {
 	ID        string          `json:"id"`
 	Timestamp time.Time       `json:"timestamp"`
 	Source    EventSource     `json:"source"`
-	Pod      PodRef          `json:"pod"`
-	Severity string          `json:"severity,omitempty"`
-	Category EventCategory   `json:"category"`
-	Summary  string          `json:"summary"`
-	Raw      json.RawMessage `json:"raw,omitempty"`
-	Tags     []string        `json:"tags,omitempty"`
+	Pod       PodRef          `json:"pod"`
+	Severity  string          `json:"severity,omitempty"`
+	Category  EventCategory   `json:"category"`
+	Summary   string          `json:"summary"`
+	Raw       json.RawMessage `json:"raw,omitempty"`
+	Tags      []string        `json:"tags,omitempty"`
 }
