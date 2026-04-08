@@ -1,0 +1,287 @@
+package schema
+
+import (
+	"encoding/json"
+	"testing"
+	"time"
+)
+
+func TestEventRoundTrip(t *testing.T) {
+	original := Event{
+		ID:        "01961234-5678-7abc-def0-123456789abc",
+		Timestamp: time.Date(2026, 4, 8, 12, 0, 0, 0, time.UTC),
+		Source:    SourceFalco,
+		Pod: PodRef{
+			Name:      "nginx-abc123",
+			Namespace: "default",
+			Node:      "worker-1",
+			UID:       "pod-uid-001",
+		},
+		Severity: "high",
+		Category: CategorySyscall,
+		Summary:  "unexpected execve from nginx container",
+		Raw:      json.RawMessage(`{"output":"test"}`),
+		Tags:     []string{"T1059", "execution"},
+	}
+
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var decoded Event
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if decoded.ID != original.ID {
+		t.Errorf("ID: got %q, want %q", decoded.ID, original.ID)
+	}
+	if decoded.Source != original.Source {
+		t.Errorf("Source: got %q, want %q", decoded.Source, original.Source)
+	}
+	if decoded.Pod.Name != original.Pod.Name {
+		t.Errorf("Pod.Name: got %q, want %q", decoded.Pod.Name, original.Pod.Name)
+	}
+	if decoded.Category != original.Category {
+		t.Errorf("Category: got %q, want %q", decoded.Category, original.Category)
+	}
+	if len(decoded.Tags) != len(original.Tags) {
+		t.Errorf("Tags length: got %d, want %d", len(decoded.Tags), len(original.Tags))
+	}
+}
+
+func TestThreatAssessmentRoundTrip(t *testing.T) {
+	original := ThreatAssessment{
+		ThreatType: "container_escape",
+		Confidence: ConfidenceScore{
+			Total:    72.5,
+			Rules:    30,
+			Baseline: 15,
+			LLM:      27.5,
+			LLMCap:   35,
+		},
+		RecommendedState: StateRestricted,
+		Reasoning:        "Multiple indicators suggest container escape attempt",
+		MitreTechniques:  []string{"T1611", "T1059.004"},
+		KillChainStage:   "exploitation",
+		Mode:             ModeLLM,
+	}
+
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var decoded ThreatAssessment
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if decoded.ThreatType != original.ThreatType {
+		t.Errorf("ThreatType: got %q, want %q", decoded.ThreatType, original.ThreatType)
+	}
+	if decoded.Confidence.Total != original.Confidence.Total {
+		t.Errorf("Confidence.Total: got %v, want %v", decoded.Confidence.Total, original.Confidence.Total)
+	}
+	if decoded.Confidence.LLM != original.Confidence.LLM {
+		t.Errorf("Confidence.LLM: got %v, want %v", decoded.Confidence.LLM, original.Confidence.LLM)
+	}
+	if decoded.RecommendedState != original.RecommendedState {
+		t.Errorf("RecommendedState: got %q, want %q", decoded.RecommendedState, original.RecommendedState)
+	}
+	if decoded.Mode != original.Mode {
+		t.Errorf("Mode: got %q, want %q", decoded.Mode, original.Mode)
+	}
+}
+
+func TestIncidentRoundTrip(t *testing.T) {
+	original := Incident{
+		ID:        "incident-001",
+		CreatedAt: time.Date(2026, 4, 8, 12, 30, 0, 0, time.UTC),
+		Pod: PodRef{
+			Name:      "victim-pod",
+			Namespace: "default",
+			UID:       "pod-uid-002",
+		},
+		Events: []Event{
+			{
+				ID:       "evt-001",
+				Source:   SourceFalco,
+				Category: CategorySyscall,
+				Summary:  "ptrace attach detected",
+			},
+			{
+				ID:       "evt-002",
+				Source:   SourceAudit,
+				Category: CategoryAPI,
+				Summary:  "secret read by unknown SA",
+			},
+		},
+		Assessment: ThreatAssessment{
+			ThreatType:       "privilege_escalation",
+			RecommendedState: StateQuarantined,
+			Mode:             ModeLLM,
+		},
+		Transitions: []StateTransition{
+			{
+				FromState:   StateClean,
+				ToState:     StateSuspicious,
+				TriggerType: "automated",
+				Confidence:  45.0,
+			},
+		},
+	}
+
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var decoded Incident
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if decoded.ID != original.ID {
+		t.Errorf("ID: got %q, want %q", decoded.ID, original.ID)
+	}
+	if len(decoded.Events) != 2 {
+		t.Errorf("Events count: got %d, want 2", len(decoded.Events))
+	}
+	if decoded.Events[0].Source != SourceFalco {
+		t.Errorf("Events[0].Source: got %q, want %q", decoded.Events[0].Source, SourceFalco)
+	}
+	if decoded.Events[1].Source != SourceAudit {
+		t.Errorf("Events[1].Source: got %q, want %q", decoded.Events[1].Source, SourceAudit)
+	}
+	if len(decoded.Transitions) != 1 {
+		t.Errorf("Transitions count: got %d, want 1", len(decoded.Transitions))
+	}
+}
+
+func TestStateTransitionRoundTrip(t *testing.T) {
+	original := StateTransition{
+		Timestamp:     time.Date(2026, 4, 8, 12, 0, 0, 0, time.UTC),
+		Pod:           PodRef{Name: "test", Namespace: "default", UID: "uid-1"},
+		FromState:     StateSuspicious,
+		ToState:       StateRestricted,
+		TriggerType:   "automated",
+		Confidence:    75.0,
+		TriggerEvents: []string{"evt-001", "evt-002"},
+	}
+
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var decoded StateTransition
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if decoded.FromState != original.FromState {
+		t.Errorf("FromState: got %q, want %q", decoded.FromState, original.FromState)
+	}
+	if decoded.ToState != original.ToState {
+		t.Errorf("ToState: got %q, want %q", decoded.ToState, original.ToState)
+	}
+	if decoded.TriggerType != original.TriggerType {
+		t.Errorf("TriggerType: got %q, want %q", decoded.TriggerType, original.TriggerType)
+	}
+}
+
+func TestValidTransition(t *testing.T) {
+	tests := []struct {
+		name string
+		from PodSecurityState
+		to   PodSecurityState
+		want bool
+	}{
+		{"clean to suspicious", StateClean, StateSuspicious, true},
+		{"suspicious to restricted", StateSuspicious, StateRestricted, true},
+		{"restricted to quarantined", StateRestricted, StateQuarantined, true},
+		{"quarantined to preserved", StateQuarantined, StatePreservedKilled, true},
+		{"clean to restricted (skip)", StateClean, StateRestricted, false},
+		{"clean to quarantined (skip)", StateClean, StateQuarantined, false},
+		{"suspicious to preserved (skip)", StateSuspicious, StatePreservedKilled, false},
+		{"restricted to clean (de-escalate)", StateRestricted, StateClean, true},
+		{"quarantined to suspicious (de-escalate)", StateQuarantined, StateSuspicious, true},
+		{"preserved to clean (de-escalate)", StatePreservedKilled, StateClean, true},
+		{"same state", StateClean, StateClean, false},
+		{"invalid state", PodSecurityState("BOGUS"), StateClean, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ValidTransition(tt.from, tt.to)
+			if got != tt.want {
+				t.Errorf("ValidTransition(%q, %q) = %v, want %v", tt.from, tt.to, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEvidencePackageRoundTrip(t *testing.T) {
+	original := EvidencePackage{
+		IncidentID:    "incident-001",
+		CapturedAt:    time.Date(2026, 4, 8, 13, 0, 0, 0, time.UTC),
+		OverlayDiff:   "diff content here",
+		PodSpec:       `{"kind":"Pod"}`,
+		ProcessList:   "PID 1 /bin/sh",
+		NetworkConns:  "tcp 10.0.0.1:80 -> 10.0.0.2:443",
+		IntegrityHash: "sha256:abc123",
+	}
+
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var decoded EvidencePackage
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if decoded.IncidentID != original.IncidentID {
+		t.Errorf("IncidentID: got %q, want %q", decoded.IncidentID, original.IncidentID)
+	}
+	if decoded.IntegrityHash != original.IntegrityHash {
+		t.Errorf("IntegrityHash: got %q, want %q", decoded.IntegrityHash, original.IntegrityHash)
+	}
+}
+
+func TestConfidenceScoreJSON(t *testing.T) {
+	original := ConfidenceScore{
+		Total:    67.5,
+		Rules:    30,
+		Baseline: 15,
+		LLM:      22.5,
+		LLMCap:   35,
+	}
+
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	// Verify snake_case keys in JSON
+	var raw map[string]interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("unmarshal raw: %v", err)
+	}
+	for _, key := range []string{"total", "rules", "baseline", "llm", "llm_cap"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q not found", key)
+		}
+	}
+
+	var decoded ConfidenceScore
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.Total != original.Total {
+		t.Errorf("Total: got %v, want %v", decoded.Total, original.Total)
+	}
+}
