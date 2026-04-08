@@ -125,10 +125,13 @@ func TestIncidentRoundTrip(t *testing.T) {
 		},
 		Transitions: []StateTransition{
 			{
-				FromState:   StateClean,
-				ToState:     StateSuspicious,
-				TriggerType: "automated",
-				Confidence:  45.0,
+				Timestamp:     time.Date(2026, 4, 8, 12, 15, 0, 0, time.UTC),
+				Pod:           PodRef{Name: "victim-pod", Namespace: "default", UID: "pod-uid-002"},
+				FromState:     StateClean,
+				ToState:       StateSuspicious,
+				TriggerType:   "automated",
+				Confidence:    45.0,
+				TriggerEvents: []string{"evt-001"},
 			},
 		},
 	}
@@ -283,5 +286,142 @@ func TestConfidenceScoreJSON(t *testing.T) {
 	}
 	if decoded.Total != original.Total {
 		t.Errorf("Total: got %v, want %v", decoded.Total, original.Total)
+	}
+}
+
+func TestRuleMatchRoundTrip(t *testing.T) {
+	original := RuleMatch{
+		RuleID:    "OLT-EXEC-001",
+		RuleName:  "Unexpected Shell in Container",
+		Severity:  "high",
+		MitreTags: []string{"T1059.004"},
+		EventID:   "evt-001",
+	}
+
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var decoded RuleMatch
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if decoded.RuleID != original.RuleID {
+		t.Errorf("RuleID: got %q, want %q", decoded.RuleID, original.RuleID)
+	}
+	if decoded.RuleName != original.RuleName {
+		t.Errorf("RuleName: got %q, want %q", decoded.RuleName, original.RuleName)
+	}
+	if len(decoded.MitreTags) != 1 || decoded.MitreTags[0] != "T1059.004" {
+		t.Errorf("MitreTags: got %v, want [T1059.004]", decoded.MitreTags)
+	}
+}
+
+func TestBaselineDeviationRoundTrip(t *testing.T) {
+	original := BaselineDeviation{
+		Metric: "syscall_frequency",
+		Value:  450.0,
+		Mean:   100.0,
+		StdDev: 25.0,
+		Sigma:  14.0,
+		PodUID: "pod-uid-001",
+	}
+
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var decoded BaselineDeviation
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if decoded.Metric != original.Metric {
+		t.Errorf("Metric: got %q, want %q", decoded.Metric, original.Metric)
+	}
+	if decoded.Sigma != original.Sigma {
+		t.Errorf("Sigma: got %v, want %v", decoded.Sigma, original.Sigma)
+	}
+	if decoded.PodUID != original.PodUID {
+		t.Errorf("PodUID: got %q, want %q", decoded.PodUID, original.PodUID)
+	}
+}
+
+func TestThreatContextRoundTrip(t *testing.T) {
+	original := ThreatContext{
+		Pod: PodRef{
+			Name:      "suspicious-pod",
+			Namespace: "default",
+			Node:      "worker-1",
+			UID:       "pod-uid-003",
+		},
+		Events: []Event{
+			{
+				ID:       "evt-010",
+				Source:   SourceFalco,
+				Category: CategorySyscall,
+				Summary:  "execve /bin/sh",
+			},
+		},
+		RuleMatches: []RuleMatch{
+			{
+				RuleID:   "OLT-EXEC-001",
+				RuleName: "Unexpected Shell",
+				Severity: "high",
+				EventID:  "evt-010",
+			},
+		},
+		Deviations: []BaselineDeviation{
+			{
+				Metric: "process_count",
+				Value:  12,
+				Mean:   3,
+				StdDev: 2,
+				Sigma:  4.5,
+				PodUID: "pod-uid-003",
+			},
+		},
+		CurrentState: StateSuspicious,
+		PodAge:       "2h30m",
+		PriorAssessment: &ThreatAssessment{
+			ThreatType:       "reconnaissance",
+			RecommendedState: StateSuspicious,
+			Mode:             ModeLLM,
+		},
+	}
+
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var decoded ThreatContext
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if decoded.Pod.UID != original.Pod.UID {
+		t.Errorf("Pod.UID: got %q, want %q", decoded.Pod.UID, original.Pod.UID)
+	}
+	if len(decoded.Events) != 1 {
+		t.Errorf("Events count: got %d, want 1", len(decoded.Events))
+	}
+	if len(decoded.RuleMatches) != 1 {
+		t.Errorf("RuleMatches count: got %d, want 1", len(decoded.RuleMatches))
+	}
+	if len(decoded.Deviations) != 1 {
+		t.Errorf("Deviations count: got %d, want 1", len(decoded.Deviations))
+	}
+	if decoded.CurrentState != StateSuspicious {
+		t.Errorf("CurrentState: got %q, want %q", decoded.CurrentState, StateSuspicious)
+	}
+	if decoded.PriorAssessment == nil {
+		t.Fatal("PriorAssessment: got nil, want non-nil")
+	}
+	if decoded.PriorAssessment.ThreatType != "reconnaissance" {
+		t.Errorf("PriorAssessment.ThreatType: got %q, want %q", decoded.PriorAssessment.ThreatType, "reconnaissance")
 	}
 }

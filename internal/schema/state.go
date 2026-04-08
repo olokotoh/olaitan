@@ -13,12 +13,20 @@ const (
 	StatePreservedKilled PodSecurityState = "PRESERVED_KILLED"
 )
 
+// stateOrderMap is the static ordering of security states for transition validation.
+var stateOrderMap = map[PodSecurityState]int{
+	StateClean:           0,
+	StateSuspicious:      1,
+	StateRestricted:      2,
+	StateQuarantined:     3,
+	StatePreservedKilled: 4,
+}
+
 // ValidTransition returns true if moving from one state to the next is allowed.
 // The FSM enforces sequential escalation and allows de-escalation to any lower state.
 func ValidTransition(from, to PodSecurityState) bool {
-	order := stateOrder()
-	fromIdx, fromOk := order[from]
-	toIdx, toOk := order[to]
+	fromIdx, fromOk := stateOrderMap[from]
+	toIdx, toOk := stateOrderMap[to]
 	if !fromOk || !toOk {
 		return false
 	}
@@ -28,16 +36,6 @@ func ValidTransition(from, to PodSecurityState) bool {
 	}
 	// De-escalation: can drop to any lower state
 	return toIdx < fromIdx
-}
-
-func stateOrder() map[PodSecurityState]int {
-	return map[PodSecurityState]int{
-		StateClean:           0,
-		StateSuspicious:      1,
-		StateRestricted:      2,
-		StateQuarantined:     3,
-		StatePreservedKilled: 4,
-	}
 }
 
 // StateTransition records a pod moving between security states.
