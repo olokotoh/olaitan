@@ -1,14 +1,15 @@
 package nats
 
 import (
+	"context"
 	"fmt"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-// Stream definitions for JetStream persistence.
-var StreamConfigs = []jetstream.StreamConfig{
+// streamConfigs defines JetStream persistence streams.
+var streamConfigs = []jetstream.StreamConfig{
 	{
 		Name:      "EVENTS",
 		Subjects:  []string{"olaitan.events.>"},
@@ -32,10 +33,17 @@ var StreamConfigs = []jetstream.StreamConfig{
 	},
 }
 
+// StreamConfigs returns a copy of the JetStream stream configurations.
+func StreamConfigs() []jetstream.StreamConfig {
+	out := make([]jetstream.StreamConfig, len(streamConfigs))
+	copy(out, streamConfigs)
+	return out
+}
+
 // EnsureStreams creates or updates all JetStream streams.
-func EnsureStreams(js jetstream.JetStream) error {
-	for _, cfg := range StreamConfigs {
-		_, err := js.CreateOrUpdateStream(ctx(), cfg)
+func EnsureStreams(ctx context.Context, js jetstream.JetStream) error {
+	for _, cfg := range streamConfigs {
+		_, err := js.CreateOrUpdateStream(ctx, cfg)
 		if err != nil {
 			return fmt.Errorf("nats: ensure stream %s: %w", cfg.Name, err)
 		}

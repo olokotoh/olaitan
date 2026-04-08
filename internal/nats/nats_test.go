@@ -141,11 +141,23 @@ func TestSubscribeContextCancel(t *testing.T) {
 		t.Fatalf("subscribe: %v", err)
 	}
 
-	// Cancel the subscription
+	// Cancel the subscription and wait for drain to finish
 	cancel()
-	time.Sleep(100 * time.Millisecond) // let drain complete
 
-	// Publish after cancel — should not be received
+	// Wait until the subscription is fully drained by checking connection stats
+	deadline := time.After(2 * time.Second)
+	for {
+		if c.Conn().NumSubscriptions() == 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for subscription to drain")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	// Publish after drain — should not be received
 	if err := c.Publish("test.cancel", "after-cancel"); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
@@ -162,14 +174,14 @@ func TestEnsureStreams(t *testing.T) {
 	srv := startTestServer(t)
 	c := newTestClient(t, srv)
 
-	if err := natsclient.EnsureStreams(c.JetStream()); err != nil {
+	if err := natsclient.EnsureStreams(context.Background(), c.JetStream()); err != nil {
 		t.Fatalf("ensure streams: %v", err)
 	}
 
 	// Verify all streams exist
 	js := c.JetStream()
 	ctx := context.Background()
-	for _, cfg := range natsclient.StreamConfigs {
+	for _, cfg := range natsclient.StreamConfigs() {
 		s, err := js.Stream(ctx, cfg.Name)
 		if err != nil {
 			t.Errorf("stream %s not found: %v", cfg.Name, err)
@@ -187,10 +199,10 @@ func TestEnsureStreamsIdempotent(t *testing.T) {
 	c := newTestClient(t, srv)
 
 	// Call twice — should not error
-	if err := natsclient.EnsureStreams(c.JetStream()); err != nil {
+	if err := natsclient.EnsureStreams(context.Background(), c.JetStream()); err != nil {
 		t.Fatalf("first call: %v", err)
 	}
-	if err := natsclient.EnsureStreams(c.JetStream()); err != nil {
+	if err := natsclient.EnsureStreams(context.Background(), c.JetStream()); err != nil {
 		t.Fatalf("second call: %v", err)
 	}
 }
@@ -199,7 +211,7 @@ func TestJetStreamPublishConsume(t *testing.T) {
 	srv := startTestServer(t)
 	c := newTestClient(t, srv)
 
-	if err := natsclient.EnsureStreams(c.JetStream()); err != nil {
+	if err := natsclient.EnsureStreams(context.Background(), c.JetStream()); err != nil {
 		t.Fatalf("ensure streams: %v", err)
 	}
 
@@ -223,7 +235,7 @@ func TestJetStreamPublishConsume(t *testing.T) {
 		t.Fatalf("create consumer: %v", err)
 	}
 
-	msg, err := cons.Next()
+	msg, err := cons.Next(jetstream.FetchMaxWait(3 * time.Second))
 	if err != nil {
 		t.Fatalf("next: %v", err)
 	}

@@ -80,7 +80,9 @@ func (c *Client) Publish(subject string, data any) error {
 }
 
 // Subscribe registers a handler for messages on the given subject.
-// The handler receives raw message data. Cancel the context to unsubscribe.
+// The handler receives raw message data. Cancelling the context initiates a
+// graceful drain: in-flight messages may still be delivered before the
+// subscription is fully removed.
 func (c *Client) Subscribe(ctx context.Context, subject string, handler func([]byte)) error {
 	sub, err := c.conn.Subscribe(subject, func(msg *nats.Msg) {
 		handler(msg.Data)
@@ -110,11 +112,10 @@ func (c *Client) Conn() *nats.Conn {
 }
 
 // Close drains and closes the NATS connection.
+// If drain fails, it falls back to a hard close.
 func (c *Client) Close() {
-	c.conn.Drain()
-}
-
-// ctx returns a background context. Used internally for JetStream operations.
-func ctx() context.Context {
-	return context.Background()
+	if err := c.conn.Drain(); err != nil {
+		slog.Warn("nats: drain failed, forcing close", "err", err)
+		c.conn.Close()
+	}
 }
