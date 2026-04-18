@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
@@ -51,8 +52,8 @@ type ClientConfig struct {
 }
 
 // DefaultConfig returns sensible defaults: local plaintext Redis, pool
-// size 10, retry 6× with 100 ms → 5 s jittered backoff (go-redis applies
-// full jitter; the sequence is not literal 100 → 200 → 400).
+// size 10, retry 6× with go-redis's exponential-with-equal-jitter backoff
+// clamped between 100 ms and 5 s (not a literal 100 → 200 → 400 schedule).
 func DefaultConfig() ClientConfig {
 	return ClientConfig{
 		Addr:                  "localhost:6379",
@@ -71,9 +72,28 @@ func DefaultConfig() ClientConfig {
 
 // Client wraps *goredis.Client with the package's error-wrapping contract
 // and the key-family validator enforced by typed setters.
+//
+// The mu/closeOnce pair protects rdb from the Close-vs-in-flight race:
+// callers resolve rdb under RLock, Close takes the write lock, nils rdb,
+// and the sync.Once ensures the underlying pool is closed exactly once
+// even under concurrent Close callers.
 type Client struct {
-	rdb *goredis.Client
-	cfg ClientConfig
+	mu        sync.RWMutex
+	closeOnce sync.Once
+	rdb       *goredis.Client
+	cfg       ClientConfig
+}
+
+// conn returns the underlying *goredis.Client under RLock, or nil if
+// the Client is closed. All method call sites use this helper instead
+// of touching c.rdb directly so Close is race-safe.
+func (c *Client) conn() *goredis.Client {
+	if c == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.rdb
 }
 
 // NewClient validates cfg, opens the pool, and issues a short-deadline
@@ -117,6 +137,9 @@ func validateConfig(cfg ClientConfig) error {
 	if cfg.Addr == "" {
 		return errors.New("redis: config: addr is empty")
 	}
+	if cfg.DB < 0 || cfg.DB > 15 {
+		return errors.New("redis: config: db must be in [0, 15]")
+	}
 	if cfg.PoolSize < 0 {
 		return errors.New("redis: config: pool-size must be non-negative")
 	}
@@ -132,14 +155,20 @@ func validateConfig(cfg ClientConfig) error {
 	if cfg.MaxRetryBackoff < 0 {
 		return errors.New("redis: config: max-retry-backoff must be non-negative")
 	}
-	if cfg.MinRetryBackoff > cfg.MaxRetryBackoff && cfg.MaxRetryBackoff > 0 {
+	if cfg.MinRetryBackoff > cfg.MaxRetryBackoff {
 		return errors.New("redis: config: min-retry-backoff must be ≤ max-retry-backoff")
 	}
 	if cfg.StreamMaxLen < 0 {
 		return errors.New("redis: config: stream-max-len must be non-negative")
 	}
-	if cfg.DialTimeout < 0 {
-		return errors.New("redis: config: dial-timeout must be non-negative")
+	if cfg.DialTimeout <= 0 {
+		return errors.New("redis: config: dial-timeout must be positive")
+	}
+	if cfg.ReadTimeout < 0 {
+		return errors.New("redis: config: read-timeout must be non-negative")
+	}
+	if cfg.WriteTimeout < 0 {
+		return errors.New("redis: config: write-timeout must be non-negative")
 	}
 	return nil
 }
@@ -148,31 +177,45 @@ func validateConfig(cfg ClientConfig) error {
 // Callers using Raw must uphold the "redis: action: %w" wrap contract
 // themselves. Prefer the typed setters/getters in the same package.
 func (c *Client) Raw() *goredis.Client {
-	if c == nil {
-		return nil
-	}
-	return c.rdb
+	return c.conn()
 }
 
 // Close flushes any pending commands and closes the underlying pool.
-// Safe to call on a nil or already-closed Client. The context deadline
-// bounds the close wait; a deadline that expires before close finishes
-// returns a wrapped context error.
+// Safe to call on a nil or already-closed Client, and safe to call
+// concurrently — only the first caller drives the actual pool close
+// via sync.Once; subsequent callers return nil immediately once rdb
+// has been cleared under the write lock. The context deadline bounds
+// the close wait; a deadline that expires before close finishes
+// returns a wrapped context error. The spawned goroutine will finish
+// once the pool drains even if this call returns on ctx.Done — it
+// cannot be cancelled, but it is bounded by the go-redis pool's own
+// lifecycle.
 func (c *Client) Close(ctx context.Context) error {
-	if c == nil || c.rdb == nil {
+	if c == nil {
 		return nil
 	}
-	done := make(chan error, 1)
-	go func() {
-		done <- c.rdb.Close()
-	}()
-	select {
-	case err := <-done:
-		if err != nil && !errors.Is(err, goredis.ErrClosed) {
-			return fmt.Errorf("redis: close: %w", err)
+	c.mu.Lock()
+	rdb := c.rdb
+	c.rdb = nil
+	c.mu.Unlock()
+	if rdb == nil {
+		return nil
+	}
+
+	var closeErr error
+	c.closeOnce.Do(func() {
+		done := make(chan error, 1)
+		go func() {
+			done <- rdb.Close()
+		}()
+		select {
+		case err := <-done:
+			if err != nil && !errors.Is(err, goredis.ErrClosed) {
+				closeErr = fmt.Errorf("redis: close: %w", err)
+			}
+		case <-ctx.Done():
+			closeErr = fmt.Errorf("redis: close: %w", ctx.Err())
 		}
-		return nil
-	case <-ctx.Done():
-		return fmt.Errorf("redis: close: %w", ctx.Err())
-	}
+	})
+	return closeErr
 }

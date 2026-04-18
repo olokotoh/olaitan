@@ -102,6 +102,10 @@ func TestStreamsRejectNonEvidencePrefix(t *testing.T) {
 		{"baseline-prefix", "baseline:default:nginx:metrics"},
 		{"no-prefix", "raw-stream"},
 		{"empty", ""},
+		{"evidence-prefix-only", "evidence:"},
+		{"evidence-glob-star", "evidence:incident:*"},
+		{"evidence-glob-q", "evidence:incident:?"},
+		{"evidence-glob-bracket", "evidence:incident:["},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -113,6 +117,34 @@ func TestStreamsRejectNonEvidencePrefix(t *testing.T) {
 				t.Errorf("err %q missing redis: prefix", err)
 			}
 		})
+	}
+}
+
+func TestStreamsReadEmptyLastIDRejected(t *testing.T) {
+	mr := startMiniredis(t)
+	c := newTestClient(t, mr)
+	ctx := context.Background()
+
+	_, err := c.Read(ctx, "evidence:incident:INC-1", "", 10, 0)
+	if err == nil {
+		t.Fatal("expected rejection for empty lastID, got nil")
+	}
+	if !strings.Contains(err.Error(), "lastID is empty") {
+		t.Errorf("err %q does not mention lastID", err)
+	}
+}
+
+func TestStreamsReadNegativeCountRejected(t *testing.T) {
+	mr := startMiniredis(t)
+	c := newTestClient(t, mr)
+	ctx := context.Background()
+
+	_, err := c.Read(ctx, "evidence:incident:INC-1", "0", -1, 0)
+	if err == nil {
+		t.Fatal("expected rejection for negative count, got nil")
+	}
+	if !strings.Contains(err.Error(), "count must be non-negative") {
+		t.Errorf("err %q does not mention count", err)
 	}
 }
 

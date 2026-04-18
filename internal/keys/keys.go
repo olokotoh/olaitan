@@ -58,20 +58,30 @@ func FamilyOf(key string) Family {
 	}
 }
 
-// validateToken rejects inputs that would break the key hierarchy or let
-// a builder emit a Redis glob pattern: empty string, whitespace, `:`
-// (the hierarchy separator), and the glob metacharacters `*`, `?`, `[`.
+// validateToken enforces an allowlist: [A-Za-z0-9_.-] only. This is a
+// superset of DNS-1123 names (k8s namespace/pod/ring identifiers) and
+// the common "INC-123"-style incident IDs, while rejecting every Redis
+// hierarchy separator, glob metacharacter, ASCII whitespace, and
+// Unicode control rune in one rule.
+//
+// Also rejects the single-character tokens "-" and "+" because they
+// collide with XRANGE's stream sentinels when an evidence key is later
+// used as the stream argument.
 func validateToken(s string) error {
 	if s == "" {
 		return fmt.Errorf("empty token")
 	}
+	if s == "-" || s == "+" {
+		return fmt.Errorf("token %q collides with XRANGE sentinel", s)
+	}
 	for _, r := range s {
-		switch r {
-		case ':', '*', '?', '[':
-			return fmt.Errorf("reserved character %q in token %q", r, s)
-		}
-		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
-			return fmt.Errorf("whitespace in token %q", s)
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '_' || r == '.' || r == '-':
+		default:
+			return fmt.Errorf("disallowed character %q in token %q (allowed: [A-Za-z0-9_.-])", r, s)
 		}
 	}
 	return nil

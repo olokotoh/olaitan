@@ -14,19 +14,23 @@ func TestBuildersValidate(t *testing.T) {
 		wantSub string
 	}{
 		{"baseline-metrics-empty-ns", func() (string, error) { return keys.BaselineMetrics("", "nginx") }, "empty"},
-		{"baseline-metrics-space-pod", func() (string, error) { return keys.BaselineMetrics("default", "ngi nx") }, "whitespace"},
-		{"baseline-metrics-colon-ns", func() (string, error) { return keys.BaselineMetrics("a:b", "nginx") }, "reserved"},
-		{"baseline-metrics-star-pod", func() (string, error) { return keys.BaselineMetrics("default", "n*ginx") }, "reserved"},
-		{"baseline-metrics-q-pod", func() (string, error) { return keys.BaselineMetrics("default", "n?ginx") }, "reserved"},
-		{"baseline-metrics-bracket-pod", func() (string, error) { return keys.BaselineMetrics("default", "n[ginx") }, "reserved"},
-		{"baseline-window-tab-pod", func() (string, error) { return keys.BaselineWindow("default", "ngi\tnx") }, "whitespace"},
-		{"state-cr-ns", func() (string, error) { return keys.State("def\rault", "nginx") }, "whitespace"},
-		{"state-lf-pod", func() (string, error) { return keys.State("default", "nginx\n") }, "whitespace"},
+		{"baseline-metrics-space-pod", func() (string, error) { return keys.BaselineMetrics("default", "ngi nx") }, "disallowed"},
+		{"baseline-metrics-colon-ns", func() (string, error) { return keys.BaselineMetrics("a:b", "nginx") }, "disallowed"},
+		{"baseline-metrics-star-pod", func() (string, error) { return keys.BaselineMetrics("default", "n*ginx") }, "disallowed"},
+		{"baseline-metrics-q-pod", func() (string, error) { return keys.BaselineMetrics("default", "n?ginx") }, "disallowed"},
+		{"baseline-metrics-bracket-pod", func() (string, error) { return keys.BaselineMetrics("default", "n[ginx") }, "disallowed"},
+		{"baseline-window-tab-pod", func() (string, error) { return keys.BaselineWindow("default", "ngi\tnx") }, "disallowed"},
+		{"state-cr-ns", func() (string, error) { return keys.State("def\rault", "nginx") }, "disallowed"},
+		{"state-lf-pod", func() (string, error) { return keys.State("default", "nginx\n") }, "disallowed"},
+		{"state-nul-pod", func() (string, error) { return keys.State("default", "ngi\x00nx") }, "disallowed"},
+		{"state-zwj-ns", func() (string, error) { return keys.State("defau\u200Dlt", "nginx") }, "disallowed"},
 		{"evidence-incident-empty", func() (string, error) { return keys.EvidenceIncident("") }, "empty"},
-		{"evidence-incident-colon", func() (string, error) { return keys.EvidenceIncident("INC:1") }, "reserved"},
+		{"evidence-incident-colon", func() (string, error) { return keys.EvidenceIncident("INC:1") }, "disallowed"},
+		{"evidence-incident-dash-sentinel", func() (string, error) { return keys.EvidenceIncident("-") }, "XRANGE sentinel"},
+		{"evidence-incident-plus-sentinel", func() (string, error) { return keys.EvidenceIncident("+") }, "XRANGE sentinel"},
 		{"evidence-transitions-empty-ns", func() (string, error) { return keys.EvidenceTransitions("", "nginx") }, "empty"},
 		{"health-empty", func() (string, error) { return keys.Health("") }, "empty"},
-		{"health-wildcard", func() (string, error) { return keys.Health("ring*") }, "reserved"},
+		{"health-wildcard", func() (string, error) { return keys.Health("ring*") }, "disallowed"},
 	}
 
 	for _, tc := range cases {

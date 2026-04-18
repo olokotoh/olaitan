@@ -55,7 +55,17 @@ func TestNewClientValidation(t *testing.T) {
 			c.MinRetryBackoff = 10 * time.Second
 			c.MaxRetryBackoff = 1 * time.Second
 		}, "min-retry-backoff must be ≤"},
+		{"backoff-ordering-max-zero", func(c *redisclient.ClientConfig) {
+			c.MinRetryBackoff = 10 * time.Second
+			c.MaxRetryBackoff = 0
+		}, "min-retry-backoff must be ≤"},
 		{"negative-stream-maxlen", func(c *redisclient.ClientConfig) { c.StreamMaxLen = -1 }, "stream-max-len"},
+		{"zero-dial-timeout", func(c *redisclient.ClientConfig) { c.DialTimeout = 0 }, "dial-timeout"},
+		{"negative-dial-timeout", func(c *redisclient.ClientConfig) { c.DialTimeout = -time.Millisecond }, "dial-timeout"},
+		{"negative-read-timeout", func(c *redisclient.ClientConfig) { c.ReadTimeout = -time.Millisecond }, "read-timeout"},
+		{"negative-write-timeout", func(c *redisclient.ClientConfig) { c.WriteTimeout = -time.Millisecond }, "write-timeout"},
+		{"db-negative", func(c *redisclient.ClientConfig) { c.DB = -1 }, "db must be in"},
+		{"db-too-large", func(c *redisclient.ClientConfig) { c.DB = 16 }, "db must be in"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -415,6 +425,18 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.PoolSize != 10 {
 		t.Errorf("PoolSize = %d, want 10", cfg.PoolSize)
 	}
+	if cfg.MinIdleConns != 2 {
+		t.Errorf("MinIdleConns = %d, want 2", cfg.MinIdleConns)
+	}
+	if cfg.DialTimeout != 5*time.Second {
+		t.Errorf("DialTimeout = %v, want 5s", cfg.DialTimeout)
+	}
+	if cfg.ReadTimeout != 3*time.Second {
+		t.Errorf("ReadTimeout = %v, want 3s", cfg.ReadTimeout)
+	}
+	if cfg.WriteTimeout != 3*time.Second {
+		t.Errorf("WriteTimeout = %v, want 3s", cfg.WriteTimeout)
+	}
 	if cfg.MaxRetries != 6 {
 		t.Errorf("MaxRetries = %d, want 6", cfg.MaxRetries)
 	}
@@ -453,5 +475,76 @@ func TestContextCancelReturnsWrappedError(t *testing.T) {
 	}
 	if !strings.HasPrefix(err.Error(), "redis:") {
 		t.Errorf("err %q missing redis: prefix", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err %q does not wrap context.Canceled", err)
+	}
+}
+
+// TestClosedClientReturnsSentinel verifies that a live client, once
+// Close() completes, returns ErrClientClosed on subsequent method calls
+// rather than the driver's redis.ErrClosed wrapped. AC5/AC7.
+func TestClosedClientReturnsSentinel(t *testing.T) {
+	mr := startMiniredis(t)
+	cfg := redisclient.DefaultConfig()
+	cfg.Addr = mr.Addr()
+	c, err := redisclient.NewClient(cfg)
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	if err := c.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	ctx := context.Background()
+	checks := []struct {
+		name string
+		run  func() error
+	}{
+		{"set-checkpoint", func() error { return c.SetCheckpoint(ctx, "checkpoint:correlator:stream_seq", "v") }},
+		{"get-state", func() error { _, err := c.GetState(ctx, "state:default:nginx"); return err }},
+		{"append", func() error { _, err := c.Append(ctx, "evidence:incident:x", map[string]any{"k": "v"}); return err }},
+		{"len", func() error { _, err := c.Len(ctx, "evidence:incident:x"); return err }},
+	}
+	for _, tc := range checks {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.run(); !errors.Is(err, redisclient.ErrClientClosed) {
+				t.Errorf("got %v, want ErrClientClosed", err)
+			}
+		})
+	}
+	if raw := c.Raw(); raw != nil {
+		t.Errorf("Raw on closed client = %v, want nil", raw)
+	}
+}
+
+// TestConcurrentClose exercises the sync.Once / mutex guarantee — N
+// goroutines each calling Close must all return nil without racing and
+// without closing the underlying pool more than once.
+func TestConcurrentClose(t *testing.T) {
+	mr := startMiniredis(t)
+	cfg := redisclient.DefaultConfig()
+	cfg.Addr = mr.Addr()
+	c, err := redisclient.NewClient(cfg)
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	const n = 20
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			if err := c.Close(context.Background()); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent close: %v", err)
 	}
 }

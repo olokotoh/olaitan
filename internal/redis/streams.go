@@ -19,17 +19,29 @@ import (
 // StreamEntry is a single message read from a Redis Stream. Fields is a
 // map of the stream entry's k/v pairs — callers marshal structured data
 // into/out of it themselves (no JSON is enforced by this package).
+//
+// Non-string values returned by Redis are stringified via fmt.Sprint, so
+// numeric fields written via Append come back as their string form.
+// Callers that need typed round-trip should marshal to JSON before
+// Append and unmarshal after Read.
 type StreamEntry struct {
 	ID     string
 	Fields map[string]string
 }
+
+// BlockForever is the sentinel for an XREAD that should wait indefinitely
+// for new entries. Pass this to Read's block argument to request
+// go-redis's native BLOCK 0 semantics. Any other non-positive value is
+// treated as "return immediately" (non-blocking).
+const BlockForever = time.Duration(-1 << 62)
 
 // Append publishes a message to a Redis Stream, trimming the stream to
 // approximately StreamMaxLen entries. Only streams under the evidence:
 // prefix are allowed — state:/health:/baseline: should never be Redis
 // Streams in this architecture.
 func (c *Client) Append(ctx context.Context, stream string, fields map[string]any) (string, error) {
-	if c == nil || c.rdb == nil {
+	rdb := c.conn()
+	if rdb == nil {
 		return "", ErrClientClosed
 	}
 	if err := validateStreamKey(stream); err != nil {
@@ -47,38 +59,48 @@ func (c *Client) Append(ctx context.Context, stream string, fields map[string]an
 		args.MaxLen = c.cfg.StreamMaxLen
 		args.Approx = true
 	}
-	id, err := c.rdb.XAdd(ctx, args).Result()
+	id, err := rdb.XAdd(ctx, args).Result()
 	if err != nil {
 		return "", fmt.Errorf("redis: append %q: %w", stream, err)
 	}
 	return id, nil
 }
 
-// Read is a thin wrapper over XREAD. lastID == "" defaults to "$" (only
-// new messages arriving after this call). A non-positive block returns
-// immediately if nothing is available; a positive block waits up to that
-// duration for new entries. (Note: go-redis v9's XReadArgs.Block sends
-// BLOCK 0 — "wait forever" — on zero, so we explicitly pass -1 to
-// suppress the BLOCK option when the caller wants no blocking.)
+// Read is a thin wrapper over XREAD. An empty lastID is rejected —
+// callers must pass an explicit sentinel: "$" for "new messages only",
+// "0" to replay from the start, or a prior entry ID to resume. For the
+// block argument: a positive duration sets a block timeout; any
+// non-positive value other than BlockForever maps to "return
+// immediately"; BlockForever maps to go-redis's BLOCK 0 (wait forever).
 func (c *Client) Read(ctx context.Context, stream, lastID string, count int64, block time.Duration) ([]StreamEntry, error) {
-	if c == nil || c.rdb == nil {
+	rdb := c.conn()
+	if rdb == nil {
 		return nil, ErrClientClosed
 	}
 	if err := validateStreamKey(stream); err != nil {
 		return nil, err
 	}
 	if lastID == "" {
-		lastID = "$"
+		return nil, fmt.Errorf("redis: read %q: lastID is empty (use \"$\", \"0\", or a prior entry ID)", stream)
 	}
-	if block <= 0 {
-		block = -1
+	if count < 0 {
+		return nil, fmt.Errorf("redis: read %q: count must be non-negative", stream)
+	}
+	var blockArg time.Duration
+	switch {
+	case block == BlockForever:
+		blockArg = 0 // go-redis sends BLOCK 0 = wait forever
+	case block <= 0:
+		blockArg = -1 // go-redis suppresses BLOCK — non-blocking
+	default:
+		blockArg = block
 	}
 	args := &goredis.XReadArgs{
 		Streams: []string{stream, lastID},
 		Count:   count,
-		Block:   block,
+		Block:   blockArg,
 	}
-	res, err := c.rdb.XRead(ctx, args).Result()
+	res, err := rdb.XRead(ctx, args).Result()
 	if errors.Is(err, goredis.Nil) {
 		return nil, nil
 	}
@@ -96,13 +118,14 @@ func (c *Client) Read(ctx context.Context, stream, lastID string, count int64, b
 
 // Range is a thin wrapper over XRANGE. Pass "-" / "+" for the full stream.
 func (c *Client) Range(ctx context.Context, stream, start, stop string) ([]StreamEntry, error) {
-	if c == nil || c.rdb == nil {
+	rdb := c.conn()
+	if rdb == nil {
 		return nil, ErrClientClosed
 	}
 	if err := validateStreamKey(stream); err != nil {
 		return nil, err
 	}
-	msgs, err := c.rdb.XRange(ctx, stream, start, stop).Result()
+	msgs, err := rdb.XRange(ctx, stream, start, stop).Result()
 	if err != nil {
 		return nil, fmt.Errorf("redis: range %q: %w", stream, err)
 	}
@@ -115,13 +138,14 @@ func (c *Client) Range(ctx context.Context, stream, start, stop string) ([]Strea
 
 // Len returns the stream's current length.
 func (c *Client) Len(ctx context.Context, stream string) (int64, error) {
-	if c == nil || c.rdb == nil {
+	rdb := c.conn()
+	if rdb == nil {
 		return 0, ErrClientClosed
 	}
 	if err := validateStreamKey(stream); err != nil {
 		return 0, err
 	}
-	n, err := c.rdb.XLen(ctx, stream).Result()
+	n, err := rdb.XLen(ctx, stream).Result()
 	if err != nil {
 		return 0, fmt.Errorf("redis: len %q: %w", stream, err)
 	}
@@ -130,7 +154,10 @@ func (c *Client) Len(ctx context.Context, stream string) (int64, error) {
 
 // validateStreamKey rejects any key that is not in the evidence family.
 // Redis Streams is used only for evidence/transitions in this epic; a
-// state: or health: stream is almost certainly a caller mistake.
+// state: or health: stream is almost certainly a caller mistake. The
+// check also requires at least one non-empty token after the prefix
+// and rejects glob metacharacters that could turn an argv string into
+// a pattern at the driver level.
 func validateStreamKey(stream string) error {
 	if stream == "" {
 		return fmt.Errorf("redis: stream key is empty")
@@ -138,17 +165,27 @@ func validateStreamKey(stream string) error {
 	if !strings.HasPrefix(stream, keys.EvidencePrefix) {
 		return fmt.Errorf("redis: stream %q: only evidence: streams are allowed", stream)
 	}
+	suffix := stream[len(keys.EvidencePrefix):]
+	if suffix == "" {
+		return fmt.Errorf("redis: stream %q: missing token after prefix", stream)
+	}
+	if strings.ContainsAny(suffix, "*?[") {
+		return fmt.Errorf("redis: stream %q: contains glob metacharacter", stream)
+	}
 	return nil
 }
 
 func messageToEntry(m goredis.XMessage) StreamEntry {
 	fields := make(map[string]string, len(m.Values))
 	for k, v := range m.Values {
-		if s, ok := v.(string); ok {
-			fields[k] = s
-			continue
+		switch x := v.(type) {
+		case nil:
+			fields[k] = ""
+		case string:
+			fields[k] = x
+		default:
+			fields[k] = fmt.Sprint(v)
 		}
-		fields[k] = fmt.Sprint(v)
 	}
 	return StreamEntry{ID: m.ID, Fields: fields}
 }
