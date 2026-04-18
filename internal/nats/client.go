@@ -91,7 +91,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 // Publish marshals data as JSON and publishes to the given subject via core NATS.
 // Use PublishJS for subjects covered by a JetStream stream to obtain a PubAck.
 func (c *Client) Publish(subject string, data any) error {
-	if c == nil || c.conn == nil {
+	if c == nil || c.conn == nil || c.conn.IsClosed() {
 		return ErrClientClosed
 	}
 	bytes, err := json.Marshal(data)
@@ -107,7 +107,7 @@ func (c *Client) Publish(subject string, data any) error {
 // PublishJS publishes to a JetStream-backed subject and returns the PubAck,
 // giving callers the at-least-once contract that core Publish cannot.
 func (c *Client) PublishJS(ctx context.Context, subject string, data any) (*jetstream.PubAck, error) {
-	if c == nil || c.js == nil {
+	if c == nil || c.js == nil || c.conn == nil || c.conn.IsClosed() {
 		return nil, ErrClientClosed
 	}
 	bytes, err := json.Marshal(data)
@@ -127,7 +127,7 @@ func (c *Client) PublishJS(ctx context.Context, subject string, data any) (*jets
 // Cancelling the context initiates a graceful drain: in-flight messages may
 // still be delivered before the subscription is fully removed.
 func (c *Client) Subscribe(ctx context.Context, subject string, handler func([]byte)) error {
-	if c == nil || c.conn == nil {
+	if c == nil || c.conn == nil || c.conn.IsClosed() {
 		return ErrClientClosed
 	}
 	sub, err := c.conn.Subscribe(subject, func(msg *nats.Msg) {
@@ -184,12 +184,14 @@ func (c *Client) Close(ctx context.Context) error {
 		c.conn.Close()
 		return fmt.Errorf("nats: close: %w", err)
 	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
 	for c.conn.Status() != nats.CLOSED {
 		select {
 		case <-ctx.Done():
 			c.conn.Close()
 			return fmt.Errorf("nats: close: %w", ctx.Err())
-		case <-time.After(10 * time.Millisecond):
+		case <-ticker.C:
 		}
 	}
 	return nil

@@ -39,8 +39,13 @@ var streamConfigs = []jetstream.StreamConfig{
 	},
 }
 
-// StreamConfigs returns a deep copy of the JetStream stream configurations.
-// Callers may mutate the returned value without affecting package state.
+// StreamConfigs returns a copy of the JetStream stream configurations.
+// The outer slice and each entry's Subjects slice are independently duplicated,
+// so callers may safely mutate those fields without affecting package state.
+// Other reference-typed fields on jetstream.StreamConfig (Mirror, Sources,
+// Placement, Republish, etc.) are not currently populated by this package
+// and are therefore not deep-copied; if future configurations set them,
+// extend the copy to cover those fields.
 func StreamConfigs() []jetstream.StreamConfig {
 	out := make([]jetstream.StreamConfig, len(streamConfigs))
 	for i, cfg := range streamConfigs {

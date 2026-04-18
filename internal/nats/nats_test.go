@@ -435,13 +435,15 @@ func TestNilClientReturnsErrClosed(t *testing.T) {
 }
 
 func TestReconnectSurvival(t *testing.T) {
-	port, err := freePort()
-	if err != nil {
-		t.Fatalf("free port: %v", err)
+	// Start srv1 on a random port, then read the actual bound port so we
+	// can restart srv2 on the same one. Avoids a freePort()-then-bind
+	// TOCTOU race where another process could claim the port in between.
+	srv1 := startServerOnce(t, -1)
+	addr, ok := srv1.Addr().(*net.TCPAddr)
+	if !ok || addr == nil {
+		t.Fatalf("srv1 addr: unexpected type %T", srv1.Addr())
 	}
-
-	// Start server once, retain port for restart.
-	srv1 := startServerOnce(t, port)
+	port := addr.Port
 
 	cfg := natsclient.ClientConfig{
 		URL:              srv1.ClientURL(),
@@ -579,15 +581,6 @@ func testStreamConfigs() []jetstream.StreamConfig {
 			Retention: jetstream.LimitsPolicy,
 		},
 	}
-}
-
-func freePort() (int, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port, nil
 }
 
 // startServerOnce starts a NATS server on the given port and registers it
