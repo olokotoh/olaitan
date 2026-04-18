@@ -53,9 +53,12 @@ func StreamConfigs() []jetstream.StreamConfig {
 	return out
 }
 
-// EnsureStreams creates or updates all JetStream streams.
-func EnsureStreams(ctx context.Context, js jetstream.JetStream) error {
-	for _, cfg := range streamConfigs {
+// EnsureStreams creates or updates the provided JetStream streams.
+// Pass StreamConfigs() for the architecture-contract defaults. Tests may
+// pass reduced configs to avoid provisioning the full production MaxBytes
+// reservation on resource-constrained runners.
+func EnsureStreams(ctx context.Context, js jetstream.JetStream, configs []jetstream.StreamConfig) error {
+	for _, cfg := range configs {
 		if _, err := js.CreateOrUpdateStream(ctx, cfg); err != nil {
 			return fmt.Errorf("nats: ensure stream %s: %w", cfg.Name, err)
 		}

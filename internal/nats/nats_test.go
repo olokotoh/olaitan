@@ -35,14 +35,9 @@ func startTestServerAt(t *testing.T, port int) *natsserver.Server {
 		Host:      "127.0.0.1",
 		Port:      port,
 		JetStream: true,
-		// JetStreamMaxStore admits the production stream MaxBytes (10 GiB
-		// EVENTS + 100 GiB EVIDENCE) on CI runners whose actual free disk
-		// is smaller. NATS validates MaxBytes against this limit, not real
-		// disk, and only allocates space as data is written.
-		JetStreamMaxStore: 256 * 1024 * 1024 * 1024,
-		StoreDir:          t.TempDir(),
-		NoLog:             true,
-		NoSigs:            true,
+		StoreDir:  t.TempDir(),
+		NoLog:     true,
+		NoSigs:    true,
 	}
 	srv, err := natsserver.NewServer(opts)
 	if err != nil {
@@ -250,7 +245,7 @@ func TestEnsureStreams(t *testing.T) {
 	srv := startTestServer(t)
 	c := newTestClient(t, srv)
 
-	if err := natsclient.EnsureStreams(context.Background(), c.JetStream()); err != nil {
+	if err := natsclient.EnsureStreams(context.Background(), c.JetStream(), testStreamConfigs()); err != nil {
 		t.Fatalf("ensure streams: %v", err)
 	}
 
@@ -279,10 +274,10 @@ func TestEnsureStreamsIdempotent(t *testing.T) {
 	srv := startTestServer(t)
 	c := newTestClient(t, srv)
 
-	if err := natsclient.EnsureStreams(context.Background(), c.JetStream()); err != nil {
+	if err := natsclient.EnsureStreams(context.Background(), c.JetStream(), testStreamConfigs()); err != nil {
 		t.Fatalf("first call: %v", err)
 	}
-	if err := natsclient.EnsureStreams(context.Background(), c.JetStream()); err != nil {
+	if err := natsclient.EnsureStreams(context.Background(), c.JetStream(), testStreamConfigs()); err != nil {
 		t.Fatalf("second call: %v", err)
 	}
 }
@@ -291,7 +286,7 @@ func TestJetStreamPublishConsume(t *testing.T) {
 	srv := startTestServer(t)
 	c := newTestClient(t, srv)
 
-	if err := natsclient.EnsureStreams(context.Background(), c.JetStream()); err != nil {
+	if err := natsclient.EnsureStreams(context.Background(), c.JetStream(), testStreamConfigs()); err != nil {
 		t.Fatalf("ensure streams: %v", err)
 	}
 
@@ -551,6 +546,41 @@ func TestStreamConfigsDeepCopy(t *testing.T) {
 
 // --- test helpers ---
 
+// testStreamConfigs mirrors the production stream topology (names, subjects,
+// retention policy) but with MemoryStorage and tiny MaxBytes so the in-process
+// test server does not try to reserve the full production MaxBytes against
+// the runner's real free disk (which would fail with err_code=10047 on
+// CI). TestStreamConfigsMatchArchitectureContract guards the production
+// values separately.
+func testStreamConfigs() []jetstream.StreamConfig {
+	return []jetstream.StreamConfig{
+		{
+			Name:      "EVENTS",
+			Subjects:  []string{subjects.Normalised},
+			MaxAge:    24 * time.Hour,
+			MaxBytes:  1 * 1024 * 1024,
+			Storage:   jetstream.MemoryStorage,
+			Retention: jetstream.LimitsPolicy,
+		},
+		{
+			Name:      "THREATS",
+			Subjects:  []string{subjects.ThreatsPrefix + ">"},
+			MaxAge:    7 * 24 * time.Hour,
+			MaxBytes:  1 * 1024 * 1024,
+			Storage:   jetstream.MemoryStorage,
+			Retention: jetstream.LimitsPolicy,
+		},
+		{
+			Name:      "EVIDENCE",
+			Subjects:  []string{subjects.EvidencePrefix + ">"},
+			MaxAge:    0,
+			MaxBytes:  1 * 1024 * 1024,
+			Storage:   jetstream.MemoryStorage,
+			Retention: jetstream.LimitsPolicy,
+		},
+	}
+}
+
 func freePort() (int, error) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -569,14 +599,9 @@ func startServerOnce(t *testing.T, port int) *natsserver.Server {
 		Host:      "127.0.0.1",
 		Port:      port,
 		JetStream: true,
-		// JetStreamMaxStore admits the production stream MaxBytes (10 GiB
-		// EVENTS + 100 GiB EVIDENCE) on CI runners whose actual free disk
-		// is smaller. NATS validates MaxBytes against this limit, not real
-		// disk, and only allocates space as data is written.
-		JetStreamMaxStore: 256 * 1024 * 1024 * 1024,
-		StoreDir:          t.TempDir(),
-		NoLog:             true,
-		NoSigs:            true,
+		StoreDir:  t.TempDir(),
+		NoLog:     true,
+		NoSigs:    true,
 	}
 	srv, err := natsserver.NewServer(opts)
 	if err != nil {
