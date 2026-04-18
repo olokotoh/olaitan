@@ -35,9 +35,14 @@ func startTestServerAt(t *testing.T, port int) *natsserver.Server {
 		Host:      "127.0.0.1",
 		Port:      port,
 		JetStream: true,
-		StoreDir:  t.TempDir(),
-		NoLog:     true,
-		NoSigs:    true,
+		// JetStreamMaxStore admits the production stream MaxBytes (10 GiB
+		// EVENTS + 100 GiB EVIDENCE) on CI runners whose actual free disk
+		// is smaller. NATS validates MaxBytes against this limit, not real
+		// disk, and only allocates space as data is written.
+		JetStreamMaxStore: 256 * 1024 * 1024 * 1024,
+		StoreDir:          t.TempDir(),
+		NoLog:             true,
+		NoSigs:            true,
 	}
 	srv, err := natsserver.NewServer(opts)
 	if err != nil {
@@ -564,9 +569,14 @@ func startServerOnce(t *testing.T, port int) *natsserver.Server {
 		Host:      "127.0.0.1",
 		Port:      port,
 		JetStream: true,
-		StoreDir:  t.TempDir(),
-		NoLog:     true,
-		NoSigs:    true,
+		// JetStreamMaxStore admits the production stream MaxBytes (10 GiB
+		// EVENTS + 100 GiB EVIDENCE) on CI runners whose actual free disk
+		// is smaller. NATS validates MaxBytes against this limit, not real
+		// disk, and only allocates space as data is written.
+		JetStreamMaxStore: 256 * 1024 * 1024 * 1024,
+		StoreDir:          t.TempDir(),
+		NoLog:             true,
+		NoSigs:            true,
 	}
 	srv, err := natsserver.NewServer(opts)
 	if err != nil {
