@@ -6,45 +6,57 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
+
+	"github.com/olokotoh/olaitan/internal/subjects"
 )
 
-// streamConfigs defines JetStream persistence streams.
+// streamConfigs defines the JetStream persistence streams per the architecture
+// contract (EVENTS normalised 24h / 10 GiB, THREATS 7d, EVIDENCE never-expire
+// with a defensive MaxBytes cap for disk safety).
 var streamConfigs = []jetstream.StreamConfig{
 	{
 		Name:      "EVENTS",
-		Subjects:  []string{"olaitan.events.>"},
+		Subjects:  []string{subjects.Normalised},
 		MaxAge:    24 * time.Hour,
+		MaxBytes:  10 * 1024 * 1024 * 1024, // 10 GiB
 		Storage:   jetstream.FileStorage,
 		Retention: jetstream.LimitsPolicy,
 	},
 	{
 		Name:      "THREATS",
-		Subjects:  []string{"olaitan.threats.>", "olaitan.correlated.>"},
+		Subjects:  []string{subjects.ThreatsPrefix + ">"},
 		MaxAge:    7 * 24 * time.Hour,
 		Storage:   jetstream.FileStorage,
 		Retention: jetstream.LimitsPolicy,
 	},
 	{
 		Name:      "EVIDENCE",
-		Subjects:  []string{"olaitan.state.>", "olaitan.health.>"},
-		MaxAge:    0, // permanent
+		Subjects:  []string{subjects.EvidencePrefix + ">"},
+		MaxAge:    0,                        // never auto-expire
+		MaxBytes:  100 * 1024 * 1024 * 1024, // 100 GiB safety cap — tune for production
 		Storage:   jetstream.FileStorage,
 		Retention: jetstream.LimitsPolicy,
 	},
 }
 
-// StreamConfigs returns a copy of the JetStream stream configurations.
+// StreamConfigs returns a deep copy of the JetStream stream configurations.
+// Callers may mutate the returned value without affecting package state.
 func StreamConfigs() []jetstream.StreamConfig {
 	out := make([]jetstream.StreamConfig, len(streamConfigs))
-	copy(out, streamConfigs)
+	for i, cfg := range streamConfigs {
+		c := cfg
+		if len(cfg.Subjects) > 0 {
+			c.Subjects = append([]string(nil), cfg.Subjects...)
+		}
+		out[i] = c
+	}
 	return out
 }
 
 // EnsureStreams creates or updates all JetStream streams.
 func EnsureStreams(ctx context.Context, js jetstream.JetStream) error {
 	for _, cfg := range streamConfigs {
-		_, err := js.CreateOrUpdateStream(ctx, cfg)
-		if err != nil {
+		if _, err := js.CreateOrUpdateStream(ctx, cfg); err != nil {
 			return fmt.Errorf("nats: ensure stream %s: %w", cfg.Name, err)
 		}
 	}
