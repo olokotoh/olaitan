@@ -1,0 +1,47 @@
+# Olaitan central configuration.
+# See _bmad-output/planning-artifacts/architecture.md#Configuration-Format
+# for the full schema. All keys are snake_case; durations are Go-style
+# strings ("24h", "10s").
+
+detection:
+  confidence_bands:
+    watch: 40
+    alert: 70
+    act: 90
+  baseline_window: 24h
+
+response:
+  excluded_namespaces:
+    - kube-system
+    - olaitan
+
+analyst:
+  provider: api
+  api:
+    endpoint: ""
+    model: ""
+    api_key_secret: olaitan-llm
+  local:
+    endpoint: "http://ollama:11434"
+    model: "gemma:2b"
+  score_cap: 35
+  timeout: 10s
+  chain:
+    enabled: false
+    l1:
+      prompt: config/prompts/l1-triage.tmpl
+      model: ""
+    l2:
+      prompt: config/prompts/l2-review.tmpl
+      model: ""
+  subtasks:
+    enabled: false
+    max_per_assessment: 3
+    severity_threshold: 70
+    timeout: 10s
+    available_types:
+      - network_forensics
+      - privilege_escalation
+      - lateral_movement
+      - mitre_mapping
+      - data_exfiltration
