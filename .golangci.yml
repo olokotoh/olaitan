@@ -1,18 +1,21 @@
+version: "2"
+
 linters:
   enable:
     - errcheck
     - govet
     - staticcheck
     - unused
-    - gosimple
     - ineffassign
-    - typecheck
+
+formatters:
+  enable:
     - gofmt
     - goimports
-
-linters-settings:
-  goimports:
-    local-prefixes: github.com/olokotoh/olaitan
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/olokotoh/olaitan
 
 run:
   timeout: 3m
