@@ -1,0 +1,130 @@
+{{/*
+Aggregator — Rings 2-4 cooperative goroutines in one process. Singleton
+(replicas: 1, strategy: Recreate) for correctness, NOT convenience.
+
+Ring 2 checkpoints NATS JetStream stream position to Redis key
+`checkpoint:correlator:stream_seq`. A RollingUpdate briefly runs two
+pods both consuming the stream + both writing the same checkpoint key →
+split-brain: events processed twice, recovery breaks.
+
+Recreate kills the old pod and waits for termination before starting
+the new one — at-most-one-aggregator semantics preserved during a Helm
+upgrade. Horizontal scaling lands with leader election (Story 8.x /
+FR39); do NOT raise replicas until then. [See Dev Notes § "The
+aggregator-replicas-1 constraint"]
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "olaitan.fullname" . }}-aggregator
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: aggregator
+spec:
+  replicas: {{ .Values.aggregator.replicas }}
+  strategy:
+    # Recreate (not RollingUpdate) — see header comment. This is load-bearing
+    # for Ring 2 correctness. Changing it to RollingUpdate corrupts the
+    # correlator checkpoint under a busy upgrade.
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "olaitan.aggregator.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "olaitan.aggregator.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "olaitan.aggregator.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.aggregator.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.aggregator.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: aggregator
+          image: {{ include "olaitan.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/olaitan"]
+          args:
+            - aggregator
+            - --config=/etc/olaitan/olaitan.yaml
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: NATS_URL
+              value: {{ .Values.endpoints.nats | quote }}
+            - name: REDIS_ADDR
+              value: {{ .Values.endpoints.redis | quote }}
+            - name: FALCO_SOCKET
+              value: {{ .Values.endpoints.falco | quote }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: {{ .Values.probes.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.periodSeconds }}
+            failureThreshold: {{ .Values.probes.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: {{ .Values.probes.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.periodSeconds }}
+            failureThreshold: {{ .Values.probes.failureThreshold }}
+          resources:
+            {{- toYaml .Values.aggregator.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/olaitan
+              readOnly: true
+            - name: rules
+              mountPath: /etc/olaitan/rules
+              readOnly: true
+            - name: secrets
+              mountPath: /etc/olaitan/secrets
+              readOnly: true
+            # DFIR reports — RW mount, aggregator-only. The collector
+            # pod spec omits this volume entirely.
+            - name: reports
+              mountPath: /var/lib/olaitan/reports
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "olaitan.fullname" . }}-config
+        - name: rules
+          configMap:
+            name: {{ include "olaitan.fullname" . }}-rules
+        - name: secrets
+          secret:
+            secretName: {{ include "olaitan.fullname" . }}-secrets
+            defaultMode: 0400
+        - name: reports
+          persistentVolumeClaim:
+            claimName: {{ include "olaitan.fullname" . }}-reports
+        - name: tmp
+          emptyDir: {}
