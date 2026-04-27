@@ -1,0 +1,32 @@
+{{/*
+Audit-webhook receiver Service. ClusterIP-only — the Kubernetes API
+server reaches this via a ValidatingWebhookConfiguration (template
+sibling), so external exposure is unnecessary and undesirable.
+
+Story 1.1 ships this Service template with the gate default-off
+(auditWebhook.enabled: false) so `helm template` rendering remains
+predictable. Story 1.7 (Kubernetes audit webhook receiver) will wire
+the matching containerPort onto the aggregator Deployment, flip the
+default gate on, and add the serving-cert wiring. Until then, this
+Service renders to nothing under default values.
+[Source: architecture.md:355-360 — Helm chart structure]
+*/}}
+{{- if .Values.auditWebhook.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "olaitan.fullname" . }}-audit-webhook
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: audit-webhook
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "olaitan.aggregator.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: webhook
+      protocol: TCP
+      port: {{ .Values.auditWebhook.servicePort }}
+      targetPort: {{ .Values.auditWebhook.containerPort }}
+{{- end }}

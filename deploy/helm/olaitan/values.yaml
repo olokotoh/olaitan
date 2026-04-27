@@ -136,6 +136,43 @@ probes:
   periodSeconds: 10
   failureThreshold: 3
 
+# --- NetworkPolicy ----------------------------------------------------
+# Namespace-scoped baseline isolation policy. Default-on because the
+# architecture treats namespace isolation as a baseline control rather
+# than an opt-in. Operators on flat networks (or operating in clusters
+# where the CNI does not enforce NetworkPolicy) can disable with
+# `--set networkPolicy.enabled=false`. [Source: architecture.md:355-360]
+networkPolicy:
+  enabled: true
+  # Extra egress rules merged into the policy as-is. Operators populate
+  # this with the LLM provider endpoints they actually use; values are
+  # raw NetworkPolicyEgressRule objects so the full schema is available
+  # without us having to mirror it in chart-level keys. Production
+  # overlays (Story 6.6) will ship a populated default for the common
+  # providers.
+  extraEgress: []
+
+# --- Audit webhook ----------------------------------------------------
+# Stub configuration consumed by service.yaml,
+# validatingwebhookconfiguration.yaml, and (in Story 1.7) the
+# aggregator container port. Default-off because Story 1.1 (this story)
+# only ships the chart-structure scaffold; Story 1.7 wires the
+# receiver and flips the default. The keys here are stable so Story
+# 1.7 will only need to flip `enabled` and add a caBundle.
+# [Source: architecture.md:355-360, epics.md Story 1.7]
+auditWebhook:
+  enabled: false
+  # Service port the API server dials. 8443 is the convention for
+  # admission webhooks in the K8s ecosystem.
+  servicePort: 8443
+  # Container port the aggregator listens on (added by Story 1.7).
+  containerPort: 8443
+  # PEM-encoded CA bundle injected into the
+  # ValidatingWebhookConfiguration. Empty during the stub phase; Story
+  # 1.7 wires this either from cert-manager or via an operator-supplied
+  # secret.
+  caBundle: ""
+
 # --- Subchart overrides ------------------------------------------------
 # Only opinions we impose on the downstream charts live here — upstream
 # defaults are otherwise preserved. To see every available knob, consult

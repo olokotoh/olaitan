@@ -1,0 +1,44 @@
+{{/*
+ValidatingWebhookConfiguration STUB. Default-off (auditWebhook.enabled:
+false) so this story (1.1) ships the template-presence the architecture
+requires without committing the production wiring.
+
+Story 1.7 (Kubernetes audit webhook receiver) is the owner of the real
+configuration: Service reference, caBundle, failurePolicy, namespace
+selectors, sideEffects declaration, the matchPolicy, and the rules
+list. Story 1.7 will replace this stub and add a values.yaml block
+that captures every operator-tunable knob.
+
+Until that lands, the only thing this template asserts is that the
+chart structure includes the resource at the path the architecture
+mandates (architecture.md:355-360). Render-on-default remains empty.
+*/}}
+{{- if .Values.auditWebhook.enabled -}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: {{ include "olaitan.fullname" . }}-audit
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+webhooks:
+  - name: audit.olaitan.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Ignore
+    timeoutSeconds: 5
+    clientConfig:
+      service:
+        name: {{ include "olaitan.fullname" . }}-audit-webhook
+        namespace: {{ .Release.Namespace }}
+        port: {{ .Values.auditWebhook.servicePort }}
+        path: /audit
+      {{- with .Values.auditWebhook.caBundle }}
+      caBundle: {{ . | quote }}
+      {{- end }}
+    rules:
+      - operations: ["CREATE", "UPDATE", "DELETE"]
+        apiGroups: ["*"]
+        apiVersions: ["*"]
+        resources: ["*"]
+        scope: "*"
+{{- end }}

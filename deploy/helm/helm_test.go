@@ -133,6 +133,7 @@ func TestDefaultPermutation(t *testing.T) {
 		"ClusterRole":            1,
 		"ClusterRoleBinding":     1,
 		"PersistentVolumeClaim":  1,
+		"NetworkPolicy":          1,
 	}
 	gotOurs := make(map[string]int)
 	for _, m := range ms {
@@ -357,6 +358,79 @@ func TestAggregatorIsSingletonRecreate(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("aggregator Deployment not rendered")
+	}
+}
+
+// TestNetworkPolicyDefault asserts the namespace-isolation NetworkPolicy
+// renders by default and disappears when explicitly disabled. This is the
+// baseline-control gate Story 1.1 added to the chart structure
+// (architecture.md:355-360).
+func TestNetworkPolicyDefault(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"falco.enabled=false", "nats.enabled=false", "redis.enabled=false",
+	})
+	ms := parseManifests(t, rendered)
+
+	nps := findByKind(ms, "NetworkPolicy")
+	found := false
+	for _, m := range nps {
+		if strings.HasPrefix(m.Metadata.Name, "olaitan") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("NetworkPolicy: olaitan-* not rendered under default values")
+	}
+
+	disabled := helmTemplate(t, []string{
+		"falco.enabled=false", "nats.enabled=false", "redis.enabled=false",
+		"networkPolicy.enabled=false",
+	})
+	disabledMs := parseManifests(t, disabled)
+	for _, m := range findByKind(disabledMs, "NetworkPolicy") {
+		if strings.HasPrefix(m.Metadata.Name, "olaitan") {
+			t.Errorf("NetworkPolicy: olaitan-* still rendered when networkPolicy.enabled=false (got %s)", m.Metadata.Name)
+		}
+	}
+}
+
+// TestAuditWebhookGate asserts the audit-webhook Service and
+// ValidatingWebhookConfiguration are absent by default (Story 1.1 ships
+// them as scaffold) and present when the gate is flipped (Story 1.7
+// will flip the default). Both kinds must come and go together.
+func TestAuditWebhookGate(t *testing.T) {
+	defaultRender := helmTemplate(t, []string{
+		"falco.enabled=false", "nats.enabled=false", "redis.enabled=false",
+	})
+	defaultMs := parseManifests(t, defaultRender)
+	for _, m := range findByKind(defaultMs, "Service") {
+		if strings.Contains(m.Metadata.Name, "audit-webhook") {
+			t.Errorf("audit-webhook Service rendered with auditWebhook.enabled=false (got %s)", m.Metadata.Name)
+		}
+	}
+	if len(findByKind(defaultMs, "ValidatingWebhookConfiguration")) != 0 {
+		t.Errorf("ValidatingWebhookConfiguration rendered with auditWebhook.enabled=false")
+	}
+
+	enabledRender := helmTemplate(t, []string{
+		"falco.enabled=false", "nats.enabled=false", "redis.enabled=false",
+		"auditWebhook.enabled=true",
+	})
+	enabledMs := parseManifests(t, enabledRender)
+
+	svcFound := false
+	for _, m := range findByKind(enabledMs, "Service") {
+		if strings.Contains(m.Metadata.Name, "audit-webhook") {
+			svcFound = true
+		}
+	}
+	if !svcFound {
+		t.Errorf("audit-webhook Service not rendered with auditWebhook.enabled=true")
+	}
+
+	if len(findByKind(enabledMs, "ValidatingWebhookConfiguration")) != 1 {
+		t.Errorf("ValidatingWebhookConfiguration: got %d, want 1 with auditWebhook.enabled=true",
+			len(findByKind(enabledMs, "ValidatingWebhookConfiguration")))
 	}
 }
 
