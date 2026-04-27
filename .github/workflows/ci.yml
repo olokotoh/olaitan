@@ -7,7 +7,9 @@ on:
     branches: [main]
 
 jobs:
-  build:
+  # Go build/test/lint — the original pipeline, renamed from `build` to
+  # `go` so the sibling `helm` job reads naturally alongside it.
+  go:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,3 +29,80 @@ jobs:
 
       - name: Lint
         run: golangci-lint run
+
+  # Helm chart validation — lint + template + kubeconform schema check
+  # + tagged Go test harness. Template-only: no live cluster. Story 7.1
+  # owns the full-stack cluster-based integration test.
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      # Cache the downloaded subcharts so re-runs skip the OCI pull from
+      # registry-1.docker.io (Bitnami Redis is the largest). The cache
+      # key MUST include Chart.lock (committed to the repo); otherwise a
+      # re-tagged subchart at the same SemVer would resolve from cache
+      # to the old digest, defeating reproducibility.
+      - name: Cache helm dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/helm
+            deploy/helm/olaitan/charts
+          key: helm-deps-${{ hashFiles('deploy/helm/olaitan/Chart.yaml', 'deploy/helm/olaitan/Chart.lock') }}
+
+      - name: Install kubeconform
+        run: go install github.com/yannh/kubeconform/cmd/kubeconform@v0.6.7
+
+      - name: Prepare chart
+        run: make helm-prepare
+
+      - name: Fetch subchart dependencies
+        run: |
+          helm repo add falcosecurity https://falcosecurity.github.io/charts
+          helm repo add nats https://nats-io.github.io/k8s/helm/charts/
+          helm repo update
+          helm dependency update deploy/helm/olaitan
+
+      - name: helm lint
+        run: helm lint deploy/helm/olaitan
+
+      - name: helm template + kubeconform
+        run: |
+          helm template deploy/helm/olaitan --generate-name \
+              --set secrets.redisPassword=ci-fake-password \
+            | kubeconform -strict -summary \
+                -kubernetes-version 1.29.0 \
+                -schema-location default \
+                -skip CustomResourceDefinition
+
+      - name: Helm Go test suite
+        run: go test ./deploy/helm/... -tags=helm -count=1 -v
+
+  # Docker image smoke test — verifies the Dockerfile + go.mod toolchain
+  # parity (AC10) by building the image and running `version`.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: make docker-build
+
+      - name: Smoke-run image
+        run: |
+          tag=$(make -s version-tag)
+          out=$(docker run --rm olaitan:"$tag" version)
+          echo "$out"
+          case "$out" in
+            olaitan\ *) ;;
+            *) echo "smoke: unexpected version output: $out" >&2; exit 1 ;;
+          esac

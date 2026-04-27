@@ -1,0 +1,109 @@
+{{/*
+Namespace-scoped NetworkPolicy for the Olaitan release. Default-on
+(networkPolicy.enabled: true) because architecture treats namespace
+isolation as a baseline security control, not an opt-in.
+
+Ingress allowlist:
+  - kube-system namespace, on the audit-webhook port. Only matters once
+    Story 1.7 enables auditWebhook.enabled — until then no inbound
+    traffic to the aggregator is required by the system, and this rule
+    is harmless.
+  - The release's own namespace, for intra-namespace pod-to-pod traffic
+    (collector to aggregator over NATS, aggregator to Redis).
+
+Egress allowlist:
+  - DNS to kube-dns (port 53 UDP and TCP). Required to resolve the NATS
+    and Redis subchart Service DNS names.
+  - Intra-namespace pods (the NATS, Redis, and Falco subchart pods).
+  - Operator-supplied extra egress CIDRs and ports for LLM provider
+    endpoints. Empty by default; production overlays
+    (Story 6.6 — values-production.yaml) populate these for
+    api.anthropic.com, api.openai.com, and any private Ollama endpoint.
+
+Operators on flat networks who do not want the policy can disable it
+with `--set networkPolicy.enabled=false`. Disabling is the operator's
+explicit choice and gets logged in `helm get values`.
+[Source: architecture.md:355-360 — Helm chart structure]
+*/}}
+{{- if .Values.networkPolicy.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "olaitan.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "olaitan.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    {{- if .Values.auditWebhook.enabled }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: TCP
+          port: {{ .Values.auditWebhook.containerPort }}
+    {{- end }}
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "olaitan.selectorLabels" . | nindent 14 }}
+    {{- /*
+    Allow kubelet probe traffic from node IPs. Required when the CNI
+    enforces NetworkPolicy on host-network traffic (Calico eBPF
+    dataplane); harmless on default-iptables Calico where kubelet
+    bypasses policy. Off by default — operator opts in by setting
+    networkPolicy.nodeCIDR.
+    */}}
+    {{- with .Values.networkPolicy.nodeCIDR }}
+    - from:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        - protocol: TCP
+          port: 8080
+    {{- end }}
+  egress:
+    {{- /* DNS — required for service-name resolution. */}}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- /*
+    Kubernetes API server. The aggregator's pod-patch path (Ring 4
+    response) and ServiceAccount token review traffic both terminate at
+    the apiserver virtual IP. Default 10.96.0.1/32 matches the kubeadm
+    1.29 stock service-CIDR; override `networkPolicy.apiServerCIDR` for
+    clusters with a non-default service-CIDR.
+    */}}
+    {{- with .Values.networkPolicy.apiServerCIDR }}
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+    {{- end }}
+    {{- /* Intra-namespace traffic to NATS, Redis, Falco subcharts. */}}
+    - to:
+        - podSelector: {}
+    {{- with .Values.networkPolicy.extraEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

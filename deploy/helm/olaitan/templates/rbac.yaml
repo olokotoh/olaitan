@@ -1,0 +1,117 @@
+{{/*
+RBAC model (ring-scoped, no wildcards, no cluster-admin — NFR13).
+Source of truth: architecture.md#K8s-API-Boundaries-(RBAC) lines 949-957.
+
+  Collector (Ring 1): pod/event GET/LIST/WATCH inside its install
+  namespace only. Narrower than the aggregator because the collector
+  only enriches events for pods it already sees via the kubelet — an
+  auditor reviewing the chart should see that the collector CANNOT
+  enumerate pods cluster-wide.
+
+  Aggregator (Rings 2-4): namespaced resources, cluster-wide reach.
+    - networkpolicies (networking.k8s.io): CREATE/UPDATE/DELETE — must
+      write into every pod's namespace, hence ClusterRole.
+    - pods: PATCH — annotation updates for FSM state transitions
+      (Ring 4a). Also cluster-wide.
+    - pods, events: GET/LIST — pod metadata lookup for enrichment.
+
+Do not shrink either role to a Role+RoleBinding pair — the aggregator
+genuinely needs cluster-wide write on NetworkPolicy to enforce responses
+in operator workload namespaces. See Dev Notes § "RBAC: Role vs ClusterRole split".
+*/}}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "olaitan.collector.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: collector
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "olaitan.aggregator.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: aggregator
+---
+# Collector: namespace-scoped pod/event reads. The collector enriches
+# events for pods it sees on its own node; it MUST NOT be able to
+# enumerate pods in unrelated namespaces.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "olaitan.collector.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: collector
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "olaitan.collector.serviceAccountName" . }}-binding
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: collector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "olaitan.collector.serviceAccountName" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "olaitan.collector.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# Aggregator: cluster-wide. NetworkPolicy writes and pod annotation
+# patches must reach every workload namespace; a Role would constrain
+# us to a single namespace, which does not match the operator model.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "olaitan.aggregator.serviceAccountName" . }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: aggregator
+rules:
+  # Ring 4: response engine writes NetworkPolicy into every pod's ns.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "update", "delete"]
+  # Ring 4a: annotation-based FSM state transitions — patch only, no
+  # delete, no exec. The agent flips pod labels/annotations to mark FSM
+  # state; it never kills pods directly (that is kubelet's job via the
+  # taint Ring 4 puts on the node/policy).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["patch"]
+  # Enrichment reads for correlator + analyst context assembly. GET/LIST
+  # only — no WATCH (events flow through Ring 1's NATS publish path, not
+  # direct watchers on the aggregator).
+  - apiGroups: [""]
+    resources: ["pods", "events"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "olaitan.aggregator.serviceAccountName" . }}-binding
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: aggregator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "olaitan.aggregator.serviceAccountName" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "olaitan.aggregator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}

@@ -27,6 +27,23 @@ make demo
 make demo-compare
 ```
 
+## Deploy
+
+Olaitan ships as a Helm chart under `deploy/helm/olaitan/` with Falco,
+NATS JetStream, and Redis declared as conditional subchart dependencies.
+
+- **[deploy/helm/README.md](deploy/helm/README.md)** — Operator guide: prerequisites, install, values, uninstall.
+- **[deploy/demo/setup.sh](deploy/demo/setup.sh)** — Cluster bootstrap helper (kubeadm + Calico preflight, Helm repo + dependency-update commands).
+
+```bash
+# One-shot bootstrap (print preflight + add helm repos + fetch subcharts):
+./deploy/demo/setup.sh --apply
+
+# Install:
+make helm-prepare
+helm install olaitan ./deploy/helm/olaitan
+```
+
 ## Project Structure
 
 ```

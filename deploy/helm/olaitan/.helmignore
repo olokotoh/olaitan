@@ -1,0 +1,21 @@
+# Patterns to ignore when packaging the chart. Do NOT add `charts/` or
+# `*.tgz` here — those paths are how Helm carries subchart dependencies,
+# and excluding them breaks `helm template`/`helm install` with a
+# "missing in charts/ directory" error that only surfaces at install
+# time. Repo-level `.gitignore` already excludes the vendor artefacts
+# from git; `.helmignore` is only for `helm package` hygiene.
+.DS_Store
+.git/
+.gitignore
+.bzr/
+.bzrignore
+.hg/
+.hgignore
+.svn/
+*.tmproj
+*.bak
+*.swp
+*~
+.project
+.idea/
+.vscode/

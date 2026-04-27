@@ -1,0 +1,88 @@
+{{/*
+ValidatingWebhookConfiguration STUB. Default-off (auditWebhook.enabled:
+false) so this story (1.1) ships the template-presence the architecture
+requires without committing the production wiring.
+
+Story 1.7 (Kubernetes audit webhook receiver) is the owner of the real
+configuration: Service reference, caBundle, failurePolicy, namespace
+selectors, sideEffects declaration, the matchPolicy, and the rules
+list. Story 1.7 will replace this stub and add a values.yaml block
+that captures every operator-tunable knob.
+
+Until that lands, the only thing this template asserts is that the
+chart structure includes the resource at the path the architecture
+mandates (architecture.md:355-360). Render-on-default remains empty.
+*/}}
+{{- if .Values.auditWebhook.enabled -}}
+{{- /*
+caBundle is mandatory when the webhook is enabled — the apiserver dials
+the receiver Service over TLS and a missing caBundle silently fails
+the handshake under failurePolicy: Ignore (no enforcement at all). Fail
+the chart render rather than installing a broken admission gate.
+
+The value must be base64-encoded DER per the K8s schema. Operators
+supplying a PEM file via `--set-file` must base64-encode it first
+(`base64 -w0 ca.pem`) — the chart does NOT auto-encode because Helm's
+`b64enc` would double-encode an already-encoded value.
+*/ -}}
+{{- $caBundle := required "auditWebhook.caBundle is required when auditWebhook.enabled=true (base64-encoded DER; `base64 -w0 ca.pem`)" .Values.auditWebhook.caBundle -}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: {{ include "olaitan.fullname" . }}-audit
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+webhooks:
+  - name: audit.olaitan.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Ignore
+    timeoutSeconds: 5
+    {{- /*
+    Exclude the install namespace and core control-plane namespaces so
+    chart-managed pod admission, kube-system controllers, and the
+    receiver's own bootstrap don't deadlock on this webhook.
+    */}}
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - {{ .Release.Namespace }}
+            - kube-system
+            - kube-public
+            - kube-node-lease
+    clientConfig:
+      service:
+        name: {{ include "olaitan.fullname" . }}-audit-webhook
+        namespace: {{ .Release.Namespace }}
+        port: {{ .Values.auditWebhook.servicePort }}
+        path: /audit
+      caBundle: {{ $caBundle | quote }}
+    {{- /*
+    Scope rules to the workload-relevant resources Story 1.7 actually
+    needs to audit. Story 1.7 may broaden this list — but starting
+    narrow avoids the chicken-and-egg problem on first install.
+    */}}
+    rules:
+      - operations: ["CREATE", "UPDATE", "DELETE"]
+        apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods", "services", "configmaps", "secrets"]
+        scope: "Namespaced"
+      - operations: ["CREATE", "UPDATE", "DELETE"]
+        apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        resources: ["deployments", "daemonsets", "statefulsets"]
+        scope: "Namespaced"
+      - operations: ["CREATE", "UPDATE", "DELETE"]
+        apiGroups: ["networking.k8s.io"]
+        apiVersions: ["v1"]
+        resources: ["networkpolicies"]
+        scope: "Namespaced"
+      - operations: ["CREATE", "UPDATE", "DELETE"]
+        apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        resources: ["rolebindings", "clusterrolebindings"]
+        scope: "*"
+{{- end }}

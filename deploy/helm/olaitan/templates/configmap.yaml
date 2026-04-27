@@ -1,0 +1,42 @@
+{{/*
+Two ConfigMaps:
+
+  olaitan-config — the central olaitan.yaml. Copied into the chart at
+    build time by `make helm-prepare` (see deploy/helm/README.md) so the
+    chart remains portable: an operator with only the packaged chart
+    (no repo checkout) can still install without the source tree.
+
+  olaitan-rules — the detection rules bundle. Empty in Story 1.7; Story
+    3.4 populates it. We ship the mount surface now so the Deployment's
+    volumeMount is stable across releases — avoiding a "no such path"
+    pod restart when rules first land.
+
+ConfigMap mount pattern: whole-directory, NOT subPath. subPath breaks
+kubelet's symlink-rotation atomic swap (it snapshots the file at pod-
+start and never updates), silently defeating the Story 1.6 hot-reload
+watcher. See Dev Notes § "The ConfigMap-atomic-swap + Story 1.6 contract".
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "olaitan.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+data:
+  olaitan.yaml: |-
+    {{- $cfg := required "files/olaitan.yaml is empty — run `make helm-prepare` to copy config/olaitan.yaml into the chart" (.Files.Get "files/olaitan.yaml") }}
+    {{- $cfg | nindent 4 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "olaitan.fullname" . }}-rules
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+# Empty for now — populated by Story 3.4 (detection rules engine). We
+# render `data: {}` explicitly: Kubernetes accepts both forms, but an
+# explicit empty map prevents `helm diff` from showing churn the first
+# time Story 3.4 lands a real entry.
+data: {}

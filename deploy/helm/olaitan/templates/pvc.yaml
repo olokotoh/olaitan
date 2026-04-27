@@ -1,0 +1,31 @@
+{{/*
+DFIR evidence + narrative reports volume (Epic 6). Mounted RW on the
+aggregator pod at /var/lib/olaitan/reports; collector has no write side.
+
+ReadWriteOnce is sufficient — MVP runs a single aggregator replica, so
+no cross-node sharing is needed. A horizontal-scale aggregator (FR39,
+Target tier) will revisit this choice together with leader election.
+[Source: architecture.md:732, 974]
+
+externalPvc=true skips the PVC creation and expects the operator to
+pre-create a claim named `<fullname>-reports` in the release namespace.
+The Deployment's volume reference is identical either way.
+*/}}
+{{- if not .Values.reports.externalPvc }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "olaitan.fullname" . }}-reports
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.reports.size | quote }}
+  {{- with .Values.reports.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+{{- end }}

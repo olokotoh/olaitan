@@ -1,0 +1,239 @@
+# Default values for the Olaitan chart. Override with `--set key=value`
+# or a custom values file (`helm install -f my-values.yaml`). See
+# deploy/helm/README.md for the operator-facing configuration guide.
+
+# --- Container image ---------------------------------------------------
+# Published image. ghcr.io is free for public repositories and the
+# project already uses the olokotoh org there. Tag defaults to
+# .Chart.AppVersion so a `helm install` without overrides pins to a
+# chart-coherent release.
+image:
+  repository: ghcr.io/olokotoh/olaitan
+  # Empty = fall back to .Chart.AppVersion in _helpers.tpl's
+  # "olaitan.image" helper. Set explicitly (e.g. a commit SHA) to pin a
+  # pre-release image.
+  tag: ""
+  # IfNotPresent avoids gratuitous registry traffic on pod restart; use
+  # Always only for mutable dev tags (not recommended in production).
+  pullPolicy: IfNotPresent
+
+# Private-registry pull credentials. Empty by default — ghcr.io/olokotoh
+# is public. Operators add their own imagePullSecret names here when
+# retagging Olaitan into a private registry.
+imagePullSecrets: []
+
+# Optional overrides to the chart name / release fullname. Rarely used;
+# the defaults (Chart.Name, Release.Name-Chart.Name) are sufficient for
+# typical single-release installs.
+nameOverride: ""
+fullnameOverride: ""
+
+# --- Collector (Ring 1 DaemonSet) --------------------------------------
+# One pod per node; consumes Falco gRPC + Kubernetes audit + cgroup
+# signals, forwards enriched events to the aggregator over NATS.
+collector:
+  # Resource envelope sized for the collector's job: decode+enrich+publish
+  # on a hot path. 256Mi limit is headroom over observed ~80-120Mi usage
+  # on the demo cluster (Falco event rate ~200/s).
+  resources:
+    limits:
+      cpu: 500m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  # Control-plane nodes have a NoSchedule taint by default (kubeadm
+  # convention). When `true`, collector tolerates the taint and runs on
+  # master nodes too — useful for single-node dev clusters. Off by
+  # default: production clusters keep control planes isolated.
+  runOnControlPlane: false
+  # Extra node-selection constraints beyond the DaemonSet default
+  # (which already scopes to every schedulable node). Merge, don't
+  # replace, in the template.
+  nodeSelector: {}
+  tolerations: []
+
+# --- Aggregator (Rings 2-4 Deployment) ---------------------------------
+# Singleton in MVP; rings are cooperative goroutines inside one process.
+# See Dev Notes § "The aggregator-replicas-1 constraint" for why this
+# must stay at 1 until Story 8.1 introduces leader election.
+aggregator:
+  # HARD CONSTRAINT. Do NOT raise above 1 until leader election lands.
+  # Two aggregator pods would split-brain the NATS JetStream checkpoint
+  # (Redis key checkpoint:correlator:stream_seq) — events get processed
+  # twice, recovery breaks.
+  replicas: 1
+  # 256Mi request / 512Mi limit. NFR5 targets "< 200 MB steady state",
+  # but 256Mi leaves headroom for fsnotify watch buffers (1.6) and
+  # future LLM context assembly (Epic 4). The 512Mi limit prevents OOM
+  # on a long-running pod as rule sets grow.
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 512Mi
+    requests:
+      cpu: 200m
+      memory: 256Mi
+  nodeSelector: {}
+  tolerations: []
+
+# --- Service endpoints -------------------------------------------------
+# Where Olaitan dials its dependencies. Empty by default — the templates
+# fall back to release-name-derived subchart Service names via the
+# `olaitan.endpoints.nats` / `olaitan.endpoints.redis` helpers
+# (`<release>-nats`, `<release>-redis-master`). Set explicitly to point
+# at externally-managed infra (e.g. when `<name>.enabled=false`).
+endpoints:
+  # Empty → "nats://<release>-nats:4222" (subchart's headless Service).
+  nats: ""
+  # Empty → "<release>-redis-master:6379" (subchart's primary Service).
+  redis: ""
+  # Falco gRPC socket. Mounted via hostPath from the Falco DaemonSet;
+  # local-unix-socket is lower-latency than the TCP/gRPC mode.
+  # [Source: architecture.md:130]
+  falco: "unix:///run/falco/falco.sock"
+
+# --- Operator-provided secrets ----------------------------------------
+# All three default to "" so the Secret always renders (downstream pods
+# mount it unconditionally). Operators supply real values via
+# `--set-file` or an external-secrets-operator reconciliation. Downstream
+# ring code (Epic 2+) validates non-empty before dialling; the chart is
+# not responsible for secret lifecycle. [Source: Dev Notes § "Secrets"]
+secrets:
+  # Redis AUTH password (NFR8). Empty at install time; Story 2.x wiring
+  # refuses to start the Redis client if empty.
+  redisPassword: ""
+  # NATS client credentials (for cluster-mode NATS with auth). Empty by
+  # default; demo cluster runs NATS without auth.
+  natsCreds: ""
+  # LLM provider API key (OpenAI/Anthropic/…). Empty by default; Epic 4
+  # analyst ring refuses to start when analyst.provider=api with empty.
+  llmApiKey: ""
+
+# --- DFIR report PVC ---------------------------------------------------
+# Read-write volume for JSON evidence files + markdown narratives (Epic
+# 6). Mounted only on the aggregator pod — collector has no write side.
+reports:
+  # "" = use the cluster's default StorageClass. Override on clusters
+  # where the operator wants a specific class (e.g., `standard-rwo`).
+  storageClass: ""
+  # 1Gi covers a demo-scale incident volume; operators bump this up for
+  # long-running clusters with high detection rates.
+  size: 1Gi
+  # Set true to skip PVC creation and bind to an externally-managed
+  # claim named `<fullname>-reports` in the release namespace. The
+  # aggregator Deployment always references the same PVC name.
+  externalPvc: false
+
+# --- Probe timing ------------------------------------------------------
+# livenessProbe + readinessProbe parameters, shared by DaemonSet and
+# Deployment. initialDelaySeconds: 3 — config load + watcher start +
+# health server bind take <1s on a warm image; 3s absorbs cold-start
+# variance without masking a real startup failure.
+probes:
+  initialDelaySeconds: 3
+  periodSeconds: 10
+  failureThreshold: 3
+
+# --- NetworkPolicy ----------------------------------------------------
+# Namespace-scoped baseline isolation policy. Default-on because the
+# architecture treats namespace isolation as a baseline control rather
+# than an opt-in. Operators on flat networks (or operating in clusters
+# where the CNI does not enforce NetworkPolicy) can disable with
+# `--set networkPolicy.enabled=false`. [Source: architecture.md:355-360]
+networkPolicy:
+  enabled: true
+  # CIDR block of node IPs (host network). Required for kubelet to reach
+  # pod liveness/readiness probes when the CNI enforces NetworkPolicy on
+  # host-network traffic — Calico in eBPF dataplane is the load-bearing
+  # case. Default-iptables Calico bypasses policy on host-network traffic
+  # so the policy works without this set. Empty = no kubelet allow-rule.
+  # Operators on eBPF dataplane MUST set this to the cluster's node CIDR
+  # (e.g. "10.0.0.0/16"); otherwise pods never reach Ready.
+  nodeCIDR: ""
+  # CIDR for the Kubernetes API server virtual IP. Default 10.96.0.1/32
+  # is the kubeadm 1.29 stock service-CIDR ClusterIP for the kubernetes
+  # Service. Override on clusters with a non-default service-CIDR. The
+  # aggregator's pod-patch path needs egress here.
+  apiServerCIDR: "10.96.0.1/32"
+  # Extra egress rules merged into the policy as-is. Operators populate
+  # this with the LLM provider endpoints they actually use; values are
+  # raw NetworkPolicyEgressRule objects so the full schema is available
+  # without us having to mirror it in chart-level keys. Production
+  # overlays (Story 6.6) will ship a populated default for the common
+  # providers.
+  extraEgress: []
+
+# --- Audit webhook ----------------------------------------------------
+# Stub configuration consumed by service.yaml,
+# validatingwebhookconfiguration.yaml, and (in Story 1.7) the
+# aggregator container port. Default-off because Story 1.1 (this story)
+# only ships the chart-structure scaffold; Story 1.7 wires the
+# receiver and flips the default. The keys here are stable so Story
+# 1.7 will only need to flip `enabled` and add a caBundle.
+# [Source: architecture.md:355-360, epics.md Story 1.7]
+auditWebhook:
+  enabled: false
+  # Service port the API server dials. 8443 is the convention for
+  # admission webhooks in the K8s ecosystem.
+  servicePort: 8443
+  # Container port the aggregator listens on (added by Story 1.7).
+  containerPort: 8443
+  # PEM-encoded CA bundle injected into the
+  # ValidatingWebhookConfiguration. Empty during the stub phase; Story
+  # 1.7 wires this either from cert-manager or via an operator-supplied
+  # secret.
+  caBundle: ""
+
+# --- Subchart overrides ------------------------------------------------
+# Only opinions we impose on the downstream charts live here — upstream
+# defaults are otherwise preserved. To see every available knob, consult
+# the subchart's own values.yaml:
+#   - https://artifacthub.io/packages/helm/falcosecurity/falco
+#   - https://artifacthub.io/packages/helm/nats/nats
+#   - https://artifacthub.io/packages/helm/bitnami/redis
+
+# Falco — host-level signal source (Ring 1). eBPF driver is the modern
+# default; the legacy kernel module and `modern_ebpf` are alternatives
+# operators can override. gRPC output is required: that is how the
+# collector reads Falco events. [Source: architecture.md:130-131]
+falco:
+  enabled: true
+  driver:
+    kind: ebpf
+  # Falco's gRPC server — both `grpc.enabled` and `grpc_output.enabled`
+  # must be on for the collector to subscribe.
+  falco:
+    grpc:
+      enabled: true
+      bind_address: "unix:///run/falco/falco.sock"
+    grpc_output:
+      enabled: true
+
+# NATS with JetStream persistence — inter-ring event bus. JetStream
+# provides the replay/checkpoint primitive that Story 2.7 + Story 3.1
+# lean on for exactly-once recovery semantics. [Source: architecture.md:132-133]
+nats:
+  enabled: true
+  config:
+    jetstream:
+      enabled: true
+
+# Redis — state store (per-workload baselines, FSM state, checkpoints).
+# Standalone architecture is enough for the single-aggregator MVP;
+# Sentinel/Cluster are deferred to the Target-tier HA story. AUTH is
+# mandatory (NFR8). The subchart reads its password from the parent
+# chart's `<fullname>-secrets` Secret (key `redis-password`) so both
+# sides agree on a single source of truth — the operator-supplied
+# `secrets.redisPassword`. NOTE: `existingSecret` is hardcoded for the
+# canonical `helm install olaitan ...` release-name pattern; for any
+# other release name, also override:
+#   --set redis.auth.existingSecret=<release>-olaitan-secrets
+# [Source: architecture.md:328, NFR8]
+redis:
+  enabled: true
+  architecture: standalone
+  auth:
+    enabled: true
+    existingSecret: olaitan-secrets
+    existingSecretPasswordKey: redis-password

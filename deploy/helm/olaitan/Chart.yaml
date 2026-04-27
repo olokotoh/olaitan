@@ -1,0 +1,38 @@
+apiVersion: v2
+name: olaitan
+description: Olaitan — LLM-powered autonomous K8s security agent
+type: application
+
+# Chart version: bumped on every chart-schema change. Independent of the
+# application (binary) version — appVersion tracks the Olaitan binary.
+version: 0.1.0
+# Tracks cmd/olaitan main.version ldflag default. When the Go binary's
+# baseline version moves, bump this and the image tag in lockstep.
+appVersion: "0.1.0"
+
+# Olaitan uses networking.k8s.io/v1 NetworkPolicy (GA since 1.7) and
+# projected-volume semantics that matured in 1.20+. 1.29 is the floor
+# for current LTS-tier clusters per architecture.md:118. Upper bound
+# < 2.0.0 guards against silent install on a future K8s major where
+# deprecated APIs the chart depends on may have been removed.
+kubeVersion: ">=1.29.0 < 2.0.0"
+
+# All three subcharts ship the infra Olaitan depends on: Falco (Ring 1
+# signal source), NATS JetStream (inter-ring bus), Redis (state store).
+# Operators with existing infra disable each via --set <name>.enabled=false
+# and point values.endpoints.* at their own services (see Dev Notes).
+# Every version is pinned exactly — no caret ranges — so a rebuild with
+# the same Chart.yaml produces the same manifests (NFR13, reproducibility).
+dependencies:
+  - name: falco
+    version: "8.0.2"
+    repository: https://falcosecurity.github.io/charts
+    condition: falco.enabled
+  - name: nats
+    version: "2.12.6"
+    repository: https://nats-io.github.io/k8s/helm/charts/
+    condition: nats.enabled
+  - name: redis
+    version: "25.3.11"
+    repository: oci://registry-1.docker.io/bitnamicharts
+    condition: redis.enabled
