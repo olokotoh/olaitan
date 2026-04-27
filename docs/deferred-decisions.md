@@ -63,3 +63,127 @@ implementation moves forward only.
   this story.
 - Story 5.1 (`eval/manifest.yaml`) will record the exact pinned
   version when the reproducibility envelope is built.
+
+---
+
+## ADR-2026-04-27-02: Single distroless base for the Olaitan binary
+
+**Status:** Accepted.
+
+**Date:** 2026-04-27.
+
+**Context.** Architecture.md tech-stack section originally prescribed
+two distroless container bases:
+`gcr.io/distroless/static:nonroot` for the controller and
+`gcr.io/distroless/base:nonroot` for the agent — with a justifying
+note that the agent "needs root for eBPF probe loading." This story
+1.1 / Code Review pass surfaced that the chart in fact references a
+single image (`{{ include "olaitan.image" . }}`) for both the
+DaemonSet (collector) and the Deployment (aggregator), and the
+Dockerfile uses `gcr.io/distroless/static-debian12:nonroot` for both.
+
+**Decision.** Honour the chart's single-image reality. Use
+`gcr.io/distroless/static-debian12:nonroot` as the canonical base.
+
+**Why this direction.**
+
+- The Olaitan agent does NOT load eBPF probes. That is the Falco
+  subchart's responsibility; Falco runs as its own DaemonSet with
+  its own container, its own privileged bits (only what eBPF needs),
+  and its own image lifecycle. The Olaitan collector binary only
+  consumes Falco events over the gRPC socket.
+- Without the eBPF justification, there is no remaining reason for
+  the agent to use `base` instead of `static`. Static is a smaller,
+  more constrained surface; it is what the Dockerfile already uses.
+- A single base simplifies CVE management: one upstream image to
+  track, one tag floor in the Helm chart, one signature to verify
+  in any future SLSA attestation flow.
+- `static-debian12` is the current stable alias for `static:nonroot`
+  on the upstream `gcr.io/distroless` registry. The two names point
+  at the same image; using the explicit `-debian12` suffix pins the
+  Debian release floor against future LTS rolls.
+
+**Alternatives considered and rejected.**
+
+- Split the chart into two image references (`controller.image`
+  and `agent.image`) so the literal architecture wording could be
+  honoured. Rejected because it adds operator-facing complexity for
+  no security or operational benefit, and would require duplicate
+  image build pipelines and CI smoke tests.
+- Switch the agent to `base:nonroot` to match the architecture
+  text. Rejected because the binary genuinely does not need anything
+  in `base` over `static`; it would be a regression.
+
+**Risk inherited.** None. The Dockerfile and Helm chart already
+agree on the single-base reality; this ADR records the architecture
+update that brings the doc into line with the running system.
+
+**Follow-ups.**
+
+- Update `_bmad-output/planning-artifacts/architecture.md` line 90
+  to reflect the single-base reality. Done in this story.
+- Story 7.x (forensic-evidence reproducibility) will pin the exact
+  image digest in `eval/manifest.yaml` when the evaluation envelope
+  is built.
+
+---
+
+## ADR-2026-04-27-03: Bitnami Redis OCI registry — accept current path
+
+**Status:** Accepted (with risk note).
+
+**Date:** 2026-04-27.
+
+**Context.** The chart depends on Bitnami's Redis chart pinned at
+version 25.3.11, served from `oci://registry-1.docker.io/bitnamicharts`.
+In mid-2025 Bitnami announced that the free-tier OCI chart catalogue
+was being relocated: legacy frozen versions moved to
+`bitnamilegacy/charts`, while the maintained catalogue moved to a
+paywalled registry. The pinned 25.3.11 is a frozen version on the
+legacy track.
+
+**Decision.** Keep the current `bitnamicharts` registry path for now
+and commit `Chart.lock` to the repo so the digest of 25.3.11 is
+pinned independently of the SemVer. If/when the upstream `bitnamicharts`
+path stops serving 25.3.11, the team will switch to
+`oci://registry-1.docker.io/bitnamilegacy` (or self-host the chart in
+the Olaitan registry) in a dedicated story.
+
+**Why this direction.**
+
+- Switching registries blindly without verifying that
+  `bitnamilegacy/redis:25.3.11` exists and resolves to the same
+  digest carries its own risk. The current path works today.
+- Committing `Chart.lock` (the pre-1.1 chart had it gitignored)
+  pins the digest of the resolved subchart so a Bitnami retag at
+  the same version no longer changes our manifest stream silently.
+  This is the load-bearing reproducibility fix.
+- If the upstream registry breaks, the failure mode is loud: CI's
+  `helm dependency update` step fails, blocking the merge. We will
+  see the breakage immediately.
+
+**Alternatives considered and rejected.**
+
+- Switch eagerly to `bitnamilegacy`. Rejected because we have not
+  verified the destination registry serves the exact pinned digest;
+  trading a working setup for an unverified one is a regression.
+- Self-host the Redis chart in `ghcr.io/olokotoh`. Rejected because
+  the chart artefact pipeline (sign + push) is itself non-trivial
+  work that does not belong in a brownfield merge story.
+
+**Risk inherited.**
+
+- The `bitnamicharts` registry may stop serving 25.3.11 at some
+  future date. Mitigated by `Chart.lock` (digest pin survives a tag
+  yank) and by CI catching a registry break loudly. Story 1.x or
+  Story 6.x can revisit if/when the breakage occurs.
+
+**Follow-ups.**
+
+- Commit `Chart.lock` to the repo (un-gitignore it). Done in this
+  story.
+- Update CI cache key to include `Chart.lock` so a re-tagged
+  subchart at the same SemVer cannot resolve from cache to the old
+  digest. Done in this story.
+- Add a low-priority deferred-work item to revisit the registry
+  choice after the Bitnami situation stabilises (or breaks).

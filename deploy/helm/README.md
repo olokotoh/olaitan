@@ -61,7 +61,7 @@ rationale. The most common overrides:
 | Use existing NATS | `--set nats.enabled=false --set endpoints.nats=nats://my-nats.svc:4222` |
 | Use existing Falco | `--set falco.enabled=false --set endpoints.falco=unix:///run/falco/falco.sock` |
 | Larger report volume | `--set reports.size=10Gi` |
-| External reports PVC | `--set reports.externalPvc=true` (claim name: `<release>-olaitan-reports`) |
+| External reports PVC | `--set reports.externalPvc=true` (claim name: `<fullname>-reports` — for the canonical `helm install olaitan ...` this collapses to `olaitan-reports`; for any other release name, the prefix is `<release>-olaitan-`) |
 | Operator-managed secrets | `--set-file secrets.llmApiKey=./path/to/key.txt` |
 | Allow control-plane scheduling | `--set collector.runOnControlPlane=true` |
 
@@ -106,7 +106,11 @@ evidence reports). Delete manually when you are sure the reports are
 archived:
 
 ```bash
-kubectl delete pvc <release>-olaitan-reports
+# For the canonical `helm install olaitan ...` install, claim name
+# is `olaitan-reports` (the chart fullname helper collapses
+# `olaitan-olaitan` to just `olaitan`). For any other release name,
+# substitute `<release>-olaitan-reports`.
+kubectl delete pvc olaitan-reports
 ```
 
 ## Scope — what this chart does NOT do

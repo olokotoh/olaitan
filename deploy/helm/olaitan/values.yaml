@@ -78,17 +78,16 @@ aggregator:
   tolerations: []
 
 # --- Service endpoints -------------------------------------------------
-# Where Olaitan dials its dependencies. Defaults point at in-cluster
-# services installed by the subcharts (nats, redis). When a subchart is
-# disabled (`<name>.enabled=false`), override the matching endpoint to
-# an externally-managed service.
+# Where Olaitan dials its dependencies. Empty by default — the templates
+# fall back to release-name-derived subchart Service names via the
+# `olaitan.endpoints.nats` / `olaitan.endpoints.redis` helpers
+# (`<release>-nats`, `<release>-redis-master`). Set explicitly to point
+# at externally-managed infra (e.g. when `<name>.enabled=false`).
 endpoints:
-  # NATS JetStream bus. The default DNS name resolves to the `nats`
-  # subchart's headless Service.
-  nats: "nats://olaitan-nats:4222"
-  # Redis primary. Subchart default is a standalone primary named
-  # `<release>-redis-master` — matches our single-release install model.
-  redis: "olaitan-redis-master:6379"
+  # Empty → "nats://<release>-nats:4222" (subchart's headless Service).
+  nats: ""
+  # Empty → "<release>-redis-master:6379" (subchart's primary Service).
+  redis: ""
   # Falco gRPC socket. Mounted via hostPath from the Falco DaemonSet;
   # local-unix-socket is lower-latency than the TCP/gRPC mode.
   # [Source: architecture.md:130]
@@ -144,6 +143,19 @@ probes:
 # `--set networkPolicy.enabled=false`. [Source: architecture.md:355-360]
 networkPolicy:
   enabled: true
+  # CIDR block of node IPs (host network). Required for kubelet to reach
+  # pod liveness/readiness probes when the CNI enforces NetworkPolicy on
+  # host-network traffic — Calico in eBPF dataplane is the load-bearing
+  # case. Default-iptables Calico bypasses policy on host-network traffic
+  # so the policy works without this set. Empty = no kubelet allow-rule.
+  # Operators on eBPF dataplane MUST set this to the cluster's node CIDR
+  # (e.g. "10.0.0.0/16"); otherwise pods never reach Ready.
+  nodeCIDR: ""
+  # CIDR for the Kubernetes API server virtual IP. Default 10.96.0.1/32
+  # is the kubeadm 1.29 stock service-CIDR ClusterIP for the kubernetes
+  # Service. Override on clusters with a non-default service-CIDR. The
+  # aggregator's pod-patch path needs egress here.
+  apiServerCIDR: "10.96.0.1/32"
   # Extra egress rules merged into the policy as-is. Operators populate
   # this with the LLM provider endpoints they actually use; values are
   # raw NetworkPolicyEgressRule objects so the full schema is available
@@ -210,11 +222,18 @@ nats:
 # Redis — state store (per-workload baselines, FSM state, checkpoints).
 # Standalone architecture is enough for the single-aggregator MVP;
 # Sentinel/Cluster are deferred to the Target-tier HA story. AUTH is
-# mandatory (NFR8); the subchart auto-generates the password into
-# `<release>-redis` Secret key `redis-password` unless an operator
-# provides `auth.password`. [Source: architecture.md:328, NFR8]
+# mandatory (NFR8). The subchart reads its password from the parent
+# chart's `<fullname>-secrets` Secret (key `redis-password`) so both
+# sides agree on a single source of truth — the operator-supplied
+# `secrets.redisPassword`. NOTE: `existingSecret` is hardcoded for the
+# canonical `helm install olaitan ...` release-name pattern; for any
+# other release name, also override:
+#   --set redis.auth.existingSecret=<release>-olaitan-secrets
+# [Source: architecture.md:328, NFR8]
 redis:
   enabled: true
   architecture: standalone
   auth:
     enabled: true
+    existingSecret: olaitan-secrets
+    existingSecretPasswordKey: redis-password

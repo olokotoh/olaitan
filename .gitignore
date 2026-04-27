@@ -37,8 +37,11 @@ bin/
 #   produced by `make helm-prepare` (see deploy/helm/README.md).
 # - deploy/helm/olaitan/charts/ holds subchart tarballs fetched by
 #   `helm dependency update`; regenerated on every chart build.
-# - Chart.lock pins subchart digests; we deliberately gitignore it so the
-#   canonical pin list lives in Chart.yaml (see Dev Notes § "Subchart versioning").
+#
+# Chart.lock IS committed (NOT gitignored) — Chart.yaml pins the SemVer
+# of each subchart but Chart.lock pins the digest. Without the lockfile
+# under version control, a re-tagged subchart at the same version (e.g.
+# Bitnami's mid-2025 retag) silently changes the rendered manifest stream
+# on the next CI run, defeating NFR13 reproducibility.
 deploy/helm/olaitan/files/
 deploy/helm/olaitan/charts/
-deploy/helm/olaitan/Chart.lock

@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,7 +58,7 @@ func TestHealthz_ReturnsOK(t *testing.T) {
 	t.Parallel()
 
 	addr := pickFreePort(t)
-	s := health.New(addr, quietLogger())
+	s := health.New(addr, quietLogger(), nil)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
@@ -96,7 +97,7 @@ func TestHealthz_ReturnsOK(t *testing.T) {
 func TestStart_ReturnsOnContextCancel(t *testing.T) {
 	t.Parallel()
 
-	s := health.New(pickFreePort(t), quietLogger())
+	s := health.New(pickFreePort(t), quietLogger(), nil)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- s.Start(ctx) }()
@@ -126,21 +127,28 @@ func TestStart_ListenFailure(t *testing.T) {
 	}
 	defer func() { _ = occupied.Close() }()
 
-	s := health.New(occupied.Addr().String(), quietLogger())
+	s := health.New(occupied.Addr().String(), quietLogger(), nil)
 	err = s.Start(t.Context())
 	if err == nil {
 		t.Fatalf("Start: got nil, want listen error")
 	}
-	// Must wrap the underlying net error so callers can errors.Is-detect.
-	if !errors.Is(err, net.ErrClosed) && err.Error() == "" {
-		t.Errorf("Start: error message empty: %v", err)
+	// The error must be wrapped with the package's "health:" prefix so
+	// callers can grep logs for the boundary, AND the underlying cause
+	// must be a *net.OpError surfacing the bind failure (EADDRINUSE on
+	// Linux). Both are part of the documented contract.
+	if !strings.HasPrefix(err.Error(), "health: ") {
+		t.Errorf("Start error not prefixed with 'health: ': %v", err)
+	}
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) {
+		t.Errorf("Start error does not unwrap to *net.OpError: %v", err)
 	}
 }
 
 func TestStart_DoubleStart(t *testing.T) {
 	t.Parallel()
 
-	s := health.New(pickFreePort(t), quietLogger())
+	s := health.New(pickFreePort(t), quietLogger(), nil)
 	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 
@@ -166,7 +174,7 @@ func TestShutdown_NilSafe(t *testing.T) {
 func TestShutdown_BeforeStart(t *testing.T) {
 	t.Parallel()
 
-	s := health.New(pickFreePort(t), quietLogger())
+	s := health.New(pickFreePort(t), quietLogger(), nil)
 	if err := s.Shutdown(t.Context()); err != nil {
 		t.Errorf("pre-Start Shutdown: got %v, want nil", err)
 	}
@@ -182,7 +190,7 @@ func TestNew_NilLoggerFallsBackToDefault(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
-	s := health.New(pickFreePort(t), nil)
+	s := health.New(pickFreePort(t), nil, nil)
 	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 
@@ -193,6 +201,79 @@ func TestNew_NilLoggerFallsBackToDefault(t *testing.T) {
 
 	if err := <-done; err != nil {
 		t.Errorf("Start with nil logger: got %v, want nil", err)
+	}
+}
+
+// TestHealthz_CheckerFailure asserts the /healthz handler returns 503
+// with an `unhealthy` status payload when the Checker reports a
+// problem. This is the kubelet-facing path that gates pod readiness on
+// internal subsystem health (e.g., the config watcher in main.go).
+func TestHealthz_CheckerFailure(t *testing.T) {
+	t.Parallel()
+
+	addr := pickFreePort(t)
+	failure := errors.New("watcher dead")
+	s := health.New(addr, quietLogger(), func() error { return failure })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Start(ctx) }()
+
+	// Spin until the listener is up. Healthz returns 503 here, so we
+	// can't reuse waitForReady (which waits for 200).
+	deadline := time.Now().Add(2 * time.Second)
+	var resp *http.Response
+	var err error
+	for time.Now().Before(deadline) {
+		resp, err = http.Get("http://" + addr + "/healthz")
+		if err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status: got %d want 503", resp.StatusCode)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body["status"] != "unhealthy" {
+		t.Errorf("body status: got %q want unhealthy", body["status"])
+	}
+	if body["err"] != failure.Error() {
+		t.Errorf("body err: got %q want %q", body["err"], failure.Error())
+	}
+
+	cancel()
+	<-errCh
+}
+
+// TestShutdown_AfterCleanStart asserts that calling Shutdown on a
+// server whose Start has already returned cleanly is a no-op (no
+// spurious http.ErrServerClosed propagation). This is the lifecycle
+// race the field-clearing in Start guards against.
+func TestShutdown_AfterCleanStart(t *testing.T) {
+	t.Parallel()
+
+	s := health.New(pickFreePort(t), quietLogger(), nil)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- s.Start(ctx) }()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Start returned %v on cancel", err)
+	}
+
+	if err := s.Shutdown(t.Context()); err != nil {
+		t.Errorf("post-Start Shutdown: got %v, want nil", err)
 	}
 }
 

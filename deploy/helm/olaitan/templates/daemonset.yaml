@@ -72,9 +72,9 @@ spec:
               protocol: TCP
           env:
             - name: NATS_URL
-              value: {{ .Values.endpoints.nats | quote }}
+              value: {{ include "olaitan.endpoints.nats" . | quote }}
             - name: REDIS_ADDR
-              value: {{ .Values.endpoints.redis | quote }}
+              value: {{ include "olaitan.endpoints.redis" . | quote }}
             - name: FALCO_SOCKET
               value: {{ .Values.endpoints.falco | quote }}
           livenessProbe:

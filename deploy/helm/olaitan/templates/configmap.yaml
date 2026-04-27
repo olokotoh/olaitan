@@ -25,7 +25,8 @@ metadata:
     {{- include "olaitan.labels" . | nindent 4 }}
 data:
   olaitan.yaml: |-
-{{ .Files.Get "files/olaitan.yaml" | indent 4 }}
+    {{- $cfg := required "files/olaitan.yaml is empty — run `make helm-prepare` to copy config/olaitan.yaml into the chart" (.Files.Get "files/olaitan.yaml") }}
+    {{- $cfg | nindent 4 }}
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -34,8 +35,8 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "olaitan.labels" . | nindent 4 }}
-# Empty for now — populated by Story 3.4 (detection rules engine).
-# Do not add a `data: {}` key: Kubernetes accepts a ConfigMap with no
-# data stanza and the pod volumeMount renders as an empty directory,
-# which is what the rings expect on a fresh cluster.
+# Empty for now — populated by Story 3.4 (detection rules engine). We
+# render `data: {}` explicitly: Kubernetes accepts both forms, but an
+# explicit empty map prevents `helm diff` from showing churn the first
+# time Story 3.4 lands a real entry.
 data: {}

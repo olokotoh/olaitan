@@ -47,14 +47,17 @@ jobs:
           version: v3.16.4
 
       # Cache the downloaded subcharts so re-runs skip the OCI pull from
-      # registry-1.docker.io (Bitnami Redis is the largest).
+      # registry-1.docker.io (Bitnami Redis is the largest). The cache
+      # key MUST include Chart.lock (committed to the repo); otherwise a
+      # re-tagged subchart at the same SemVer would resolve from cache
+      # to the old digest, defeating reproducibility.
       - name: Cache helm dependencies
         uses: actions/cache@v4
         with:
           path: |
             ~/.cache/helm
             deploy/helm/olaitan/charts
-          key: helm-deps-${{ hashFiles('deploy/helm/olaitan/Chart.yaml') }}
+          key: helm-deps-${{ hashFiles('deploy/helm/olaitan/Chart.yaml', 'deploy/helm/olaitan/Chart.lock') }}
 
       - name: Install kubeconform
         run: go install github.com/yannh/kubeconform/cmd/kubeconform@v0.6.7
@@ -75,6 +78,7 @@ jobs:
       - name: helm template + kubeconform
         run: |
           helm template deploy/helm/olaitan --generate-name \
+              --set secrets.redisPassword=ci-fake-password \
             | kubeconform -strict -summary \
                 -kubernetes-version 1.29.0 \
                 -schema-location default \

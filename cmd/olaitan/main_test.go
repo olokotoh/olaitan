@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"os"
@@ -109,11 +110,16 @@ func TestRunRing_GracefulShutdown(t *testing.T) {
 
 	cfgPath := writeTestConfig(t)
 
-	// Start runRing in a goroutine. Send ourselves SIGTERM after the
-	// health server has bound, and assert runRing returns 0 (graceful).
+	// Drive runRingCtx directly with our own cancellable context — no
+	// real signals involved. This avoids the SIGINT-to-test-process
+	// pattern that interleaves badly with `go test -p>1` and the test
+	// runner's own Ctrl-C handler.
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+
 	done := make(chan int, 1)
 	go func() {
-		done <- runRing("aggregator", []string{"--config=" + cfgPath}, os.Stderr)
+		done <- runRingCtx(ctx, "aggregator", []string{"--config=" + cfgPath}, os.Stderr)
 	}()
 
 	// Poll until /healthz responds, proving the server is live.
@@ -131,22 +137,14 @@ func TestRunRing_GracefulShutdown(t *testing.T) {
 	t.Fatalf("health server never became ready at %s", healthAddr)
 READY:
 
-	// signal.NotifyContext in runRing listens for SIGINT+SIGTERM; send
-	// SIGTERM to this process to trigger graceful shutdown.
-	p, err := os.FindProcess(os.Getpid())
-	if err != nil {
-		t.Fatalf("FindProcess: %v", err)
-	}
-	if err := p.Signal(os.Interrupt); err != nil {
-		t.Fatalf("signal: %v", err)
-	}
+	cancel()
 
 	select {
 	case code := <-done:
 		if code != 0 {
-			t.Errorf("runRing exit code after SIGINT: got %d want 0", code)
+			t.Errorf("runRingCtx exit code after cancel: got %d want 0", code)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatalf("runRing did not exit within 5s of SIGINT")
+		t.Fatalf("runRingCtx did not exit within 5s of cancel")
 	}
 }

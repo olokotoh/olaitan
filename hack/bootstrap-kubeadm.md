@@ -91,6 +91,32 @@ sudo apt-get install -y kubelet kubeadm kubectl
 sudo apt-mark hold kubelet kubeadm kubectl
 ```
 
+## Re-running on a partially-initialised node
+
+If `kubeadm init` was run previously on this node (failed install,
+partial setup), reset before attempting again — `kubeadm init` is NOT
+idempotent and will fail with "etcd already exists" or similar
+cryptic errors when state from a prior run remains.
+
+```bash
+# Wipe kubeadm-managed state. Safe on a clean node (it just reports
+# nothing to clean). Required between failed/aborted init attempts.
+sudo kubeadm reset -f
+
+# kubeadm reset leaves these behind by design — clean up so the next
+# init starts fresh.
+sudo rm -rf /etc/cni/net.d
+sudo rm -rf $HOME/.kube
+sudo iptables -F && sudo iptables -t nat -F && sudo iptables -t mangle -F && sudo iptables -X
+```
+
+Worker-side reset (before re-joining):
+
+```bash
+sudo kubeadm reset -f
+sudo rm -rf /etc/cni/net.d
+```
+
 ## Initialise the control plane
 
 On the control-plane node only:

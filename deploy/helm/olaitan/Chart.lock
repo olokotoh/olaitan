@@ -1,0 +1,12 @@
+dependencies:
+- name: falco
+  repository: https://falcosecurity.github.io/charts
+  version: 8.0.2
+- name: nats
+  repository: https://nats-io.github.io/k8s/helm/charts/
+  version: 2.12.6
+- name: redis
+  repository: oci://registry-1.docker.io/bitnamicharts
+  version: 25.3.11
+digest: sha256:334eff389fe2ef47bc7f92f591035c80b8c4eac1b8dde4095a2cb17980d81ab2
+generated: "2026-04-27T07:38:36.876680857+01:00"

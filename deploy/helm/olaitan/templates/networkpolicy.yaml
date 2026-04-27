@@ -54,6 +54,21 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "olaitan.selectorLabels" . | nindent 14 }}
+    {{- /*
+    Allow kubelet probe traffic from node IPs. Required when the CNI
+    enforces NetworkPolicy on host-network traffic (Calico eBPF
+    dataplane); harmless on default-iptables Calico where kubelet
+    bypasses policy. Off by default — operator opts in by setting
+    networkPolicy.nodeCIDR.
+    */}}
+    {{- with .Values.networkPolicy.nodeCIDR }}
+    - from:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        - protocol: TCP
+          port: 8080
+    {{- end }}
   egress:
     {{- /* DNS — required for service-name resolution. */}}
     - to:
@@ -68,6 +83,23 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
+    {{- /*
+    Kubernetes API server. The aggregator's pod-patch path (Ring 4
+    response) and ServiceAccount token review traffic both terminate at
+    the apiserver virtual IP. Default 10.96.0.1/32 matches the kubeadm
+    1.29 stock service-CIDR; override `networkPolicy.apiServerCIDR` for
+    clusters with a non-default service-CIDR.
+    */}}
+    {{- with .Values.networkPolicy.apiServerCIDR }}
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+    {{- end }}
     {{- /* Intra-namespace traffic to NATS, Redis, Falco subcharts. */}}
     - to:
         - podSelector: {}

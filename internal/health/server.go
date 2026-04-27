@@ -26,6 +26,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -41,12 +42,24 @@ var ErrServerRunning = errors.New("health: server already running")
 // drain in future rings) comfortably.
 const shutdownTimeout = 5 * time.Second
 
+// Checker is the readiness contract Start consults on every /healthz
+// request. Returning a non-nil error makes the handler emit 503 with
+// the error string in the JSON body, signalling kubelet to mark the
+// pod NotReady and stop sending it traffic.
+//
+// Implementations should be O(1) — a probe fires every few seconds.
+// Typical pattern: an atomic.Bool toggled by the watcher / ring
+// goroutines on health-relevant state changes.
+type Checker func() error
+
 // Server is a single-shot HTTP server serving /healthz on addr. Safe
 // to construct with New even if Start is never called — the zero cost
 // is a few bytes and no goroutines.
 type Server struct {
 	addr    string
 	log     *slog.Logger
+	check   Checker
+	mu      sync.Mutex // guards srv across Start/Shutdown
 	srv     *http.Server
 	running atomic.Bool
 }
@@ -55,11 +68,15 @@ type Server struct {
 // conventions (":8080" for all interfaces). log may be nil — in that
 // case slog.Default() is used so callers can construct before their
 // logger is wired.
-func New(addr string, log *slog.Logger) *Server {
+//
+// check, when non-nil, is consulted on every /healthz request to
+// decide between 200 and 503. Pass nil for an always-200 health
+// surface (only appropriate for tests or as a temporary stub).
+func New(addr string, log *slog.Logger, check Checker) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{addr: addr, log: log}
+	return &Server{addr: addr, log: log, check: check}
 }
 
 // Start binds the listener, serves /healthz, and blocks on ctx. On
@@ -89,10 +106,12 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("health: listen %q: %w", s.addr, err)
 	}
 
+	s.mu.Lock()
 	s.srv = &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+	s.mu.Unlock()
 
 	serveErrCh := make(chan error, 1)
 	go func() {
@@ -109,14 +128,23 @@ func (s *Server) Start(ctx context.Context) error {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		if err := s.srv.Shutdown(shutdownCtx); err != nil {
+		s.mu.Lock()
+		srv := s.srv
+		s.mu.Unlock()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
 			s.log.Error("health: shutdown", "err", err)
 		}
 		// Drain the serve goroutine before returning; otherwise it could
 		// leak past the server's lifetime and race with the next Start.
 		<-serveErrCh
+		s.mu.Lock()
+		s.srv = nil
+		s.mu.Unlock()
 		return nil
 	case err := <-serveErrCh:
+		s.mu.Lock()
+		s.srv = nil
+		s.mu.Unlock()
 		return err
 	}
 }
@@ -125,24 +153,38 @@ func (s *Server) Start(ctx context.Context) error {
 // Shutdown is a silent no-op; a Shutdown on a never-Started server is
 // likewise a no-op. Nil-receiver safe.
 func (s *Server) Shutdown(ctx context.Context) error {
-	if s == nil || s.srv == nil {
+	if s == nil {
 		return nil
 	}
-	if err := s.srv.Shutdown(ctx); err != nil {
+	s.mu.Lock()
+	srv := s.srv
+	s.mu.Unlock()
+	if srv == nil {
+		return nil
+	}
+	if err := srv.Shutdown(ctx); err != nil {
 		return fmt.Errorf("health: shutdown: %w", err)
 	}
 	return nil
 }
 
-// handleHealthz is the kubelet-facing handler. 200 + JSON body is
-// enough for a liveness/readiness probe; the body is a sanity-check
-// hook for `kubectl exec -- wget -qO- http://localhost:8080/healthz`
+// handleHealthz is the kubelet-facing handler. Consults the check
+// function (if any) and returns 200 with `{"status":"ok"}` on pass,
+// 503 with `{"status":"unhealthy","err":"..."}` on fail. The body is
+// a sanity-check hook for `kubectl exec -- wget -qO- /healthz`
 // during incident response.
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	if s.check != nil {
+		if err := s.check(); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"status": "unhealthy",
+				"err":    err.Error(),
+			})
+			return
+		}
+	}
 	w.WriteHeader(http.StatusOK)
-	// json.NewEncoder is slightly cheaper than Marshal + Write for a
-	// fixed-shape payload; the body is small enough that the difference
-	// is immaterial, but the signature is cleaner.
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }

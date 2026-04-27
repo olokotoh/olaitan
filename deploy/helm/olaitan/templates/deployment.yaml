@@ -13,6 +13,14 @@ upgrade. Horizontal scaling lands with leader election (Story 8.x /
 FR39); do NOT raise replicas until then. [See Dev Notes § "The
 aggregator-replicas-1 constraint"]
 */}}
+{{- /*
+Render-time guard: refuse to install if the operator has overridden
+replicas above 1, since that silently corrupts the correlator
+checkpoint. Story 8.x will lift this once leader election is wired.
+*/}}
+{{- if gt (int .Values.aggregator.replicas) 1 }}
+{{- fail "aggregator.replicas must not exceed 1 — Ring 2 NATS JetStream checkpoint requires at-most-one-aggregator semantics. Leader election lands in Story 8.x; until then, this is a hard constraint. Set aggregator.replicas=1 (the default) to proceed." }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -46,6 +54,12 @@ spec:
         runAsUser: 65532
         runAsGroup: 65532
         fsGroup: 65532
+        # OnRootMismatch — kubelet skips the recursive chown of the PVC
+        # when the volume root already has the right ownership. Without
+        # this, pod restart time grows linearly with the number of files
+        # in the reports PVC and quickly blows past the readiness probe
+        # budget (initialDelay 3s + 10s × 3 failureThreshold = 33s).
+        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       {{- with .Values.aggregator.nodeSelector }}
@@ -70,9 +84,9 @@ spec:
               protocol: TCP
           env:
             - name: NATS_URL
-              value: {{ .Values.endpoints.nats | quote }}
+              value: {{ include "olaitan.endpoints.nats" . | quote }}
             - name: REDIS_ADDR
-              value: {{ .Values.endpoints.redis | quote }}
+              value: {{ include "olaitan.endpoints.redis" . | quote }}
             - name: FALCO_SOCKET
               value: {{ .Values.endpoints.falco | quote }}
           livenessProbe:

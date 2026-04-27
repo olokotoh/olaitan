@@ -12,8 +12,10 @@ appVersion: "0.1.0"
 
 # Olaitan uses networking.k8s.io/v1 NetworkPolicy (GA since 1.7) and
 # projected-volume semantics that matured in 1.20+. 1.29 is the floor
-# for current LTS-tier clusters per architecture.md:118.
-kubeVersion: ">=1.29.0"
+# for current LTS-tier clusters per architecture.md:118. Upper bound
+# < 2.0.0 guards against silent install on a future K8s major where
+# deprecated APIs the chart depends on may have been removed.
+kubeVersion: ">=1.29.0 < 2.0.0"
 
 # All three subcharts ship the infra Olaitan depends on: Falco (Ring 1
 # signal source), NATS JetStream (inter-ring bus), Redis (state store).

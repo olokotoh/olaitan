@@ -93,3 +93,26 @@ every template so `--set image.tag=<sha>` works consistently.
 {{- $tag := default .Chart.AppVersion .Values.image.tag -}}
 {{- printf "%s:%s" .Values.image.repository $tag -}}
 {{- end -}}
+
+{{/*
+Endpoint helpers. The default subchart Service names are
+`<release>-nats` and `<release>-redis-master`; hardcoding the literal
+"olaitan-" prefix in values.yaml broke any non-default release name.
+These helpers fall back to the release-derived defaults when the
+operator has not set an explicit override in `endpoints.<name>`.
+*/}}
+{{- define "olaitan.endpoints.nats" -}}
+{{- if .Values.endpoints.nats -}}
+{{- .Values.endpoints.nats -}}
+{{- else -}}
+{{- printf "nats://%s-nats:4222" .Release.Name -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "olaitan.endpoints.redis" -}}
+{{- if .Values.endpoints.redis -}}
+{{- .Values.endpoints.redis -}}
+{{- else -}}
+{{- printf "%s-redis-master:6379" .Release.Name -}}
+{{- end -}}
+{{- end -}}

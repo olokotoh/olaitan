@@ -23,7 +23,9 @@ docker-build:
 	docker build -t $(IMAGE):$(TAG) .
 
 clean:
-	rm -rf bin/ $(CHART_DIR)/files $(CHART_DIR)/charts $(CHART_DIR)/Chart.lock
+	# Chart.lock is committed to the repo (it pins subchart digests for
+	# reproducibility); do not rm it during a build clean.
+	rm -rf bin/ $(CHART_DIR)/files $(CHART_DIR)/charts
 
 # Prints just the image tag (no newline). Used by CI's docker smoke
 # test: `docker run --rm olaitan:$(make -s version-tag) version`.

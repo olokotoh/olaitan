@@ -42,7 +42,9 @@ repo update, helm dependency update for the Olaitan chart).
                 the preflight instructions. Does NOT run kubeadm.
   -h, --help    Print this help and exit.
 
-Pre-reqs on PATH: kubectl, helm, kubeadm.
+Pre-reqs on PATH: kubectl, helm. (kubeadm is only required on the
+control-plane node when you actually execute the printed commands;
+this script never invokes kubeadm itself.)
 See deploy/helm/README.md for the full install flow.
 EOF
 }
@@ -58,10 +60,15 @@ check_tool() {
   fi
 }
 
+# This script only ever runs operator-side commands — `helm repo add`,
+# `helm dependency update`, optionally `make helm-prepare`. It prints
+# kubeadm and kubectl-against-cluster commands but never invokes them.
+# So the prereq list is the operator-side toolchain only; do not
+# require `kubeadm` here (the operator running this from a workstation
+# without kubeadm installed is the common case).
 check_prereqs() {
   check_tool kubectl "https://kubernetes.io/docs/tasks/tools/#kubectl"
   check_tool helm    "https://helm.sh/docs/intro/install/"
-  check_tool kubeadm "https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/"
 }
 
 # Preflight commands are always printed (never executed by this script) so
@@ -97,7 +104,14 @@ EOF
 # Helm repo operations run as the current user (no root needed). The OCI
 # Bitnami registry for Redis needs no `helm repo add` — `helm dependency
 # update` handles OCI transparently.
+#
+# The `make helm-prepare` step copies config/olaitan.yaml into the chart's
+# files/ directory so Helm's `.Files.Get` can read it. Without this, the
+# rendered config ConfigMap is empty and pods crash-loop on first start.
 install_helm_repos() {
+  echo "--> make helm-prepare (copy config/olaitan.yaml into chart)"
+  make -C "${REPO_ROOT}" helm-prepare
+
   echo "--> helm repo add falcosecurity"
   helm repo add falcosecurity https://falcosecurity.github.io/charts
 
