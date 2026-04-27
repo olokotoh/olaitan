@@ -691,6 +691,12 @@ func TestAuditWebhookGate(t *testing.T) {
 	enabledRender := helmTemplate(t, []string{
 		"falco.enabled=false", "nats.enabled=false", "redis.enabled=false",
 		"auditWebhook.enabled=true",
+		// caBundle is required when the webhook is enabled (see the
+		// fail-fast guard in templates/validatingwebhookconfiguration.yaml
+		// covered separately by TestAuditWebhookCABundleGuard). Use a
+		// dummy base64 string so this test can exercise the rendering
+		// path without standing up a real CA.
+		"auditWebhook.caBundle=ZmFrZS1jYS1idW5kbGU=",
 	})
 	enabledMs := parseManifests(t, enabledRender)
 
