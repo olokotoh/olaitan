@@ -187,3 +187,249 @@ the Olaitan registry) in a dedicated story.
   digest. Done in this story.
 - Add a low-priority deferred-work item to revisit the registry
   choice after the Bitnami situation stabilises (or breaks).
+
+---
+
+## ADR-2026-04-28-01: Sigma parser strategy
+
+**Status:** Accepted.
+
+**Date:** 2026-04-28.
+
+**Context.** Story 1.15 (OLT Sigma rule engine) needs a strategy for
+parsing the OLT dialect of Sigma rules. The dialect adds Kubernetes-
+native field references (`k8s.*`), an `attack:` annotation listing
+MITRE ATT&CK technique IDs, and a project-local rule-ID grammar
+(`OLT-(EXEC|NET|FILE|PRIV|IMPACT|RECON|PERSIST|EXFIL|CRED|LATERAL)-[0-9]{3}`)
+to standard SIGMA-HQ Sigma. Three approaches are open: wrap an
+existing Go Sigma parser and extend it via post-parse handlers, fork
+one and patch the OLT extensions in natively, or hand-roll a custom
+OLT-only parser. Story 1.2 is a time-boxed spike to settle the choice
+before Story 1.15 starts.
+
+The architecture document (`_bmad-output/planning-artifacts/architecture.md`,
+line 332) named `siglens/siglens` and `bradleyjkemp/sigma-go` as the
+two candidates to evaluate. SigLens is in fact an observability
+platform (a unified Logs/Metrics/Traces store, alternative to Splunk)
+whose repository was archived 2026-03-12 and which exposes no
+importable Sigma parser. The architecture mention was a documentation
+mistake. This ADR records the corrected candidate set; Story 1.2 also
+patches architecture.md line 332 to drop the SigLens reference.
+
+**Decision.** Take the **wrap-existing-parser** path, building on
+`github.com/runreveal/sigmalite` (Apache 2.0; commit
+`f180cb50a6a1bba454874c844500bd79f4b30a41` of 2025-09-18; no tagged
+release as of 2026-04-28). Extend the upstream parser via two of
+sigmalite's existing extension surfaces:
+
+- `Rule.Extra map[string]Decoder` carries the OLT-only top-level
+  fields (`attack:`, `severity:`). The OLT engine decodes these into
+  typed Go values without forking the upstream YAML schema.
+- `sigma.MatchOptions.FieldResolver` carries the OLT field-resolver,
+  which routes `k8s.*` lookups to the workload-posture data and all
+  other field lookups to the streaming-event field map.
+
+The parser lands in `internal/decision/rules/parser/` under Story
+1.15, importing sigmalite and the OLT extension code.
+
+**Why this direction.**
+
+- sigmalite is the only candidate that exposes both extension
+  surfaces (`Extra` for unknown top-level fields and
+  `FieldResolver` for custom field lookup) as first-class API. The
+  `FieldResolver` interface was added in commit f180cb5 specifically
+  for stream-processing scenarios that match Olaitan's per-
+  EvidencePackage evaluation pattern.
+- The wrap-path POC at `spikes/sigma-parser/wrap/main.go` evaluates
+  `OLT-IMPACT-005` against three fixtures and passes 3-of-3 with
+  ~300 lines of Go, none of which patches the upstream library. The
+  failure-case POC at `spikes/sigma-parser/custom/main.go` ran the
+  same fixtures through a hand-rolled parser at ~280 lines, but
+  covers only the AND-condition subset and five modifiers.
+- A wrap-path Story 1.15 inherits sigmalite's modifier coverage
+  (`contains`, `all`, `startswith`, `endswith`, `windash`, `base64`,
+  `base64offset`, `re`, `cidr`, `expand`) for free. A custom path
+  re-implements all of them, plus the SIGMA-HQ condition grammar,
+  plus a SIGMA-HQ regression suite.
+- sigmalite's MIT-derivative Apache 2.0 licence is compatible with
+  Olaitan's licence (MIT). No patent or copyleft entanglement.
+- The OLT strict-superset claim (every standard SIGMA-HQ rule must
+  remain parseable) is preserved by construction: the wrap path
+  delegates everything outside the OLT namespaces to sigmalite's
+  unmodified parser.
+
+**Alternatives considered and rejected.**
+
+- `bradleyjkemp/sigma-go` (MIT; latest tag `v0.6.6`; latest commit
+  2025-05-15). Exposes its AST natively (`ast.go`) and has a longer
+  production track record (Monzo Bank). Rejected for two reasons:
+  the AST surface is more invasive to extend than sigmalite's
+  `FieldResolver` (we would need a custom AST walker, where
+  sigmalite gives us a typed callback); and the upstream is now
+  semi-dormant (six months since the last commit), which inverts
+  the maintenance-cost calculus relative to sigmalite's active main
+  branch. sigmalite is itself a partial fork of sigma-go, so the
+  "production miles" advantage is partly retained.
+- `markuskont/go-sigma-rule-engine` (Apache 2.0; latest tag `v0.3.0`;
+  latest commit 2023-09-25). Self-described as a reference
+  implementation; explicitly does not implement aggregations or the
+  `Near()` operator. Rejected because it has been unmaintained for
+  over two years and its API does not expose a custom field-resolver
+  contract (every field lookup walks `event[name]` directly, with
+  no escape hatch for the workload-posture split OLT needs).
+- `siglens/siglens` (named in architecture.md line 332). Not a Sigma
+  parser; an observability platform. Repository archived 2026-03-12.
+  Cannot be used.
+- Fork `bradleyjkemp/sigma-go`. Rejected because forking adds the
+  full burden of tracking upstream regression fixes and modifier
+  additions for a benefit (deeper extension hooks) that the wrap
+  path achieves with less code.
+- Hand-rolled custom parser. Cost projection inferred from the
+  `spikes/sigma-parser/custom/` POC: roughly 1500-2500 lines of Go
+  plus 1500 lines of tests to reach SIGMA-HQ parity, two to four
+  engineering weeks. The spike's POC handled only flat AND
+  conditions and five modifiers in 280 lines; full grammar plus
+  modifier coverage scales roughly linearly. Rejected on calendar
+  grounds and on the strict-superset risk: a custom parser must be
+  separately verified against the SIGMA-HQ regression corpus, where
+  the wrap path inherits that verification from upstream.
+
+**Maintenance and licensing implications.**
+
+- New top-level Go dependency for the main module: `github.com/runreveal/sigmalite`
+  pinned at commit `f180cb50a6a1bba454874c844500bd79f4b30a41`.
+  Story 1.15 adds this dependency; Story 1.2 keeps it confined to
+  `spikes/sigma-parser/wrap/go.mod` so the spike does not pollute the
+  main go.sum.
+- Licence: Apache 2.0. Compatible with Olaitan's MIT licence; the
+  notice file under `internal/decision/rules/parser/` will carry an
+  Apache 2.0 attribution line per the licence's Section 4(d).
+- Upstream cadence is light but active (commits in 2025-09 and 2025-04).
+  We pin by commit SHA rather than `latest` to keep parser behaviour
+  stable across rule-corpus updates; bumps are explicit decisions.
+- If sigmalite is abandoned, the fallback is the custom-parser plan
+  in this ADR's "Fallback custom-parser plan" section.
+
+**Risks inherited.**
+
+- *Upstream stagnation risk.* sigmalite has no tagged releases. If
+  the project is abandoned, Olaitan would need to either fork it or
+  fall back to the hand-rolled custom-parser path (see fallback
+  section). Mitigated by SHA-pinning and by the wrap-path
+  architecture: switching to a fork is a single import-path edit
+  rather than a re-implementation.
+- *Modifier completeness risk.* sigmalite implements ten modifiers
+  but its test coverage of edge cases (Unicode, empty patterns, the
+  `expand` placeholder semantics) is uneven. Story 1.15 will add a
+  property-based test (`gopter`) that exercises modifier combinations
+  against generated event maps; any gaps surfaced there get patched
+  upstream or in an OLT-side adapter, with the choice recorded in a
+  follow-up ADR.
+- *FieldResolver-only lookup risk.* When `MatchOptions.FieldResolver`
+  is non-nil, sigmalite uses ONLY the resolver (it does not fall back
+  to `LogEntry.Fields`). The OLT field-resolver therefore must
+  resolve every field referenced by every rule, not just `k8s.*`
+  fields. The wrap POC handles this by delegating non-`k8s.*` lookups
+  to the streaming-event map; Story 1.15 inherits this contract and
+  must test it against rules that reference exotic field names.
+- *Strict-superset verification.* The "every SIGMA-HQ rule remains
+  parseable" claim is asserted but not yet exercised against a real
+  community-rule corpus. Story 1.15 must run a regression batch
+  (e.g. the SigmaHQ rule pack's `cloud/k8s/` subset) through the
+  wrap-path engine and record the pass count in its Completion Notes.
+
+**Performance rough cut.**
+
+Measured on the wrap-path POC (`spikes/sigma-parser/wrap/main.go`)
+running `--bench`: 100-iteration warm-up plus 1000 timed iterations,
+each iteration evaluating one fixture against a 10-rule corpus
+(`OLT-IMPACT-005` plus nine `id`-mutated duplicates).
+
+| Metric | Value |
+|---|---|
+| Total wall-clock (1000 iterations) | 100.27 ms |
+| Min per iteration | 63.08 µs |
+| Median per iteration | 85.46 µs |
+| p99 per iteration | 211.54 µs |
+| Max per iteration | 1.06 ms |
+
+Hardware: Intel Core i7-10510U @ 1.80 GHz, Linux 6.17.0 x86_64.
+Toolchain: Go 1.25.9 (linux/amd64), inside a `golang:1.25-alpine`
+container. This is a sanity check, not the NFR3 100 ms p99
+contract; the production gate is Story 1.15's to satisfy under
+realistic load (a 50-rule corpus, full EvidencePackage matching,
+NATS-driven concurrency). Single-digit-microsecond per-rule
+matching at ten rules is comfortable headroom; flag in Story 1.15
+if scaling to 50 rules introduces non-linear overhead.
+
+**Hand-off to Story 1.15.**
+
+- *Library and version pin.* `github.com/runreveal/sigmalite` at
+  commit `f180cb50a6a1bba454874c844500bd79f4b30a41` (2025-09-18).
+  Add to the main module's `go.mod` when wiring the parser. The
+  pin survives a tag yank because the SHA is content-addressed.
+- *Parser landing path.* `internal/decision/rules/parser/` for the
+  wrapper code, `internal/decision/rules/matcher/` for the OLT field
+  resolver, `internal/decision/rules/loader/` for the corpus loader
+  that reuses `internal/config/watcher` (see hot-reload note below).
+- *Augmentation strategy.* Post-parse, not fork: read OLT extras
+  from `Rule.Extra["attack"]` and `Rule.Extra["severity"]`, and
+  install the OLT field resolver on `MatchOptions.FieldResolver`.
+  Do not patch sigmalite source.
+- *Test fixtures to migrate.* `spikes/sigma-parser/testdata/OLT-IMPACT-005.yaml`
+  and `spikes/sigma-parser/testdata/fixtures/{positive,negative_namespace,negative_process}.json`
+  migrate to `internal/decision/rules/testdata/positive/` and
+  `internal/decision/rules/testdata/negative/` respectively under
+  Story 1.15's TDD red-phase. The spike directory is then deletable.
+- *Hot-reload substrate.* Reuse the existing `internal/config/watcher`
+  Manager (Story 1.6, fsnotify-backed, 50 ms debounce, atomic.Pointer
+  swap). Architecture.md line 343 mentions
+  `k8s.io/client-go/tools/cache.NewFilteredListWatchFromClient`
+  for ConfigMap watching; that is wrong about the current substrate.
+  The fsnotify-on-projected-volume approach already implemented
+  handles ConfigMap mounts correctly. Do not switch to client-go.
+- *Return type.* The matcher returns `internal/schema.RuleMatch`
+  (`internal/schema/detection.go`) for each matched rule. The wrap
+  POC produces this struct verbatim; Story 1.15 inherits the same
+  contract.
+
+**Fallback custom-parser plan.**
+
+If sigmalite is abandoned, retracts the `FieldResolver` interface,
+or proves to have a regression we cannot work around, the project
+forks the wrap-path code into a hand-rolled parser. Cost projection,
+based on the spike's `custom/main.go` POC (280 LOC for AND-only,
+five modifiers, no test coverage):
+
+| Surface | LOC estimate |
+|---|---|
+| YAML rule shape and `attack:` / `severity:` | 200 |
+| Full SIGMA-HQ condition grammar (AND, OR, NOT, parens, `1 of`, `all of`) | 600 |
+| All ten modifiers | 400 |
+| Field-resolver indirection | 150 |
+| SIGMA-HQ regression suite (parsing tests against the SigmaHQ pack) | 800 |
+| OLT-specific tests (lint, k8s.* binding, attack annotation) | 700 |
+| **Total** | **2850** |
+
+Two to four engineering weeks, depending on how much of the SIGMA-HQ
+regression test suite is brought in verbatim versus rewritten. This
+is the calendar-aware cost the project owner inherits if the wrap
+path becomes unviable.
+
+**Follow-ups.**
+
+- Patch `_bmad-output/planning-artifacts/architecture.md` line 332 to
+  drop the `siglens/siglens` reference and replace it with the
+  candidate trio (sigma-go, sigmalite, go-sigma-rule-engine). Done
+  in this story.
+- Story 1.15 reads this ADR's "Hand-off" section verbatim and
+  produces the production parser, matcher, and loader.
+- Story 1.16 authors the initial ten-rule corpus against the
+  dialect specified in `docs/sigma-extensions.md`.
+- Story 6.5 (`cmd/olaitan-lint`) enforces the OLT rule-ID regex,
+  the `attack:` annotation format, and the `k8s.*` namespace policy
+  defined in `docs/sigma-extensions.md`.
+- Project memory (`project_olaitan.md`) gets a new tech-stack entry
+  for `github.com/runreveal/sigmalite` when Story 1.15 actually
+  pulls the dependency into the main module. This story keeps the
+  dependency confined to `spikes/sigma-parser/wrap/go.mod`.
