@@ -45,3 +45,9 @@ bin/
 # on the next CI run, defeating NFR13 reproducibility.
 deploy/helm/olaitan/files/
 deploy/helm/olaitan/charts/
+
+# Spike binaries — `go run` and `go build` may drop a binary named after
+# the directory (e.g. `spikes/sigma-parser/wrap/wrap`). The source lives
+# under spikes/<name>/{wrap,custom}/main.go; the binary should not.
+spikes/sigma-parser/wrap/wrap
+spikes/sigma-parser/custom/custom
