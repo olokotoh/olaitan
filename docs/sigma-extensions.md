@@ -71,9 +71,15 @@ All `k8s.*` references support the standard SIGMA-HQ modifier set
 
 Every OLT rule MUST declare an `attack:` field at the top level whose
 value is a non-empty YAML list of MITRE ATT&CK for Containers v18
-technique IDs. The IDs use the canonical form: uppercase `T` followed
-by digits, with no separator and no sub-technique dot. Sub-techniques
-use the canonical `T<digits>.<digits>` form.
+technique IDs. Two ID forms are valid:
+
+- **Base technique** — uppercase `T` followed by exactly four digits
+  (`T1496`, `T1611`). No separator, no trailing dot.
+- **Sub-technique** — base technique ID, a single dot, and exactly
+  three digits (`T1059.004`).
+
+Both forms are accepted in the same list. The four-digit base and
+three-digit sub-technique counts match MITRE ATT&CK Enterprise v18.
 
 ```yaml
 attack:
@@ -195,6 +201,13 @@ OLT rules MAY declare a top-level `severity:` integer in the range
 present, `severity:` wins because it carries finer resolution that
 the deterministic ThreatScore depends on. A rule with neither field
 is treated as `level: medium` for backward compatibility.
+An explicit `severity: null` (or `severity:` with no value) is
+rejected at parse time: rules either supply an integer in `[0, 100]`
+or omit the `severity:` key entirely so the level-table fallback
+applies. Silent fallback from explicit-null is forbidden because the
+deterministic ThreatScore consumer cannot distinguish "operator
+opted out of severity" from "operator forgot to fill it in", and a
+loud parser error is the safer disposition for security tooling.
 
 | `level:` | Implied `severity:` if numeric absent |
 |---|---|

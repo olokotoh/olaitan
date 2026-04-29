@@ -14,11 +14,23 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
+
+// sourceDir resolves to the directory containing this file. Anchoring
+// relative paths against it lets `go run .` from inside custom/ and
+// `go run ./spikes/sigma-parser/custom` from repo root behave identically.
+func sourceDir() string {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		return "."
+	}
+	return filepath.Dir(file)
+}
 
 type rule struct {
 	Title          string         `yaml:"title"`
@@ -40,7 +52,7 @@ func main() {
 }
 
 func run() error {
-	rulePath, _ := filepath.Abs("../testdata/OLT-IMPACT-005.yaml")
+	rulePath := filepath.Join(sourceDir(), "..", "testdata", "OLT-IMPACT-005.yaml")
 	raw, err := os.ReadFile(rulePath)
 	if err != nil {
 		return fmt.Errorf("read rule: %w", err)
@@ -55,14 +67,16 @@ func run() error {
 	fmt.Printf("[custom] parsed rule id=%s title=%q attack=%v severity=%d\n",
 		r.ID, r.Title, r.Attack, r.Severity)
 
+	fixtureDir := filepath.Join(sourceDir(), "..", "testdata", "fixtures")
 	fixtures := []struct {
 		name      string
 		path      string
 		wantMatch bool
 	}{
-		{"positive", "../testdata/fixtures/positive.json", true},
-		{"negative_namespace", "../testdata/fixtures/negative_namespace.json", false},
-		{"negative_process", "../testdata/fixtures/negative_process.json", false},
+		{"positive", filepath.Join(fixtureDir, "positive.json"), true},
+		{"negative_namespace", filepath.Join(fixtureDir, "negative_namespace.json"), false},
+		{"negative_process", filepath.Join(fixtureDir, "negative_process.json"), false},
+		{"negative_missing_process", filepath.Join(fixtureDir, "negative_missing_process.json"), false},
 	}
 
 	pass := 0
@@ -91,8 +105,7 @@ func run() error {
 }
 
 func loadEvent(path string) (map[string]any, error) {
-	abs, _ := filepath.Abs(path)
-	raw, err := os.ReadFile(abs)
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -140,13 +153,21 @@ func evaluate(r rule, event map[string]any) (bool, error) {
 	return true, nil
 }
 
-var identRe = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_.-]*`)
+var (
+	identRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.-]*$`)
+	andSep  = regexp.MustCompile(`(?i)\s+and\s+`)
+)
 
+// parseAndCondition splits a SIGMA-HQ condition string into the
+// identifiers connected by AND. Case-insensitive on " and " (SIGMA-HQ
+// allows AND/and/And). A single identifier with no operator is treated
+// as a degenerate AND of one (valid SIGMA-HQ); empty input is rejected.
 func parseAndCondition(s string) []string {
-	tokens := strings.Split(s, " and ")
-	if len(tokens) == 0 {
+	s = strings.TrimSpace(s)
+	if s == "" {
 		return nil
 	}
+	tokens := andSep.Split(s, -1)
 	out := make([]string, 0, len(tokens))
 	for _, t := range tokens {
 		t = strings.TrimSpace(t)
@@ -171,7 +192,11 @@ func matchBlock(block map[string]any, event map[string]any) (bool, error) {
 		if !ok {
 			return false, nil
 		}
-		if !anyPatternMatches(eventValue, patterns, modifier) {
+		matched, err := anyPatternMatches(eventValue, patterns, modifier)
+		if err != nil {
+			return false, fmt.Errorf("field %q: %w", fieldKey, err)
+		}
+		if !matched {
 			return false, nil
 		}
 	}
@@ -210,43 +235,50 @@ func lookup(event map[string]any, field string) (string, bool) {
 	return stringify(v), true
 }
 
-func anyPatternMatches(eventValue string, patterns []string, modifier string) bool {
+func anyPatternMatches(eventValue string, patterns []string, modifier string) (bool, error) {
 	for _, pat := range patterns {
-		if patternMatches(eventValue, pat, modifier) {
-			return true
+		if pat == "" && (modifier == "" || modifier == "contains" || modifier == "startswith" || modifier == "endswith") {
+			return false, fmt.Errorf("empty pattern with modifier %q is a footgun: every value would match", modifier)
+		}
+		matched, err := patternMatches(eventValue, pat, modifier)
+		if err != nil {
+			return false, err
+		}
+		if matched {
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
-func patternMatches(value, pattern, modifier string) bool {
+func patternMatches(value, pattern, modifier string) (bool, error) {
 	switch modifier {
 	case "":
-		return value == pattern
+		return value == pattern, nil
 	case "contains":
-		return strings.Contains(value, pattern)
+		return strings.Contains(value, pattern), nil
 	case "startswith":
-		return strings.HasPrefix(value, pattern)
+		return strings.HasPrefix(value, pattern), nil
 	case "endswith":
-		return strings.HasSuffix(value, pattern)
+		return strings.HasSuffix(value, pattern), nil
 	case "re":
 		re, err := regexp.Compile(pattern)
 		if err != nil {
-			return false
+			return false, fmt.Errorf("compile regex %q: %w", pattern, err)
 		}
-		return re.MatchString(value)
+		return re.MatchString(value), nil
 	case "cidr":
 		prefix, err := netip.ParsePrefix(pattern)
 		if err != nil {
-			return false
+			return false, fmt.Errorf("parse cidr %q: %w", pattern, err)
 		}
 		addr, err := netip.ParseAddr(value)
 		if err != nil {
-			return false
+			return false, fmt.Errorf("parse ip %q: %w", value, err)
 		}
-		return prefix.Contains(addr)
+		return prefix.Contains(addr), nil
 	default:
-		return false
+		return false, fmt.Errorf("unsupported modifier %q (POC implements: contains, startswith, endswith, re, cidr; bare equality)", modifier)
 	}
 }
 

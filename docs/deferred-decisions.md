@@ -216,6 +216,22 @@ importable Sigma parser. The architecture mention was a documentation
 mistake. This ADR records the corrected candidate set; Story 1.2 also
 patches architecture.md line 332 to drop the SigLens reference.
 
+**Candidate inventory.** Three Go Sigma parsers were evaluated.
+
+| Library | Licence | Last commit / tag | API surface | Modifier coverage |
+|---|---|---|---|---|
+| `github.com/bradleyjkemp/sigma-go` | MIT | `v0.6.6`, 2025-05-15; semi-dormant since | AST exposed via `ast.go`; arbitrary keys per `Event` map | Standard SIGMA-HQ modifier set per upstream `modifiers.go` (verified to compile against the 2025-05 snapshot; per-modifier behavioural verification deferred to a fork-path revisit, see *Modifier completeness risk* below) |
+| `github.com/runreveal/sigmalite` | Apache 2.0 | commit `f180cb5`, 2025-09-18; active main, no tagged releases | `Rule.Extra` for unknown top-level fields; `MatchOptions.FieldResolver` for custom field lookup | Ten modifiers verified against the spike POC: `contains`, `all`, `startswith`, `endswith`, `windash`, `base64`, `base64offset`, `re`, `cidr`, `expand` |
+| `github.com/markuskont/go-sigma-rule-engine` | Apache 2.0 | `v0.3.0`, 2023-09-25; unmaintained for over two years | `Selector` interface; `Matcher` tree traversal via `Match(event)`; no custom field-resolver hook | Modifier set in upstream `match/`; explicitly omits aggregations and the `Near()` operator per the upstream README. Per-modifier coverage table deferred — the unmaintained-status finding triggered rejection before a full enumeration was warranted |
+
+Modifier-coverage rows for `sigma-go` and `markuskont/go-sigma-rule-engine`
+were not reverified at the spike-POC layer because both candidates were
+rejected on independent grounds (extension-surface fit and maintenance
+status, respectively). The chosen library's modifier set was verified
+against the POC's three fixtures plus the bench corpus; Story 1.15's
+per-modifier conformance suite will close the verification gap if the
+fallback path is ever reconsidered.
+
 **Decision.** Take the **wrap-existing-parser** path, building on
 `github.com/runreveal/sigmalite` (Apache 2.0; commit
 `f180cb50a6a1bba454874c844500bd79f4b30a41` of 2025-09-18; no tagged
@@ -329,9 +345,16 @@ The parser lands in `internal/decision/rules/parser/` under Story
   is non-nil, sigmalite uses ONLY the resolver (it does not fall back
   to `LogEntry.Fields`). The OLT field-resolver therefore must
   resolve every field referenced by every rule, not just `k8s.*`
-  fields. The wrap POC handles this by delegating non-`k8s.*` lookups
-  to the streaming-event map; Story 1.15 inherits this contract and
-  must test it against rules that reference exotic field names.
+  fields. The wrap POC handles this by maintaining two lowered-key
+  indices built once at fixture load: one for `k8s.*` posture
+  fields, one for streaming-event fields. Lookups are O(1) and
+  case-insensitive on field names. The dialect spec uses lowercase
+  exclusively, so production-side rules and events are expected to
+  match in case; the resolver folds case as a forgiving operator
+  affordance, and the loader rejects fixtures whose source keys
+  collide on case so the choice cannot mask data-quality issues.
+  Story 1.15 inherits this contract and must test it against rules
+  that reference exotic field names.
 - *Strict-superset verification.* The "every SIGMA-HQ rule remains
   parseable" claim is asserted but not yet exercised against a real
   community-rule corpus. Story 1.15 must run a regression batch
@@ -341,25 +364,30 @@ The parser lands in `internal/decision/rules/parser/` under Story
 **Performance rough cut.**
 
 Measured on the wrap-path POC (`spikes/sigma-parser/wrap/main.go`)
-running `--bench`: 100-iteration warm-up plus 1000 timed iterations,
-each iteration evaluating one fixture against a 10-rule corpus
-(`OLT-IMPACT-005` plus nine `id`-mutated duplicates).
+running `--bench`: 100-iteration warm-up plus 1000 timed iterations
+per fixture, each iteration evaluating one fixture against a 10-rule
+corpus (`OLT-IMPACT-005` plus nine `id`-mutated duplicates with
+distinct IDs). The bench reports per-fixture stats so match-path
+latency (positive fixture, full AND walk) and short-circuit-miss
+latency (negative fixtures, early exit) are not conflated. The
+resolver and `MatchOptions` are hoisted outside the timed loop so the
+numbers reflect rule evaluation, not harness allocation. Percentile
+indices use `(n-1)*99/100` so p99 of 1000 samples reads the 990th
+position (zero-indexed 989).
 
-| Metric | Value |
-|---|---|
-| Total wall-clock (1000 iterations) | 100.27 ms |
-| Min per iteration | 63.08 µs |
-| Median per iteration | 85.46 µs |
-| p99 per iteration | 211.54 µs |
-| Max per iteration | 1.06 ms |
+| Fixture | Total (1000 iter) | Min | Median | p99 | Max |
+|---|---|---|---|---|---|
+| positive (full match) | 50.72 ms | 38.6 µs | 39.7 µs | 93.1 µs | 153.9 µs |
+| negative_namespace (early exit) | 37.53 ms | 30.9 µs | 31.7 µs | 69.7 µs | 105.2 µs |
+| negative_process (mid exit) | 41.28 ms | 34.2 µs | 34.8 µs | 77.3 µs | 104.3 µs |
 
 Hardware: Intel Core i7-10510U @ 1.80 GHz, Linux 6.17.0 x86_64.
-Toolchain: Go 1.25.9 (linux/amd64), inside a `golang:1.25-alpine`
+Toolchain: Go 1.25.0 (linux/amd64), inside a `golang:1.25-alpine`
 container. This is a sanity check, not the NFR3 100 ms p99
 contract; the production gate is Story 1.15's to satisfy under
 realistic load (a 50-rule corpus, full EvidencePackage matching,
-NATS-driven concurrency). Single-digit-microsecond per-rule
-matching at ten rules is comfortable headroom; flag in Story 1.15
+NATS-driven concurrency). Match-path p99 of 93.1 µs at 10 rules
+gives roughly 1000x headroom under the NFR3 gate; flag in Story 1.15
 if scaling to 50 rules introduces non-linear overhead.
 
 **Hand-off to Story 1.15.**

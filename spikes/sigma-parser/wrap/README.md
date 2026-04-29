@@ -12,8 +12,14 @@ Story 1.2 spike. Demonstrates that the OLT dialect can ride on top of
   need to fork the upstream YAML schema.
 - Kubernetes-native field references (`k8s.pod.namespace`,
   `k8s.workload.owner_kind`, etc.) resolve through a custom
-  `sigma.FieldResolver` that splits the lookup space into a streaming-event
-  half (`process.*`, `network.*`) and a workload-posture half (`k8s.*`).
+  `sigma.FieldResolver` that splits the lookup space into a
+  streaming-event half (`process.*`, `network.*`) and a workload-posture
+  half (`k8s.*`). Both halves are pre-built lowered-key indices so
+  resolver lookups are O(1) and case-insensitive on field names.
+- Dialect MUSTs are enforced at parse time: missing or empty `attack:`
+  list, malformed ATT&CK IDs, and severity values outside `[0, 100]`
+  all fail to load. A rule without `severity:` falls back to the
+  level-table mapping per `docs/sigma-extensions.md` §8.
 - The matching path produces an `internal/schema.RuleMatch`-shaped struct
   so Story 1.15 inherits the exact return type.
 
@@ -44,12 +50,15 @@ If any fixture prints `FAIL`, the POC exits non-zero.
 go run . --bench
 ```
 
-Adds a 100-iteration warm-up plus 1000 timed iterations of one fixture
+Adds a 100-iteration warm-up plus 1000 timed iterations per fixture
 against a 10-rule corpus (OLT-IMPACT-005 plus nine `id`-mutated
-duplicates) and prints `total`, `min`, `median`, `p99`, `max`. The
-recorded numbers feed ADR-2026-04-28-01's "Performance rough cut"
-section. This is a sanity check, not the NFR3 100 ms p99 contract;
-that gate is Story 1.15's.
+duplicates with distinct IDs). Each fixture is timed separately so
+match-path latency and short-circuit-miss latency are reported on
+their own rows. The resolver and `MatchOptions` are hoisted outside
+the timed loop so the numbers reflect rule evaluation, not harness
+allocation. The recorded numbers feed ADR-2026-04-28-01's
+"Performance rough cut" section. This is a sanity check, not the
+NFR3 100 ms p99 contract; that gate is Story 1.15's.
 
 ## Failure mode if the wrap path were rejected
 
