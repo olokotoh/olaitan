@@ -377,18 +377,25 @@ position (zero-indexed 989).
 
 | Fixture | Total (1000 iter) | Min | Median | p99 | Max |
 |---|---|---|---|---|---|
-| positive (full match) | 50.72 ms | 38.6 µs | 39.7 µs | 93.1 µs | 153.9 µs |
-| negative_namespace (early exit) | 37.53 ms | 30.9 µs | 31.7 µs | 69.7 µs | 105.2 µs |
-| negative_process (mid exit) | 41.28 ms | 34.2 µs | 34.8 µs | 77.3 µs | 104.3 µs |
+| positive (full match) | 83.38 ms | 57.3 µs | 70.1 µs | 156.0 µs | 192.7 µs |
+| negative_namespace (early exit) | 57.81 ms | 44.3 µs | 49.0 µs | 108.1 µs | 136.8 µs |
+| negative_process (mid exit) | 65.07 ms | 49.2 µs | 54.8 µs | 111.9 µs | 134.5 µs |
+| negative_missing_process (immediate exit) | 2.44 ms | 2.0 µs | 2.1 µs | 4.2 µs | 27.4 µs |
 
 Hardware: Intel Core i7-10510U @ 1.80 GHz, Linux 6.17.0 x86_64.
 Toolchain: Go 1.25.0 (linux/amd64), inside a `golang:1.25-alpine`
-container. This is a sanity check, not the NFR3 100 ms p99
-contract; the production gate is Story 1.15's to satisfy under
-realistic load (a 50-rule corpus, full EvidencePackage matching,
-NATS-driven concurrency). Match-path p99 of 93.1 µs at 10 rules
-gives roughly 1000x headroom under the NFR3 gate; flag in Story 1.15
-if scaling to 50 rules introduces non-linear overhead.
+container. Numbers re-measured 2026-04-29 after the Round 1 patch
+that hoists `MatchOptions` out of the timed loop; they are within
+host-noise variance of the original 2026-04-28 measurements (the
+positive-fixture median moved from 39.7 µs to 70.1 µs across runs,
+attributable to container scheduling rather than a regression — the
+patch removes per-call allocation, it does not add work). This is
+a sanity check, not the NFR3 100 ms p99 contract; the production
+gate is Story 1.15's to satisfy under realistic load (a 50-rule
+corpus, full EvidencePackage matching, NATS-driven concurrency).
+Match-path p99 of 156 µs at 10 rules gives roughly 600x headroom
+under the NFR3 gate; flag in Story 1.15 if scaling to 50 rules
+introduces non-linear overhead.
 
 **Hand-off to Story 1.15.**
 

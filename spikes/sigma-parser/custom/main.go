@@ -64,6 +64,9 @@ func run() error {
 	if err := lintID(r.ID); err != nil {
 		return fmt.Errorf("rule id: %w", err)
 	}
+	if err := validate(r); err != nil {
+		return fmt.Errorf("validate rule: %w", err)
+	}
 	fmt.Printf("[custom] parsed rule id=%s title=%q attack=%v severity=%d\n",
 		r.ID, r.Title, r.Attack, r.Severity)
 
@@ -307,9 +310,35 @@ func stringify(v any) string {
 
 var oltIDRegex = regexp.MustCompile(`^OLT-(EXEC|NET|FILE|PRIV|IMPACT|RECON|PERSIST|EXFIL|CRED|LATERAL)-[0-9]{3}$`)
 
+// attackIDRegex enforces the OLT dialect §4 grammar for ATT&CK
+// technique IDs: base techniques (Tdddd) and sub-techniques
+// (Tdddd.ddd). Mirrored verbatim in the wrap POC.
+var attackIDRegex = regexp.MustCompile(`^T[0-9]{4}(\.[0-9]{3})?$`)
+
 func lintID(id string) error {
 	if !oltIDRegex.MatchString(id) {
 		return fmt.Errorf("rule id %q does not match %s", id, oltIDRegex.String())
+	}
+	return nil
+}
+
+// validate enforces the dialect MUSTs documented in
+// docs/sigma-extensions.md §4 (attack: required, non-empty, ID format)
+// and §8 (severity range [0, 100]). The custom POC has no Decoder
+// access (yaml.v3 struct unmarshalling collapses missing/null/zero
+// into the int default), so explicit-null severity detection is
+// scoped to the wrap POC's parseOLTExtras; here we enforce the range.
+func validate(r rule) error {
+	if len(r.Attack) == 0 {
+		return fmt.Errorf("attack: must be a non-empty list")
+	}
+	for _, id := range r.Attack {
+		if !attackIDRegex.MatchString(id) {
+			return fmt.Errorf("attack: %q does not match %s", id, attackIDRegex.String())
+		}
+	}
+	if r.Severity < 0 || r.Severity > 100 {
+		return fmt.Errorf("severity: %d is outside [0, 100]", r.Severity)
 	}
 	return nil
 }

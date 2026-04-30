@@ -220,12 +220,18 @@ func stringify(v any) string {
 	}
 }
 
-// evaluate runs the rule's detection against the fixture's pre-built
-// resolver. Allocating the MatchOptions and resolver outside the timed
-// hot loop keeps the AC5 numbers free of harness allocation noise.
-func evaluate(rule *sigma.Rule, entry *sigma.LogEntry, resolver *oltResolver) bool {
-	opts := &sigma.MatchOptions{FieldResolver: resolver}
+// evaluate runs the rule's detection against a pre-built MatchOptions.
+// The opts pointer is built once at fixture load (see buildOpts) and
+// reused for the lifetime of the run so the AC5 numbers measure rule
+// evaluation rather than per-call MatchOptions allocation. The ADR's
+// Performance section makes this hoisting claim explicitly; if you
+// change the signature you must also update that claim.
+func evaluate(rule *sigma.Rule, entry *sigma.LogEntry, opts *sigma.MatchOptions) bool {
 	return rule.Detection.Matches(entry, opts)
+}
+
+func buildOpts(resolver *oltResolver) *sigma.MatchOptions {
+	return &sigma.MatchOptions{FieldResolver: resolver}
 }
 
 type fixture struct {
@@ -262,7 +268,7 @@ func runFixtures(rule *sigma.Rule, extras oltExtras) (int, error) {
 		if err != nil {
 			return pass, fmt.Errorf("load %s: %w", fx.Name, err)
 		}
-		got := evaluate(rule, entry, resolver)
+		got := evaluate(rule, entry, buildOpts(resolver))
 		status := "PASS"
 		if got != fx.WantMatch {
 			status = "FAIL"
@@ -295,8 +301,8 @@ func runBench(originalYAML []byte) error {
 	}
 
 	type loaded struct {
-		entry    *sigma.LogEntry
-		resolver *oltResolver
+		entry *sigma.LogEntry
+		opts  *sigma.MatchOptions
 	}
 	loadedFixtures := make([]loaded, len(fixtures))
 	for i, fx := range fixtures {
@@ -304,13 +310,13 @@ func runBench(originalYAML []byte) error {
 		if err != nil {
 			return err
 		}
-		loadedFixtures[i] = loaded{entry: entry, resolver: resolver}
+		loadedFixtures[i] = loaded{entry: entry, opts: buildOpts(resolver)}
 	}
 
 	for i := 0; i < warmup; i++ {
 		idx := i % len(fixtures)
 		for _, r := range corpus {
-			_ = evaluate(r, loadedFixtures[idx].entry, loadedFixtures[idx].resolver)
+			_ = evaluate(r, loadedFixtures[idx].entry, loadedFixtures[idx].opts)
 		}
 	}
 
@@ -321,7 +327,7 @@ func runBench(originalYAML []byte) error {
 		for j := 0; j < n; j++ {
 			start := time.Now()
 			for _, r := range corpus {
-				_ = evaluate(r, loadedFixtures[i].entry, loadedFixtures[i].resolver)
+				_ = evaluate(r, loadedFixtures[i].entry, loadedFixtures[i].opts)
 			}
 			samples[j] = time.Since(start)
 		}

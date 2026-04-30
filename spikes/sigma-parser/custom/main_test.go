@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -116,6 +117,61 @@ func TestParseAndCondition(t *testing.T) {
 	}
 	if got := parseAndCondition("(a and b)"); got != nil {
 		t.Fatalf("parseAndCondition should reject parentheses: %v", got)
+	}
+}
+
+// TestValidateRejectsDialectViolations guards the dialect MUSTs in
+// docs/sigma-extensions.md §4 (attack required, non-empty, ID format)
+// and §8 (severity range [0, 100]). A rule that violates any MUST
+// must fail to load so Story 1.15 inherits a clean contract from the
+// custom-parser fallback path as well as from the wrap path.
+func TestValidateRejectsDialectViolations(t *testing.T) {
+	cases := []struct {
+		name        string
+		r           rule
+		errContains string
+	}{
+		{
+			name:        "missing_attack",
+			r:           rule{Attack: nil, Severity: 50},
+			errContains: "attack",
+		},
+		{
+			name:        "empty_attack",
+			r:           rule{Attack: []string{}, Severity: 50},
+			errContains: "non-empty",
+		},
+		{
+			name:        "malformed_attack_id",
+			r:           rule{Attack: []string{"MITRE-1496"}, Severity: 50},
+			errContains: "does not match",
+		},
+		{
+			name:        "severity_above_max",
+			r:           rule{Attack: []string{"T1496"}, Severity: 200},
+			errContains: "[0, 100]",
+		},
+		{
+			name:        "severity_below_min",
+			r:           rule{Attack: []string{"T1496"}, Severity: -1},
+			errContains: "[0, 100]",
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			err := validate(tc.r)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.errContains)
+			}
+			if !strings.Contains(err.Error(), tc.errContains) {
+				t.Fatalf("expected error containing %q, got: %v", tc.errContains, err)
+			}
+		})
+	}
+	// Sub-technique form must be accepted.
+	if err := validate(rule{Attack: []string{"T1059.004"}, Severity: 50}); err != nil {
+		t.Fatalf("sub-technique T1059.004 should be valid, got: %v", err)
 	}
 }
 
