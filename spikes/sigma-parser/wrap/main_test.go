@@ -58,7 +58,7 @@ func TestFixturesAgainstRule(t *testing.T) {
 			if err != nil {
 				t.Fatalf("load fixture: %v", err)
 			}
-			got := evaluate(rule, entry, resolver)
+			got := evaluate(rule, entry, buildOpts(resolver))
 			if got != tc.want {
 				t.Fatalf("evaluate %s: want=%v got=%v", tc.name, tc.want, got)
 			}
