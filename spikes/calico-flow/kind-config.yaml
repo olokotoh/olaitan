@@ -1,0 +1,18 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: olaitan-flow-spike
+networking:
+  # Calico replaces kindnetd. The Tigera operator installs the CNI
+  # plugin once the Installation CR is applied; bootstrap pods run
+  # without a network until then, which is expected.
+  disableDefaultCNI: true
+  podSubnet: "192.168.0.0/16"
+  serviceSubnet: "10.96.0.0/16"
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "olaitan.io/spike=calico-flow"
