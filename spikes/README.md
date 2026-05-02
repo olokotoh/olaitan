@@ -23,3 +23,4 @@ Throwaway investigation code that backs research-spike stories.
 |---|---|---|---|
 | `sigma-parser/` | 1.2 | Choose the OLT Sigma parser strategy: wrap an existing Go Sigma parser vs. fork vs. hand-roll a custom parser. | ADR-2026-04-28-01 |
 | `calico-flow/` | 1.3 | Choose the Calico flow record export mechanism: Goldmane gRPC API vs. custom collector sidecar vs. Falco-syscalls fallback vs. FR4 descope. | ADR-2026-04-30-01 |
+| `criu-checkpoint/` | 1.4 | Determine whether CRIU container checkpointing via the kubelet API is feasible on the project's pinned K8s 1.29 / containerd 1.7 / runc 1.1 substrate. Outcome: infeasible by default; Story 4.2 ships the documented `kubectl logs --previous` + debug-pod filesystem-tar fallback. | ADR-2026-05-02-01 |

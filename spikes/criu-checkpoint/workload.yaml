@@ -1,0 +1,43 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: criu-spike
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: busybox-target
+  namespace: criu-spike
+  labels:
+    app.kubernetes.io/name: criu-spike-target
+spec:
+  restartPolicy: Never
+  containers:
+    - name: busybox
+      image: busybox:1.36
+      command: ["/bin/sh", "-c"]
+      # The shell loop writes a marker line every second so the checkpoint
+      # captures non-trivial process state (file descriptors, stdout buffer,
+      # accumulated counter in shell variable space) without needing a real
+      # application. Sufficient for AC4's privacy-scan input fixture.
+      args:
+        - |
+          i=0
+          while true; do
+            echo "tick $i $(date -u +%FT%TZ) secret-marker=should-not-be-cleartext"
+            i=$((i+1))
+            sleep 1
+          done
+      env:
+        - name: APP_TOKEN
+          value: "spike-injected-token-do-not-use-in-prod"
+        - name: SLEEP_INTERVAL_SECONDS
+          value: "1"
+      resources:
+        requests:
+          cpu: "10m"
+          memory: "16Mi"
+        limits:
+          cpu: "100m"
+          memory: "64Mi"
