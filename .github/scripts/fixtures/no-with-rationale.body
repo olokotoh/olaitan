@@ -1,0 +1,19 @@
+## Summary
+
+Docs-only typo fix.
+
+## FRs Addressed
+
+(none)
+
+## Traceability
+
+traceability_updated: no
+
+### Traceability rationale
+
+Docs-only PR, fixes a typo in README. No FR or NFR claim is affected.
+
+## Testing Done
+
+n/a, prose change.

@@ -106,3 +106,33 @@ jobs:
             olaitan\ *) ;;
             *) echo "smoke: unexpected version output: $out" >&2; exit 1 ;;
           esac
+
+  # Traceability matrix gate (NFR42). Runs only on pull_request events
+  # because a push to main has no PR body to read. The gate enforces the
+  # matrix-or-rationale rule: every PR must either update
+  # docs/traceability.md (with `traceability_updated: yes`) or carry a
+  # non-empty rationale (with `traceability_updated: no`). The script is
+  # self-tested by .github/scripts/check-traceability.bats; the bats
+  # tests run before the live gate so a broken script never silently
+  # passes the gate.
+  traceability:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The live gate diffs against origin/main, so the merge-base
+          # must be reachable. The other jobs do not need full history.
+          fetch-depth: 0
+
+      - name: Install bats
+        run: sudo apt-get update && sudo apt-get install -y bats
+
+      - name: Run gate self-tests
+        run: bats .github/scripts/check-traceability.bats
+
+      - name: Check traceability matrix
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: bash .github/scripts/check-traceability.sh
