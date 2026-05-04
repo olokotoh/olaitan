@@ -1,0 +1,23 @@
+## Summary
+
+Adds row to matrix for c4.2-foo claim.
+
+## FRs Addressed
+
+FR99
+
+## Traceability
+
+traceability_updated: yes
+
+### Traceability rationale
+
+This PR adds the c4.2-foo claim row.
+
+## Testing Done
+
+go test ./...
+
+## Checklist
+
+- [x] Tests pass

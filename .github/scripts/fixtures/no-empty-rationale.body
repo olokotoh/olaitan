@@ -1,0 +1,21 @@
+## Summary
+
+Forgot rationale.
+
+## FRs Addressed
+
+(none)
+
+## Traceability
+
+traceability_updated: no
+
+### Traceability rationale
+
+<!-- One or more lines explaining why the matrix was or was not updated.
+     Required when traceability_updated: yes (briefly state the claim added).
+     Required when traceability_updated: no (state which NFR or class of change exempts this PR). -->
+
+## Testing Done
+
+n/a
