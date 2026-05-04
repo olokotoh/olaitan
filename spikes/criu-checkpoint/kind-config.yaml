@@ -11,7 +11,10 @@
 # at the apiserver level for cluster-wide consistency.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
-name: olaitan-criu-spike
+# Cluster name is supplied at create-time via `kind create cluster --name $(CLUSTER_NAME)`
+# in the Makefile so the Makefile remains the single source of truth and the
+# downstream `docker exec $(CLUSTER_NAME)-control-plane ...` and harness
+# `-node=$(CLUSTER_NAME)-control-plane` references stay consistent.
 featureGates:
   ContainerCheckpoint: true
 nodes:

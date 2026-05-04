@@ -52,6 +52,9 @@ Prereqs on the host:
 - kind v0.27.0 or newer (which bundles containerd 2.x in the node
   image)
 - kubectl (any 1.29-skew-compatible client)
+- jq (used by `make cluster` to print the kubelet feature-gate map
+  from the configz response, matching the verification recipe in
+  the Story 1.4 spec Task 2.2)
 - Go 1.22+
 
 ```bash

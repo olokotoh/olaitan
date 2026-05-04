@@ -13,6 +13,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -62,11 +63,12 @@ func postCheckpoint(ctx context.Context, client *http.Client, target string) run
 		return runResult{wallClock: time.Since(start), err: err}
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, readErr := io.ReadAll(resp.Body)
 	return runResult{
 		httpStatus: resp.StatusCode,
 		wallClock:  time.Since(start),
 		body:       strings.TrimSpace(string(body)),
+		err:        readErr,
 	}
 }
 
@@ -113,8 +115,9 @@ func main() {
 	defer cancel()
 
 	proxyCmd := exec.CommandContext(ctx, "kubectl", "proxy", "--port="+strconv.Itoa(*proxyPort))
+	var proxyStderr bytes.Buffer
 	proxyCmd.Stdout = io.Discard
-	proxyCmd.Stderr = io.Discard
+	proxyCmd.Stderr = &proxyStderr
 	if err := proxyCmd.Start(); err != nil {
 		log.Fatalf("failed to start kubectl proxy: %v", err)
 	}
@@ -124,7 +127,14 @@ func main() {
 	}()
 
 	if err := waitForProxy(ctx, proxyBase, 5*time.Second); err != nil {
-		log.Fatalf("proxy not ready: %v", err)
+		// Cancel and wait so the stderr-copy goroutine completes before we read the buffer.
+		cancel()
+		_ = proxyCmd.Wait()
+		stderr := strings.TrimSpace(proxyStderr.String())
+		if stderr == "" {
+			log.Fatalf("proxy not ready: %v (no stderr captured)", err)
+		}
+		log.Fatalf("proxy not ready: %v\nkubectl proxy stderr:\n%s", err, stderr)
 	}
 
 	target := kubeletCheckpointURL(proxyBase, *node, *namespace, *pod, *container)
@@ -152,7 +162,7 @@ func main() {
 	fmt.Println()
 	fmt.Printf("Summary: %d/%d successful checkpoints over %d runs.\n", successes, *runs, *runs)
 	if successes == 0 {
-		fmt.Println("Outcome: FAIL — no successful checkpoint. See ADR-2026-05-DD-NN for the documented fallback path.")
+		fmt.Println("Outcome: FAIL — no successful checkpoint. See ADR-2026-05-02-01 for the documented fallback path.")
 		os.Exit(2)
 	}
 	if successes < *runs {

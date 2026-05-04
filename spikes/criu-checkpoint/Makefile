@@ -25,7 +25,7 @@ spike: cluster workload harness
 
 cluster:
 	@echo "==> Bringing up kind cluster: $(CLUSTER_NAME)"
-	kind create cluster --config kind-config.yaml --wait 2m
+	kind create cluster --name $(CLUSTER_NAME) --config kind-config.yaml --wait 2m
 	@echo "==> Installing CRIU inside the kind node"
 	docker exec $(CLUSTER_NAME)-control-plane apt-get update -qq
 	docker exec $(CLUSTER_NAME)-control-plane apt-get install -y -qq criu
@@ -33,7 +33,7 @@ cluster:
 	-docker exec $(CLUSTER_NAME)-control-plane criu check --all || true
 	@echo "==> Verifying ContainerCheckpoint feature gate"
 	kubectl get --raw /api/v1/nodes/$(CLUSTER_NAME)-control-plane/proxy/configz \
-		| python3 -c 'import json,sys; print(json.load(sys.stdin)["kubeletconfig"].get("featureGates",{}))'
+		| jq '.kubeletconfig.featureGates'
 
 workload:
 	@echo "==> Deploying test workload"
@@ -43,6 +43,7 @@ workload:
 harness:
 	@echo "==> Running Go harness (3 checkpoint attempts, AC5 timing)"
 	go run . \
+		-node=$(CLUSTER_NAME)-control-plane \
 		-namespace=$(WORKLOAD_NS) \
 		-pod=$(WORKLOAD_POD) \
 		-container=$(WORKLOAD_CON) \

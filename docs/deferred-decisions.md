@@ -743,21 +743,52 @@ The Go harness URL-construction logic (`kubeletCheckpointURL`) maps
 directly to the production controller's URL builder if Path B is
 taken.
 
-**Chapter 5 (Conclusion / Future Work) implications.**
+**Thesis (Ch3 + Ch5) implications.**
 
-The thesis Chapter 1 §1.6 currently describes the forensic
-preservation feature without committing to a memory-image baseline.
-No edit needed here. Chapter 5 (Future Work) gains an entry along
-the lines of: "Memory-image forensics (CRIU container checkpoint)
-deferred pending substrate-version uplift to containerd 2.0+; the
-fallback path captures kill-chain evidence sufficient for the
-DFIR rubric (RQ5) but cannot reconstruct in-memory adversary
-state. Engineering scope to enable: a kernel-vs-CRIU compatibility
-gate (`criu check --all` on every node), the substrate bumps listed
-in ADR-2026-05-02-01 Path B prerequisites, and a binary-aware
+Chapter 1 §1.6 currently describes the forensic preservation
+feature without committing to a memory-image baseline. No edit
+needed there.
+
+Chapter 3 *does* commit to memory-image forensics in two places
+that contradict this ADR's Path A default and must be revised once
+Story 4.2 implements the fallback:
+
+- *§3.7.1 (state table row, `chapter-3-methodology.md:160`)*
+  currently reads "pod state preserved via container checkpoint
+  (CRI-O CRIU), then pod deleted." Suggested replacement:
+  "the doomed pod's logs, manifest, recent events, and writable-
+  layer filesystem are captured to S3 by the `ForensicsController`
+  before pod deletion; memory-image checkpoint via CRIU is
+  conditional on a substrate uplift — see ADR-2026-05-02-01."
+- *§3.7.4 ("Forensic State Preservation",
+  `chapter-3-methodology.md:186`)* currently reads
+  "the `ForensicsController` invokes the container runtime's
+  checkpoint API (CRIU via CRI-O or containerd) to capture a
+  memory and filesystem snapshot of the running container before
+  deletion." Suggested replacement: replace the CRIU-centric
+  description with the fallback's capture set (`kubectl logs
+  --previous` for each container, a debug-pod filesystem-tar of
+  the pod's writable layers, pod spec/status/events via the K8s
+  API), retain the "stored in a configurable S3-compatible object
+  store … KMS encryption (NFR17), content-addressed by SHA-256
+  (FR45)" wording, and add a closing sentence noting that memory-
+  image checkpoint is a Path B option conditional on the
+  substrate prerequisites in ADR-2026-05-02-01.
+
+Chapter 5 (Future Work) gains an entry along the lines of:
+"Memory-image forensics (CRIU container checkpoint) deferred
+pending substrate-version uplift to containerd 2.0+; the fallback
+path captures kill-chain evidence sufficient for the DFIR rubric
+(RQ5) but cannot reconstruct in-memory adversary state.
+Engineering scope to enable: a kernel-vs-CRIU compatibility gate
+(`criu check --all` on every node), the substrate bumps listed in
+ADR-2026-05-02-01 Path B prerequisites, and a binary-aware
 forensic redactor for archive content if regulatory contexts
-require redaction before persistence." Story 5.10 owns the actual
-text edit; this ADR carries the reference point.
+require redaction before persistence."
+
+Story 5.10 owns the actual edits in both Ch3 §3.7.1 / §3.7.4 and
+the Ch5 Future Work entry; this ADR carries the reference points
+and the wording seeds.
 
 **Follow-ups.**
 
@@ -775,5 +806,6 @@ text edit; this ADR carries the reference point.
 - Story 1.5 (traceability matrix bootstrap) records Story 1.4 as
   *informing* FR36 — satisfaction lands in Story 4.2 (Path A or
   Path B depending on the project owner's choice).
-- Story 5.10 (Chapter 5 Conclusion / Future Work) inherits the
-  Future Work entry described above.
+- Story 5.10 (thesis revision pass) inherits both the Ch3 §3.7.1
+  / §3.7.4 contradictions flagged above and the Ch5 Future Work
+  entry described above.
