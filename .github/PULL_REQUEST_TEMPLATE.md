@@ -12,9 +12,12 @@ traceability_updated: <!-- yes | no. yes if docs/traceability.md is updated in t
 
 ### Traceability rationale
 
-<!-- One or more lines explaining why the matrix was or was not updated.
-     Required when traceability_updated: yes (briefly state the claim added).
-     Required when traceability_updated: no (state which NFR or class of change exempts this PR). -->
+<!-- One or more lines explaining the claim added (when yes) or why this
+     PR adds no claim (when no). Required when traceability_updated: no
+     (the CI gate fails on an empty rationale). Encouraged when
+     traceability_updated: yes (briefly state the claim added) so
+     reviewers can find the new row at a glance, but the gate does not
+     enforce it on the yes path. -->
 
 ## Testing Done
 

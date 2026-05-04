@@ -42,8 +42,9 @@ fi
 pr_body=$(printf '%s' "$pr_body" | tr -d '\r')
 changed_files=$(printf '%s' "$changed_files" | tr -d '\r')
 
-# Strip HTML comments from $1, including comments that span multiple lines.
-# Keeps surrounding text and writes the result to stdout.
+# Strip HTML comments from stdin, including comments that span multiple
+# lines. Keeps surrounding text and writes the result to stdout.
+# Invoked as `printf '%s' "$x" | strip_html_comments`, not `strip_html_comments "$x"`.
 strip_html_comments() {
   awk '
     BEGIN { in_comment = 0 }
