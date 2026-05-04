@@ -468,3 +468,344 @@ path becomes unviable.
   for `github.com/runreveal/sigmalite` when Story 1.15 actually
   pulls the dependency into the main module. This story keeps the
   dependency confined to `spikes/sigma-parser/wrap/go.mod`.
+
+---
+
+## ADR-2026-05-02-01: CRIU forensic checkpoint feasibility
+
+**Status:** Accepted.
+
+**Date:** 2026-05-02.
+
+**Context.** Story 4.2 (CRIU forensic checkpoint controller or
+documented fallback) is the implementation half of FR36 (forensic
+preservation of `PRESERVED+KILLED` workloads). The architecture
+document defers the CRIU client choice to a feasibility spike
+(`architecture.md:117`, `:205`, `:217`). Story 1.4 is that spike,
+time-boxed to one to one-and-a-half days. The spike must answer
+whether the kubelet's `ContainerCheckpoint` API can be used to
+implement Story 4.2's `PRESERVED+KILLED` forensic-capture path on
+the project's pinned Kubernetes 1.29 (`architecture.md:79`) /
+containerd 1.7 / runc 1.1 (`architecture.md:80`) substrate, and if
+not, whether the documented fallback (`kubectl logs --previous` plus
+a debug-pod filesystem-tar snapshot) is sufficient.
+
+**Decision.** **Story 4.2 ships the documented fallback path
+(`internal/response/forensics/kubectl_fallback.go`) by default.**
+The spike identifies two independent infeasibility blockers on the
+pinned substrate, either of which is sufficient on its own to
+require either the fallback or substrate-version bumps that the
+project owner has not yet approved.
+
+**Why this direction.**
+
+- *Runtime stack blocker (project pin).* containerd 1.7 does not
+  implement the `CheckpointContainer` CRI RPC. The implementation
+  was wired in [containerd/containerd#6965](https://github.com/containerd/containerd/pull/6965),
+  merged 2024-03-07 and assigned to the **containerd 2.0 milestone**.
+  The change has not been back-ported to the 1.7.x line. The kubelet
+  delegates the `POST /checkpoint/...` request to the CRI runtime
+  via `CheckpointContainer`; on a containerd 1.7 cluster, the call
+  surfaces as "unknown method" at the CRI layer (see also the K8s
+  upstream tracking issue
+  [kubernetes/kubernetes#113621](https://github.com/kubernetes/kubernetes/issues/113621)
+  for the equivalent symptom on earlier containerd lines).
+- *Kernel/CRIU compatibility blocker (substrate).* Even on the
+  upstream stack inside this spike's kind cluster (containerd 2.0.2,
+  runc 1.2.3, CRIU 3.17.1 from Debian bookworm), CRIU fails to
+  initialise on Linux 6.17.0 with `vdso: Unexpected rt vDSO area
+  bounds` (full log in `spikes/criu-checkpoint/README.md`). The
+  kernel's vDSO layout is newer than CRIU 3.17.1 supports. The
+  project's deployment substrate is Ubuntu 22.04 LTS, which ships
+  kernel 5.15 (LTS) or 6.5 (HWE) — both of which CRIU 3.16.1-2
+  (the jammy package) supports — so this blocker would not fire
+  in production on the declared substrate. It nevertheless surfaces
+  a kernel-vs-CRIU compatibility risk that Story 4.2 inherits if
+  the deployment substrate ever drifts forward (HWE rolls, kernel
+  6.x backports, Ubuntu 24.04 migration).
+
+**Empirical evidence (this spike).** Three timed kubelet checkpoint
+API calls against `criu-spike/busybox-target/busybox` on a kind
+cluster pinned to `kindest/node:v1.29.14` with the
+`ContainerCheckpoint` feature gate enabled at both apiserver and
+kubelet levels:
+
+| Run | HTTP | Wall-clock | Outcome |
+|---|---|---|---|
+| 1 | 500 | 140.5 ms | FAIL at CRIU vDSO init |
+| 2 | 500 | 121.9 ms | FAIL at CRIU vDSO init |
+| 3 | 500 | 136.9 ms | FAIL at CRIU vDSO init |
+
+The 121-140 ms range is the round-trip to the CRIU initialisation
+failure; no checkpoint archive is produced. The full
+`criu-dump.log` is excerpted in `spikes/criu-checkpoint/README.md`.
+The ContainerCheckpoint feature gate verified active on the kubelet
+via `/api/v1/nodes/.../proxy/configz` returning `"ContainerCheckpoint":
+true`. The Go harness, `go.mod`, unit tests, and Makefile are
+checked in under `spikes/criu-checkpoint/` for reproducibility; they
+will be deleted when Story 4.2 (or the fallback variant) merges and
+this ADR remains the durable record.
+
+**Kubernetes and runtime compatibility findings.**
+
+| Component | Project pin | Spike measured | Required for kubelet checkpoint API |
+|---|---|---|---|
+| Kubernetes | 1.29 | 1.29.14 (matches) | API alpha at 1.25-1.29, beta at 1.30+; alpha requires `feature-gates: ContainerCheckpoint=true` on both apiserver and kubelet |
+| containerd | 1.7 | 2.0.2 (skewed forward in kind v0.27.0) | **2.0+** for `CheckpointContainer` CRI RPC (PR #6965) |
+| runc | 1.1 | 1.2.3 | 1.1.0+ for `runc checkpoint` with CRIU |
+| CRIU | unpinned (production-substrate-supplied) | 3.17.1-2 (Debian bookworm); 3.16.1-2 ships in Ubuntu 22.04 jammy/universe | Linux ≥3.11 with `CONFIG_CHECKPOINT_RESTORE`; 3.17.1 incompatible with kernel 6.17.0 vDSO layout |
+
+The project's eval-substrate pin (Ubuntu 22.04, CRIU 3.16.1-2,
+kernel 5.15 LTS or 6.5 HWE) clears the kernel/CRIU blocker but not
+the containerd 1.7 blocker.
+
+**Checkpoint performance.** Empirical wall-clock-to-failure on this
+host's kind cluster ranges 121-140 ms — these numbers reflect a CRIU
+initialisation failure, not a successful checkpoint, and **do not**
+inform the epics target of <5 s per typical workload
+(`epics.md:546`) or NFR7's 10 s p99 for the full checkpoint-to-S3-
+to-pod-delete cycle (`epics.md:1809-1810`). Story 4.2 must measure
+checkpoint time on a substrate where CRIU initialises successfully;
+no project-relevant performance data was obtainable in this spike.
+
+**Privacy and security findings.** AC4's empirical
+checkpoint-content inspection is conditional on AC3 succeeding;
+because no archive was produced on this host, the spike could not
+extract memory pages and grep them for cleartext secrets. The
+privacy concern is nevertheless **carried forward**:
+
+- A successful CRIU checkpoint embeds the full process memory image,
+  open-FD state, mounted-namespace snapshots, and network-socket
+  state. By construction this includes cleartext environment
+  variables, in-memory secrets, ServiceAccount tokens loaded into
+  the process address space, and unredacted log buffers.
+- NFR15 (sensitive-data redaction before persistence) and NFR17
+  (KMS encryption on S3) both apply to checkpoint archives.
+  Story 4.2's S3 writer must KMS-encrypt and tag every forensic
+  checkpoint as a secret-tier artefact.
+- The text-redaction pipeline that Story 3.1 builds operates on
+  text fields and **must not** be applied to binary CRIU memory
+  pages — it would either corrupt the archive or fail silently.
+  Story 4.2 either bypasses redaction for the checkpoint binary
+  (with a documented justification) or implements a
+  binary-aware redactor as a separate concern.
+
+**Decision: documented fallback as default; CRIU as an option Story 4.2 flags as conditional.**
+
+`internal/response/forensics/kubectl_fallback.go` ships under Story
+4.2 as the default forensic-capture mechanism. It captures:
+
+- `kubectl logs --previous` for each container in the pod (stdout,
+  stderr, terminated-container last-state output).
+- A debug-pod filesystem-tar snapshot of the pod's writable layers
+  via `kubectl debug --image=busybox -- /bin/sh -c 'tar c /var/log
+  /tmp /proc/1/...'` (or the equivalent shareProcessNamespace
+  approach). Story 4.2 specifies the exact debug-pod recipe.
+- The pod's spec, status, and recent events
+  (`kubectl get pod ... -o yaml`, `kubectl describe pod ...`).
+
+This captures contemporaneous state at containment time but not
+process memory pages. For Olaitan's threat model — DFIR-grade
+post-mortem of containment events — the kill-chain timeline,
+exfiltration evidence in `/tmp` and `/var/log`, and the pod
+manifest are the load-bearing forensic inputs. Memory-page
+forensics (which the CRIU path would have provided) becomes a
+Future Work item for Chapter 5.
+
+**Alternatives considered and rejected.**
+
+- *Bump containerd to 2.0+ as a Story 4.2 prerequisite.* This
+  would unlock the kubelet checkpoint path. Rejected as the default
+  because (a) containerd 2.0 was released 2024-11-05 and the project
+  has no operational experience with it, (b) the bump touches
+  `architecture.md:80`, `hack/bootstrap-kubeadm.md`, the Helm
+  chart's `kubeVersion` constraint, and `eval/manifest.yaml`
+  reproducibility (NFR37) — each is a multi-file change with
+  cluster-bringup verification gates. Story 4.2 may revisit if the
+  project owner explicitly approves the bump.
+- *Bump Kubernetes to 1.30+ to graduate the API to beta.* The
+  feature-gate alpha-vs-beta status is **not** the binding
+  blocker — the spike confirmed empirically that the alpha gate
+  enables cleanly on K8s 1.29. The runtime is the binding blocker.
+- *Direct `runc checkpoint` bypassing the CRI.* Sidesteps the
+  containerd 1.7 RPC gap by invoking runc directly on the node.
+  Rejected because it requires shell access to the node's
+  `runc` binary, container-ID discovery via `crictl`, and a
+  custom controller-side binary that ships outside the K8s API
+  surface. The project's controller is a Kubernetes operator;
+  reaching past the kubelet to invoke runc breaks the abstraction
+  and re-introduces the kernel/CRIU compatibility risk without
+  the substrate-version lever.
+- *`crictl checkpoint`.* Same containerd-1.7 RPC blocker; the
+  CLI is a thin wrapper over `CheckpointContainer`.
+- *Switch the CRI runtime from containerd to CRI-O.* CRI-O has
+  shipped checkpoint support since 1.25. Rejected as too
+  substrate-disruptive for this stage of the project; no
+  brownfield CRI-O experience.
+
+**Risks inherited.**
+
+- *Memory-page forensics excluded from MVP.* Story 4.2's fallback
+  captures filesystem and log evidence but not in-memory state.
+  Chapter 5 must declare this as Future Work and note it limits
+  detection of in-memory-only payloads (fileless malware, JIT'd
+  loaders). The DFIR rubric (RQ5, Story 5.7) must be designed
+  knowing the fallback's scope so its evaluation is not graded
+  against a CRIU-grade memory-image baseline.
+- *Substrate kernel drift risk if the project later adopts
+  CRIU.* If Story 4.2 (or a successor) is reopened to ship CRIU,
+  the kernel-vs-CRIU compatibility check must run on every
+  evaluation cluster: `criu check --all` is the gate.
+- *containerd version skew between kind dev clusters and the
+  production kubeadm cluster.* The spike used containerd 2.0.2 in
+  kind; production runs containerd 1.7. Any future spike or test
+  that uses kind nodes for CRI-level behavioural verification
+  must explicitly note this skew or pin a kind version that
+  ships containerd 1.7 (kind v0.20.x).
+- *No live CRIU performance data for the project's substrate.*
+  Story 4.2 cannot inherit measured numbers from this spike —
+  the 121-140 ms wall-clock is failure-time, not checkpoint-time.
+
+**Hand-off to Story 4.2.**
+
+Story 4.2 implements *one of* the following two paths. Default is
+the fallback; the CRIU path activates only on explicit project-owner
+approval of the substrate bumps.
+
+*Path A — Documented fallback (default).*
+
+- *File.* `internal/response/forensics/kubectl_fallback.go` plus
+  `kubectl_fallback_test.go`. The map at `architecture.md:954`
+  binds FR36 to `internal/response/forensics/`; that mapping
+  remains correct.
+- *Capture inputs.* For each container in the doomed pod:
+  `kubectl logs <pod> -c <container> --previous` (terminated
+  container's last-state log), `kubectl logs <pod> -c <container>`
+  (current logs), plus pod spec, status, and recent events
+  via the typed client-go API.
+- *Filesystem snapshot.* A debug-pod runs against the doomed
+  pod's node, mounts the kubelet's pod-volumes path read-only,
+  and `tar`s the pod's writable layers. Exact recipe in Story 4.2.
+- *S3 contract.* Same FR45 contract as the CRIU path would have
+  used: content-addressed by SHA-256, KMS-encrypted (NFR17),
+  written under `s3://<bucket>/<incident-id>/forensic-bundle.tar.gz`.
+  Object Lock applies. Story 4.7 (forensic-write retry and
+  deferred queue) inherits this object shape.
+- *Settling window.* Story 4.3's settling window applies
+  unchanged — capture begins after the FSM enters
+  `PRESERVED+KILLED` and before `kubectl delete pod`.
+
+*Path B — CRIU forensic checkpoint (conditional, requires
+project-owner approval of substrate bumps).*
+
+- *Prerequisite 1: containerd 2.0+ on the production kubeadm
+  cluster.* `architecture.md:80` updates to `containerd 2.0+
+  with runc 1.2+`; `hack/bootstrap-kubeadm.md` updates the apt
+  source pin; `eval/manifest.yaml` updates the runtime version
+  cell. Each is a multi-file change with its own verification
+  gate; Story 4.2 cannot satisfy them on its own — they are
+  prerequisite stories the project owner must schedule.
+- *Prerequisite 2: CRIU package installed on every node.* Add
+  to `hack/bootstrap-kubeadm.md` as a step alongside the
+  containerd install. Pin to the jammy `criu 3.16.1-2` package
+  unless the cluster also bumps to a newer Ubuntu (which
+  introduces its own kernel-vs-CRIU compatibility check via
+  `criu check --all`).
+- *Prerequisite 3: `ContainerCheckpoint` feature gate enabled.*
+  At K8s 1.29 alpha (`feature-gates: ContainerCheckpoint=true`
+  on apiserver and kubelet) or, if the project also bumps to
+  K8s 1.30+, no flag is required (beta default-on).
+- *File.* `internal/response/forensics/criu.go` plus tests.
+  The map at `architecture.md:954` binds FR36 to
+  `internal/response/forensics/`; that mapping remains correct.
+- *Capture path.* The controller calls the kubelet's
+  `POST /checkpoint/{namespace}/{pod}/{container}` endpoint via
+  the Kubernetes API server's `nodes/proxy` subresource. The
+  kubelet writes the archive to `/var/lib/kubelet/checkpoints/`;
+  the controller streams it out via a privileged sidecar or a
+  debug-pod with the `/var/lib/kubelet` hostPath mount.
+- *Privacy contract.* The archive is treated as a
+  secret-tier binary artefact: KMS-encrypted on S3 (NFR17),
+  redaction pipeline NOT applied (binary memory pages cannot
+  pass through a text redactor), retention controlled by the
+  same Object Lock window as Path A.
+- *Performance contract.* Story 4.2 must measure on the
+  production substrate; the spike provides no usable numbers.
+  If median checkpoint time exceeds 5 s (`epics.md:546`) or p99
+  exceeds the 10 s NFR7 budget (`epics.md:1809-1810`),
+  Story 4.2 escalates to the project owner before merging.
+
+*Test fixtures from `spikes/criu-checkpoint/` that should inform
+Story 4.2.* The busybox `workload.yaml` deployment that loops a
+`secret-marker=should-not-be-cleartext` line per second is reusable
+as a Story 4.2 integration-test fixture for the privacy assertions.
+The Go harness URL-construction logic (`kubeletCheckpointURL`) maps
+directly to the production controller's URL builder if Path B is
+taken.
+
+**Thesis (Ch3 + Ch5) implications.**
+
+Chapter 1 §1.6 currently describes the forensic preservation
+feature without committing to a memory-image baseline. No edit
+needed there.
+
+Chapter 3 *does* commit to memory-image forensics in two places
+that contradict this ADR's Path A default and must be revised once
+Story 4.2 implements the fallback:
+
+- *§3.7.1 (state table row, `chapter-3-methodology.md:160`)*
+  currently reads "pod state preserved via container checkpoint
+  (CRI-O CRIU), then pod deleted." Suggested replacement:
+  "the doomed pod's logs, manifest, recent events, and writable-
+  layer filesystem are captured to S3 by the `ForensicsController`
+  before pod deletion; memory-image checkpoint via CRIU is
+  conditional on a substrate uplift — see ADR-2026-05-02-01."
+- *§3.7.4 ("Forensic State Preservation",
+  `chapter-3-methodology.md:186`)* currently reads
+  "the `ForensicsController` invokes the container runtime's
+  checkpoint API (CRIU via CRI-O or containerd) to capture a
+  memory and filesystem snapshot of the running container before
+  deletion." Suggested replacement: replace the CRIU-centric
+  description with the fallback's capture set (`kubectl logs
+  --previous` for each container, a debug-pod filesystem-tar of
+  the pod's writable layers, pod spec/status/events via the K8s
+  API), retain the "stored in a configurable S3-compatible object
+  store … KMS encryption (NFR17), content-addressed by SHA-256
+  (FR45)" wording, and add a closing sentence noting that memory-
+  image checkpoint is a Path B option conditional on the
+  substrate prerequisites in ADR-2026-05-02-01.
+
+Chapter 5 (Future Work) gains an entry along the lines of:
+"Memory-image forensics (CRIU container checkpoint) deferred
+pending substrate-version uplift to containerd 2.0+; the fallback
+path captures kill-chain evidence sufficient for the DFIR rubric
+(RQ5) but cannot reconstruct in-memory adversary state.
+Engineering scope to enable: a kernel-vs-CRIU compatibility gate
+(`criu check --all` on every node), the substrate bumps listed in
+ADR-2026-05-02-01 Path B prerequisites, and a binary-aware
+forensic redactor for archive content if regulatory contexts
+require redaction before persistence."
+
+Story 5.10 owns the actual edits in both Ch3 §3.7.1 / §3.7.4 and
+the Ch5 Future Work entry; this ADR carries the reference points
+and the wording seeds.
+
+**Follow-ups.**
+
+- Patch `_bmad-output/planning-artifacts/architecture.md` line 117
+  (the "CRIU forensic checkpoint feasibility" Unknowns bullet) to
+  reflect this spike's conclusion. Done in this story (Task 6.1).
+- Patch `_bmad-output/planning-artifacts/architecture.md` line 205
+  (the "CRIU client (deferred until spike result is known)" line)
+  to name the chosen fallback. Done in this story (Task 6.2).
+- Add a row to `spikes/README.md` under "Active spikes" matching
+  the Story 1.2 and 1.3 row format. Done in this story (Task 6.3).
+- Story 4.2 reads this ADR's "Hand-off to Story 4.2" section
+  verbatim, defaults to Path A, and gates Path B on explicit
+  project-owner approval of the substrate prerequisites.
+- Story 1.5 (traceability matrix bootstrap) records Story 1.4 as
+  *informing* FR36 — satisfaction lands in Story 4.2 (Path A or
+  Path B depending on the project owner's choice).
+- Story 5.10 (thesis revision pass) inherits both the Ch3 §3.7.1
+  / §3.7.4 contradictions flagged above and the Ch5 Future Work
+  entry described above.
