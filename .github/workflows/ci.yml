@@ -118,6 +118,13 @@ jobs:
   traceability:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # The default GITHUB_TOKEN is read-only for most scopes; the gate
+    # script calls `gh pr view` to read the PR body, which needs
+    # `pull-requests: read`. Other scopes stay at the workflow default
+    # (the existing go/helm/docker jobs do not need any extra grants).
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
