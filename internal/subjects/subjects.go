@@ -9,13 +9,22 @@ import (
 	"strings"
 )
 
-// Ring 1 → Ring 2: raw events per source.
+// RawPrefix is the common prefix shared by every per-source raw subject.
+// JetStream stream configs may use `RawPrefix + ">"` to cover the whole
+// raw-event hierarchy with a single subscription token. The trailing
+// dot keeps the prefix aligned with the per-source constants below.
+const RawPrefix = "olaitan.events.raw."
+
+// Ring 1 → Ring 2: raw events per source. Defined in terms of
+// RawPrefix so the relationship is explicit; refactoring the prefix
+// (or adding a sixth source) flows through automatically and the
+// JetStream coverage tests cannot drift from the constant set.
 const (
-	RawFalco   = "olaitan.events.raw.falco"
-	RawAudit   = "olaitan.events.raw.audit"
-	RawRuntime = "olaitan.events.raw.runtime"
-	RawNetwork = "olaitan.events.raw.network"
-	RawAppLog  = "olaitan.events.raw.applog"
+	RawFalco   = RawPrefix + "falco"
+	RawAudit   = RawPrefix + "audit"
+	RawRuntime = RawPrefix + "runtime"
+	RawNetwork = RawPrefix + "network"
+	RawAppLog  = RawPrefix + "applog"
 )
 
 // Ring 1 → Ring 2: normalised events (common schema).

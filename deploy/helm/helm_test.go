@@ -578,6 +578,39 @@ func TestEndpointsTemplated(t *testing.T) {
 	}
 }
 
+// TestCollectorDaemonsetHasK8sNodeNameDownwardAPI confirms the
+// collector DaemonSet renders the K8S_NODE_NAME env var via the
+// downward-API field path `spec.nodeName`. The collector subcommand
+// fails fast on an empty K8S_NODE_NAME (cmd/olaitan/main.go's
+// startCollectorRing); a refactor that silently strips the env block
+// would otherwise crash-loop the pod with a non-obvious "K8S_NODE_NAME
+// env var is empty" message at startup.
+func TestCollectorDaemonsetHasK8sNodeNameDownwardAPI(t *testing.T) {
+	args := []string{
+		"template", "olaitan-test", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+	}
+	cmd := exec.Command("helm", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("helm template failed: %v\nstderr: %s", err, stderr.String())
+	}
+	rendered := stdout.String()
+	// The downward-API block we expect, rendered tightly so a stray
+	// re-indent or removal trips this test rather than passing on a
+	// near-miss.
+	want := `- name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName`
+	if !strings.Contains(rendered, want) {
+		t.Errorf("K8S_NODE_NAME downward-API env not rendered on collector daemonset; rendered output sample:\n%s",
+			snippet(rendered, "K8S_NODE_NAME"))
+	}
+}
+
 // snippet returns a few lines around the first occurrence of needle
 // in the rendered output, for human-friendly error messages.
 func snippet(rendered, needle string) string {

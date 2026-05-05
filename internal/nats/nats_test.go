@@ -529,6 +529,27 @@ func TestDefaultConfig(t *testing.T) {
 	}
 }
 
+func TestStreamConfigsCoversRawSubjects(t *testing.T) {
+	// Story 1.6 requires the EVENTS_RAW stream so per-source raw subjects
+	// (subjects.RawFalco, RawAudit, RawRuntime, RawNetwork, RawAppLog)
+	// gain JetStream at-least-once semantics. Guard against silent
+	// regression: future edits to streams.go must keep the raw prefix in
+	// some stream's Subjects.
+	configs := natsclient.StreamConfigs()
+	rawCovered := false
+	for _, cfg := range configs {
+		for _, subj := range cfg.Subjects {
+			if subj == subjects.RawPrefix+">" || subj == "olaitan.events.raw.>" {
+				rawCovered = true
+				break
+			}
+		}
+	}
+	if !rawCovered {
+		t.Fatalf("StreamConfigs: no stream covers %q", subjects.RawPrefix+">")
+	}
+}
+
 func TestStreamConfigsDeepCopy(t *testing.T) {
 	a := natsclient.StreamConfigs()
 	b := natsclient.StreamConfigs()
@@ -560,6 +581,14 @@ func testStreamConfigs() []jetstream.StreamConfig {
 			Name:      "EVENTS",
 			Subjects:  []string{subjects.Normalised},
 			MaxAge:    24 * time.Hour,
+			MaxBytes:  1 * 1024 * 1024,
+			Storage:   jetstream.MemoryStorage,
+			Retention: jetstream.LimitsPolicy,
+		},
+		{
+			Name:      "EVENTS_RAW",
+			Subjects:  []string{subjects.RawPrefix + ">"},
+			MaxAge:    6 * time.Hour,
 			MaxBytes:  1 * 1024 * 1024,
 			Storage:   jetstream.MemoryStorage,
 			Retention: jetstream.LimitsPolicy,

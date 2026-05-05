@@ -77,6 +77,15 @@ spec:
               value: {{ include "olaitan.endpoints.redis" . | quote }}
             - name: FALCO_SOCKET
               value: {{ .Values.endpoints.falco | quote }}
+            # Story 1.6: the Falco adapter records the node name on
+            # every emitted Event.Pod.Node so host events without K8s
+            # pod context still record where they were observed. Sourced
+            # from the downward API because os.Hostname() returns the
+            # pod name, not the node name, on Kubernetes.
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           livenessProbe:
             httpGet:
               path: /healthz
