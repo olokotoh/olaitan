@@ -767,11 +767,32 @@ func TestNetworkPolicyDefault(t *testing.T) {
 	}
 }
 
-// TestAuditWebhookGate asserts the audit-webhook Service and
-// ValidatingWebhookConfiguration are absent by default (Story 1.1 ships
-// them as scaffold) and present when the gate is flipped (Story 1.7
-// will flip the default). Both kinds must come and go together.
-func TestAuditWebhookGate(t *testing.T) {
+// auditWebhookEnabledArgs returns a --set list that satisfies every
+// fail-fast guard the Story 1.7 templates introduce (caBundle,
+// clusterCAData, apiserverClientCert/Key, servingCert/Key). All values
+// are deliberately stub base64 — the tests exercise the rendering
+// path, not real cert validation. Includes the Story 1.1 caBundle
+// guard so this helper is the single source of truth for "audit
+// webhook enabled" in the helm test suite.
+func auditWebhookEnabledArgs() []string {
+	const stub = "ZmFrZS1iYXNlNjQ="
+	return []string{
+		"auditWebhook.enabled=true",
+		"auditWebhook.caBundle=" + stub,
+		"auditWebhook.clusterCAData=" + stub,
+		"auditWebhook.apiserverClientCert=" + stub,
+		"auditWebhook.apiserverClientKey=" + stub,
+		"auditWebhook.servingCert=" + stub,
+		"auditWebhook.servingKey=" + stub,
+	}
+}
+
+// TestAuditWebhookGate_AllResourcesGated asserts every audit-webhook
+// resource (Service, ValidatingWebhookConfiguration stub, audit-policy
+// ConfigMap, kubeconfig Secret, TLS Secret) is absent by default and
+// present when the gate is flipped. All gated resources must come and
+// go together — a partial render is a chart-rot signal.
+func TestAuditWebhookGate_AllResourcesGated(t *testing.T) {
 	defaultRender := helmTemplate(t, []string{
 		"falco.enabled=false", "nats.enabled=false", "redis.enabled=false",
 	})
@@ -784,17 +805,20 @@ func TestAuditWebhookGate(t *testing.T) {
 	if len(findByKind(defaultMs, "ValidatingWebhookConfiguration")) != 0 {
 		t.Errorf("ValidatingWebhookConfiguration rendered with auditWebhook.enabled=false")
 	}
+	for _, m := range findByKind(defaultMs, "ConfigMap") {
+		if strings.Contains(m.Metadata.Name, "audit-policy") {
+			t.Errorf("audit-policy ConfigMap rendered with auditWebhook.enabled=false (got %s)", m.Metadata.Name)
+		}
+	}
+	for _, m := range findByKind(defaultMs, "Secret") {
+		if strings.Contains(m.Metadata.Name, "audit-webhook-kubeconfig") ||
+			strings.Contains(m.Metadata.Name, "audit-tls") {
+			t.Errorf("audit-webhook secret rendered with auditWebhook.enabled=false (got %s)", m.Metadata.Name)
+		}
+	}
 
-	enabledRender := helmTemplate(t, []string{
-		"falco.enabled=false", "nats.enabled=false", "redis.enabled=false",
-		"auditWebhook.enabled=true",
-		// caBundle is required when the webhook is enabled (see the
-		// fail-fast guard in templates/validatingwebhookconfiguration.yaml
-		// covered separately by TestAuditWebhookCABundleGuard). Use a
-		// dummy base64 string so this test can exercise the rendering
-		// path without standing up a real CA.
-		"auditWebhook.caBundle=ZmFrZS1jYS1idW5kbGU=",
-	})
+	enabledArgs := append([]string{"falco.enabled=false", "nats.enabled=false", "redis.enabled=false"}, auditWebhookEnabledArgs()...)
+	enabledRender := helmTemplate(t, enabledArgs)
 	enabledMs := parseManifests(t, enabledRender)
 
 	svcFound := false
@@ -806,10 +830,205 @@ func TestAuditWebhookGate(t *testing.T) {
 	if !svcFound {
 		t.Errorf("audit-webhook Service not rendered with auditWebhook.enabled=true")
 	}
-
 	if len(findByKind(enabledMs, "ValidatingWebhookConfiguration")) != 1 {
 		t.Errorf("ValidatingWebhookConfiguration: got %d, want 1 with auditWebhook.enabled=true",
 			len(findByKind(enabledMs, "ValidatingWebhookConfiguration")))
+	}
+
+	policyCMFound := false
+	for _, m := range findByKind(enabledMs, "ConfigMap") {
+		if strings.HasSuffix(m.Metadata.Name, "-audit-policy") {
+			policyCMFound = true
+		}
+	}
+	if !policyCMFound {
+		t.Errorf("audit-policy ConfigMap not rendered with auditWebhook.enabled=true")
+	}
+
+	kubeconfigSecretFound := false
+	tlsSecretFound := false
+	for _, m := range findByKind(enabledMs, "Secret") {
+		if strings.HasSuffix(m.Metadata.Name, "-audit-webhook-kubeconfig") {
+			kubeconfigSecretFound = true
+		}
+		if strings.HasSuffix(m.Metadata.Name, "-audit-tls") {
+			tlsSecretFound = true
+		}
+	}
+	if !kubeconfigSecretFound {
+		t.Errorf("audit kubeconfig Secret not rendered with auditWebhook.enabled=true")
+	}
+	if !tlsSecretFound {
+		t.Errorf("audit-tls Secret not rendered with auditWebhook.enabled=true")
+	}
+}
+
+// TestAuditPolicyConfigMapRenders_WhenEnabled checks the audit-policy
+// ConfigMap embeds the chart's default policy YAML when no custom
+// override is supplied.
+func TestAuditPolicyConfigMapRenders_WhenEnabled(t *testing.T) {
+	args := append([]string{"falco.enabled=false", "nats.enabled=false", "redis.enabled=false"}, auditWebhookEnabledArgs()...)
+	rendered := helmTemplate(t, args)
+	if !strings.Contains(rendered, "kind: ConfigMap") {
+		t.Fatalf("expected ConfigMap kind in rendered output")
+	}
+	if !strings.Contains(rendered, "olaitan-audit-policy") {
+		t.Errorf("expected ConfigMap name olaitan-audit-policy in rendered output\n%s", snippet(rendered, "audit-policy"))
+	}
+	// Default policy spot-check: rules + omitStages must survive.
+	if !strings.Contains(rendered, "omitStages") {
+		t.Errorf("default audit policy missing omitStages stanza\n%s", snippet(rendered, "audit-policy"))
+	}
+	if !strings.Contains(rendered, "rolebindings") {
+		t.Errorf("default audit policy missing rolebindings rule")
+	}
+}
+
+// TestAuditWebhookKubeconfigSecretRenders_WhenEnabled confirms the
+// kubeconfig Secret renders the apiserver-side mTLS material plus the
+// receiver Service FQDN.
+func TestAuditWebhookKubeconfigSecretRenders_WhenEnabled(t *testing.T) {
+	args := append([]string{"falco.enabled=false", "nats.enabled=false", "redis.enabled=false"}, auditWebhookEnabledArgs()...)
+	rendered := helmTemplate(t, args)
+	if !strings.Contains(rendered, "olaitan-audit-webhook-kubeconfig") {
+		t.Fatalf("kubeconfig Secret not rendered\n%s", snippet(rendered, "audit-webhook-kubeconfig"))
+	}
+	if !strings.Contains(rendered, "audit-webhook.default.svc.cluster.local") {
+		t.Errorf("kubeconfig server URL missing Service FQDN\n%s", snippet(rendered, "audit-webhook.default"))
+	}
+	if !strings.Contains(rendered, "client-certificate-data:") {
+		t.Errorf("kubeconfig missing client-certificate-data field")
+	}
+}
+
+// TestAuditWebhookTLSSecretRenders_WhenEnabled confirms the TLS Secret
+// carries the receiver serving cert/key and the cluster CA bundle.
+func TestAuditWebhookTLSSecretRenders_WhenEnabled(t *testing.T) {
+	args := append([]string{"falco.enabled=false", "nats.enabled=false", "redis.enabled=false"}, auditWebhookEnabledArgs()...)
+	rendered := helmTemplate(t, args)
+	if !strings.Contains(rendered, "olaitan-audit-tls") {
+		t.Fatalf("audit-tls Secret not rendered")
+	}
+	if !strings.Contains(rendered, "type: kubernetes.io/tls") {
+		t.Errorf("audit-tls Secret missing kubernetes.io/tls type")
+	}
+}
+
+// TestAuditWebhookFailsFast_WhenApiserverClientCertEmpty asserts the
+// kubeconfig Secret guard fires when the operator forgets the
+// apiserver client cert.
+func TestAuditWebhookFailsFast_WhenApiserverClientCertEmpty(t *testing.T) {
+	args := []string{"template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+		"--set", "auditWebhook.enabled=true",
+		"--set", "auditWebhook.caBundle=ZmFrZQ==",
+		"--set", "auditWebhook.clusterCAData=ZmFrZQ==",
+		"--set", "auditWebhook.apiserverClientKey=ZmFrZQ==",
+		"--set", "auditWebhook.servingCert=ZmFrZQ==",
+		"--set", "auditWebhook.servingKey=ZmFrZQ==",
+	}
+	cmd := exec.Command("helm", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("helm template with empty apiserverClientCert succeeded; expected guard to fire")
+	}
+	if !strings.Contains(stderr.String(), "auditWebhook.apiserverClientCert is required") {
+		t.Errorf("expected apiserverClientCert guard, got:\n%s", stderr.String())
+	}
+}
+
+// TestAuditWebhookFailsFast_WhenClusterCADataEmpty asserts the TLS
+// Secret guard fires when the operator forgets the cluster CA bundle.
+func TestAuditWebhookFailsFast_WhenClusterCADataEmpty(t *testing.T) {
+	args := []string{"template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+		"--set", "auditWebhook.enabled=true",
+		"--set", "auditWebhook.caBundle=ZmFrZQ==",
+		"--set", "auditWebhook.apiserverClientCert=ZmFrZQ==",
+		"--set", "auditWebhook.apiserverClientKey=ZmFrZQ==",
+		"--set", "auditWebhook.servingCert=ZmFrZQ==",
+		"--set", "auditWebhook.servingKey=ZmFrZQ==",
+	}
+	cmd := exec.Command("helm", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("helm template with empty clusterCAData succeeded; expected guard to fire")
+	}
+	if !strings.Contains(stderr.String(), "auditWebhook.clusterCAData is required") {
+		t.Errorf("expected clusterCAData guard, got:\n%s", stderr.String())
+	}
+}
+
+// TestDaemonsetMountsAuditTLSSecret_WhenEnabled confirms the collector
+// DaemonSet mounts the audit-tls Secret at /etc/olaitan/audit-tls when
+// the gate is on, AND does not mount it when the gate is off. The
+// asserts target the DaemonSet pod spec specifically (the same path
+// string also appears in the baked olaitan.yaml ConfigMap, which is
+// inert until the adapter is gated on).
+func TestDaemonsetMountsAuditTLSSecret_WhenEnabled(t *testing.T) {
+	disabledRender := helmTemplate(t, []string{"falco.enabled=false", "nats.enabled=false", "redis.enabled=false"})
+	disabledMs := parseManifests(t, disabledRender)
+	for _, m := range findByKind(disabledMs, "DaemonSet") {
+		if strings.Contains(m.Metadata.Name, "collector") {
+			yamlBytes, _ := yaml.Marshal(&m.Raw)
+			if strings.Contains(string(yamlBytes), "name: audit-tls") {
+				t.Errorf("audit-tls volume rendered on DaemonSet with auditWebhook.enabled=false")
+			}
+		}
+	}
+
+	enabledArgs := append([]string{"falco.enabled=false", "nats.enabled=false", "redis.enabled=false"}, auditWebhookEnabledArgs()...)
+	enabledRender := helmTemplate(t, enabledArgs)
+	enabledMs := parseManifests(t, enabledRender)
+	mountFound := false
+	portFound := false
+	for _, m := range findByKind(enabledMs, "DaemonSet") {
+		if !strings.Contains(m.Metadata.Name, "collector") {
+			continue
+		}
+		yamlBytes, _ := yaml.Marshal(&m.Raw)
+		dsText := string(yamlBytes)
+		if strings.Contains(dsText, "name: audit-tls") &&
+			strings.Contains(dsText, "/etc/olaitan/audit-tls") {
+			mountFound = true
+		}
+		if strings.Contains(dsText, "name: audit-webhook") &&
+			strings.Contains(dsText, "containerPort: 8443") {
+			portFound = true
+		}
+	}
+	if !mountFound {
+		t.Errorf("audit-tls volume + mount not rendered on collector DaemonSet with auditWebhook.enabled=true")
+	}
+	if !portFound {
+		t.Errorf("audit-webhook container port (8443) not rendered on collector DaemonSet with auditWebhook.enabled=true")
+	}
+}
+
+// TestValidatingWebhookConfigurationUntouched is the negative
+// regression test the Story 1.7 ACs require: enabling audit-webhook
+// must NOT change the existing admission-webhook stub from Story 1.1.
+// Specifically, the rule list (pods/services/configmaps/secrets +
+// deployments/daemonsets/statefulsets + networkpolicies +
+// rolebindings/clusterrolebindings) and the namespaceSelector
+// exclusions must remain intact.
+func TestValidatingWebhookConfigurationUntouched(t *testing.T) {
+	args := append([]string{"falco.enabled=false", "nats.enabled=false", "redis.enabled=false"}, auditWebhookEnabledArgs()...)
+	rendered := helmTemplate(t, args)
+	for _, want := range []string{
+		"audit.olaitan.io",
+		"sideEffects: None",
+		"failurePolicy: Ignore",
+		"rolebindings",
+		"clusterrolebindings",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("ValidatingWebhookConfiguration stub from Story 1.1 missing %q (Story 1.7 must NOT modify it)", want)
+		}
 	}
 }
 

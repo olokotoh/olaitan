@@ -4,9 +4,10 @@ VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo 
 LDFLAGS     := -ldflags "-X main.version=$(VERSION)"
 IMAGE       := olaitan
 TAG         ?= $(VERSION)
-CHART_DIR   := deploy/helm/olaitan
-CONFIG_SRC  := config/olaitan.yaml
-CHART_FILES := $(CHART_DIR)/files/olaitan.yaml
+CHART_DIR        := deploy/helm/olaitan
+CONFIG_SRC       := config/olaitan.yaml
+AUDIT_POLICY_SRC := config/audit-policy-default.yaml
+CHART_FILES      := $(CHART_DIR)/files/olaitan.yaml $(CHART_DIR)/files/audit-policy-default.yaml
 
 .PHONY: build test lint docker-build clean helm-prepare helm-lint helm-template helm-deps version-tag
 
@@ -33,16 +34,21 @@ version-tag:
 	@echo $(TAG)
 
 # --- Helm chart targets -----------------------------------------------
-# helm-prepare copies config/olaitan.yaml into the chart's files/
-# directory. Helm's .Files.Get is chart-relative and cannot traverse
-# into parent directories, so the canonical config must be duplicated
-# at package time. The copy is a build artefact, gitignored; the
-# canonical source stays in config/olaitan.yaml.
+# helm-prepare copies the canonical config files into the chart's
+# files/ directory. Helm's .Files.Get is chart-relative and cannot
+# traverse into parent directories, so the canonical configs must be
+# duplicated at package time. The copies are build artefacts,
+# gitignored; the canonical sources stay under config/. Story 1.7
+# extends the set with the audit-policy default.
 helm-prepare: $(CHART_FILES)
 
-$(CHART_FILES): $(CONFIG_SRC)
+$(CHART_DIR)/files/olaitan.yaml: $(CONFIG_SRC)
 	@mkdir -p $(CHART_DIR)/files
-	cp $(CONFIG_SRC) $(CHART_FILES)
+	cp $(CONFIG_SRC) $@
+
+$(CHART_DIR)/files/audit-policy-default.yaml: $(AUDIT_POLICY_SRC)
+	@mkdir -p $(CHART_DIR)/files
+	cp $(AUDIT_POLICY_SRC) $@
 
 # helm-deps runs `helm dependency update` so the subchart tarballs
 # (Falco, NATS, Redis) land in deploy/helm/olaitan/charts/. Required

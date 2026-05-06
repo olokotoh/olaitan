@@ -1,12 +1,12 @@
 {{/*
-Ring 1 collector — one pod per node, consumes Falco gRPC, K8s audit,
+Ring 1 collector -- one pod per node, consumes Falco gRPC, K8s audit,
 and cgroup signals; publishes enriched events to NATS.
 
 hostNetwork: false, hostPID: false. Falco already owns the host-level
 signal-capture side on each node; the collector talks to Falco through
 a gRPC socket mounted from the Falco pod's hostPath, so we stay inside
 the pod network namespace. This keeps the collector's blast radius
-small — an auditor reviewing the pod spec sees no host-level escape
+small -- an auditor reviewing the pod spec sees no host-level escape
 surface.
 */}}
 apiVersion: apps/v1
@@ -70,6 +70,14 @@ spec:
             - name: health
               containerPort: 8080
               protocol: TCP
+            {{- if .Values.auditWebhook.enabled }}
+            # Story 1.7 audit-webhook receiver port. The kube-apiserver
+            # dials this port via the Service FQDN baked into the
+            # audit kubeconfig (templates/audit-webhook-kubeconfig-secret.yaml).
+            - name: audit-webhook
+              containerPort: {{ .Values.auditWebhook.containerPort }}
+              protocol: TCP
+            {{- end }}
           env:
             - name: NATS_URL
               value: {{ include "olaitan.endpoints.nats" . | quote }}
@@ -110,7 +118,7 @@ spec:
             capabilities:
               drop: [ALL]
           volumeMounts:
-            # Whole-directory mount — see Dev Notes § "The ConfigMap-
+            # Whole-directory mount -- see Dev Notes § "The ConfigMap-
             # atomic-swap + Story 1.6 contract". Do not introduce subPath.
             - name: config
               mountPath: /etc/olaitan
@@ -131,11 +139,20 @@ spec:
             # default exposes the socket at /run/falco/falco.sock on the
             # node; the collector pod opens it via the FALCO_SOCKET env
             # var. Read-only because the collector only ever connects
-            # (reads) — never writes — to the socket. Mounted only when
+            # (reads) -- never writes -- to the socket. Mounted only when
             # endpoints.falco is a unix:// target; tcp:// targets reach
             # Falco over the pod network and need no host mount.
             - name: falco-socket
               mountPath: /run/falco
+              readOnly: true
+            {{- end }}
+            {{- if .Values.auditWebhook.enabled }}
+            # Story 1.7: receiver TLS material (serving cert+key plus
+            # cluster-CA bundle for verifying the apiserver client
+            # cert). Mounted readonly; rendered by templates/
+            # audit-webhook-tls-secret.yaml only when enabled=true.
+            - name: audit-tls
+              mountPath: /etc/olaitan/audit-tls
               readOnly: true
             {{- end }}
       volumes:
@@ -158,4 +175,10 @@ spec:
           hostPath:
             path: /run/falco
             type: Directory
+        {{- end }}
+        {{- if .Values.auditWebhook.enabled }}
+        - name: audit-tls
+          secret:
+            secretName: {{ include "olaitan.fullname" . }}-audit-tls
+            defaultMode: 0400
         {{- end }}

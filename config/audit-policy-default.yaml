@@ -1,0 +1,73 @@
+# Default audit policy for the Olaitan audit-webhook receiver. Story
+# 1.7. The kube-apiserver mounts this file via --audit-policy-file when
+# the audit-webhook backend is wired up; see deploy/helm/olaitan/AUDIT.md
+# for the operator workflow.
+#
+# Filter scope is justified in Story 1.7 Task 2.2. Goal: keep within
+# the NFR1 1000 events/sec/node budget by silencing the kubelet /
+# controller-manager noise floor and recording full payload only for
+# the resources that drive the academic detection scenarios (RBAC,
+# NetPol, Secret access, exec/portforward).
+#
+# Operators can override by setting auditWebhook.policy.custom in the
+# Helm values; the chart renders that verbatim into the ConfigMap when
+# non-empty.
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages:
+  # Filter at the source: the apiserver emits one event per stage, and
+  # RequestReceived events lack response context the correlator needs.
+  - "RequestReceived"
+rules:
+  # Drop the noisiest read-only kubelet / controller-manager traffic.
+  - level: None
+    resources:
+      - group: ""
+        resources: ["events", "endpoints", "endpointslices"]
+      - group: "coordination.k8s.io"
+        resources: ["leases"]
+    verbs: ["get", "list", "watch"]
+
+  # Drop kube-system service-account list/watch on nodes (high volume,
+  # low signal).
+  - level: None
+    users:
+      - "system:serviceaccount:kube-system:*"
+    resources:
+      - group: ""
+        resources: ["nodes", "nodes/status"]
+    verbs: ["get", "list", "watch"]
+
+  # Full request+response on Secret and ConfigMap traffic -- credential
+  # exfiltration patterns key off these payloads.
+  - level: RequestResponse
+    resources:
+      - group: ""
+        resources: ["secrets", "configmaps"]
+
+  # Full request+response on RBAC and NetworkPolicy mutations.
+  - level: RequestResponse
+    resources:
+      - group: "rbac.authorization.k8s.io"
+        resources: ["rolebindings", "clusterrolebindings", "roles", "clusterroles"]
+      - group: "networking.k8s.io"
+        resources: ["networkpolicies"]
+    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+
+  # Privilege use through pods/exec, pods/portforward, pods/attach --
+  # request body only (response is an upgrade stream).
+  - level: Request
+    resources:
+      - group: ""
+        resources: ["pods/exec", "pods/portforward", "pods/attach"]
+
+  # Pod CRUD: metadata only. The full pod spec is mostly noise; the
+  # admission decision and the verb are the actionable bits.
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["pods"]
+    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+
+  # Catch-all: metadata for everything else.
+  - level: Metadata

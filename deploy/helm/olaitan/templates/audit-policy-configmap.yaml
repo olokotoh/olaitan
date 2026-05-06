@@ -1,0 +1,28 @@
+{{/*
+Audit policy ConfigMap. Mounted by the kube-apiserver via
+--audit-policy-file; see deploy/helm/olaitan/AUDIT.md for the operator
+wiring step.
+
+The ConfigMap renders only when auditWebhook.enabled=true so a default
+chart install (Story 1.1 default) leaves the resource absent. When
+.Values.auditWebhook.policy.custom is non-empty it is used verbatim;
+otherwise the baked-in default at files/audit-policy-default.yaml is
+rendered.
+*/}}
+{{- if .Values.auditWebhook.enabled -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "olaitan.fullname" . }}-audit-policy
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+data:
+  policy.yaml: |-
+    {{- if .Values.auditWebhook.policy.custom }}
+    {{- .Values.auditWebhook.policy.custom | nindent 4 }}
+    {{- else }}
+    {{- $default := required "files/audit-policy-default.yaml is missing from the chart -- restore from source" (.Files.Get "files/audit-policy-default.yaml") }}
+    {{- $default | nindent 4 }}
+    {{- end }}
+{{- end }}

@@ -1,0 +1,42 @@
+# kubeadm 1.29 control-plane patch for the Olaitan audit-webhook
+# receiver (Story 1.7). Copy to /etc/kubernetes/patches/kube-apiserver+json.yaml
+# (the +json suffix tells kubeadm to apply the patch as JSON-Patch
+# rather than strategic merge), then run:
+#
+#   sudo kubeadm init phase control-plane apiserver \
+#       --patches /etc/kubernetes/patches/
+#
+# Pre-requisites (see deploy/helm/olaitan/AUDIT.md step 4):
+#   /etc/kubernetes/audit/policy.yaml             -- chmod 0644
+#   /etc/kubernetes/audit/webhook-kubeconfig.yaml -- chmod 0600
+
+- op: add
+  path: /spec/containers/0/command/-
+  value: --audit-policy-file=/etc/kubernetes/audit/policy.yaml
+
+- op: add
+  path: /spec/containers/0/command/-
+  value: --audit-webhook-config-file=/etc/kubernetes/audit/webhook-kubeconfig.yaml
+
+- op: add
+  path: /spec/containers/0/command/-
+  value: --audit-webhook-batch-max-size=400
+
+- op: add
+  path: /spec/containers/0/command/-
+  value: --audit-webhook-batch-max-wait=10s
+
+- op: add
+  path: /spec/containers/0/volumeMounts/-
+  value:
+    name: audit
+    mountPath: /etc/kubernetes/audit
+    readOnly: true
+
+- op: add
+  path: /spec/volumes/-
+  value:
+    name: audit
+    hostPath:
+      path: /etc/kubernetes/audit
+      type: Directory
