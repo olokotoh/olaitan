@@ -22,6 +22,7 @@ type EventCategory string
 const (
 	CategorySyscall   EventCategory = "syscall"
 	CategoryAPI       EventCategory = "api"
+	CategoryAudit     EventCategory = "audit"
 	CategoryLifecycle EventCategory = "lifecycle"
 	CategoryFlow      EventCategory = "flow"
 	CategoryLog       EventCategory = "log"

@@ -1,12 +1,12 @@
 // Command olaitan is the entrypoint for both the collector (DaemonSet)
-// and the aggregator (Deployment). One binary, two subcommands —
+// and the aggregator (Deployment). One binary, two subcommands --
 // selected at container start via the Helm chart's pod spec (see
 // deploy/helm/olaitan/templates/daemonset.yaml + deployment.yaml).
 //
 // Ring wiring is stubbed here: Story 1.7 delivers the shared startup
 // skeleton (flag parsing, config load + watch, health server, SIGTERM
-// graceful shutdown). The actual ring goroutines — signal collectors,
-// correlator, analyst, decision, response — land in Epic 2+.
+// graceful shutdown). The actual ring goroutines -- signal collectors,
+// correlator, analyst, decision, response -- land in Epic 2+.
 //
 // Exit codes:
 //
@@ -30,10 +30,12 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/olokotoh/olaitan/internal/collector/audit"
 	"github.com/olokotoh/olaitan/internal/collector/falco"
 	"github.com/olokotoh/olaitan/internal/config"
 	"github.com/olokotoh/olaitan/internal/health"
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
+	"github.com/olokotoh/olaitan/internal/retry"
 )
 
 var version = "dev"
@@ -123,7 +125,7 @@ func runRingCtx(ctx context.Context, ring string, args []string, stderr io.Write
 	// Hot-reload goroutine. Watch returns nil when ringCtx is cancelled;
 	// when it returns an error before cancel (fsnotify exhaustion,
 	// inode rotation), trip the watcherFailed flag so the readiness
-	// probe goes 503 and kubelet restarts the pod — preferable to the
+	// probe goes 503 and kubelet restarts the pod -- preferable to the
 	// log-and-pretend-config-reload-still-works failure mode.
 	//
 	// Tied to ringCtx (not the outer ctx) so ringCancel on the error
@@ -135,7 +137,7 @@ func runRingCtx(ctx context.Context, ring string, args []string, stderr io.Write
 		defer close(watcherDone)
 		if err := mgr.Watch(ringCtx); err != nil && ringCtx.Err() == nil {
 			watcherFailed.Store(true)
-			log.Error("config: watch exited unexpectedly — readiness probe will fail",
+			log.Error("config: watch exited unexpectedly -- readiness probe will fail",
 				"err", err)
 		}
 	}()
@@ -170,7 +172,7 @@ func runRingCtx(ctx context.Context, ring string, args []string, stderr io.Write
 	// second concrete instance reveals what is variant vs invariant).
 	// The aggregator subcommand's wiring lands in Epic 2.
 	if ring == "collector" {
-		if err := startCollectorRing(gctx, g, log); err != nil {
+		if err := startCollectorRing(gctx, g, log, mgr.Get()); err != nil {
 			log.Error("startup: collector ring wiring", "err", err)
 			// Cancel ringCtx (the parent of gctx) so the health server
 			// and any goroutines already registered on g unblock; then
@@ -203,15 +205,19 @@ func runRingCtx(ctx context.Context, ring string, args []string, stderr io.Write
 }
 
 // startCollectorRing wires the Ring 1 sensor adapters into the supplied
-// errgroup. As of Story 1.6 only the Falco adapter lands; Stories
-// 1.7-1.10 add audit, cri, applog, and cni adapters by following the
-// same dial-and-spawn pattern.
+// errgroup. As of Story 1.7 the Falco gRPC adapter (Story 1.6) and the
+// Kubernetes audit-webhook receiver (Story 1.7) both land here;
+// Stories 1.8-1.10 will add cri, applog, and cni adapters by
+// following the same spawn pattern.
 //
 // Connection coordinates come from environment variables injected by
 // the Helm chart's downward API (see deploy/helm/olaitan/templates/
 // daemonset.yaml): NATS_URL for the bus, FALCO_SOCKET for the Falco
 // gRPC endpoint, K8S_NODE_NAME for the per-event Pod.Node identifier.
-func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger) error {
+// The audit-webhook adapter is gated on cfg.Detection.Sources.Audit.
+// Enabled, so a chart deploy with the default
+// auditWebhook.enabled=false leaves the receiver dormant.
+func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger, cfg *config.Config) error {
 	natsURL := os.Getenv("NATS_URL")
 	if natsURL == "" {
 		return errors.New("collector: NATS_URL env var is empty (set by Helm chart)")
@@ -294,8 +300,52 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 		return nil
 	})
 
+	// Story 1.7: Kubernetes audit-webhook receiver. Gated on the
+	// config block so a chart deploy with auditWebhook.enabled=false
+	// leaves the receiver dormant.
+	if cfg != nil && cfg.Detection.Sources.Audit.Enabled {
+		auditCfg := audit.Config{
+			ListenAddr:       cfg.Detection.Sources.Audit.ListenAddr,
+			TLSCertFile:      cfg.Detection.Sources.Audit.TLSCertFile,
+			TLSKeyFile:       cfg.Detection.Sources.Audit.TLSKeyFile,
+			ClientCAFile:     cfg.Detection.Sources.Audit.ClientCAFile,
+			Hostname:         nodeName,
+			MaxPayloadBytes:  cfg.Detection.Sources.Audit.MaxPayloadBytes,
+			StalenessTimeout: cfg.Detection.Sources.Audit.StalenessTimeout.Duration(),
+			PublishRetry:     toRetryStrategy(cfg.Detection.Sources.Audit.PublishRetry),
+		}
+		auditAdapter, aerr := audit.New(auditCfg, nc, log)
+		if aerr != nil {
+			closeNATS()
+			return fmt.Errorf("collector: audit adapter: %w", aerr)
+		}
+		g.Go(func() error {
+			if err := auditAdapter.Run(ctx); err != nil {
+				return fmt.Errorf("collector: audit run: %w", err)
+			}
+			return nil
+		})
+		log.Info("collector: ring 1 wired (audit)",
+			"listen_addr", auditCfg.ListenAddr,
+			"max_payload_bytes", auditCfg.MaxPayloadBytes)
+	}
+
 	log.Info("collector: ring 1 wired", "falco_socket", falcoSocket, "node", nodeName)
 	return nil
+}
+
+// toRetryStrategy materialises the YAML-shaped RetryStrategyConfig as
+// an internal/retry.Strategy. Empty / zero fields are passed through
+// to retry.Strategy where they are interpreted as "use the adapter's
+// default" by retry.Strategy.IsZero().
+func toRetryStrategy(r config.RetryStrategyConfig) retry.Strategy {
+	return retry.Strategy{
+		Min:         r.Min.Duration(),
+		Max:         r.Max.Duration(),
+		Multiplier:  r.Multiplier,
+		Jitter:      r.Jitter,
+		MaxAttempts: r.MaxAttempts,
+	}
 }
 
 func printUsage(w io.Writer) {
@@ -310,6 +360,6 @@ Commands:
 Flags (collector, aggregator):
   --config <path>   Path to olaitan.yaml (default: /etc/olaitan/olaitan.yaml)
 
-Olaitan — LLM-powered autonomous runtime security agent for Kubernetes.
+Olaitan -- LLM-powered autonomous runtime security agent for Kubernetes.
 `)
 }

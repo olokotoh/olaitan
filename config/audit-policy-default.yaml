@@ -1,0 +1,96 @@
+# Default audit policy for the Olaitan audit-webhook receiver. Story
+# 1.7. The kube-apiserver mounts this file via --audit-policy-file when
+# the audit-webhook backend is wired up; see deploy/helm/olaitan/AUDIT.md
+# for the operator workflow.
+#
+# Filter scope is justified in Story 1.7 Task 2.2 plus the bmad-code-
+# review correctness fixes (P4: PolicyRule.Users is exact-match not
+# globbed -> use userGroups; P5: endpointslices group is
+# discovery.k8s.io not core; P6: Secret/ConfigMap list/watch must not
+# inherit the RequestResponse level the mutating verbs need). Goal:
+# keep within the NFR1 1000 events/sec/node budget by silencing the
+# kubelet / controller-manager noise floor and recording full payload
+# only for the resources that drive the academic detection scenarios
+# (RBAC, NetPol, Secret access, exec/portforward).
+#
+# Operators can override by setting auditWebhook.policy.custom in the
+# Helm values; the chart renders that verbatim into the ConfigMap when
+# non-empty.
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages:
+  # Filter at the source: the apiserver emits one event per stage, and
+  # RequestReceived events lack response context the correlator needs.
+  - "RequestReceived"
+rules:
+  # Drop the noisiest read-only kubelet / controller-manager traffic.
+  # Note: endpointslices live in the discovery.k8s.io group, NOT the
+  # core ("") group; the previous shape silently never matched.
+  - level: None
+    resources:
+      - group: ""
+        resources: ["events", "endpoints"]
+      - group: "discovery.k8s.io"
+        resources: ["endpointslices"]
+      - group: "coordination.k8s.io"
+        resources: ["leases"]
+    verbs: ["get", "list", "watch"]
+
+  # Drop kube-system service-account list/watch on nodes (high volume,
+  # low signal). audit.k8s.io/v1 PolicyRule.users is exact-match (not
+  # globbed); use the apiserver-synthesised group selector
+  # `system:serviceaccounts:kube-system` which matches every kube-
+  # system SA at request time.
+  - level: None
+    userGroups:
+      - "system:serviceaccounts:kube-system"
+    resources:
+      - group: ""
+        resources: ["nodes", "nodes/status"]
+    verbs: ["get", "list", "watch"]
+
+  # Full request+response on Secret and ConfigMap mutations + reads.
+  # Credential-exfiltration / config-tampering signals key off these
+  # payloads. list/watch is captured at Metadata level only (next rule)
+  # because controller-manager continuously list-watches both resources
+  # and full-payload retention would dominate the audit firehose at
+  # scale.
+  - level: RequestResponse
+    resources:
+      - group: ""
+        resources: ["secrets", "configmaps"]
+    verbs: ["create", "update", "patch", "delete", "deletecollection", "get"]
+
+  # Metadata-only on Secret/ConfigMap list/watch.
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["secrets", "configmaps"]
+    verbs: ["list", "watch"]
+
+  # Full request+response on RBAC and NetworkPolicy mutations.
+  - level: RequestResponse
+    resources:
+      - group: "rbac.authorization.k8s.io"
+        resources: ["rolebindings", "clusterrolebindings", "roles", "clusterroles"]
+      - group: "networking.k8s.io"
+        resources: ["networkpolicies"]
+    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+
+  # Privilege use through pods/exec, pods/portforward, pods/attach --
+  # request body only (response is an upgrade stream).
+  - level: Request
+    resources:
+      - group: ""
+        resources: ["pods/exec", "pods/portforward", "pods/attach"]
+
+  # Pod CRUD: metadata only. The full pod spec is mostly noise; the
+  # admission decision and the verb are the actionable bits.
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["pods"]
+    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+
+  # Catch-all: metadata for everything else.
+  - level: Metadata

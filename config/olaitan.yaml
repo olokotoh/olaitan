@@ -9,6 +9,25 @@ detection:
     alert: 70
     act: 90
   baseline_window: 24h
+  # Story 1.7: per-source adapter configuration. The audit-webhook
+  # receiver is gated on enabled; chart deploys with
+  # auditWebhook.enabled=false leave this block at its zero value and
+  # the collector subcommand does not spawn the audit goroutine.
+  sources:
+    audit:
+      enabled: false
+      listen_addr: ":8443"
+      tls_cert_file: "/etc/olaitan/audit-tls/tls.crt"
+      tls_key_file: "/etc/olaitan/audit-tls/tls.key"
+      client_ca_file: "/etc/olaitan/audit-tls/ca.crt"
+      max_payload_bytes: 8388608
+      staleness_timeout: "5m"
+      publish_retry:
+        min: "100ms"
+        max: "1s"
+        multiplier: 2.0
+        jitter: 0.1
+        max_attempts: 3
 
 response:
   excluded_namespaces:

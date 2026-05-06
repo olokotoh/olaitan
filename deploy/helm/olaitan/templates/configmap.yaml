@@ -25,7 +25,19 @@ metadata:
     {{- include "olaitan.labels" . | nindent 4 }}
 data:
   olaitan.yaml: |-
-    {{- $cfg := required "files/olaitan.yaml is empty — run `make helm-prepare` to copy config/olaitan.yaml into the chart" (.Files.Get "files/olaitan.yaml") }}
+    {{- $cfg := required "files/olaitan.yaml is empty -- run `make helm-prepare` to copy config/olaitan.yaml into the chart" (.Files.Get "files/olaitan.yaml") }}
+    {{- /*
+    Dual-flag bridge (post-bmad-code-review fix C11): keep
+    auditWebhook.enabled (chart-side) and detection.sources.audit.
+    enabled (config-side) in lockstep. We do a targeted regex on the
+    audit-source `enabled:` line so operators only flip the Helm flag.
+    Without this overlay the chart rendered all the audit-webhook
+    resources but the receiver goroutine stayed dormant -- a silent
+    operator trap.
+    */ -}}
+    {{- if .Values.auditWebhook.enabled }}
+    {{- $cfg = regexReplaceAll "(audit:[[:space:]]*\\n[[:space:]]+)enabled:[[:space:]]+false" $cfg "${1}enabled: true" }}
+    {{- end }}
     {{- $cfg | nindent 4 }}
 ---
 apiVersion: v1

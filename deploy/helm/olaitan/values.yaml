@@ -17,7 +17,7 @@ image:
   # Always only for mutable dev tags (not recommended in production).
   pullPolicy: IfNotPresent
 
-# Private-registry pull credentials. Empty by default — ghcr.io/olokotoh
+# Private-registry pull credentials. Empty by default -- ghcr.io/olokotoh
 # is public. Operators add their own imagePullSecret names here when
 # retagging Olaitan into a private registry.
 imagePullSecrets: []
@@ -44,7 +44,7 @@ collector:
       memory: 128Mi
   # Control-plane nodes have a NoSchedule taint by default (kubeadm
   # convention). When `true`, collector tolerates the taint and runs on
-  # master nodes too — useful for single-node dev clusters. Off by
+  # master nodes too -- useful for single-node dev clusters. Off by
   # default: production clusters keep control planes isolated.
   runOnControlPlane: false
   # Extra node-selection constraints beyond the DaemonSet default
@@ -60,7 +60,7 @@ collector:
 aggregator:
   # HARD CONSTRAINT. Do NOT raise above 1 until leader election lands.
   # Two aggregator pods would split-brain the NATS JetStream checkpoint
-  # (Redis key checkpoint:correlator:stream_seq) — events get processed
+  # (Redis key checkpoint:correlator:stream_seq) -- events get processed
   # twice, recovery breaks.
   replicas: 1
   # 256Mi request / 512Mi limit. NFR5 targets "< 200 MB steady state",
@@ -78,7 +78,7 @@ aggregator:
   tolerations: []
 
 # --- Service endpoints -------------------------------------------------
-# Where Olaitan dials its dependencies. Empty by default — the templates
+# Where Olaitan dials its dependencies. Empty by default -- the templates
 # fall back to release-name-derived subchart Service names via the
 # `olaitan.endpoints.nats` / `olaitan.endpoints.redis` helpers
 # (`<release>-nats`, `<release>-redis-master`). Set explicitly to point
@@ -112,7 +112,7 @@ secrets:
 
 # --- DFIR report PVC ---------------------------------------------------
 # Read-write volume for JSON evidence files + markdown narratives (Epic
-# 6). Mounted only on the aggregator pod — collector has no write side.
+# 6). Mounted only on the aggregator pod -- collector has no write side.
 reports:
   # "" = use the cluster's default StorageClass. Override on clusters
   # where the operator wants a specific class (e.g., `standard-rwo`).
@@ -127,7 +127,7 @@ reports:
 
 # --- Probe timing ------------------------------------------------------
 # livenessProbe + readinessProbe parameters, shared by DaemonSet and
-# Deployment. initialDelaySeconds: 3 — config load + watcher start +
+# Deployment. initialDelaySeconds: 3 -- config load + watcher start +
 # health server bind take <1s on a warm image; 3s absorbs cold-start
 # variance without masking a real startup failure.
 probes:
@@ -145,7 +145,7 @@ networkPolicy:
   enabled: true
   # CIDR block of node IPs (host network). Required for kubelet to reach
   # pod liveness/readiness probes when the CNI enforces NetworkPolicy on
-  # host-network traffic — Calico in eBPF dataplane is the load-bearing
+  # host-network traffic -- Calico in eBPF dataplane is the load-bearing
   # case. Default-iptables Calico bypasses policy on host-network traffic
   # so the policy works without this set. Empty = no kubelet allow-rule.
   # Operators on eBPF dataplane MUST set this to the cluster's node CIDR
@@ -165,35 +165,93 @@ networkPolicy:
   extraEgress: []
 
 # --- Audit webhook ----------------------------------------------------
-# Stub configuration consumed by service.yaml,
-# validatingwebhookconfiguration.yaml, and (in Story 1.7) the
-# aggregator container port. Default-off because Story 1.1 (this story)
-# only ships the chart-structure scaffold; Story 1.7 wires the
-# receiver and flips the default. The keys here are stable so Story
-# 1.7 will only need to flip `enabled` and add a caBundle.
-# [Source: architecture.md:355-360, epics.md Story 1.7]
+# Story 1.7 -- Kubernetes audit webhook receiver. Default-off so chart
+# installs without the operator-side kube-apiserver wiring continue to
+# render. Operators flip enabled=true after they have applied the
+# kube-apiserver --audit-webhook-config-file + --audit-policy-file
+# patches per deploy/helm/olaitan/AUDIT.md.
+#
+# Note on terminology: the architecture document refers to this as a
+# "ValidatingWebhookConfiguration audit-webhook variant" -- that is
+# incorrect Kubernetes terminology. Audit webhook backends are NOT
+# ValidatingWebhookConfiguration resources; they are configured via
+# the apiserver's --audit-webhook-config-file flag pointing at a
+# kubeconfig Secret. The existing
+# deploy/helm/olaitan/templates/validatingwebhookconfiguration.yaml is
+# an admission-webhook stub from Story 1.1 (a separate feature) and is
+# left alone by this story. See AUDIT.md for the full reconciliation.
+# [Source: epics.md Story 1.7, architecture.md:§Audit Webhook TLS]
 auditWebhook:
   enabled: false
-  # Service port the API server dials. 8443 is the convention for
-  # admission webhooks in the K8s ecosystem.
+
+  # Service port the apiserver dials. 8443 is the convention for
+  # webhook receivers in the K8s ecosystem.
   servicePort: 8443
-  # Container port the aggregator listens on (added by Story 1.7).
+
+  # Container port the receiver listens on. Must match the kubeconfig
+  # 'server' URL the apiserver dials.
   containerPort: 8443
-  # PEM-encoded CA bundle injected into the
-  # ValidatingWebhookConfiguration. Empty during the stub phase; Story
-  # 1.7 wires this either from cert-manager or via an operator-supplied
-  # secret.
+
+  # base64-encoded PEM bytes of the CA that signed the receiver's
+  # serving cert. The apiserver kubeconfig embeds this as
+  # certificate-authority-data so the apiserver trusts the receiver
+  # during mTLS. Required when enabled=true; chart fails render
+  # otherwise. Operators base64-encode the PEM file themselves
+  # (`base64 -w0 ca.pem`); the chart does NOT re-encode (Helm's
+  # b64enc would double-encode). Multi-line wrapped output (e.g. plain
+  # `base64` without -w0) MUST be stripped to one line before pasting.
   caBundle: ""
 
+  # Operator-supplied cluster-CA data -- the CA that signs the
+  # kube-apiserver's client certificate presented during mTLS to the
+  # receiver. On kubeadm clusters this is the cluster's root CA at
+  # /etc/kubernetes/pki/ca.crt; extract and base64-encode before set.
+  # See AUDIT.md for the extraction recipe. Required when enabled=true.
+  clusterCAData: ""
+
+  # Audit kubeconfig credentials the apiserver presents to the
+  # receiver during mTLS. apiserverClientCert / apiserverClientKey are
+  # base64-encoded PEMs of the client cert + private key issued for
+  # CN=kube-apiserver. Required when enabled=true.
+  apiserverClientCert: ""
+  apiserverClientKey: ""
+
+  # Receiver serving cert + key. Operator-supplied (Path B per Story
+  # 1.7 Task 7); base64-encoded PEM. Path A (cert-manager) is deferred
+  # to a future Helm hardening story per AUDIT.md.
+  servingCert: ""
+  servingKey: ""
+
+  # Audit policy. When custom is non-empty the chart renders it
+  # verbatim into the policy ConfigMap; otherwise the chart's
+  # files/audit-policy-default.yaml is used. The default policy is
+  # justified in Story 1.7 Task 2.2 (kubelet/controller-manager noise
+  # filtered, RBAC + NetPol + Secret + exec/portforward elevated).
+  policy:
+    custom: ""
+
+  # NOTE: runtime adapter knobs (listen_addr, TLS file paths,
+  # max_payload_bytes, staleness_timeout, publish_retry) live in
+  # config/olaitan.yaml under detection.sources.audit. The chart
+  # renders config/olaitan.yaml verbatim into the ConfigMap via
+  # `.Files.Get` -- no Helm-values overlay is applied -- so operators
+  # who want to tune these knobs MUST edit config/olaitan.yaml before
+  # `make helm-prepare && helm install`. The dual-flag relationship
+  # also requires `detection.sources.audit.enabled: true` in
+  # config/olaitan.yaml AND `auditWebhook.enabled: true` here for the
+  # receiver to actually run; the chart fails render with a clear
+  # message if the flags disagree (see templates/audit-policy-
+  # configmap.yaml). See AUDIT.md for the full operator workflow.
+
 # --- Subchart overrides ------------------------------------------------
-# Only opinions we impose on the downstream charts live here — upstream
+# Only opinions we impose on the downstream charts live here -- upstream
 # defaults are otherwise preserved. To see every available knob, consult
 # the subchart's own values.yaml:
 #   - https://artifacthub.io/packages/helm/falcosecurity/falco
 #   - https://artifacthub.io/packages/helm/nats/nats
 #   - https://artifacthub.io/packages/helm/bitnami/redis
 
-# Falco — host-level signal source (Ring 1). eBPF driver is the modern
+# Falco -- host-level signal source (Ring 1). eBPF driver is the modern
 # default; the legacy kernel module and `modern_ebpf` are alternatives
 # operators can override. gRPC output is required: that is how the
 # collector reads Falco events. [Source: architecture.md:130-131]
@@ -201,7 +259,7 @@ falco:
   enabled: true
   driver:
     kind: ebpf
-  # Falco's gRPC server — both `grpc.enabled` and `grpc_output.enabled`
+  # Falco's gRPC server -- both `grpc.enabled` and `grpc_output.enabled`
   # must be on for the collector to subscribe.
   falco:
     grpc:
@@ -210,7 +268,7 @@ falco:
     grpc_output:
       enabled: true
 
-# NATS with JetStream persistence — inter-ring event bus. JetStream
+# NATS with JetStream persistence -- inter-ring event bus. JetStream
 # provides the replay/checkpoint primitive that Story 2.7 + Story 3.1
 # lean on for exactly-once recovery semantics. [Source: architecture.md:132-133]
 nats:
@@ -219,12 +277,12 @@ nats:
     jetstream:
       enabled: true
 
-# Redis — state store (per-workload baselines, FSM state, checkpoints).
+# Redis -- state store (per-workload baselines, FSM state, checkpoints).
 # Standalone architecture is enough for the single-aggregator MVP;
 # Sentinel/Cluster are deferred to the Target-tier HA story. AUTH is
 # mandatory (NFR8). The subchart reads its password from the parent
 # chart's `<fullname>-secrets` Secret (key `redis-password`) so both
-# sides agree on a single source of truth — the operator-supplied
+# sides agree on a single source of truth -- the operator-supplied
 # `secrets.redisPassword`. NOTE: `existingSecret` is hardcoded for the
 # canonical `helm install olaitan ...` release-name pattern; for any
 # other release name, also override:

@@ -1,7 +1,7 @@
 {{/*
 Canonical name helpers. Modelled on upstream Bitnami/stable conventions
 so an operator familiar with the Kubernetes chart ecosystem can read
-this chart without surprises. Do not reinvent — keep the names stable
+this chart without surprises. Do not reinvent -- keep the names stable
 across releases; external tooling (kubectl label selectors, monitoring
 dashboards) keys on these.
 */}}
@@ -12,7 +12,7 @@ dashboards) keys on these.
 
 {{/*
 Fully qualified release-scoped name. Drops the release-name prefix when
-it already matches the chart name — avoids "olaitan-olaitan" for the
+it already matches the chart name -- avoids "olaitan-olaitan" for the
 canonical `helm install olaitan ./deploy/helm/olaitan` invocation.
 */}}
 {{- define "olaitan.fullname" -}}
@@ -47,7 +47,7 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 
 {{/*
-Selector labels — immutable once a Deployment/DaemonSet is created, so
+Selector labels -- immutable once a Deployment/DaemonSet is created, so
 they MUST NOT include the chart version or appVersion (both change on
 upgrade and would break the selector match).
 */}}
@@ -57,7 +57,7 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{/*
-Component-scoped selector labels — used on DaemonSet and Deployment to
+Component-scoped selector labels -- used on DaemonSet and Deployment to
 distinguish collector pods from aggregator pods. Value is the ring's
 short name; kubelet probes and kubectl selectors both use this.
 */}}
@@ -74,7 +74,7 @@ app.kubernetes.io/component: aggregator
 {{/*
 ServiceAccount name helpers. Each ring has its own SA so the RBAC grant
 stays ring-scoped (Dev Notes § "RBAC: Role vs ClusterRole split"). The
-SA name is deterministic from the fullname — it is not a user-tunable
+SA name is deterministic from the fullname -- it is not a user-tunable
 value, because rbac.yaml bindings reference it by string.
 */}}
 {{- define "olaitan.collector.serviceAccountName" -}}
@@ -115,4 +115,19 @@ operator has not set an explicit override in `endpoints.<name>`.
 {{- else -}}
 {{- printf "%s-redis-master:6379" .Release.Name -}}
 {{- end -}}
+{{- end -}}
+
+{{/*
+Audit-webhook Service FQDN -- used by the kubeconfig Secret to tell the
+kube-apiserver where to push audit batches. Story 1.7 (Kubernetes
+audit-webhook receiver). Resolves to:
+
+  <fullname>-audit-webhook.<namespace>.svc.cluster.local
+
+The kube-apiserver runs outside this chart's namespace (kube-system),
+so the FQDN must include the cluster.local suffix; truncated forms
+that work for in-namespace clients break for cross-namespace dialers.
+*/}}
+{{- define "olaitan.auditWebhookServiceFqdn" -}}
+{{- printf "%s-audit-webhook.%s.svc.cluster.local" (include "olaitan.fullname" .) .Release.Namespace -}}
 {{- end -}}

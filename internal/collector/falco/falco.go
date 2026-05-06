@@ -60,6 +60,7 @@ import (
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
 	"github.com/olokotoh/olaitan/internal/retry"
 	"github.com/olokotoh/olaitan/internal/schema"
+	"github.com/olokotoh/olaitan/internal/sourcehealth"
 	"github.com/olokotoh/olaitan/internal/subjects"
 )
 
@@ -72,13 +73,10 @@ type natsPublisher interface {
 	PublishJS(ctx context.Context, subject string, data any, opts ...natsjs.PublishOpt) (*natsjs.PubAck, error)
 }
 
-// HealthReader is the read-only view of the adapter's source-health
-// tracker. Story 1.12's Prometheus collector only needs Status(); we
-// expose this narrow interface from Adapter.Health() so callers cannot
-// reach MarkHealthy / MarkUnhealthy from outside the package.
-type HealthReader interface {
-	Status() (bool, error)
-}
+// HealthReader is preserved as an alias for callers that already speak
+// the falco-package name. The canonical interface is now
+// sourcehealth.Reader, which Adapter.Health returns directly.
+type HealthReader = sourcehealth.Reader
 
 // Config holds the runtime knobs for an Adapter.
 type Config struct {
@@ -209,10 +207,11 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 
 // Health returns the read-only source-health view. Story 1.12 binds
 // this to the Prometheus gauge `source_healthy{source="falco"}` (FR8).
-// Returning the narrow HealthReader interface (rather than the concrete
-// *SourceHealth) prevents callers outside this package from reaching
-// the mutator methods MarkHealthy / MarkUnhealthy.
-func (a *Adapter) Health() HealthReader {
+// Returning the narrow sourcehealth.Reader interface (rather than the
+// concrete *sourcehealth.Tracker) prevents callers outside this
+// package from reaching the mutator methods MarkHealthy /
+// MarkUnhealthy.
+func (a *Adapter) Health() sourcehealth.Reader {
 	return &a.health
 }
 
