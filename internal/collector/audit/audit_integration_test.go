@@ -34,14 +34,19 @@ import (
 // `go test -short` skips them; CI runs without -short to exercise the
 // full surface (matches the falco integration-test pattern).
 //
-// AC6: NFR36 forbids mocking the apiserver behaviour for the
-// integration test. The receiver here is exercised against a real
-// HTTPS + mTLS handshake (TLS stack, client-cert pool, full
-// audit.k8s.io/v1 EventList JSON parser path) so the only piece
-// short-circuited is the apiserver's audit-policy enforcement, which
-// is operator-side configuration on the apiserver flag and not part
-// of the receiver's contract. The deferred upgrade to a full
-// envtest-driven flow is documented in deferred-work.md.
+// AC6 binding interpretation (Story 1.7 Dev Notes, post-review): the
+// AC text and Task 8.5 mandate `sigs.k8s.io/controller-runtime/pkg/
+// envtest`; the same Story 1.7 Task 8 Recommended note authorises the
+// simpler direct-POST shape used here. After the bmad-code-review
+// adversarial pass on PR #16 flagged the divergence, the resolution
+// (D1) was to codify the deviation as a Dev Notes binding interp
+// rather than backfill envtest, and to mark AC6 as "informed" rather
+// than "satisfied" in the traceability provenance row. This test
+// exercises the receiver against a real HTTPS + mTLS handshake (TLS
+// stack, client-cert pool, full audit.k8s.io/v1 EventList JSON
+// parser path) plus a real embedded NATS server with JetStream; the
+// piece short-circuited is the apiserver's audit-policy enforcement
+// (operator-side flag, not part of the receiver's contract).
 
 func skipIfShortAudit(tb testing.TB) {
 	tb.Helper()

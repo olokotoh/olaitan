@@ -80,14 +80,25 @@ type AuditSourceConfig struct {
 }
 
 // RetryStrategyConfig is the YAML mirror of internal/retry.Strategy.
-// Adapters that expose retry knobs use this shape; the Convert method
-// produces a retry.Strategy ready to pass to retry.Do.
+// Adapters that expose retry knobs use this shape. Conversion to a
+// `retry.Strategy` is performed by the caller (see
+// `cmd/olaitan/main.go:toRetryStrategy`); this type intentionally
+// avoids depending on `internal/retry` so the config package stays a
+// leaf in the import graph.
 type RetryStrategyConfig struct {
 	Min         DurationYAML `yaml:"min,omitempty"`
 	Max         DurationYAML `yaml:"max,omitempty"`
 	Multiplier  float64      `yaml:"multiplier,omitempty"`
 	Jitter      float64      `yaml:"jitter,omitempty"`
 	MaxAttempts int          `yaml:"max_attempts,omitempty"`
+}
+
+// IsZero reports whether r is the Go zero value (no fields set).
+// Used by retry-strategy validators that distinguish "operator left
+// the block out, use defaults" from "operator set partial fields,
+// validate after merge".
+func (r RetryStrategyConfig) IsZero() bool {
+	return r.Min == 0 && r.Max == 0 && r.Multiplier == 0 && r.Jitter == 0 && r.MaxAttempts == 0
 }
 
 // ConfidenceBands holds the three cumulative score thresholds that
@@ -282,6 +293,11 @@ func (d DetectionConfig) validate() error {
 // validate enforces the AuditSourceConfig invariants. When Enabled is
 // false the block may be entirely zero-valued; only the enabled path
 // requires the TLS triplet and a positive listen address.
+//
+// PublishRetry is validated structurally: a partial block (e.g. only
+// `multiplier: 2` set, leaving `min` zero) is rejected here rather
+// than left to crashloop the adapter at runtime with a wrapped
+// "retry: min must be > 0" error.
 func (a AuditSourceConfig) validate() error {
 	if !a.Enabled {
 		return nil
@@ -303,6 +319,35 @@ func (a AuditSourceConfig) validate() error {
 	}
 	if a.StalenessTimeout.Duration() < 0 {
 		return fmt.Errorf("detection.sources.audit.staleness_timeout: must be >= 0 (0 means default; got %s)", a.StalenessTimeout.Duration())
+	}
+	if err := a.PublishRetry.validatePartial("detection.sources.audit.publish_retry"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validatePartial returns an error when r is not the zero value AND
+// any required field is unset. Fully-zero r is "use defaults" and is
+// accepted. Non-zero r must specify min, max, and multiplier; jitter
+// defaults to 0 (deterministic backoff) and max_attempts to unlimited.
+func (r RetryStrategyConfig) validatePartial(prefix string) error {
+	if r.IsZero() {
+		return nil
+	}
+	if r.Min.Duration() <= 0 {
+		return fmt.Errorf("%s.min: must be > 0 when other retry fields are set", prefix)
+	}
+	if r.Max.Duration() < r.Min.Duration() {
+		return fmt.Errorf("%s.max: must be >= min (got min=%s, max=%s)", prefix, r.Min.Duration(), r.Max.Duration())
+	}
+	if r.Multiplier < 1.0 {
+		return fmt.Errorf("%s.multiplier: must be >= 1.0 (got %v)", prefix, r.Multiplier)
+	}
+	if r.Jitter < 0 || r.Jitter > 1 {
+		return fmt.Errorf("%s.jitter: must be in [0, 1] (got %v)", prefix, r.Jitter)
+	}
+	if r.MaxAttempts < 0 {
+		return fmt.Errorf("%s.max_attempts: must be >= 0 (got %d)", prefix, r.MaxAttempts)
 	}
 	return nil
 }

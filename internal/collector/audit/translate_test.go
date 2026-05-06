@@ -17,10 +17,15 @@ import (
 	"github.com/olokotoh/olaitan/internal/schema"
 )
 
-// fixedNow gives deterministic timestamps to assertions; well after
-// minValidEventTime and well within maxFutureSkew of any plausible
-// wall clock used by `go test`.
-var fixedNow = time.Date(2026, time.May, 1, 12, 0, 0, 0, time.UTC)
+// fixedNow returns a deterministic-but-relative timestamp for tests.
+// Anchoring to time.Now()-1m keeps assertions inside Translate's
+// future-skew window (maxFutureSkew = 24h) regardless of when the
+// test runs. The previous shape baked a calendar date that flipped a
+// year of test runs into a 24h-future-skew rejection on dev machines
+// whose clock pre-dated the calendar anchor.
+func fixedNowFn() time.Time { return time.Now().Add(-1 * time.Minute).UTC() }
+
+var fixedNow = fixedNowFn()
 
 const testNode = "node-test-01"
 
@@ -391,6 +396,52 @@ func TestTranslate_PodsExecIsWarning(t *testing.T) {
 	}
 	if !sliceContains(got.Tags, "resource:pods/exec") {
 		t.Errorf("expected resource:pods/exec tag, got %v", got.Tags)
+	}
+}
+
+func TestTranslate_PodsLogIsWarning(t *testing.T) {
+	t.Parallel()
+	ev := validEvent()
+	ev.Verb = "get"
+	ev.ObjectRef = &auditv1.ObjectReference{
+		Resource:    "pods",
+		Subresource: "log",
+		Namespace:   "default",
+		Name:        "leaky-app",
+		APIVersion:  "v1",
+	}
+	got, err := Translate(ev, testNode)
+	if err != nil {
+		t.Fatalf("translate err: %v", err)
+	}
+	if got.Severity != "warning" {
+		t.Errorf("pods/log should be warning (credential-leak signal), got %q", got.Severity)
+	}
+	if !sliceContains(got.Tags, "resource:pods/log") {
+		t.Errorf("expected resource:pods/log tag, got %v", got.Tags)
+	}
+}
+
+func TestTranslate_ImpersonatedUserBumpsSeverity(t *testing.T) {
+	t.Parallel()
+	ev := validEvent()
+	// A get on a benign resource via impersonation should still
+	// flag warning -- impersonation is the privilege-escalation
+	// signal regardless of the underlying verb/resource.
+	ev.Verb = "get"
+	ev.ObjectRef = &auditv1.ObjectReference{
+		Resource:   "configmaps",
+		Namespace:  "default",
+		Name:       "trace-config",
+		APIVersion: "v1",
+	}
+	ev.ImpersonatedUser = &authnv1.UserInfo{Username: "system:masters"}
+	got, err := Translate(ev, testNode)
+	if err != nil {
+		t.Fatalf("translate err: %v", err)
+	}
+	if got.Severity != "warning" {
+		t.Errorf("impersonated request should be warning, got %q", got.Severity)
 	}
 }
 

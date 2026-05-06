@@ -36,11 +36,15 @@ import (
 	"github.com/olokotoh/olaitan/internal/subjects"
 )
 
-// stubPublisher captures published events for assertion.
+// stubPublisher captures published events for assertion. attempts
+// counts every PublishJS call (success or failure) so tests can
+// verify the retry budget actually executed; calls captures only
+// successful publishes.
 type stubPublisher struct {
 	mu        sync.Mutex
 	calls     []stubCall
-	failNext  atomic.Int32 // number of upcoming calls to fail
+	attempts  atomic.Int64 // every PublishJS invocation, regardless of outcome
+	failNext  atomic.Int32 // number of upcoming calls to fail transiently
 	failErr   error
 	permanent atomic.Bool
 }
@@ -51,6 +55,7 @@ type stubCall struct {
 }
 
 func (s *stubPublisher) PublishJS(_ context.Context, subject string, data any, opts ...natsjs.PublishOpt) (*natsjs.PubAck, error) {
+	s.attempts.Add(1)
 	if s.failNext.Add(-1) >= 0 {
 		err := s.failErr
 		if err == nil {
@@ -65,11 +70,6 @@ func (s *stubPublisher) PublishJS(_ context.Context, subject string, data any, o
 	if err != nil {
 		return nil, err
 	}
-	// Extract msgID by re-publishing with our own opts catch -- the
-	// jetstream package does not expose the headers from PublishOpt
-	// directly without a fake transport. We'll compare publish counts
-	// by event ID inside Adapter tests; msgID round-trip is asserted
-	// via the integration test against an embedded NATS server.
 	_ = opts
 	s.mu.Lock()
 	s.calls = append(s.calls, stubCall{subject: subject, data: b})
@@ -82,6 +82,8 @@ func (s *stubPublisher) Calls() []stubCall {
 	defer s.mu.Unlock()
 	return append([]stubCall(nil), s.calls...)
 }
+
+func (s *stubPublisher) Attempts() int64 { return s.attempts.Load() }
 
 // testCerts holds the on-disk paths to a synthetic CA, server cert,
 // and client cert generated for a single test.
@@ -477,7 +479,7 @@ func TestReceiver_Rejects_UnknownClientCA(t *testing.T) {
 func TestReceiver_5xx_When_AllPublishesFailTransiently(t *testing.T) {
 	t.Parallel()
 	pub := &stubPublisher{}
-	pub.failNext.Store(100) // larger than any retry budget × event count
+	pub.failNext.Store(100) // larger than any retry budget x event count
 	_, url, tc, _ := startAdapter(t, pub, nil)
 
 	client := mtlsClient(t, tc, true)
@@ -488,6 +490,13 @@ func TestReceiver_5xx_When_AllPublishesFailTransiently(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("status: got %d, want 500 (all transient publishes failed)", resp.StatusCode)
+	}
+	// Retry budget assertion (P31): the configured PublishRetry has
+	// MaxAttempts=3 and the batch contains exactly 1 event, so we
+	// expect exactly 3 PublishJS attempts. A regression that drops the
+	// retry loop or shrinks MaxAttempts would surface here.
+	if got, want := pub.Attempts(), int64(3); got != want {
+		t.Errorf("PublishJS attempts: got %d, want %d (MaxAttempts=3 x 1 event)", got, want)
 	}
 }
 
@@ -562,7 +571,7 @@ func TestReceiver_Health_StalenessFlipsUnhealthy(t *testing.T) {
 	if healthy {
 		t.Errorf("expected unhealthy after staleness, got healthy=true err=%v", herr)
 	}
-	if herr == nil || !strings.Contains(herr.Error(), "no inbound traffic") {
+	if herr == nil || !strings.Contains(herr.Error(), "no successful publish") {
 		t.Errorf("expected staleness err message, got %v", herr)
 	}
 }

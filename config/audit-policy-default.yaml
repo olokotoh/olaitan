@@ -3,11 +3,15 @@
 # the audit-webhook backend is wired up; see deploy/helm/olaitan/AUDIT.md
 # for the operator workflow.
 #
-# Filter scope is justified in Story 1.7 Task 2.2. Goal: keep within
-# the NFR1 1000 events/sec/node budget by silencing the kubelet /
-# controller-manager noise floor and recording full payload only for
-# the resources that drive the academic detection scenarios (RBAC,
-# NetPol, Secret access, exec/portforward).
+# Filter scope is justified in Story 1.7 Task 2.2 plus the bmad-code-
+# review correctness fixes (P4: PolicyRule.Users is exact-match not
+# globbed -> use userGroups; P5: endpointslices group is
+# discovery.k8s.io not core; P6: Secret/ConfigMap list/watch must not
+# inherit the RequestResponse level the mutating verbs need). Goal:
+# keep within the NFR1 1000 events/sec/node budget by silencing the
+# kubelet / controller-manager noise floor and recording full payload
+# only for the resources that drive the academic detection scenarios
+# (RBAC, NetPol, Secret access, exec/portforward).
 #
 # Operators can override by setting auditWebhook.policy.custom in the
 # Helm values; the chart renders that verbatim into the ConfigMap when
@@ -20,30 +24,49 @@ omitStages:
   - "RequestReceived"
 rules:
   # Drop the noisiest read-only kubelet / controller-manager traffic.
+  # Note: endpointslices live in the discovery.k8s.io group, NOT the
+  # core ("") group; the previous shape silently never matched.
   - level: None
     resources:
       - group: ""
-        resources: ["events", "endpoints", "endpointslices"]
+        resources: ["events", "endpoints"]
+      - group: "discovery.k8s.io"
+        resources: ["endpointslices"]
       - group: "coordination.k8s.io"
         resources: ["leases"]
     verbs: ["get", "list", "watch"]
 
   # Drop kube-system service-account list/watch on nodes (high volume,
-  # low signal).
+  # low signal). audit.k8s.io/v1 PolicyRule.users is exact-match (not
+  # globbed); use the apiserver-synthesised group selector
+  # `system:serviceaccounts:kube-system` which matches every kube-
+  # system SA at request time.
   - level: None
-    users:
-      - "system:serviceaccount:kube-system:*"
+    userGroups:
+      - "system:serviceaccounts:kube-system"
     resources:
       - group: ""
         resources: ["nodes", "nodes/status"]
     verbs: ["get", "list", "watch"]
 
-  # Full request+response on Secret and ConfigMap traffic -- credential
-  # exfiltration patterns key off these payloads.
+  # Full request+response on Secret and ConfigMap mutations + reads.
+  # Credential-exfiltration / config-tampering signals key off these
+  # payloads. list/watch is captured at Metadata level only (next rule)
+  # because controller-manager continuously list-watches both resources
+  # and full-payload retention would dominate the audit firehose at
+  # scale.
   - level: RequestResponse
     resources:
       - group: ""
         resources: ["secrets", "configmaps"]
+    verbs: ["create", "update", "patch", "delete", "deletecollection", "get"]
+
+  # Metadata-only on Secret/ConfigMap list/watch.
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["secrets", "configmaps"]
+    verbs: ["list", "watch"]
 
   # Full request+response on RBAC and NetworkPolicy mutations.
   - level: RequestResponse

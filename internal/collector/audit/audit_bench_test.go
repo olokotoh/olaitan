@@ -170,6 +170,16 @@ func BenchmarkAdapter_PublishLatency(b *testing.B) {
 	// Suppress ns/op so the report focuses on p50/p99 (Story 1.6 precedent).
 	b.ReportMetric(0, "ns/op")
 
+	// AC4 gate (post-bmad-code-review fix P33): NFR1's 50ms p99 budget
+	// is the contract. Failing the bench here is the regression signal
+	// when a future change breaks the latency floor on this hardware.
+	// Production-class measurement under 1000 ev/s/node load lands
+	// with the Story 5.1 evaluation harness.
+	const ac4P99Budget = 50 * time.Millisecond
+	if p99 > ac4P99Budget {
+		b.Fatalf("AC4 violation: p99 receive->PubAck latency %s exceeds NFR1 budget %s (p50=%s, n=%d)",
+			p99, ac4P99Budget, p50, len(latencies))
+	}
 }
 
 // formatAuditID renders a deterministic 36-char UUID-shaped string

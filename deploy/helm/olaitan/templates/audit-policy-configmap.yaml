@@ -8,6 +8,15 @@ chart install (Story 1.1 default) leaves the resource absent. When
 .Values.auditWebhook.policy.custom is non-empty it is used verbatim;
 otherwise the baked-in default at files/audit-policy-default.yaml is
 rendered.
+
+Dual-flag relationship (post-bmad-code-review fix C11): the chart's
+audit-policy / kubeconfig / TLS resources gate on auditWebhook.enabled
+here. The receiver adapter goroutine separately gates on
+detection.sources.audit.enabled inside config/olaitan.yaml. Those two
+flags are kept in lockstep automatically by the configmap.yaml
+template (a regex overlay flips the runtime config flag whenever the
+Helm flag is true), so operators only need to flip auditWebhook.
+enabled here.
 */}}
 {{- if .Values.auditWebhook.enabled -}}
 apiVersion: v1

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"mime"
 	"net/http"
 	"os"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	natsjs "github.com/nats-io/nats.go/jetstream"
 	auditv1 "k8s.io/apiserver/pkg/apis/audit/v1"
 
@@ -25,18 +27,25 @@ import (
 	"github.com/olokotoh/olaitan/internal/subjects"
 )
 
-// rejectedCounters tracks per-reason counters for HTTP-layer rejections.
-// Story 1.12 will read these via Adapter.Rejected() and bind each
-// reason to a Prometheus counter audit_webhook_rejected{reason}. The
-// reason set is fixed at compile time so a typo at the call site is a
-// compile error rather than a silently-dropped metric.
+// rejectedCounters tracks per-reason counters for HTTP-layer
+// rejections plus translate-layer drops. Story 1.12 will read these via
+// Adapter.Rejected() and bind each reason to a Prometheus counter
+// audit_webhook_rejected{reason}. The reason set is open-ended at the
+// type level but the production reasons are:
+//
+//	method_not_allowed
+//	unsupported_media_type
+//	payload_too_large
+//	decode_error
+//	trailing_json
+//	translate_failed
 type rejectedCounters struct {
 	mu       sync.RWMutex
 	counters map[string]*atomic.Uint64
 }
 
 func newRejectedCounters() *rejectedCounters {
-	return &rejectedCounters{counters: make(map[string]*atomic.Uint64, 4)}
+	return &rejectedCounters{counters: make(map[string]*atomic.Uint64, 6)}
 }
 
 func (r *rejectedCounters) Inc(reason string) {
@@ -67,11 +76,22 @@ func (r *rejectedCounters) Snapshot() map[string]uint64 {
 
 // natsPublisher is the minimal NATS surface the adapter consumes.
 // Mirrors the falco package's interface so tests can supply a stub.
-// The variadic opts let callers pass natsjs.WithMsgID for server-side
-// dedup on retry.
 type natsPublisher interface {
 	PublishJS(ctx context.Context, subject string, data any, opts ...natsjs.PublishOpt) (*natsjs.PubAck, error)
 }
+
+// defaultClientCNs is the allow-list of leaf-cert CommonNames the
+// receiver accepts when no explicit ClientCNAllow is configured.
+// "kube-apiserver" is the canonical CN the kubeadm-issued
+// apiserver-kubelet-client cert uses; operators with a custom client
+// cert override via ClientCNAllow.
+//
+// The post-review D2 binding interpretation (see Story 1.7 Review
+// Findings) requires this pinning because on kubeadm clusters the
+// cluster CA at /etc/kubernetes/pki/ca.crt signs every control-plane
+// component (kubelet, controller-manager, scheduler, ...) -- a CA
+// trust pool alone is not enough to identify the apiserver.
+var defaultClientCNs = []string{"kube-apiserver"}
 
 // Config holds the runtime knobs for an audit-webhook Adapter.
 type Config struct {
@@ -91,23 +111,38 @@ type Config struct {
 	// signed by an unknown CA fails the TLS handshake.
 	ClientCAFile string
 
+	// ClientCNAllow is the list of leaf-cert CommonNames the receiver
+	// accepts after CA validation. Empty means "use defaultClientCNs".
+	// Set to a single-element list when the operator's apiserver client
+	// cert uses a non-standard CN. Defence-in-depth on top of the CA
+	// trust pool: prevents any other workload pod with a CA-signed cert
+	// from posting forged audit events.
+	ClientCNAllow []string
+
 	// Hostname is the node-level identifier the adapter records on
 	// every emitted Event.Pod.Node. Sourced from the K8S_NODE_NAME env
 	// var the Helm chart's downward API injects.
 	Hostname string
 
 	// MaxPayloadBytes caps the request body size before rejection. The
-	// apiserver default batch is ~400 events × ~1-32 KiB each ≈ <4 MiB;
+	// apiserver default batch is ~400 events x ~1-32 KiB each ~ <4 MiB;
 	// 8 MiB is a generous cap that fails misconfigured upstreams loud
 	// (413, no retry) instead of OOMing the receiver. Default 8 MiB
 	// when zero-valued.
 	MaxPayloadBytes int64
 
 	// StalenessTimeout is how long without an inbound batch before the
-	// source is marked unhealthy. Default 5m when zero-valued. The
-	// source health is "did we receive a batch recently?" -- there is
-	// no outbound connection to monitor (the apiserver is the active
-	// side), so absence of traffic IS the negative signal.
+	// source is marked unhealthy. Default 5m when zero-valued.
+	//
+	// Health semantics: source health flips to healthy on the first
+	// successful PublishJS PubAck, NOT on the first received batch.
+	// "Received but every event failed to translate" stays unhealthy
+	// because it indicates a real upstream contract break. The
+	// staleness watchdog flips back to unhealthy only after the source
+	// has previously been marked healthy AND no successful publish has
+	// landed within StalenessTimeout (preserves a more specific
+	// MarkUnhealthy reason posted by the listen-fail or publish-loop
+	// paths).
 	StalenessTimeout time.Duration
 
 	// PublishRetry is the bounded inner retry for transient NATS
@@ -118,9 +153,31 @@ type Config struct {
 	// Default 10s when zero-valued.
 	ReadHeaderTimeout time.Duration
 
+	// ReadTimeout caps total-body-read time. Without this a post-mTLS
+	// hostile client can keep the body trickling within
+	// MaxPayloadBytes indefinitely. Default 30s when zero-valued.
+	ReadTimeout time.Duration
+
+	// WriteTimeout caps response-write time. Default 30s when
+	// zero-valued. Mostly a defence-in-depth knob; our handler writes
+	// 204/4xx/5xx promptly.
+	WriteTimeout time.Duration
+
+	// IdleTimeout caps keep-alive reuse. Default 60s when zero-valued.
+	IdleTimeout time.Duration
+
 	// ShutdownGrace is the deadline for srv.Shutdown to drain in-flight
 	// requests on ctx cancellation. Default 5s when zero-valued.
 	ShutdownGrace time.Duration
+
+	// PublishWallClockBudget caps the total wall-clock time
+	// publishWithRetry can spend on a single event, including retries.
+	// Default = PublishRetry.MaxAttempts * publishAttemptTimeout +
+	// retry-backoffs (~9s for the production strategy). The retry path
+	// uses context.WithoutCancel so an apiserver client disconnect does
+	// not abort an in-flight retry budget; this knob bounds the
+	// detached path so a stuck NATS does not orphan a goroutine.
+	PublishWallClockBudget time.Duration
 }
 
 // DefaultPublishRetry returns the per-publish bounded retry strategy.
@@ -137,11 +194,17 @@ func DefaultPublishRetry() retry.Strategy {
 	}
 }
 
-// publishAttemptTimeout caps a single PublishJS attempt. Same value as
-// the falco adapter's bound: JetStream's default publish-ack-wait is
-// ~5s; without a per-attempt deadline a NATS partition can stall a
-// single PublishJS for ~5s before retry 2 starts.
+// publishAttemptTimeout caps a single PublishJS attempt. JetStream's
+// default publish-ack-wait is ~5s; without a per-attempt deadline a
+// NATS partition can stall a single PublishJS for ~5s before retry 2
+// starts. Same value as the falco adapter's bound.
 const publishAttemptTimeout = 2 * time.Second
+
+// defaultPublishWallClockBudget bounds the detached retry context the
+// publish path uses (see D6 in Story 1.7 Review Findings). 12s covers
+// 3 attempts x 2s deadline + ~6s of jittered backoff between them with
+// generous slack.
+const defaultPublishWallClockBudget = 12 * time.Second
 
 // Adapter is the audit-webhook receiver. Construct with New; run the
 // per-instance lifecycle via Run; observe health via Health.
@@ -151,25 +214,13 @@ type Adapter struct {
 	log    *slog.Logger
 	health sourcehealth.Tracker
 
-	// lastTrafficUnixNano is the Unix-nanosecond timestamp of the most
-	// recent inbound batch. Updated atomically on every received batch
-	// (regardless of per-event success); the staleness watchdog reads
-	// it to flip MarkUnhealthy when no traffic has arrived for
-	// StalenessTimeout. Zero means "no traffic ever".
-	lastTrafficUnixNano atomic.Int64
+	// lastPublishOKUnixNano is the Unix-nanosecond timestamp of the
+	// most recent successful PublishJS PubAck. The staleness watchdog
+	// reads it to decide whether to flip MarkUnhealthy. Zero means "no
+	// successful publish ever".
+	lastPublishOKUnixNano atomic.Int64
 
-	// rejected is a per-reason counter for requests rejected at the
-	// HTTP layer. Story 1.12 will read these via Adapter.Rejected
-	// (separate method) and bind to a Prometheus counter
-	// audit_webhook_rejected{reason}. Reasons map to:
-	//   "method_not_allowed", "unsupported_media_type",
-	//   "payload_too_large", "decode_error".
-	// Counter access uses sync/atomic; reads need no lock.
 	rejected *rejectedCounters
-
-	// addrFn is a test seam: production uses (*http.Server).Addr; tests
-	// can override to capture the bound port from a :0 listen.
-	addrFn func() string
 
 	// nowFn is a test seam for time-dependent assertions in
 	// staleness-watchdog tests.
@@ -211,14 +262,29 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 	if cfg.ReadHeaderTimeout <= 0 {
 		cfg.ReadHeaderTimeout = 10 * time.Second
 	}
+	if cfg.ReadTimeout <= 0 {
+		cfg.ReadTimeout = 30 * time.Second
+	}
+	if cfg.WriteTimeout <= 0 {
+		cfg.WriteTimeout = 30 * time.Second
+	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = 60 * time.Second
+	}
 	if cfg.ShutdownGrace <= 0 {
 		cfg.ShutdownGrace = 5 * time.Second
+	}
+	if cfg.PublishWallClockBudget <= 0 {
+		cfg.PublishWallClockBudget = defaultPublishWallClockBudget
 	}
 	if cfg.PublishRetry.IsZero() {
 		cfg.PublishRetry = DefaultPublishRetry()
 	}
 	if err := cfg.PublishRetry.Validate(); err != nil {
 		return nil, fmt.Errorf("audit: new: publish retry: %w", err)
+	}
+	if len(cfg.ClientCNAllow) == 0 {
+		cfg.ClientCNAllow = append([]string(nil), defaultClientCNs...)
 	}
 
 	return &Adapter{
@@ -249,7 +315,10 @@ func (a *Adapter) Rejected() map[string]uint64 {
 
 // Run binds the receiver, starts the staleness watchdog, and blocks
 // until ctx is cancelled. On cancellation it gives the HTTP server
-// cfg.ShutdownGrace to drain in-flight requests.
+// cfg.ShutdownGrace to drain in-flight requests. On a listen failure
+// (cert rotation surprise, transient bind error, panic in the listen
+// goroutine) the watchdog is also cancelled so Run does not deadlock
+// waiting on the watchdogDone channel.
 func (a *Adapter) Run(ctx context.Context) error {
 	a.log.Info("audit: adapter starting",
 		"addr", a.cfg.ListenAddr,
@@ -274,29 +343,35 @@ func (a *Adapter) Run(ctx context.Context) error {
 		Handler:           mux,
 		TLSConfig:         tlsCfg,
 		ReadHeaderTimeout: a.cfg.ReadHeaderTimeout,
-	}
-	if a.addrFn == nil {
-		a.addrFn = func() string { return srv.Addr }
+		ReadTimeout:       a.cfg.ReadTimeout,
+		WriteTimeout:      a.cfg.WriteTimeout,
+		IdleTimeout:       a.cfg.IdleTimeout,
 	}
 
-	// Staleness watchdog. Wakes every StalenessTimeout/2 to compare
-	// last-traffic to wall clock; flips MarkUnhealthy on staleness.
-	// MarkHealthy is the handler's job (on first successful publish).
+	// Derive a watchdog ctx from the parent so listen-failure can
+	// cancel the watchdog without waiting on the parent shutdown.
+	wdCtx, wdCancel := context.WithCancel(ctx)
 	watchdogDone := make(chan struct{})
 	go func() {
 		defer close(watchdogDone)
-		a.runStalenessWatchdog(ctx)
+		a.runStalenessWatchdog(wdCtx)
 	}()
 
-	// Mark unhealthy at startup until first traffic. The Falco adapter
-	// flips healthy on the first successful Recv; the audit adapter
-	// flips healthy on the first successful publish.
+	// Mark unhealthy at startup until first successful publish.
 	a.health.MarkUnhealthy(errors.New("audit: awaiting initial inbound traffic"))
 
 	listenErr := make(chan error, 1)
 	go func() {
-		// Empty cert/key file paths are illegal here; New() already
-		// guarded that. ListenAndServeTLS reads the files at bind time.
+		// Defensive: a panic in ListenAndServeTLS-driven handler stack
+		// must not orphan Run waiting on listenErr forever.
+		defer func() {
+			if r := recover(); r != nil {
+				select {
+				case listenErr <- fmt.Errorf("audit: listen goroutine panic: %v", r):
+				default:
+				}
+			}
+		}()
 		err := srv.ListenAndServeTLS(a.cfg.TLSCertFile, a.cfg.TLSKeyFile)
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			listenErr <- err
@@ -307,6 +382,9 @@ func (a *Adapter) Run(ctx context.Context) error {
 
 	select {
 	case err := <-listenErr:
+		// Cancel the watchdog so we don't wait forever on watchdogDone
+		// just because the parent ctx is still live.
+		wdCancel()
 		<-watchdogDone
 		if err != nil {
 			a.health.MarkUnhealthy(err)
@@ -320,14 +398,20 @@ func (a *Adapter) Run(ctx context.Context) error {
 			a.log.Warn("audit: shutdown grace expired or errored", "err", err)
 		}
 		<-listenErr
+		wdCancel()
 		<-watchdogDone
 		return nil
 	}
 }
 
 // runStalenessWatchdog periodically checks whether the time since the
-// last inbound batch has exceeded StalenessTimeout; if so, marks the
-// source unhealthy. Returns when ctx is cancelled.
+// last successful publish has exceeded StalenessTimeout. Only flips
+// MarkUnhealthy when the source is currently healthy: this preserves
+// any more-specific error a publish-loop or listen-fail path stored.
+// Backward clock jumps (negative Sub) are treated as "not stale" so a
+// transient NTP step does not falsely flip the source.
+//
+// Returns when ctx is cancelled.
 func (a *Adapter) runStalenessWatchdog(ctx context.Context) {
 	period := a.cfg.StalenessTimeout / 2
 	if period <= 0 {
@@ -340,24 +424,52 @@ func (a *Adapter) runStalenessWatchdog(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			lastNs := a.lastTrafficUnixNano.Load()
+			lastNs := a.lastPublishOKUnixNano.Load()
 			if lastNs == 0 {
-				// Never received traffic; the startup MarkUnhealthy is
-				// authoritative until the first batch flips it.
+				// Never had a successful publish; the startup
+				// MarkUnhealthy is authoritative until the first OK
+				// publish flips it.
 				continue
 			}
 			last := time.Unix(0, lastNs)
-			if a.nowFn().Sub(last) > a.cfg.StalenessTimeout {
-				a.health.MarkUnhealthy(fmt.Errorf("audit: no inbound traffic for %s", a.cfg.StalenessTimeout))
+			delta := a.nowFn().Sub(last)
+			if delta < 0 {
+				// Backward clock jump (NTP step). Treat as "fresh"
+				// rather than fabricating a staleness signal.
+				continue
 			}
+			if delta <= a.cfg.StalenessTimeout {
+				continue
+			}
+			// Only override health if we are currently healthy. If a
+			// listen-fail or publish-loop has already stored a more
+			// specific error, leave it alone.
+			if healthy, _ := a.health.Status(); !healthy {
+				continue
+			}
+			a.health.MarkUnhealthy(fmt.Errorf("audit: no successful publish for %s", a.cfg.StalenessTimeout))
 		}
 	}
 }
 
 // buildTLSConfig assembles the receiver's TLS configuration. mTLS is
 // mandatory: ClientAuth=RequireAndVerifyClientCert ensures the Go
-// stdlib TLS handshake fails before the request reaches our handler if
-// the apiserver does not present a cert signed by ClientCAFile.
+// stdlib TLS handshake fails before the request reaches the handler if
+// the apiserver does not present a cert signed by ClientCAFile, AND
+// VerifyPeerCertificate adds CN-pinning so a cluster-CA-signed cert
+// from another workload (kubelet, controller-manager, ...) cannot
+// authenticate as "the apiserver".
+//
+// AC3 binding interpretation (see Story 1.7 Review Findings D4):
+// rejection at the TLS layer is operationally stronger than an HTTP
+// 403 but does not run through the Go handler stack, so per-request
+// HTTP-403 / `audit_webhook_rejected{reason}` / structured-log fields
+// for cert-failure paths are not emitted; instead, mTLS rejections
+// surface in the apiserver's own audit-webhook backoff logs and
+// (post-Story-1.12) in the `tls_handshake_failed_total` counter
+// derived from `crypto/tls.Config.GetConfigForClient` instrumentation.
+// Story 1.12 will add the latter; this story stops at the in-process
+// CN-pinning.
 func (a *Adapter) buildTLSConfig() (*tls.Config, error) {
 	caBytes, err := os.ReadFile(a.cfg.ClientCAFile)
 	if err != nil {
@@ -367,10 +479,32 @@ func (a *Adapter) buildTLSConfig() (*tls.Config, error) {
 	if !pool.AppendCertsFromPEM(caBytes) {
 		return nil, fmt.Errorf("parse client ca %q: no PEM certs found", a.cfg.ClientCAFile)
 	}
+	allow := make(map[string]struct{}, len(a.cfg.ClientCNAllow))
+	for _, cn := range a.cfg.ClientCNAllow {
+		allow[cn] = struct{}{}
+	}
 	return &tls.Config{
 		ClientAuth: tls.RequireAndVerifyClientCert,
 		ClientCAs:  pool,
-		MinVersion: tls.VersionTLS12,
+		// TLS 1.3 is the floor on kubeadm 1.29 (apiserver supports it
+		// universally); TLS 1.2 + no CipherSuites left a CBC-padding
+		// surface that adds nothing for an in-cluster hop.
+		MinVersion: tls.VersionTLS13,
+		// Defence-in-depth on top of the CA pool: VerifyPeerCertificate
+		// runs after Go's chain validation when ClientAuth is
+		// RequireAndVerifyClientCert, so any verifiedChains[0][0] is
+		// already CA-signed. We additionally require its CN to be in
+		// the configured allow-list.
+		VerifyPeerCertificate: func(_ [][]byte, verifiedChains [][]*x509.Certificate) error {
+			if len(verifiedChains) == 0 || len(verifiedChains[0]) == 0 {
+				return errors.New("audit: tls: no verified peer chain")
+			}
+			leaf := verifiedChains[0][0]
+			if _, ok := allow[leaf.Subject.CommonName]; ok {
+				return nil
+			}
+			return fmt.Errorf("audit: tls: peer CN %q not in client_cn_allow", leaf.Subject.CommonName)
+		},
 	}, nil
 }
 
@@ -378,15 +512,17 @@ func (a *Adapter) buildTLSConfig() (*tls.Config, error) {
 // audit.k8s.io/v1 EventList JSON batches. We translate each event,
 // publish to subjects.RawAudit, and return:
 //
-//   - 204 No Content on all-events-processed (translate-or-publish-or-
-//     skip; per-event failures are logged but never 5xx because the
-//     apiserver retries the entire batch on 5xx).
-//   - 5xx only when EVERY event in the batch fails to publish on the
-//     transient path. This signals to the apiserver to retry; the per-
-//     event WithMsgID dedups on JetStream within its 2-minute window.
+//   - 204 No Content when every translate-eligible event publishes
+//     successfully (or every failure is permanent / per-event terminal,
+//     which the apiserver should NOT retry).
+//   - 5xx (Internal Server Error) when ANY translate-eligible event
+//     fails transiently. WithMsgID dedup on the subsequent retry means
+//     the events that did publish will not duplicate. This is the
+//     post-D5 binding: at-least-once is the contract WithMsgID was
+//     added to honour, so partial-success ergonomics yield to it.
 //
 // Other rejections short-circuit before translation: 405 (method),
-// 415 (content-type), 413 (payload too large).
+// 415 (content-type), 413 (payload too large), 400 (decode error).
 func (a *Adapter) handleAudit(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		a.rejected.Inc("method_not_allowed")
@@ -395,13 +531,10 @@ func (a *Adapter) handleAudit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	ct := r.Header.Get("Content-Type")
-	// The apiserver sends application/json; tolerate
-	// "application/json; charset=utf-8" and similar parameter forms.
-	if !strings.HasPrefix(ct, "application/json") {
+	if !isJSONContentType(r.Header.Get("Content-Type")) {
 		a.rejected.Inc("unsupported_media_type")
 		a.peerLog(r).Warn("audit: rejected non-JSON content-type",
-			"content_type", ct)
+			"content_type", r.Header.Get("Content-Type"))
 		http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)
 		return
 	}
@@ -412,8 +545,6 @@ func (a *Adapter) handleAudit(w http.ResponseWriter, r *http.Request) {
 	var list auditv1.EventList
 	dec := json.NewDecoder(body)
 	if err := dec.Decode(&list); err != nil {
-		// MaxBytesReader surfaces oversize as
-		// "http: request body too large"; map that to 413.
 		if isMaxBytesError(err) {
 			a.rejected.Inc("payload_too_large")
 			a.peerLog(r).Warn("audit: rejected oversize payload",
@@ -426,16 +557,31 @@ func (a *Adapter) handleAudit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	// Reject trailing JSON after the EventList: a spec-violating
+	// upstream that sends a second top-level value after the EventList
+	// would otherwise be silently truncated.
+	if dec.More() {
+		a.rejected.Inc("trailing_json")
+		a.peerLog(r).Warn("audit: rejected trailing JSON after EventList")
+		http.Error(w, "trailing json", http.StatusBadRequest)
+		return
+	}
 
-	a.lastTrafficUnixNano.Store(a.nowFn().UnixNano())
+	// publishCtx is detached from r.Context() so an apiserver-side
+	// disconnect mid-batch does not abort the bounded retry budget.
+	// We bound the detached path with a wall-clock deadline so a
+	// stuck NATS cannot orphan a goroutine.
+	publishCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(r.Context()),
+		a.cfg.PublishWallClockBudget,
+	)
+	defer cancel()
 
-	ctx := r.Context()
 	var (
-		processed int
-		published int
-		permanent int
-		dropped   int
-		anyOK     bool
+		processed      int
+		published      int
+		permanent      int
+		transientFails int
 	)
 
 	for i := range list.Items {
@@ -449,12 +595,12 @@ func (a *Adapter) handleAudit(w http.ResponseWriter, r *http.Request) {
 			}
 			a.log.Warn("audit: translate skipped malformed event",
 				"err", terr, "audit_id", ev.AuditID)
-			dropped++
+			a.rejected.Inc("translate_failed")
 			continue
 		}
 		processed++
 
-		if perr := a.publishWithRetry(ctx, schemaEv); perr != nil {
+		if perr := a.publishWithRetry(publishCtx, schemaEv); perr != nil {
 			if isPermanentPublishError(perr) {
 				a.log.Error("audit: publish dropped (permanent, per-event)",
 					"err", perr, "event_id", schemaEv.ID,
@@ -464,31 +610,27 @@ func (a *Adapter) handleAudit(w http.ResponseWriter, r *http.Request) {
 			}
 			a.log.Warn("audit: publish failed transiently",
 				"err", perr, "event_id", schemaEv.ID)
+			transientFails++
 			continue
 		}
 		published++
-		anyOK = true
 	}
 
-	if anyOK {
-		// First successful publish (or any subsequent success) flips
-		// the source healthy. The Falco adapter parallel: MarkHealthy
-		// only after evidence of byte traffic in both directions.
+	if published > 0 {
+		a.lastPublishOKUnixNano.Store(a.nowFn().UnixNano())
 		a.health.MarkHealthy()
 	}
 
-	// 5xx only when there were translate-eligible events AND none of
-	// them published. Permanent (per-event terminal) failures do not
-	// count as a reason to 5xx -- the apiserver should NOT retry an
-	// oversize event indefinitely. If only permanents and zero
-	// transient failures occurred, return 204; the events are dropped
-	// at our edge, not the apiserver's.
-	transientFails := processed - published - permanent
-	if processed > 0 && published == 0 && transientFails > 0 {
-		http.Error(w, "publish failed", http.StatusInternalServerError)
+	// Post-D5: 5xx on ANY transient failure so the apiserver retries
+	// the batch; WithMsgID(ev.ID) on each publish dedups the events
+	// that already landed within the JetStream 2-minute window. This
+	// preserves the at-least-once contract end-to-end.
+	if transientFails > 0 {
+		http.Error(w, "publish failed (transient)", http.StatusInternalServerError)
 		return
 	}
-
+	_ = processed
+	_ = permanent
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -497,9 +639,13 @@ func (a *Adapter) handleAudit(w http.ResponseWriter, r *http.Request) {
 // (publishAttemptTimeout). ev.ID is forwarded as the JetStream
 // Nats-Msg-Id header so a retry the server already persisted on a
 // previous attempt is server-side deduplicated within the stream's
-// dedup window. A permanent server-side error (e.g. payload-too-big)
-// is wrapped in retry.Permanent so the inner-retry exits immediately
-// and the caller can log+drop without 5xx.
+// 2-minute dedup window. A permanent server-side error (e.g.
+// payload-too-big) is wrapped in retry.Permanent so the inner-retry
+// exits immediately and the caller can log+drop without 5xx.
+//
+// The supplied ctx is the caller-managed publish context (detached
+// from the HTTP request context per D6); each attempt derives its own
+// 2s sub-context.
 func (a *Adapter) publishWithRetry(ctx context.Context, ev schema.Event) error {
 	return a.cfg.PublishRetry.Do(ctx, func(ctx context.Context) error {
 		attemptCtx, cancel := context.WithTimeout(ctx, publishAttemptTimeout)
@@ -524,33 +670,73 @@ func (a *Adapter) peerLog(r *http.Request) *slog.Logger {
 		return a.log
 	}
 	cert := r.TLS.PeerCertificates[0]
+	serial := ""
+	if cert.SerialNumber != nil {
+		serial = cert.SerialNumber.String()
+	}
 	return a.log.With(
 		"peer_cn", cert.Subject.CommonName,
-		"peer_serial", cert.SerialNumber.String(),
+		"peer_serial", serial,
 	)
 }
 
+// isJSONContentType returns true when ct is exactly application/json
+// (with optional parameters per RFC 7231). Avoids the false-positive
+// HasPrefix match that would accept "application/json-seq" or
+// "application/jsonp".
+func isJSONContentType(ct string) bool {
+	if ct == "" {
+		return false
+	}
+	mt, _, err := mime.ParseMediaType(ct)
+	if err != nil {
+		return false
+	}
+	return mt == "application/json"
+}
+
 // isMaxBytesError reports whether err originates from
-// http.MaxBytesReader hitting its cap.
+// http.MaxBytesReader hitting its cap. http.MaxBytesError is the
+// typed error since Go 1.19; the substring fallback is removed
+// because errors.As(*http.MaxBytesError) is the only path
+// MaxBytesReader produces.
 func isMaxBytesError(err error) bool {
 	if err == nil {
 		return false
 	}
-	// http.MaxBytesError landed in Go 1.19; errors.As matches by type.
 	var mbErr *http.MaxBytesError
-	if errors.As(err, &mbErr) {
-		return true
-	}
-	return strings.Contains(err.Error(), "http: request body too large")
+	return errors.As(err, &mbErr)
 }
 
-// isPermanentPublishError mirrors falco.isPermanentPublishError. The
-// JetStream client surfaces "maximum payload violation" / "message
-// size exceeded" / similar with version-specific strings; substring-
-// match against the lower-cased error to catch them all.
+// isPermanentPublishError reports whether err from a JetStream
+// PublishJS call is a per-message terminal condition (the message
+// itself violates a stream-level invariant). Caller is expected to
+// log+drop the offending event and return a permanent retry signal.
+//
+// Detection layers (in order):
+//  1. errors.Is(err, nats.ErrMaxPayload) -- the typed client-side cap.
+//  2. *jetstream.APIError with a payload/size error code, when
+//     upstream surfaces one.
+//  3. Substring fallback against the lower-cased message body for
+//     server-side errors that come through as plain wrapped strings;
+//     mirrors the falco adapter's pragmatic shape.
+//
+// Layer (1) is the preferred path; (3) is the safety net for
+// server-side variants that don't surface as a typed APIError.
 func isPermanentPublishError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, nats.ErrMaxPayload) {
+		return true
+	}
+	var apiErr *natsjs.APIError
+	if errors.As(err, &apiErr) {
+		// Code 10054: stream message size exceeds maximum (NATS server
+		// constant; not exported by nats.go yet, hence the literal).
+		if apiErr.ErrorCode == 10054 {
+			return true
+		}
 	}
 	msg := strings.ToLower(err.Error())
 	if strings.Contains(msg, "maximum payload") ||

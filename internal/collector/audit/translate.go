@@ -56,12 +56,19 @@ var ErrSkipNonResponseComplete = errors.New("audit: skip non-ResponseComplete st
 // Translate converts an audit.k8s.io/v1 Event into the canonical
 // schema.Event.
 //
-// Pure: no I/O, no side effects, deterministic given the same input.
-// The nodeName argument is the node-level identifier the caller already
-// knows (typically read from the K8S_NODE_NAME env var injected by the
-// Helm chart's downward API); it lands in Event.Pod.Node so events
-// without a pod-scoped ObjectRef still record where Olaitan observed
-// them.
+// Determinism: the field-mapping is purely a function of the input.
+// The future-skew check reads `time.Now()` to reject events that
+// arrive with a RequestReceivedTimestamp more than maxFutureSkew
+// ahead of wall clock; this is the one wall-clock dependency. Every
+// other field of the returned schema.Event is determined entirely by
+// the input ev. Two calls within the same maxFutureSkew window
+// produce byte-equal outputs.
+//
+// The nodeName argument is the node-level identifier the caller
+// already knows (typically read from the K8S_NODE_NAME env var
+// injected by the Helm chart's downward API); it lands in
+// Event.Pod.Node so events without a pod-scoped ObjectRef still
+// record where Olaitan observed them.
 //
 // Translation contract (Story 1.7 Task 1):
 //
@@ -129,7 +136,7 @@ func Translate(ev *auditv1.Event, nodeName string) (schema.Event, error) {
 	}
 
 	pod := podRefFromObjectRef(ev.ObjectRef, nodeName)
-	severity := severityFromVerbResource(ev.Verb, ev.ObjectRef)
+	severity := severityFromEvent(ev)
 	summary := summaryFromEvent(ev)
 	tags := tagsFromEvent(ev)
 
@@ -174,6 +181,19 @@ func podRefFromObjectRef(ref *auditv1.ObjectReference, nodeName string) schema.P
 	return pod
 }
 
+// severityFromEvent maps the audit event to a coarse severity hint.
+// Defaults to "informational"; bumps to "warning" for the
+// privilege-relevant operations. Additionally bumps to "warning" when
+// the request was issued via impersonation (a common
+// privilege-escalation pattern), regardless of the underlying
+// resource severity.
+func severityFromEvent(ev *auditv1.Event) string {
+	if ev.ImpersonatedUser != nil && ev.ImpersonatedUser.Username != "" {
+		return "warning"
+	}
+	return severityFromVerbResource(ev.Verb, ev.ObjectRef)
+}
+
 // severityFromVerbResource maps the audit verb + resource to a coarse
 // severity hint. Defaults to "informational"; bumps to "warning" for
 // the privilege-relevant operations.
@@ -205,10 +225,12 @@ func severityFromVerbResource(verb string, ref *auditv1.ObjectReference) string 
 		return "warning"
 	}
 
-	// pods/exec, pods/portforward, pods/attach are privilege-use signals.
+	// pods subresources that indicate privilege use:
+	//   - exec, portforward, attach: shell / direct connection
+	//   - log: credential leakage via stdout/stderr scrape
 	if resource == "pods" {
 		switch subresource {
-		case "exec", "portforward", "attach":
+		case "exec", "portforward", "attach", "log":
 			return "warning"
 		}
 	}

@@ -43,16 +43,34 @@ The apiserver-side wiring is operator-side (kubeadm
 
 ### 1. Generate the receiver serving cert + signing CA
 
-The receiver listens at the Service FQDN:
+The receiver listens at the Service FQDN. The chart helper
+`olaitan.auditWebhookServiceFqdn` builds it from the chart's
+`<fullname>` (which collapses to the release name when it equals the
+chart name) plus the namespace:
 
 ```
-<release>-olaitan-audit-webhook.<namespace>.svc.cluster.local
+<fullname>-audit-webhook.<namespace>.svc.cluster.local
 ```
+
+For the canonical install (`helm install olaitan ./deploy/helm/olaitan
+--namespace olaitan ...`) this resolves to:
+
+```
+olaitan-audit-webhook.olaitan.svc.cluster.local
+```
+
+For non-canonical release names or namespaces, substitute as
+appropriate -- the cert SAN MUST match the rendered FQDN exactly.
 
 Generate a self-signed CA, sign a serving cert for that FQDN, and a
 client cert with `CN=kube-apiserver` for mTLS:
 
 ```sh
+# Substitute these for non-canonical installs:
+RELEASE="olaitan"          # helm release name
+NAMESPACE="olaitan"        # install namespace
+SVC_FQDN="${RELEASE}-audit-webhook.${NAMESPACE}.svc.cluster.local"
+
 # CA
 openssl genpkey -algorithm ED25519 -out audit-ca.key
 openssl req -x509 -new -nodes -key audit-ca.key -subj "/CN=olaitan-audit-ca" \
@@ -61,13 +79,16 @@ openssl req -x509 -new -nodes -key audit-ca.key -subj "/CN=olaitan-audit-ca" \
 # Receiver serving cert
 openssl genpkey -algorithm ED25519 -out audit-server.key
 openssl req -new -key audit-server.key \
-    -subj "/CN=olaitan-audit-webhook.olaitan.svc.cluster.local" \
+    -subj "/CN=${SVC_FQDN}" \
     -out audit-server.csr
 openssl x509 -req -in audit-server.csr -CA audit-ca.crt -CAkey audit-ca.key \
     -CAcreateserial -days 365 -out audit-server.crt \
-    -extfile <(printf "subjectAltName=DNS:olaitan-audit-webhook.olaitan.svc.cluster.local")
+    -extfile <(printf "subjectAltName=DNS:%s" "$SVC_FQDN")
 
-# Client cert (presented by the apiserver during mTLS)
+# Client cert (presented by the apiserver during mTLS).
+# CN MUST be "kube-apiserver" -- the receiver's TLS VerifyPeerCertificate
+# hook rejects any other CN by default. Override the allow-list via
+# Config.ClientCNAllow if your apiserver presents a different CN.
 openssl genpkey -algorithm ED25519 -out audit-client.key
 openssl req -new -key audit-client.key -subj "/CN=kube-apiserver" -out audit-client.csr
 openssl x509 -req -in audit-client.csr -CA audit-ca.crt -CAkey audit-ca.key \
@@ -156,18 +177,44 @@ curl -sk https://localhost:18443/healthz   # 204 No Content
 
 ## Tuning
 
-- `auditWebhook.policy.custom` overrides the baked-in default policy
-  byte-for-byte. Use this when your cluster has a high
+- `auditWebhook.policy.custom` (Helm value) overrides the baked-in
+  default policy byte-for-byte. Use this when your cluster has a high
   controller-manager noise floor and the default filter does not cover
   it.
-- `auditWebhook.receiver.maxPayloadBytes` (default 8 MiB) caps the
-  request body. Reject-413s do not retry on the apiserver side, so a
-  consistently 413-ing receiver indicates a misconfigured
-  `--audit-webhook-batch-max-size` upstream.
-- `auditWebhook.receiver.stalenessTimeout` (default 5m) flips the
-  source unhealthy when no inbound traffic arrives. Lower this for
-  low-traffic test clusters; raise it for clusters with conservative
-  audit policies that emit infrequent events.
+- `detection.sources.audit.max_payload_bytes` (in `config/olaitan.yaml`,
+  default 8 MiB) caps the request body. Reject-413s do not retry on
+  the apiserver side, so a consistently 413-ing receiver indicates a
+  misconfigured `--audit-webhook-batch-max-size` upstream.
+- `detection.sources.audit.staleness_timeout` (in `config/olaitan.yaml`,
+  default 5m) flips the source unhealthy when no successful publish
+  has landed. Lower this for low-traffic test clusters; raise it for
+  clusters with conservative audit policies that emit infrequent
+  events.
+- `detection.sources.audit.publish_retry` (in `config/olaitan.yaml`)
+  tunes the per-publish bounded retry. Defaults: 100ms..1s, equal-
+  jitter at 1.0, 3 attempts. Aligned with the in-code defaults to
+  avoid `helm install --debug` rendering values that disagree with
+  what the Go adapter actually uses.
+
+Edits to `config/olaitan.yaml` MUST be followed by `make helm-prepare`
+before the next `helm install` / `helm upgrade` because the chart
+copies the file into the chart's `files/` directory at package time.
+
+### Dual-flag relationship (auditWebhook.enabled vs detection.sources.audit.enabled)
+
+The chart-side `auditWebhook.enabled` Helm value gates rendering of
+the audit-webhook resources (Service, Secrets, policy ConfigMap, port
++ TLS volume on the DaemonSet). The runtime-side
+`detection.sources.audit.enabled` boolean inside `config/olaitan.yaml`
+gates whether the collector subcommand actually starts the receiver
+goroutine.
+
+The chart's `templates/configmap.yaml` automatically flips the
+runtime flag to `true` whenever `auditWebhook.enabled=true` (via a
+targeted regex overlay on the rendered configmap), so operators only
+need to flip the Helm flag. The static value in `config/olaitan.yaml`
+stays `false` so dev-local runs (without Helm) leave the receiver
+dormant.
 
 ## Future migration: cert-manager
 

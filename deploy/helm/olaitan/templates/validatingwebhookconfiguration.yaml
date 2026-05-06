@@ -33,12 +33,13 @@ the receiver Service over TLS and a missing caBundle silently fails
 the handshake under failurePolicy: Ignore (no enforcement at all). Fail
 the chart render rather than installing a broken admission gate.
 
-The value must be base64-encoded DER per the K8s schema. Operators
-supplying a PEM file via `--set-file` must base64-encode it first
-(`base64 -w0 ca.pem`) -- the chart does NOT auto-encode because Helm's
-`b64enc` would double-encode an already-encoded value.
+The value is base64-encoded PEM bytes (the K8s admission-webhook
+schema accepts the wire-equivalent). Operators supplying a PEM file
+via `--set-file` must single-line base64-encode it first
+(`base64 -w0 ca.pem`) -- the chart does NOT auto-encode because
+Helm's `b64enc` would double-encode an already-encoded value.
 */ -}}
-{{- $caBundle := required "auditWebhook.caBundle is required when auditWebhook.enabled=true (base64-encoded DER; `base64 -w0 ca.pem`)" .Values.auditWebhook.caBundle -}}
+{{- $caBundle := required "auditWebhook.caBundle is required when auditWebhook.enabled=true (base64-encoded PEM bytes; `base64 -w0 ca.pem`)" .Values.auditWebhook.caBundle -}}
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
 metadata:
