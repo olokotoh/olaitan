@@ -22,11 +22,15 @@ import (
 // mis-bucket the event, so reject early.
 var minValidEventTime = time.Date(2010, time.January, 1, 0, 0, 0, 0, time.UTC)
 
-// unknownPriorityOnce ensures the warn for an unknown Falco priority
-// enum value fires at most once per process lifetime; without this a
-// runaway upstream that ships 10k events with an unknown enum would
-// flood the operator's log aggregator.
-var unknownPriorityOnce sync.Once
+// unknownPrioritySeen tracks which unknown priority enum values have
+// already been logged so the warn for each fires at most once per
+// process lifetime. A package-level sync.Once was insufficient: a
+// Falco upgrade introducing two new enum values would warn for the
+// first and silently swallow the second forever. Keying by int32 means
+// every distinct unknown value gets exactly one warn while still
+// keeping noise bounded for a runaway upstream that emits the same
+// unknown enum on every event.
+var unknownPrioritySeen sync.Map
 
 // Translate converts a Falco gRPC Response into the canonical schema.Event.
 //
@@ -135,15 +139,19 @@ func stableEventID(resp *falcopb.Response) string {
 	if uuid := fields["evt.uuid"]; uuid != "" {
 		return uuid
 	}
+	// Use \x00 as field separator so a payload containing the literal
+	// "|" cannot be reordered into a colliding hash input. hash.Hash
+	// writes are infallible (Write returns nil error per its contract);
+	// errors are explicitly discarded to satisfy errcheck.
 	h := sha256.New()
 	if t := resp.GetTime(); t != nil {
-		fmt.Fprintf(h, "%d.%d|", t.GetSeconds(), t.GetNanos())
+		_, _ = fmt.Fprintf(h, "%d.%d\x00", t.GetSeconds(), t.GetNanos())
 	}
-	fmt.Fprintf(h, "%s|", fields["evt.num"])
-	fmt.Fprintf(h, "%s|", fields["proc.pid"])
-	fmt.Fprintf(h, "%s|", fields["proc.tid"])
-	fmt.Fprintf(h, "%s|", fields["proc.exe"])
-	fmt.Fprintf(h, "%s", resp.GetOutput())
+	_, _ = fmt.Fprintf(h, "%s\x00", fields["evt.num"])
+	_, _ = fmt.Fprintf(h, "%s\x00", fields["proc.pid"])
+	_, _ = fmt.Fprintf(h, "%s\x00", fields["proc.tid"])
+	_, _ = fmt.Fprintf(h, "%s\x00", fields["proc.exe"])
+	_, _ = fmt.Fprintf(h, "%s", resp.GetOutput())
 	sum := h.Sum(nil)
 	return hex.EncodeToString(sum)[:32]
 }
@@ -179,10 +187,11 @@ func canonicalPriorityName(p falcopb.Priority) string {
 	case falcopb.Priority_DEBUG:
 		return "DEBUG"
 	default:
-		unknownPriorityOnce.Do(func() {
+		key := int32(p)
+		if _, loaded := unknownPrioritySeen.LoadOrStore(key, struct{}{}); !loaded {
 			slog.Warn("falco: translate: unknown Falco priority enum, falling back to informational",
-				"priority_int", int32(p))
-		})
+				"priority_int", key)
+		}
 		return fmt.Sprintf("UNKNOWN(%d)", int32(p))
 	}
 }

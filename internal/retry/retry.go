@@ -85,6 +85,12 @@ func (s Strategy) Validate() error {
 // before or during the loop. Returns a "retry: max attempts exhausted"
 // error wrapping the last attempt's error when MaxAttempts > 0 is hit.
 // Returns a "retry: <field>" config error if the strategy is invalid.
+//
+// If op returns an error wrapped in *PermanentError (via Permanent),
+// Do returns the underlying error immediately without sleeping or
+// re-trying. This is the standard pattern from cenkalti/backoff and
+// lets callers signal "this error is a configuration mistake; retrying
+// will never help" without modifying the Strategy struct.
 func (s Strategy) Do(ctx context.Context, op func(ctx context.Context) error) error {
 	if err := s.validate(); err != nil {
 		return err
@@ -105,6 +111,11 @@ func (s Strategy) Do(ctx context.Context, op func(ctx context.Context) error) er
 		// Treat ctx errors as terminal; do not retry past a cancelled context.
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return fmt.Errorf("retry: ctx cancelled during op: %w", err)
+		}
+		// Caller-signalled permanent error: bail out without retrying.
+		var perm *PermanentError
+		if errors.As(err, &perm) {
+			return perm.Unwrap()
 		}
 		lastErr = err
 
@@ -177,6 +188,32 @@ func (s Strategy) validate() error {
 		return fmt.Errorf("retry: max-attempts must be >= 0 (got %d, where 0 means unlimited)", s.MaxAttempts)
 	}
 	return nil
+}
+
+// PermanentError marks an error as non-retryable so Strategy.Do bails
+// out without backoff or further attempts. Construct via Permanent.
+// Errors wrapped this way are typically configuration mistakes
+// (permission denied on a Unix socket, gRPC Unauthenticated) where the
+// next attempt cannot succeed without operator intervention; loud,
+// fast failure is the right signal so the parent process can crash and
+// kubelet can restart the pod.
+type PermanentError struct {
+	err error
+}
+
+// Error returns the underlying error message.
+func (p *PermanentError) Error() string { return p.err.Error() }
+
+// Unwrap returns the wrapped error so errors.Is/As reach through.
+func (p *PermanentError) Unwrap() error { return p.err }
+
+// Permanent wraps err so Strategy.Do treats it as terminal. A nil err
+// returns nil (unchanged behaviour: no error means no retry).
+func Permanent(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &PermanentError{err: err}
 }
 
 // realSleep blocks for d unless ctx is cancelled first; in the latter

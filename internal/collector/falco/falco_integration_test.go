@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"net"
 	"sort"
@@ -144,7 +145,10 @@ type mockSendError struct {
 }
 
 func (e *mockSendError) Error() string {
-	return e.inner.Error()
+	// Surface the partial-emission state in the message itself so a
+	// test failure log captures "sent 2 of 3 then …" rather than the
+	// bare inner error, which makes root-causing flakes much faster.
+	return fmt.Sprintf("mockFalco: sent %d of %d then: %v", e.index, e.total, e.inner)
 }
 
 func (e *mockSendError) Unwrap() error {
@@ -415,9 +419,9 @@ type timingPub struct {
 	latencies []time.Duration
 }
 
-func (t *timingPub) PublishJS(ctx context.Context, subject string, data any) (*natsjs.PubAck, error) {
+func (t *timingPub) PublishJS(ctx context.Context, subject string, data any, opts ...natsjs.PublishOpt) (*natsjs.PubAck, error) {
 	start := time.Now()
-	pa, err := t.inner.PublishJS(ctx, subject, data)
+	pa, err := t.inner.PublishJS(ctx, subject, data, opts...)
 	if err == nil {
 		d := time.Since(start)
 		t.mu.Lock()
@@ -509,6 +513,12 @@ func BenchmarkAdapter_PublishLatency(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		mock.send(fixtureResponse(i, now.Add(time.Duration(i)*time.Millisecond)))
 	}
+	// Fail-fast on back-pressure: a saturated mock channel manifests
+	// as drops, not wall-clock waits, so surface the count BEFORE
+	// waitDelivered's b.Fatalf can mask it as "delivered X of Y".
+	if dropped := mock.dropped(); dropped > 0 {
+		b.Fatalf("bench: mock send saturated; dropped %d of %d events before delivery wait", dropped, b.N)
+	}
 	mock.waitDelivered(b, b.N, 30*time.Second)
 	b.StopTimer()
 
@@ -525,15 +535,17 @@ func BenchmarkAdapter_PublishLatency(b *testing.B) {
 		b.Logf("bench: nats close: %v", err)
 	}
 
-	// Report the percentiles. p99 is the binding number per AC3; p50
-	// is reported alongside as a sanity check.
+	// Suppress ns/op from the report. The bench loop calls send()
+	// (non-blocking) followed by a polling waitDelivered, so the
+	// reported ns/op conflates send-rate, gRPC stream throughput, and
+	// the 1ms waitDelivered poll resolution. Only the percentile
+	// metrics (computed from per-publish wall-clock inside timingPub)
+	// are meaningful for AC3's NFR1 budget.
+	b.ReportMetric(0, "ns/op")
 	p50 := pub.percentile(0.50)
 	p99 := pub.percentile(0.99)
 	b.ReportMetric(float64(p50)/float64(time.Millisecond), "p50-ms")
 	b.ReportMetric(float64(p99)/float64(time.Millisecond), "p99-ms")
-	if mock.dropped() > 0 {
-		b.ReportMetric(float64(mock.dropped()), "dropped-events")
-	}
 }
 
 // === bench-flavoured helpers (testing.B variants) ===
@@ -562,10 +574,10 @@ func startTestNATSBench(b *testing.B) *natsserver.Server {
 // counter the bench reports rather than wedging silently.
 type pacedMockFalco struct {
 	falcopb.UnimplementedServiceServer
-	sendCh   chan *falcopb.Response
-	mu       sync.Mutex
-	count    int
-	dropCnt  int
+	sendCh  chan *falcopb.Response
+	mu      sync.Mutex
+	count   int
+	dropCnt int
 }
 
 func newMockFalcoBench(_ *testing.B) *pacedMockFalco {

@@ -106,7 +106,9 @@ func (c *Client) Publish(subject string, data any) error {
 
 // PublishJS publishes to a JetStream-backed subject and returns the PubAck,
 // giving callers the at-least-once contract that core Publish cannot.
-func (c *Client) PublishJS(ctx context.Context, subject string, data any) (*jetstream.PubAck, error) {
+// Variadic opts forward to jetstream.PublishOpt; pass jetstream.WithMsgID(id)
+// for server-side deduplication on retry within the stream's dedup window.
+func (c *Client) PublishJS(ctx context.Context, subject string, data any, opts ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
 	if c == nil || c.js == nil || c.conn == nil || c.conn.IsClosed() {
 		return nil, ErrClientClosed
 	}
@@ -114,7 +116,7 @@ func (c *Client) PublishJS(ctx context.Context, subject string, data any) (*jets
 	if err != nil {
 		return nil, fmt.Errorf("nats: marshal %q: %w", subject, err)
 	}
-	ack, err := c.js.Publish(ctx, subject, bytes)
+	ack, err := c.js.Publish(ctx, subject, bytes, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("nats: publish-js %s: %w", subject, err)
 	}

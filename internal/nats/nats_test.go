@@ -533,20 +533,24 @@ func TestStreamConfigsCoversRawSubjects(t *testing.T) {
 	// Story 1.6 requires the EVENTS_RAW stream so per-source raw subjects
 	// (subjects.RawFalco, RawAudit, RawRuntime, RawNetwork, RawAppLog)
 	// gain JetStream at-least-once semantics. Guard against silent
-	// regression: future edits to streams.go must keep the raw prefix in
-	// some stream's Subjects.
+	// regression: future edits to streams.go must keep subjects.RawPrefix
+	// in some stream's Subjects. Asserting against subjects.RawPrefix
+	// (rather than a literal "olaitan.events.raw.>") means a future
+	// rename of RawPrefix that forgets to update streams.go trips this
+	// test instead of silently passing.
+	want := subjects.RawPrefix + ">"
 	configs := natsclient.StreamConfigs()
 	rawCovered := false
 	for _, cfg := range configs {
 		for _, subj := range cfg.Subjects {
-			if subj == subjects.RawPrefix+">" || subj == "olaitan.events.raw.>" {
+			if subj == want {
 				rawCovered = true
 				break
 			}
 		}
 	}
 	if !rawCovered {
-		t.Fatalf("StreamConfigs: no stream covers %q", subjects.RawPrefix+">")
+		t.Fatalf("StreamConfigs: no stream covers %q", want)
 	}
 }
 

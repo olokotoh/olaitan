@@ -31,10 +31,10 @@ var streamConfigs = []jetstream.StreamConfig{
 		Retention: jetstream.LimitsPolicy,
 	},
 	{
-		Name:      "EVENTS_RAW",
-		Subjects:  []string{subjects.RawPrefix + ">"},
-		MaxAge:    6 * time.Hour,
-		MaxBytes:  50 * 1024 * 1024 * 1024, // 50 GiB; see comment block above
+		Name:     "EVENTS_RAW",
+		Subjects: []string{subjects.RawPrefix + ">"},
+		MaxAge:   6 * time.Hour,
+		MaxBytes: 50 * 1024 * 1024 * 1024, // 50 GiB; see comment block above
 		// MaxMsgSize caps each individual event at 256 KiB. A
 		// well-formed Falco / audit / CNI event sits comfortably under
 		// 4 KiB; a runaway rule emitting a multi-MiB output_fields blob

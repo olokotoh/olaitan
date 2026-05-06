@@ -91,13 +91,13 @@ func TestSourceHealth_ConcurrentReadersAndWriters(t *testing.T) {
 }
 
 func TestSourceHealth_StatusReturnsConsistentSnapshot(t *testing.T) {
-	// A reader that observes healthy=true must observe lastErr=nil.
-	// We cannot strictly guarantee atomicity across two atomic reads in Go,
-	// so this test documents the design intent: callers that require a
-	// strictly consistent (healthy, err) tuple should not interleave with
-	// MarkHealthy/MarkUnhealthy. The runtime contract is "at any individual
-	// moment the underlying atomic fields are valid"; anything stronger is
-	// out of scope. The test verifies the single-threaded case.
+	// SourceHealth uses a single atomic.Pointer[healthState] holding the
+	// (healthy, lastErr) tuple, so Status() is a single atomic load and
+	// readers always observe a self-consistent snapshot — there is no
+	// possibility of seeing healthy=true alongside a stale lastErr from
+	// a prior MarkUnhealthy. This test verifies that contract under the
+	// single-threaded case; the concurrent-readers-and-writers test
+	// above exercises the same guarantee under load.
 	var h SourceHealth
 	h.MarkUnhealthy(errors.New("e"))
 	h.MarkHealthy()

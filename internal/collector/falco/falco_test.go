@@ -15,7 +15,7 @@ import (
 // NATS server (see falco_integration_test.go).
 type stubPub struct{}
 
-func (stubPub) PublishJS(ctx context.Context, subject string, data any) (*natsjs.PubAck, error) {
+func (stubPub) PublishJS(ctx context.Context, subject string, data any, opts ...natsjs.PublishOpt) (*natsjs.PubAck, error) {
 	return &natsjs.PubAck{Stream: "EVENTS_RAW"}, nil
 }
 
