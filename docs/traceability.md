@@ -51,7 +51,9 @@ and unit-tested at `.github/scripts/check-traceability.bats`. See the
 
 | claim_id | ch3_section | code_package | test_files | test_ids | eval_run_ids |
 |---|---|---|---|---|---|
+| `c3-traceability-bootstrap` | §3-meta | `docs/` | `.github/scripts/check-traceability.bats` | `AC6a: yes path with matrix change passes`, `AC6b: yes path without matrix change fails`, `AC6c: no path with non-empty rationale passes`, `AC6d: no path with HTML-comment-only rationale fails`, `AC6e: missing traceability_updated field fails`, `Invalid traceability_updated value fails` | n/a |
 | `c3.4-calico-flow-spike` | §3.4 | `spikes/calico-flow/` | `spikes/calico-flow/main_test.go` | `TestTranslateContract`, `TestRoundTripJSON`, `TestTimestampStability` | n/a |
+| `c3.4-falco-syscall-adapter` | §3.4 | `internal/collector/falco/` | `internal/collector/falco/falco_test.go`, `internal/collector/falco/falco_integration_test.go`, `internal/collector/falco/translate_test.go`, `internal/collector/falco/health_test.go`, `internal/retry/retry_test.go` | `TestNew_RejectsNilPublisher`, `TestNew_RejectsEmptyEndpoint`, `TestNew_RejectsEmptyHostname`, `TestNew_AppliesDefaultRetryWhenZeroValued`, `TestNew_PreservesCallerSuppliedRetry`, `TestHealth_ReturnsTrackerInZeroState`, `TestAdapter_EndToEnd_Bufconn`, `TestAdapter_RetriesOnDialFailure`, `TestTranslate_HappyPath`, `TestTranslate_DeterministicIDFallback`, `TestTranslate_DifferentInputsYieldDifferentIDs`, `TestTranslate_HostEventWithoutPodFields`, `TestTranslate_MissingTimeReturnsError`, `TestTranslate_NilResponseReturnsError`, `TestTranslate_EmptyOutputFields`, `TestTranslate_PrioritySeverityMapping`, `TestSourceHealth_ZeroValueIsUnhealthy`, `TestSourceHealth_MarkHealthy`, `TestSourceHealth_MarkUnhealthyCarriesError`, `TestSourceHealth_MarkUnhealthyNilErrorIsAllowed`, `TestSourceHealth_HealthyClearsLastError`, `TestSourceHealth_ConcurrentReadersAndWriters`, `TestSourceHealth_StatusReturnsConsistentSnapshot`, `TestStrategyDo_SuccessOnFirstAttempt`, `TestStrategyDo_SuccessAfterTransientFailures`, `TestStrategyDo_MaxAttemptsExhaustionReturnsLastErrorWrapped`, `TestStrategyDo_ContextCancelMidBackoff`, `TestStrategyDo_ContextAlreadyCancelled`, `TestStrategyDo_ZeroValueReturnsConfigError`, `TestStrategyDo_InvalidConfigVariants`, `TestStrategyDo_BackoffProgressionRespectsMultiplier`, `TestStrategyDo_BackoffCappedAtMax`, `TestStrategyDo_JitterBoundsRespected`, `TestStrategyDo_UnlimitedAttemptsTerminateOnSuccess`, `BenchmarkAdapter_PublishLatency` | n/a |
 | `c3.6.1-sigma-parser-spike` | §3.6.1 | `spikes/sigma-parser/` | `spikes/sigma-parser/wrap/main_test.go`, `spikes/sigma-parser/custom/main_test.go` | `TestFixturesAgainstRule`, `TestRuleMatchShape`, `TestParseOLTExtrasRejectsViolations`, `TestSeverityFallbackFromLevel`, `TestBuildCorpusFailsOnAnchorDrift`, `TestLintID`, `TestPatternMatchesModifiers`, `TestPatternMatchesErrors`, `TestEmptyPatternRejected`, `TestParseAndCondition`, `TestValidateRejectsDialectViolations`, `TestEvaluateExercisesParseAndCondition` | n/a |
 | `c3.7.4-criu-checkpoint-spike` | §3.7.4 | `spikes/criu-checkpoint/` | `spikes/criu-checkpoint/main_test.go` | `TestKubeletCheckpointURL`, `TestTruncate` | n/a |
 | `c3.8-helm-chart-skel` | §3.8 | `deploy/helm/olaitan/` | `deploy/helm/helm_test.go` | `TestDefaultPermutation`, `TestSubchartsDisabled`, `TestRedisDisabledOnly`, `TestRBACVerbs`, `TestPodSecurityContext`, `TestReplicasGuard`, `TestRedisAuthGuard`, `TestAuditWebhookCABundleGuard`, `TestEndpointsTemplated`, `TestAggregatorIsSingletonRecreate`, `TestNetworkPolicyDefault`, `TestAuditWebhookGate`, `TestKubeconform` | n/a |
@@ -63,6 +65,14 @@ Per AC4, the four bootstrap rows above carry their merged-PR coordinates here
 NFR42 while the auditable chain is preserved row-for-row. New PRs from Story
 1.6 onward append their own provenance block here whenever they add a row.
 
+### `c3-traceability-bootstrap`
+
+- **Story:** 1.5 (Traceability matrix bootstrap and PR template). Self-row, back-filled from Story 1.6 because PR number and merge SHA were not knowable at Story 1.5 PR-open time (chicken-and-egg).
+- **Merge SHA:** `215f36e` (PR #12, 2026-05-04). Three commits on the merged branch: `21206dd` (initial), `2f310b0` (CI permissions fix on the new traceability job), `26d579c` (Copilot review patches: PR template wording aligned with gate, `strip_html_comments` docstring corrected).
+- **FRs/NFRs:** NFR42 (satisfied; the matrix-or-rationale CI gate is now active on every PR). NFR34 (forward reference only; runbook sample row lands with Story 6.8).
+- **ADRs:** none (cross-cutting infrastructure; no deferred decisions recorded).
+- **eval_run_ids rationale:** infrastructure / process gate, not evaluation-bearing.
+
 ### `c3.4-calico-flow-spike`
 
 - **Story:** 1.3 (Calico flow record export feasibility spike).
@@ -71,6 +81,14 @@ NFR42 while the auditable chain is preserved row-for-row. New PRs from Story
 - **FRs/NFRs:** FR4 (informed, not satisfied; production wiring lands with Story 1.10).
 - **ADRs:** ADR-2026-04-30-01 (Calico Goldmane gRPC API).
 - **eval_run_ids rationale:** spike, pre-dates the Epic 5 evaluation harness.
+
+### `c3.4-falco-syscall-adapter`
+
+- **Story:** 1.6 (Falco gRPC sensor adapter).
+- **Merge SHA:** *pending* (this PR).
+- **FRs/NFRs:** FR1 (satisfied; the adapter ingests Falco gRPC syscall events and produces canonical `schema.Event` records of `Source: SourceFalco` + `Category: CategorySyscall`). FR8 (partially satisfied; the in-process `SourceHealth` tracker is wired and Story 1.12 will bind it to the Prometheus gauge `source_healthy{source="falco"}` per `architecture.md:946`). NFR1 (informed; the bufconn benchmark measured ~100 microseconds per event mean throughput, well inside the 50ms p99 budget; production-class measurement awaits Story 5.1 eval harness). NFR35 (satisfied; ≥80% line coverage on hand-written files in `internal/collector/falco/` and `internal/retry/`, integration test uses real boundaries (embedded NATS server + bufconn gRPC server)). NFR42 (satisfied; this row plus the back-filled `c3-traceability-bootstrap` row close the gate's first-PR onward contract).
+- **ADRs:** none for the adapter itself. The Falco gRPC client choice (vendored protos at `internal/collector/falco/falcopb/` rather than the archived upstream `falcosecurity/client-go`) is documented in `internal/collector/falco/falcopb/README.md` rather than as a separate ADR; the deprecation of the upstream module is a pure circumstance, not a project decision worth ADR-ing.
+- **eval_run_ids rationale:** infrastructure adapter; the bufconn benchmark is for AC3 verification, not for the Epic 5 evaluation harness's per-scenario runs.
 
 ### `c3.6.1-sigma-parser-spike`
 

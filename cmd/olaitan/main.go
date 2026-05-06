@@ -26,9 +26,14 @@ import (
 	"os/signal"
 	"sync/atomic"
 	"syscall"
+	"time"
 
+	"golang.org/x/sync/errgroup"
+
+	"github.com/olokotoh/olaitan/internal/collector/falco"
 	"github.com/olokotoh/olaitan/internal/config"
 	"github.com/olokotoh/olaitan/internal/health"
+	natsclient "github.com/olokotoh/olaitan/internal/nats"
 )
 
 var version = "dev"
@@ -108,16 +113,27 @@ func runRingCtx(ctx context.Context, ring string, args []string, stderr io.Write
 		return 1
 	}
 
-	// Hot-reload goroutine. Watch returns nil when ctx is cancelled;
-	// when it returns an error before ctx-cancel (fsnotify exhaustion,
+	// Wrap ctx with an explicit cancel so the error path can tear down
+	// the errgroup's gctx (errgroup itself only cancels gctx on a
+	// goroutine error or parent-ctx cancel; the ring-wiring failure
+	// path needs to force the cancel from outside the group).
+	ringCtx, ringCancel := context.WithCancel(ctx)
+	defer ringCancel()
+
+	// Hot-reload goroutine. Watch returns nil when ringCtx is cancelled;
+	// when it returns an error before cancel (fsnotify exhaustion,
 	// inode rotation), trip the watcherFailed flag so the readiness
 	// probe goes 503 and kubelet restarts the pod — preferable to the
 	// log-and-pretend-config-reload-still-works failure mode.
+	//
+	// Tied to ringCtx (not the outer ctx) so ringCancel on the error
+	// path also tears the watcher down; otherwise <-watcherDone below
+	// would block until the operator sent SIGTERM.
 	var watcherFailed atomic.Bool
 	watcherDone := make(chan struct{})
 	go func() {
 		defer close(watcherDone)
-		if err := mgr.Watch(ctx); err != nil && ctx.Err() == nil {
+		if err := mgr.Watch(ringCtx); err != nil && ringCtx.Err() == nil {
 			watcherFailed.Store(true)
 			log.Error("config: watch exited unexpectedly — readiness probe will fail",
 				"err", err)
@@ -133,27 +149,153 @@ func runRingCtx(ctx context.Context, ring string, args []string, stderr io.Write
 		return nil
 	}
 
-	// Health server on :8080. Start returns when ctx is cancelled, so we
-	// run it inline (blocking) — the watcher goroutine already covers
-	// the parallel teardown path.
-	srv := health.New(healthAddr, log, check)
-	log.Info(ring+": not yet implemented, awaiting ring wiring",
-		"config", *cfgPath,
-	)
+	// Ring goroutines run alongside the health server under a shared
+	// errgroup so a fatal source failure trips ctx-cancel for everyone
+	// (kubelet then restarts the pod).
+	g, gctx := errgroup.WithContext(ringCtx)
 
-	if err := srv.Start(ctx); err != nil {
-		log.Error("startup: health server", "addr", healthAddr, "err", err)
-		// Block on the watcher so it gets a chance to clean up before
-		// returning. The watcher goroutine reacts to ctx cancellation;
-		// runRing's outer signal.NotifyContext defer (or the test's
-		// context cancel) is what unblocks it.
-		<-watcherDone
-		return 1
+	// Health server on :8080. Start returns when gctx is cancelled.
+	srv := health.New(healthAddr, log, check)
+	g.Go(func() error {
+		if err := srv.Start(gctx); err != nil {
+			return fmt.Errorf("startup: health server %q: %w", healthAddr, err)
+		}
+		return nil
+	})
+
+	// Ring-specific wiring. The collector subcommand spawns Ring 1
+	// adapter goroutines (Story 1.6 lands the Falco adapter as the
+	// first; Stories 1.7-1.10 add the four others, with the
+	// SourceAdapter interface extraction landing in Story 1.7 once a
+	// second concrete instance reveals what is variant vs invariant).
+	// The aggregator subcommand's wiring lands in Epic 2.
+	if ring == "collector" {
+		if err := startCollectorRing(gctx, g, log); err != nil {
+			log.Error("startup: collector ring wiring", "err", err)
+			// Cancel ringCtx (the parent of gctx) so the health server
+			// and any goroutines already registered on g unblock; then
+			// drain the group and the watcher.
+			ringCancel()
+			_ = g.Wait()
+			<-watcherDone
+			return 1
+		}
+	} else {
+		log.Info(ring+": not yet implemented, awaiting Epic 2 wiring",
+			"config", *cfgPath,
+		)
+	}
+
+	if err := g.Wait(); err != nil {
+		// errgroup.Wait propagates the first non-nil error; ctx-cancel
+		// itself is not an error, so anything here is a real failure.
+		if !errors.Is(err, context.Canceled) {
+			log.Error("ring exited with error", "err", err)
+			ringCancel()
+			<-watcherDone
+			return 1
+		}
 	}
 
 	log.Info(ring + ": shutting down")
 	<-watcherDone
 	return 0
+}
+
+// startCollectorRing wires the Ring 1 sensor adapters into the supplied
+// errgroup. As of Story 1.6 only the Falco adapter lands; Stories
+// 1.7-1.10 add audit, cri, applog, and cni adapters by following the
+// same dial-and-spawn pattern.
+//
+// Connection coordinates come from environment variables injected by
+// the Helm chart's downward API (see deploy/helm/olaitan/templates/
+// daemonset.yaml): NATS_URL for the bus, FALCO_SOCKET for the Falco
+// gRPC endpoint, K8S_NODE_NAME for the per-event Pod.Node identifier.
+func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger) error {
+	natsURL := os.Getenv("NATS_URL")
+	if natsURL == "" {
+		return errors.New("collector: NATS_URL env var is empty (set by Helm chart)")
+	}
+	falcoSocket := os.Getenv("FALCO_SOCKET")
+	if falcoSocket == "" {
+		return errors.New("collector: FALCO_SOCKET env var is empty (set by Helm chart)")
+	}
+	nodeName := os.Getenv("K8S_NODE_NAME")
+	if nodeName == "" {
+		return errors.New("collector: K8S_NODE_NAME env var is empty (set by Helm chart's downward API)")
+	}
+
+	natsCfg := natsclient.DefaultConfig()
+	natsCfg.URL = natsURL
+	natsCfg.Name = "olaitan-collector"
+
+	nc, err := natsclient.NewClient(natsCfg)
+	if err != nil {
+		return fmt.Errorf("collector: nats: %w", err)
+	}
+
+	// closeNATS is the shared error-path teardown: bound at 2s so a
+	// half-connected client cannot hang startup, and the failure case
+	// (nc.Close error) is logged rather than swallowed silently.
+	closeNATS := func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := nc.Close(closeCtx); err != nil {
+			log.Warn("collector: nats close on error path", "err", err)
+		}
+	}
+
+	// Provision JetStream streams once at startup. EnsureStreams is
+	// idempotent so a re-run on a pre-existing stream is a no-op.
+	streamsCtx, streamsCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer streamsCancel()
+	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigs()); err != nil {
+		closeNATS()
+		return fmt.Errorf("collector: ensure streams: %w", err)
+	}
+
+	adapter, err := falco.New(falco.Config{
+		Endpoint: falcoSocket,
+		Hostname: nodeName,
+	}, nc, log)
+	if err != nil {
+		closeNATS()
+		return fmt.Errorf("collector: falco adapter: %w", err)
+	}
+
+	// Falco adapter goroutine. NATS drain happens after g.Wait()
+	// returns (see runRingCtx) so the adapter has fully exited before
+	// nc.Close races against any in-flight PublishJS.
+	adapterDone := make(chan struct{})
+	g.Go(func() error {
+		defer close(adapterDone)
+		if err := adapter.Run(ctx); err != nil {
+			return fmt.Errorf("collector: falco run: %w", err)
+		}
+		return nil
+	})
+
+	// Drain NATS only after the adapter has signalled exit. Avoids the
+	// shutdown race where parallel-goroutine drain raced PublishJS and
+	// surfaced ErrClientClosed as an errgroup error.
+	g.Go(func() error {
+		select {
+		case <-adapterDone:
+		case <-ctx.Done():
+			<-adapterDone
+		}
+		// Allow up to 10s for the drain; matches the Helm chart's
+		// terminationGracePeriodSeconds budget.
+		drainCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := nc.Close(drainCtx); err != nil {
+			log.Warn("collector: nats drain", "err", err)
+		}
+		return nil
+	})
+
+	log.Info("collector: ring 1 wired", "falco_socket", falcoSocket, "node", nodeName)
+	return nil
 }
 
 func printUsage(w io.Writer) {

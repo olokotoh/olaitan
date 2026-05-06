@@ -77,6 +77,15 @@ spec:
               value: {{ include "olaitan.endpoints.redis" . | quote }}
             - name: FALCO_SOCKET
               value: {{ .Values.endpoints.falco | quote }}
+            # Story 1.6: the Falco adapter records the node name on
+            # every emitted Event.Pod.Node so host events without K8s
+            # pod context still record where they were observed. Sourced
+            # from the downward API because os.Hostname() returns the
+            # pod name, not the node name, on Kubernetes.
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           livenessProbe:
             httpGet:
               path: /healthz
@@ -117,6 +126,18 @@ spec:
             # artefacts on crash which need a writable path.
             - name: tmp
               mountPath: /tmp
+            {{- if hasPrefix "unix://" .Values.endpoints.falco }}
+            # Falco gRPC socket bind-mounted from the host. Falco's chart
+            # default exposes the socket at /run/falco/falco.sock on the
+            # node; the collector pod opens it via the FALCO_SOCKET env
+            # var. Read-only because the collector only ever connects
+            # (reads) — never writes — to the socket. Mounted only when
+            # endpoints.falco is a unix:// target; tcp:// targets reach
+            # Falco over the pod network and need no host mount.
+            - name: falco-socket
+              mountPath: /run/falco
+              readOnly: true
+            {{- end }}
       volumes:
         - name: config
           configMap:
@@ -132,3 +153,9 @@ spec:
             defaultMode: 0400
         - name: tmp
           emptyDir: {}
+        {{- if hasPrefix "unix://" .Values.endpoints.falco }}
+        - name: falco-socket
+          hostPath:
+            path: /run/falco
+            type: Directory
+        {{- end }}

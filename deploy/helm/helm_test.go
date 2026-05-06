@@ -68,8 +68,8 @@ func helmTemplate(t *testing.T, sets []string) string {
 // Using yaml.Node for rules/containers lets us introspect nested arrays
 // without declaring the full K8s API shape.
 type manifest struct {
-	APIVersion string    `yaml:"apiVersion"`
-	Kind       string    `yaml:"kind"`
+	APIVersion string `yaml:"apiVersion"`
+	Kind       string `yaml:"kind"`
 	Metadata   struct {
 		Name string `yaml:"name"`
 	} `yaml:"metadata"`
@@ -133,15 +133,15 @@ func TestDefaultPermutation(t *testing.T) {
 	// Track kinds we own — subcharts add their own Deployments/Secrets,
 	// so scope the assertions to our olaitan-* names.
 	expectOurs := map[string]int{
-		"DaemonSet":              1,
-		"Deployment":             1,
-		"ServiceAccount":         2,
-		"Role":                   1,
-		"RoleBinding":            1,
-		"ClusterRole":            1,
-		"ClusterRoleBinding":     1,
-		"PersistentVolumeClaim":  1,
-		"NetworkPolicy":          1,
+		"DaemonSet":             1,
+		"Deployment":            1,
+		"ServiceAccount":        2,
+		"Role":                  1,
+		"RoleBinding":           1,
+		"ClusterRole":           1,
+		"ClusterRoleBinding":    1,
+		"PersistentVolumeClaim": 1,
+		"NetworkPolicy":         1,
 	}
 	gotOurs := make(map[string]int)
 	for _, m := range ms {
@@ -575,6 +575,103 @@ func TestEndpointsTemplated(t *testing.T) {
 	if !strings.Contains(rendered, `value: "foo-redis-master:6379"`) {
 		t.Errorf("REDIS_ADDR did not template from release name 'foo'; rendered output sample:\n%s",
 			snippet(rendered, "REDIS_ADDR"))
+	}
+}
+
+// TestCollectorDaemonsetHasK8sNodeNameDownwardAPI confirms the
+// collector DaemonSet renders the K8S_NODE_NAME env var via the
+// downward-API field path `spec.nodeName`. The collector subcommand
+// fails fast on an empty K8S_NODE_NAME (cmd/olaitan/main.go's
+// startCollectorRing); a refactor that silently strips the env block
+// would otherwise crash-loop the pod with a non-obvious "K8S_NODE_NAME
+// env var is empty" message at startup.
+func TestCollectorDaemonsetHasK8sNodeNameDownwardAPI(t *testing.T) {
+	args := []string{
+		"template", "olaitan-test", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+	}
+	cmd := exec.Command("helm", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("helm template failed: %v\nstderr: %s", err, stderr.String())
+	}
+	rendered := stdout.String()
+	// The downward-API block we expect, rendered tightly so a stray
+	// re-indent or removal trips this test rather than passing on a
+	// near-miss.
+	want := `- name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName`
+	if !strings.Contains(rendered, want) {
+		t.Errorf("K8S_NODE_NAME downward-API env not rendered on collector daemonset; rendered output sample:\n%s",
+			snippet(rendered, "K8S_NODE_NAME"))
+	}
+}
+
+// TestCollectorDaemonsetMountsFalcoSocketWhenUnix verifies that the
+// collector DaemonSet bind-mounts /run/falco from the host when
+// endpoints.falco uses a unix:// scheme (the chart default). Without
+// this mount the FALCO_SOCKET env points at a path that is not visible
+// inside the pod, so every dial silently fails and the adapter loops
+// "Falco unreachable" forever; the bug is invisible until an operator
+// notices zero events. Guard tightly so a chart refactor that strips
+// the volume or volumeMount trips this test.
+func TestCollectorDaemonsetMountsFalcoSocketWhenUnix(t *testing.T) {
+	args := []string{
+		"template", "olaitan-test", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+	}
+	cmd := exec.Command("helm", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("helm template failed: %v\nstderr: %s", err, stderr.String())
+	}
+	rendered := stdout.String()
+	wantMount := `- name: falco-socket
+              mountPath: /run/falco
+              readOnly: true`
+	if !strings.Contains(rendered, wantMount) {
+		t.Errorf("falco-socket volumeMount not rendered on collector daemonset; rendered output sample:\n%s",
+			snippet(rendered, "falco-socket"))
+	}
+	wantVolume := `- name: falco-socket
+          hostPath:
+            path: /run/falco
+            type: Directory`
+	if !strings.Contains(rendered, wantVolume) {
+		t.Errorf("falco-socket hostPath volume not rendered on collector daemonset; rendered output sample:\n%s",
+			snippet(rendered, "hostPath"))
+	}
+}
+
+// TestCollectorDaemonsetSkipsFalcoSocketMountWhenTCP verifies that
+// when endpoints.falco is set to a tcp:// target (Falco gRPC over the
+// pod network rather than a host socket) the collector DaemonSet does
+// NOT bind-mount /run/falco. Avoiding an unnecessary host-path mount
+// keeps the collector's blast radius small in TCP-mode deployments;
+// the mount only makes sense when the target is a Unix-domain socket.
+func TestCollectorDaemonsetSkipsFalcoSocketMountWhenTCP(t *testing.T) {
+	args := []string{
+		"template", "olaitan-test", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+		"--set", "endpoints.falco=tcp://falco.svc.cluster.local:5060",
+	}
+	cmd := exec.Command("helm", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("helm template failed: %v\nstderr: %s", err, stderr.String())
+	}
+	rendered := stdout.String()
+	if strings.Contains(rendered, "falco-socket") {
+		t.Errorf("falco-socket volume/mount rendered for tcp:// endpoint; expected omission. Rendered sample:\n%s",
+			snippet(rendered, "falco-socket"))
 	}
 }
 
