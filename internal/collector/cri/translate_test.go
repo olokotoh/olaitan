@@ -443,3 +443,107 @@ func containsTag(tags []string, want string) bool {
 	}
 	return false
 }
+
+// TestTranslate_StripPathTruncatesLongMessage verifies the P5 fix:
+// when the un-stripped marshal exceeds rawSizeBudget, the strip path
+// caps each ContainersStatuses[i].Message at maxStrippedMessageLen.
+// Pre-P5 a 4 KiB Message survived the strip pass and could push the
+// post-strip body past rawSizeBudget, tripping a permanent oversize
+// publish error with no second strip pass.
+func TestTranslate_StripPathTruncatesLongMessage(t *testing.T) {
+	longMsg := strings.Repeat("E", 4*1024)
+	bigImage := strings.Repeat("a", 8*1024)
+	ev := makeEvent(func(e *runtimeapi.ContainerEventResponse) {
+		e.ContainersStatuses = []*runtimeapi.ContainerStatus{}
+		for i := 0; i < 4; i++ {
+			e.ContainersStatuses = append(e.ContainersStatuses,
+				&runtimeapi.ContainerStatus{
+					Id:       "container-" + string(rune('a'+i)),
+					ImageRef: bigImage,
+					Message:  longMsg,
+				},
+			)
+		}
+	})
+	got, err := Translate(ev, "node-01")
+	if err != nil {
+		t.Fatalf("Translate: %v", err)
+	}
+	// The Raw must be marked _stripped, and every container message
+	// inside it must be at most maxStrippedMessageLen.
+	if !strings.Contains(string(got.Raw), `"_stripped":true`) {
+		t.Errorf("expected _stripped:true in Raw; got: %s", string(got.Raw))
+	}
+	var canon rawCanonical
+	if err := json.Unmarshal(got.Raw, &canon); err != nil {
+		t.Fatalf("unmarshal Raw: %v", err)
+	}
+	for i, cs := range canon.ContainerStatuses {
+		if len(cs.Message) > maxStrippedMessageLen {
+			t.Errorf("ContainerStatuses[%d].Message len = %d, want <= %d (P5 truncation)",
+				i, len(cs.Message), maxStrippedMessageLen)
+		}
+	}
+}
+
+// TestTranslate_SanitizesLabelControlChars verifies the P17 fix: a
+// label value containing newlines or NUL bytes must be stripped
+// before it reaches the published Tags. Pre-P17 the value passed
+// through verbatim and could derail downstream tag-string parsers.
+func TestTranslate_SanitizesLabelControlChars(t *testing.T) {
+	ev := makeEvent(func(e *runtimeapi.ContainerEventResponse) {
+		e.PodSandboxStatus.Labels["app.kubernetes.io/component"] = "evil\nhello\x00world\rmore"
+	})
+	got, err := Translate(ev, "node-01")
+	if err != nil {
+		t.Fatalf("Translate: %v", err)
+	}
+	for _, tag := range got.Tags {
+		if strings.ContainsAny(tag, "\n\r\x00") {
+			t.Errorf("tag %q still carries control characters after P17 sanitization", tag)
+		}
+	}
+}
+
+// TestTranslate_SanitizesLabelLengthCap verifies the P17 length cap:
+// label values larger than maxSanitizedTagLen (256) are truncated.
+func TestTranslate_SanitizesLabelLengthCap(t *testing.T) {
+	ev := makeEvent(func(e *runtimeapi.ContainerEventResponse) {
+		e.PodSandboxStatus.Labels["app.kubernetes.io/component"] = strings.Repeat("Z", 4*1024)
+	})
+	got, err := Translate(ev, "node-01")
+	if err != nil {
+		t.Fatalf("Translate: %v", err)
+	}
+	var found bool
+	for _, tag := range got.Tags {
+		if strings.HasPrefix(tag, "app.kubernetes.io/component:") {
+			value := strings.TrimPrefix(tag, "app.kubernetes.io/component:")
+			if len(value) > maxSanitizedTagLen {
+				t.Errorf("label value len = %d, want <= %d (P17 cap)", len(value), maxSanitizedTagLen)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected app.kubernetes.io/component tag, got none")
+	}
+}
+
+// TestTranslate_SanitizesSummaryControlChars verifies the P18 fix:
+// pod name / namespace control characters must not leak into the
+// rendered Summary line. Pre-P18 a malicious pod name carrying \n
+// could split a structured log line into two records.
+func TestTranslate_SanitizesSummaryControlChars(t *testing.T) {
+	ev := makeEvent(func(e *runtimeapi.ContainerEventResponse) {
+		e.PodSandboxStatus.Metadata.Name = "evil\npayments"
+		e.PodSandboxStatus.Metadata.Namespace = "tenant\x00alpha"
+	})
+	got, err := Translate(ev, "node-01")
+	if err != nil {
+		t.Fatalf("Translate: %v", err)
+	}
+	if strings.ContainsAny(got.Summary, "\n\r\x00") {
+		t.Errorf("Summary still carries control characters after P18 sanitization: %q", got.Summary)
+	}
+}

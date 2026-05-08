@@ -11,7 +11,6 @@ import (
 	"mime"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -710,19 +709,25 @@ func isMaxBytesError(err error) bool {
 
 // isPermanentPublishError reports whether err from a JetStream
 // PublishJS call is a per-message terminal condition (the message
-// itself violates a stream-level invariant). Caller is expected to
+// itself violates a stream-level invariant or the cluster is in a
+// shape where retrying will not succeed). Caller is expected to
 // log+drop the offending event and return a permanent retry signal.
 //
-// Detection layers (in order):
-//  1. errors.Is(err, nats.ErrMaxPayload) -- the typed client-side cap.
-//  2. *jetstream.APIError with a payload/size error code, when
-//     upstream surfaces one.
-//  3. Substring fallback against the lower-cased message body for
-//     server-side errors that come through as plain wrapped strings;
-//     mirrors the falco adapter's pragmatic shape.
+// Detection layers (in order, all typed -- no substring fallback):
+//  1. errors.Is(err, nats.ErrMaxPayload) -- typed client-side
+//     oversize cap.
+//  2. errors.Is(err, nats.ErrNoResponders) -- no JetStream subscriber
+//     answered the publish (subject has no bound stream).
+//  3. errors.Is(err, natsjs.ErrStreamNotFound) -- the configured
+//     stream was deleted out from under us.
+//  4. *natsjs.APIError with one of the stream-message-size,
+//     stream-not-found, or jetstream-not-enabled error codes.
 //
-// Layer (1) is the preferred path; (3) is the safety net for
-// server-side variants that don't surface as a typed APIError.
+// The post-Story-1.7 substring fallback was removed in Story 1.8 P28
+// (back-ported here so the cri and audit adapters share an identical
+// termination criterion); gRPC and NATS error message text is not
+// stable surface and a substring match would silently drift between
+// nats-go releases.
 func isPermanentPublishError(err error) bool {
 	if err == nil {
 		return false
@@ -730,21 +735,22 @@ func isPermanentPublishError(err error) bool {
 	if errors.Is(err, nats.ErrMaxPayload) {
 		return true
 	}
+	if errors.Is(err, nats.ErrNoResponders) {
+		return true
+	}
+	if errors.Is(err, natsjs.ErrStreamNotFound) {
+		return true
+	}
 	var apiErr *natsjs.APIError
 	if errors.As(err, &apiErr) {
-		// Code 10054: stream message size exceeds maximum (NATS server
-		// constant; not exported by nats.go yet, hence the literal).
-		if apiErr.ErrorCode == 10054 {
+		switch apiErr.ErrorCode {
+		// 10054: stream message size exceeds maximum.
+		// 10059: stream not found.
+		// 10076: JetStream not enabled.
+		// 10039: JetStream not enabled for account.
+		case 10054, 10059, 10076, 10039:
 			return true
 		}
-	}
-	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "maximum payload") ||
-		strings.Contains(msg, "max payload") ||
-		strings.Contains(msg, "message size exceeded") ||
-		strings.Contains(msg, "max msg size") ||
-		strings.Contains(msg, "payload too big") {
-		return true
 	}
 	return false
 }

@@ -352,6 +352,13 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 		}
 		g.Go(func() error {
 			if err := criAdapter.Run(ctx); err != nil {
+				// P22: clean shutdown surfaces context.Canceled
+				// (sometimes wrapped by retry.Do); treat as nil to
+				// keep errgroup.Wait quiet, matching the Story 1.6
+				// Falco / Story 1.7 audit pattern.
+				if errors.Is(err, context.Canceled) {
+					return nil
+				}
 				return fmt.Errorf("collector: cri run: %w", err)
 			}
 			return nil

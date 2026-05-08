@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	natsjs "github.com/nats-io/nats.go/jetstream"
 	authnv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -64,7 +65,10 @@ func (s *stubPublisher) PublishJS(_ context.Context, subject string, data any, o
 		return nil, err
 	}
 	if s.permanent.Load() {
-		return nil, errors.New("nats: maximum payload exceeded")
+		// P28: typed nats.ErrMaxPayload (post-substring-drop). Pre-P28
+		// the same string-only error tripped the substring fallback;
+		// the typed wrap survives the post-P28 typed-only matcher.
+		return nil, fmt.Errorf("publish: %w", nats.ErrMaxPayload)
 	}
 	b, err := json.Marshal(data)
 	if err != nil {
@@ -606,5 +610,29 @@ func TestNew_RejectsMissingFields(t *testing.T) {
 				t.Errorf("expected error for %s, got nil", tc.name)
 			}
 		})
+	}
+}
+
+// TestIsPermanentPublishError_RejectsSubstringOnlyMatch is the audit-
+// side regression net for Story 1.8 P28 (back-port of the cri-side
+// drop). Pre-P28 the helper matched a lowercased-substring error
+// string ("nats: maximum payload exceeded") as terminal even when
+// the typed nats.ErrMaxPayload was nowhere in the chain. Post-P28
+// only typed-error paths qualify.
+func TestIsPermanentPublishError_RejectsSubstringOnlyMatch(t *testing.T) {
+	t.Parallel()
+	wrapped := fmt.Errorf("publish: %w", nats.ErrMaxPayload)
+	if !isPermanentPublishError(wrapped) {
+		t.Errorf("isPermanentPublishError(wrapped ErrMaxPayload): got false, want true")
+	}
+	stringy := errors.New("nats: maximum payload exceeded")
+	if isPermanentPublishError(stringy) {
+		t.Errorf("isPermanentPublishError(substring-only): got true, want false (P28 dropped substring fallback)")
+	}
+	if !isPermanentPublishError(fmt.Errorf("publish: %w", nats.ErrNoResponders)) {
+		t.Errorf("isPermanentPublishError(ErrNoResponders): got false, want true")
+	}
+	if !isPermanentPublishError(fmt.Errorf("publish: %w", natsjs.ErrStreamNotFound)) {
+		t.Errorf("isPermanentPublishError(ErrStreamNotFound): got false, want true")
 	}
 }

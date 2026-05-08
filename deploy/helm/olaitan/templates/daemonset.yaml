@@ -9,8 +9,32 @@ the pod network namespace. This keeps the collector's blast radius
 small -- an auditor reviewing the pod spec sees no host-level escape
 surface.
 */}}
-{{- if and .Values.containerdSensor.enabled (eq (default "" .Values.containerdSensor.socketPath) "") }}
+{{- if .Values.containerdSensor.enabled }}
+{{- $sp := default "" .Values.containerdSensor.socketPath }}
+{{- if eq $sp "" }}
 {{- fail "containerdSensor.socketPath is required when containerdSensor.enabled=true. Default is /run/containerd/containerd.sock for stock containerd 1.7 on kubeadm; override only if your cluster uses a non-standard install layout. See deploy/helm/olaitan/CRI.md for guidance." }}
+{{- end }}
+{{- /* P16: reject paths that would mount unsafe locations or render
+       a malformed volume. Absolute path required (relative paths are
+       interpreted relative to the host's cwd, which is meaningless
+       for hostPath); reject "/" and "/<anything>/" with no parent
+       directory because dir(socketPath) would resolve to "/" and
+       expose the entire host root. Also reject shell metachars
+       ($, `, ;) so a values file pasted from a shell snippet cannot
+       smuggle expansion into a literal yaml string. */}}
+{{- if not (hasPrefix "/" $sp) }}
+{{- fail (printf "containerdSensor.socketPath must be an absolute path (got %q). Examples: /run/containerd/containerd.sock or /run/k3s/containerd/containerd.sock." $sp) }}
+{{- end }}
+{{- $spTrim := $sp }}
+{{- if and (gt (len $spTrim) 1) (hasSuffix "/" $spTrim) }}
+{{- $spTrim = trimSuffix "/" $spTrim }}
+{{- end }}
+{{- if eq (dir $spTrim) "/" }}
+{{- fail (printf "containerdSensor.socketPath would mount the host root (dir(%q)=\"/\"). Set socketPath to a real socket nested under at least one parent directory, e.g. /run/containerd/containerd.sock." $sp) }}
+{{- end }}
+{{- if regexMatch "[\\$\\`;]" $sp }}
+{{- fail (printf "containerdSensor.socketPath contains shell metacharacters (got %q); paste a literal path without quoting/expansion characters." $sp) }}
+{{- end }}
 {{- end }}
 apiVersion: apps/v1
 kind: DaemonSet
@@ -169,7 +193,13 @@ spec:
             # deploy/helm/olaitan/CRI.md for the threat model.
             - name: containerd-socket
               mountPath: {{ dir .Values.containerdSensor.socketPath | quote }}
-              readOnly: false
+              # P2: read-only. The adapter only opens GetContainerEvents
+              # (a server-streaming RPC) and never writes to the socket
+              # inode. K8s hostPath best practice and 2026 Falco install
+              # guidance both treat runtime-socket mounts as read-only;
+              # no production CRI client requires write permission on
+              # the parent directory.
+              readOnly: true
             {{- end }}
       volumes:
         - name: config
@@ -202,5 +232,11 @@ spec:
         - name: containerd-socket
           hostPath:
             path: {{ dir .Values.containerdSensor.socketPath | quote }}
-            type: DirectoryOrCreate
+            # P3: Directory (not DirectoryOrCreate). On a misconfigured
+            # node (CRI-O cluster, tainted node, k3s without
+            # /run/containerd) DirectoryOrCreate would silently
+            # materialise an empty root-owned directory and pollute the
+            # host filesystem; Directory fails the pod loudly so the
+            # operator notices the misconfiguration.
+            type: Directory
         {{- end }}

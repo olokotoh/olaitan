@@ -13,6 +13,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
@@ -108,16 +109,19 @@ func DefaultConnectRetry() retry.Strategy {
 }
 
 // DefaultPublishRetry returns the per-publish bounded retry strategy.
-// 100ms..1s, 3 attempts, equal jitter -- combined with the per-attempt
-// 2s deadline this caps total transient backoff at ~9s before the
-// stream loop logs+drops and continues. Mirrors falco /
-// audit.DefaultPublishRetry exactly.
+// 100ms..1s, 3 attempts, low equal-jitter (0.1) -- combined with the
+// per-attempt 2s deadline this caps total transient backoff at ~9s
+// before the stream loop logs+drops and continues. The 0.1 jitter
+// matches the config/olaitan.yaml default for
+// detection.sources.containerd.publish_retry so the rendered runtime
+// behaviour matches the code default; tuning either knob in isolation
+// would silently desync the two. (Story 1.7 patch P29 precedent.)
 func DefaultPublishRetry() retry.Strategy {
 	return retry.Strategy{
 		Min:         100 * time.Millisecond,
 		Max:         1 * time.Second,
 		Multiplier:  2.0,
-		Jitter:      1.0,
+		Jitter:      0.1,
 		MaxAttempts: 3,
 	}
 }
@@ -131,8 +135,11 @@ const publishAttemptTimeout = 2 * time.Second
 // connectivityCheckInterval is the watchdog's tick period. The
 // watchdog reads the gRPC connection state, the last-event timestamp,
 // and the configured StalenessTimeout to decide whether to
-// MarkUnhealthy. Half the configured staleness timeout, floored at 30s
-// to keep idle CPU low when staleness is set very short in tests.
+// MarkUnhealthy. Returns half the configured staleness timeout, with
+// a 30s fallback applied ONLY when staleness is non-positive (zero or
+// negative) -- a short staleness like 1s in tests therefore yields a
+// 500ms tick, not a 30s tick. Production callers always set staleness
+// well above the fallback threshold, so the floor never fires there.
 func connectivityCheckInterval(staleness time.Duration) time.Duration {
 	period := staleness / 2
 	if period <= 0 {
@@ -149,10 +156,13 @@ type Adapter struct {
 	log    *slog.Logger
 	health sourcehealth.Tracker
 
-	// lastEventUnixNano is the Unix-nanosecond wall-clock timestamp
-	// of the most recent successful Translate. Read by the staleness
-	// watchdog. Zero means "no event ever received".
-	lastEventUnixNano atomic.Int64
+	// lastEventTime is the wall-clock baseline of the most recent
+	// successful Translate. Stored as *time.Time (atomic) so the
+	// monotonic clock reading is preserved across reads -- a forward
+	// NTP step would falsely trip the staleness watchdog if we used a
+	// stripped Unix-nanosecond representation. Read by the staleness
+	// watchdog; nil means "no event ever received".
+	lastEventTime atomic.Pointer[time.Time]
 
 	// connState is the current gRPC connection state, updated by the
 	// stream loop on connect-success / connect-failure transitions.
@@ -381,7 +391,11 @@ func (a *Adapter) connectAndConsume(ctx context.Context) error {
 
 		// Record the wall-clock time of the most recent successful
 		// translate so the staleness watchdog can decide actionability.
-		a.lastEventUnixNano.Store(a.nowFn().UnixNano())
+		// Storing *time.Time (rather than UnixNano) preserves monotonic
+		// clock reading so a forward NTP step does not trip the
+		// watchdog instantly.
+		now := a.nowFn()
+		a.lastEventTime.Store(&now)
 
 		if perr := a.publishWithRetry(ctx, schemaEv); perr != nil {
 			if isPermanentPublishError(perr) {
@@ -441,14 +455,29 @@ func (a *Adapter) publishWithRetry(ctx context.Context, ev schema.Event) error {
 // difference from Stories 1.6 (Falco) and 1.7 (audit): CRI lifecycle
 // events are quiet by design, so staleness alone is uninformative.
 //
-// Only flips MarkUnhealthy when the source is currently healthy.
-// Preserves any more-specific error a publish-loop or connect-fail
-// path may have stored. Backward clock jumps (negative Sub) are
-// treated as "not stale" so a transient NTP step does not falsely
-// flip the source.
+// MarkUnhealthy is always overwritten when the staleness condition
+// trips. The Story 1.7 P8 "only-if-healthy" precheck was advisory and
+// race-prone (the stream loop's MarkHealthy can land between the
+// watchdog's Status read and MarkUnhealthy write, clobbering fresh-
+// good with stale-bad); reverting to the watchdog's documented always-
+// overwrite behaviour is the simpler correct shape. Backward clock
+// jumps (negative Sub) are treated as "not stale" so a transient NTP
+// step does not falsely flip the source; forward jumps are similarly
+// tolerated because lastEventTime preserves the monotonic clock
+// reading.
+//
+// Panics inside this goroutine are caught and surfaced via
+// MarkUnhealthy rather than crashing the agent process: a clock-
+// dependency or nil-pointer regression should degrade the source, not
+// take the whole DaemonSet pod down.
 //
 // Returns when ctx is cancelled.
 func (a *Adapter) runStalenessWatchdog(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			a.health.MarkUnhealthy(fmt.Errorf("cri: watchdog panic: %v", r))
+		}
+	}()
 	period := connectivityCheckInterval(a.cfg.StalenessTimeout)
 	ticker := time.NewTicker(period)
 	defer ticker.Stop()
@@ -457,8 +486,8 @@ func (a *Adapter) runStalenessWatchdog(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			lastNs := a.lastEventUnixNano.Load()
-			if lastNs == 0 {
+			lastPtr := a.lastEventTime.Load()
+			if lastPtr == nil {
 				// Never received an event. The startup MarkUnhealthy
 				// is authoritative until the first successful Recv
 				// flips it. Don't fabricate a staleness event.
@@ -471,20 +500,15 @@ func (a *Adapter) runStalenessWatchdog(ctx context.Context) {
 				// TestRun_StalenessWatchdog_QuietButConnected_DoesNotFlipUnhealthy.
 				continue
 			}
-			last := time.Unix(0, lastNs)
-			delta := a.nowFn().Sub(last)
+			// time.Since uses the stored monotonic reading when
+			// available, so a forward NTP step that bumps wall clock
+			// without elapsing actual time does not trip the watchdog.
+			delta := a.nowFn().Sub(*lastPtr)
 			if delta < 0 {
 				// Backward clock jump (NTP step). Treat as fresh.
 				continue
 			}
 			if delta <= a.cfg.StalenessTimeout {
-				continue
-			}
-			// Only override if currently healthy; preserve a more-
-			// specific MarkUnhealthy reason the connect-fail or
-			// publish-loop path may have stored. Story 1.7 patch P8
-			// idempotency.
-			if healthy, _ := a.health.Status(); !healthy {
 				continue
 			}
 			a.health.MarkUnhealthy(fmt.Errorf("cri: no event for %s and connection not Ready", a.cfg.StalenessTimeout))
@@ -502,21 +526,48 @@ func criDialTarget(socketPath string) string {
 	return "unix://" + socketPath
 }
 
-// defaultDial dials target with insecure transport credentials. CRI
-// uses a Unix domain socket protected by file-system permissions;
-// mTLS does not apply (the remote is not network-reachable). The
-// agent's pod-spec security context limits exposure: the host-socket
-// mount is the privilege boundary, not the gRPC handshake.
+// defaultDial dials target with insecure transport credentials and
+// blocks (bounded by dialCtx) until the connection reaches
+// connectivity.Ready. CRI uses a Unix domain socket protected by
+// file-system permissions; mTLS does not apply (the remote is not
+// network-reachable). The agent's pod-spec security context limits
+// exposure: the host-socket mount is the privilege boundary, not the
+// gRPC handshake.
 //
-// grpc.NewClient is intentionally lazy in modern grpc-go (>= 1.63);
-// connection establishment happens on the first RPC. The dialCtx
-// timeout is consumed by the upstream Recv path, not by NewClient
-// itself.
-func defaultDial(_ context.Context, target string) (*grpc.ClientConn, error) {
-	return grpc.NewClient(
+// grpc.NewClient is intentionally lazy in modern grpc-go (>= 1.63):
+// it does not connect until the first RPC. Without an explicit
+// readiness wait the configured DialTimeout would be cosmetic and a
+// wrong/missing socket would surface only as a stream error several
+// seconds later, leaving the watchdog's "stale AND not Ready" gate to
+// keep the source falsely healthy in the meantime. We therefore call
+// cc.Connect to exit Idle and loop on cc.WaitForStateChange until the
+// state reaches Ready (success), TransientFailure or Shutdown
+// (terminal for this attempt), or dialCtx is done. On timeout the
+// connection is closed and a wrapped error is returned to the outer
+// retry loop. (grpc-go anti-patterns documentation, 2026.)
+func defaultDial(dialCtx context.Context, target string) (*grpc.ClientConn, error) {
+	cc, err := grpc.NewClient(
 		target,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
+	if err != nil {
+		return nil, err
+	}
+	cc.Connect()
+	for {
+		state := cc.GetState()
+		if state == connectivity.Ready {
+			return cc, nil
+		}
+		if !cc.WaitForStateChange(dialCtx, state) {
+			// dialCtx done before the state changed.
+			_ = cc.Close()
+			if cerr := dialCtx.Err(); cerr != nil {
+				return nil, fmt.Errorf("dial wait-for-ready: %w", cerr)
+			}
+			return nil, fmt.Errorf("dial wait-for-ready: state=%s", state)
+		}
+	}
 }
 
 // defaultNewClient is the production constructor for the CRI
@@ -536,8 +587,15 @@ func defaultNewClient(cc *grpc.ClientConn) runtimeClient {
 //   - gRPC codes.Unauthenticated: Auth failure (rare on a Unix socket
 //     but defended for completeness).
 //   - gRPC codes.PermissionDenied: server-side authorization denial.
+//   - gRPC codes.ResourceExhausted: containerd's CRI rate-limiter
+//     refused the connection. Treating this as permanent escalates
+//     into the outer connect-loop's longer backoff rather than a
+//     reconnect storm against a server that is asking us to back off.
 //
-// Mirrors falco.isTerminalConnectError.
+// Mirrors falco.isTerminalConnectError. Detection is purely typed --
+// a "permission denied" substring fallback is intentionally NOT
+// included because gRPC error message text is not stable surface
+// (locale-/version-fragile).
 func isTerminalConnectError(err error) bool {
 	if err == nil {
 		return false
@@ -546,23 +604,32 @@ func isTerminalConnectError(err error) bool {
 		return true
 	}
 	switch status.Code(err) {
-	case codes.Unauthenticated, codes.PermissionDenied:
+	case codes.Unauthenticated, codes.PermissionDenied, codes.ResourceExhausted:
 		return true
 	}
-	return strings.Contains(strings.ToLower(err.Error()), "permission denied")
+	return false
 }
 
 // isPermanentPublishError reports whether err from a JetStream
 // PublishJS call is a per-message terminal condition (the message
-// itself violates a stream-level invariant) rather than a transient
+// itself violates a stream-level invariant or the cluster is in a
+// shape where retrying will not succeed) rather than a transient
 // transport hiccup. Caller is expected to log+drop the offending
 // event and continue.
 //
-// Detection layers (in order):
-//  1. errors.Is(err, nats.ErrMaxPayload) -- the typed client-side cap.
-//  2. *jetstream.APIError with the stream-message-size error code.
-//  3. Substring fallback for server-side variants that surface as
-//     plain wrapped strings.
+// Detection layers (in order, all typed -- no substring fallback):
+//  1. errors.Is(err, nats.ErrMaxPayload) -- typed client-side
+//     oversize cap.
+//  2. errors.Is(err, nats.ErrNoResponders) -- no JetStream subscriber
+//     answered the publish (subject has no bound stream). An
+//     infinite reconnect loop would lose every event for the lifetime
+//     of the misconfiguration; drop loudly instead.
+//  3. errors.Is(err, natsjs.ErrStreamNotFound) -- the configured
+//     stream was deleted out from under us.
+//  4. *natsjs.APIError with one of the stream-message-size,
+//     stream-not-found, or jetstream-not-enabled error codes (server-
+//     side counterparts of the typed errors above, surfaced when the
+//     client wraps an APIError before returning).
 //
 // Mirrors audit.isPermanentPublishError exactly so the three adapters
 // converge on the same termination criterion.
@@ -573,21 +640,22 @@ func isPermanentPublishError(err error) bool {
 	if errors.Is(err, nats.ErrMaxPayload) {
 		return true
 	}
+	if errors.Is(err, nats.ErrNoResponders) {
+		return true
+	}
+	if errors.Is(err, natsjs.ErrStreamNotFound) {
+		return true
+	}
 	var apiErr *natsjs.APIError
 	if errors.As(err, &apiErr) {
-		// Code 10054: stream message size exceeds maximum. NATS
-		// server constant; not exported by nats.go.
-		if apiErr.ErrorCode == 10054 {
+		switch apiErr.ErrorCode {
+		// 10054: stream message size exceeds maximum.
+		// 10059: stream not found.
+		// 10076: JetStream not enabled.
+		// 10039: JetStream not enabled for account.
+		case 10054, 10059, 10076, 10039:
 			return true
 		}
-	}
-	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "maximum payload") ||
-		strings.Contains(msg, "max payload") ||
-		strings.Contains(msg, "message size exceeded") ||
-		strings.Contains(msg, "max msg size") ||
-		strings.Contains(msg, "payload too big") {
-		return true
 	}
 	return false
 }

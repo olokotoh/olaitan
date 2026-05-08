@@ -4,7 +4,13 @@
 // RuntimeService.GetContainerEvents (server-streaming RPC), translates
 // each ContainerEventResponse into the canonical schema.Event of
 // source=runtime / category=lifecycle, and publishes to
-// subjects.RawRuntime via JetStream with at-least-once semantics.
+// subjects.RawRuntime via JetStream with best-effort at-least-once
+// semantics under a bounded retry budget: an event whose publish
+// exhausts the configured PublishRetry strategy is log+dropped
+// (containerd does not replay lifecycle events from its side, so the
+// in-flight event is lost). A retry that the JetStream server already
+// persisted on a previous attempt is server-side deduplicated within
+// the stream's 2-minute dedup window via WithMsgID.
 //
 // Why source=runtime not source=containerd: the schema package
 // (internal/schema/event.go) was bootstrapped with SourceRuntime =
@@ -60,6 +66,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 
@@ -89,6 +96,22 @@ const maxFutureSkew = 24 * time.Hour
 // every containers_statuses[i].image_ref are included; we strip those
 // while retaining the forensically-relevant fields.
 const rawSizeBudget = 32 * 1024
+
+// maxStrippedMessageLen caps the per-container Message field on the
+// strip path. Runtime / kernel error strings can run into kilobytes
+// (containerd surfaces the full OCI runtime stderr on a failed
+// container start); a single 4 KiB Message can push the post-strip
+// body past rawSizeBudget and trigger a permanent oversize publish
+// failure with no second strip pass. 1 KiB is enough for the
+// forensically-useful prefix of every observed message in the spec
+// fixtures.
+const maxStrippedMessageLen = 1024
+
+// maxSanitizedTagLen caps a single sanitized label / pod-name / pod-
+// namespace value. The inbound CRI proto carries user-controlled
+// strings; downstream tag-string parsers and log lines must not be
+// derailed by an arbitrarily long crash-vector value.
+const maxSanitizedTagLen = 256
 
 // labelPrefixesAllowed is the whitelist of pod label prefixes the
 // adapter forwards to schema.Event.Tags. User-controlled label values
@@ -265,11 +288,18 @@ func podRefFromSandbox(sandbox *runtimeapi.PodSandboxStatus, nodeName string) sc
 // Truncates container_id to 12 hex chars (Docker / crictl convention)
 // for log readability, but only when the ID is at least that long --
 // some test runtimes use short IDs.
+//
+// podNS and podName originate from user-controlled
+// pod_sandbox.metadata fields; sanitize before formatting so a pod
+// crafted with newlines or NUL bytes in its name cannot inject
+// control characters into structured log lines.
 func buildSummary(eventTypeName, containerID, podNS, podName string) string {
 	shortID := containerID
 	if len(shortID) > 12 {
 		shortID = shortID[:12]
 	}
+	podNS = sanitizeForTag(podNS)
+	podName = sanitizeForTag(podName)
 	if podNS == "" && podName == "" {
 		return fmt.Sprintf("%s container=%s", eventTypeName, shortID)
 	}
@@ -314,7 +344,10 @@ func buildTags(eventTypeName string, sandbox *runtimeapi.PodSandboxStatus) []str
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			tags = append(tags, k+":"+labels[k])
+			// User-controlled label value: strip control chars and cap
+			// length so a pod with a newline-bearing label cannot
+			// derail downstream tag-string parsers or log lines.
+			tags = append(tags, k+":"+sanitizeForTag(labels[k]))
 		}
 	}
 	return append([]string(nil), tags...)
@@ -330,6 +363,36 @@ func labelHasAllowedPrefix(k string) bool {
 		}
 	}
 	return false
+}
+
+// sanitizeForTag strips control characters (Unicode category Cc apart
+// from \t) and caps the result at maxSanitizedTagLen bytes. Used on
+// every user-controlled string that ends up inside a tag entry, the
+// summary log line, or any other downstream-parsed text. Newlines,
+// NUL bytes, and arbitrary control sequences would otherwise let a
+// pod-label or pod-name value break the tag-string format expected by
+// the OLT Sigma rule engine and the structured logger.
+func sanitizeForTag(s string) string {
+	if s == "" {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if r == '\t' {
+			b.WriteRune(r)
+			continue
+		}
+		if unicode.IsControl(r) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	out := b.String()
+	if len(out) > maxSanitizedTagLen {
+		out = out[:maxSanitizedTagLen]
+	}
+	return out
 }
 
 // containerEventTypeName returns the canonical CRI enum name plus a
@@ -456,8 +519,9 @@ func marshalTrimmedRaw(ev *runtimeapi.ContainerEventResponse) (json.RawMessage, 
 // buildRawCanonical projects ContainerEventResponse into the
 // deterministic rawCanonical shape. When forceStrip is true the
 // container_statuses[i] entries drop their image-ref text entirely
-// and the per-entry message is truncated to keep the post-strip
-// marshal bounded.
+// and the per-entry Message is truncated to maxStrippedMessageLen
+// (1 KiB) so a multi-kilobyte runtime/kernel error string cannot push
+// the post-strip body back over rawSizeBudget.
 func buildRawCanonical(ev *runtimeapi.ContainerEventResponse, forceStrip bool) *rawCanonical {
 	typeName, _ := containerEventTypeName(ev.ContainerEventType)
 	// Unknown enum values emit the raw int form so the persisted Raw
@@ -528,6 +592,11 @@ func buildRawCanonical(ev *runtimeapi.ContainerEventResponse, forceStrip bool) *
 				// long but are forensically valuable). Strip path
 				// drops them to bound the post-strip size.
 				rc.Image = status.ImageRef
+			} else if len(rc.Message) > maxStrippedMessageLen {
+				// Strip path: cap Message so a multi-kilobyte runtime
+				// stderr does not blow the rawSizeBudget after the
+				// other fields have already been trimmed.
+				rc.Message = rc.Message[:maxStrippedMessageLen]
 			}
 			out = append(out, rc)
 		}

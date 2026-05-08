@@ -1048,29 +1048,36 @@ func TestContainerdSensorAbsent_WhenDisabled(t *testing.T) {
 }
 
 // TestContainerdSensorRenders_WhenEnabled asserts the DaemonSet
-// gains the host-path volume + read-write volumeMount when the
-// chart value is flipped to enabled. The host-side path mounts the
-// PARENT directory of the socket file, mirroring the Falco socket
-// mount: a containerd restart that removes-and-recreates the socket
-// inode is observed without remount.
+// gains the host-path volume + (read-only, post-P2) volumeMount when
+// the chart value is flipped to enabled. The host-side path mounts
+// the PARENT directory of the socket file, mirroring the Falco
+// socket mount: a containerd restart that removes-and-recreates the
+// socket inode is observed without remount. Post-P3 the hostPath
+// volume uses type: Directory (not DirectoryOrCreate) so a
+// misconfigured node fails loudly instead of materialising an empty
+// directory at the mount path.
 func TestContainerdSensorRenders_WhenEnabled(t *testing.T) {
 	rendered := helmTemplate(t, []string{
 		"containerdSensor.enabled=true",
 	})
-	wantMount := `- name: containerd-socket
-              mountPath: "/run/containerd"
-              readOnly: false`
-	if !strings.Contains(rendered, wantMount) {
+	if !strings.Contains(rendered, `- name: containerd-socket
+              mountPath: "/run/containerd"`) {
 		t.Errorf("containerd-socket volumeMount not rendered with containerdSensor.enabled=true; rendered sample:\n%s",
 			snippet(rendered, "containerd-socket"))
 	}
-	wantVolume := `- name: containerd-socket
+	if !strings.Contains(rendered, "readOnly: true") {
+		t.Errorf("containerd-socket volumeMount missing readOnly: true (P2); rendered sample:\n%s",
+			snippet(rendered, "containerd-socket"))
+	}
+	if !strings.Contains(rendered, `- name: containerd-socket
           hostPath:
-            path: "/run/containerd"
-            type: DirectoryOrCreate`
-	if !strings.Contains(rendered, wantVolume) {
+            path: "/run/containerd"`) {
 		t.Errorf("containerd-socket hostPath volume not rendered with containerdSensor.enabled=true; rendered sample:\n%s",
 			snippet(rendered, "hostPath"))
+	}
+	if !strings.Contains(rendered, "type: Directory") {
+		t.Errorf("containerd-socket hostPath missing type: Directory (P3); rendered sample:\n%s",
+			snippet(rendered, "containerd-socket"))
 	}
 }
 
@@ -1194,6 +1201,185 @@ func TestContainerdSensorEmptySocketPathFails(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "containerdSensor.socketPath is required") {
 		t.Errorf("stderr did not mention the fail-fast guard; got:\n%s", stderr.String())
+	}
+}
+
+// TestContainerdSensorConfigmapBridge_StalenessTimeout asserts the
+// Story 1.8 P27 ConfigMap bridge propagates a `--set
+// containerdSensor.stalenessTimeout=...` override into the rendered
+// detection.sources.containerd.staleness_timeout field. Pre-P27 the
+// chart only exposed `enabled` and `socketPath`; runtime knobs lived
+// only in config/olaitan.yaml and `helm install --set` could not
+// reach them, a silent operator trap.
+func TestContainerdSensorConfigmapBridge_StalenessTimeout(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"falco.enabled=false",
+		"nats.enabled=false",
+		"redis.enabled=false",
+		"containerdSensor.enabled=true",
+		"containerdSensor.stalenessTimeout=42m",
+	})
+	if !strings.Contains(rendered, `staleness_timeout: "42m"`) {
+		t.Errorf("staleness_timeout override did not propagate to ConfigMap; rendered sample:\n%s",
+			snippet(rendered, "containerd:"))
+	}
+	// Audit block's staleness_timeout (5m default) must be untouched.
+	if !strings.Contains(rendered, `staleness_timeout: "5m"`) {
+		t.Errorf("audit block staleness_timeout was mutated by the containerd bridge; rendered sample:\n%s",
+			snippet(rendered, "audit:"))
+	}
+}
+
+// TestContainerdSensorConfigmapBridge_SocketPath asserts the bridge
+// keeps Helm's containerdSensor.socketPath in sync with the rendered
+// detection.sources.containerd.socket_path. Pre-P27 the operator had
+// to set the path twice (once per file) and a desync would silently
+// dial the wrong socket on each node.
+func TestContainerdSensorConfigmapBridge_SocketPath(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"falco.enabled=false",
+		"nats.enabled=false",
+		"redis.enabled=false",
+		"containerdSensor.enabled=true",
+		"containerdSensor.socketPath=/run/k3s/containerd/containerd.sock",
+	})
+	if !strings.Contains(rendered, `socket_path: "/run/k3s/containerd/containerd.sock"`) {
+		t.Errorf("socketPath override did not propagate to ConfigMap socket_path; rendered sample:\n%s",
+			snippet(rendered, "containerd:"))
+	}
+	// And the chart's own enabled-flag bridge: containerdSensor.enabled=true
+	// must flip detection.sources.containerd.enabled to true so the
+	// adapter actually runs.
+	if !strings.Contains(rendered, "containerd:\n          enabled: true") {
+		t.Errorf("containerdSensor.enabled=true did not flip detection.sources.containerd.enabled; rendered sample:\n%s",
+			snippet(rendered, "containerd:"))
+	}
+}
+
+// TestContainerdSensorConfigmapBridge_RetryStrategies asserts both
+// nested retry blocks (connect_retry / publish_retry) bridge their
+// scalar fields into the ConfigMap. The two blocks share field names
+// (min/max/multiplier/jitter/max_attempts), so the regex bridge has
+// to disambiguate via the parent header; this test pins that
+// behaviour.
+func TestContainerdSensorConfigmapBridge_RetryStrategies(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"falco.enabled=false",
+		"nats.enabled=false",
+		"redis.enabled=false",
+		"containerdSensor.enabled=true",
+		"containerdSensor.connectRetry.min=3s",
+		"containerdSensor.connectRetry.max=99s",
+		"containerdSensor.publishRetry.min=222ms",
+		"containerdSensor.publishRetry.maxAttempts=7",
+	})
+	for _, want := range []string{
+		`min: "3s"`,
+		`max: "99s"`,
+		`min: "222ms"`,
+		"max_attempts: 7",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("retry-strategy override %q did not propagate to ConfigMap; rendered sample:\n%s",
+				want, snippet(rendered, "containerd:"))
+		}
+	}
+}
+
+// TestContainerdSensorMountReadOnly asserts the P2 fix landed: the
+// containerd-socket volumeMount must be readOnly: true when the
+// sensor is enabled. K8s hostPath best practice for runtime sockets;
+// regression here would re-expose the unnecessary write surface.
+func TestContainerdSensorMountReadOnly(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"containerdSensor.enabled=true",
+	})
+	if !strings.Contains(rendered, "readOnly: true") {
+		t.Errorf("containerd-socket volumeMount missing readOnly: true; rendered sample:\n%s",
+			snippet(rendered, "containerd-socket"))
+	}
+	if strings.Contains(rendered, `- name: containerd-socket
+              mountPath: "/run/containerd"
+              readOnly: false`) {
+		t.Errorf("containerd-socket volumeMount still rendered with readOnly: false (P2 regression)")
+	}
+}
+
+// TestContainerdSensorHostPathTypeDirectory asserts the P3 fix landed:
+// the hostPath volume must use type: Directory (not
+// DirectoryOrCreate). Pre-P3 a misconfigured node (no containerd, or
+// CRI-O) would silently materialise an empty root-owned directory at
+// the path; with type: Directory the pod fails loudly so the
+// operator notices.
+func TestContainerdSensorHostPathTypeDirectory(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"containerdSensor.enabled=true",
+	})
+	if !strings.Contains(rendered, `type: Directory`) {
+		t.Errorf("containerd-socket hostPath missing type: Directory; rendered sample:\n%s",
+			snippet(rendered, "containerd-socket"))
+	}
+	if strings.Contains(rendered, `type: DirectoryOrCreate`) {
+		// The Olaitan-owned containerd-socket volume must NOT use
+		// DirectoryOrCreate. The Falco subchart may legitimately use
+		// it for its own runtime-discovery hostPaths; scope the
+		// assertion to a window around the containerd-socket name to
+		// keep that subchart's behaviour out of the assertion.
+		idx := strings.Index(rendered, "name: containerd-socket")
+		if idx >= 0 {
+			window := rendered[idx:]
+			if end := strings.Index(window, "---"); end > 0 && end < 600 {
+				window = window[:end]
+			}
+			if strings.Contains(window, "DirectoryOrCreate") {
+				t.Errorf("containerd-socket hostPath still rendered with DirectoryOrCreate (P3 regression); window:\n%s", window)
+			}
+		}
+	}
+}
+
+// TestContainerdSocketPathFailsFast_RootOnly asserts the P16 fail-
+// fast: setting socketPath to "/" (or any path whose parent dir is
+// "/") must crash helm template rather than render a host-root
+// mount.
+func TestContainerdSocketPathFailsFast_RootOnly(t *testing.T) {
+	args := []string{
+		"template", "olaitan-test", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+		"--set", "containerdSensor.enabled=true",
+		"--set", "containerdSensor.socketPath=/foo",
+	}
+	cmd := exec.Command("helm", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatal("helm template succeeded with socketPath=/foo (parent dir = /); expected fail-fast")
+	}
+	if !strings.Contains(stderr.String(), "host root") {
+		t.Errorf("stderr did not mention the host-root guard; got:\n%s", stderr.String())
+	}
+}
+
+// TestContainerdSocketPathFailsFast_RelativePath asserts the P16
+// fail-fast on a non-absolute path (which would be interpreted
+// relative to the host's cwd, meaningless for hostPath).
+func TestContainerdSocketPathFailsFast_RelativePath(t *testing.T) {
+	args := []string{
+		"template", "olaitan-test", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+		"--set", "containerdSensor.enabled=true",
+		"--set", "containerdSensor.socketPath=run/containerd/containerd.sock",
+	}
+	cmd := exec.Command("helm", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatal("helm template succeeded with relative socketPath; expected fail-fast")
+	}
+	if !strings.Contains(stderr.String(), "absolute path") {
+		t.Errorf("stderr did not mention the absolute-path guard; got:\n%s", stderr.String())
 	}
 }
 

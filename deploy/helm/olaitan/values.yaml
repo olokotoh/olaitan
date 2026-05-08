@@ -268,8 +268,48 @@ containerdSensor:
   # Path on the host node to the containerd CRI socket. Default for
   # containerd 1.7 on a stock kubeadm 1.29 cluster. Operators using a
   # non-standard install layout (k3s, microk8s, custom containerd
-  # build) override here AND in config/olaitan.yaml.
+  # build) override here. The value flows through the rendered
+  # ConfigMap into detection.sources.containerd.socket_path so a
+  # single Helm override updates both the host-path mount and the
+  # adapter's runtime knob (mirrors auditWebhook.enabled bridging).
   socketPath: /run/containerd/containerd.sock
+
+  # gRPC dial timeout for the initial wait-for-ready handshake. Bumped
+  # past the default for slow nodes where containerd's CRI server
+  # takes longer than 10s to come up post-restart. Bridged into
+  # detection.sources.containerd.dial_timeout.
+  dialTimeout: "10s"
+
+  # Staleness watchdog threshold. CRI lifecycle events are quiet by
+  # design: a stable cluster with no Pod churn can go hours without an
+  # event, so the watchdog only flips MarkUnhealthy when staleness
+  # AND a non-Ready connection coincide. Bridged into
+  # detection.sources.containerd.staleness_timeout.
+  stalenessTimeout: "5m"
+
+  # Outer connect-loop backoff strategy used when the gRPC dial or
+  # GetContainerEvents stream open fails. Equal-jitter exponential
+  # backoff; max_attempts=0 means unlimited (the long-lived DaemonSet
+  # adapter never gives up on its own). Bridged into
+  # detection.sources.containerd.connect_retry.
+  connectRetry:
+    min: "1s"
+    max: "30s"
+    multiplier: 2.0
+    jitter: 0.5
+    maxAttempts: 0
+
+  # Per-publish bounded retry strategy. Combined with the per-attempt
+  # 2s deadline this caps total transient backoff at ~9s before the
+  # stream loop log+drops. jitter=0.1 matches the code default in
+  # internal/collector/cri.DefaultPublishRetry. Bridged into
+  # detection.sources.containerd.publish_retry.
+  publishRetry:
+    min: "100ms"
+    max: "1s"
+    multiplier: 2.0
+    jitter: 0.1
+    maxAttempts: 3
 
 # --- Subchart overrides ------------------------------------------------
 # Only opinions we impose on the downstream charts live here -- upstream

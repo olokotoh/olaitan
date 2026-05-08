@@ -222,16 +222,20 @@ func BenchmarkAdapter_PublishLatency(b *testing.B) {
 	runDone := make(chan error, 1)
 	go func() { runDone <- adapter.Run(ctx) }()
 
-	// Wait for stream-connected health flag before timing.
+	// Wait for stream-connected health flag before timing. P14: send
+	// the warm-up event exactly once before the wait loop so the
+	// post-bench `waitDelivered(b.N+1, ...)` count is exact. Pre-P14
+	// the warm-up emit lived inside the polling loop, which on a slow
+	// runner sent multiple warm-ups and produced spurious "paced CRI
+	// server reported drops" failures.
 	deadline := time.Now().Add(3 * time.Second)
 	now := time.Now()
+	srv.send(fixtureContainerEvent(0, now))
 	for time.Now().Before(deadline) {
 		healthy, _ := adapter.Health().Status()
 		if healthy {
 			break
 		}
-		// Give the stream something to flip MarkHealthy on.
-		srv.send(fixtureContainerEvent(0, now))
 		time.Sleep(5 * time.Millisecond)
 	}
 
@@ -239,7 +243,7 @@ func BenchmarkAdapter_PublishLatency(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		srv.send(fixtureContainerEvent(i+1, now.Add(time.Duration(i)*time.Microsecond)))
 	}
-	srv.waitDelivered(b, b.N+1, 30*time.Second) // +1 for the warm-up event above
+	srv.waitDelivered(b, b.N+1, 30*time.Second) // +1 for the single warm-up event above
 	b.StopTimer()
 	if dropped := srv.dropped(); dropped > 0 {
 		b.Fatalf("bench: paced CRI server reported drops post-bench: %d of %d events", dropped, b.N)

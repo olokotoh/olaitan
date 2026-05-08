@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -323,6 +324,23 @@ func TestAdapter_DropsTranslateError_RealBoundary(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() { runDone <- adapter.Run(ctx) }()
 
+	// P15: synchronise on TranslateErrors() == 1 first. The pre-P15
+	// shape did a single Fetch + count and asserted, which races on a
+	// fast runner where the fetch returns before the adapter has even
+	// read the malformed fixture: the test passed for the wrong
+	// reason. Polling the typed counter ensures the malformed event
+	// has actually traversed the adapter's translate boundary.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if adapter.TranslateErrors() == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := adapter.TranslateErrors(); got != 1 {
+		t.Errorf("TranslateErrors: got %d, want 1 (the malformed fixture; counter never tripped)", got)
+	}
+
 	// Only one event (the good one) should reach the consumer.
 	batch, err := consumer.Fetch(1, natsjs.FetchMaxWait(3*time.Second))
 	if err != nil {
@@ -336,10 +354,143 @@ func TestAdapter_DropsTranslateError_RealBoundary(t *testing.T) {
 	if count != 1 {
 		t.Errorf("expected 1 event published, got %d", count)
 	}
-	if got := adapter.TranslateErrors(); got != 1 {
-		t.Errorf("TranslateErrors: got %d, want 1 (the malformed fixture)", got)
+
+	cancel()
+	<-runDone
+}
+
+// TestAdapter_AllFourEventTypesPlusOverstrip exercises Task 7.4 (story
+// line 272) directly: the test substrate emits one event per CRI
+// ContainerEventType (CREATED, STARTED, STOPPED, DELETED) plus one
+// oversize fixture whose strip path must be visible at the publish
+// boundary. Pre-P8 the integration test only covered STARTED.
+func TestAdapter_AllFourEventTypesPlusOverstrip(t *testing.T) {
+	now := time.Date(2026, 5, 5, 14, 30, 0, 0, time.UTC)
+
+	// Build one event per type.
+	build := func(idx int, kind runtimeapi.ContainerEventType) *runtimeapi.ContainerEventResponse {
+		ev := fixtureContainerEvent(idx, now.Add(time.Duration(idx)*time.Millisecond))
+		ev.ContainerEventType = kind
+		return ev
+	}
+	created := build(1, runtimeapi.ContainerEventType_CONTAINER_CREATED_EVENT)
+	started := build(2, runtimeapi.ContainerEventType_CONTAINER_STARTED_EVENT)
+	stopped := build(3, runtimeapi.ContainerEventType_CONTAINER_STOPPED_EVENT)
+	deleted := build(4, runtimeapi.ContainerEventType_CONTAINER_DELETED_EVENT)
+
+	// Oversize: pad ContainersStatuses with a long ImageRef + a long
+	// Message so the un-stripped marshal exceeds rawSizeBudget and
+	// the strip path runs at publish time.
+	oversize := build(5, runtimeapi.ContainerEventType_CONTAINER_STARTED_EVENT)
+	oversize.ContainersStatuses = []*runtimeapi.ContainerStatus{}
+	bigImage := strings.Repeat("a", 8*1024)
+	bigMsg := strings.Repeat("b", 4*1024)
+	for i := 0; i < 6; i++ {
+		oversize.ContainersStatuses = append(oversize.ContainersStatuses,
+			&runtimeapi.ContainerStatus{
+				Id:       "container-" + string(rune('a'+i)),
+				ImageRef: bigImage,
+				Message:  bigMsg,
+			},
+		)
+	}
+
+	fixtures := []*runtimeapi.ContainerEventResponse{created, started, stopped, deleted, oversize}
+
+	natsSrv := startTestNATS(t)
+	natsCfg := natsclient.DefaultConfig()
+	natsCfg.URL = natsSrv.ClientURL()
+	natsCfg.Name = "cri-it-types"
+	nc, err := natsclient.NewClient(natsCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = nc.Close(context.Background()) })
+	if err := natsclient.EnsureStreams(context.Background(), nc.JetStream(), testStreamConfigs()); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := newFixtureCRIServer(fixtures)
+	dialFn := startBufconnCRI(t, srv)
+
+	consumer, err := nc.JetStream().CreateOrUpdateConsumer(context.Background(), "EVENTS_RAW",
+		natsjs.ConsumerConfig{
+			Name:          "cri-it-types-consumer",
+			FilterSubject: subjects.RawRuntime,
+			AckPolicy:     natsjs.AckExplicitPolicy,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	adapter, err := New(Config{
+		SocketPath:       "/run/containerd/containerd.sock",
+		Hostname:         "node-test",
+		ConnectRetry:     retry.Strategy{Min: 10 * time.Millisecond, Max: 100 * time.Millisecond, Multiplier: 2.0, Jitter: 0, MaxAttempts: 0},
+		PublishRetry:     retry.Strategy{Min: 10 * time.Millisecond, Max: 50 * time.Millisecond, Multiplier: 2.0, Jitter: 0, MaxAttempts: 3},
+		DialTimeout:      1 * time.Second,
+		StalenessTimeout: 1 * time.Minute,
+	}, nc, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter.dialFn = dialFn
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- adapter.Run(ctx) }()
+
+	got := make([]schema.Event, 0, len(fixtures))
+	for len(got) < len(fixtures) {
+		batch, ferr := consumer.Fetch(len(fixtures)-len(got), natsjs.FetchMaxWait(3*time.Second))
+		if ferr != nil {
+			t.Fatalf("consumer fetch: %v", ferr)
+		}
+		for msg := range batch.Messages() {
+			var ev schema.Event
+			if uerr := json.Unmarshal(msg.Data(), &ev); uerr != nil {
+				t.Errorf("unmarshal: %v", uerr)
+				continue
+			}
+			got = append(got, ev)
+			_ = msg.Ack()
+		}
 	}
 
 	cancel()
 	<-runDone
+
+	if len(got) != len(fixtures) {
+		t.Fatalf("got %d events, want %d", len(got), len(fixtures))
+	}
+
+	// Assert one tag per type appears across the publish boundary.
+	wantTags := map[string]bool{
+		"event_type:created": false,
+		"event_type:started": false,
+		"event_type:stopped": false,
+		"event_type:deleted": false,
+	}
+	sawStripped := false
+	for _, ev := range got {
+		for _, tag := range ev.Tags {
+			if _, ok := wantTags[tag]; ok {
+				wantTags[tag] = true
+			}
+		}
+		// The oversize fixture's published Raw must be strip-marked.
+		if strings.Contains(string(ev.Raw), `"_stripped":true`) {
+			sawStripped = true
+		}
+	}
+	for tag, seen := range wantTags {
+		if !seen {
+			t.Errorf("missing tag at publish boundary: %q", tag)
+		}
+	}
+	if !sawStripped {
+		t.Errorf("oversize fixture did not produce a _stripped:true event at the publish boundary")
+	}
 }

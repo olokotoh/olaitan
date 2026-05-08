@@ -51,17 +51,18 @@ Downstream consumers:
      socketPath: /run/containerd/containerd.sock  # adjust if non-standard
    ```
 
-3. Set the matching runtime knob in `config/olaitan.yaml` (the chart
-   does NOT overlay Helm values onto the agent's runtime config -- the
-   two flags must agree explicitly):
-
-   ```yaml
-   detection:
-     sources:
-       containerd:
-         enabled: true
-         socket_path: "/run/containerd/containerd.sock"
-   ```
+3. (Story 1.8 P27: no longer required.) Pre-P27 operators had to
+   set the matching runtime knob in `config/olaitan.yaml` separately,
+   in lockstep with the Helm flag. Post-P27 the chart's ConfigMap
+   bridges every `containerdSensor.*` knob (`enabled`, `socketPath`,
+   `dialTimeout`, `stalenessTimeout`, `connectRetry`, `publishRetry`)
+   into the rendered `detection.sources.containerd` block, so a
+   single `helm upgrade --set containerdSensor.foo=...` flips both
+   the host-path mount (gating) and the adapter's runtime behaviour.
+   Operators with a customised `config/olaitan.yaml` who prefer to
+   author runtime knobs in YAML still can: the bridge is regex-based
+   and only overrides keys whose chart value is set, so an unset
+   chart value leaves the file's value as-is.
 
 4. Re-render and apply the chart:
 
@@ -77,10 +78,15 @@ Downstream consumers:
      | grep "cri:"
    ```
 
-   Look for `cri: stream connected` followed by per-event publish
-   confirmations. Story 1.12 will surface a Prometheus
-   `source_healthy{source="runtime"}` gauge for steady-state
-   monitoring.
+   Look for one `cri: stream connected` line per node after the
+   sensor flips on. The adapter does NOT log a line per published
+   event on the success path -- a quiet log between connects is the
+   expected steady state. Drops are surfaced via two log lines plus
+   the matching counters (`Adapter.TranslateErrors()` for malformed
+   events, `Adapter.PublishDrops()` for permanent publish failures);
+   Story 1.12 will bind those counters to Prometheus together with
+   the `source_healthy{source="runtime"}` gauge so steady-state
+   monitoring lives off metrics rather than log-grep.
 
 ## Health semantics
 
@@ -139,9 +145,33 @@ source unhealthy after the configured `staleness_timeout` (default
 
 Mounting `/run/containerd/containerd.sock` (via the parent directory)
 into the agent pod gives the agent privileged access to the
-container runtime. An attacker who escapes to the agent pod can
-speak the full CRI to containerd: list containers, exec into any
-container on the node, pull arbitrary images.
+container runtime. An auditor reviewing this chart must understand
+that the host-path mount enables, at a minimum, the following CRI
+operations against the local containerd:
+
+- `RuntimeService.ListContainers` -- enumerate every container on
+  the node, including those owned by other namespaces.
+- `RuntimeService.ContainerStatus` / `PodSandboxStatus` -- read
+  per-container state, including labels, env, and image references.
+- `RuntimeService.ExecSync` and `Exec` -- run arbitrary commands
+  inside any running container on the node. This is the load-
+  bearing privilege: an attacker who reaches the agent pod can
+  pivot into any workload on that node.
+- `ImageService.PullImage` and `ListImages` -- pull arbitrary
+  images and inspect the local image cache.
+- `RuntimeService.RunPodSandbox` / `CreateContainer` /
+  `StartContainer` -- launch new workloads on the node.
+
+The mount is read-only at the pod-spec level (`readOnly: true` in
+the volumeMount, see `templates/daemonset.yaml`) so the agent
+cannot create or replace the socket file itself, but Unix-socket
+RPC permissions are governed by the inode mode, not by the bind-
+mount flag -- once any process inside the agent pod can `connect(2)`
+to the socket, the full CRI surface above is reachable. The K8s
+ecosystem has standardised on the Kyverno
+`disallow-cri-sock-mount` policy as the upstream pattern for
+flagging this mount class; clusters running Kyverno will need an
+explicit exception for the Olaitan collector DaemonSet.
 
 This is privilege equivalent to what Falco's `/run/falco/falco.sock`
 mount already grants (Falco's Unix socket exposes equivalent

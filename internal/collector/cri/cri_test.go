@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	natsjs "github.com/nats-io/nats.go/jetstream"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -16,6 +17,7 @@ import (
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 
 	"github.com/olokotoh/olaitan/internal/retry"
+	"github.com/olokotoh/olaitan/internal/subjects"
 )
 
 // stubRuntimeClient is an in-process implementation of the local
@@ -256,8 +258,8 @@ func TestRun_PublishesTranslateableEvent(t *testing.T) {
 	if pub.count() != 1 {
 		t.Errorf("publish count: got %d, want 1", pub.count())
 	}
-	if pub.subjects[0] != "olaitan.events.raw.runtime" {
-		t.Errorf("publish subject: got %q, want olaitan.events.raw.runtime", pub.subjects[0])
+	if pub.subjects[0] != subjects.RawRuntime {
+		t.Errorf("publish subject: got %q, want %q", pub.subjects[0], subjects.RawRuntime)
 	}
 	healthy, _ := a.Health().Status()
 	if !healthy {
@@ -312,7 +314,11 @@ func TestRun_DropsTranslateError_NoCrash(t *testing.T) {
 
 func TestRun_TerminalPublishErrorIsDropped(t *testing.T) {
 	pub := &stubPublisher{
-		publishErr:  fmt.Errorf("nats: maximum payload exceeded"),
+		// Wrap the typed error rather than crafting a substring-only
+		// message: post-P28 the adapter no longer matches publish
+		// errors via lowercased-substring fallback, so the test must
+		// exercise the typed-error path that survives.
+		publishErr:  fmt.Errorf("publish: %w", nats.ErrMaxPayload),
 		publishedCh: make(chan struct{}),
 	}
 	a, err := New(quickConfig(), pub, nil)
@@ -414,6 +420,13 @@ func TestRun_StalenessWatchdog_DisconnectedAndStale_FlipsUnhealthy(t *testing.T)
 	// returning an error; the outer connect-loop will retry. We use a
 	// dialFn that fails after the first successful open so the
 	// reconnection attempt produces the dial-failure path.
+	//
+	// Synthetic clock (P13): pre-P13 the test polled real time on a
+	// 100ms staleness against a 5..20ms retry loop with a 3s deadline,
+	// which made it flake-magnet on slow CI runners. The Adapter's
+	// nowFn seam is wired here so the watchdog's "delta > staleness"
+	// gate sees a controlled virtual now -- no wall-clock dependency
+	// in the assertion path.
 	cfg := quickConfig()
 	cfg.StalenessTimeout = 100 * time.Millisecond
 	pub := &stubPublisher{publishedCh: make(chan struct{})}
@@ -421,6 +434,12 @@ func TestRun_StalenessWatchdog_DisconnectedAndStale_FlipsUnhealthy(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	// Synthetic clock: a virtual "now" that the test advances by
+	// stepping the atomic baseline.
+	var virtualNanos atomic.Int64
+	virtualNanos.Store(time.Date(2026, 5, 8, 0, 0, 0, 0, time.UTC).UnixNano())
+	a.nowFn = func() time.Time { return time.Unix(0, virtualNanos.Load()).UTC() }
 
 	var dialCalls atomic.Int32
 	a.dialFn = func(_ context.Context, _ string) (*grpc.ClientConn, error) {
@@ -461,7 +480,14 @@ func TestRun_StalenessWatchdog_DisconnectedAndStale_FlipsUnhealthy(t *testing.T)
 	// Trigger disconnect; reconnects will fail via dialFn.
 	close(streamErr)
 
-	// Wait for the watchdog to flip unhealthy after disconnect+stale.
+	// Advance the synthetic clock past StalenessTimeout. The
+	// watchdog's tick still fires on real time (period = 50ms), so
+	// after the next tick the watchdog will read the bumped nowFn and
+	// trip unhealthy.
+	virtualNanos.Add(int64(10 * cfg.StalenessTimeout))
+
+	// Wait for the watchdog to flip unhealthy. The watchdog tick is
+	// real-time (period = 50ms here); 3s is generous slack on slow CI.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		healthy, _ := a.Health().Status()
@@ -507,6 +533,190 @@ func (s *disconnectingStream) CloseSend() error             { return nil }
 func (s *disconnectingStream) Context() context.Context     { return s.ctx }
 func (s *disconnectingStream) SendMsg(_ any) error          { return nil }
 func (s *disconnectingStream) RecvMsg(_ any) error          { return nil }
+
+// TestRun_ReconnectsOnTransientStreamError exercises AC4 part (c):
+// when the stream returns codes.Unavailable mid-flight the adapter
+// must NOT propagate the error upward; the outer connect-loop must
+// reconnect, the stub's second openFn invocation must see live ctx,
+// and a subsequent event must publish through. Spec-required test
+// listed in Story 1.8 Task 7.3 (story line 259).
+func TestRun_ReconnectsOnTransientStreamError(t *testing.T) {
+	pub := &stubPublisher{publishedCh: make(chan struct{})}
+	a, err := New(quickConfig(), pub, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.dialFn = fakeDial(t)
+
+	// Two channels: first stream emits one event then errs Unavailable;
+	// second stream emits another event after reconnect.
+	first := make(chan stubEvent, 2)
+	second := make(chan stubEvent, 1)
+	var openCount atomic.Int32
+	a.newClientFn = func(_ *grpc.ClientConn) runtimeClient {
+		return &stubRuntimeClient{
+			openFn: func(ctx context.Context) (runtimeapi.RuntimeService_GetContainerEventsClient, error) {
+				n := openCount.Add(1)
+				if n == 1 {
+					return &stubStream{ctx: ctx, events: first}, nil
+				}
+				return &stubStream{ctx: ctx, events: second}, nil
+			},
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- a.Run(ctx) }()
+
+	// Stream 1: one good event, then an Unavailable error to tear it
+	// down. errors.New is fine: isTerminalConnectError requires a
+	// typed code, not a substring.
+	first <- stubEvent{ev: makeEvent(nil)}
+	first <- stubEvent{err: errors.New("rpc error: code = Unavailable desc = transient containerd outage")}
+
+	select {
+	case <-pub.publishedCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first event was not published before the simulated stream error")
+	}
+
+	// Stream 2: open again and emit the post-reconnect event.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if openCount.Load() >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if openCount.Load() < 2 {
+		t.Fatal("adapter did not reconnect after transient stream error")
+	}
+	second <- stubEvent{ev: makeEvent(func(e *runtimeapi.ContainerEventResponse) {
+		// Distinct CreatedAt so stableEventID differs from event 1.
+		e.CreatedAt = e.CreatedAt + 1
+	})}
+
+	// Wait for the second event to land in the publisher.
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if pub.count() >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if pub.count() < 2 {
+		t.Fatalf("post-reconnect publish count: got %d, want >= 2", pub.count())
+	}
+
+	cancel()
+	<-runDone
+}
+
+// TestRun_HealthRestoresOnReconnect exercises AC4's health-restoration
+// promise: after a transient connection failure that flips the source
+// unhealthy, a successful reconnect-and-publish must flip it back to
+// healthy. Spec-required test listed in Story 1.8 Task 7.3 (story
+// line 262).
+func TestRun_HealthRestoresOnReconnect(t *testing.T) {
+	pub := &stubPublisher{}
+	a, err := New(quickConfig(), pub, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// First dial succeeds, second fails (forces health unhealthy
+	// during the reconnect attempt), third succeeds again.
+	var dialCalls atomic.Int32
+	a.dialFn = func(_ context.Context, _ string) (*grpc.ClientConn, error) {
+		n := dialCalls.Add(1)
+		if n == 2 {
+			return nil, errSyntheticDial
+		}
+		return grpc.NewClient("passthrough:///stub", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+
+	first := make(chan stubEvent, 2)
+	second := make(chan stubEvent, 1)
+	var openCount atomic.Int32
+	a.newClientFn = func(_ *grpc.ClientConn) runtimeClient {
+		return &stubRuntimeClient{
+			openFn: func(ctx context.Context) (runtimeapi.RuntimeService_GetContainerEventsClient, error) {
+				n := openCount.Add(1)
+				if n == 1 {
+					return &stubStream{ctx: ctx, events: first}, nil
+				}
+				return &stubStream{ctx: ctx, events: second}, nil
+			},
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- a.Run(ctx) }()
+
+	first <- stubEvent{ev: makeEvent(nil)}
+	first <- stubEvent{err: errors.New("rpc error: code = Unavailable")}
+
+	// Wait for the unhealthy state during reconnect attempts.
+	deadline := time.Now().Add(3 * time.Second)
+	sawUnhealthy := false
+	for time.Now().Before(deadline) {
+		healthy, _ := a.Health().Status()
+		if !healthy {
+			sawUnhealthy = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !sawUnhealthy {
+		t.Fatal("Health: expected unhealthy at some point during the reconnect window")
+	}
+
+	// Second event after the second reconnect must restore healthy.
+	second <- stubEvent{ev: makeEvent(func(e *runtimeapi.ContainerEventResponse) {
+		e.CreatedAt = e.CreatedAt + 1
+	})}
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		healthy, _ := a.Health().Status()
+		if healthy {
+			cancel()
+			<-runDone
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("Health did not flip back to healthy after reconnect-and-publish")
+}
+
+// TestIsPermanentPublishError_RejectsSubstringOnlyMatch is the
+// regression net for P28: pre-P28 the helper matched a lowercased-
+// substring error string ("nats: maximum payload exceeded") as
+// terminal even when the typed nats.ErrMaxPayload was nowhere in the
+// chain. Post-P28 only typed-error paths qualify; a substring-only
+// look-alike must NOT trip the permanent branch.
+func TestIsPermanentPublishError_RejectsSubstringOnlyMatch(t *testing.T) {
+	// Typed wrap: must be permanent.
+	wrapped := fmt.Errorf("publish: %w", nats.ErrMaxPayload)
+	if !isPermanentPublishError(wrapped) {
+		t.Errorf("isPermanentPublishError(wrapped ErrMaxPayload): got false, want true")
+	}
+	// Substring-only error: must NOT be permanent now.
+	stringy := errors.New("nats: maximum payload exceeded")
+	if isPermanentPublishError(stringy) {
+		t.Errorf("isPermanentPublishError(substring-only): got true, want false (P28 dropped substring fallback)")
+	}
+	// Other typed errors stay permanent.
+	if !isPermanentPublishError(fmt.Errorf("publish: %w", nats.ErrNoResponders)) {
+		t.Errorf("isPermanentPublishError(ErrNoResponders): got false, want true (P9 extension)")
+	}
+	if !isPermanentPublishError(fmt.Errorf("publish: %w", natsjs.ErrStreamNotFound)) {
+		t.Errorf("isPermanentPublishError(ErrStreamNotFound): got false, want true (P9 extension)")
+	}
+}
 
 // quickConfig returns a Config with tiny retry intervals so tests do
 // not spend seconds idling between attempts.
