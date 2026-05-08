@@ -1,0 +1,27 @@
+{{/*
+Service fronting the applog admission webhook Deployment. Story 1.9.
+The MutatingWebhookConfiguration's clientConfig.service field
+references this Service by name + namespace + path so the apiserver
+can route AdmissionReview POSTs to the webhook pods.
+*/}}
+{{- if .Values.applogSidecar.enabled -}}
+{{- $port := .Values.applogSidecar.webhook.port | default 8443 -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "olaitan.fullname" . }}-applog-webhook
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: applog-webhook
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "olaitan.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: applog-webhook
+  ports:
+    - name: tls
+      port: 443
+      targetPort: {{ $port }}
+      protocol: TCP
+{{- end }}

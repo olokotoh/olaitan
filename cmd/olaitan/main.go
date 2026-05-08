@@ -63,6 +63,14 @@ func run(args []string, stderr io.Writer) int {
 	switch args[0] {
 	case "collector", "aggregator":
 		return runRing(args[0], args[1:], stderr)
+	case "applog-sidecar":
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		return runApplogSidecar(ctx, args[1:], stderr)
+	case "applog-webhook":
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		return runApplogWebhook(ctx, args[1:], stderr)
 	case "version":
 		fmt.Printf("olaitan %s\n", version)
 		return 0
@@ -389,10 +397,12 @@ func printUsage(w io.Writer) {
 	_, _ = fmt.Fprintf(w, `Usage: olaitan <command> [flags]
 
 Commands:
-  collector    Run the signal collector (DaemonSet mode)
-  aggregator   Run the aggregator (correlator + decision + response)
-  version      Print version
-  help         Show this help
+  collector        Run the signal collector (DaemonSet mode)
+  aggregator       Run the aggregator (correlator + decision + response)
+  applog-sidecar   Run the application log sidecar (in-pod, opt-in)
+  applog-webhook   Run the application log MutatingAdmissionWebhook server
+  version          Print version
+  help             Show this help
 
 Flags (collector, aggregator):
   --config <path>   Path to olaitan.yaml (default: /etc/olaitan/olaitan.yaml)

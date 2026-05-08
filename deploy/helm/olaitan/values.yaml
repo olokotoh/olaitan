@@ -311,6 +311,105 @@ containerdSensor:
     jitter: 0.1
     maxAttempts: 3
 
+# --- application log sidecar (FR5) -----------------------------------
+# Story 1.9 -- fifth Ring 1 sensor source. The chart deploys a
+# MutatingAdmissionWebhook (separate Deployment from the agent
+# DaemonSet) that injects an Olaitan applog sidecar into pods bearing
+# the annotation `olaitan.io/log-sidecar: "enabled"`. The sidecar
+# tails the cooperating application's stdout/stderr from a shared
+# emptyDir log volume and publishes lines to subjects.RawAppLog.
+#
+# Default disabled until the operator confirms (a) the cooperation
+# cost (the application must arrange to write its stdout/stderr to
+# /var/log/app/stdout.log and /var/log/app/stderr.log) and (b) the
+# security review of the admission-webhook surface is complete (see
+# APPLOG.md for the threat model).
+applogSidecar:
+  enabled: false
+
+  # Use the K8s 1.28+ native sidecar pattern (initContainer with
+  # restartPolicy: Always per KEP-753). On older clusters where the
+  # SidecarContainers feature gate is disabled, set to false to
+  # inject as a regular container instead, with the documented
+  # trade-off that pod-termination semantics differ.
+  useNativeSidecar: true
+
+  # Namespace selector for the MutatingWebhookConfiguration.
+  # System namespaces (kube-system, kube-public) are excluded by
+  # default per the K8s admission-webhook good-practice guidance.
+  # Operators can further scope by editing the matchExpressions.
+  namespaceSelector:
+    matchExpressions:
+      - key: kubernetes.io/metadata.name
+        operator: NotIn
+        values:
+          - kube-system
+          - kube-public
+
+  # Sidecar container resource requests and limits. Operators with
+  # heterogeneous log volumes can override per-Pod via annotations
+  # (FUTURE; not implemented in Story 1.9).
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+  # Adapter knobs. Mirrored into the sidecar's downward-API env vars
+  # by the admission webhook at injection time.
+  stdoutPath: /var/log/app/stdout.log
+  stderrPath: /var/log/app/stderr.log
+  channelBuffer: 1024
+  maxLineBytes: 65536
+  publishStallTimeout: "5s"
+  stalenessTimeout: "30m"
+  publishRetry:
+    min: "100ms"
+    max: "1s"
+    multiplier: 2.0
+    jitter: 0.1
+    maxAttempts: 3
+
+  # Webhook server config.
+  webhook:
+    # HA replica count per the K8s admission-webhook good-practice
+    # guidance (a single-replica webhook is a SPOF on the apiserver
+    # path). Operators with a single-node cluster can drop to 1.
+    replicaCount: 2
+    # TLS listen port. Must be in [1024, 65535] (chart fail-fast).
+    port: 8443
+    # FailurePolicy: Ignore (non-critical mutation) versus Fail
+    # (critical). Olaitan applog injection is non-critical -- a pod
+    # missing the sidecar still functions, it just doesn't publish
+    # log events. The K8s good-practice guidance recommends Ignore
+    # for non-critical paths so a webhook outage does NOT block Pod
+    # admission cluster-wide.
+    failurePolicy: Ignore
+    # Apiserver-side timeout for the admission call. The webhook
+    # itself is in-memory pure; 5s is generous.
+    timeoutSeconds: 5
+
+  # TLS material. Path A: cert-manager Certificate (production).
+  # Path B: manual self-signed kubernetes.io/tls Secret (dev). The
+  # chart fails fast (Helm `{{ fail }}`) when neither is configured.
+  tls:
+    certManagerEnabled: false
+    issuerName: olaitan-ca
+    # When certManagerEnabled=false, the chart renders a Secret
+    # containing tls.crt and tls.key from these PEM-encoded values
+    # (base64-encoded by Helm at render time). Both required when
+    # certManagerEnabled=false.
+    servingCert: ""
+    servingKey: ""
+    # CA bundle distributed to the apiserver via the
+    # MutatingWebhookConfiguration.clientConfig.caBundle field.
+    # Required when certManagerEnabled=false; ignored when
+    # certManagerEnabled=true (cert-manager fills in the bundle from
+    # the Issuer).
+    caBundle: ""
+
 # --- Subchart overrides ------------------------------------------------
 # Only opinions we impose on the downstream charts live here -- upstream
 # defaults are otherwise preserved. To see every available knob, consult

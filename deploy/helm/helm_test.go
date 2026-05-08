@@ -1409,3 +1409,194 @@ func TestKubeconform(t *testing.T) {
 			err, stdout.String(), stderr.String())
 	}
 }
+
+// applogSidecarEnabledArgs returns the minimum --set list to enable
+// the applog admission webhook with manual self-signed TLS material.
+// Tests append further --set entries to override individual knobs.
+func applogSidecarEnabledArgs() []string {
+	return []string{
+		"applogSidecar.enabled=true",
+		"applogSidecar.tls.servingCert=ZmFrZS1jZXJ0",
+		"applogSidecar.tls.servingKey=ZmFrZS1rZXk=",
+		"applogSidecar.tls.caBundle=ZmFrZS1jYQ==",
+	}
+}
+
+// TestApplogSidecarRenders_WhenEnabled asserts the four chart resources
+// (Deployment, Service, MutatingWebhookConfiguration, TLS Secret) are
+// all present when applogSidecar.enabled=true.
+func TestApplogSidecarRenders_WhenEnabled(t *testing.T) {
+	args := append([]string{"falco.enabled=false", "nats.enabled=false", "redis.enabled=false"}, applogSidecarEnabledArgs()...)
+	rendered := helmTemplate(t, args)
+	for _, want := range []string{
+		"olaitan/templates/applog-webhook-deployment.yaml",
+		"olaitan/templates/applog-webhook-service.yaml",
+		"olaitan/templates/applog-webhook-mutatingconfiguration.yaml",
+		"olaitan/templates/applog-webhook-tls-secret.yaml",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("expected source comment %q in render", want)
+		}
+	}
+}
+
+// TestApplogSidecarAbsent_WhenDisabled asserts none of the four
+// resources render when the gate is off (the default).
+func TestApplogSidecarAbsent_WhenDisabled(t *testing.T) {
+	rendered := helmTemplate(t, []string{"falco.enabled=false", "nats.enabled=false", "redis.enabled=false"})
+	for _, off := range []string{
+		"olaitan/templates/applog-webhook-deployment.yaml",
+		"olaitan/templates/applog-webhook-service.yaml",
+		"olaitan/templates/applog-webhook-mutatingconfiguration.yaml",
+		"olaitan/templates/applog-webhook-tls-secret.yaml",
+	} {
+		if strings.Contains(rendered, off) {
+			t.Errorf("template %q rendered when applogSidecar.enabled=false", off)
+		}
+	}
+}
+
+// TestApplogWebhookFailurePolicyDefaultIgnore asserts the rendered
+// MutatingWebhookConfiguration carries failurePolicy: Ignore by default.
+func TestApplogWebhookFailurePolicyDefaultIgnore(t *testing.T) {
+	args := append([]string{"falco.enabled=false", "nats.enabled=false", "redis.enabled=false"}, applogSidecarEnabledArgs()...)
+	rendered := helmTemplate(t, args)
+	if !strings.Contains(rendered, "failurePolicy: Ignore") {
+		t.Errorf("expected failurePolicy: Ignore in render\n%s", snippet(rendered, "failurePolicy"))
+	}
+}
+
+// TestApplogWebhookNamespaceSelectorExcludesKubeSystem asserts the
+// default namespaceSelector lists kube-system / kube-public exclusions.
+func TestApplogWebhookNamespaceSelectorExcludesKubeSystem(t *testing.T) {
+	args := append([]string{"falco.enabled=false", "nats.enabled=false", "redis.enabled=false"}, applogSidecarEnabledArgs()...)
+	rendered := helmTemplate(t, args)
+	if !strings.Contains(rendered, "kube-system") {
+		t.Errorf("expected kube-system in namespaceSelector exclusion list")
+	}
+	if !strings.Contains(rendered, "kube-public") {
+		t.Errorf("expected kube-public in namespaceSelector exclusion list")
+	}
+}
+
+// TestApplogWebhookFailFast_OnEmptyCABundle asserts the chart rejects
+// configurations missing the apiserver-side caBundle when manual TLS is
+// in use.
+func TestApplogWebhookFailFast_OnEmptyCABundle(t *testing.T) {
+	args := []string{"template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+		"--set", "applogSidecar.enabled=true",
+		"--set", "applogSidecar.tls.servingCert=ZmFrZQ==",
+		"--set", "applogSidecar.tls.servingKey=ZmFrZQ==",
+		// caBundle deliberately absent
+	}
+	cmd := exec.Command("helm", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("helm template with empty caBundle succeeded; expected guard to fire")
+	}
+	if !strings.Contains(stderr.String(), "applogSidecar.tls.caBundle") {
+		t.Errorf("expected caBundle guard, got:\n%s", stderr.String())
+	}
+}
+
+// TestApplogWebhookFailFast_OnRelativeStdoutPath asserts the chart
+// rejects relative stdout paths.
+func TestApplogWebhookFailFast_OnRelativeStdoutPath(t *testing.T) {
+	args := append([]string{"template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+	}, "--set", "applogSidecar.enabled=true",
+		"--set", "applogSidecar.tls.servingCert=ZmFrZQ==",
+		"--set", "applogSidecar.tls.servingKey=ZmFrZQ==",
+		"--set", "applogSidecar.tls.caBundle=ZmFrZQ==",
+		"--set", "applogSidecar.stdoutPath=relative/path.log")
+	cmd := exec.Command("helm", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("helm template with relative stdoutPath succeeded; expected guard to fire")
+	}
+	if !strings.Contains(stderr.String(), "stdoutPath must be absolute") {
+		t.Errorf("expected stdoutPath guard, got:\n%s", stderr.String())
+	}
+}
+
+// TestApplogWebhookFailFast_OnIdenticalPaths asserts the chart rejects
+// stdout==stderr (would conflate two streams into one file).
+func TestApplogWebhookFailFast_OnIdenticalPaths(t *testing.T) {
+	args := append([]string{"template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+	}, "--set", "applogSidecar.enabled=true",
+		"--set", "applogSidecar.tls.servingCert=ZmFrZQ==",
+		"--set", "applogSidecar.tls.servingKey=ZmFrZQ==",
+		"--set", "applogSidecar.tls.caBundle=ZmFrZQ==",
+		"--set", "applogSidecar.stdoutPath=/var/log/app/same.log",
+		"--set", "applogSidecar.stderrPath=/var/log/app/same.log")
+	cmd := exec.Command("helm", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("helm template with identical paths succeeded; expected guard to fire")
+	}
+	if !strings.Contains(stderr.String(), "stdoutPath and") && !strings.Contains(stderr.String(), "must differ") {
+		t.Errorf("expected identical-paths guard, got:\n%s", stderr.String())
+	}
+}
+
+// TestApplogWebhookFailFast_OnShellMetachars asserts the chart rejects
+// stdoutPath containing .. or ~ (path-traversal vector).
+func TestApplogWebhookFailFast_OnShellMetachars(t *testing.T) {
+	args := append([]string{"template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+	}, "--set", "applogSidecar.enabled=true",
+		"--set", "applogSidecar.tls.servingCert=ZmFrZQ==",
+		"--set", "applogSidecar.tls.servingKey=ZmFrZQ==",
+		"--set", "applogSidecar.tls.caBundle=ZmFrZQ==",
+		"--set", "applogSidecar.stdoutPath=/var/log/app/../escape.log")
+	cmd := exec.Command("helm", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("helm template with .. in path succeeded; expected guard to fire")
+	}
+	if !strings.Contains(stderr.String(), "forbidden characters") {
+		t.Errorf("expected forbidden-characters guard, got:\n%s", stderr.String())
+	}
+}
+
+// TestApplogSidecarTLSCertManagerCertificateRendered asserts that
+// when certManagerEnabled=true the chart renders a cert-manager
+// Certificate resource (not a kubernetes.io/tls Secret).
+func TestApplogSidecarTLSCertManagerCertificateRendered(t *testing.T) {
+	args := []string{"falco.enabled=false", "nats.enabled=false", "redis.enabled=false",
+		"applogSidecar.enabled=true",
+		"applogSidecar.tls.certManagerEnabled=true",
+		"applogSidecar.tls.issuerName=olaitan-ca",
+	}
+	rendered := helmTemplate(t, args)
+	if !strings.Contains(rendered, "kind: Certificate") {
+		t.Errorf("expected cert-manager Certificate kind in render\n%s", snippet(rendered, "applog-webhook-tls"))
+	}
+	if !strings.Contains(rendered, "cert-manager.io/v1") {
+		t.Errorf("expected cert-manager.io/v1 apiVersion in render")
+	}
+	if !strings.Contains(rendered, "cert-manager.io/inject-ca-from") {
+		t.Errorf("expected cainjector annotation on MutatingWebhookConfiguration")
+	}
+}
+
+// TestApplogSidecarHAReplicaCountDefault asserts the webhook
+// Deployment defaults to replicas: 2 (HA per the K8s good-practice
+// guidance).
+func TestApplogSidecarHAReplicaCountDefault(t *testing.T) {
+	args := append([]string{"falco.enabled=false", "nats.enabled=false", "redis.enabled=false"}, applogSidecarEnabledArgs()...)
+	rendered := helmTemplate(t, args)
+	if !strings.Contains(rendered, "replicas: 2") {
+		t.Errorf("expected replicas: 2 default for HA, got\n%s", snippet(rendered, "applog-webhook"))
+	}
+}

@@ -1,0 +1,123 @@
+{{/*
+Applog MutatingAdmissionWebhook server Deployment. Story 1.9.
+
+Topology: a separate Deployment from the agent DaemonSet. Replica
+count default 2 for HA per the K8s admission-webhook good-practice
+guidance (a single-replica webhook is a SPOF on the apiserver path).
+The webhook Pod runs the same `olaitan-agent` image as the DaemonSet
+and dispatches via the multi-call subcommand `olaitan applog-webhook`.
+
+Renders only when applogSidecar.enabled=true.
+
+Pod-level security posture: nonroot, read-only root FS, all
+capabilities dropped, no privilege escalation. The webhook performs
+no host-level operations.
+*/}}
+{{- if .Values.applogSidecar.enabled -}}
+{{- $port := .Values.applogSidecar.webhook.port | default 8443 -}}
+{{- if or (lt (int $port) 1024) (gt (int $port) 65535) -}}
+{{- fail (printf "applogSidecar.webhook.port must be in [1024, 65535] (got %d)" (int $port)) -}}
+{{- end -}}
+{{- if eq .Values.applogSidecar.stdoutPath .Values.applogSidecar.stderrPath -}}
+{{- fail "applogSidecar.stdoutPath and applogSidecar.stderrPath must differ" -}}
+{{- end -}}
+{{- if not (hasPrefix "/" .Values.applogSidecar.stdoutPath) -}}
+{{- fail (printf "applogSidecar.stdoutPath must be absolute (got %q)" .Values.applogSidecar.stdoutPath) -}}
+{{- end -}}
+{{- if not (hasPrefix "/" .Values.applogSidecar.stderrPath) -}}
+{{- fail (printf "applogSidecar.stderrPath must be absolute (got %q)" .Values.applogSidecar.stderrPath) -}}
+{{- end -}}
+{{- if or (contains ".." .Values.applogSidecar.stdoutPath) (contains "~" .Values.applogSidecar.stdoutPath) -}}
+{{- fail (printf "applogSidecar.stdoutPath contains forbidden characters (..,~) (got %q)" .Values.applogSidecar.stdoutPath) -}}
+{{- end -}}
+{{- if or (contains ".." .Values.applogSidecar.stderrPath) (contains "~" .Values.applogSidecar.stderrPath) -}}
+{{- fail (printf "applogSidecar.stderrPath contains forbidden characters (..,~) (got %q)" .Values.applogSidecar.stderrPath) -}}
+{{- end -}}
+{{- if lt (int .Values.applogSidecar.channelBuffer) 1 -}}
+{{- fail (printf "applogSidecar.channelBuffer must be >= 1 (got %d)" (int .Values.applogSidecar.channelBuffer)) -}}
+{{- end -}}
+{{- if lt (int .Values.applogSidecar.maxLineBytes) 1024 -}}
+{{- fail (printf "applogSidecar.maxLineBytes must be >= 1024 (got %d)" (int .Values.applogSidecar.maxLineBytes)) -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "olaitan.fullname" . }}-applog-webhook
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: applog-webhook
+spec:
+  replicas: {{ .Values.applogSidecar.webhook.replicaCount | default 2 }}
+  selector:
+    matchLabels:
+      {{- include "olaitan.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: applog-webhook
+  template:
+    metadata:
+      labels:
+        {{- include "olaitan.labels" . | nindent 8 }}
+        app.kubernetes.io/component: applog-webhook
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: applog-webhook
+          image: {{ include "olaitan.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
+          args:
+            - applog-webhook
+          ports:
+            - name: tls
+              containerPort: {{ $port }}
+              protocol: TCP
+          env:
+            - name: OLAITAN_WEBHOOK_LISTEN_ADDR
+              value: ":{{ $port }}"
+            - name: OLAITAN_WEBHOOK_TLS_CERT
+              value: /etc/olaitan/tls/tls.crt
+            - name: OLAITAN_WEBHOOK_TLS_KEY
+              value: /etc/olaitan/tls/tls.key
+            - name: OLAITAN_WEBHOOK_USE_NATIVE_SIDECAR
+              value: {{ .Values.applogSidecar.useNativeSidecar | default true | quote }}
+            - name: OLAITAN_WEBHOOK_SIDECAR_IMAGE
+              value: {{ include "olaitan.image" . | quote }}
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/olaitan/tls
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: tls
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: tls
+              scheme: HTTPS
+            initialDelaySeconds: 1
+            periodSeconds: 5
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ include "olaitan.fullname" . }}-applog-webhook-tls
+{{- end }}
