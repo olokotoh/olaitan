@@ -60,7 +60,8 @@ type DetectionConfig struct {
 // SourcesConfig groups per-source adapter configuration. Each entry is
 // optional; omission leaves the source's adapter disabled.
 type SourcesConfig struct {
-	Audit AuditSourceConfig `yaml:"audit,omitempty"`
+	Audit      AuditSourceConfig      `yaml:"audit,omitempty"`
+	Containerd ContainerdSourceConfig `yaml:"containerd,omitempty"`
 }
 
 // AuditSourceConfig configures the Story 1.7 Kubernetes audit-webhook
@@ -77,6 +78,46 @@ type AuditSourceConfig struct {
 	MaxPayloadBytes  int64               `yaml:"max_payload_bytes,omitempty"`
 	StalenessTimeout DurationYAML        `yaml:"staleness_timeout,omitempty"`
 	PublishRetry     RetryStrategyConfig `yaml:"publish_retry,omitempty"`
+}
+
+// ContainerdSourceConfig configures the Story 1.8 containerd CRI
+// lifecycle adapter. When Enabled is true the collector subcommand
+// spawns the adapter goroutine and the config validator enforces a
+// non-empty SocketPath. When Enabled is false the block may stay
+// zero-valued; the adapter is not constructed.
+type ContainerdSourceConfig struct {
+	Enabled          bool                `yaml:"enabled"`
+	SocketPath       string              `yaml:"socket_path,omitempty"`
+	DialTimeout      DurationYAML        `yaml:"dial_timeout,omitempty"`
+	StalenessTimeout DurationYAML        `yaml:"staleness_timeout,omitempty"`
+	ConnectRetry     RetryStrategyConfig `yaml:"connect_retry,omitempty"`
+	PublishRetry     RetryStrategyConfig `yaml:"publish_retry,omitempty"`
+}
+
+// validate enforces ContainerdSourceConfig invariants. Mirrors the
+// AuditSourceConfig pattern: zero block is allowed when Enabled is
+// false; partial retry blocks are rejected here rather than left to
+// crashloop the adapter at runtime.
+func (c ContainerdSourceConfig) validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if c.SocketPath == "" {
+		return errors.New("detection.sources.containerd.socket_path: required when enabled=true")
+	}
+	if c.DialTimeout.Duration() < 0 {
+		return fmt.Errorf("detection.sources.containerd.dial_timeout: must be >= 0 (0 means default; got %s)", c.DialTimeout.Duration())
+	}
+	if c.StalenessTimeout.Duration() < 0 {
+		return fmt.Errorf("detection.sources.containerd.staleness_timeout: must be >= 0 (0 means default; got %s)", c.StalenessTimeout.Duration())
+	}
+	if err := c.ConnectRetry.validatePartial("detection.sources.containerd.connect_retry"); err != nil {
+		return err
+	}
+	if err := c.PublishRetry.validatePartial("detection.sources.containerd.publish_retry"); err != nil {
+		return err
+	}
+	return nil
 }
 
 // RetryStrategyConfig is the YAML mirror of internal/retry.Strategy.
@@ -285,6 +326,9 @@ func (d DetectionConfig) validate() error {
 		return fmt.Errorf("detection.confidence_bands: alert(%d) must be < act(%d)", b.Alert, b.Act)
 	}
 	if err := d.Sources.Audit.validate(); err != nil {
+		return err
+	}
+	if err := d.Sources.Containerd.validate(); err != nil {
 		return err
 	}
 	return nil

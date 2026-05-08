@@ -243,6 +243,34 @@ auditWebhook:
   # message if the flags disagree (see templates/audit-policy-
   # configmap.yaml). See AUDIT.md for the full operator workflow.
 
+# --- containerd CRI lifecycle sensor ---------------------------------
+# Story 1.8 -- third Ring 1 sensor source (FR3). Subscribes to the
+# containerd CRI runtime via RuntimeService.GetContainerEvents over a
+# Unix domain socket bind-mounted from the host. Default-off until the
+# operator confirms the socket path is correct on their cluster's
+# nodes and the security boundary documented in CRI.md is acceptable.
+#
+# The chart renders the per-node hostPath volume + volumeMount only
+# when containerdSensor.enabled=true; the runtime adapter knobs
+# (socket_path, dial_timeout, staleness_timeout, retry strategies)
+# live in config/olaitan.yaml under detection.sources.containerd. The
+# dual-flag relationship requires both blocks set to enabled=true for
+# the adapter to actually run.
+#
+# Security boundary: mounting the containerd CRI socket grants the
+# agent the full CRI surface on the node (list+exec+image-pull); see
+# CRI.md for the threat model. Privilege equivalent to the existing
+# Falco socket mount; threat model unchanged from the post-Story-1.6
+# baseline.
+containerdSensor:
+  enabled: false
+
+  # Path on the host node to the containerd CRI socket. Default for
+  # containerd 1.7 on a stock kubeadm 1.29 cluster. Operators using a
+  # non-standard install layout (k3s, microk8s, custom containerd
+  # build) override here AND in config/olaitan.yaml.
+  socketPath: /run/containerd/containerd.sock
+
 # --- Subchart overrides ------------------------------------------------
 # Only opinions we impose on the downstream charts live here -- upstream
 # defaults are otherwise preserved. To see every available knob, consult

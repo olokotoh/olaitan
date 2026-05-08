@@ -31,6 +31,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/olokotoh/olaitan/internal/collector/audit"
+	"github.com/olokotoh/olaitan/internal/collector/cri"
 	"github.com/olokotoh/olaitan/internal/collector/falco"
 	"github.com/olokotoh/olaitan/internal/config"
 	"github.com/olokotoh/olaitan/internal/health"
@@ -328,6 +329,35 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 		log.Info("collector: ring 1 wired (audit)",
 			"listen_addr", auditCfg.ListenAddr,
 			"max_payload_bytes", auditCfg.MaxPayloadBytes)
+	}
+
+	// Story 1.8: containerd CRI lifecycle adapter. Gated on the
+	// config block so a chart deploy with containerdSensor.enabled=false
+	// (default) leaves the adapter dormant. The adapter mounts the
+	// host's CRI socket directory via a Helm hostPath volume; the
+	// security boundary is documented in deploy/helm/olaitan/CRI.md.
+	if cfg != nil && cfg.Detection.Sources.Containerd.Enabled {
+		criCfg := cri.Config{
+			SocketPath:       cfg.Detection.Sources.Containerd.SocketPath,
+			Hostname:         nodeName,
+			DialTimeout:      cfg.Detection.Sources.Containerd.DialTimeout.Duration(),
+			StalenessTimeout: cfg.Detection.Sources.Containerd.StalenessTimeout.Duration(),
+			ConnectRetry:     toRetryStrategy(cfg.Detection.Sources.Containerd.ConnectRetry),
+			PublishRetry:     toRetryStrategy(cfg.Detection.Sources.Containerd.PublishRetry),
+		}
+		criAdapter, cerr := cri.New(criCfg, nc, log)
+		if cerr != nil {
+			closeNATS()
+			return fmt.Errorf("collector: cri adapter: %w", cerr)
+		}
+		g.Go(func() error {
+			if err := criAdapter.Run(ctx); err != nil {
+				return fmt.Errorf("collector: cri run: %w", err)
+			}
+			return nil
+		})
+		log.Info("collector: ring 1 wired (containerd cri)",
+			"socket_path", criCfg.SocketPath)
 	}
 
 	log.Info("collector: ring 1 wired", "falco_socket", falcoSocket, "node", nodeName)

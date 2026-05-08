@@ -9,6 +9,9 @@ the pod network namespace. This keeps the collector's blast radius
 small -- an auditor reviewing the pod spec sees no host-level escape
 surface.
 */}}
+{{- if and .Values.containerdSensor.enabled (eq (default "" .Values.containerdSensor.socketPath) "") }}
+{{- fail "containerdSensor.socketPath is required when containerdSensor.enabled=true. Default is /run/containerd/containerd.sock for stock containerd 1.7 on kubeadm; override only if your cluster uses a non-standard install layout. See deploy/helm/olaitan/CRI.md for guidance." }}
+{{- end }}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -155,6 +158,19 @@ spec:
               mountPath: /etc/olaitan/audit-tls
               readOnly: true
             {{- end }}
+            {{- if .Values.containerdSensor.enabled }}
+            # Story 1.8: containerd CRI socket bind-mounted from the
+            # host. We mount the parent directory rather than the
+            # socket file directly so a containerd restart that
+            # removes-and-recreates the socket inode is observed by
+            # the agent without a remount. Same pattern as the Falco
+            # /run/falco socket mount above. Security boundary:
+            # privilege equivalent to the Falco mount; see
+            # deploy/helm/olaitan/CRI.md for the threat model.
+            - name: containerd-socket
+              mountPath: {{ dir .Values.containerdSensor.socketPath | quote }}
+              readOnly: false
+            {{- end }}
       volumes:
         - name: config
           configMap:
@@ -181,4 +197,10 @@ spec:
           secret:
             secretName: {{ include "olaitan.fullname" . }}-audit-tls
             defaultMode: 0400
+        {{- end }}
+        {{- if .Values.containerdSensor.enabled }}
+        - name: containerd-socket
+          hostPath:
+            path: {{ dir .Values.containerdSensor.socketPath | quote }}
+            type: DirectoryOrCreate
         {{- end }}

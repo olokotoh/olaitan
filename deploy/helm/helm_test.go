@@ -1032,6 +1032,171 @@ func TestValidatingWebhookConfigurationUntouched(t *testing.T) {
 	}
 }
 
+// TestContainerdSensorAbsent_WhenDisabled is the negative-default
+// regression test for Story 1.8: with containerdSensor.enabled=false
+// (the chart default) the rendered DaemonSet must NOT carry the
+// containerd-socket volume or volumeMount. A regression that always
+// renders the host-path mount would expand the agent's privilege
+// surface on every existing install -- catching it here keeps the
+// default-off promise honest.
+func TestContainerdSensorAbsent_WhenDisabled(t *testing.T) {
+	rendered := helmTemplate(t, nil)
+	if strings.Contains(rendered, "containerd-socket") {
+		t.Errorf("containerd-socket volume/mount rendered with containerdSensor disabled by default; rendered sample:\n%s",
+			snippet(rendered, "containerd-socket"))
+	}
+}
+
+// TestContainerdSensorRenders_WhenEnabled asserts the DaemonSet
+// gains the host-path volume + read-write volumeMount when the
+// chart value is flipped to enabled. The host-side path mounts the
+// PARENT directory of the socket file, mirroring the Falco socket
+// mount: a containerd restart that removes-and-recreates the socket
+// inode is observed without remount.
+func TestContainerdSensorRenders_WhenEnabled(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"containerdSensor.enabled=true",
+	})
+	wantMount := `- name: containerd-socket
+              mountPath: "/run/containerd"
+              readOnly: false`
+	if !strings.Contains(rendered, wantMount) {
+		t.Errorf("containerd-socket volumeMount not rendered with containerdSensor.enabled=true; rendered sample:\n%s",
+			snippet(rendered, "containerd-socket"))
+	}
+	wantVolume := `- name: containerd-socket
+          hostPath:
+            path: "/run/containerd"
+            type: DirectoryOrCreate`
+	if !strings.Contains(rendered, wantVolume) {
+		t.Errorf("containerd-socket hostPath volume not rendered with containerdSensor.enabled=true; rendered sample:\n%s",
+			snippet(rendered, "hostPath"))
+	}
+}
+
+// TestContainerdSocketPathConfigurable verifies that overriding
+// containerdSensor.socketPath flows through to both the volumeMount
+// and the hostPath. Operators with non-standard install layouts
+// (k3s under /run/k3s/containerd/...) need this knob; regression
+// here would silently mount the wrong directory.
+func TestContainerdSocketPathConfigurable(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"containerdSensor.enabled=true",
+		"containerdSensor.socketPath=/run/k3s/containerd/containerd.sock",
+	})
+	if !strings.Contains(rendered, `mountPath: "/run/k3s/containerd"`) {
+		t.Errorf("custom socketPath did not propagate to mountPath; rendered sample:\n%s",
+			snippet(rendered, "containerd-socket"))
+	}
+	if !strings.Contains(rendered, `path: "/run/k3s/containerd"`) {
+		t.Errorf("custom socketPath did not propagate to hostPath path; rendered sample:\n%s",
+			snippet(rendered, "containerd-socket"))
+	}
+}
+
+// TestContainerdSensorMountsParentDirectoryNotFile guards against a
+// regression where the Olaitan collector's volume path would be the
+// socket file itself ("/run/containerd/containerd.sock") rather than
+// the parent directory. Mounting the file inode breaks across
+// containerd restarts that recreate the inode; the parent-directory
+// mount observes the new socket file without a pod restart.
+//
+// Scope: only the Olaitan-owned collector DaemonSet. The Falco
+// subchart's own DaemonSet renders host-side socket paths
+// (`/run/containerd/containerd.sock`, `/run/k3s/containerd/...`) for
+// its own runtime-discovery feature; those are NOT this story's
+// concern.
+func TestContainerdSensorMountsParentDirectoryNotFile(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"containerdSensor.enabled=true",
+	})
+	ms := parseManifests(t, rendered)
+	dss := findByKind(ms, "DaemonSet")
+	for _, ds := range dss {
+		// Scope to the Olaitan-owned collector DaemonSet; skip the
+		// Falco subchart's DaemonSet (which has its own runtime
+		// socket-discovery hostPath block).
+		if !strings.Contains(ds.Metadata.Name, "olaitan") || !strings.Contains(ds.Metadata.Name, "collector") {
+			continue
+		}
+		yamlBytes, _ := yaml.Marshal(&ds.Raw)
+		text := string(yamlBytes)
+		// Find the containerd-socket volume + mount entries inside
+		// the Olaitan DaemonSet only and assert each path:/mountPath
+		// inside that scope is the parent directory.
+		idx := strings.Index(text, "name: containerd-socket")
+		if idx == -1 {
+			t.Fatalf("Olaitan collector DaemonSet missing containerd-socket entry; rendered:\n%s",
+				snippet(text, "volumes"))
+		}
+		// Inspect the next 20 lines after each containerd-socket marker.
+		remaining := text
+		for {
+			pos := strings.Index(remaining, "name: containerd-socket")
+			if pos == -1 {
+				break
+			}
+			window := remaining[pos:]
+			if end := indexNthLine(window, 6); end > 0 {
+				window = window[:end]
+			}
+			for _, line := range strings.Split(window, "\n") {
+				stripped := strings.TrimSpace(line)
+				if !strings.HasPrefix(stripped, "path:") && !strings.HasPrefix(stripped, "mountPath:") {
+					continue
+				}
+				if strings.Contains(stripped, "/run/containerd/containerd.sock") {
+					t.Errorf("Olaitan containerd-socket entry references the socket file: %q (must be the parent directory)",
+						stripped)
+				}
+			}
+			remaining = remaining[pos+1:]
+		}
+	}
+}
+
+// indexNthLine returns the byte offset of the n-th \n in s, or -1 if
+// fewer newlines exist. Helper for slicing a fixed window of lines
+// after a needle.
+func indexNthLine(s string, n int) int {
+	count := 0
+	for i, r := range s {
+		if r != '\n' {
+			continue
+		}
+		count++
+		if count == n {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestContainerdSensorEmptySocketPathFails verifies the fail-fast
+// guard added to daemonset.yaml: enabling the sensor without a
+// socket path is a misconfiguration that must crashloop helm render
+// rather than render a broken DaemonSet that mounts an empty path
+// on every node.
+func TestContainerdSensorEmptySocketPathFails(t *testing.T) {
+	args := []string{
+		"template", "olaitan-test", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+		"--set", "containerdSensor.enabled=true",
+		"--set", "containerdSensor.socketPath=",
+	}
+	cmd := exec.Command("helm", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err == nil {
+		t.Fatal("helm template succeeded with containerdSensor.enabled=true and empty socketPath; expected fail-fast")
+	}
+	if !strings.Contains(stderr.String(), "containerdSensor.socketPath is required") {
+		t.Errorf("stderr did not mention the fail-fast guard; got:\n%s", stderr.String())
+	}
+}
+
 // TestKubeconform runs `kubeconform` against the rendered chart for
 // K8s 1.29. Skips when kubeconform is not on PATH (local dev case) —
 // CI installs it via `go install`.
