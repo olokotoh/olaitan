@@ -554,6 +554,27 @@ func TestStreamConfigsCoversRawSubjects(t *testing.T) {
 	}
 }
 
+// TestStreamConfigsCoversContainerdLifecycleSubject asserts that the
+// EVENTS_RAW stream coverage includes the per-source subject the
+// Story 1.8 containerd CRI lifecycle adapter publishes on. The
+// assertion is symbolic against subjects.RawRuntime (rather than the
+// literal string) so a future rename flowing through the constant
+// keeps the regression visible. The wildcard test above covers the
+// general case; this test names the binding so a reader looking for
+// "where does FR3 prove its raw-subject coverage?" finds it directly.
+func TestStreamConfigsCoversContainerdLifecycleSubject(t *testing.T) {
+	configs := natsclient.StreamConfigs()
+	for _, cfg := range configs {
+		for _, subj := range cfg.Subjects {
+			if subj == subjects.RawRuntime || subj == subjects.RawPrefix+">" {
+				return
+			}
+		}
+	}
+	t.Fatalf("StreamConfigs: no stream covers subjects.RawRuntime (%q) or its wildcard parent",
+		subjects.RawRuntime)
+}
+
 func TestStreamConfigsDeepCopy(t *testing.T) {
 	a := natsclient.StreamConfigs()
 	b := natsclient.StreamConfigs()

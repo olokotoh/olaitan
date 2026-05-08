@@ -38,6 +38,65 @@ data:
     {{- if .Values.auditWebhook.enabled }}
     {{- $cfg = regexReplaceAll "(audit:[[:space:]]*\\n[[:space:]]+)enabled:[[:space:]]+false" $cfg "${1}enabled: true" }}
     {{- end }}
+    {{- /*
+    Story 1.8 P27 (resolves D1): bridge the chart-side
+    containerdSensor knobs into the rendered detection.sources.
+    containerd block so a single `--set containerdSensor.foo=...` flips
+    both the host-path mount (gating) and the adapter's runtime
+    behaviour. Pre-P27 only `enabled` and `socketPath` were exposed by
+    the chart and the runtime knobs (dial_timeout, staleness_timeout,
+    connect_retry, publish_retry) had to be edited in
+    config/olaitan.yaml directly -- a silent operator trap.
+
+    The nested retry blocks share scalar field names (min/max/
+    multiplier/jitter/max_attempts) across connect_retry and
+    publish_retry; we anchor each per-field regex to the block header
+    via a 4-line lookahead window so the bridge is unambiguous. Sticking
+    to per-scalar regex (rather than a templated full block) keeps the
+    diff minimal and preserves the chart's single-source `.Files.Get`
+    contract: the rest of olaitan.yaml is rendered verbatim.
+    */ -}}
+    {{- if .Values.containerdSensor.enabled }}
+    {{- $cs := .Values.containerdSensor }}
+    {{- /* Top-level scalars under detection.sources.containerd. The
+           containerd block sits below detection.sources.audit so each
+           top-level scalar field name is unique to the containerd
+           block when matched alongside the literal `containerd:`
+           prefix; we use a non-greedy lookahead window to anchor. */}}
+    {{- $cfg = regexReplaceAll "(containerd:[[:space:]]*\\n[[:space:]]+)enabled:[[:space:]]+false" $cfg "${1}enabled: true" }}
+    {{- $cfg = regexReplaceAll "(?s)(containerd:.{0,256}?\\n[[:space:]]+)socket_path:[[:space:]]+\"[^\"]*\"" $cfg (printf "${1}socket_path: %q" $cs.socketPath) }}
+    {{- if $cs.dialTimeout }}
+    {{- $cfg = regexReplaceAll "(?s)(containerd:.{0,512}?\\n[[:space:]]+)dial_timeout:[[:space:]]+\"[^\"]*\"" $cfg (printf "${1}dial_timeout: %q" $cs.dialTimeout) }}
+    {{- end }}
+    {{- if $cs.stalenessTimeout }}
+    {{- $cfg = regexReplaceAll "(?s)(containerd:.{0,512}?\\n[[:space:]]+)staleness_timeout:[[:space:]]+\"[^\"]*\"" $cfg (printf "${1}staleness_timeout: %q" $cs.stalenessTimeout) }}
+    {{- end }}
+    {{- /* Nested retry blocks: connect_retry: appears under
+           audit (no) and containerd (yes). To unambiguously target
+           the containerd block, anchor each per-field regex on
+           `connect_retry:` / `publish_retry:` directly; both keys
+           appear once each in the containerd block and not at all in
+           the audit block. */}}
+    {{- if $cs.connectRetry }}
+    {{- $cr := $cs.connectRetry }}
+    {{- if $cr.min }}{{- $cfg = regexReplaceAll "(?s)(connect_retry:.{0,256}?\\n[[:space:]]+)min:[[:space:]]+\"[^\"]*\"" $cfg (printf "${1}min: %q" $cr.min) }}{{- end }}
+    {{- if $cr.max }}{{- $cfg = regexReplaceAll "(?s)(connect_retry:.{0,256}?\\n[[:space:]]+)max:[[:space:]]+\"[^\"]*\"" $cfg (printf "${1}max: %q" $cr.max) }}{{- end }}
+    {{- if $cr.multiplier }}{{- $cfg = regexReplaceAll "(?s)(connect_retry:.{0,256}?\\n[[:space:]]+)multiplier:[[:space:]]+[0-9.]+" $cfg (printf "${1}multiplier: %v" $cr.multiplier) }}{{- end }}
+    {{- if hasKey $cr "jitter" }}{{- $cfg = regexReplaceAll "(?s)(connect_retry:.{0,256}?\\n[[:space:]]+)jitter:[[:space:]]+[0-9.]+" $cfg (printf "${1}jitter: %v" $cr.jitter) }}{{- end }}
+    {{- if hasKey $cr "maxAttempts" }}{{- $cfg = regexReplaceAll "(?s)(connect_retry:.{0,256}?\\n[[:space:]]+)max_attempts:[[:space:]]+[0-9]+" $cfg (printf "${1}max_attempts: %v" $cr.maxAttempts) }}{{- end }}
+    {{- end }}
+    {{- if $cs.publishRetry }}
+    {{- $pr := $cs.publishRetry }}
+    {{- /* publish_retry: appears under both audit and containerd
+           blocks. Anchor on `containerd:` plus the publish_retry header
+           so the audit publish_retry stays untouched. */}}
+    {{- if $pr.min }}{{- $cfg = regexReplaceAll "(?s)(containerd:.{0,999}?publish_retry:.{0,256}?\\n[[:space:]]+)min:[[:space:]]+\"[^\"]*\"" $cfg (printf "${1}min: %q" $pr.min) }}{{- end }}
+    {{- if $pr.max }}{{- $cfg = regexReplaceAll "(?s)(containerd:.{0,999}?publish_retry:.{0,256}?\\n[[:space:]]+)max:[[:space:]]+\"[^\"]*\"" $cfg (printf "${1}max: %q" $pr.max) }}{{- end }}
+    {{- if $pr.multiplier }}{{- $cfg = regexReplaceAll "(?s)(containerd:.{0,999}?publish_retry:.{0,256}?\\n[[:space:]]+)multiplier:[[:space:]]+[0-9.]+" $cfg (printf "${1}multiplier: %v" $pr.multiplier) }}{{- end }}
+    {{- if hasKey $pr "jitter" }}{{- $cfg = regexReplaceAll "(?s)(containerd:.{0,999}?publish_retry:.{0,256}?\\n[[:space:]]+)jitter:[[:space:]]+[0-9.]+" $cfg (printf "${1}jitter: %v" $pr.jitter) }}{{- end }}
+    {{- if hasKey $pr "maxAttempts" }}{{- $cfg = regexReplaceAll "(?s)(containerd:.{0,999}?publish_retry:.{0,256}?\\n[[:space:]]+)max_attempts:[[:space:]]+[0-9]+" $cfg (printf "${1}max_attempts: %v" $pr.maxAttempts) }}{{- end }}
+    {{- end }}
+    {{- end }}
     {{- $cfg | nindent 4 }}
 ---
 apiVersion: v1
