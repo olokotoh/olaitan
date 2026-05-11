@@ -13,30 +13,48 @@ paths and are baked in here:
   - reinvocationPolicy: Never (the webhook is idempotent; no need to
     re-fire when another mutating webhook rewrites the spec).
   - namespaceSelector: excludes kube-system / kube-public by default
-    (operators can scope further).
+    (operators can scope further). When the operator passes a null
+    or unset namespaceSelector through chart values, the chart
+    substitutes the safe default rather than rendering an empty
+    selector (the empty selector matches all namespaces including
+    kube-system, defeating the chart layer's defence in depth).
   - admissionReviewVersions: v1 only (the K8s 1.29 minimum).
 
 When applogSidecar.tls.certManagerEnabled=true, the cainjector
 annotation lets cert-manager populate clientConfig.caBundle from the
 referenced Issuer's CA. Otherwise the chart-supplied caBundle from
-applogSidecar.tls.caBundle is used directly.
+applogSidecar.tls.caBundle is used directly (raw base64, NOT
+double-quoted: the apiserver expects a plain base64 string).
 */}}
 {{- if .Values.applogSidecar.enabled -}}
-{{- $svcName := printf "%s-applog-webhook" (include "olaitan.fullname" .) -}}
+{{- $svcName := printf "%s-applog-injector" (include "olaitan.fullname" .) -}}
 {{- $failurePolicy := .Values.applogSidecar.webhook.failurePolicy | default "Ignore" -}}
 {{- if and (ne $failurePolicy "Ignore") (ne $failurePolicy "Fail") -}}
 {{- fail (printf "applogSidecar.webhook.failurePolicy must be Ignore or Fail (got %q)" $failurePolicy) -}}
 {{- end -}}
+{{/*
+  namespaceSelector safe-default. When the operator passes nil or an
+  empty selector, render the kube-system / kube-public exclusion as
+  the baked-in baseline rather than rendering `null`, which the
+  apiserver interprets as match-all.
+*/}}
+{{- $ns := .Values.applogSidecar.namespaceSelector -}}
+{{- $hasSelector := false -}}
+{{- if $ns -}}
+{{- if or $ns.matchExpressions $ns.matchLabels -}}
+{{- $hasSelector = true -}}
+{{- end -}}
+{{- end -}}
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:
-  name: {{ include "olaitan.fullname" . }}-applog-webhook
+  name: {{ include "olaitan.fullname" . }}-applog-injector
   labels:
     {{- include "olaitan.labels" . | nindent 4 }}
-    app.kubernetes.io/component: applog-webhook
+    app.kubernetes.io/component: applog-injector
   {{- if .Values.applogSidecar.tls.certManagerEnabled }}
   annotations:
-    cert-manager.io/inject-ca-from: {{ printf "%s/%s-applog-webhook-tls" .Release.Namespace (include "olaitan.fullname" .) | quote }}
+    cert-manager.io/inject-ca-from: {{ printf "%s/%s-applog-injector-tls" .Release.Namespace (include "olaitan.fullname" .) | quote }}
   {{- end }}
 webhooks:
   - name: applog.olaitan.io
@@ -46,7 +64,16 @@ webhooks:
     failurePolicy: {{ $failurePolicy }}
     timeoutSeconds: {{ .Values.applogSidecar.webhook.timeoutSeconds | default 5 }}
     namespaceSelector:
-      {{- toYaml .Values.applogSidecar.namespaceSelector | nindent 6 }}
+      {{- if $hasSelector }}
+      {{- toYaml $ns | nindent 6 }}
+      {{- else }}
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - kube-system
+            - kube-public
+      {{- end }}
     rules:
       - operations: ["CREATE"]
         apiGroups: [""]
@@ -60,6 +87,6 @@ webhooks:
         path: /mutate
         port: 443
       {{- if not .Values.applogSidecar.tls.certManagerEnabled }}
-      caBundle: {{ required "applogSidecar.tls.caBundle is required when certManagerEnabled=false" .Values.applogSidecar.tls.caBundle | quote }}
+      caBundle: {{ required "applogSidecar.tls.caBundle is required when certManagerEnabled=false" .Values.applogSidecar.tls.caBundle }}
       {{- end }}
 {{- end }}

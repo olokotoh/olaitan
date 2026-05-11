@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -37,16 +39,64 @@ const (
 // triggered), subsequent sends use a non-blocking select with a default
 // case that drops the line and increments LinesShed. The shed flag
 // flips back off when the channel drains below the low-water mark.
+//
+// Concurrency: a single shedState is shared across both tail
+// goroutines (stdout, stderr) because shed-mode is a property of the
+// shared sink channel, not the per-stream reader. Both goroutines may
+// race on `shedding.Load`/`Store` and on the `len(sink)` peek; the
+// flip is best-effort and may oscillate briefly under contention. The
+// `dropped` counter is atomic and aggregates across both streams.
 type shedState struct {
 	shedding atomic.Bool
 	dropped  atomic.Int64
 	cap      int
+
+	// stallTimeout, when > 0, enables the stall-time gate: when the
+	// non-shedding send path observes the channel-fill ratio AT OR ABOVE
+	// the high-water mark for longer than stallTimeout since the last
+	// successful send, the tracker flips into shed-mode independent of
+	// the strict-greater-than channel-fill condition. Zero disables the
+	// gate (channel-fill is the only trigger).
+	stallTimeout time.Duration
+
+	// lastSendAt is the wall-clock time of the most recent successful
+	// send. The stall-time gate compares against this. Stored as a
+	// monotonic-preserving *time.Time so a forward NTP step does not
+	// trip a spurious flip.
+	lastSendAt atomic.Pointer[time.Time]
+
+	// log surfaces WARN messages on shed-mode entry and exit (Task 4.3
+	// of Story 1.9). nil is treated as slog.Default by the call sites
+	// so a zero-value shedState in tests does not panic.
+	log *slog.Logger
+
+	// nowFn is a test seam for the stall-time gate.
+	nowFn func() time.Time
 }
 
 // newShedState returns a fresh shed-state tracker for a channel of
-// the given capacity.
+// the given capacity. Panics on cap < 1: a zero-cap channel is an
+// always-shedding configuration and a negative cap is a producer bug.
 func newShedState(channelCap int) *shedState {
-	return &shedState{cap: channelCap}
+	if channelCap < 1 {
+		panic(fmt.Sprintf("applog: newShedState: capacity must be >= 1 (got %d)", channelCap))
+	}
+	return &shedState{cap: channelCap, nowFn: time.Now}
+}
+
+// withLogger installs the logger used for shed-mode entry/exit WARN
+// emission. Returns s for fluent setup.
+func (s *shedState) withLogger(log *slog.Logger) *shedState {
+	s.log = log
+	return s
+}
+
+// withStallTimeout installs the stall-time gate threshold. Zero disables
+// the gate (channel-fill is the only trigger). Returns s for fluent
+// setup.
+func (s *shedState) withStallTimeout(d time.Duration) *shedState {
+	s.stallTimeout = d
+	return s
 }
 
 // LinesShed returns the cumulative count of LineRecords dropped due
@@ -79,9 +129,12 @@ func (s *shedState) send(ctx context.Context, sink chan<- LineRecord, rec LineRe
 	if s.shedding.Load() {
 		select {
 		case sink <- rec:
+			s.recordSendTime()
 			// Drained below the low-water mark: clear shed-mode.
 			if len(sink)*shedLowWaterRatio < s.cap {
-				s.shedding.Store(false)
+				if s.shedding.CompareAndSwap(true, false) {
+					s.logShedExit("channel drained below low-water mark")
+				}
 			}
 			return nil
 		case <-ctx.Done():
@@ -97,17 +150,76 @@ func (s *shedState) send(ctx context.Context, sink chan<- LineRecord, rec LineRe
 	// `len*4 > cap*3` -- i.e. len > cap * 3/4. Entering shed-mode here
 	// also drops the current rec (the consumer is already drowning).
 	if len(sink)*shedHighWaterRatio > s.cap*3 {
-		s.shedding.Store(true)
+		if s.shedding.CompareAndSwap(false, true) {
+			s.logShedEntry("channel-fill above high-water mark", len(sink))
+		}
 		s.dropped.Add(1)
 		return nil
 	}
 
+	// Stall-time gate: when the channel is AT-OR-ABOVE the high-water
+	// mark and the last successful send is older than stallTimeout, the
+	// consumer is moving but at a rate that does not drain the buffer.
+	// Flip into shed-mode preemptively. The strict >-greater channel-
+	// fill check above will not fire in this case (the buffer is not
+	// quite over the threshold) so without this gate a slow-but-not-
+	// stopped consumer would leave the tailer blocked at full capacity
+	// for arbitrary periods.
+	if s.stallTimeout > 0 && len(sink)*shedHighWaterRatio >= s.cap*3 {
+		if lastPtr := s.lastSendAt.Load(); lastPtr != nil {
+			if s.nowFn != nil && s.nowFn().Sub(*lastPtr) > s.stallTimeout {
+				if s.shedding.CompareAndSwap(false, true) {
+					s.logShedEntry("stall-time gate fired", len(sink))
+				}
+				s.dropped.Add(1)
+				return nil
+			}
+		}
+	}
+
 	select {
 	case sink <- rec:
+		s.recordSendTime()
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// recordSendTime stamps lastSendAt for the stall-time gate. Captures
+// the time on the goroutine that did the send so a forward NTP step
+// does not poison the staleness math.
+func (s *shedState) recordSendTime() {
+	if s.nowFn == nil {
+		return
+	}
+	t := s.nowFn()
+	s.lastSendAt.Store(&t)
+}
+
+// logShedEntry / logShedExit emit a WARN log at the shed-mode
+// transition boundaries. Per Task 4.3 of Story 1.9 the WARN log is the
+// operator-visible signal that the line tailer is dropping events; the
+// dropped counter is reported at exit so operators can quantify the
+// stall.
+func (s *shedState) logShedEntry(reason string, chanLen int) {
+	if s.log == nil {
+		return
+	}
+	s.log.Warn("applog: tail entered shed mode",
+		"reason", reason,
+		"channel_len", chanLen,
+		"channel_cap", s.cap,
+		"dropped_before", s.dropped.Load())
+}
+
+func (s *shedState) logShedExit(reason string) {
+	if s.log == nil {
+		return
+	}
+	s.log.Warn("applog: tail exited shed mode",
+		"reason", reason,
+		"dropped_total", s.dropped.Load())
 }
 
 // runReaderTail drains lines from r using a bufio.Scanner with the
@@ -122,9 +234,12 @@ func (s *shedState) send(ctx context.Context, sink chan<- LineRecord, rec LineRe
 // next newline. This avoids the silent-drop-on-overlong-line failure
 // mode bufio.Scanner defaults to.
 //
-// On ctx cancellation, runReaderTail flushes any in-flight partial
-// line (no trailing newline) to sink as a final LineRecord and returns
-// nil. On unrecoverable read error other than io.EOF, runReaderTail
+// On ctx cancellation, runReaderTail returns nil immediately without
+// flushing any in-flight partial bytes; the next-line read is
+// abandoned. Any unterminated final line buffered inside
+// readLineWithLongLinePolicy is dropped at shutdown. Callers must not
+// rely on a partial-line flush. On unrecoverable read error other
+// than io.EOF, runReaderTail
 // logs and returns the wrapped error so the parent goroutine can
 // decide whether to fail the adapter or restart this stream.
 //
@@ -157,7 +272,14 @@ func runReaderTail(
 			return nil
 		}
 		line, err := readLineWithLongLinePolicy(br, scannerBufferLimit)
-		if len(line) > 0 || (err == nil) {
+		// Emit when we either have line bytes (including a legitimate
+		// empty line, which arrives as a non-nil zero-length slice from
+		// readLineWithLongLinePolicy) or the read completed cleanly with
+		// a non-nil slice. The explicit line != nil guard skips the
+		// pathological (nil, nil) case where a misbehaving reader signals
+		// no progress and no error; without this guard the loop would
+		// emit a phantom LineRecord and bump the offset counter.
+		if line != nil && (len(line) > 0 || err == nil) {
 			ts := now()
 			off := offsetSeq.Add(1)
 			rec := recBuilder(stream, line, ts, off)
@@ -174,6 +296,12 @@ func runReaderTail(
 				return nil
 			}
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil
+			}
+			// During shutdown the underlying pipe / file descriptor may
+			// have been closed mid-read; surface as graceful nil rather
+			// than a wrapped error so the errgroup unwinds cleanly.
+			if ctx.Err() != nil && (errors.Is(err, os.ErrClosed) || errors.Is(err, io.ErrClosedPipe)) {
 				return nil
 			}
 			log.Warn("applog: reader error", "stream", stream, "err", err)
@@ -305,6 +433,7 @@ func runFileTail(
 	now func() time.Time,
 	recBuilder func(stream string, line []byte, ts time.Time, offset int64) LineRecord,
 	log *slog.Logger,
+	recordReaderErr func(),
 ) error {
 	cfg := tail.Config{
 		ReOpen:    true,
@@ -318,21 +447,29 @@ func runFileTail(
 		return fmt.Errorf("applog: tail-file %q: %w", path, err)
 	}
 
-	// Stop the tailer on ctx cancellation. Stop returns the first
-	// error encountered by the tailer goroutine; we log but do not
-	// propagate the close-time error because the call is best-effort
-	// teardown.
+	// Stop the tailer once. The async stop goroutine fires on
+	// ctx.Done; the function-exit defer fires unconditionally so a
+	// fast-exit (ctx already cancelled at entry, error mid-loop, etc.)
+	// does not leak the underlying file descriptor / inotify watcher.
+	// sync.Once guards against the double-Stop race.
+	var stopOnce sync.Once
+	stopTail := func() {
+		stopOnce.Do(func() {
+			if serr := t.Stop(); serr != nil {
+				log.Warn("applog: tail-file stop", "path", path, "err", serr)
+			}
+		})
+	}
 	stopDone := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
-			if serr := t.Stop(); serr != nil {
-				log.Warn("applog: tail-file stop", "path", path, "err", serr)
-			}
+			stopTail()
 		case <-stopDone:
 		}
 	}()
 	defer close(stopDone)
+	defer stopTail()
 
 	for {
 		select {
@@ -343,6 +480,17 @@ func runFileTail(
 				return nil
 			}
 			if line.Err != nil {
+				// Stamp readerErrAt so the staleness watchdog can
+				// combine a recent reader-side error with the
+				// staleness window when deciding to flip unhealthy.
+				// Without this stamp, per-line errors are invisible
+				// to the watchdog (the function-return-only stamp on
+				// defaultFileTail never fires while t.Lines is still
+				// open) and a stream-broken-but-channel-still-open
+				// scenario would never flip the source unhealthy.
+				if recordReaderErr != nil {
+					recordReaderErr()
+				}
 				log.Warn("applog: tail-file line error", "path", path, "err", line.Err)
 				continue
 			}

@@ -10,17 +10,17 @@ to troubleshoot a stuck injection.
 When `applogSidecar.enabled=true` the chart deploys four resources
 beyond the agent DaemonSet:
 
-1. `Deployment <fullname>-applog-webhook` running the multi-call
-   binary subcommand `olaitan applog-webhook`. Default replica count
+1. `Deployment <fullname>-applog-injector` running the multi-call
+   binary subcommand `olaitan applog-injector`. Default replica count
    is `2` for high availability per the K8s admission-webhook good-
    practice guidance.
-2. `Service <fullname>-applog-webhook` (ClusterIP, port 443 -> sidecar
+2. `Service <fullname>-applog-injector` (ClusterIP, port 443 -> sidecar
    8443) routing apiserver admission traffic to the webhook pods.
-3. `MutatingWebhookConfiguration <fullname>-applog-webhook` with
+3. `MutatingWebhookConfiguration <fullname>-applog-injector` with
    `failurePolicy: Ignore`, `sideEffects: None`,
    `reinvocationPolicy: Never`, and a `namespaceSelector` excluding
    `kube-system` and `kube-public` by default.
-4. `Secret <fullname>-applog-webhook-tls` (or a cert-manager
+4. `Secret <fullname>-applog-injector-tls` (or a cert-manager
    `Certificate` resource when `applogSidecar.tls.certManagerEnabled=
    true`) providing the webhook's serving cert + key.
 
@@ -38,7 +38,7 @@ sidecar runs in operator workload pods, not the agent pod.
      `cert-manager.io/inject-ca-from` annotation.
    - **Path B (dev / air-gapped)**: manual self-signed cert.
      Generate a CA, sign a serving cert valid for the SAN
-     `<fullname>-applog-webhook.<namespace>.svc`, then populate
+     `<fullname>-applog-injector.<namespace>.svc`, then populate
      `applogSidecar.tls.servingCert` (PEM, base64-encoded),
      `applogSidecar.tls.servingKey` (PEM, base64-encoded), and
      `applogSidecar.tls.caBundle` (PEM, base64-encoded). Set
@@ -56,9 +56,9 @@ sidecar runs in operator workload pods, not the agent pod.
 3. Verify the webhook is up:
 
    ```sh
-   kubectl -n olaitan get deploy/olaitan-applog-webhook
-   kubectl -n olaitan logs deploy/olaitan-applog-webhook -c applog-webhook --tail=20
-   curl -k https://olaitan-applog-webhook.olaitan.svc:443/healthz   # via port-forward or in-cluster
+   kubectl -n olaitan get deploy/olaitan-applog-injector
+   kubectl -n olaitan logs deploy/olaitan-applog-injector -c applog-injector --tail=20
+   curl -k https://olaitan-applog-injector.olaitan.svc:443/healthz   # via port-forward or in-cluster
    ```
 
 4. Annotate the target workload Pod (or its owning Deployment /
@@ -182,14 +182,14 @@ every Pod cluster-wide. Threat model:
 ## Troubleshooting
 
 - **Sidecar not injected after annotation**: check the webhook logs
-  (`kubectl -n olaitan logs deploy/olaitan-applog-webhook`). Common
+  (`kubectl -n olaitan logs deploy/olaitan-applog-injector`). Common
   causes:
   - `kube-system` / `kube-public` pods (system-namespace
     exclusion).
   - The webhook never received the AdmissionReview because the
     `MutatingWebhookConfiguration.clientConfig.service` does not
     resolve. Verify with
-    `kubectl get mutatingwebhookconfiguration olaitan-applog-webhook -o yaml`.
+    `kubectl get mutatingwebhookconfiguration olaitan-applog-injector -o yaml`.
   - `failurePolicy: Ignore` swallowed an error. The webhook logs
     every skipped pod with the reason.
 - **AdmissionReview decode error**: the apiserver may be sending an
@@ -198,9 +198,9 @@ every Pod cluster-wide. Threat model:
 - **Cert / TLS issues**:
   - Path A (cert-manager): verify the Issuer is Ready
     (`kubectl describe issuer <name>`). Verify the Certificate is
-    Ready (`kubectl describe cert olaitan-applog-webhook-tls`).
+    Ready (`kubectl describe cert olaitan-applog-injector-tls`).
   - Path B: verify the manual Secret carries `tls.crt` and `tls.key`
-    (`kubectl -n olaitan get secret olaitan-applog-webhook-tls -o yaml`).
+    (`kubectl -n olaitan get secret olaitan-applog-injector-tls -o yaml`).
     Verify the apiserver-side caBundle on the
     MutatingWebhookConfiguration matches the CA that signed the
     serving cert.
@@ -213,6 +213,26 @@ every Pod cluster-wide. Threat model:
   - Adapter dropped lines under back-pressure shedding (the
     `applog_lines_shed_total` counter increments; see Story 1.12 for
     the Prometheus surface).
+
+## Unsupported pod shapes
+
+The webhook does not inject the sidecar into the following pod shapes,
+even when the annotation is present:
+
+- **Init-only pods** -- pods whose `spec.containers` is empty (only
+  init containers). The native-sidecar pattern (KEP-753) places the
+  sidecar in `spec.initContainers` alongside the application's own
+  init containers, but the cooperation contract requires a peer
+  application container to mount the shared volume and write its
+  stdout / stderr into it. An init-only pod has no such peer. The
+  webhook returns `Allowed: true` with no patch and bumps the
+  `applog_admission_unsupported_shape_total` counter; the operator
+  sees a WARN log noting the namespace and pod name. Future work
+  (`gds_*` future-work backlog): support init-only pods by either
+  scoping the sidecar to a specific init container or by tailing
+  kubelet-managed `/var/log/pods` (option (ii) hostPath below).
+- **Pods in `kube-system` / `kube-public`** (defended in code and at
+  the chart's `namespaceSelector`).
 
 ## Future-hardening alternatives
 

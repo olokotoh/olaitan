@@ -1590,6 +1590,73 @@ func TestApplogSidecarTLSCertManagerCertificateRendered(t *testing.T) {
 	}
 }
 
+// TestApplogSidecarConfigMapBridgesValues asserts that the chart's
+// applogSidecar knobs (stdoutPath, stderrPath, channelBuffer,
+// maxLineBytes, publishStallTimeout, stalenessTimeout) flow through to
+// the rendered injector Deployment as OLAITAN_WEBHOOK_SIDECAR_* env
+// vars. Story 1.9 D1+D2+H3 closure: the prior implementation defined
+// these in values.yaml but never propagated them; this test guards the
+// bridge so a future regression fails fast.
+//
+// (Implementation note: the Story 1.9 spec named this test
+// "ConfigMapBridgesValues" by analogy with Story 1.8's P27 pattern,
+// but this story bridges via Deployment env vars rather than a
+// ConfigMap. The spec name is preserved for traceability; the assertion
+// is against the actual bridge.)
+func TestApplogSidecarConfigMapBridgesValues(t *testing.T) {
+	args := append([]string{"falco.enabled=false", "nats.enabled=false", "redis.enabled=false"}, applogSidecarEnabledArgs()...)
+	args = append(args,
+		"applogSidecar.stdoutPath=/var/log/app/custom-stdout.log",
+		"applogSidecar.stderrPath=/var/log/app/custom-stderr.log",
+		"applogSidecar.channelBuffer=2048",
+		"applogSidecar.maxLineBytes=131072",
+		"applogSidecar.publishStallTimeout=7s",
+		"applogSidecar.stalenessTimeout=15m",
+	)
+	rendered := helmTemplate(t, args)
+
+	cases := []struct {
+		envName string
+		want    string
+	}{
+		{"OLAITAN_WEBHOOK_SIDECAR_STDOUT_PATH", "/var/log/app/custom-stdout.log"},
+		{"OLAITAN_WEBHOOK_SIDECAR_STDERR_PATH", "/var/log/app/custom-stderr.log"},
+		{"OLAITAN_WEBHOOK_SIDECAR_CHANNEL_BUFFER", "2048"},
+		{"OLAITAN_WEBHOOK_SIDECAR_MAX_LINE_BYTES", "131072"},
+		{"OLAITAN_WEBHOOK_SIDECAR_PUBLISH_STALL_TIMEOUT", "7s"},
+		{"OLAITAN_WEBHOOK_SIDECAR_STALENESS_TIMEOUT", "15m"},
+	}
+	for _, tc := range cases {
+		if !strings.Contains(rendered, tc.envName) {
+			t.Errorf("expected env var %q in rendered Deployment", tc.envName)
+			continue
+		}
+		if !strings.Contains(rendered, tc.want) {
+			t.Errorf("expected %s value %q in rendered Deployment", tc.envName, tc.want)
+		}
+	}
+}
+
+// TestApplogInjectorDeploymentRenamed asserts the rendered Deployment,
+// Service, MutatingWebhookConfiguration, and TLS Secret all carry the
+// olaitan-applog-injector suffix per D3 of the Story 1.9 code review.
+func TestApplogInjectorDeploymentRenamed(t *testing.T) {
+	args := append([]string{"falco.enabled=false", "nats.enabled=false", "redis.enabled=false"}, applogSidecarEnabledArgs()...)
+	rendered := helmTemplate(t, args)
+	for _, want := range []string{
+		"name: olaitan-applog-injector",     // Deployment + Service + MWC resources
+		"name: olaitan-applog-injector-tls", // TLS Secret
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("expected substring %q in rendered chart", want)
+		}
+	}
+	// The old applog-webhook name should not appear as a metadata.name.
+	if strings.Contains(rendered, "name: olaitan-applog-webhook\n") {
+		t.Errorf("rendered chart still carries the old olaitan-applog-webhook resource name")
+	}
+}
+
 // TestApplogSidecarHAReplicaCountDefault asserts the webhook
 // Deployment defaults to replicas: 2 (HA per the K8s good-practice
 // guidance).

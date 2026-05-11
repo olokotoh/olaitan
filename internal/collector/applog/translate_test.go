@@ -396,6 +396,16 @@ func TestTranslate_IDDerivedFromTruncatedNotOriginal(t *testing.T) {
 	if ev.ID != ev2.ID {
 		t.Errorf("ID mismatch: original=%q truncated=%q", ev.ID, ev2.ID)
 	}
+	// Tag-presence assertion: the original (longer than MaxLineBytes)
+	// must carry truncated:true; the deliberately-pre-truncated
+	// re-translate must NOT carry it (its Line is exactly MaxLineBytes,
+	// the truncation boundary, but never exceeded).
+	if !containsTag(ev.Tags, "truncated:true") {
+		t.Errorf("over-cap event missing truncated:true tag: tags=%v", ev.Tags)
+	}
+	if containsTag(ev2.Tags, "truncated:true") {
+		t.Errorf("at-cap event unexpectedly carries truncated:true: tags=%v", ev2.Tags)
+	}
 }
 
 func containsTag(tags []string, want string) bool {

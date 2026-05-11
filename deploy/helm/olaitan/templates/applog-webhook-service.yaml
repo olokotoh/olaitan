@@ -9,16 +9,16 @@ can route AdmissionReview POSTs to the webhook pods.
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "olaitan.fullname" . }}-applog-webhook
+  name: {{ include "olaitan.fullname" . }}-applog-injector
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "olaitan.labels" . | nindent 4 }}
-    app.kubernetes.io/component: applog-webhook
+    app.kubernetes.io/component: applog-injector
 spec:
   type: ClusterIP
   selector:
     {{- include "olaitan.selectorLabels" . | nindent 4 }}
-    app.kubernetes.io/component: applog-webhook
+    app.kubernetes.io/component: applog-injector
   ports:
     - name: tls
       port: 443

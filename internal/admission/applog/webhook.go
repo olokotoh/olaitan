@@ -39,9 +39,9 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -120,6 +120,38 @@ type WebhookConfig struct {
 	SidecarMemoryRequest string
 	SidecarCPULimit      string
 	SidecarMemoryLimit   string
+
+	// SidecarStdoutPath / SidecarStderrPath override the sidecar's
+	// default cooperating-app stdout / stderr file paths. Empty falls
+	// back to the adapter's compiled defaults (/var/log/app/stdout.log,
+	// /var/log/app/stderr.log). The webhook plumbs these through to the
+	// injected sidecar container as OLAITAN_APPLOG_STDOUT_PATH /
+	// OLAITAN_APPLOG_STDERR_PATH env vars.
+	SidecarStdoutPath string
+	SidecarStderrPath string
+
+	// SidecarChannelBuffer is the bounded LineRecord channel capacity
+	// the sidecar runs with. Empty falls back to the adapter default.
+	// Stringly-typed because the chart values pass via env var; the
+	// adapter's New() parses int and rejects invalid forms.
+	SidecarChannelBuffer string
+
+	// SidecarMaxLineBytes is the per-event line cap the sidecar applies
+	// at translate time. Empty falls back to the adapter default
+	// (MaxLineBytes constant, 64 KiB). Operator can tune to trade
+	// JetStream payload size against context-richness for the Sigma
+	// engine.
+	SidecarMaxLineBytes string
+
+	// SidecarPublishStallTimeout configures the back-pressure shed-mode
+	// stall-time gate. Empty falls back to the adapter default (5 s).
+	// The value is a Go time.Duration string (e.g. "3s", "500ms").
+	SidecarPublishStallTimeout string
+
+	// SidecarStalenessTimeout configures the watchdog's staleness
+	// threshold. Empty falls back to the adapter default (30 m). Go
+	// time.Duration string.
+	SidecarStalenessTimeout string
 }
 
 // Webhook is the HTTPS admission server.
@@ -133,10 +165,29 @@ type Webhook struct {
 	mux *http.ServeMux
 
 	// counters for tests / Prometheus binding (Story 1.12).
-	requestsTotal     atomic.Int64
-	injectedTotal     atomic.Int64
-	deprecatedKeyHits atomic.Int64
-	skippedTotal      atomic.Int64
+	//
+	// skippedTotal is preserved as the umbrella "no-mutation" counter
+	// for backward compatibility with the Story 1.9 first-pass tests
+	// that asserted it. Three sub-counters split out:
+	//   - idempotentTotal: container already present on the Pod (the
+	//     normal re-fire path under stacked mutating webhooks).
+	//   - injectErrorTotal: Inject() returned an error (an internal
+	//     regression that warrants a separate alarm).
+	//   - unsupportedShapeTotal: the Pod shape is not supported (e.g.
+	//     init-only Pods per D5). Distinct so an operator can quantify
+	//     how many workloads are being skipped because of the
+	//     non-support contract.
+	//   - dryRunTotal: AdmissionReview.DryRun=true requests; these do
+	//     NOT bump requestsTotal / injectedTotal so the per-cluster
+	//     "real injection" rate is not polluted by API-server dry runs.
+	requestsTotal         atomic.Int64
+	injectedTotal         atomic.Int64
+	deprecatedKeyHits     atomic.Int64
+	skippedTotal          atomic.Int64
+	idempotentTotal       atomic.Int64
+	injectErrorTotal      atomic.Int64
+	unsupportedShapeTotal atomic.Int64
+	dryRunTotal           atomic.Int64
 }
 
 // NewWebhook constructs a Webhook. cfg is validated; nil log is
@@ -197,7 +248,16 @@ func (w *Webhook) Run(ctx context.Context) error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = w.srv.Shutdown(shutdownCtx)
-		<-serveErr
+		// Bounded receive: if Shutdown's 10 s window expires while a
+		// long-running in-flight admission call is still draining,
+		// ListenAndServeTLS may not return immediately. Block for at
+		// most 5 s on serveErr; if nothing arrives, log and proceed
+		// to caller cleanup so the Run goroutine cannot deadlock.
+		select {
+		case <-serveErr:
+		case <-time.After(5 * time.Second):
+			w.log.Warn("applog/webhook: serveErr did not arrive within 5s of Shutdown; proceeding")
+		}
 		return nil
 	case err := <-serveErr:
 		return err
@@ -210,10 +270,14 @@ func (w *Webhook) Mux() *http.ServeMux { return w.mux }
 
 // RequestsTotal / InjectedTotal / DeprecatedKeyHits / SkippedTotal
 // expose the per-request counters for tests and Story 1.12.
-func (w *Webhook) RequestsTotal() int64     { return w.requestsTotal.Load() }
-func (w *Webhook) InjectedTotal() int64     { return w.injectedTotal.Load() }
-func (w *Webhook) DeprecatedKeyHits() int64 { return w.deprecatedKeyHits.Load() }
-func (w *Webhook) SkippedTotal() int64      { return w.skippedTotal.Load() }
+func (w *Webhook) RequestsTotal() int64         { return w.requestsTotal.Load() }
+func (w *Webhook) InjectedTotal() int64         { return w.injectedTotal.Load() }
+func (w *Webhook) DeprecatedKeyHits() int64     { return w.deprecatedKeyHits.Load() }
+func (w *Webhook) SkippedTotal() int64          { return w.skippedTotal.Load() }
+func (w *Webhook) IdempotentTotal() int64       { return w.idempotentTotal.Load() }
+func (w *Webhook) InjectErrorTotal() int64      { return w.injectErrorTotal.Load() }
+func (w *Webhook) UnsupportedShapeTotal() int64 { return w.unsupportedShapeTotal.Load() }
+func (w *Webhook) DryRunTotal() int64           { return w.dryRunTotal.Load() }
 
 // handleHealthz is a trivial liveness probe. Returns 200 OK for any
 // GET; the apiserver does not probe this endpoint -- kubelet does for
@@ -223,20 +287,34 @@ func (w *Webhook) handleHealthz(rw http.ResponseWriter, _ *http.Request) {
 	_, _ = rw.Write([]byte("ok\n"))
 }
 
+// maxAdmissionReviewBody is the upper bound on an AdmissionReview
+// request body the webhook is willing to read. The apiserver default
+// max-request-size is ~3 MiB; matching it via http.MaxBytesReader
+// makes oversized POSTs return 413 deterministically rather than
+// silently truncating mid-decode.
+const maxAdmissionReviewBody = 3 << 20
+
 // handleMutate is the AdmissionReview HTTP handler.
 func (w *Webhook) handleMutate(rw http.ResponseWriter, r *http.Request) {
-	w.requestsTotal.Add(1)
-
 	if r.Method != http.MethodPost {
 		http.Error(rw, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if ct := r.Header.Get("Content-Type"); ct != "application/json" {
+	if !isJSONContentType(r.Header.Get("Content-Type")) {
 		http.Error(rw, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	// MaxBytesReader returns http.MaxBytesError once the limit is
+	// reached, which surfaces a 413 to the client; below that ceiling
+	// io.ReadAll completes normally.
+	r.Body = http.MaxBytesReader(rw, r.Body, maxAdmissionReviewBody)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			http.Error(rw, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		w.log.Warn("applog/webhook: read body", "err", err)
 		http.Error(rw, "read body", http.StatusBadRequest)
 		return
@@ -252,7 +330,43 @@ func (w *Webhook) handleMutate(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "AdmissionReview.Request is nil", http.StatusBadRequest)
 		return
 	}
+	if review.Request.UID == "" {
+		// Apiserver protocol requires response UID echo request UID;
+		// an empty request UID would round-trip an empty response UID
+		// which the apiserver may reject. Surface as 400 so the
+		// apiserver retries with a well-formed request.
+		http.Error(rw, "AdmissionReview.Request.UID is empty", http.StatusBadRequest)
+		return
+	}
+	// Resource defence-in-depth: even though the MWC rules scope to
+	// pods, a misconfigured rules block could route non-pod resources
+	// here. Reject anything other than `pods` rather than attempt to
+	// json.Unmarshal a non-Pod object.
+	if review.Request.Resource.Resource != "" && review.Request.Resource.Resource != "pods" {
+		http.Error(rw, "AdmissionReview.Request.Resource must be pods", http.StatusBadRequest)
+		return
+	}
+	// DryRun short-circuit: the apiserver issues dry-run admission for
+	// `kubectl --dry-run=server` and similar. We allow the pod through
+	// without mutation, count separately, and DO NOT bump injectedTotal
+	// so the per-cluster injection rate is not polluted by dry-runs.
+	if review.Request.DryRun != nil && *review.Request.DryRun {
+		w.dryRunTotal.Add(1)
+		out := admissionv1.AdmissionReview{
+			TypeMeta: review.TypeMeta,
+			Response: &admissionv1.AdmissionResponse{
+				UID:     review.Request.UID,
+				Allowed: true,
+			},
+		}
+		rw.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(rw).Encode(&out); err != nil {
+			w.log.Warn("applog/webhook: encode dryRun AdmissionReview", "err", err)
+		}
+		return
+	}
 
+	w.requestsTotal.Add(1)
 	resp := w.review(&review)
 	out := admissionv1.AdmissionReview{
 		TypeMeta: review.TypeMeta,
@@ -262,6 +376,20 @@ func (w *Webhook) handleMutate(rw http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(rw).Encode(&out); err != nil {
 		w.log.Warn("applog/webhook: encode AdmissionReview", "err", err)
 	}
+}
+
+// isJSONContentType returns true when ct is application/json, with or
+// without RFC-2616 media-type parameters (charset=utf-8 etc.). Mirrors
+// internal/collector/audit/audit.go:isJSONContentType.
+func isJSONContentType(ct string) bool {
+	if ct == "" {
+		return false
+	}
+	mt, _, err := mime.ParseMediaType(ct)
+	if err != nil {
+		return false
+	}
+	return mt == "application/json"
 }
 
 // review decides how to mutate the incoming Pod. Returns an
@@ -281,45 +409,84 @@ func (w *Webhook) review(review *admissionv1.AdmissionReview) *admissionv1.Admis
 		return resp
 	}
 
+	// Empty Object.Raw is the apiserver's signal that the admission
+	// request carries no Pod content (e.g. a CONNECT-mode admission).
+	// Skip silently; bumping WARN here at apiserver rate would spam
+	// the log with no operator-actionable signal.
+	if len(review.Request.Object.Raw) == 0 {
+		w.skippedTotal.Add(1)
+		return resp
+	}
+
 	pod := corev1.Pod{}
 	if err := json.Unmarshal(review.Request.Object.Raw, &pod); err != nil {
 		w.log.Warn("applog/webhook: decode pod", "err", err)
 		// failurePolicy: Ignore means we still allow the Pod through;
 		// just don't inject. The reviewer can debug via webhook logs.
 		w.skippedTotal.Add(1)
+		w.injectErrorTotal.Add(1)
 		return resp
 	}
 
-	enabled, deprecated := annotationEnabled(pod.Annotations)
-	if !enabled {
-		w.skippedTotal.Add(1)
-		return resp
-	}
-	if deprecated {
+	// Always probe both keys for presence so the deprecated-alias
+	// counter reflects actual operator-side usage even when the
+	// canonical key also fires (annotationEnabled returns
+	// deprecated=false in that case because the canonical key wins).
+	if v, ok := pod.Annotations[AnnotationEnableDeprecated]; ok && v == AnnotationValueEnabled {
 		w.deprecatedKeyHits.Add(1)
-		w.log.Warn("applog/webhook: deprecated annotation key in use",
+		w.log.Warn("applog/webhook: deprecated annotation key present",
 			"deprecated_key", AnnotationEnableDeprecated,
 			"canonical_key", AnnotationEnable,
 			"namespace", review.Request.Namespace,
 			"pod_name", pod.Name)
 	}
 
+	enabled, _ := annotationEnabled(pod.Annotations)
+	if !enabled {
+		w.skippedTotal.Add(1)
+		return resp
+	}
+
+	// D5: init-only Pods (zero spec.containers) are explicitly not
+	// supported. Report distinctly so an operator-visible counter
+	// captures the volume of skipped non-support shapes without
+	// conflating with idempotent re-fires.
+	if len(pod.Spec.Containers) == 0 {
+		w.unsupportedShapeTotal.Add(1)
+		w.skippedTotal.Add(1)
+		w.log.Warn("applog/webhook: unsupported pod shape (init-only, zero containers)",
+			"namespace", review.Request.Namespace,
+			"pod_name", pod.Name)
+		return resp
+	}
+
 	patchBytes, err := Inject(&pod, InjectOptions{
-		UseNativeSidecar:     w.cfg.UseNativeSidecar,
-		SidecarImage:         w.cfg.SidecarImage,
-		SidecarCPURequest:    w.cfg.SidecarCPURequest,
-		SidecarMemoryRequest: w.cfg.SidecarMemoryRequest,
-		SidecarCPULimit:      w.cfg.SidecarCPULimit,
-		SidecarMemoryLimit:   w.cfg.SidecarMemoryLimit,
+		UseNativeSidecar:           w.cfg.UseNativeSidecar,
+		SidecarImage:               w.cfg.SidecarImage,
+		SidecarCPURequest:          w.cfg.SidecarCPURequest,
+		SidecarMemoryRequest:       w.cfg.SidecarMemoryRequest,
+		SidecarCPULimit:            w.cfg.SidecarCPULimit,
+		SidecarMemoryLimit:         w.cfg.SidecarMemoryLimit,
+		SidecarStdoutPath:          w.cfg.SidecarStdoutPath,
+		SidecarStderrPath:          w.cfg.SidecarStderrPath,
+		SidecarChannelBuffer:       w.cfg.SidecarChannelBuffer,
+		SidecarMaxLineBytes:        w.cfg.SidecarMaxLineBytes,
+		SidecarPublishStallTimeout: w.cfg.SidecarPublishStallTimeout,
+		SidecarStalenessTimeout:    w.cfg.SidecarStalenessTimeout,
 	})
 	if err != nil {
 		w.log.Warn("applog/webhook: inject", "err", err)
 		w.skippedTotal.Add(1)
+		w.injectErrorTotal.Add(1)
 		return resp
 	}
 	if len(patchBytes) == 0 {
 		// Already injected (idempotent re-fire) or no peer container
-		// matched the target annotation.
+		// matched the target annotation. Bumping idempotentTotal
+		// separately keeps the umbrella skippedTotal meaningful while
+		// still distinguishing the normal re-fire path from inject
+		// errors.
+		w.idempotentTotal.Add(1)
 		w.skippedTotal.Add(1)
 		return resp
 	}
@@ -344,13 +511,3 @@ func annotationEnabled(ann map[string]string) (enabled, deprecated bool) {
 	}
 	return false, false
 }
-
-// helper for tests to construct a request body
-func unusedTimeReference() time.Duration { return 0 } //nolint:unused
-//
-// (kept to avoid unused-import lint when the time package is not
-// directly referenced; the time.Duration return type matches the
-// http.Server timeout fields above, which already pull time in.)
-
-// _ keeps fmt referenced via the format directive in other branches.
-var _ = fmt.Sprintf

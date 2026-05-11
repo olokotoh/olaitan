@@ -391,12 +391,16 @@ func TestRun_StalenessWatchdog_QuietButHealthy_DoesNotFlipUnhealthy(t *testing.T
 func TestRun_StalenessWatchdog_StaleAndReaderError_FlipsUnhealthy(t *testing.T) {
 	pub := newStubPublisher()
 	cfg := Config{
-		StdoutPath:       "/x",
-		StderrPath:       "/y",
-		Pod:              schema.PodRef{Name: "p", Namespace: "ns", UID: "u"},
-		Container:        "app",
-		ChannelBuffer:    8,
-		StalenessTimeout: 50 * time.Millisecond,
+		StdoutPath:    "/x",
+		StderrPath:    "/y",
+		Pod:           schema.PodRef{Name: "p", Namespace: "ns", UID: "u"},
+		Container:     "app",
+		ChannelBuffer: 8,
+		// Above the watchdog period's 100ms floor so the ticker fires
+		// inside the test deadline AND the readerErrAt set at t=0 is
+		// still inside the StalenessTimeout window when the first
+		// tick reads it.
+		StalenessTimeout: 400 * time.Millisecond,
 	}
 	a, err := New(cfg, pub, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -416,8 +420,8 @@ func TestRun_StalenessWatchdog_StaleAndReaderError_FlipsUnhealthy(t *testing.T) 
 		a.runStalenessWatchdog(ctx)
 	}()
 
-	// Wait up to 1s for the watchdog to flip the source unhealthy.
-	deadline := time.After(1 * time.Second)
+	// Wait up to 2s for the watchdog to flip the source unhealthy.
+	deadline := time.After(2 * time.Second)
 	for {
 		healthy, _ := a.health.Status()
 		if !healthy {
@@ -467,6 +471,103 @@ func TestRun_TopLevelPanic_MarksUnhealthy_DoesNotPropagate(t *testing.T) {
 	if herr == nil {
 		t.Errorf("expected non-nil panic error in health, got nil")
 	}
+}
+
+// TestRun_HealthFlipsOnAllScannerFailure asserts that when both tail
+// goroutines return errors, Adapter.Run wraps the error, surfaces it
+// to the errgroup, and Health() reports unhealthy with that error.
+// Mirrors the Story 1.7 P29 / Story 1.8 P27 health-on-scanner-failure
+// guarantees the Acceptance Auditor flagged as missing.
+func TestRun_HealthFlipsOnAllScannerFailure(t *testing.T) {
+	pub := newStubPublisher()
+	a := newTestAdapter(t, pub)
+
+	scannerErr := errors.New("synthetic scanner failure")
+	a.stdoutTailFn = func(ctx context.Context, sink chan<- LineRecord) error {
+		a.recordReaderErr()
+		return scannerErr
+	}
+	a.stderrTailFn = func(ctx context.Context, sink chan<- LineRecord) error {
+		a.recordReaderErr()
+		return scannerErr
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- a.Run(ctx) }()
+
+	select {
+	case err := <-runDone:
+		if err == nil {
+			t.Fatalf("Run returned nil; expected wrapped scanner error")
+		}
+		if !errors.Is(err, scannerErr) {
+			t.Errorf("Run err = %v; want chain containing %v", err, scannerErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return within 2s of scanner failure")
+	}
+
+	healthy, herr := a.health.Status()
+	if healthy {
+		t.Errorf("expected unhealthy after scanner failure")
+	}
+	if herr == nil {
+		t.Errorf("expected non-nil health error after scanner failure")
+	}
+}
+
+// TestRun_HealthRestoresOnReconnect drives the adapter through an
+// initial scanner-error window (health unhealthy due to the
+// readerErrAt stamp + zero published events) and then a successful
+// publish path which must flip health back to healthy. Mirrors the
+// Story 1.8 reconnect-and-resume coverage that the Acceptance Auditor
+// listed as required.
+func TestRun_HealthRestoresOnReconnect(t *testing.T) {
+	pub := newStubPublisher()
+	a := newTestAdapter(t, pub)
+
+	// First start: stamp an early reader error then send a line. The
+	// successful publish that follows should flip health back to
+	// healthy.
+	a.recordReaderErr()
+	healthy, _ := a.health.Status()
+	if healthy {
+		t.Fatal("expected initial unhealthy state from recordReaderErr precondition")
+	}
+
+	wOut, stdoutFn := pipeTailFn(t, a, "stdout")
+	a.stdoutTailFn = stdoutFn
+	a.stderrTailFn = func(ctx context.Context, sink chan<- LineRecord) error {
+		<-ctx.Done()
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- a.Run(ctx) }()
+
+	if _, err := wOut.Write([]byte("recovery line\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	deadline := time.After(3 * time.Second)
+	for {
+		h, _ := a.health.Status()
+		if h && pub.successes() > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			cancel()
+			<-runDone
+			t.Fatalf("health did not restore after successful publish (healthy=%v, successes=%d)", h, pub.successes())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-runDone
 }
 
 func TestRun_BackpressureShedding_SignalsViaCounter(t *testing.T) {

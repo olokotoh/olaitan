@@ -397,17 +397,23 @@ applogSidecar:
   tls:
     certManagerEnabled: false
     issuerName: olaitan-ca
+    # cert-manager Issuer reference kind. "Issuer" is namespace-scoped
+    # and matches the default olaitan-ca Issuer pattern; operators using
+    # a cluster-wide CA can set "ClusterIssuer". Chart rejects other
+    # values via fail-fast.
+    issuerKind: Issuer
     # When certManagerEnabled=false, the chart renders a Secret
     # containing tls.crt and tls.key from these PEM-encoded values
-    # (base64-encoded by Helm at render time). Both required when
-    # certManagerEnabled=false.
+    # (raw base64 strings, NOT double-quoted -- the kubelet and
+    # apiserver require plain base64 in tls.crt / tls.key). Both
+    # required when certManagerEnabled=false.
     servingCert: ""
     servingKey: ""
     # CA bundle distributed to the apiserver via the
     # MutatingWebhookConfiguration.clientConfig.caBundle field.
     # Required when certManagerEnabled=false; ignored when
     # certManagerEnabled=true (cert-manager fills in the bundle from
-    # the Issuer).
+    # the Issuer). Raw base64 string (NOT double-quoted).
     caBundle: ""
 
 # --- Subchart overrides ------------------------------------------------

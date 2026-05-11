@@ -406,7 +406,7 @@ func TestTail_FileTail_ReadsBasicFileLines(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		_ = runFileTail(ctx, path, "stdout", sink, shed, off, time.Now, testRecBuilder(), silentLogger())
+		_ = runFileTail(ctx, path, "stdout", sink, shed, off, time.Now, testRecBuilder(), silentLogger(), nil)
 	}()
 
 	got := drainCh(sink, 2, 5*time.Second)

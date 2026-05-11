@@ -49,12 +49,13 @@ func startTestNATS(t *testing.T) *natsserver.Server {
 func testStreamConfigsForApplog() []natsjs.StreamConfig {
 	return []natsjs.StreamConfig{
 		{
-			Name:      "EVENTS_RAW",
-			Subjects:  []string{subjects.RawPrefix + ">"},
-			MaxAge:    1 * time.Hour,
-			MaxBytes:  1 * 1024 * 1024,
-			Storage:   natsjs.MemoryStorage,
-			Retention: natsjs.LimitsPolicy,
+			Name:       "EVENTS_RAW",
+			Subjects:   []string{subjects.RawPrefix + ">"},
+			MaxAge:     1 * time.Hour,
+			MaxBytes:   1 * 1024 * 1024,
+			Storage:    natsjs.MemoryStorage,
+			Retention:  natsjs.LimitsPolicy,
+			Duplicates: 2 * time.Minute,
 		},
 	}
 }
@@ -319,19 +320,15 @@ func TestIntegration_EmbeddedNUL_PreservedInRaw(t *testing.T) {
 	}
 }
 
-// TestIntegration_MsgIDDedup asserts that JetStream WithMsgID dedup is
-// active: republishing the same line within the dedup window produces
-// only one event in the stream (the second publish is server-side
-// dropped).
-func TestIntegration_MsgIDDedup(t *testing.T) {
+// TestIntegration_MsgIDDistinctOffsets is the byte-identical-line /
+// distinct-offset path: stableEventID's offset participation produces
+// different IDs for two writes of the same content, so JetStream
+// dedup does NOT swallow either. Both events surface.
+//
+// (Renamed from TestIntegration_MsgIDDedup per the Story 1.9 code
+// review: the original name asserted the opposite of dedup.)
+func TestIntegration_MsgIDDistinctOffsets(t *testing.T) {
 	h := startTestAdapter(t)
-	// Write the same line content twice from the same stream. The
-	// stableEventID derivation includes the per-stream offset
-	// counter, so two writes produce DIFFERENT IDs and both are
-	// expected to surface. This test asserts that the protocol
-	// supports dedup, but does not artificially emulate two messages
-	// with the same ID -- a real producer could not produce
-	// colliding IDs by design.
 	if _, err := h.stdoutW.Write([]byte("dedup-line\n")); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -347,19 +344,65 @@ func TestIntegration_MsgIDDedup(t *testing.T) {
 	}
 }
 
-// TestIntegration_BackpressureShedding_NoOOMUnderStall asserts that
-// even under a stalled consumer (here we simulate by NOT Fetching),
-// the adapter does not buffer unboundedly. The shed-state counter
-// must increment and the channel never exceeds capacity.
-func TestIntegration_BackpressureShedding_NoOOMUnderStall(t *testing.T) {
+// TestIntegration_MsgIDDedup_TrueDedup directly publishes two events
+// to the same JetStream stream with the SAME Nats-Msg-Id header and
+// asserts that only one event surfaces -- this is the genuine dedup
+// guarantee the adapter relies on for at-least-once-with-retry
+// semantics. Goes around the Adapter so we can force the colliding
+// MsgID; the Adapter never actually emits colliding IDs by design
+// (stableEventID's per-stream offset participation guarantees
+// distinct IDs even for byte-identical lines).
+func TestIntegration_MsgIDDedup_TrueDedup(t *testing.T) {
+	h := startTestAdapter(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ev := schema.Event{
+		ID:        "fixed-dedup-id-0123456789abcdef0",
+		Timestamp: time.Now(),
+		Source:    schema.SourceAppLog,
+		Pod:       schema.PodRef{Name: "p", Namespace: "ns", UID: "u"},
+		Severity:  "informational",
+		Category:  schema.CategoryLog,
+		Summary:   "dedup-test",
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := h.js.Publish(ctx, subjects.RawAppLog, mustJSON(t, ev), natsjs.WithMsgID(ev.ID)); err != nil {
+			t.Fatalf("publish#%d: %v", i, err)
+		}
+	}
+
+	// Fetch with a 1-second wait window: dedup means only one of the
+	// two publishes will become a stream message.
+	got := fetchN(t, h, 2, 2*time.Second)
+	if len(got) != 1 {
+		t.Errorf("got %d events want 1 (JetStream dedup should swallow the second publish with the same Nats-Msg-Id)", len(got))
+	}
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return b
+}
+
+// TestIntegration_BackpressureBurstDeliveredAgainstFastConsumer asserts
+// that a large burst against a fast in-memory JetStream is delivered
+// without OOM (the bounded channel + shed-state machinery does not
+// starve the publish loop). LinesShed may or may not increment
+// depending on CI hardware speed; the canonical stalled-consumer test
+// lives in applog_test.go as TestRun_BackpressureShedding_SignalsViaCounter
+// (slow-publisher fixture, deterministic assertion on LinesShed > 0).
+//
+// (Renamed from TestIntegration_BackpressureShedding_NoOOMUnderStall
+// per the Story 1.9 code review: the original name claimed an OOM-
+// stress assertion the test does not perform.)
+func TestIntegration_BackpressureBurstDeliveredAgainstFastConsumer(t *testing.T) {
 	h := startTestAdapter(t)
 
-	// Pump aggressively. The adapter's bounded channel (64) will
-	// fill, the consume loop publishes as fast as JetStream allows
-	// (which is plenty fast against an in-memory store), so we
-	// rarely actually shed under this configuration. The test is
-	// conservative: assert the LinesShed counter starts at zero and
-	// the channel stays bounded.
 	go func() {
 		for i := 0; i < 4096; i++ {
 			_, _ = h.stdoutW.Write([]byte("burst\n"))
@@ -371,12 +414,5 @@ func TestIntegration_BackpressureShedding_NoOOMUnderStall(t *testing.T) {
 	if len(got) == 0 {
 		t.Fatalf("got 0 events under burst; expected at least some")
 	}
-	// The bounded channel + shed-state ensures the adapter does not
-	// buffer 4096 lines in memory; under a slow consumer the
-	// shed counter increments. Either outcome is correct: no OOM,
-	// no panic. We assert only that the published count is non-zero
-	// (the bus was reachable) -- the specific drop-vs-publish ratio
-	// depends on JetStream consume speed, which is not stable across
-	// CI hardware.
 	t.Logf("burst delivered: published=%d shed=%d", len(got), h.adapter.LinesShed())
 }

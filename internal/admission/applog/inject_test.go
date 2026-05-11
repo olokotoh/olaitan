@@ -69,7 +69,7 @@ func TestInject_NoAnnotation_Skipped(t *testing.T) {
 	}
 }
 
-func TestInject_DeprecatedKey_AccepedAsAlias(t *testing.T) {
+func TestInject_DeprecatedKey_AcceptedAsAlias(t *testing.T) {
 	enabled, deprecated := annotationEnabled(map[string]string{
 		AnnotationEnableDeprecated: AnnotationValueEnabled,
 	})

@@ -28,6 +28,18 @@ type InjectOptions struct {
 	SidecarMemoryRequest string
 	SidecarCPULimit      string
 	SidecarMemoryLimit   string
+
+	// Sidecar runtime knobs forwarded from the chart through the
+	// webhook's env into the injected sidecar container as
+	// OLAITAN_APPLOG_* env vars. Empty falls back to the adapter's
+	// compiled defaults. Stringly-typed so the chart can pass
+	// duration / int values verbatim; the adapter parses on start-up.
+	SidecarStdoutPath          string
+	SidecarStderrPath          string
+	SidecarChannelBuffer       string
+	SidecarMaxLineBytes        string
+	SidecarPublishStallTimeout string
+	SidecarStalenessTimeout    string
 }
 
 // jsonPatchOp models a single JSON Patch (RFC 6902) operation. Only
@@ -84,7 +96,14 @@ func Inject(pod *corev1.Pod, opts InjectOptions) ([]byte, error) {
 		return nil, err
 	}
 
-	sidecar := buildSidecarContainer(opts)
+	// Pass the resolved peer container name into the sidecar build so
+	// OLAITAN_TARGET_CONTAINER is set deterministically rather than
+	// relying on the downward-API fieldRef to an annotation that may
+	// or may not be present (the common case is no annotation, where
+	// the field-ref resolves to empty and the sidecar fails-fast on
+	// start-up).
+	peerContainerName := pod.Spec.Containers[peerIdx].Name
+	sidecar := buildSidecarContainer(opts, peerContainerName)
 
 	ops := make([]jsonPatchOp, 0, 6)
 
@@ -101,34 +120,72 @@ func Inject(pod *corev1.Pod, opts InjectOptions) ([]byte, error) {
 		ops = append(ops, jsonPatchOp{Op: "add", Path: "/spec/containers/-", Value: sidecar})
 	}
 
-	// Step 2: ensure spec.volumes exists, then add the shared emptyDir.
-	sharedVolume := corev1.Volume{
-		Name: SharedVolumeName,
-		VolumeSource: corev1.VolumeSource{
-			EmptyDir: &corev1.EmptyDirVolumeSource{},
-		},
+	// Step 2: ensure spec.volumes exists, then add the shared emptyDir
+	// only if no volume of the same name is already present. The
+	// duplicate-name check protects against another mutating webhook
+	// (or operator hand-edit) that already added the volume; appending
+	// twice would make the apiserver reject the Pod with "duplicate
+	// volume name".
+	if !hasVolumeNamed(pod, SharedVolumeName) {
+		sharedVolume := corev1.Volume{
+			Name: SharedVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		}
+		if pod.Spec.Volumes == nil {
+			ops = append(ops, jsonPatchOp{Op: "add", Path: "/spec/volumes", Value: []corev1.Volume{}})
+		}
+		ops = append(ops, jsonPatchOp{Op: "add", Path: "/spec/volumes/-", Value: sharedVolume})
 	}
-	if pod.Spec.Volumes == nil {
-		ops = append(ops, jsonPatchOp{Op: "add", Path: "/spec/volumes", Value: []corev1.Volume{}})
-	}
-	ops = append(ops, jsonPatchOp{Op: "add", Path: "/spec/volumes/-", Value: sharedVolume})
 
-	// Step 3: mount the shared volume into the peer container.
-	mount := corev1.VolumeMount{
-		Name:      SharedVolumeName,
-		MountPath: SharedVolumeMountPath,
-	}
+	// Step 3: mount the shared volume into the peer container, again
+	// guarding against an existing mount at the same path (a previous
+	// admission cycle, or operator hand-edit, may already have wired
+	// it in).
 	peer := pod.Spec.Containers[peerIdx]
-	if peer.VolumeMounts == nil {
+	if !hasMountAtPath(peer.VolumeMounts, SharedVolumeMountPath) {
+		mount := corev1.VolumeMount{
+			Name:      SharedVolumeName,
+			MountPath: SharedVolumeMountPath,
+		}
+		if peer.VolumeMounts == nil {
+			ops = append(ops, jsonPatchOp{Op: "add",
+				Path:  fmt.Sprintf("/spec/containers/%d/volumeMounts", peerIdx),
+				Value: []corev1.VolumeMount{}})
+		}
 		ops = append(ops, jsonPatchOp{Op: "add",
-			Path:  fmt.Sprintf("/spec/containers/%d/volumeMounts", peerIdx),
-			Value: []corev1.VolumeMount{}})
+			Path:  fmt.Sprintf("/spec/containers/%d/volumeMounts/-", peerIdx),
+			Value: mount})
 	}
-	ops = append(ops, jsonPatchOp{Op: "add",
-		Path:  fmt.Sprintf("/spec/containers/%d/volumeMounts/-", peerIdx),
-		Value: mount})
 
 	return json.Marshal(ops)
+}
+
+// hasVolumeNamed reports whether pod.Spec.Volumes already contains a
+// volume of the given name. Used in Inject's idempotency guard so a
+// re-fire does not append a duplicate volume entry (the apiserver
+// rejects duplicate volume names with a clear error, but we should
+// not generate the invalid patch in the first place).
+func hasVolumeNamed(pod *corev1.Pod, name string) bool {
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// hasMountAtPath reports whether mounts already includes an entry at
+// the given mount path. Used by Inject to guard against duplicate
+// peer-container mounts on re-fire.
+func hasMountAtPath(mounts []corev1.VolumeMount, path string) bool {
+	for _, m := range mounts {
+		if m.MountPath == path {
+			return true
+		}
+	}
+	return false
 }
 
 // alreadyInjected returns true when a container named
@@ -177,26 +234,67 @@ func selectPeerContainer(pod *corev1.Pod) (int, error) {
 // patch will inject. The structure is constant per opts (no
 // per-Pod customisation beyond resources and image); the
 // downward-API env vars carry the per-pod identity.
-func buildSidecarContainer(opts InjectOptions) corev1.Container {
+//
+// peerContainerName is the resolved name of the application container
+// the sidecar is targeting; it is set into the OLAITAN_TARGET_CONTAINER
+// env var as a literal value rather than via a downward-API fieldRef
+// to an annotation, because the common case is that no annotation is
+// present and the field-ref would resolve to empty (which would then
+// fail-fast in the sidecar's startup guard).
+func buildSidecarContainer(opts InjectOptions, peerContainerName string) corev1.Container {
+	env := []corev1.EnvVar{
+		{Name: "K8S_POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
+		{Name: "K8S_POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
+		{Name: "K8S_POD_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}},
+		{Name: "K8S_NODE_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"}}},
+		{Name: "OLAITAN_TARGET_CONTAINER", Value: peerContainerName},
+	}
+	// Forward chart-tuned sidecar runtime knobs. Empty values are not
+	// emitted so the adapter's compiled defaults stay in force.
+	if v := opts.SidecarStdoutPath; v != "" {
+		env = append(env, corev1.EnvVar{Name: "OLAITAN_APPLOG_STDOUT_PATH", Value: v})
+	}
+	if v := opts.SidecarStderrPath; v != "" {
+		env = append(env, corev1.EnvVar{Name: "OLAITAN_APPLOG_STDERR_PATH", Value: v})
+	}
+	if v := opts.SidecarChannelBuffer; v != "" {
+		env = append(env, corev1.EnvVar{Name: "OLAITAN_APPLOG_CHANNEL_BUFFER", Value: v})
+	}
+	if v := opts.SidecarMaxLineBytes; v != "" {
+		env = append(env, corev1.EnvVar{Name: "OLAITAN_APPLOG_MAX_LINE_BYTES", Value: v})
+	}
+	if v := opts.SidecarPublishStallTimeout; v != "" {
+		env = append(env, corev1.EnvVar{Name: "OLAITAN_APPLOG_PUBLISH_STALL_TIMEOUT", Value: v})
+	}
+	if v := opts.SidecarStalenessTimeout; v != "" {
+		env = append(env, corev1.EnvVar{Name: "OLAITAN_APPLOG_STALENESS_TIMEOUT", Value: v})
+	}
+
 	c := corev1.Container{
 		Name:  SidecarContainerName,
 		Image: opts.SidecarImage,
-		Args:  []string{"applog-sidecar"},
-		Env: []corev1.EnvVar{
-			{Name: "K8S_POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
-			{Name: "K8S_POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
-			{Name: "K8S_POD_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}},
-			{Name: "K8S_NODE_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"}}},
-			{Name: "OLAITAN_TARGET_CONTAINER", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
-				FieldPath: fmt.Sprintf("metadata.annotations['%s']", AnnotationTargetContainer),
-			}}},
-		},
+		// Set Command explicitly so the contract does not depend on
+		// the Dockerfile's ENTRYPOINT (a future image-build refactor
+		// that wraps the binary in a launcher script would otherwise
+		// silently break the sidecar). Args carries the multi-call
+		// subcommand the binary dispatches on.
+		Command: []string{"olaitan"},
+		Args:    []string{"applog-sidecar"},
+		Env:     env,
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: SharedVolumeName, MountPath: SharedVolumeMountPath, ReadOnly: true},
 		},
 		Resources: buildResourceRequirements(opts),
 		SecurityContext: &corev1.SecurityContext{
+			// Pod Security Standards "restricted" baseline plus the
+			// nonroot UID/GID pair from the distroless image. Without
+			// these explicit values the sidecar would inherit the
+			// peer container's PodSecurityContext, which an operator
+			// running a privileged workload might have widened.
+			SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			RunAsNonRoot:             ptrTrue(),
+			RunAsUser:                ptrInt64(65532),
+			RunAsGroup:               ptrInt64(65532),
 			ReadOnlyRootFilesystem:   ptrTrue(),
 			AllowPrivilegeEscalation: ptrFalse(),
 			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
@@ -212,6 +310,11 @@ func buildSidecarContainer(opts InjectOptions) corev1.Container {
 	}
 	return c
 }
+
+// ptrInt64 returns a pointer to the supplied int64. Used for
+// SecurityContext numeric fields that take *int64 to distinguish unset
+// from zero.
+func ptrInt64(v int64) *int64 { return &v }
 
 // buildResourceRequirements assembles ResourceRequirements from the
 // opts; empty strings fall back to the documented defaults.

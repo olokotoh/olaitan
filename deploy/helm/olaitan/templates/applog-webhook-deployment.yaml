@@ -39,35 +39,52 @@ no host-level operations.
 {{- if lt (int .Values.applogSidecar.maxLineBytes) 1024 -}}
 {{- fail (printf "applogSidecar.maxLineBytes must be >= 1024 (got %d)" (int .Values.applogSidecar.maxLineBytes)) -}}
 {{- end -}}
+{{/*
+  useNativeSidecar default-true coercion: Helm's `default` returns
+  the default whenever the given value is a Go zero-value, so
+  `default true false` would return `true` (bool zero-value is
+  false). Use hasKey on .Values.applogSidecar against
+  "useNativeSidecar" to distinguish "unset" from "explicitly false";
+  when unset, default to true; when set, take the operator value
+  as-is.
+*/}}
+{{- $useNative := true -}}
+{{- if hasKey .Values.applogSidecar "useNativeSidecar" -}}
+{{- $useNative = .Values.applogSidecar.useNativeSidecar -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "olaitan.fullname" . }}-applog-webhook
+  name: {{ include "olaitan.fullname" . }}-applog-injector
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "olaitan.labels" . | nindent 4 }}
-    app.kubernetes.io/component: applog-webhook
+    app.kubernetes.io/component: applog-injector
 spec:
   replicas: {{ .Values.applogSidecar.webhook.replicaCount | default 2 }}
   selector:
     matchLabels:
       {{- include "olaitan.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: applog-webhook
+      app.kubernetes.io/component: applog-injector
   template:
     metadata:
       labels:
         {{- include "olaitan.labels" . | nindent 8 }}
-        app.kubernetes.io/component: applog-webhook
+        app.kubernetes.io/component: applog-injector
     spec:
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - name: applog-webhook
+        - name: applog-injector
           image: {{ include "olaitan.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
+          command:
+            - olaitan
           args:
             - applog-webhook
           ports:
@@ -82,9 +99,24 @@ spec:
             - name: OLAITAN_WEBHOOK_TLS_KEY
               value: /etc/olaitan/tls/tls.key
             - name: OLAITAN_WEBHOOK_USE_NATIVE_SIDECAR
-              value: {{ .Values.applogSidecar.useNativeSidecar | default true | quote }}
+              value: {{ $useNative | quote }}
             - name: OLAITAN_WEBHOOK_SIDECAR_IMAGE
               value: {{ include "olaitan.image" . | quote }}
+            # Sidecar runtime knobs forwarded through the webhook env
+            # into the injected sidecar's OLAITAN_APPLOG_* env vars.
+            # Story 1.9 D1+D2+H3: dead-knobs defect closure.
+            - name: OLAITAN_WEBHOOK_SIDECAR_STDOUT_PATH
+              value: {{ .Values.applogSidecar.stdoutPath | quote }}
+            - name: OLAITAN_WEBHOOK_SIDECAR_STDERR_PATH
+              value: {{ .Values.applogSidecar.stderrPath | quote }}
+            - name: OLAITAN_WEBHOOK_SIDECAR_CHANNEL_BUFFER
+              value: {{ .Values.applogSidecar.channelBuffer | quote }}
+            - name: OLAITAN_WEBHOOK_SIDECAR_MAX_LINE_BYTES
+              value: {{ .Values.applogSidecar.maxLineBytes | quote }}
+            - name: OLAITAN_WEBHOOK_SIDECAR_PUBLISH_STALL_TIMEOUT
+              value: {{ .Values.applogSidecar.publishStallTimeout | quote }}
+            - name: OLAITAN_WEBHOOK_SIDECAR_STALENESS_TIMEOUT
+              value: {{ .Values.applogSidecar.stalenessTimeout | quote }}
           volumeMounts:
             - name: tls
               mountPath: /etc/olaitan/tls
@@ -119,5 +151,5 @@ spec:
       volumes:
         - name: tls
           secret:
-            secretName: {{ include "olaitan.fullname" . }}-applog-webhook-tls
+            secretName: {{ include "olaitan.fullname" . }}-applog-injector-tls
 {{- end }}

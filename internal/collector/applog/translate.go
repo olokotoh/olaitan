@@ -139,6 +139,14 @@ var ErrEmptyContainer = errors.New("applog: empty container name")
 // successfully; nil indicates a producer bug.
 var ErrNilLine = errors.New("applog: nil line bytes")
 
+// ErrNegativeOffset is returned by Translate when LineRecord.Offset is
+// negative. The tailer increments Offset by one per scanned line
+// starting from 1; a negative value indicates either an overflow (the
+// adapter has run long enough that a 63-bit counter wrapped, which is
+// not currently realistic) or a producer bug. Rejecting protects the
+// stableEventID dedup-collision guarantee.
+var ErrNegativeOffset = errors.New("applog: negative offset")
+
 // LineRecord is the input value-type to Translate. The adapter's tail
 // layer constructs one per scanned line and pushes it onto the bounded
 // in-process channel; the consumer goroutine pulls and translates.
@@ -193,6 +201,13 @@ type LineRecord struct {
 	// projected volume) so the map is constant for the process
 	// lifetime; nil is legal (pod has no labels of interest).
 	Labels map[string]string
+
+	// MaxLineBytes is the operator-tuned per-event line cap. Zero means
+	// "use the package default" (the MaxLineBytes constant, 64 KiB). The
+	// adapter populates this from Config.MaxLineBytesOverride; the
+	// recBuilder closure forwards it on every record. Translate clamps
+	// any non-zero value below 1 KiB up to 1 KiB defensively.
+	MaxLineBytes int
 }
 
 // Translate converts a LineRecord into the canonical schema.Event.
@@ -250,6 +265,9 @@ func Translate(rec LineRecord) (schema.Event, error) {
 	if rec.Container == "" {
 		return schema.Event{}, fmt.Errorf("applog: translate: %w", ErrEmptyContainer)
 	}
+	if rec.Offset < 0 {
+		return schema.Event{}, fmt.Errorf("applog: translate: offset=%d: %w", rec.Offset, ErrNegativeOffset)
+	}
 	if rec.Timestamp.IsZero() {
 		return schema.Event{}, fmt.Errorf("applog: translate: zero timestamp: %w", ErrInvalidTimestamp)
 	}
@@ -262,7 +280,7 @@ func Translate(rec LineRecord) (schema.Event, error) {
 			rec.Timestamp.Format(time.RFC3339Nano), maxFutureSkew, ErrInvalidTimestamp)
 	}
 
-	sanitised, replaced, truncated := sanitizeLine(rec.Line)
+	sanitised, replaced, truncated := sanitizeLine(rec.Line, effectiveMaxLineBytes(rec.MaxLineBytes))
 
 	id := stableEventID(rec, sanitised)
 	summary := buildSummary(rec.Stream, rec.Container, rec.Pod, sanitised)
@@ -299,9 +317,12 @@ func Translate(rec LineRecord) (schema.Event, error) {
 // The returned slice is freshly allocated; it never aliases the input
 // slice's backing array, so callers can safely retain a reference even
 // if the input came from a scanner's reusable buffer.
-func sanitizeLine(line []byte) (out []byte, replaced bool, truncated bool) {
-	if len(line) > MaxLineBytes {
-		line = line[:MaxLineBytes]
+func sanitizeLine(line []byte, max int) (out []byte, replaced bool, truncated bool) {
+	if max <= 0 {
+		max = MaxLineBytes
+	}
+	if len(line) > max {
+		line = line[:max]
 		truncated = true
 	}
 	if utf8.Valid(line) {
@@ -397,6 +418,21 @@ func buildTags(stream, container string, truncated, replaced bool, labels map[st
 		}
 	}
 	return append([]string(nil), tags...)
+}
+
+// effectiveMaxLineBytes returns the per-record effective cap. Zero
+// uses the package default (MaxLineBytes constant, 64 KiB). Any value
+// below 1 KiB is clamped up to 1 KiB so an operator misconfiguration
+// in the chart values cannot wire through a cap that breaks the bench
+// gate or starves the Sigma engine of context.
+func effectiveMaxLineBytes(override int) int {
+	if override <= 0 {
+		return MaxLineBytes
+	}
+	if override < 1024 {
+		return 1024
+	}
+	return override
 }
 
 // labelHasAllowedPrefix returns true when k starts with any prefix in

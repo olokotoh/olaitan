@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -93,6 +92,22 @@ func runApplogSidecar(ctx context.Context, args []string, stderr io.Writer) int 
 			return 1
 		}
 		cfg.ChannelBuffer = n
+	}
+	if v := os.Getenv("OLAITAN_APPLOG_MAX_LINE_BYTES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			log.Error("startup: OLAITAN_APPLOG_MAX_LINE_BYTES not a valid int", "value", v, "err", err)
+			return 1
+		}
+		cfg.MaxLineBytesOverride = n
+	}
+	if v := os.Getenv("OLAITAN_APPLOG_PUBLISH_STALL_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			log.Error("startup: OLAITAN_APPLOG_PUBLISH_STALL_TIMEOUT not a valid duration", "value", v, "err", err)
+			return 1
+		}
+		cfg.PublishStallTimeout = d
 	}
 	if v := os.Getenv("OLAITAN_APPLOG_STALENESS_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -199,6 +214,17 @@ func runApplogWebhook(ctx context.Context, args []string, stderr io.Writer) int 
 		TLSKeyFile:       key,
 		UseNativeSidecar: useNative,
 		SidecarImage:     os.Getenv("OLAITAN_WEBHOOK_SIDECAR_IMAGE"),
+		// Per-Pod sidecar-runtime knobs surface to the webhook as
+		// env vars and are forwarded into the injection patch's env
+		// list so the sidecar container picks them up via the
+		// downward API at start-up. Empty values fall through to the
+		// adapter's own defaults.
+		SidecarStdoutPath:          os.Getenv("OLAITAN_WEBHOOK_SIDECAR_STDOUT_PATH"),
+		SidecarStderrPath:          os.Getenv("OLAITAN_WEBHOOK_SIDECAR_STDERR_PATH"),
+		SidecarChannelBuffer:       os.Getenv("OLAITAN_WEBHOOK_SIDECAR_CHANNEL_BUFFER"),
+		SidecarMaxLineBytes:        os.Getenv("OLAITAN_WEBHOOK_SIDECAR_MAX_LINE_BYTES"),
+		SidecarPublishStallTimeout: os.Getenv("OLAITAN_WEBHOOK_SIDECAR_PUBLISH_STALL_TIMEOUT"),
+		SidecarStalenessTimeout:    os.Getenv("OLAITAN_WEBHOOK_SIDECAR_STALENESS_TIMEOUT"),
 	}
 
 	srv, err := applog.NewWebhook(cfg, log)
@@ -249,7 +275,18 @@ func parseLabelsFromEnv() map[string]string {
 		}
 		k := strings.TrimSpace(line[:eq])
 		v := strings.TrimSpace(line[eq+1:])
-		v = strings.Trim(v, `"`)
+		// Downward-API projected label files quote values per the
+		// Kubernetes contract (key="value"). strconv.Unquote unwraps
+		// the surrounding quotes AND interprets backslash escapes
+		// (e.g. \" within a value); strings.Trim(`"`) erased the
+		// quotes but left embedded escapes raw. Fall back to the raw
+		// value when Unquote rejects the form (some operators write
+		// unquoted values).
+		if unquoted, err := strconv.Unquote(v); err == nil {
+			v = unquoted
+		} else {
+			v = strings.Trim(v, `"`)
+		}
 		if k == "" {
 			continue
 		}
@@ -260,21 +297,3 @@ func parseLabelsFromEnv() map[string]string {
 	}
 	return out
 }
-
-// _ is a build-time assertion that the runApplog* functions match the
-// switch-case dispatch signatures used in main.go. Without this the
-// signatures could drift silently.
-var (
-	_ = func(ctx context.Context, args []string, stderr io.Writer) int {
-		return runApplogSidecar(ctx, args, stderr)
-	}
-	_ = func(ctx context.Context, args []string, stderr io.Writer) int {
-		return runApplogWebhook(ctx, args, stderr)
-	}
-
-	// duration is referenced via fmt.Sprintf in helper paths (kept to
-	// avoid an unused-import lint when the optional time/strconv
-	// branches above are unreachable in a stripped build).
-	_ time.Duration
-	_ = fmt.Sprintf
-)

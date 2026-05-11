@@ -50,8 +50,9 @@ type Config struct {
 
 	// Container is the application (peer) container name. Populated
 	// from the OLAITAN_TARGET_CONTAINER env var injected by the
-	// admission webhook (or, when the env var is unset, defaults to
-	// the first non-init container in the spec). Required.
+	// admission webhook with the peer container name selected at
+	// admission time (see internal/admission/applog.selectPeerContainer).
+	// Required and non-empty: New() rejects zero-value Container.
 	Container string
 
 	// Labels are the workload pod's labels for the tag-forwarding
@@ -143,9 +144,20 @@ type Adapter struct {
 	translateErrors atomic.Int64
 
 	// publishDrops counts events whose publish attempt returned a
-	// permanent error (oversize, JetStream-disabled). Story 1.12 will
-	// bind to a Prometheus counter.
+	// permanent error (oversize, JetStream-disabled) OR exhausted the
+	// bounded transient retry budget. Either disposition is "this
+	// event was dropped, the adapter continues" so the operator
+	// surface treats them uniformly. Story 1.12 will bind to a
+	// Prometheus counter.
 	publishDrops atomic.Int64
+
+	// lostOnShutdown counts events whose publishWithRetry was
+	// cancelled mid-flight by ctx.Done() before NATS persisted them.
+	// Distinct from publishDrops (which is a per-event terminal
+	// decision) because lostOnShutdown is a one-shot shutdown-time
+	// loss the operator may want to alarm on separately. Story 1.12
+	// will bind to a Prometheus counter.
+	lostOnShutdown atomic.Int64
 
 	// shed is the back-pressure shed-state tracker for the line
 	// channel. Both reader goroutines share it; the consumer drains
@@ -216,10 +228,12 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 	}
 
 	a := &Adapter{
-		cfg:   cfg,
-		pub:   nc,
-		log:   log,
-		shed:  newShedState(cfg.ChannelBuffer),
+		cfg: cfg,
+		pub: nc,
+		log: log,
+		shed: newShedState(cfg.ChannelBuffer).
+			withLogger(log).
+			withStallTimeout(cfg.PublishStallTimeout),
 		nowFn: time.Now,
 	}
 	// Default tail functions point at runFileTail with the configured
@@ -232,12 +246,15 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 
 // defaultFileTail returns a closure that invokes runFileTail with the
 // configured path and the adapter's per-stream offset counter,
-// recBuilder, and shedding state.
+// recBuilder, and shedding state. The closure also threads
+// recordReaderErr into runFileTail so per-line tail errors stamp the
+// watchdog's recent-error baseline (otherwise only function-return
+// errors would stamp, which never fires while t.Lines stays open).
 func (a *Adapter) defaultFileTail(stream, path string) func(ctx context.Context, sink chan<- LineRecord) error {
 	off := &atomic.Int64{}
 	rb := a.recBuilder()
 	return func(ctx context.Context, sink chan<- LineRecord) error {
-		err := runFileTail(ctx, path, stream, sink, a.shed, off, a.nowFn, rb, a.log)
+		err := runFileTail(ctx, path, stream, sink, a.shed, off, a.nowFn, rb, a.log, a.recordReaderErr)
 		if err != nil {
 			a.recordReaderErr()
 		}
@@ -253,15 +270,17 @@ func (a *Adapter) recBuilder() func(stream string, line []byte, ts time.Time, of
 	pod := a.cfg.Pod
 	container := a.cfg.Container
 	labels := a.cfg.Labels
+	maxLine := a.cfg.MaxLineBytesOverride
 	return func(stream string, line []byte, ts time.Time, offset int64) LineRecord {
 		return LineRecord{
-			Line:      append([]byte(nil), line...),
-			Stream:    stream,
-			Timestamp: ts,
-			Pod:       pod,
-			Container: container,
-			Offset:    offset,
-			Labels:    labels,
+			Line:         append([]byte(nil), line...),
+			Stream:       stream,
+			Timestamp:    ts,
+			Pod:          pod,
+			Container:    container,
+			Offset:       offset,
+			Labels:       labels,
+			MaxLineBytes: maxLine,
 		}
 	}
 }
@@ -303,6 +322,11 @@ func (a *Adapter) LinesShed() int64 {
 	return a.shed.LinesShed()
 }
 
+// LostOnShutdown returns the cumulative count of events whose
+// publishWithRetry was cancelled mid-flight by ctx.Done. Exposed for
+// Story 1.12's Prometheus surface.
+func (a *Adapter) LostOnShutdown() int64 { return a.lostOnShutdown.Load() }
+
 // Run blocks until ctx is cancelled or every reader goroutine has
 // exited. The adapter owns three goroutines under an errgroup: one
 // tailer per stream (stdout, stderr) plus a consumer that drains the
@@ -338,9 +362,14 @@ func (a *Adapter) Run(ctx context.Context) (runErr error) {
 
 	lineCh := make(chan LineRecord, a.cfg.ChannelBuffer)
 
-	// Watchdog goroutine. Tied to a child context so it tears down
-	// cleanly when the errgroup unwinds.
-	wdCtx, wdCancel := context.WithCancel(ctx)
+	g, gctx := errgroup.WithContext(ctx)
+
+	// Watchdog goroutine. Derived from gctx (NOT the outer ctx) so a
+	// sibling consume / tail panic that fires errgroup cancellation
+	// stops the watchdog atomically. If the watchdog ran off the outer
+	// ctx, it could MarkUnhealthy AFTER the panic-recovery's
+	// MarkUnhealthy, overwriting the more informative panic message.
+	wdCtx, wdCancel := context.WithCancel(gctx)
 	defer wdCancel()
 	watchdogDone := make(chan struct{})
 	go func() {
@@ -348,7 +377,6 @@ func (a *Adapter) Run(ctx context.Context) (runErr error) {
 		a.runStalenessWatchdog(wdCtx)
 	}()
 
-	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
 		return a.runWithRecover("stdout-tail", func() error { return a.stdoutTailFn(gctx, lineCh) })
 	})
@@ -428,9 +456,25 @@ func (a *Adapter) consume(ctx context.Context, lineCh <-chan LineRecord) error {
 					"container", rec.Container)
 				continue
 			}
-			t := a.nowFn()
-			a.lastEventTime.Store(&t)
 			if perr := a.publishWithRetry(ctx, ev); perr != nil {
+				// Distinguish three failure shapes:
+				//  1. ctx already cancelled -- shutdown loss; count
+				//     separately and exit the loop cleanly.
+				//  2. retry.Permanent terminal -- per-event drop.
+				//  3. retry budget exhausted on transient errors --
+				//     also drop+continue (treating retry-exhaustion as
+				//     a tear-down failure-mode would amplify a
+				//     short-lived NATS hiccup into a full sidecar
+				//     bounce, losing every in-flight line for the
+				//     duration of the restart).
+				if errors.Is(perr, context.Canceled) || errors.Is(perr, context.DeadlineExceeded) {
+					a.lostOnShutdown.Add(1)
+					a.log.Warn("applog: publish lost on shutdown",
+						"err", perr,
+						"event_id", ev.ID,
+						"stream", rec.Stream)
+					return nil
+				}
 				if isPermanentPublishError(perr) {
 					a.publishDrops.Add(1)
 					a.log.Error("applog: publish dropped (permanent, per-event)",
@@ -439,10 +483,24 @@ func (a *Adapter) consume(ctx context.Context, lineCh <-chan LineRecord) error {
 						"stream", rec.Stream)
 					continue
 				}
-				// Transient persistent failure: tear the consumer so
-				// the errgroup unwinds and Run returns the error.
-				return fmt.Errorf("applog: publish: %w", perr)
+				// Retry budget exhausted on transient errors. Drop and
+				// continue. A persistent NATS outage will surface to
+				// the operator via the staleness watchdog when no
+				// successful publish has stamped lastEventTime for the
+				// staleness window AND readerErrAt is also stale.
+				a.publishDrops.Add(1)
+				a.log.Error("applog: publish dropped (retry budget exhausted)",
+					"err", perr,
+					"event_id", ev.ID,
+					"stream", rec.Stream)
+				continue
 			}
+			// Stamp lastEventTime ONLY after a successful publish so
+			// the watchdog cannot be fooled by a sustained permanent
+			// error stream (every translate stamping a fresh
+			// lastEventTime even though no event reaches JetStream).
+			t := a.nowFn()
+			a.lastEventTime.Store(&t)
 			// First successful publish: flip healthy. Subsequent
 			// publishes are no-op-equivalent at the tracker layer
 			// (MarkHealthy is idempotent).
@@ -494,9 +552,18 @@ func (a *Adapter) runStalenessWatchdog(ctx context.Context) {
 			a.health.MarkUnhealthy(fmt.Errorf("applog: watchdog panic: %v", r))
 		}
 	}()
+	// Period policy: half the staleness window so a flip happens at
+	// most one period after the threshold is crossed, but capped at
+	// 30 s so an operator-tuned StalenessTimeout above 60 s does not
+	// stretch the period beyond useful reactivity, and floored at
+	// 100 ms so sub-second StalenessTimeout values (test rigs) still
+	// drive the ticker.
 	period := a.cfg.StalenessTimeout / 2
-	if period <= 0 {
+	if period <= 0 || period > 30*time.Second {
 		period = 30 * time.Second
+	}
+	if period < 100*time.Millisecond {
+		period = 100 * time.Millisecond
 	}
 	ticker := time.NewTicker(period)
 	defer ticker.Stop()
