@@ -575,6 +575,27 @@ func TestStreamConfigsCoversContainerdLifecycleSubject(t *testing.T) {
 		subjects.RawRuntime)
 }
 
+// TestStreamConfigsCoversAppLogSubject asserts that the EVENTS_RAW
+// stream coverage includes the per-source subject the Story 1.9
+// application log sidecar adapter publishes on. The assertion is
+// symbolic against subjects.RawAppLog (rather than the literal string)
+// so a future rename flowing through the constant keeps the regression
+// visible. The wildcard test above covers the general case; this test
+// names the binding so a reader looking for "where does FR5 prove its
+// raw-subject coverage?" finds it directly.
+func TestStreamConfigsCoversAppLogSubject(t *testing.T) {
+	configs := natsclient.StreamConfigs()
+	for _, cfg := range configs {
+		for _, subj := range cfg.Subjects {
+			if subj == subjects.RawAppLog || subj == subjects.RawPrefix+">" {
+				return
+			}
+		}
+	}
+	t.Fatalf("StreamConfigs: no stream covers subjects.RawAppLog (%q) or its wildcard parent",
+		subjects.RawAppLog)
+}
+
 func TestStreamConfigsDeepCopy(t *testing.T) {
 	a := natsclient.StreamConfigs()
 	b := natsclient.StreamConfigs()

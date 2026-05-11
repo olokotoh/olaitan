@@ -101,6 +101,29 @@ func TestRunRing_MissingConfig_Exits1(t *testing.T) {
 	}
 }
 
+func TestRun_DispatchesAppLogSidecar_MissingEnv_Exits1(t *testing.T) {
+	// applog-sidecar dispatch must route to runApplogSidecar which
+	// fail-fasts on missing required env vars. The test asserts the
+	// dispatch case path (not the env-var validation behaviour itself,
+	// which has its own coverage in cmd_applog_test.go if added).
+	for _, name := range []string{"K8S_POD_NAME", "K8S_POD_NAMESPACE", "K8S_POD_UID", "K8S_NODE_NAME", "OLAITAN_TARGET_CONTAINER", "NATS_URL"} {
+		t.Setenv(name, "")
+	}
+	code := run([]string{"applog-sidecar"}, os.Stderr)
+	if code != 1 {
+		t.Errorf("applog-sidecar without env: got %d want 1", code)
+	}
+}
+
+func TestRun_DispatchesAppLogWebhook_MissingEnv_Exits1(t *testing.T) {
+	t.Setenv("OLAITAN_WEBHOOK_TLS_CERT", "")
+	t.Setenv("OLAITAN_WEBHOOK_TLS_KEY", "")
+	code := run([]string{"applog-webhook"}, os.Stderr)
+	if code != 1 {
+		t.Errorf("applog-webhook without env: got %d want 1", code)
+	}
+}
+
 func TestRunRing_GracefulShutdown(t *testing.T) {
 	// Swap healthAddr to a free port for this test — production uses
 	// :8080 which tests mustn't bind. Restore after.

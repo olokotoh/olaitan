@@ -7,13 +7,16 @@ require (
 	github.com/fsnotify/fsnotify v1.8.0
 	github.com/nats-io/nats-server/v2 v2.11.15
 	github.com/nats-io/nats.go v1.50.0
+	github.com/nxadm/tail v1.4.8
 	github.com/redis/go-redis/v9 v9.18.0
 	golang.org/x/sync v0.20.0
 	google.golang.org/grpc v1.81.0
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
+	k8s.io/api v0.29.10
 	k8s.io/apimachinery v0.29.10
 	k8s.io/apiserver v0.29.10
+	k8s.io/cri-api v0.29.10
 )
 
 require (
@@ -41,9 +44,8 @@ require (
 	golang.org/x/time v0.15.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260226221140-a57be14db171 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
+	gopkg.in/tomb.v1 v1.0.0-20141024135613-dd632973f1e7 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
-	k8s.io/api v0.29.10 // indirect
-	k8s.io/cri-api v0.29.10 // indirect
 	k8s.io/klog/v2 v2.110.1 // indirect
 	k8s.io/utils v0.0.0-20230726121419-3b25d923346b // indirect
 	sigs.k8s.io/json v0.0.0-20221116044647-bc3834ca7abd // indirect
