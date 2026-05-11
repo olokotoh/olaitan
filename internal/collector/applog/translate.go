@@ -88,6 +88,15 @@ var minValidEventTime = time.Date(2010, time.January, 1, 0, 0, 0, 0, time.UTC)
 // common guard across all sources).
 const maxFutureSkew = 24 * time.Hour
 
+// MaxLineBytesAbsoluteCap is the operator-override upper bound. The
+// EVENTS_RAW JetStream stream is configured with MaxMsgSize = 256 KiB
+// (see internal/nats/streams.go); the cap leaves 64 KiB of headroom
+// for the schema.Event envelope (Pod, Tags, Summary, timestamp, source,
+// category, hashed ID). Config.Validate rejects an override above this
+// bound; effectiveMaxLineBytes clamps defensively as a second line of
+// defence in case the override path is bypassed by a future caller.
+const MaxLineBytesAbsoluteCap = 192 * 1024
+
 // MaxLineBytes is the per-line payload cap applied at translate time.
 // Lines longer than the cap are truncated to MaxLineBytes; the truncated
 // suffix is dropped and a "truncated:true" tag is appended. The cap
@@ -424,13 +433,19 @@ func buildTags(stream, container string, truncated, replaced bool, labels map[st
 // uses the package default (MaxLineBytes constant, 64 KiB). Any value
 // below 1 KiB is clamped up to 1 KiB so an operator misconfiguration
 // in the chart values cannot wire through a cap that breaks the bench
-// gate or starves the Sigma engine of context.
+// gate or starves the Sigma engine of context. Any value above
+// MaxLineBytesAbsoluteCap is clamped down so a caller that bypassed
+// Config.Validate cannot push the published event above the
+// EVENTS_RAW stream's MaxMsgSize after envelope overhead.
 func effectiveMaxLineBytes(override int) int {
 	if override <= 0 {
 		return MaxLineBytes
 	}
 	if override < 1024 {
 		return 1024
+	}
+	if override > MaxLineBytesAbsoluteCap {
+		return MaxLineBytesAbsoluteCap
 	}
 	return override
 }

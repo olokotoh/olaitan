@@ -103,7 +103,10 @@ func Inject(pod *corev1.Pod, opts InjectOptions) ([]byte, error) {
 	// the field-ref resolves to empty and the sidecar fails-fast on
 	// start-up).
 	peerContainerName := pod.Spec.Containers[peerIdx].Name
-	sidecar := buildSidecarContainer(opts, peerContainerName)
+	sidecar, err := buildSidecarContainer(opts, peerContainerName)
+	if err != nil {
+		return nil, err
+	}
 
 	ops := make([]jsonPatchOp, 0, 6)
 
@@ -142,7 +145,13 @@ func Inject(pod *corev1.Pod, opts InjectOptions) ([]byte, error) {
 	// Step 3: mount the shared volume into the peer container, again
 	// guarding against an existing mount at the same path (a previous
 	// admission cycle, or operator hand-edit, may already have wired
-	// it in).
+	// it in). The peer mount is intentionally read-write (the default
+	// when ReadOnly is unset): the cooperation contract documented in
+	// APPLOG.md requires the application container to write its
+	// stdout/stderr to /var/log/app/stdout.log and stderr.log, which
+	// the sidecar then tails read-only. The repo's general
+	// read-only-mount preference does not apply here because making
+	// this mount read-only would break the FR5 ingest path.
 	peer := pod.Spec.Containers[peerIdx]
 	if !hasMountAtPath(peer.VolumeMounts, SharedVolumeMountPath) {
 		mount := corev1.VolumeMount{
@@ -241,7 +250,7 @@ func selectPeerContainer(pod *corev1.Pod) (int, error) {
 // to an annotation, because the common case is that no annotation is
 // present and the field-ref would resolve to empty (which would then
 // fail-fast in the sidecar's startup guard).
-func buildSidecarContainer(opts InjectOptions, peerContainerName string) corev1.Container {
+func buildSidecarContainer(opts InjectOptions, peerContainerName string) (corev1.Container, error) {
 	env := []corev1.EnvVar{
 		{Name: "K8S_POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
 		{Name: "K8S_POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
@@ -270,6 +279,10 @@ func buildSidecarContainer(opts InjectOptions, peerContainerName string) corev1.
 		env = append(env, corev1.EnvVar{Name: "OLAITAN_APPLOG_STALENESS_TIMEOUT", Value: v})
 	}
 
+	resources, err := buildResourceRequirements(opts)
+	if err != nil {
+		return corev1.Container{}, err
+	}
 	c := corev1.Container{
 		Name:  SidecarContainerName,
 		Image: opts.SidecarImage,
@@ -284,7 +297,7 @@ func buildSidecarContainer(opts InjectOptions, peerContainerName string) corev1.
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: SharedVolumeName, MountPath: SharedVolumeMountPath, ReadOnly: true},
 		},
-		Resources: buildResourceRequirements(opts),
+		Resources: resources,
 		SecurityContext: &corev1.SecurityContext{
 			// Pod Security Standards "restricted" baseline plus the
 			// nonroot UID/GID pair from the distroless image. Without
@@ -308,7 +321,7 @@ func buildSidecarContainer(opts InjectOptions, peerContainerName string) corev1.
 		policy := corev1.ContainerRestartPolicyAlways
 		c.RestartPolicy = &policy
 	}
-	return c
+	return c, nil
 }
 
 // ptrInt64 returns a pointer to the supplied int64. Used for
@@ -317,39 +330,46 @@ func buildSidecarContainer(opts InjectOptions, peerContainerName string) corev1.
 func ptrInt64(v int64) *int64 { return &v }
 
 // buildResourceRequirements assembles ResourceRequirements from the
-// opts; empty strings fall back to the documented defaults.
-func buildResourceRequirements(opts InjectOptions) corev1.ResourceRequirements {
+// opts; empty strings fall back to the documented defaults. A
+// non-empty value that fails resource.ParseQuantity is surfaced as an
+// error so the webhook fails the admission request loudly instead of
+// silently injecting empty Requests/Limits (which would behave very
+// differently from the documented defaults and is hard to diagnose
+// after the fact).
+func buildResourceRequirements(opts InjectOptions) (corev1.ResourceRequirements, error) {
 	requests := corev1.ResourceList{}
 	limits := corev1.ResourceList{}
-	if v := opts.SidecarCPURequest; v != "" {
-		if q, err := resource.ParseQuantity(v); err == nil {
-			requests[corev1.ResourceCPU] = q
+	parse := func(field, val, fallback string) (resource.Quantity, error) {
+		if val == "" {
+			return resource.MustParse(fallback), nil
 		}
-	} else {
-		requests[corev1.ResourceCPU] = resource.MustParse("10m")
-	}
-	if v := opts.SidecarMemoryRequest; v != "" {
-		if q, err := resource.ParseQuantity(v); err == nil {
-			requests[corev1.ResourceMemory] = q
+		q, err := resource.ParseQuantity(val)
+		if err != nil {
+			return resource.Quantity{}, fmt.Errorf("applog/inject: invalid %s quantity %q: %w", field, val, err)
 		}
-	} else {
-		requests[corev1.ResourceMemory] = resource.MustParse("32Mi")
+		return q, nil
 	}
-	if v := opts.SidecarCPULimit; v != "" {
-		if q, err := resource.ParseQuantity(v); err == nil {
-			limits[corev1.ResourceCPU] = q
-		}
-	} else {
-		limits[corev1.ResourceCPU] = resource.MustParse("100m")
+	q, err := parse("SidecarCPURequest", opts.SidecarCPURequest, "10m")
+	if err != nil {
+		return corev1.ResourceRequirements{}, err
 	}
-	if v := opts.SidecarMemoryLimit; v != "" {
-		if q, err := resource.ParseQuantity(v); err == nil {
-			limits[corev1.ResourceMemory] = q
-		}
-	} else {
-		limits[corev1.ResourceMemory] = resource.MustParse("128Mi")
+	requests[corev1.ResourceCPU] = q
+	q, err = parse("SidecarMemoryRequest", opts.SidecarMemoryRequest, "32Mi")
+	if err != nil {
+		return corev1.ResourceRequirements{}, err
 	}
-	return corev1.ResourceRequirements{Requests: requests, Limits: limits}
+	requests[corev1.ResourceMemory] = q
+	q, err = parse("SidecarCPULimit", opts.SidecarCPULimit, "100m")
+	if err != nil {
+		return corev1.ResourceRequirements{}, err
+	}
+	limits[corev1.ResourceCPU] = q
+	q, err = parse("SidecarMemoryLimit", opts.SidecarMemoryLimit, "128Mi")
+	if err != nil {
+		return corev1.ResourceRequirements{}, err
+	}
+	limits[corev1.ResourceMemory] = q
+	return corev1.ResourceRequirements{Requests: requests, Limits: limits}, nil
 }
 
 func ptrTrue() *bool  { v := true; return &v }

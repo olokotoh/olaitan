@@ -40,6 +40,14 @@ no host-level operations.
 {{- fail (printf "applogSidecar.maxLineBytes must be >= 1024 (got %d)" (int .Values.applogSidecar.maxLineBytes)) -}}
 {{- end -}}
 {{/*
+  Upper bound: 192 KiB = 196608. Mirrors the adapter's
+  MaxLineBytesAbsoluteCap, which leaves 64 KiB envelope headroom under
+  the EVENTS_RAW stream's 256 KiB MaxMsgSize.
+*/}}
+{{- if gt (int .Values.applogSidecar.maxLineBytes) 196608 -}}
+{{- fail (printf "applogSidecar.maxLineBytes must be <= 196608 (got %d); the cap leaves envelope headroom below EVENTS_RAW MaxMsgSize" (int .Values.applogSidecar.maxLineBytes)) -}}
+{{- end -}}
+{{/*
   useNativeSidecar default-true coercion: Helm's `default` returns
   the default whenever the given value is a Go zero-value, so
   `default true false` would return `true` (bool zero-value is

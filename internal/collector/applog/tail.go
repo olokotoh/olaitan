@@ -317,9 +317,15 @@ func runReaderTail(
 //
 // If the line is longer than maxLine, the first maxLine bytes are
 // returned and the remainder up to the next newline is silently
-// discarded. The truncation flag is implicit in the line length being
-// exactly maxLine; the caller (Translate) detects this via the
-// MaxLineBytes cap downstream.
+// discarded.
+//
+// maxLine here is scannerBufferLimit (1 MiB). Translate then applies a
+// second, per-record cap from Config.MaxLineBytesOverride which
+// Config.Validate bounds at MaxLineBytesAbsoluteCap (192 KiB). Because
+// the translate-side cap is always strictly less than scannerBufferLimit,
+// any reader-side truncation here would already have been preempted by
+// the translate-side truncation, which is what sets the truncated:true
+// tag. No separate reader-truncated flag is needed.
 //
 // Returns (nil, io.EOF) when the underlying reader is fully drained
 // with no trailing partial line. Returns (partial, nil) when br

@@ -165,16 +165,18 @@ func runApplogSidecar(ctx context.Context, args []string, stderr io.Writer) int 
 //
 // Required env vars:
 //
-//   - OLAITAN_WEBHOOK_TLS_CERT  filesystem path to the TLS server cert
-//   - OLAITAN_WEBHOOK_TLS_KEY   filesystem path to the TLS server key
+//   - OLAITAN_WEBHOOK_TLS_CERT     filesystem path to the TLS server cert
+//   - OLAITAN_WEBHOOK_TLS_KEY      filesystem path to the TLS server key
+//   - OLAITAN_WEBHOOK_SIDECAR_IMAGE  image:tag the Helm chart supplies for the
+//     injected sidecar. NewWebhook rejects an empty value because the
+//     injected Pod would otherwise have no image to run; we fail-fast
+//     on startup here so the operator gets a clear log line rather
+//     than burying the failure inside NewWebhook.
 //
 // Optional env vars (sane defaults):
 //
-//   - OLAITAN_WEBHOOK_LISTEN_ADDR     default :8443
-//   - OLAITAN_WEBHOOK_USE_NATIVE_SIDECAR  default true (KEP-753 native sidecar)
-//   - OLAITAN_WEBHOOK_SIDECAR_IMAGE   default ""; when empty the
-//     webhook reads the image from a downward-API env passthrough so
-//     the chart can supply image:tag at deploy time.
+//   - OLAITAN_WEBHOOK_LISTEN_ADDR          default :8443
+//   - OLAITAN_WEBHOOK_USE_NATIVE_SIDECAR   default true (KEP-753 native sidecar)
 func runApplogWebhook(ctx context.Context, args []string, stderr io.Writer) int {
 	fs := flag.NewFlagSet("olaitan applog-webhook", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -192,6 +194,11 @@ func runApplogWebhook(ctx context.Context, args []string, stderr io.Writer) int 
 	key := os.Getenv("OLAITAN_WEBHOOK_TLS_KEY")
 	if cert == "" || key == "" {
 		log.Error("startup: OLAITAN_WEBHOOK_TLS_CERT and OLAITAN_WEBHOOK_TLS_KEY must both be set")
+		return 1
+	}
+	sidecarImage := os.Getenv("OLAITAN_WEBHOOK_SIDECAR_IMAGE")
+	if sidecarImage == "" {
+		log.Error("startup: OLAITAN_WEBHOOK_SIDECAR_IMAGE must be set (Helm chart supplies it from .Values.image)")
 		return 1
 	}
 
@@ -213,7 +220,7 @@ func runApplogWebhook(ctx context.Context, args []string, stderr io.Writer) int 
 		TLSCertFile:      cert,
 		TLSKeyFile:       key,
 		UseNativeSidecar: useNative,
-		SidecarImage:     os.Getenv("OLAITAN_WEBHOOK_SIDECAR_IMAGE"),
+		SidecarImage:     sidecarImage,
 		// Per-Pod sidecar-runtime knobs surface to the webhook as
 		// env vars and are forwarded into the injection patch's env
 		// list so the sidecar container picks them up via the

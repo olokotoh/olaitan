@@ -76,9 +76,11 @@ type Config struct {
 	PublishStallTimeout time.Duration
 
 	// MaxLineBytesOverride lets the operator tune the per-event line
-	// cap. Zero uses the default MaxLineBytes (64 KiB). Capped above
-	// at 256 KiB to stay below JetStream's MaxMsgSize after envelope
-	// overhead.
+	// cap. Zero uses the default MaxLineBytes (64 KiB). Validate
+	// rejects values above MaxLineBytesAbsoluteCap (192 KiB), leaving
+	// 64 KiB of headroom below the EVENTS_RAW stream's 256 KiB
+	// MaxMsgSize for the Pod, Tags, Summary, and timestamp envelope.
+	// effectiveMaxLineBytes also clamps defensively at the same cap.
 	MaxLineBytesOverride int
 
 	// PublishRetry is the bounded inner retry for transient NATS
@@ -207,6 +209,9 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 	}
 	if cfg.MaxLineBytesOverride != 0 && cfg.MaxLineBytesOverride < 1024 {
 		return nil, fmt.Errorf("applog: new: max line bytes must be >= 1024 when set (got %d)", cfg.MaxLineBytesOverride)
+	}
+	if cfg.MaxLineBytesOverride > MaxLineBytesAbsoluteCap {
+		return nil, fmt.Errorf("applog: new: max line bytes must be <= %d (got %d); the cap leaves envelope headroom below EVENTS_RAW MaxMsgSize", MaxLineBytesAbsoluteCap, cfg.MaxLineBytesOverride)
 	}
 	if cfg.PublishStallTimeout < 0 {
 		return nil, fmt.Errorf("applog: new: publish stall timeout must be >= 0 (got %s)", cfg.PublishStallTimeout)

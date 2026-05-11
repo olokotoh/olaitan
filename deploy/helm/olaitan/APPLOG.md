@@ -11,7 +11,7 @@ When `applogSidecar.enabled=true` the chart deploys four resources
 beyond the agent DaemonSet:
 
 1. `Deployment <fullname>-applog-injector` running the multi-call
-   binary subcommand `olaitan applog-injector`. Default replica count
+   binary subcommand `olaitan applog-webhook`. Default replica count
    is `2` for high availability per the K8s admission-webhook good-
    practice guidance.
 2. `Service <fullname>-applog-injector` (ClusterIP, port 443 -> sidecar

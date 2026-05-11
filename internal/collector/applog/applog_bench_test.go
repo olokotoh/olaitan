@@ -28,10 +28,17 @@ import (
 // Story 1.7 / 1.8 closure pattern (P33 retrofitted into the original
 // commit here).
 //
-// b.ReportMetric is used so `go test -bench=. -benchmem` displays the
-// p50 / p99 numbers alongside the standard Go bench output. ns/op is
-// suppressed (Story 1.6 follow-up patch precedent: ns/op for an
-// asynchronous pipeline is nonsensical).
+// This file is guarded by `//go:build integration` so the embedded
+// NATS server is not pulled into the default unit-test compile. Run
+// the benchmark with:
+//
+//	go test -tags=integration -bench=BenchmarkAdapter_PublishLatency \
+//	    -run=^$ -benchtime=10s ./internal/collector/applog/
+//
+// b.ReportMetric is used so the run displays the p50 / p99 numbers
+// alongside the standard Go bench output. ns/op is suppressed (Story
+// 1.6 follow-up patch precedent: ns/op for an asynchronous pipeline
+// is nonsensical).
 func BenchmarkAdapter_PublishLatency(b *testing.B) {
 	// Stand up an embedded NATS with JetStream in-process.
 	tmpDir := b.TempDir()
