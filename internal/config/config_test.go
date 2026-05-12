@@ -285,6 +285,137 @@ func TestValidateTable(t *testing.T) {
 			},
 			"analyst.subtasks.available_types",
 		},
+		{
+			"calico-enabled-no-addr",
+			func(c *config.Config) {
+				c.Detection.Sources.Calico = config.CalicoSourceConfig{
+					Enabled:        true,
+					CABundlePath:   "/etc/olaitan/cni/ca.crt",
+					ClientCertPath: "/etc/olaitan/cni/client.crt",
+					ClientKeyPath:  "/etc/olaitan/cni/client.key",
+				}
+			},
+			"detection.sources.calico.goldmane_addr",
+		},
+		{
+			"calico-enabled-no-ca",
+			func(c *config.Config) {
+				c.Detection.Sources.Calico = config.CalicoSourceConfig{
+					Enabled:        true,
+					GoldmaneAddr:   "goldmane.calico-system.svc:7443",
+					ClientCertPath: "/etc/olaitan/cni/client.crt",
+					ClientKeyPath:  "/etc/olaitan/cni/client.key",
+				}
+			},
+			"detection.sources.calico.ca_bundle_path",
+		},
+		{
+			"calico-enabled-no-client-cert",
+			func(c *config.Config) {
+				c.Detection.Sources.Calico = config.CalicoSourceConfig{
+					Enabled:       true,
+					GoldmaneAddr:  "goldmane.calico-system.svc:7443",
+					CABundlePath:  "/etc/olaitan/cni/ca.crt",
+					ClientKeyPath: "/etc/olaitan/cni/client.key",
+				}
+			},
+			"detection.sources.calico.client_cert_path",
+		},
+		{
+			"calico-enabled-no-client-key",
+			func(c *config.Config) {
+				c.Detection.Sources.Calico = config.CalicoSourceConfig{
+					Enabled:        true,
+					GoldmaneAddr:   "goldmane.calico-system.svc:7443",
+					CABundlePath:   "/etc/olaitan/cni/ca.crt",
+					ClientCertPath: "/etc/olaitan/cni/client.crt",
+				}
+			},
+			"detection.sources.calico.client_key_path",
+		},
+		{
+			"calico-enabled-max-event-bytes-below-floor",
+			func(c *config.Config) {
+				c.Detection.Sources.Calico = config.CalicoSourceConfig{
+					Enabled:        true,
+					GoldmaneAddr:   "goldmane.calico-system.svc:7443",
+					CABundlePath:   "/etc/olaitan/cni/ca.crt",
+					ClientCertPath: "/etc/olaitan/cni/client.crt",
+					ClientKeyPath:  "/etc/olaitan/cni/client.key",
+					MaxEventBytes:  1024,
+				}
+			},
+			"detection.sources.calico.max_event_bytes",
+		},
+		{
+			"calico-disabled-zero-block-ok",
+			func(c *config.Config) {
+				// Zero block with Enabled=false must not error -- this is
+				// the "operator hasn't touched the chart calicoSensor
+				// block" baseline.
+				c.Detection.Sources.Calico = config.CalicoSourceConfig{}
+			},
+			"", // empty wantSub: expect NO error.
+		},
+		{
+			"calico-aggregation-interval-non-15-rejected",
+			func(c *config.Config) {
+				c.Detection.Sources.Calico = config.CalicoSourceConfig{
+					Enabled:             true,
+					GoldmaneAddr:        "goldmane.calico-system.svc:7443",
+					CABundlePath:        "/etc/olaitan/cni/ca.crt",
+					ClientCertPath:      "/etc/olaitan/cni/client.crt",
+					ClientKeyPath:       "/etc/olaitan/cni/client.key",
+					AggregationInterval: 30,
+				}
+			},
+			"must be 15s per Goldmane proto",
+		},
+		{
+			"calico-start-time-gte-positive-rejected",
+			func(c *config.Config) {
+				positive := int64(60)
+				c.Detection.Sources.Calico = config.CalicoSourceConfig{
+					Enabled:        true,
+					GoldmaneAddr:   "goldmane.calico-system.svc:7443",
+					CABundlePath:   "/etc/olaitan/cni/ca.crt",
+					ClientCertPath: "/etc/olaitan/cni/client.crt",
+					ClientKeyPath:  "/etc/olaitan/cni/client.key",
+					StartTimeGte:   &positive,
+				}
+			},
+			"start_time_gte: must be <= 0",
+		},
+		{
+			"calico-start-time-gte-explicit-zero-ok",
+			func(c *config.Config) {
+				zero := int64(0)
+				c.Detection.Sources.Calico = config.CalicoSourceConfig{
+					Enabled:        true,
+					GoldmaneAddr:   "goldmane.calico-system.svc:7443",
+					CABundlePath:   "/etc/olaitan/cni/ca.crt",
+					ClientCertPath: "/etc/olaitan/cni/client.crt",
+					ClientKeyPath:  "/etc/olaitan/cni/client.key",
+					StartTimeGte:   &zero,
+				}
+			},
+			"", // explicit 0 reaches Goldmane's "now" semantic per proto line 91
+		},
+		{
+			"calico-start-time-gte-negative-ok",
+			func(c *config.Config) {
+				neg := int64(-300)
+				c.Detection.Sources.Calico = config.CalicoSourceConfig{
+					Enabled:        true,
+					GoldmaneAddr:   "goldmane.calico-system.svc:7443",
+					CABundlePath:   "/etc/olaitan/cni/ca.crt",
+					ClientCertPath: "/etc/olaitan/cni/client.crt",
+					ClientKeyPath:  "/etc/olaitan/cni/client.key",
+					StartTimeGte:   &neg,
+				}
+			},
+			"", // negative is relative seconds; -300 = "last 5 minutes"
+		},
 	}
 
 	for _, tt := range tests {
@@ -297,6 +428,13 @@ func TestValidateTable(t *testing.T) {
 			tt.mutate(&cfg)
 
 			err := cfg.Validate()
+			if tt.wantSub == "" {
+				// Sentinel for "this mutation must validate cleanly".
+				if err != nil {
+					t.Fatalf("unexpected validation error: %v", err)
+				}
+				return
+			}
 			if err == nil {
 				t.Fatalf("expected validation error containing %q", tt.wantSub)
 			}

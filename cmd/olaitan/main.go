@@ -31,6 +31,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/olokotoh/olaitan/internal/collector/audit"
+	"github.com/olokotoh/olaitan/internal/collector/cni"
 	"github.com/olokotoh/olaitan/internal/collector/cri"
 	"github.com/olokotoh/olaitan/internal/collector/falco"
 	"github.com/olokotoh/olaitan/internal/config"
@@ -373,6 +374,46 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 		})
 		log.Info("collector: ring 1 wired (containerd cri)",
 			"socket_path", criCfg.SocketPath)
+	}
+
+	// Story 1.10: Calico CNI flow adapter. Gated on the config block
+	// so a chart deploy with calicoSensor.enabled=false (default)
+	// leaves the adapter dormant. Goldmane requires the operator to
+	// have installed Calico v3.31.5+ via the Tigera operator path
+	// (ADR-2026-05-12-01); the agent presents a client cert signed
+	// by the Tigera CA on every connect.
+	if cfg != nil && cfg.Detection.Sources.Calico.Enabled {
+		cniCfg := cni.Config{
+			GoldmaneAddr:        cfg.Detection.Sources.Calico.GoldmaneAddr,
+			ServerName:          cfg.Detection.Sources.Calico.ServerName,
+			CABundlePath:        cfg.Detection.Sources.Calico.CABundlePath,
+			ClientCertPath:      cfg.Detection.Sources.Calico.ClientCertPath,
+			ClientKeyPath:       cfg.Detection.Sources.Calico.ClientKeyPath,
+			DialTimeout:         cfg.Detection.Sources.Calico.DialTimeout.Duration(),
+			StalenessTimeout:    cfg.Detection.Sources.Calico.StalenessTimeout.Duration(),
+			ConnectRetry:        toRetryStrategy(cfg.Detection.Sources.Calico.ConnectRetry),
+			PublishRetry:        toRetryStrategy(cfg.Detection.Sources.Calico.PublishRetry),
+			MaxEventBytes:       cfg.Detection.Sources.Calico.MaxEventBytes,
+			StartTimeGte:        cfg.Detection.Sources.Calico.StartTimeGte,
+			AggregationInterval: cfg.Detection.Sources.Calico.AggregationInterval,
+			Hostname:            nodeName,
+		}
+		cniAdapter, nerr := cni.New(cniCfg, nc, log)
+		if nerr != nil {
+			closeNATS()
+			return fmt.Errorf("collector: cni adapter: %w", nerr)
+		}
+		g.Go(func() error {
+			if err := cniAdapter.Run(ctx); err != nil {
+				if errors.Is(err, context.Canceled) {
+					return nil
+				}
+				return fmt.Errorf("collector: cni run: %w", err)
+			}
+			return nil
+		})
+		log.Info("collector: ring 1 wired (calico cni)",
+			"goldmane_addr", cniCfg.GoldmaneAddr)
 	}
 
 	log.Info("collector: ring 1 wired", "falco_socket", falcoSocket, "node", nodeName)

@@ -311,8 +311,114 @@ containerdSensor:
     jitter: 0.1
     maxAttempts: 3
 
+# --- Calico CNI flow sensor (FR4) ------------------------------------
+# Story 1.10 -- fifth Ring 1 streaming sensor source. Subscribes to
+# the Calico Goldmane gRPC API (`goldmane.Flows.Stream`) over mTLS,
+# translating each FlowResult into a schema.Event of source=network /
+# category=flow. Default-off because Goldmane requires the Tigera
+# operator install path on Calico v3.31.5+; see CNI.md for the full
+# operator workflow and ADR-2026-04-30-01 / ADR-2026-05-12-01 in
+# docs/deferred-decisions.md for the install-path migration rationale.
+#
+# Dual-flag relationship: calicoSensor.enabled here AND
+# detection.sources.calico.enabled in config/olaitan.yaml must both
+# be true for the adapter to run. The chart fails render with a clear
+# message if calicoSensor.enabled=true but TLS material is missing.
+#
+# Security boundary: mTLS-authenticated egress to
+# `goldmane.calico-system.svc:7443` (within-cluster). The agent must
+# present a client cert signed by the Tigera operator's CA. Two
+# provisioning paths are supported (Path A cert-manager, Path B
+# operator-supplied) -- see CNI.md.
+calicoSensor:
+  enabled: false
+
+  # gRPC target for the Calico Goldmane Service. Default matches the
+  # Tigera operator's v3.31.5 install layout. Operators with
+  # non-default cluster install paths override here.
+  goldmaneAddr: "goldmane.calico-system.svc:7443"
+
+  # TLS SNI / verify name presented during the mTLS handshake. Default
+  # matches the cert the Tigera operator issues for Goldmane.
+  serverName: "goldmane.calico-system.svc"
+
+  # FlowStreamRequest knobs. StartTimeGte is negative for "relative
+  # to now" (Goldmane convention; -60 means "replay the last 60s").
+  # An explicit 0 reaches Goldmane's documented "now" semantic per
+  # the v3.31.5 proto contract (goldmane/proto/api.proto line 91:
+  # "A value of zero means 'now'"); pass null / omit to fall back
+  # to the chart default of -60. Goldmane requires AggregationInterval
+  # to be exactly 15s per the same proto contract (line 100: "It
+  # must always be 15s.").
+  startTimeGte: -60
+  aggregationInterval: 15
+
+  # gRPC dial timeout for the initial wait-for-ready handshake.
+  # Bridged into detection.sources.calico.dial_timeout.
+  dialTimeout: "10s"
+
+  # Staleness watchdog threshold. Goldmane flow records are quiet by
+  # design: a cluster with no east-west traffic produces no
+  # FlowResults, so the watchdog only flips MarkUnhealthy when
+  # staleness AND a non-Ready connection coincide. Bridged into
+  # detection.sources.calico.staleness_timeout.
+  stalenessTimeout: "10m"
+
+  # Per-event marshalled size cap. The default of 196608 bytes (192
+  # KiB) leaves 64 KiB of envelope headroom under JetStream's 256 KiB
+  # MaxMsgSize ceiling. Events exceeding this cap are log+dropped at
+  # translate time. Floor 4096; ceiling 262144 (256 KiB). Bridged
+  # into detection.sources.calico.max_event_bytes.
+  maxEventBytes: 196608
+
+  # Outer connect-loop backoff strategy used when the gRPC dial, mTLS
+  # handshake, or stream open fails. Equal-jitter exponential
+  # backoff; max_attempts=0 means unlimited. Bridged into
+  # detection.sources.calico.connect_retry.
+  connectRetry:
+    min: "1s"
+    max: "60s"
+    multiplier: 2.0
+    jitter: 1.0
+    maxAttempts: 0
+
+  # Per-publish bounded retry strategy. Combined with the per-attempt
+  # 2s deadline this caps total transient backoff at ~9s before the
+  # stream loop log+drops. Bridged into
+  # detection.sources.calico.publish_retry.
+  publishRetry:
+    min: "100ms"
+    max: "1s"
+    multiplier: 2.0
+    jitter: 1.0
+    maxAttempts: 3
+
+  # TLS material. Goldmane enforces mTLS; the agent presents a client
+  # cert signed by the Tigera CA on every connect. Two provisioning
+  # paths:
+  #
+  #   Path A (preferred, production): cert-manager issues a
+  #   Certificate against a ClusterIssuer backed by the Tigera CA.
+  #   The chart consumes the resulting Secret directly. Cert rotation
+  #   is automatic. To select Path A, set:
+  #     calicoSensor.tls.certManagerSecretName: <secret-name>
+  #
+  #   Path B (dev sandbox): operator extracts the Tigera CA bundle
+  #   and a client cert from an existing Tigera-issued Secret and
+  #   supplies them base64-encoded here. Cert rotation is manual.
+  #   To select Path B, set tls.caBundle, tls.clientCert, and
+  #   tls.clientKey.
+  #
+  # The chart fails render when calicoSensor.enabled=true and neither
+  # path is configured. See CNI.md for the full provisioning recipe.
+  tls:
+    certManagerSecretName: ""
+    caBundle: ""
+    clientCert: ""
+    clientKey: ""
+
 # --- application log sidecar (FR5) -----------------------------------
-# Story 1.9 -- fifth Ring 1 sensor source. The chart deploys a
+# Story 1.9 -- fourth Ring 1 sensor source (Story 1.10 takes the fifth slot). The chart deploys a
 # MutatingAdmissionWebhook (separate Deployment from the agent
 # DaemonSet) that injects an Olaitan applog sidecar into pods bearing
 # the annotation `olaitan.io/log-sidecar: "enabled"`. The sidecar

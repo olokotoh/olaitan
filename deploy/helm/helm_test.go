@@ -1667,3 +1667,205 @@ func TestApplogSidecarHAReplicaCountDefault(t *testing.T) {
 		t.Errorf("expected replicas: 2 default for HA, got\n%s", snippet(rendered, "applog-webhook"))
 	}
 }
+
+// --- Story 1.10: Calico CNI flow sensor ---------------------------
+
+// calicoSensorPathBArgs returns a minimal --set list that enables
+// calicoSensor with Path B (operator-supplied PEMs). Used by tests
+// that assert render of the rendered Secret, daemonset mount, and
+// configmap bridge.
+func calicoSensorPathBArgs() []string {
+	// The PEM values are intentionally arbitrary base64 -- the
+	// chart's required guard only enforces non-empty, not
+	// well-formed.
+	dummy := "Zm9vYmFy"
+	return []string{
+		"calicoSensor.enabled=true",
+		"calicoSensor.tls.caBundle=" + dummy,
+		"calicoSensor.tls.clientCert=" + dummy,
+		"calicoSensor.tls.clientKey=" + dummy,
+	}
+}
+
+// TestCalicoSensorAbsent_WhenDisabled asserts the chart renders no
+// CNI TLS Secret and no /etc/olaitan/cni mount when calicoSensor is
+// disabled (the default). The bundled olaitan.yaml ConfigMap
+// references /etc/olaitan/cni paths as defaults for the calico
+// block, so we check the daemonset mount line directly rather than
+// the substring (which would false-positive on the embedded config).
+func TestCalicoSensorAbsent_WhenDisabled(t *testing.T) {
+	rendered := helmTemplate(t, nil)
+	if strings.Contains(rendered, "mountPath: /etc/olaitan/cni") {
+		t.Errorf("/etc/olaitan/cni mount rendered with calicoSensor disabled by default; rendered sample:\n%s",
+			snippet(rendered, "olaitan/cni"))
+	}
+	if strings.Contains(rendered, "name: cni-tls") {
+		t.Errorf("cni-tls volume rendered with calicoSensor disabled by default; rendered sample:\n%s",
+			snippet(rendered, "cni-tls"))
+	}
+}
+
+// TestCalicoSensorPathB_RendersTLSSecret asserts that with Path B
+// configured the chart renders the cni-tls Secret carrying the three
+// PEM keys at the expected names.
+func TestCalicoSensorPathB_RendersTLSSecret(t *testing.T) {
+	rendered := helmTemplate(t, calicoSensorPathBArgs())
+	for _, want := range []string{
+		"name: olaitan-cni-tls",
+		"ca.crt:",
+		"client.crt:",
+		"client.key:",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("expected substring %q in rendered chart; sample:\n%s",
+				want, snippet(rendered, "cni-tls"))
+		}
+	}
+}
+
+// TestCalicoSensorPathA_SkipsTLSSecret asserts that with Path A
+// (cert-manager-issued Secret name supplied) the chart does NOT
+// render an Opaque cni-tls Secret -- the chart consumes the cert-
+// manager-managed Secret directly via the daemonset mount.
+func TestCalicoSensorPathA_SkipsTLSSecret(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"calicoSensor.enabled=true",
+		"calicoSensor.tls.certManagerSecretName=external-cni-tls",
+	})
+	// The Opaque Secret named <release>-cni-tls must NOT appear.
+	if strings.Contains(rendered, "name: olaitan-cni-tls\n") {
+		t.Errorf("Path A should not render a chart-owned cni-tls Secret; rendered carries it:\n%s",
+			snippet(rendered, "cni-tls"))
+	}
+	// But the daemonset MUST mount the operator-supplied Secret.
+	if !strings.Contains(rendered, "secretName: \"external-cni-tls\"") &&
+		!strings.Contains(rendered, "secretName: external-cni-tls") {
+		t.Errorf("DaemonSet missing external-cni-tls Secret mount under Path A; sample:\n%s",
+			snippet(rendered, "cni-tls"))
+	}
+}
+
+// TestCalicoSensorEnabled_RequiresTLS asserts the chart fails render
+// with a clear message if calicoSensor.enabled=true but no TLS
+// material is supplied (neither Path A nor Path B).
+func TestCalicoSensorEnabled_RequiresTLS(t *testing.T) {
+	cmd := exec.Command("helm", "template", chartDir(t),
+		"--set", "redis.auth.password=test",
+		"--set", "secrets.redisPassword=test",
+		"--set", "calicoSensor.enabled=true",
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("expected helm template to fail when calicoSensor.enabled=true but no TLS configured")
+	}
+	if !strings.Contains(stderr.String(), "calicoSensor.tls.caBundle is required") {
+		t.Errorf("expected fail-fast message mentioning caBundle; stderr:\n%s", stderr.String())
+	}
+}
+
+// TestCalicoSensorDaemonsetMountsTLS asserts the DaemonSet mounts
+// the cni-tls Secret at /etc/olaitan/cni under Path B.
+func TestCalicoSensorDaemonsetMountsTLS(t *testing.T) {
+	rendered := helmTemplate(t, calicoSensorPathBArgs())
+	if !strings.Contains(rendered, "mountPath: /etc/olaitan/cni") {
+		t.Errorf("DaemonSet missing /etc/olaitan/cni mount; sample:\n%s",
+			snippet(rendered, "cni"))
+	}
+	if !strings.Contains(rendered, "name: cni-tls") {
+		t.Errorf("DaemonSet missing cni-tls volume; sample:\n%s",
+			snippet(rendered, "cni-tls"))
+	}
+}
+
+// TestCalicoSensorNetworkPolicyAllowsGoldmaneEgress asserts the
+// rendered NetworkPolicy permits egress from the agent namespace to
+// calico-system/goldmane:7443 only when calicoSensor.enabled=true.
+func TestCalicoSensorNetworkPolicyAllowsGoldmaneEgress(t *testing.T) {
+	disabled := helmTemplate(t, nil)
+	if strings.Contains(disabled, "k8s-app: goldmane") {
+		t.Errorf("NetworkPolicy carries Goldmane egress rule by default; should be gated on calicoSensor")
+	}
+	enabled := helmTemplate(t, calicoSensorPathBArgs())
+	if !strings.Contains(enabled, "k8s-app: goldmane") {
+		t.Errorf("NetworkPolicy missing Goldmane egress rule when calicoSensor.enabled=true; sample:\n%s",
+			snippet(enabled, "calico-system"))
+	}
+	if !strings.Contains(enabled, "port: 7443") {
+		t.Errorf("NetworkPolicy missing port 7443 for Goldmane egress; sample:\n%s",
+			snippet(enabled, "7443"))
+	}
+}
+
+// TestCalicoSensorConfigMapBridgesStartTimeGte verifies the
+// pointer-shape bridge added by Story 1.10 P31. The chart's
+// `calicoSensor.startTimeGte` value can be a number (including 0),
+// null, or omitted; the configmap bridge must surface each shape
+// faithfully so the Go loader's *int64 distinguishes the three
+// semantics per Goldmane proto line 91.
+func TestCalicoSensorConfigMapBridgesStartTimeGte(t *testing.T) {
+	cases := []struct {
+		name     string
+		override string
+		wantLine string
+	}{
+		{
+			"explicit-zero-now-semantic",
+			"calicoSensor.startTimeGte=0",
+			"start_time_gte: 0",
+		},
+		{
+			"explicit-negative-replay",
+			"calicoSensor.startTimeGte=-300",
+			"start_time_gte: -300",
+		},
+		{
+			"omitted-default-replay",
+			"", // no startTimeGte override; chart default -60 stays
+			"start_time_gte: -60",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := calicoSensorPathBArgs()
+			if tc.override != "" {
+				args = append(args, tc.override)
+			}
+			rendered := helmTemplate(t, args)
+			if !strings.Contains(rendered, tc.wantLine) {
+				t.Errorf("expected %q in rendered configmap; sample:\n%s",
+					tc.wantLine, snippet(rendered, "start_time_gte"))
+			}
+		})
+	}
+}
+
+// TestCalicoSensorConfigMapBridgesValues asserts that overriding
+// chart-side calicoSensor knobs flows through into the rendered
+// detection.sources.calico ConfigMap block. This is the dual-flag
+// contract: operators flip one Helm value, both the chart-side
+// mount and the adapter's runtime config track in lockstep.
+func TestCalicoSensorConfigMapBridgesValues(t *testing.T) {
+	args := append(
+		calicoSensorPathBArgs(),
+		`calicoSensor.goldmaneAddr=custom.calico-system.svc:7443`,
+		`calicoSensor.stalenessTimeout=20m`,
+	)
+	rendered := helmTemplate(t, args)
+	if !strings.Contains(rendered, `goldmane_addr: "custom.calico-system.svc:7443"`) {
+		t.Errorf("ConfigMap bridge did not propagate goldmaneAddr; sample:\n%s",
+			snippet(rendered, "goldmane_addr"))
+	}
+	if !strings.Contains(rendered, `staleness_timeout: "20m"`) {
+		t.Errorf("ConfigMap bridge did not propagate stalenessTimeout; sample:\n%s",
+			snippet(rendered, "staleness_timeout"))
+	}
+	// The calico-block enabled flag must flip to true. The block is
+	// nested inside `data.olaitan.yaml:` so the indent depth varies;
+	// match the canonical "calico:" + (any whitespace) + "enabled:
+	// true" pattern via a substring check on the trimmed form.
+	if !strings.Contains(strings.ReplaceAll(rendered, " ", ""), "calico:\nenabled:true") {
+		t.Errorf("ConfigMap bridge did not flip calico.enabled; sample:\n%s",
+			snippet(rendered, "calico:"))
+	}
+}

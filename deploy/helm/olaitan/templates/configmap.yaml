@@ -97,6 +97,64 @@ data:
     {{- if hasKey $pr "maxAttempts" }}{{- $cfg = regexReplaceAll "(?s)(containerd:.{0,999}?publish_retry:.{0,256}?\\n[[:space:]]+)max_attempts:[[:space:]]+[0-9]+" $cfg (printf "${1}max_attempts: %v" $pr.maxAttempts) }}{{- end }}
     {{- end }}
     {{- end }}
+    {{- /*
+    Story 1.10: bridge the chart-side calicoSensor knobs into the
+    rendered detection.sources.calico block so a single
+    `--set calicoSensor.foo=...` flips both the chart-side mount (gating)
+    and the adapter's runtime behaviour. Mirrors the Story 1.8 P27
+    containerd bridge pattern. Anchored on `calico:` block prefix; nested
+    retry blocks anchor on `calico:` plus the retry-block header so the
+    audit / containerd `publish_retry:` blocks stay untouched.
+    */ -}}
+    {{- /* Story 1.10 D4 (code-review patch P28): every regexReplaceAll
+           below is preceded by `mustRegexFind` that fails the render
+           with a clear message if the anchor pattern is not present
+           in the upstream `config/olaitan.yaml`. Without this guard a
+           silent miss (regexReplaceAll returns the unchanged string)
+           would drop operator `--set` values without any signal. The
+           `enabled` substitution matches `(?:true|false)` so it is
+           idempotent across upstream-default flips. */ -}}
+    {{- if .Values.calicoSensor.enabled }}
+    {{- $cs := .Values.calicoSensor }}
+    {{- $pEn := "(calico:[[:space:]]*\\n[[:space:]]+)enabled:[[:space:]]+(?:true|false)" -}}
+    {{- if not (mustRegexFind $pEn $cfg) }}{{- fail (printf "helm bridge: calico.enabled anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pEn) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pEn $cfg (printf "${1}enabled: %t" $cs.enabled) }}
+    {{- if $cs.goldmaneAddr }}{{- $p := "(?s)(calico:.{0,256}?\\n[[:space:]]+)goldmane_addr:[[:space:]]+\"[^\"]*\"" -}}{{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: calico.goldmane_addr anchor not found (pattern %q)" $p) }}{{- end }}{{- $cfg = regexReplaceAll $p $cfg (printf "${1}goldmane_addr: %q" $cs.goldmaneAddr) }}{{- end }}
+    {{- if $cs.serverName }}{{- $p := "(?s)(calico:.{0,512}?\\n[[:space:]]+)server_name:[[:space:]]+\"[^\"]*\"" -}}{{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: calico.server_name anchor not found (pattern %q)" $p) }}{{- end }}{{- $cfg = regexReplaceAll $p $cfg (printf "${1}server_name: %q" $cs.serverName) }}{{- end }}
+    {{- if $cs.dialTimeout }}{{- $p := "(?s)(calico:.{0,768}?\\n[[:space:]]+)dial_timeout:[[:space:]]+\"[^\"]*\"" -}}{{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: calico.dial_timeout anchor not found (pattern %q)" $p) }}{{- end }}{{- $cfg = regexReplaceAll $p $cfg (printf "${1}dial_timeout: %q" $cs.dialTimeout) }}{{- end }}
+    {{- if $cs.stalenessTimeout }}{{- $p := "(?s)(calico:.{0,768}?\\n[[:space:]]+)staleness_timeout:[[:space:]]+\"[^\"]*\"" -}}{{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: calico.staleness_timeout anchor not found (pattern %q)" $p) }}{{- end }}{{- $cfg = regexReplaceAll $p $cfg (printf "${1}staleness_timeout: %q" $cs.stalenessTimeout) }}{{- end }}
+    {{- if $cs.maxEventBytes }}{{- $p := "(?s)(calico:.{0,768}?\\n[[:space:]]+)max_event_bytes:[[:space:]]+[0-9]+" -}}{{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: calico.max_event_bytes anchor not found (pattern %q)" $p) }}{{- end }}{{- $cfg = regexReplaceAll $p $cfg (printf "${1}max_event_bytes: %v" $cs.maxEventBytes) }}{{- end }}
+    {{- /* Story 1.10 P31: StartTimeGte is *int64 in Go; an explicit
+           0 reaches Goldmane's documented "now" semantic, omission
+           defaults to -60 replay. The bridge handles three shapes:
+           operator passes a number (emit the number including 0),
+           operator passes null (emit null so the Go loader stores
+           nil), operator omits the key (leave the YAML default
+           untouched, which is -60). */ -}}
+    {{- if hasKey $cs "startTimeGte" }}
+    {{- $pSt := "(?s)(calico:.{0,768}?\\n[[:space:]]+)start_time_gte:[[:space:]]+-?[0-9]+" -}}
+    {{- if not (mustRegexFind $pSt $cfg) }}{{- fail (printf "helm bridge: calico.start_time_gte anchor not found (pattern %q)" $pSt) }}{{- end }}
+    {{- if eq (kindOf $cs.startTimeGte) "invalid" }}{{- $cfg = regexReplaceAll $pSt $cfg "${1}start_time_gte: null" }}
+    {{- else }}{{- $cfg = regexReplaceAll $pSt $cfg (printf "${1}start_time_gte: %v" $cs.startTimeGte) }}{{- end }}
+    {{- end }}
+    {{- if $cs.aggregationInterval }}{{- $p := "(?s)(calico:.{0,768}?\\n[[:space:]]+)aggregation_interval:[[:space:]]+[0-9]+" -}}{{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: calico.aggregation_interval anchor not found (pattern %q)" $p) }}{{- end }}{{- $cfg = regexReplaceAll $p $cfg (printf "${1}aggregation_interval: %v" $cs.aggregationInterval) }}{{- end }}
+    {{- if $cs.connectRetry }}
+    {{- $cr := $cs.connectRetry }}
+    {{- if $cr.min }}{{- $p := "(?s)(calico:.{0,999}?connect_retry:.{0,256}?\\n[[:space:]]+)min:[[:space:]]+\"[^\"]*\"" -}}{{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: calico.connect_retry.min anchor not found (pattern %q)" $p) }}{{- end }}{{- $cfg = regexReplaceAll $p $cfg (printf "${1}min: %q" $cr.min) }}{{- end }}
+    {{- if $cr.max }}{{- $p := "(?s)(calico:.{0,999}?connect_retry:.{0,256}?\\n[[:space:]]+)max:[[:space:]]+\"[^\"]*\"" -}}{{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: calico.connect_retry.max anchor not found (pattern %q)" $p) }}{{- end }}{{- $cfg = regexReplaceAll $p $cfg (printf "${1}max: %q" $cr.max) }}{{- end }}
+    {{- if $cr.multiplier }}{{- $p := "(?s)(calico:.{0,999}?connect_retry:.{0,256}?\\n[[:space:]]+)multiplier:[[:space:]]+[0-9.]+" -}}{{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: calico.connect_retry.multiplier anchor not found (pattern %q)" $p) }}{{- end }}{{- $cfg = regexReplaceAll $p $cfg (printf "${1}multiplier: %v" $cr.multiplier) }}{{- end }}
+    {{- if hasKey $cr "jitter" }}{{- $p := "(?s)(calico:.{0,999}?connect_retry:.{0,256}?\\n[[:space:]]+)jitter:[[:space:]]+[0-9.]+" -}}{{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: calico.connect_retry.jitter anchor not found (pattern %q)" $p) }}{{- end }}{{- $cfg = regexReplaceAll $p $cfg (printf "${1}jitter: %v" $cr.jitter) }}{{- end }}
+    {{- if hasKey $cr "maxAttempts" }}{{- $p := "(?s)(calico:.{0,999}?connect_retry:.{0,256}?\\n[[:space:]]+)max_attempts:[[:space:]]+[0-9]+" -}}{{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: calico.connect_retry.max_attempts anchor not found (pattern %q)" $p) }}{{- end }}{{- $cfg = regexReplaceAll $p $cfg (printf "${1}max_attempts: %v" $cr.maxAttempts) }}{{- end }}
+    {{- end }}
+    {{- if $cs.publishRetry }}
+    {{- $pr := $cs.publishRetry }}
+    {{- if $pr.min }}{{- $p := "(?s)(calico:.{0,999}?publish_retry:.{0,256}?\\n[[:space:]]+)min:[[:space:]]+\"[^\"]*\"" -}}{{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: calico.publish_retry.min anchor not found (pattern %q)" $p) }}{{- end }}{{- $cfg = regexReplaceAll $p $cfg (printf "${1}min: %q" $pr.min) }}{{- end }}
+    {{- if $pr.max }}{{- $p := "(?s)(calico:.{0,999}?publish_retry:.{0,256}?\\n[[:space:]]+)max:[[:space:]]+\"[^\"]*\"" -}}{{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: calico.publish_retry.max anchor not found (pattern %q)" $p) }}{{- end }}{{- $cfg = regexReplaceAll $p $cfg (printf "${1}max: %q" $pr.max) }}{{- end }}
+    {{- if $pr.multiplier }}{{- $p := "(?s)(calico:.{0,999}?publish_retry:.{0,256}?\\n[[:space:]]+)multiplier:[[:space:]]+[0-9.]+" -}}{{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: calico.publish_retry.multiplier anchor not found (pattern %q)" $p) }}{{- end }}{{- $cfg = regexReplaceAll $p $cfg (printf "${1}multiplier: %v" $pr.multiplier) }}{{- end }}
+    {{- if hasKey $pr "jitter" }}{{- $p := "(?s)(calico:.{0,999}?publish_retry:.{0,256}?\\n[[:space:]]+)jitter:[[:space:]]+[0-9.]+" -}}{{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: calico.publish_retry.jitter anchor not found (pattern %q)" $p) }}{{- end }}{{- $cfg = regexReplaceAll $p $cfg (printf "${1}jitter: %v" $pr.jitter) }}{{- end }}
+    {{- if hasKey $pr "maxAttempts" }}{{- $p := "(?s)(calico:.{0,999}?publish_retry:.{0,256}?\\n[[:space:]]+)max_attempts:[[:space:]]+[0-9]+" -}}{{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: calico.publish_retry.max_attempts anchor not found (pattern %q)" $p) }}{{- end }}{{- $cfg = regexReplaceAll $p $cfg (printf "${1}max_attempts: %v" $pr.maxAttempts) }}{{- end }}
+    {{- end }}
+    {{- end }}
     {{- $cfg | nindent 4 }}
 ---
 apiVersion: v1
