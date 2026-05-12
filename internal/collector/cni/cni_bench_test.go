@@ -6,8 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log/slog"
 	"os"
 	"sort"
 	"testing"
@@ -57,12 +55,9 @@ func TestBench_NFR1ReceiveToPublishP99(t *testing.T) {
 	base := integrationFixture()
 	// Translate once outside the timed loop to prime any package-
 	// level lazy state (protojson MarshalOptions, etc).
-	if _, terr := Translate(base, 0); terr != nil {
+	if _, terr := Translate(base, "", 0); terr != nil {
 		t.Fatalf("warm-up translate: %v", terr)
 	}
-
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	_ = log
 
 	samples := make([]time.Duration, 0, target)
 	for i := 0; i < target; i++ {
@@ -71,7 +66,7 @@ func TestBench_NFR1ReceiveToPublishP99(t *testing.T) {
 			Flow: base.Flow,
 		}
 		t0 := time.Now()
-		ev, terr := Translate(fr, 0)
+		ev, terr := Translate(fr, "", 0)
 		if terr != nil {
 			t.Fatalf("translate iter %d: %v", i, terr)
 		}

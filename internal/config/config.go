@@ -128,19 +128,24 @@ func (c ContainerdSourceConfig) validate() error {
 // mTLS; see ADR-2026-04-30-01). When Enabled is false the block may
 // stay zero-valued; the adapter is not constructed.
 type CalicoSourceConfig struct {
-	Enabled             bool                `yaml:"enabled"`
-	GoldmaneAddr        string              `yaml:"goldmane_addr,omitempty"`
-	ServerName          string              `yaml:"server_name,omitempty"`
-	CABundlePath        string              `yaml:"ca_bundle_path,omitempty"`
-	ClientCertPath      string              `yaml:"client_cert_path,omitempty"`
-	ClientKeyPath       string              `yaml:"client_key_path,omitempty"`
-	DialTimeout         DurationYAML        `yaml:"dial_timeout,omitempty"`
-	StalenessTimeout    DurationYAML        `yaml:"staleness_timeout,omitempty"`
-	ConnectRetry        RetryStrategyConfig `yaml:"connect_retry,omitempty"`
-	PublishRetry        RetryStrategyConfig `yaml:"publish_retry,omitempty"`
-	MaxEventBytes       int                 `yaml:"max_event_bytes,omitempty"`
-	StartTimeGte        int64               `yaml:"start_time_gte,omitempty"`
-	AggregationInterval int64               `yaml:"aggregation_interval,omitempty"`
+	Enabled          bool                `yaml:"enabled"`
+	GoldmaneAddr     string              `yaml:"goldmane_addr,omitempty"`
+	ServerName       string              `yaml:"server_name,omitempty"`
+	CABundlePath     string              `yaml:"ca_bundle_path,omitempty"`
+	ClientCertPath   string              `yaml:"client_cert_path,omitempty"`
+	ClientKeyPath    string              `yaml:"client_key_path,omitempty"`
+	DialTimeout      DurationYAML        `yaml:"dial_timeout,omitempty"`
+	StalenessTimeout DurationYAML        `yaml:"staleness_timeout,omitempty"`
+	ConnectRetry     RetryStrategyConfig `yaml:"connect_retry,omitempty"`
+	PublishRetry     RetryStrategyConfig `yaml:"publish_retry,omitempty"`
+	MaxEventBytes    int                 `yaml:"max_event_bytes,omitempty"`
+	// StartTimeGte is a pointer so the YAML loader can distinguish
+	// omitted (defaults to -60 replay; see DefaultStartTimeGteReplay
+	// in internal/collector/cni) from explicit 0 (which means "now"
+	// per Goldmane proto goldmane/proto/api.proto line 91). The
+	// omitempty tag on a plain int64 would collapse these two cases.
+	StartTimeGte        *int64 `yaml:"start_time_gte,omitempty"`
+	AggregationInterval int64  `yaml:"aggregation_interval,omitempty"`
 }
 
 // validate enforces CalicoSourceConfig invariants. Mirrors the
@@ -179,6 +184,12 @@ func (c CalicoSourceConfig) validate() error {
 	}
 	if c.AggregationInterval < 0 {
 		return fmt.Errorf("detection.sources.calico.aggregation_interval: must be >= 0 (0 means default; got %d)", c.AggregationInterval)
+	}
+	if c.AggregationInterval != 0 && c.AggregationInterval != 15 {
+		return fmt.Errorf("detection.sources.calico.aggregation_interval: must be 15s per Goldmane proto (goldmane/proto/api.proto line 100; got %d)", c.AggregationInterval)
+	}
+	if c.StartTimeGte != nil && *c.StartTimeGte > 0 {
+		return fmt.Errorf("detection.sources.calico.start_time_gte: must be <= 0 (negative is relative seconds, zero is 'now' per Goldmane proto goldmane/proto/api.proto line 91; got %d)", *c.StartTimeGte)
 	}
 	if err := c.ConnectRetry.validatePartial("detection.sources.calico.connect_retry"); err != nil {
 		return err

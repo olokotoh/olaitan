@@ -145,14 +145,14 @@ upstream install steps are below.
 # 1. Install the Tigera operator (the controller that reconciles
 # Calico's Installation + APIServer + Goldmane + Whisker custom
 # resources).
-kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.5/manifests/tigera-operator.yaml
+kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.5/manifests/tigera-operator.yaml
 kubectl -n tigera-operator rollout status deployment/tigera-operator --timeout=180s
 
 # 2. Apply the default custom-resources manifest (creates the
 # Installation CR with the iptables dataplane, the APIServer CR
 # enabling Calico API resources, the Goldmane CR enabling the flow
 # API, and the Whisker CR exposing the flow UI).
-kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.5/manifests/custom-resources.yaml
+kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.5/manifests/custom-resources.yaml
 
 # 3. Wait for the operator to reconcile.
 kubectl -n calico-system rollout status deployment/calico-typha --timeout=180s

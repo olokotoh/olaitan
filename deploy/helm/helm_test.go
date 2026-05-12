@@ -1797,6 +1797,49 @@ func TestCalicoSensorNetworkPolicyAllowsGoldmaneEgress(t *testing.T) {
 	}
 }
 
+// TestCalicoSensorConfigMapBridgesStartTimeGte verifies the
+// pointer-shape bridge added by Story 1.10 P31. The chart's
+// `calicoSensor.startTimeGte` value can be a number (including 0),
+// null, or omitted; the configmap bridge must surface each shape
+// faithfully so the Go loader's *int64 distinguishes the three
+// semantics per Goldmane proto line 91.
+func TestCalicoSensorConfigMapBridgesStartTimeGte(t *testing.T) {
+	cases := []struct {
+		name     string
+		override string
+		wantLine string
+	}{
+		{
+			"explicit-zero-now-semantic",
+			"calicoSensor.startTimeGte=0",
+			"start_time_gte: 0",
+		},
+		{
+			"explicit-negative-replay",
+			"calicoSensor.startTimeGte=-300",
+			"start_time_gte: -300",
+		},
+		{
+			"omitted-default-replay",
+			"", // no startTimeGte override; chart default -60 stays
+			"start_time_gte: -60",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := calicoSensorPathBArgs()
+			if tc.override != "" {
+				args = append(args, tc.override)
+			}
+			rendered := helmTemplate(t, args)
+			if !strings.Contains(rendered, tc.wantLine) {
+				t.Errorf("expected %q in rendered configmap; sample:\n%s",
+					tc.wantLine, snippet(rendered, "start_time_gte"))
+			}
+		})
+	}
+}
+
 // TestCalicoSensorConfigMapBridgesValues asserts that overriding
 // chart-side calicoSensor knobs flows through into the rendered
 // detection.sources.calico ConfigMap block. This is the dual-flag

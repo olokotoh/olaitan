@@ -43,6 +43,14 @@ var streamConfigs = []jetstream.StreamConfig{
 		// loudly at PublishJS time so the adapter can log+drop rather
 		// than wedge the consume loop.
 		MaxMsgSize: 256 * 1024,
+		// Duplicates is the at-least-once + server-side dedup
+		// window. Adapter publishWithRetry attaches the event ID
+		// as the Nats-Msg-Id header so a retry the server already
+		// persisted is server-side suppressed. Two minutes covers
+		// the bounded inner-retry budget (~9s) plus generous slack
+		// for cross-pod re-publishes on a brief NATS partition.
+		// Locked in by TestStreamConfigsCoversNetworkFlowSubject.
+		Duplicates: 2 * time.Minute,
 		Storage:    jetstream.FileStorage,
 		Retention:  jetstream.LimitsPolicy,
 	},

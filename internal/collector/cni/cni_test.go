@@ -3,7 +3,9 @@ package cni
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -19,9 +21,11 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
+	"github.com/nats-io/nats.go"
 	natsjs "github.com/nats-io/nats.go/jetstream"
 
 	"github.com/olokotoh/olaitan/internal/collector/cni/goldmanepb"
+	"github.com/olokotoh/olaitan/internal/schema"
 )
 
 // stubPublisher records all PublishJS calls. Each call is appended
@@ -146,6 +150,7 @@ func newAdapterWithStubs(t *testing.T, stream *stubStream, pub *stubPublisher) *
 			t.Fatalf("write %s: %v", p, err)
 		}
 	}
+	stg := int64(-60)
 	cfg := Config{
 		GoldmaneAddr:        "stub:7443",
 		CABundlePath:        caPath,
@@ -153,7 +158,7 @@ func newAdapterWithStubs(t *testing.T, stream *stubStream, pub *stubPublisher) *
 		ClientKeyPath:       keyPath,
 		StalenessTimeout:    100 * time.Millisecond,
 		AggregationInterval: 15,
-		StartTimeGte:        -60,
+		StartTimeGte:        &stg,
 	}
 	a, err := New(cfg, pub, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -234,8 +239,8 @@ func TestNew_DefaultsApplied(t *testing.T) {
 	if a.cfg.AggregationInterval != 15 {
 		t.Errorf("AggregationInterval default: got %d, want 15", a.cfg.AggregationInterval)
 	}
-	if a.cfg.StartTimeGte != -60 {
-		t.Errorf("StartTimeGte default: got %d, want -60", a.cfg.StartTimeGte)
+	if a.cfg.StartTimeGte == nil || *a.cfg.StartTimeGte != DefaultStartTimeGteReplay {
+		t.Errorf("StartTimeGte default: got %v, want pointer to -60", a.cfg.StartTimeGte)
 	}
 }
 
@@ -456,26 +461,27 @@ func TestRun_WatchdogQuietWhenReady_DoesNotFlipUnhealthy(t *testing.T) {
 	defer cancel()
 	a.runStalenessWatchdog(ctx)
 
-	healthy, _ := a.Health().Status()
-	if !healthy {
+	healthy, lastErr := a.Health().Status()
+	if !healthy && lastErr != nil && strings.Contains(lastErr.Error(), "no flow for") {
 		// The initial state of a fresh Tracker is unhealthy with no
 		// error; we want to assert the watchdog did NOT push an
-		// unhealthy-because-stale state. Use the lastErr signal.
-		_, lastErr := a.Health().Status()
-		if lastErr != nil && strings.Contains(lastErr.Error(), "no flow for") {
-			t.Errorf("watchdog flipped unhealthy even though connReady=true: %v", lastErr)
-		}
+		// unhealthy-because-stale state.
+		t.Errorf("watchdog flipped unhealthy even though connReady=true: %v", lastErr)
 	}
 }
 
-func TestRun_WatchdogStaleAndNotReady_FlipsUnhealthy(t *testing.T) {
+func TestRun_WatchdogStaleWithStreamOpen_FlipsUnhealthy(t *testing.T) {
+	// Story 1.10 D1 (code-review patch P25): the gating signal is
+	// streamOpen, not connReady. (streamOpen=true && lastEventTime
+	// stale) is the actionable case: the stream is up at the gRPC
+	// layer but Goldmane went silent after previously sending flows.
 	stream := &stubStream{}
 	pub := newStubPublisher()
 	a := newAdapterWithStubs(t, stream, pub)
 
 	long := time.Now().Add(-1 * time.Hour)
 	a.lastEventTime.Store(&long)
-	a.connReady.Store(false)
+	a.streamOpen.Store(true)
 	a.cfg.StalenessTimeout = 10 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
@@ -484,10 +490,34 @@ func TestRun_WatchdogStaleAndNotReady_FlipsUnhealthy(t *testing.T) {
 
 	healthy, lastErr := a.Health().Status()
 	if healthy {
-		t.Errorf("Health: want unhealthy when stale AND not ready")
+		t.Errorf("Health: want unhealthy when streamOpen=true AND lastEventTime stale")
 	}
 	if lastErr == nil || !strings.Contains(lastErr.Error(), "no flow for") {
 		t.Errorf("lastErr: got %v, want 'no flow for' staleness message", lastErr)
+	}
+}
+
+func TestRun_WatchdogStaleButStreamNotOpen_DoesNotFlipUnhealthy(t *testing.T) {
+	// Story 1.10 D1 (code-review patch P25): when streamOpen=false
+	// the connect loop owns the operator signal; watchdog stays
+	// silent regardless of lastEventTime staleness. Reconnects
+	// must not double-flag the same outage.
+	stream := &stubStream{}
+	pub := newStubPublisher()
+	a := newAdapterWithStubs(t, stream, pub)
+
+	long := time.Now().Add(-1 * time.Hour)
+	a.lastEventTime.Store(&long)
+	a.streamOpen.Store(false)
+	a.cfg.StalenessTimeout = 10 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	a.runStalenessWatchdog(ctx)
+
+	_, lastErr := a.Health().Status()
+	if lastErr != nil && strings.Contains(lastErr.Error(), "no flow for") {
+		t.Errorf("watchdog flipped unhealthy on streamOpen=false reconnect path: %v", lastErr)
 	}
 }
 
@@ -558,4 +588,295 @@ func TestConnectivityCheckInterval(t *testing.T) {
 	if connectivityCheckInterval(0) != 30*time.Second {
 		t.Errorf("0 -> 30s fallback")
 	}
+}
+
+// TestNew_AggregationIntervalNon15_Rejected locks in the P32 fix:
+// any non-15 AggregationInterval (other than 0, which defaults to
+// 15) is rejected at New time per Goldmane proto contract line 100.
+func TestNew_AggregationIntervalNon15_Rejected(t *testing.T) {
+	pub := newStubPublisher()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	_, err := New(Config{
+		CABundlePath:        "ca",
+		ClientCertPath:      "c",
+		ClientKeyPath:       "k",
+		AggregationInterval: 30,
+	}, pub, log)
+	if err == nil {
+		t.Fatalf("got nil, want aggregation-interval error")
+	}
+	if !strings.Contains(err.Error(), "must be 15s per Goldmane proto") {
+		t.Errorf("err missing proto-contract message: %v", err)
+	}
+}
+
+// TestNew_StartTimeGtePositive_Rejected locks in the P31 fix:
+// a positive StartTimeGte against a streaming RPC is meaningless
+// (it would request a future-only stream) and is rejected.
+func TestNew_StartTimeGtePositive_Rejected(t *testing.T) {
+	pub := newStubPublisher()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	positive := int64(60)
+	_, err := New(Config{
+		CABundlePath:        "ca",
+		ClientCertPath:      "c",
+		ClientKeyPath:       "k",
+		AggregationInterval: 15,
+		StartTimeGte:        &positive,
+	}, pub, log)
+	if err == nil {
+		t.Fatalf("got nil, want start_time_gte error")
+	}
+	if !strings.Contains(err.Error(), "must be <= 0") {
+		t.Errorf("err missing constraint message: %v", err)
+	}
+}
+
+// TestNew_StartTimeGteExplicitZero_Preserved locks in the P31
+// fix: an explicit 0 reaches Goldmane unchanged (per proto line
+// 91: "A value of zero means 'now'").
+func TestNew_StartTimeGteExplicitZero_Preserved(t *testing.T) {
+	pub := newStubPublisher()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	zero := int64(0)
+	a, err := New(Config{
+		CABundlePath:        "ca",
+		ClientCertPath:      "c",
+		ClientKeyPath:       "k",
+		AggregationInterval: 15,
+		StartTimeGte:        &zero,
+	}, pub, log)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if a.cfg.StartTimeGte == nil || *a.cfg.StartTimeGte != 0 {
+		t.Errorf("StartTimeGte: got %v, want pointer to 0", a.cfg.StartTimeGte)
+	}
+}
+
+// TestNew_StartTimeGteOmitted_DefaultsToReplay locks in the P31
+// fix: omission (nil) defaults to DefaultStartTimeGteReplay (-60).
+func TestNew_StartTimeGteOmitted_DefaultsToReplay(t *testing.T) {
+	pub := newStubPublisher()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	a, err := New(Config{
+		CABundlePath:        "ca",
+		ClientCertPath:      "c",
+		ClientKeyPath:       "k",
+		AggregationInterval: 15,
+	}, pub, log)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if a.cfg.StartTimeGte == nil || *a.cfg.StartTimeGte != DefaultStartTimeGteReplay {
+		t.Errorf("StartTimeGte: got %v, want pointer to %d (DefaultStartTimeGteReplay)", a.cfg.StartTimeGte, DefaultStartTimeGteReplay)
+	}
+}
+
+// TestIsTerminalTLSError_TypedClassifier locks in the P35 fix:
+// the typed errors.As path replaces the substring fallback that
+// the original code carried. Three sentinel cases exercise the
+// tls.RecordHeaderError, x509.UnknownAuthorityError, and
+// x509.CertificateInvalidError branches.
+func TestIsTerminalTLSError_TypedClassifier(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"missing-file", &os.PathError{Op: "open", Path: "/x", Err: os.ErrNotExist}, true},
+		{"perm-denied", &os.PathError{Op: "open", Path: "/x", Err: os.ErrPermission}, true},
+		{"ca-bundle-unparseable", errCABundleUnparseable, true},
+		{"ca-bundle-unparseable-wrapped", fmt.Errorf("ca bundle: %w", errCABundleUnparseable), true},
+		{"tls record-header", tls.RecordHeaderError{Msg: "bad cert"}, true},
+		{"tls record-header wrapped", fmt.Errorf("dial: %w", tls.RecordHeaderError{}), true},
+		{"x509 unknown-authority", x509.UnknownAuthorityError{}, true},
+		{"x509 cert-invalid", x509.CertificateInvalidError{Reason: x509.NotAuthorizedToSign}, true},
+		{"half-written-pem msg (transient)", errors.New("ca bundle contained no parseable certificates"), false},
+		{"generic transient", errors.New("dial tcp i/o timeout"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isTerminalTLSError(tc.err); got != tc.want {
+				t.Errorf("got %v, want %v (err=%v)", got, tc.want, tc.err)
+			}
+		})
+	}
+}
+
+// TestIsTerminalConnectError_PermissionDeniedSubstring locks in
+// the P36 fix: the falco-precedent "permission denied" substring
+// fallback runs AFTER the typed checks and promotes string-only
+// transport errors to terminal.
+func TestIsTerminalConnectError_PermissionDeniedSubstring(t *testing.T) {
+	err := status.Error(codes.Unavailable, "transport: connection refused: permission denied")
+	if !isTerminalConnectError(err) {
+		t.Errorf("got false, want true for unix-socket EACCES wrapped as Unavailable with 'permission denied' substring")
+	}
+}
+
+// TestPublishWithRetry_PerAttemptDeadline_DoesNotCollapseBudget
+// locks in the P17 fix: a per-attempt context.DeadlineExceeded
+// while the outer ctx is alive must surface as a transient error
+// so retry.Do honours MaxAttempts.
+func TestPublishWithRetry_PerAttemptDeadline_DoesNotCollapseBudget(t *testing.T) {
+	stream := &stubStream{}
+	pub := newStubPublisher()
+	a := newAdapterWithStubs(t, stream, pub)
+
+	// Substitute the publisher with one that returns
+	// context.DeadlineExceeded for the first two attempts then
+	// succeeds. retry.Permanent shows up only if the strategy
+	// short-circuits MaxAttempts due to ctx-cancelled propagation.
+	calls := atomic.Int32{}
+	failPub := &failingPublisher{
+		failN: 2,
+		calls: &calls,
+		err:   context.DeadlineExceeded,
+	}
+	a.pub = failPub
+	a.cfg.PublishRetry.Min = 1 * time.Millisecond
+	a.cfg.PublishRetry.Max = 5 * time.Millisecond
+	a.cfg.PublishRetry.MaxAttempts = 3
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ev := goldmaneFlowToTestEvent(t, validFixture())
+	err := a.publishWithRetry(ctx, ev)
+	if err != nil {
+		t.Errorf("publishWithRetry: got %v, want nil after 2 fails + 1 success", err)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Errorf("publish attempts: got %d, want 3 (proves per-attempt deadlines did not collapse the budget)", got)
+	}
+}
+
+// TestRun_ConnReadyDeferredUntilFirstRecv locks in the P18 fix:
+// connReady stays false until the first successful Recv arrives.
+// We exercise this by running with a stream that blocks Recv;
+// the watchdog must see connReady=false.
+func TestRun_ConnReadyDeferredUntilFirstRecv(t *testing.T) {
+	stream := &stubStream{blockAfterQueue: true} // empty queue, will block on Recv
+	pub := newStubPublisher()
+	a := newAdapterWithStubs(t, stream, pub)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+
+	// Give the adapter a moment to dial and enter the Recv loop.
+	time.Sleep(200 * time.Millisecond)
+
+	// connReady must still be false because Recv has not yet
+	// returned a flow.
+	if a.connReady.Load() {
+		t.Errorf("connReady prematurely true before first Recv")
+	}
+
+	cancel()
+	<-done
+}
+
+// TestRun_LastEventTime_UpdatedOnRecvSuccess locks in the Story
+// 1.10 P13 semantic: lastEventTime tracks UPSTREAM bus liveness
+// (Goldmane → adapter via stream.Recv), not downstream publish
+// throughput. A publish-drop must NOT reset lastEventTime back to
+// nil — Goldmane sent us a flow, so the upstream is alive. Publish
+// failures surface separately via publishDrops + MarkUnhealthy.
+//
+// This replaces the P19 semantic (lastEventTime advances only on
+// publish success); see Review Findings in the Story 1.10 spec.
+func TestRun_LastEventTime_UpdatedOnRecvSuccess(t *testing.T) {
+	stream := &stubStream{queue: []*goldmanepb.FlowResult{validFixture()}, blockAfterQueue: true}
+	pub := newStubPublisher()
+	pub.failOn[0] = nats.ErrMaxPayload // permanent error -> publish-drop
+	a := newAdapterWithStubs(t, stream, pub)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if a.PublishDrops() >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if got := a.lastEventTime.Load(); got == nil {
+		t.Errorf("lastEventTime is nil after a successful Recv (P13: bus liveness must register regardless of publish outcome)")
+	}
+
+	cancel()
+	<-done
+}
+
+// TestLoadTLSConfigFromDisk_CABundleNotPEM_Terminal locks in the
+// P22 fix: a ca_bundle file with no PEM block at all (operator
+// typo, e.g. caBundle: "foo") surfaces errCABundleUnparseable so
+// isTerminalTLSError flips the failure to terminal.
+func TestLoadTLSConfigFromDisk_CABundleNotPEM_Terminal(t *testing.T) {
+	dir := t.TempDir()
+	caPath := filepath.Join(dir, "ca.crt")
+	if err := os.WriteFile(caPath, []byte("foo"), 0o644); err != nil {
+		t.Fatalf("write ca: %v", err)
+	}
+	// loadTLSConfigFromDisk also requires client cert/key paths;
+	// supply real ones so the CA path is reached.
+	certPath := filepath.Join(dir, "client.crt")
+	keyPath := filepath.Join(dir, "client.key")
+	for _, p := range []string{certPath, keyPath} {
+		if err := os.WriteFile(p, []byte("placeholder"), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+
+	a := &Adapter{cfg: Config{
+		CABundlePath:   caPath,
+		ClientCertPath: certPath,
+		ClientKeyPath:  keyPath,
+		ServerName:     "test",
+	}}
+	_, err := a.loadTLSConfigFromDisk()
+	if err == nil {
+		t.Fatal("expected error on non-PEM ca bundle")
+	}
+	if !errors.Is(err, errCABundleUnparseable) {
+		t.Errorf("err is not errCABundleUnparseable: %v", err)
+	}
+	if !isTerminalTLSError(err) {
+		t.Errorf("isTerminalTLSError: got false, want true for non-PEM ca bundle")
+	}
+}
+
+// failingPublisher fails the first failN calls with err then
+// succeeds for the rest. Used to exercise P17's per-attempt
+// deadline distinction without spinning up a real stalled NATS
+// partition.
+type failingPublisher struct {
+	failN int
+	calls *atomic.Int32
+	err   error
+}
+
+func (f *failingPublisher) PublishJS(_ context.Context, _ string, _ any, _ ...natsjs.PublishOpt) (*natsjs.PubAck, error) {
+	n := f.calls.Add(1)
+	if int(n) <= f.failN {
+		return nil, f.err
+	}
+	return &natsjs.PubAck{Stream: "EVENTS_RAW", Sequence: uint64(n)}, nil
+}
+
+// goldmaneFlowToTestEvent converts a fixture FlowResult to a
+// schema.Event via the production Translate path so the
+// publishWithRetry test exercises a realistic event payload.
+func goldmaneFlowToTestEvent(t *testing.T, fr *goldmanepb.FlowResult) schema.Event {
+	t.Helper()
+	ev, err := Translate(fr, "test-node", 0)
+	if err != nil {
+		t.Fatalf("Translate: %v", err)
+	}
+	return ev
 }

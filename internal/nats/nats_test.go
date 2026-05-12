@@ -612,6 +612,16 @@ func TestStreamConfigsCoversNetworkFlowSubject(t *testing.T) {
 	for _, cfg := range configs {
 		for _, subj := range cfg.Subjects {
 			if subj == subjects.RawNetwork || subj == subjects.RawPrefix+">" {
+				// Story 1.10 P23 follow-up: lock in the dedup
+				// window so a future stream-config change cannot
+				// silently regress the at-least-once + dedup
+				// contract. publishWithRetry passes the event ID
+				// as WithMsgID; the stream's Duplicates window
+				// must remain >= 2m so retries within that window
+				// are server-side deduplicated.
+				if cfg.Name == "EVENTS_RAW" && cfg.Duplicates < 2*time.Minute {
+					t.Errorf("EVENTS_RAW Duplicates window: got %s, want >= 2m for at-least-once dedup", cfg.Duplicates)
+				}
 				return
 			}
 		}

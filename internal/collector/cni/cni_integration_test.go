@@ -3,6 +3,7 @@
 package cni
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -20,6 +21,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -29,6 +31,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
@@ -180,7 +183,7 @@ func newTestTLSMaterial(t *testing.T) *testTLSMaterial {
 		IsCA:                  true,
 		BasicConstraintsValid: true,
 	}
-	rogueDER, _ := x509.CreateCertificate(rand.Reader, rogueCATpl, rogueCATpl, &rogueCAKey.PublicKey, rogueCAKey)
+	_, _ = x509.CreateCertificate(rand.Reader, rogueCATpl, rogueCATpl, &rogueCAKey.PublicKey, rogueCAKey)
 	rogueClientKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	rogueClientTpl := &x509.Certificate{
 		SerialNumber: big.NewInt(11),
@@ -195,7 +198,6 @@ func newTestTLSMaterial(t *testing.T) *testTLSMaterial {
 	rogueKeyDER, _ := x509.MarshalECPrivateKey(rogueClientKey)
 	rogueKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: rogueKeyDER})
 	rogueClientCert, _ := tls.X509KeyPair(rogueCertPEM, rogueKeyPEM)
-	_ = rogueDER
 
 	return &testTLSMaterial{
 		caPEM:          caPEM,
@@ -317,6 +319,7 @@ func newIntegrationClient(t *testing.T, srv *natsserver.Server) *natsclient.Clie
 
 func newIntegrationAdapter(t *testing.T, m *testTLSMaterial, addr string, nc *natsclient.Client) *Adapter {
 	t.Helper()
+	stg := int64(-60)
 	cfg := Config{
 		GoldmaneAddr:        addr,
 		ServerName:          "localhost",
@@ -326,7 +329,7 @@ func newIntegrationAdapter(t *testing.T, m *testTLSMaterial, addr string, nc *na
 		DialTimeout:         5 * time.Second,
 		StalenessTimeout:    250 * time.Millisecond,
 		AggregationInterval: 15,
-		StartTimeGte:        -60,
+		StartTimeGte:        &stg,
 		Hostname:            "integration-test-node",
 	}
 	a, err := New(cfg, nc, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -372,8 +375,26 @@ func TestIntegration_ConnectsAndPublishesOneFlow(t *testing.T) {
 	nc := newIntegrationClient(t, natsSrv)
 	m := newTestTLSMaterial(t)
 
-	fixture := integrationFixture()
-	fake := &fakeFlowsServer{fixtures: []*goldmanepb.FlowResult{fixture}}
+	// Load the byte-stable fixture rather than building one in
+	// Go: AC4 requires a byte-for-byte fixture compare, and the
+	// binpb fixture pinned at Story 1.3 spike capture time is the
+	// reference. expected.json is regenerated via the -update flag
+	// in TestUpdateExpectedJSON whenever Translate's behavioural
+	// surface intentionally changes.
+	binpb, err := os.ReadFile("testdata/sample-flow.binpb")
+	if err != nil {
+		t.Fatalf("read sample-flow.binpb: %v", err)
+	}
+	var fixture goldmanepb.FlowResult
+	if err := proto.Unmarshal(binpb, &fixture); err != nil {
+		t.Fatalf("unmarshal sample-flow.binpb: %v", err)
+	}
+	expected, err := os.ReadFile("testdata/expected.json")
+	if err != nil {
+		t.Fatalf("read expected.json: %v", err)
+	}
+
+	fake := &fakeFlowsServer{fixtures: []*goldmanepb.FlowResult{&fixture}}
 	addr := startMTLSGoldmaneServer(t, m, fake)
 
 	a := newIntegrationAdapter(t, m, addr, nc)
@@ -390,6 +411,15 @@ func TestIntegration_ConnectsAndPublishesOneFlow(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Errorf("Run did not return within 2s of cancel")
+	}
+
+	// AC4 byte-stable compare against the pinned expected.json
+	// fixture. The published bytes are the canonical JSON the
+	// production publish path emits; regenerating the fixture
+	// requires running TestUpdateExpectedJSON -update.
+	if !bytes.Equal(data, expected) {
+		t.Errorf("published bytes diverge from testdata/expected.json (AC4 fixture)\n  got:  %s\n  want: %s",
+			string(data), string(expected))
 	}
 
 	var ev schema.Event
@@ -413,6 +443,7 @@ func TestIntegration_ConnectsAndPublishesOneFlow(t *testing.T) {
 	}
 }
 
+
 func TestIntegration_HealthFlipOnDialFailure(t *testing.T) {
 	natsSrv := startTestNATS(t)
 	nc := newIntegrationClient(t, natsSrv)
@@ -427,8 +458,16 @@ func TestIntegration_HealthFlipOnDialFailure(t *testing.T) {
 	a.cfg.DialTimeout = 200 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = a.Run(ctx) }()
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Errorf("Run did not return within 2s of cancel")
+		}
+	}()
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
@@ -465,6 +504,7 @@ func TestIntegration_TerminalErrorOnUnauthenticatedClient(t *testing.T) {
 	fake := &fakeFlowsServer{}
 	addr := startMTLSGoldmaneServer(t, m, fake)
 
+	stg := int64(-60)
 	cfg := Config{
 		GoldmaneAddr:        addr,
 		ServerName:          "localhost",
@@ -474,7 +514,7 @@ func TestIntegration_TerminalErrorOnUnauthenticatedClient(t *testing.T) {
 		DialTimeout:         2 * time.Second,
 		StalenessTimeout:    250 * time.Millisecond,
 		AggregationInterval: 15,
-		StartTimeGte:        -60,
+		StartTimeGte:        &stg,
 	}
 	a, err := New(cfg, nc, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -489,11 +529,34 @@ func TestIntegration_TerminalErrorOnUnauthenticatedClient(t *testing.T) {
 	defer cancel()
 	runErr := a.Run(ctx)
 	// Goldmane's mTLS rejection surfaces as either a TLS-layer
-	// handshake error (transient) or a gRPC Unauthenticated code
-	// (terminal). Either way the adapter must mark itself unhealthy.
+	// handshake error (transient retry, surfacing as unhealthy) or
+	// a gRPC Unauthenticated code (terminal). Either way the
+	// adapter must mark itself unhealthy. The health-flip is the
+	// load-bearing contract; whether the dial-side error chain
+	// reaches the typed terminal classifier depends on how the
+	// grpc-go transport layer surfaces the server-side TLS alert
+	// (typically wrapped as a string-only Unavailable status, which
+	// the typed isTerminalConnectError correctly classifies as
+	// transient). The Story 1.10 P10 follow-up strengthens the
+	// assertion to also verify that the adapter records the
+	// rejection as a lastErr; a nil runErr from a 4s-bounded ctx
+	// after a known-bad cert means Run silently swallowed the
+	// transient retry loop, which is itself a defect.
 	healthy, lastErr := a.Health().Status()
 	if healthy {
 		t.Errorf("Health: want unhealthy on rogue-CA cert; lastErr=%v, runErr=%v", lastErr, runErr)
+	}
+	if lastErr == nil {
+		t.Errorf("Health lastErr: got nil; expected rogue-CA cert rejection to be recorded")
+	}
+	// Accept either terminal (typed classifier fired) or non-nil
+	// transient (retry exhausted before ctx timeout, or non-nil
+	// final wrap from Run). A nil runErr is acceptable only if the
+	// ctx-bound retry-loop genuinely cancelled; a healthy=false +
+	// lastErr non-nil + runErr nil chain is the documented
+	// behaviour for transient handshake-rejection scenarios.
+	if runErr != nil && !strings.Contains(runErr.Error(), "terminal") && !strings.Contains(runErr.Error(), "tls") && !strings.Contains(runErr.Error(), "dial") && !strings.Contains(runErr.Error(), "stream") {
+		t.Errorf("Run: got unexpected error shape %v; expected terminal/tls/dial/stream-related", runErr)
 	}
 }
 
@@ -512,13 +575,20 @@ func TestIntegration_MsgIDDedupAcrossRepublish(t *testing.T) {
 
 	a := newIntegrationAdapter(t, m, addr, nc)
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = a.Run(ctx) }()
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Errorf("Run did not return within 2s of cancel")
+		}
+	}()
 
-	// Wait long enough for both publishes to attempt.
-	time.Sleep(1 * time.Second)
-
-	// Check stream's message count: should be exactly 1 (dedup).
+	// Poll the stream's message count instead of sleeping a fixed
+	// 1s; with dedup we expect exactly 1 message. 5s timeout gives
+	// the adapter generous slack to publish both attempts.
 	conn, err := nats.Connect(natsSrv.ClientURL())
 	if err != nil {
 		t.Fatalf("nats.Connect: %v", err)
@@ -528,18 +598,39 @@ func TestIntegration_MsgIDDedupAcrossRepublish(t *testing.T) {
 	if err != nil {
 		t.Fatalf("jetstream.New: %v", err)
 	}
-	ctxQ, cancelQ := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancelQ()
-	stream, err := js.Stream(ctxQ, "EVENTS_RAW")
-	if err != nil {
-		t.Fatalf("stream lookup: %v", err)
+	pollDeadline := time.Now().Add(5 * time.Second)
+	var msgs uint64
+	for time.Now().Before(pollDeadline) {
+		ctxQ, cancelQ := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		stream, sErr := js.Stream(ctxQ, "EVENTS_RAW")
+		if sErr != nil {
+			cancelQ()
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		info, iErr := stream.Info(ctxQ)
+		cancelQ()
+		if iErr != nil {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		msgs = info.State.Msgs
+		if msgs >= 1 {
+			// Wait a bit more for the second (deduped) publish to
+			// settle before locking in the count.
+			time.Sleep(200 * time.Millisecond)
+			ctxQ2, cancelQ2 := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			info2, iErr2 := stream.Info(ctxQ2)
+			cancelQ2()
+			if iErr2 == nil {
+				msgs = info2.State.Msgs
+			}
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	info, err := stream.Info(ctxQ)
-	if err != nil {
-		t.Fatalf("stream info: %v", err)
-	}
-	if info.State.Msgs != 1 {
-		t.Errorf("EVENTS_RAW msg count after dedup: got %d, want 1", info.State.Msgs)
+	if msgs != 1 {
+		t.Errorf("EVENTS_RAW msg count after dedup: got %d, want 1", msgs)
 	}
 }
 
@@ -562,8 +653,16 @@ func TestIntegration_StreamRecvErrorTriggersReconnect(t *testing.T) {
 	a.cfg.ConnectRetry.Max = 50 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = a.Run(ctx) }()
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Errorf("Run did not return within 2s of cancel")
+		}
+	}()
 
 	// Wait for the server to log at least 2 Stream calls (one fail
 	// then one reconnect).
@@ -575,6 +674,177 @@ func TestIntegration_StreamRecvErrorTriggersReconnect(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Errorf("expected adapter to reconnect after stream tear-down (calls=%d)", fake.calls.Load())
+}
+
+// TestIntegration_HealthRecoversOnReconnect verifies the watchdog
+// flips healthy after a transient stream tear-down. Server emits
+// one fixture, returns codes.Unavailable, then accepts on the next
+// Stream call; the adapter's MarkHealthy on the first flow of the
+// second connect should restore the source-health gauge to healthy.
+// Locks in Story 1.10 Task 6.3 (test name from the spec) +
+// review patch P25.
+func TestIntegration_HealthRecoversOnReconnect(t *testing.T) {
+	natsSrv := startTestNATS(t)
+	nc := newIntegrationClient(t, natsSrv)
+	m := newTestTLSMaterial(t)
+
+	fixture := integrationFixture()
+	// Two-phase server: first call sends a fixture then aborts
+	// with Unavailable; second call sends another fixture and
+	// blocks until ctx cancellation. The fakeFlowsServer doesn't
+	// natively support per-call behaviour, so we use a counter
+	// closure via a custom server-side implementation.
+	var callCount atomic.Int32
+	customSrv := &reconnectFakeServer{
+		fixture: fixture,
+		count:   &callCount,
+	}
+	addr := startMTLSGoldmaneServerWithCustom(t, m, customSrv)
+
+	a := newIntegrationAdapter(t, m, addr, nc)
+	a.cfg.ConnectRetry.Min = 5 * time.Millisecond
+	a.cfg.ConnectRetry.Max = 50 * time.Millisecond
+	a.cfg.StalenessTimeout = 2 * time.Second // tests should not race the watchdog
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Errorf("Run did not return within 2s of cancel")
+		}
+	}()
+
+	// Poll for at least two Stream calls (the first that errored
+	// and the second that succeeded) AND a healthy gauge.
+	pollDeadline := time.Now().Add(5 * time.Second)
+	var lastHealthy bool
+	var lastErr error
+	for time.Now().Before(pollDeadline) {
+		if callCount.Load() >= 2 {
+			lastHealthy, lastErr = a.Health().Status()
+			if lastHealthy {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("Health did not flip healthy after reconnect: calls=%d, healthy=%v, lastErr=%v",
+		callCount.Load(), lastHealthy, lastErr)
+}
+
+// reconnectFakeServer is a per-test gRPC server that mimics the
+// "transient tear-down then recovery" reconnect scenario for P25.
+type reconnectFakeServer struct {
+	goldmanepb.UnimplementedFlowsServer
+	fixture *goldmanepb.FlowResult
+	count   *atomic.Int32
+}
+
+func (r *reconnectFakeServer) Stream(_ *goldmanepb.FlowStreamRequest, stream grpc.ServerStreamingServer[goldmanepb.FlowResult]) error {
+	n := r.count.Add(1)
+	if err := stream.Send(r.fixture); err != nil {
+		return err
+	}
+	if n == 1 {
+		return status.Error(codes.Unavailable, "synthetic tear-down for reconnect test")
+	}
+	<-stream.Context().Done()
+	return stream.Context().Err()
+}
+
+// startMTLSGoldmaneServerWithCustom mirrors startMTLSGoldmaneServer
+// but accepts the concrete server type so tests with per-call
+// behaviour can swap the fakeFlowsServer baseline.
+func startMTLSGoldmaneServerWithCustom(t *testing.T, m *testTLSMaterial, srv goldmanepb.FlowsServer) string {
+	t.Helper()
+	clientCAs := x509.NewCertPool()
+	clientCAs.AppendCertsFromPEM(m.caPEM)
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{m.serverCert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    clientCAs,
+		MinVersion:   tls.VersionTLS12,
+	}
+	creds := credentials.NewTLS(tlsCfg)
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	gsrv := grpc.NewServer(grpc.Creds(creds))
+	goldmanepb.RegisterFlowsServer(gsrv, srv)
+	go func() { _ = gsrv.Serve(lis) }()
+	t.Cleanup(func() {
+		gsrv.GracefulStop()
+		_ = lis.Close()
+	})
+	return lis.Addr().String()
+}
+
+// TestIntegration_TLSConfig_RequiresValidCert verifies that an
+// adapter without a client cert cannot complete the mTLS
+// handshake. Mirrors Story 1.9's analogous applog-webhook test:
+// server requires client cert via tls.RequireAndVerifyClientCert,
+// adapter dials with a CA-only TLS config (no client cert), and
+// the dial / stream fails. Locks in Story 1.10 Task 6.3 + P26.
+func TestIntegration_TLSConfig_RequiresValidCert(t *testing.T) {
+	natsSrv := startTestNATS(t)
+	nc := newIntegrationClient(t, natsSrv)
+	m := newTestTLSMaterial(t)
+
+	fake := &fakeFlowsServer{}
+	addr := startMTLSGoldmaneServer(t, m, fake)
+
+	// Build an adapter whose TLS loader returns a config with NO
+	// client certificate. Production never has this shape -- the
+	// chart requires the three file paths -- but a misconfigured
+	// loader that dropped the client cert would be caught by this
+	// test before the adapter shipped to production.
+	stg := int64(-60)
+	cfg := Config{
+		GoldmaneAddr:        addr,
+		ServerName:          "localhost",
+		CABundlePath:        m.caPath,
+		ClientCertPath:      m.clientCertPath,
+		ClientKeyPath:       m.clientKeyPath,
+		DialTimeout:         2 * time.Second,
+		StalenessTimeout:    2 * time.Second,
+		AggregationInterval: 15,
+		StartTimeGte:        &stg,
+	}
+	a, err := New(cfg, nc, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	a.tlsLoaderFn = func() (*tls.Config, error) {
+		pool := x509.NewCertPool()
+		pool.AppendCertsFromPEM(m.caPEM)
+		return &tls.Config{
+			RootCAs:    pool,
+			ServerName: "localhost",
+			MinVersion: tls.VersionTLS12,
+			// Deliberately omit Certificates -- the server's
+			// RequireAndVerifyClientCert will reject the
+			// handshake.
+		}, nil
+	}
+	a.cfg.ConnectRetry.Min = 5 * time.Millisecond
+	a.cfg.ConnectRetry.Max = 20 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_ = a.Run(ctx)
+
+	healthy, lastErr := a.Health().Status()
+	if healthy {
+		t.Errorf("Health: want unhealthy when adapter has no client cert; lastErr=%v", lastErr)
+	}
+	if lastErr == nil {
+		t.Errorf("Health lastErr: got nil; expected mTLS rejection to be recorded")
+	}
 }
 
 // compile-time check: avoid unused-helper warnings when the test

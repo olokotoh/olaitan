@@ -66,6 +66,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"google.golang.org/protobuf/encoding/protojson"
 
@@ -142,14 +143,20 @@ var nowFunc = time.Now
 // Translate converts a Goldmane FlowResult into the canonical
 // internal/schema.Event the rest of Olaitan consumes. The exported
 // function is callable from the adapter's consume loop and from the
-// translate_test.go unit tests in the test package. maxEventBytes
-// caps the marshalled Event; pass 0 to use DefaultMaxEventBytes.
+// translate_test.go unit tests in the test package. hostname is the
+// node-level identifier the adapter records on Event.Pod.Node so the
+// downstream correlator can attribute the flow to a specific node;
+// pass the empty string when no node identifier is available (tests).
+// maxEventBytes caps the marshalled Event; pass 0 to use
+// DefaultMaxEventBytes.
 //
 // Edge cases (each gets a unit test):
 //
 //   - fr == nil OR fr.Flow == nil OR fr.Flow.Key == nil -> ErrNilFlowResult.
 //   - flow.StartTime == 0 OR before 2010-01-01 UTC -> ErrInvalidTimestamp.
 //   - flow.StartTime > now + 24h -> ErrInvalidTimestamp.
+//   - flow.EndTime < flow.StartTime OR > now + 24h -> emit
+//     "time_anomaly:true" tag without rejecting (defence in depth).
 //   - key.Proto == "" -> emit "proto:unknown" tag (defensive; flow
 //     records always have a proto, but defence in depth).
 //   - key.Action == Action_ActionUnspecified -> emit
@@ -164,7 +171,7 @@ var nowFunc = time.Now
 //
 // The function is pure: no I/O, no allocation beyond what
 // protojson.Marshal and json.Marshal require.
-func Translate(fr *goldmanepb.FlowResult, maxEventBytes int) (schema.Event, error) {
+func Translate(fr *goldmanepb.FlowResult, hostname string, maxEventBytes int) (schema.Event, error) {
 	if fr == nil || fr.GetFlow() == nil || fr.GetFlow().GetKey() == nil {
 		return schema.Event{}, ErrNilFlowResult
 	}
@@ -202,17 +209,23 @@ func Translate(fr *goldmanepb.FlowResult, maxEventBytes int) (schema.Event, erro
 	dstNS := sanitizeForTag(key.GetDestNamespace())
 	dstName := sanitizeForTag(key.GetDestName())
 
-	summary := fmt.Sprintf("%s/%s -> %s/%s:%d (%s, %s, %s)",
+	// Summary is composed from already-sanitised pieces; no outer
+	// sanitizeForTag pass so the 256-byte cap does not silently
+	// truncate a long src/dst combination. The marshalled-event
+	// size guard below is the load-bearing ceiling. Story 1.10
+	// code-review patch P10: render DestPort via destPortSummary so
+	// out-of-range ports show "invalid" in the human-facing summary
+	// consistently with the dst-port:invalid tag emitted by buildTags.
+	summary := fmt.Sprintf("%s/%s -> %s/%s:%s (%s, %s, %s)",
 		nonEmpty(srcNS, "-"),
 		nonEmpty(srcName, "-"),
 		nonEmpty(dstNS, "-"),
 		nonEmpty(dstName, "-"),
-		key.GetDestPort(),
+		destPortSummary(key.GetDestPort()),
 		strings.ToLower(sanitizeForTag(key.GetProto())),
 		actionString(key.GetAction()),
 		reporterString(key.GetReporter()),
 	)
-	summary = sanitizeForTag(summary)
 
 	ev := schema.Event{
 		ID:        id,
@@ -221,6 +234,7 @@ func Translate(fr *goldmanepb.FlowResult, maxEventBytes int) (schema.Event, erro
 		Pod: schema.PodRef{
 			Name:      srcName,
 			Namespace: srcNS,
+			Node:      hostname,
 		},
 		Severity: "informational",
 		Category: schema.CategoryFlow,
@@ -258,15 +272,19 @@ func validateTimestamp(startTime int64) error {
 	if startTime < minValidTimestamp {
 		return fmt.Errorf("%w: start_time=%d before 2010-01-01 UTC", ErrInvalidTimestamp, startTime)
 	}
-	skew := time.Unix(startTime, 0).Sub(nowFunc())
-	if skew > maxFutureSkew {
-		return fmt.Errorf("%w: start_time=%d is %s in the future", ErrInvalidTimestamp, startTime, skew)
+	// Compare seconds directly to avoid time.Duration saturation when
+	// startTime is near math.MaxInt64 (Sub() returns math.MaxInt64
+	// nanoseconds, which sign-flips and may evade the >maxFutureSkew
+	// guard). Subtracting int64 seconds is safe up to the 2^63-1 bound.
+	skewSec := startTime - nowFunc().Unix()
+	if skewSec > int64(maxFutureSkew.Seconds()) {
+		return fmt.Errorf("%w: start_time=%d is %ds in the future", ErrInvalidTimestamp, startTime, skewSec)
 	}
 	return nil
 }
 
 // buildTags returns the deterministic tag set for a FlowResult.
-// Lifted from the spike's buildTags with three additions:
+// Lifted from the spike's buildTags with several additions:
 //   - "pod_name_kind:generatename" so the correlator (Story 1.14)
 //     can detect the GenerateName-derived FlowKey.source_name and
 //     drive K8s API enrichment via the posture client (Story 1.11).
@@ -275,6 +293,15 @@ func validateTimestamp(startTime int64) error {
 //     EndpointType case).
 //   - "dst-port:invalid" when the port falls outside the uint16
 //     range (defensive: the proto declares int64 for DestPort).
+//   - "time_anomaly:true" when Flow.EndTime is before StartTime or
+//     more than 24h in the future from now (defence in depth).
+//   - "src-label:<k>=<v>" / "dst-label:<k>=<v>" for K8s pod labels
+//     under app.kubernetes.io/* and olaitan.io/* (allowlist; the
+//     remaining Calico-injected labels are noisy for downstream
+//     pattern-match rules).
+//   - "policy:<kind>/<ns>/<name>:<action>" for up to maxPolicyTags
+//     enforced + pending policy hits so policy-context-aware Sigma
+//     rules can pattern-match.
 //
 // Each sanitised value passes through sanitizeForTag to strip
 // control characters and cap length, defending against a hostile
@@ -306,7 +333,185 @@ func buildTags(key *goldmanepb.FlowKey, flow *goldmanepb.Flow) []string {
 	if cs := flow.GetNumConnectionsStarted(); cs > 0 {
 		tags = append(tags, "conns-started:"+strconv.FormatInt(cs, 10))
 	}
+	// EndTime anomaly: Goldmane proto says "EndTime is always at
+	// least one aggregation interval after StartTime"; an inverted
+	// or far-future EndTime is a malformed flow but we keep it for
+	// the downstream rules engine and surface the anomaly via tag.
+	if endTimeAnomalous(flow.GetStartTime(), flow.GetEndTime()) {
+		tags = append(tags, "time_anomaly:true")
+	}
+	// Story 1.10 code-review patch P16: cap label iteration at
+	// maxLabelIter per direction. A workload with 1000+ labels is
+	// legal in K8s; even though only allowlisted prefixes propagate,
+	// iterating every label costs sanitizeForTag + HasPrefix per
+	// entry. Emit a "labels_truncated:true" marker so downstream
+	// rules can flag the truncation.
+	truncated := false
+	for i, l := range flow.GetSourceLabels() {
+		if i >= maxLabelIter {
+			truncated = true
+			break
+		}
+		if t := labelTag("src-label:", l); t != "" {
+			tags = append(tags, t)
+		}
+	}
+	for i, l := range flow.GetDestLabels() {
+		if i >= maxLabelIter {
+			truncated = true
+			break
+		}
+		if t := labelTag("dst-label:", l); t != "" {
+			tags = append(tags, t)
+		}
+	}
+	if truncated {
+		tags = append(tags, "labels_truncated:true")
+	}
+	tags = append(tags, policyTags(key.GetPolicies())...)
 	return tags
+}
+
+// maxLabelIter caps how many labels per direction (source/dest) are
+// considered for the allowlist match. K8s permits unbounded label
+// count (object size is the only cap); a pathological workload with
+// thousands of labels would otherwise force the adapter to call
+// sanitizeForTag thousands of times per flow. 64 covers the realistic
+// upper bound for production workloads (recommended max is dozens).
+// Story 1.10 code-review patch P16.
+const maxLabelIter = 64
+
+// maxPolicyTags caps the number of policy: tags emitted per event
+// so a pathological PolicyTrace cannot blow the event-size budget.
+// Calico's hit count is bounded by the number of policies traversed;
+// 16 covers the realistic upper bound (tier + namespace + global +
+// admin + baseline + EndOfTier across two directions).
+const maxPolicyTags = 16
+
+// allowedLabelPrefixes is the K8s pod-label forwarding allowlist.
+// Matches the cri / applog precedent: only labels under the
+// well-known Kubernetes app metadata namespace and the project's
+// own olaitan.io/* namespace propagate downstream. Calico-injected
+// labels (projectcalico.org/*) are deliberately excluded; they are
+// dataplane bookkeeping rather than workload identity signals.
+var allowedLabelPrefixes = []string{
+	"app.kubernetes.io/",
+	"olaitan.io/",
+}
+
+// labelTag returns prefix + sanitised label when the label matches
+// the allowlist; empty string otherwise. Labels arrive as "k=v"
+// strings per the Calico Goldmane convention.
+func labelTag(prefix, kv string) string {
+	for _, p := range allowedLabelPrefixes {
+		if strings.HasPrefix(kv, p) {
+			return prefix + sanitizeForTag(kv)
+		}
+	}
+	return ""
+}
+
+// policyTags renders a PolicyTrace as up to maxPolicyTags
+// "policy:<kind>/<ns>/<name>:<action>" entries. Enforced policies
+// come first; pending policies fill the remaining slots.
+//
+// Story 1.10 D3 (code-review patch P27): `/` and `:` in ns or name
+// are replaced with `_` BEFORE building the tag string. Calico
+// legally allows tier-prefixed names (e.g., `tier1/rule2`) and
+// the `:` separator the tag format uses for the action segment
+// would otherwise collide with a `:` inside a hostile or
+// auto-generated policy name. Downstream Sigma rules and the
+// Story 1.14 correlator can safely split the tag on the
+// documented separators after this sanitisation.
+//
+// Story 1.10 code-review patch P20: emit returns false when the
+// maxPolicyTags ceiling is hit so the outer loops can break
+// rather than walk the remainder of the slice and discard each
+// sanitizeForTag result.
+func policyTags(pt *goldmanepb.PolicyTrace) []string {
+	if pt == nil {
+		return nil
+	}
+	out := make([]string, 0, maxPolicyTags)
+	emit := func(p *goldmanepb.PolicyHit) bool {
+		if len(out) >= maxPolicyTags {
+			return false
+		}
+		kind := policyKindString(p.GetKind())
+		ns := policySegmentReplacer.Replace(sanitizeForTag(p.GetNamespace()))
+		name := policySegmentReplacer.Replace(sanitizeForTag(p.GetName()))
+		action := actionString(p.GetAction())
+		out = append(out, fmt.Sprintf("policy:%s/%s/%s:%s", kind, nonEmpty(ns, "-"), nonEmpty(name, "-"), action))
+		return true
+	}
+	for _, p := range pt.GetEnforcedPolicies() {
+		if !emit(p) {
+			break
+		}
+	}
+	for _, p := range pt.GetPendingPolicies() {
+		if !emit(p) {
+			break
+		}
+	}
+	return out
+}
+
+// policySegmentReplacer sanitises Calico policy namespace/name segments
+// before they land in a "policy:<kind>/<ns>/<name>:<action>" tag.
+// Calico tier-prefixed names like "tier1/rule2" carry a literal "/"
+// that downstream parsers would treat as the kind/ns/name separator;
+// ":" inside a name would similarly collide with the action separator.
+// Story 1.10 D3 (code-review patch P27).
+var policySegmentReplacer = strings.NewReplacer("/", "_", ":", "_")
+
+// policyKindString maps the PolicyKind enum to a stable tag
+// substring. Unrecognised kinds degrade to "unspecified" so a
+// future enum addition does not produce a noisy raw-int form.
+func policyKindString(k goldmanepb.PolicyKind) string {
+	switch k {
+	case goldmanepb.PolicyKind_CalicoNetworkPolicy:
+		return "calico-np"
+	case goldmanepb.PolicyKind_GlobalNetworkPolicy:
+		return "calico-gnp"
+	case goldmanepb.PolicyKind_StagedNetworkPolicy:
+		return "staged-np"
+	case goldmanepb.PolicyKind_StagedGlobalNetworkPolicy:
+		return "staged-gnp"
+	case goldmanepb.PolicyKind_StagedKubernetesNetworkPolicy:
+		return "staged-k8s-np"
+	case goldmanepb.PolicyKind_NetworkPolicy:
+		return "k8s-np"
+	case goldmanepb.PolicyKind_AdminNetworkPolicy:
+		return "admin-np"
+	case goldmanepb.PolicyKind_BaselineAdminNetworkPolicy:
+		return "baseline-admin-np"
+	case goldmanepb.PolicyKind_Profile:
+		return "profile"
+	case goldmanepb.PolicyKind_EndOfTier:
+		return "end-of-tier"
+	default:
+		return "unspecified"
+	}
+}
+
+// endTimeAnomalous reports whether the EndTime / StartTime pair is
+// out of contract (inverted or far-future). The 24h far-future
+// allowance matches validateTimestamp's maxFutureSkew.
+func endTimeAnomalous(start, end int64) bool {
+	if end == 0 {
+		// EndTime is optional in some Goldmane release flavours;
+		// only flag explicit anomalies.
+		return false
+	}
+	if end < start {
+		return true
+	}
+	// Compare seconds directly to avoid time.Duration saturation for
+	// near-MaxInt64 end timestamps (see validateTimestamp for the same
+	// overflow rationale).
+	skewSec := end - nowFunc().Unix()
+	return skewSec > int64(maxFutureSkew.Seconds())
 }
 
 // destPortTag returns the tag-suffix for FlowKey.DestPort.
@@ -315,6 +520,18 @@ func buildTags(key *goldmanepb.FlowKey, flow *goldmanepb.Flow) []string {
 // > 65535 violates the network-layer invariant). Defensive
 // "invalid" tag retains the flow rather than dropping it.
 func destPortTag(p int64) string {
+	if p < 0 || p > 65535 {
+		return "invalid"
+	}
+	return strconv.FormatInt(p, 10)
+}
+
+// destPortSummary returns the port rendering for the human-facing
+// Event.Summary string. Mirrors destPortTag's range guard so the
+// Summary cannot show an absurd "999999" or negative port while the
+// dst-port:invalid tag is also emitted. Story 1.10 code-review
+// patch P10.
+func destPortSummary(p int64) string {
 	if p < 0 || p > 65535 {
 		return "invalid"
 	}
@@ -385,7 +602,9 @@ func nonEmpty(s, fallback string) string {
 // sanitizeForTag strips control characters (tab is preserved) and
 // caps the result at maxSanitizedTagLen bytes. Mirrors
 // applog.sanitizeForTag exactly so all five adapters apply the
-// same defence-in-depth tag-sanitisation contract.
+// same defence-in-depth tag-sanitisation contract. Truncation
+// walks back to the preceding rune boundary so a multi-byte UTF-8
+// sequence is never split mid-codepoint.
 func sanitizeForTag(s string) string {
 	if s == "" {
 		return s
@@ -404,7 +623,11 @@ func sanitizeForTag(s string) string {
 	}
 	out := b.String()
 	if len(out) > maxSanitizedTagLen {
-		out = out[:maxSanitizedTagLen]
+		cut := maxSanitizedTagLen
+		for cut > 0 && !utf8.RuneStart(out[cut]) {
+			cut--
+		}
+		out = out[:cut]
 	}
 	return out
 }

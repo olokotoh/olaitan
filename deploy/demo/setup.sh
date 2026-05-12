@@ -99,9 +99,9 @@ sudo chown \$(id -u):\$(id -g) \$HOME/.kube/config
 # NOT produce a Goldmane Deployment. See deploy/helm/olaitan/CNI.md
 # and docs/deferred-decisions.md (ADR-2026-04-30-01 / ADR-2026-05-12-01).
 # ---------------------------------------------------------------------
-kubectl create -f ${TIGERA_OPERATOR_MANIFEST}
+kubectl apply -f ${TIGERA_OPERATOR_MANIFEST}
 kubectl -n tigera-operator rollout status deployment/tigera-operator --timeout=180s
-kubectl create -f ${CALICO_CUSTOM_RESOURCES}
+kubectl apply -f ${CALICO_CUSTOM_RESOURCES}
 kubectl -n calico-system rollout status deployment/goldmane --timeout=300s
 kubectl -n calico-system wait --for=condition=Ready pod -l k8s-app=calico-node --timeout=180s
 

@@ -150,6 +150,21 @@ NetworkPolicy outside the chart must replicate this rule manually.
   Goldmane's 15-second aggregation interval, not a per-packet
   timestamp. Sigma rules using `timestamp` semantics must account
   for the aggregation window.
+- **`startTimeGte` semantics.** The chart default
+  (`calicoSensor.startTimeGte: -60`) replays the last 60 seconds of
+  flow records on every reconnect, matching the spike's capture
+  mode. An explicit `0` reaches Goldmane's documented "now"
+  semantic per the v3.31.5 proto contract
+  (`goldmane/proto/api.proto` line 91: "A value of zero means
+  'now'") and starts the stream from current wall-clock without
+  replay. Positive values are rejected at config-load time. To use
+  the chart default explicitly, set `calicoSensor.startTimeGte:
+  null` (or omit the key).
+- **`aggregationInterval` is fixed at 15s.** Goldmane's proto
+  contract pins the value (`goldmane/proto/api.proto` line 100: "It
+  must always be 15s."). The chart default and the config-loader
+  reject any non-15 value to fail fast rather than surface a
+  Goldmane-side rejection at stream-open time.
 
 ## Future hardening
 

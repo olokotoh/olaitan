@@ -590,7 +590,7 @@ SourceNetwork` and `Category: CategoryFlow`, and publishing to
   `go_package` to the production path; this requires regenerating
   the `.pb.go` files via `buf generate` (the spike's `buf.gen.yaml`
   is reusable).
-- *New main-module dependencies.* `google.golang.org/grpc v1.80.0`
+- *New main-module dependencies.* `google.golang.org/grpc v1.81.0`
   and `google.golang.org/protobuf v1.36.11` move from the spike's
   isolated `go.mod` into the main module. Story 1.10 runs
   `go mod tidy` and verifies no transitive breakage in existing
@@ -670,7 +670,7 @@ top of the spike numbers.
   Goldmane proto pinned to SHA
   `2e4da40144aac869e1ed2cc220b6c4b62f32efdd` (the `v3.31.5` tag
   commit of `projectcalico/calico` at `goldmane/proto/api.proto`).
-  `google.golang.org/grpc v1.80.0` and
+  `google.golang.org/grpc v1.81.0` and
   `google.golang.org/protobuf v1.36.11` move into the main module.
 - *Adapter landing path.* `internal/collector/cni/` for the
   adapter (`cni.go`, `translate.go`, tests, bench), with the

@@ -357,6 +357,65 @@ func TestValidateTable(t *testing.T) {
 			},
 			"", // empty wantSub: expect NO error.
 		},
+		{
+			"calico-aggregation-interval-non-15-rejected",
+			func(c *config.Config) {
+				c.Detection.Sources.Calico = config.CalicoSourceConfig{
+					Enabled:             true,
+					GoldmaneAddr:        "goldmane.calico-system.svc:7443",
+					CABundlePath:        "/etc/olaitan/cni/ca.crt",
+					ClientCertPath:      "/etc/olaitan/cni/client.crt",
+					ClientKeyPath:       "/etc/olaitan/cni/client.key",
+					AggregationInterval: 30,
+				}
+			},
+			"must be 15s per Goldmane proto",
+		},
+		{
+			"calico-start-time-gte-positive-rejected",
+			func(c *config.Config) {
+				positive := int64(60)
+				c.Detection.Sources.Calico = config.CalicoSourceConfig{
+					Enabled:        true,
+					GoldmaneAddr:   "goldmane.calico-system.svc:7443",
+					CABundlePath:   "/etc/olaitan/cni/ca.crt",
+					ClientCertPath: "/etc/olaitan/cni/client.crt",
+					ClientKeyPath:  "/etc/olaitan/cni/client.key",
+					StartTimeGte:   &positive,
+				}
+			},
+			"start_time_gte: must be <= 0",
+		},
+		{
+			"calico-start-time-gte-explicit-zero-ok",
+			func(c *config.Config) {
+				zero := int64(0)
+				c.Detection.Sources.Calico = config.CalicoSourceConfig{
+					Enabled:        true,
+					GoldmaneAddr:   "goldmane.calico-system.svc:7443",
+					CABundlePath:   "/etc/olaitan/cni/ca.crt",
+					ClientCertPath: "/etc/olaitan/cni/client.crt",
+					ClientKeyPath:  "/etc/olaitan/cni/client.key",
+					StartTimeGte:   &zero,
+				}
+			},
+			"", // explicit 0 reaches Goldmane's "now" semantic per proto line 91
+		},
+		{
+			"calico-start-time-gte-negative-ok",
+			func(c *config.Config) {
+				neg := int64(-300)
+				c.Detection.Sources.Calico = config.CalicoSourceConfig{
+					Enabled:        true,
+					GoldmaneAddr:   "goldmane.calico-system.svc:7443",
+					CABundlePath:   "/etc/olaitan/cni/ca.crt",
+					ClientCertPath: "/etc/olaitan/cni/client.crt",
+					ClientKeyPath:  "/etc/olaitan/cni/client.key",
+					StartTimeGte:   &neg,
+				}
+			},
+			"", // negative is relative seconds; -300 = "last 5 minutes"
+		},
 	}
 
 	for _, tt := range tests {

@@ -312,7 +312,7 @@ containerdSensor:
     maxAttempts: 3
 
 # --- Calico CNI flow sensor (FR4) ------------------------------------
-# Story 1.10 -- fourth Ring 1 streaming sensor source. Subscribes to
+# Story 1.10 -- fifth Ring 1 streaming sensor source. Subscribes to
 # the Calico Goldmane gRPC API (`goldmane.Flows.Stream`) over mTLS,
 # translating each FlowResult into a schema.Event of source=network /
 # category=flow. Default-off because Goldmane requires the Tigera
@@ -342,9 +342,14 @@ calicoSensor:
   # matches the cert the Tigera operator issues for Goldmane.
   serverName: "goldmane.calico-system.svc"
 
-  # FlowStreamRequest knobs. StartTimeGte is negative for "relative to
-  # now" (Goldmane convention; -60 means "last 60s"). AggregationInterval
-  # has a 15s minimum at the Goldmane layer.
+  # FlowStreamRequest knobs. StartTimeGte is negative for "relative
+  # to now" (Goldmane convention; -60 means "replay the last 60s").
+  # An explicit 0 reaches Goldmane's documented "now" semantic per
+  # the v3.31.5 proto contract (goldmane/proto/api.proto line 91:
+  # "A value of zero means 'now'"); pass null / omit to fall back
+  # to the chart default of -60. Goldmane requires AggregationInterval
+  # to be exactly 15s per the same proto contract (line 100: "It
+  # must always be 15s.").
   startTimeGte: -60
   aggregationInterval: 15
 
@@ -413,7 +418,7 @@ calicoSensor:
     clientKey: ""
 
 # --- application log sidecar (FR5) -----------------------------------
-# Story 1.9 -- fifth Ring 1 sensor source. The chart deploys a
+# Story 1.9 -- fourth Ring 1 sensor source (Story 1.10 takes the fifth slot). The chart deploys a
 # MutatingAdmissionWebhook (separate Deployment from the agent
 # DaemonSet) that injects an Olaitan applog sidecar into pods bearing
 # the annotation `olaitan.io/log-sidecar: "enabled"`. The sidecar
