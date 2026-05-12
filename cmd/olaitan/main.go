@@ -30,10 +30,15 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+
 	"github.com/olokotoh/olaitan/internal/collector/audit"
 	"github.com/olokotoh/olaitan/internal/collector/cni"
 	"github.com/olokotoh/olaitan/internal/collector/cri"
 	"github.com/olokotoh/olaitan/internal/collector/falco"
+	"github.com/olokotoh/olaitan/internal/collector/posture"
 	"github.com/olokotoh/olaitan/internal/config"
 	"github.com/olokotoh/olaitan/internal/health"
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
@@ -181,7 +186,8 @@ func runRingCtx(ctx context.Context, ring string, args []string, stderr io.Write
 	// SourceAdapter interface extraction landing in Story 1.7 once a
 	// second concrete instance reveals what is variant vs invariant).
 	// The aggregator subcommand's wiring lands in Epic 2.
-	if ring == "collector" {
+	switch ring {
+	case "collector":
 		if err := startCollectorRing(gctx, g, log, mgr.Get()); err != nil {
 			log.Error("startup: collector ring wiring", "err", err)
 			// Cancel ringCtx (the parent of gctx) so the health server
@@ -192,7 +198,15 @@ func runRingCtx(ctx context.Context, ring string, args []string, stderr io.Write
 			<-watcherDone
 			return 1
 		}
-	} else {
+	case "aggregator":
+		if err := startAggregatorRing(ringCtx, log, mgr.Get()); err != nil {
+			log.Error("startup: aggregator ring wiring", "err", err)
+			ringCancel()
+			_ = g.Wait()
+			<-watcherDone
+			return 1
+		}
+	default:
 		log.Info(ring+": not yet implemented, awaiting Epic 2 wiring",
 			"config", *cfgPath,
 		)
@@ -212,6 +226,92 @@ func runRingCtx(ctx context.Context, ring string, args []string, stderr io.Write
 	log.Info(ring + ": shutting down")
 	<-watcherDone
 	return 0
+}
+
+// kubeClientFactory is the test-seam for constructing a typed K8s
+// clientset. Production calls rest.InClusterConfig (with the
+// out-of-cluster KUBECONFIG fallback below); tests override this
+// variable to inject a fake clientset.
+var kubeClientFactory = defaultKubeClientFactory
+
+func defaultKubeClientFactory(log *slog.Logger) (kubernetes.Interface, error) {
+	if cfg, err := rest.InClusterConfig(); err == nil {
+		return kubernetes.NewForConfig(cfg)
+	}
+	// Out-of-cluster fallback: KUBECONFIG env var or the default
+	// loading rules. This path supports `make deploy-kind` smoke
+	// tests run from an operator workstation; production Pods always
+	// have InClusterConfig.
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	overrides := &clientcmd.ConfigOverrides{}
+	clientCfg := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides)
+	cfg, err := clientCfg.ClientConfig()
+	if err != nil {
+		return nil, fmt.Errorf("k8s rest config: %w", err)
+	}
+	return kubernetes.NewForConfig(cfg)
+}
+
+// postureClient is the package-level reference to the constructed
+// posture client. Story 1.14 (correlator) reads this when assembling
+// EvidencePackages; Story 1.12 binds the cache-hit counter to the
+// Prometheus surface via the client's getters. The reference is set
+// only when posture.enabled=true in the loaded config and the K8s
+// client construction succeeds; otherwise it stays nil and downstream
+// callers fall through to a degraded posture (Unavailable=true).
+var postureClient *posture.Client
+
+// startAggregatorRing performs the Story 1.11 wiring: construct a
+// posture.Client backed by an in-cluster (or KUBECONFIG-backed) K8s
+// clientset, store it in the package-level postureClient pointer so
+// Story 1.14's correlator can pick it up. The Story 1.14 correlator
+// wiring lands here later. For now this function only constructs the
+// client and verifies the K8s API is reachable when posture is
+// enabled.
+//
+// Behaviour matrix:
+//
+//   - posture.enabled=true AND K8s client construction succeeds -> set
+//     postureClient and return nil.
+//   - posture.enabled=true AND K8s client construction fails -> log
+//     error and return the error so the pod CrashLoops; an
+//     intentionally-enabled posture must not silently degrade.
+//   - posture.enabled=false -> log "posture disabled", leave
+//     postureClient nil, return nil.
+func startAggregatorRing(ctx context.Context, log *slog.Logger, cfg *config.Config) error {
+	if !cfg.Detection.Posture.Enabled {
+		log.Info("aggregator: posture client disabled in config; skipping")
+		return nil
+	}
+
+	cs, err := kubeClientFactory(log)
+	if err != nil {
+		return fmt.Errorf("posture: kube client: %w", err)
+	}
+
+	pCfg := posture.DefaultConfig()
+	if d := cfg.Detection.Posture.CacheTTL.Duration(); d > 0 {
+		pCfg.CacheTTL = d
+	}
+	if d := cfg.Detection.Posture.FetchTimeout.Duration(); d > 0 {
+		pCfg.FetchTimeout = d
+	}
+
+	client, err := posture.New(pCfg, cs, log)
+	if err != nil {
+		return fmt.Errorf("posture: client init: %w", err)
+	}
+	postureClient = client
+	log.Info("aggregator: posture client constructed",
+		"cache_ttl", pCfg.CacheTTL,
+		"fetch_timeout", pCfg.FetchTimeout,
+	)
+	// Future Story 1.14: wire postureClient into the correlator
+	// goroutine here. The ctx is plumbed through for the lifecycle
+	// hand-off so the correlator can scope per-Get contexts under
+	// ringCtx.
+	_ = ctx
+	return nil
 }
 
 // startCollectorRing wires the Ring 1 sensor adapters into the supplied

@@ -83,6 +83,16 @@ detection:
         multiplier: 2.0
         jitter: 1.0
         max_attempts: 3
+  # Story 1.11: read-on-demand workload posture client (FR7,
+  # architecture.md:45, :324, :751). The client queries the K8s API
+  # for the workload's RBAC bindings, applicable NetworkPolicies, and
+  # PodSecurityContext at investigation time; results are cached for
+  # cache_ttl seconds keyed by workload identity. The TTL ceiling is
+  # 60s per architecture.md:324 + AC3; the chart rejects higher.
+  posture:
+    enabled: true
+    cache_ttl: "60s"
+    fetch_timeout: "5s"
 
 response:
   excluded_namespaces:

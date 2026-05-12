@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -14,6 +15,8 @@ import (
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"golang.org/x/sync/errgroup"
+	"k8s.io/client-go/kubernetes"
+	kubefake "k8s.io/client-go/kubernetes/fake"
 
 	"github.com/olokotoh/olaitan/internal/config"
 )
@@ -311,5 +314,104 @@ func TestStartCollectorRing_WiresCalicoAdapter(t *testing.T) {
 				t.Fatalf("errgroup did not unwind within 5s of cancel")
 			}
 		})
+	}
+}
+
+// TestStartAggregator_BuildsPostureClientWhenEnabled exercises the
+// Story 1.11 wiring: when detection.posture.enabled=true and the
+// kube-client factory returns a valid clientset, startAggregatorRing
+// constructs the package-level postureClient and returns nil.
+func TestStartAggregator_BuildsPostureClientWhenEnabled(t *testing.T) {
+	// Save and restore the package-level seam so this test does not
+	// leak into other tests in the suite.
+	prevFactory := kubeClientFactory
+	prevClient := postureClient
+	t.Cleanup(func() {
+		kubeClientFactory = prevFactory
+		postureClient = prevClient
+	})
+
+	kubeClientFactory = func(*slog.Logger) (kubernetes.Interface, error) {
+		return kubefake.NewSimpleClientset(), nil
+	}
+	postureClient = nil
+
+	cfg := &config.Config{
+		Detection: config.DetectionConfig{
+			Posture: config.PostureConfig{Enabled: true},
+		},
+	}
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+
+	if err := startAggregatorRing(context.Background(), log, cfg); err != nil {
+		t.Fatalf("startAggregatorRing: %v", err)
+	}
+	if postureClient == nil {
+		t.Errorf("postureClient: got nil, want non-nil")
+	}
+}
+
+// TestStartAggregator_PostureDisabledLeavesClientNil exercises the
+// short-circuit when posture is disabled: no kube-client construction,
+// postureClient stays nil, no error.
+func TestStartAggregator_PostureDisabledLeavesClientNil(t *testing.T) {
+	prevFactory := kubeClientFactory
+	prevClient := postureClient
+	t.Cleanup(func() {
+		kubeClientFactory = prevFactory
+		postureClient = prevClient
+	})
+
+	kubeClientFactory = func(*slog.Logger) (kubernetes.Interface, error) {
+		t.Fatalf("kube client factory must not be called when posture disabled")
+		return nil, nil
+	}
+	postureClient = nil
+
+	cfg := &config.Config{
+		Detection: config.DetectionConfig{
+			Posture: config.PostureConfig{Enabled: false},
+		},
+	}
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	if err := startAggregatorRing(context.Background(), log, cfg); err != nil {
+		t.Fatalf("startAggregatorRing: %v", err)
+	}
+	if postureClient != nil {
+		t.Errorf("postureClient: got non-nil, want nil")
+	}
+}
+
+// TestStartAggregator_KubeClientFailureWrapsError exercises the
+// posture-enabled-with-broken-client path: the function returns a
+// wrapped error and leaves postureClient nil.
+func TestStartAggregator_KubeClientFailureWrapsError(t *testing.T) {
+	prevFactory := kubeClientFactory
+	prevClient := postureClient
+	t.Cleanup(func() {
+		kubeClientFactory = prevFactory
+		postureClient = prevClient
+	})
+
+	kubeClientFactory = func(*slog.Logger) (kubernetes.Interface, error) {
+		return nil, fmt.Errorf("simulated rest.InClusterConfig failure")
+	}
+	postureClient = nil
+
+	cfg := &config.Config{
+		Detection: config.DetectionConfig{
+			Posture: config.PostureConfig{Enabled: true},
+		},
+	}
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	err := startAggregatorRing(context.Background(), log, cfg)
+	if err == nil {
+		t.Fatalf("expected error from startAggregatorRing under kube-client failure")
+	}
+	if !strings.Contains(err.Error(), "posture: kube client") {
+		t.Errorf("err: got %q, want wrap with %q", err, "posture: kube client")
+	}
+	if postureClient != nil {
+		t.Errorf("postureClient: got non-nil, want nil on failure path")
 	}
 }
