@@ -7,14 +7,19 @@
 # dry-run pass.
 #
 # Source of truth: _bmad-output/planning-artifacts/architecture.md#Initialization-Sequence
-# lines 118-141. Calico version pinned to v3.29.0 (April 2026) — verify the
-# tag redirect target at docs.tigera.io/calico/latest before each release.
+# lines 118-141. Calico version pinned to v3.31.5 (the April 2026
+# stable release; ADR-2026-04-30-01 + ADR-2026-05-12-01 in
+# docs/deferred-decisions.md record the migration from the v3.29.0
+# manifest install to the v3.31.5 Tigera operator install). Verify
+# the tag redirect target at docs.tigera.io/calico/latest before
+# each release.
 
 set -euo pipefail
 umask 022
 
-CALICO_VERSION="v3.29.0"
-CALICO_MANIFEST="https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/calico.yaml"
+CALICO_VERSION="v3.31.5"
+TIGERA_OPERATOR_MANIFEST="https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/tigera-operator.yaml"
+CALICO_CUSTOM_RESOURCES="https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/custom-resources.yaml"
 POD_NETWORK_CIDR="192.168.0.0/16"
 
 # Repo root resolves relative to this script, so `setup.sh` works from any cwd.
@@ -88,9 +93,17 @@ sudo cp -i /etc/kubernetes/admin.conf \$HOME/.kube/config
 sudo chown \$(id -u):\$(id -g) \$HOME/.kube/config
 
 # ---------------------------------------------------------------------
-# 2. Install Calico CNI (pinned to ${CALICO_VERSION}):
+# 2. Install Calico CNI via the Tigera operator (pinned to ${CALICO_VERSION}).
+# Goldmane (Story 1.10 CNI flow adapter prerequisite) ships only under
+# the Tigera operator install path; the legacy manifest install does
+# NOT produce a Goldmane Deployment. See deploy/helm/olaitan/CNI.md
+# and docs/deferred-decisions.md (ADR-2026-04-30-01 / ADR-2026-05-12-01).
 # ---------------------------------------------------------------------
-kubectl apply -f ${CALICO_MANIFEST}
+kubectl create -f ${TIGERA_OPERATOR_MANIFEST}
+kubectl -n tigera-operator rollout status deployment/tigera-operator --timeout=180s
+kubectl create -f ${CALICO_CUSTOM_RESOURCES}
+kubectl -n calico-system rollout status deployment/goldmane --timeout=300s
+kubectl -n calico-system wait --for=condition=Ready pod -l k8s-app=calico-node --timeout=180s
 
 # ---------------------------------------------------------------------
 # 3. Join worker nodes (run the output from \`kubeadm init\` on each):

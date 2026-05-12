@@ -103,6 +103,24 @@ spec:
     {{- /* Intra-namespace traffic to NATS, Redis, Falco subcharts. */}}
     - to:
         - podSelector: {}
+    {{- /*
+    Story 1.10: egress to Calico Goldmane in the calico-system
+    namespace on port 7443 (the Goldmane mTLS gRPC listener).
+    Conditional on calicoSensor.enabled so a chart deploy that does
+    not consume Calico flows does not punch this hole.
+    */}}
+    {{- if .Values.calicoSensor.enabled }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: calico-system
+          podSelector:
+            matchLabels:
+              k8s-app: goldmane
+      ports:
+        - protocol: TCP
+          port: 7443
+    {{- end }}
     {{- with .Values.networkPolicy.extraEgress }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

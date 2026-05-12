@@ -62,6 +62,7 @@ type DetectionConfig struct {
 type SourcesConfig struct {
 	Audit      AuditSourceConfig      `yaml:"audit,omitempty"`
 	Containerd ContainerdSourceConfig `yaml:"containerd,omitempty"`
+	Calico     CalicoSourceConfig     `yaml:"calico,omitempty"`
 }
 
 // AuditSourceConfig configures the Story 1.7 Kubernetes audit-webhook
@@ -115,6 +116,74 @@ func (c ContainerdSourceConfig) validate() error {
 		return err
 	}
 	if err := c.PublishRetry.validatePartial("detection.sources.containerd.publish_retry"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// CalicoSourceConfig configures the Story 1.10 Calico CNI flow
+// adapter. When Enabled is true the collector subcommand spawns the
+// adapter goroutine and the config validator enforces a non-empty
+// Goldmane address plus the three TLS file paths (Goldmane enforces
+// mTLS; see ADR-2026-04-30-01). When Enabled is false the block may
+// stay zero-valued; the adapter is not constructed.
+type CalicoSourceConfig struct {
+	Enabled             bool                `yaml:"enabled"`
+	GoldmaneAddr        string              `yaml:"goldmane_addr,omitempty"`
+	ServerName          string              `yaml:"server_name,omitempty"`
+	CABundlePath        string              `yaml:"ca_bundle_path,omitempty"`
+	ClientCertPath      string              `yaml:"client_cert_path,omitempty"`
+	ClientKeyPath       string              `yaml:"client_key_path,omitempty"`
+	DialTimeout         DurationYAML        `yaml:"dial_timeout,omitempty"`
+	StalenessTimeout    DurationYAML        `yaml:"staleness_timeout,omitempty"`
+	ConnectRetry        RetryStrategyConfig `yaml:"connect_retry,omitempty"`
+	PublishRetry        RetryStrategyConfig `yaml:"publish_retry,omitempty"`
+	MaxEventBytes       int                 `yaml:"max_event_bytes,omitempty"`
+	StartTimeGte        int64               `yaml:"start_time_gte,omitempty"`
+	AggregationInterval int64               `yaml:"aggregation_interval,omitempty"`
+}
+
+// validate enforces CalicoSourceConfig invariants. Mirrors the
+// AuditSourceConfig / ContainerdSourceConfig patterns: zero block is
+// allowed when Enabled is false; partial retry blocks are rejected
+// here rather than left to crashloop the adapter at runtime. mTLS
+// material is mandatory because Goldmane rejects server-only TLS
+// (ADR-2026-04-30-01).
+func (c CalicoSourceConfig) validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if c.GoldmaneAddr == "" {
+		return errors.New("detection.sources.calico.goldmane_addr: required when enabled=true")
+	}
+	if c.CABundlePath == "" {
+		return errors.New("detection.sources.calico.ca_bundle_path: required when enabled=true")
+	}
+	if c.ClientCertPath == "" {
+		return errors.New("detection.sources.calico.client_cert_path: required when enabled=true")
+	}
+	if c.ClientKeyPath == "" {
+		return errors.New("detection.sources.calico.client_key_path: required when enabled=true")
+	}
+	if c.DialTimeout.Duration() < 0 {
+		return fmt.Errorf("detection.sources.calico.dial_timeout: must be >= 0 (0 means default; got %s)", c.DialTimeout.Duration())
+	}
+	if c.StalenessTimeout.Duration() < 0 {
+		return fmt.Errorf("detection.sources.calico.staleness_timeout: must be >= 0 (0 means default; got %s)", c.StalenessTimeout.Duration())
+	}
+	if c.MaxEventBytes < 0 {
+		return fmt.Errorf("detection.sources.calico.max_event_bytes: must be >= 0 (0 means default; got %d)", c.MaxEventBytes)
+	}
+	if c.MaxEventBytes > 0 && c.MaxEventBytes < 4096 {
+		return fmt.Errorf("detection.sources.calico.max_event_bytes: must be >= 4096 when set (got %d)", c.MaxEventBytes)
+	}
+	if c.AggregationInterval < 0 {
+		return fmt.Errorf("detection.sources.calico.aggregation_interval: must be >= 0 (0 means default; got %d)", c.AggregationInterval)
+	}
+	if err := c.ConnectRetry.validatePartial("detection.sources.calico.connect_retry"); err != nil {
+		return err
+	}
+	if err := c.PublishRetry.validatePartial("detection.sources.calico.publish_retry"); err != nil {
 		return err
 	}
 	return nil
@@ -329,6 +398,9 @@ func (d DetectionConfig) validate() error {
 		return err
 	}
 	if err := d.Sources.Containerd.validate(); err != nil {
+		return err
+	}
+	if err := d.Sources.Calico.validate(); err != nil {
 		return err
 	}
 	return nil

@@ -52,6 +52,37 @@ detection:
         multiplier: 2.0
         jitter: 0.1
         max_attempts: 3
+    # Story 1.10: Calico CNI flow adapter (FR4). Default disabled
+    # until the operator confirms the Tigera operator install path
+    # is in place (Calico v3.31.5+) and the mTLS material has been
+    # provisioned. See deploy/helm/olaitan/CNI.md and
+    # ADR-2026-04-30-01 / ADR-2026-05-12-01 for the full workflow.
+    # The watchdog only flips unhealthy when stale AND not-Ready:
+    # Goldmane flows are quiet by design.
+    calico:
+      enabled: false
+      goldmane_addr: "goldmane.calico-system.svc:7443"
+      server_name: "goldmane.calico-system.svc"
+      ca_bundle_path: "/etc/olaitan/cni/ca.crt"
+      client_cert_path: "/etc/olaitan/cni/client.crt"
+      client_key_path: "/etc/olaitan/cni/client.key"
+      dial_timeout: "10s"
+      staleness_timeout: "10m"
+      max_event_bytes: 196608
+      start_time_gte: -60
+      aggregation_interval: 15
+      connect_retry:
+        min: "1s"
+        max: "60s"
+        multiplier: 2.0
+        jitter: 1.0
+        max_attempts: 0
+      publish_retry:
+        min: "100ms"
+        max: "1s"
+        multiplier: 2.0
+        jitter: 1.0
+        max_attempts: 3
 
 response:
   excluded_namespaces:

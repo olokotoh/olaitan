@@ -201,6 +201,17 @@ spec:
               # the parent directory.
               readOnly: true
             {{- end }}
+            {{- if .Values.calicoSensor.enabled }}
+            # Story 1.10: Calico Goldmane mTLS material. Mounted as a
+            # Secret (read-only) under /etc/olaitan/cni/. The CNI
+            # adapter reads ca.crt, client.crt, and client.key from
+            # disk on every connect-loop iteration so cert-manager-
+            # driven rotations are picked up without an adapter
+            # restart. See deploy/helm/olaitan/CNI.md.
+            - name: cni-tls
+              mountPath: /etc/olaitan/cni
+              readOnly: true
+            {{- end }}
       volumes:
         - name: config
           configMap:
@@ -239,4 +250,18 @@ spec:
             # host filesystem; Directory fails the pod loudly so the
             # operator notices the misconfiguration.
             type: Directory
+        {{- end }}
+        {{- if .Values.calicoSensor.enabled }}
+        - name: cni-tls
+          secret:
+            # Path A consumes the cert-manager-issued Secret directly;
+            # Path B consumes the chart-rendered Secret (see
+            # templates/cni-tls-secret.yaml). The two paths converge
+            # on a single mount via this if/else.
+            {{- if .Values.calicoSensor.tls.certManagerSecretName }}
+            secretName: {{ .Values.calicoSensor.tls.certManagerSecretName | quote }}
+            {{- else }}
+            secretName: {{ include "olaitan.fullname" . }}-cni-tls
+            {{- end }}
+            defaultMode: 0400
         {{- end }}

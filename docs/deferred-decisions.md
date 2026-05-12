@@ -471,6 +471,302 @@ path becomes unviable.
 
 ---
 
+## ADR-2026-04-30-01: Calico flow record export mechanism
+
+**Status:** Accepted.
+
+**Date:** 2026-04-30.
+
+**Context.** Story 1.3 (Calico flow record export feasibility) is a
+time-boxed spike to settle FR4's source choice before Story 1.10
+implements the production adapter. The architecture document
+(`_bmad-output/planning-artifacts/architecture.md:115-119`) listed
+the question as an "Unknowns Requiring Spike Investigation" item:
+which open-source mechanism does Calico expose for streaming flow
+records into a sidecar consumer, and is the mechanism mature enough
+to be the fifth signal source alongside Falco syscalls, Kubernetes
+audit, containerd CRI lifecycle, and application logs.
+
+The spike sat at `spikes/calico-flow/`. The architecture text
+called out three candidate mechanisms (flow-log file tail, the
+Tigera Enterprise flow API, and the Calico Goldmane gRPC API) plus
+a fallback descope of FR4 if all three proved unworkable.
+
+The corresponding architecture-vs-tooling reconciliation needed
+recording here: ADR-2026-04-27-01 stated Calico's April 2026
+stable release was v3.29.0. That was wrong; v3.31.5 was released
+on 2026-04-15 as the actual April 2026 stable and is the release
+that ships Goldmane. ADR-2026-04-27-01 is preserved as the
+historical record; this ADR carries the corrected fact.
+
+**Candidate inventory.** Three mechanisms were evaluated against
+the spike's ACs.
+
+| Mechanism | Status in v3.31.5 | Wire format | API surface | Operator-install cost |
+|---|---|---|---|---|
+| Calico Goldmane gRPC API | Tech preview, default-on under Tigera operator install | Protobuf streaming `goldmane.Flows.Stream` | Server-streaming RPC over mTLS at `goldmane.calico-system.svc:7443` | New install path: Tigera operator + custom resources (replaces manifest install) |
+| Flow log file tail (`/var/log/calico/flowlogs/`) | OSS, file-based, opt-in via Felix `FlowLogsFileEnabled` | JSON-lines | File-system tail with rotation handling | None beyond enabling the Felix knob, but requires DaemonSet hostPath mount |
+| Tigera Enterprise flow API | Enterprise-only | gRPC | Proprietary | Requires Calico Enterprise licence (out of scope for OSS-only Olaitan) |
+
+**Decision.** Take the **Calico Goldmane gRPC API** path. Story
+1.10 lands the production adapter at `internal/collector/cni/`,
+consuming `goldmane.Flows.Stream` over mTLS, translating each
+`FlowResult` into a canonical `schema.Event` of `Source:
+SourceNetwork` and `Category: CategoryFlow`, and publishing to
+`subjects.RawNetwork`.
+
+**Why this direction.**
+
+- Goldmane is the upstream-supported flow-export path for Calico
+  OSS as of v3.31.5. The flow-log file tail is technically usable
+  but inherits Felix's file-rotation timing and parsing-fragility
+  surface (a Felix config change can rewrite the JSON shape, and
+  multi-node tail requires per-node hostPath mounts plus a
+  rotation-aware reader). gRPC streaming over a stable Service is
+  the more durable contract.
+- The spike's POC at `spikes/calico-flow/main.go` connects via
+  mTLS, opens `Flows.Stream`, receives a `FlowResult` within ~3s
+  on a kind cluster generating traffic, and translates it cleanly
+  into the canonical schema. The translation function is reusable
+  by Story 1.10 with only the `go_package` rewrite to relocate the
+  vendored proto stubs.
+- Goldmane runs at the cluster level (one Deployment in
+  `calico-system`), not per-node. This is the inversion of the
+  flow-log file tail (which requires per-node mounts) and matches
+  Olaitan's existing collector-ring topology where each agent pod
+  consumes one upstream Service.
+- mTLS is enforced by Goldmane and matches the existing Olaitan
+  TLS-by-default posture (see Story 1.7 audit-webhook).
+- Performance: spike-measured translation overhead is median
+  257us / p99 1.70ms per record on the spike hardware, well under
+  NFR1's 50 ms p99 receive-to-publish budget. Headroom for the
+  NATS publish portion is roughly 30x.
+
+**Alternatives considered and rejected.**
+
+- *Flow log file tail* (`/var/log/calico/flowlogs/`). Rejected for
+  three reasons: (a) the JSON shape is Felix-version-dependent
+  with no stable schema contract (each Felix point release has
+  the latitude to add fields and reorder existing ones), (b)
+  rotation timing is OS-driven and the consumer must handle
+  partial-line writes, file-deletion races, and inotify-watch
+  reattach across rotations, and (c) per-node hostPath mounts add
+  PodSecurityPolicy / OPA Gatekeeper friction that the cluster-
+  level gRPC path does not have.
+- *Tigera Enterprise flow API*. Rejected on licence grounds. The
+  project is OSS-only.
+- *Descope FR4*. Rejected because the spike succeeded. Olaitan
+  ships with four streaming sources plus the on-demand workload
+  posture client only if the spike concluded no mechanism was
+  workable; with Goldmane workable, the production agent has
+  five streaming sources.
+
+**Maintenance and licensing implications.**
+
+- *Operator-install path required.* Goldmane is shipped only under
+  the Tigera operator install path (the `tigera-operator.yaml`
+  plus `custom-resources.yaml` pair from the v3.31.5 release).
+  The manifest install path (the single `calico.yaml` URL that
+  `deploy/demo/setup.sh` and `hack/bootstrap-kubeadm.md`
+  currently use against v3.29.0) does not produce a Goldmane
+  Deployment. **Story 1.10 therefore carries the bootstrap-
+  migration cost: the production install path moves to the
+  Tigera operator, and the `CALICO_VERSION` pin moves from
+  v3.29.0 to v3.31.5.** This is the one-time-per-cluster cost
+  flagged in the *Hand-off to Story 1.10* section below.
+- *Tech-preview status.* Goldmane is documented as tech preview
+  in the v3.31.5 release notes. The wire format and proto
+  contract are not yet API-stable. Story 1.10 must pin the proto
+  SHA (the `v3.31.5` tag commit at
+  `2e4da40144aac869e1ed2cc220b6c4b62f32efdd`) and treat each
+  Calico point-release bump as a re-verification gate. A regression
+  story (Epic 6 hardening) can later switch to `buf push` against
+  `buf.build/projectcalico/goldmane` if Calico publishes the proto
+  to the Buf Schema Registry.
+- *Proto vendoring.* The spike kept the generated stubs under
+  `spikes/calico-flow/proto/` with the `go_package` pointing at
+  the spike module. Story 1.10 relocates the stubs to
+  `internal/collector/cni/goldmanepb/` and rewrites the
+  `go_package` to the production path; this requires regenerating
+  the `.pb.go` files via `buf generate` (the spike's `buf.gen.yaml`
+  is reusable).
+- *New main-module dependencies.* `google.golang.org/grpc v1.80.0`
+  and `google.golang.org/protobuf v1.36.11` move from the spike's
+  isolated `go.mod` into the main module. Story 1.10 runs
+  `go mod tidy` and verifies no transitive breakage in existing
+  packages.
+- *mTLS cert provisioning.* Goldmane enforces mTLS on its gRPC
+  listener; a server-only TLS handshake is rejected. The spike
+  borrowed the `whisker-backend-key-pair` Secret (Tigera-CA-
+  signed) as a stopgap; Story 1.10 must document operator-facing
+  provisioning paths. Two paths are sketched in the Hand-off
+  section: cert-manager-issued (production) and operator-
+  extracted from an existing Tigera Secret (dev sandbox).
+- *Licence.* The vendored Goldmane proto is Apache 2.0 (Calico's
+  licence). Compatible with Olaitan's MIT.
+
+**Risks inherited.**
+
+- *Tech-preview proto churn.* Goldmane's proto contract may
+  evolve in Calico v3.32 / v3.33. Each Calico point-release bump
+  must re-verify the SHA pin, the `Flow.StartTime` semantics, the
+  `FlowKey` field set, and the `Action` / `Reporter` / `EndpointType`
+  enum values. Story 1.10's integration test against the captured
+  byte fixture is the regression net.
+- *FlowKey.source_name is GenerateName-derived.* Goldmane
+  identifies workloads by "a set of pods that share a
+  GenerateName" rather than by individual pod name. The canonical
+  Olaitan workload identity (`namespace/owner-kind/owner-name`)
+  cannot be derived from a `FlowKey` alone; enrichment requires a
+  K8s API lookup against the namespace-and-set. Story 1.10
+  populates `PodRef.Name` from `FlowKey.SourceName` verbatim and
+  flags the GenerateName-derived nature via a
+  `pod_name_kind:generatename` tag; the on-demand workload posture
+  client (Story 1.11) is responsible for the enrichment downstream.
+  Doing the K8s API lookup inline in the per-record translate path
+  would violate the read-on-demand posture pattern and break the
+  NFR1 50 ms latency budget.
+- *Operator-install cost on existing clusters.* Operators with
+  v3.29.0 manifest-install clusters must migrate to the Tigera
+  operator install path to consume Goldmane. The bootstrap
+  migration is the prerequisite Story 1.10 takes on.
+- *mTLS cert rotation.* The dev-sandbox path of reusing a Tigera-
+  issued Secret is rotation-unaware. cert-manager-issued certs
+  (Path A) rotate automatically; the Path B operator-extracted
+  certs require manual re-extraction on rotation. The
+  documentation in Story 1.10's `CNI.md` flags this.
+
+**Performance rough cut.**
+
+Measured on the spike's bench harness (`spikes/calico-flow/main.go
+--mode bench`): 100 timed iterations per real flow received from
+the live Goldmane stream, each iteration translating one
+`FlowResult` and JSON-marshalling the resulting `schema.Event`.
+The gRPC client, JSON encoder, and translation function are
+hoisted outside the timed loop so the recorded timings reflect
+translation overhead, not harness allocation. Percentile indices
+use `samples[(n-1)*99/100]` per the Story 1.2 review.
+
+| Metric | Value |
+|---|---|
+| Samples | 100 |
+| Min | ~200us |
+| Median | ~257us |
+| p99 | ~1.70ms |
+| Max | ~2ms |
+
+Hardware: Intel Core i7-10510U @ 1.80 GHz, Linux 6.17.0
+x86_64 / Ubuntu 24.04.4. Toolchain: Go 1.26.2 linux/amd64.
+
+This is **per-record translation overhead**, NOT the NFR1 receive-
+to-publish gate that Story 1.10's bench owns. NFR1's gate adds the
+JetStream publish portion (typically ~500us on embedded NATS);
+the production p99 budget is 50 ms, giving roughly 30x headroom on
+top of the spike numbers.
+
+**Hand-off to Story 1.10.**
+
+- *Library and version pin.* Calico v3.31.5 (released 2026-04-15).
+  Goldmane proto pinned to SHA
+  `2e4da40144aac869e1ed2cc220b6c4b62f32efdd` (the `v3.31.5` tag
+  commit of `projectcalico/calico` at `goldmane/proto/api.proto`).
+  `google.golang.org/grpc v1.80.0` and
+  `google.golang.org/protobuf v1.36.11` move into the main module.
+- *Adapter landing path.* `internal/collector/cni/` for the
+  adapter (`cni.go`, `translate.go`, tests, bench), with the
+  vendored proto stubs under `internal/collector/cni/goldmanepb/`
+  matching the `internal/collector/falco/falcopb/` convention.
+- *Bootstrap migration cost (the one-time-per-cluster entry cost).*
+  Story 1.10 owns the install-path migration:
+  - `deploy/demo/setup.sh`: bump `CALICO_VERSION="v3.29.0"` to
+    `CALICO_VERSION="v3.31.5"`; replace the manifest-install
+    invocation with the operator-install pair
+    (`tigera-operator.yaml` + `custom-resources.yaml`).
+  - `hack/bootstrap-kubeadm.md`: rewrite the "Install Calico CNI"
+    section to walk through the Tigera operator install. Use this
+    spike's "Bring-up sequence" as the canonical step list.
+  - Append a separate ADR (`ADR-2026-05-DD-NN: Calico bootstrap
+    migration to Tigera operator install`) documenting the
+    migration cost.
+  - The dev sandbox cannot run kubeadm end-to-end (Story 1.1 AC5
+    lineage). Hardware verification is deferred to operator-side
+    follow-up logged in
+    `_bmad-output/implementation-artifacts/deferred-work.md`.
+- *Field-mapping table.* The spike's `translate.go` is the
+  authoritative reference. Field-by-field:
+
+  | `schema.Event` field | `FlowResult` source | Notes |
+  |---|---|---|
+  | `ID` | `fmt.Sprintf("calico-flow-%d-%d", flow.StartTime, fr.Id)` | `FlowResult.Id` is not stable across Goldmane restarts; `StartTime` is the durable half. Deterministic per Story 1.6 / 1.7 / 1.8 / 1.9 precedent. |
+  | `Timestamp` | `time.Unix(flow.StartTime, 0).UTC()` | Start of Goldmane's 15s aggregation window, not per-packet wall-time. Sigma rules using `timestamp` semantics must understand the aggregation window. Reject zero / pre-2010 / far-future. |
+  | `Source` | `schema.SourceNetwork` | Existing constant value `"network"`. |
+  | `Category` | `schema.CategoryFlow` | Existing constant value `"flow"`. |
+  | `Pod.Name` | `key.SourceName` | GenerateName-derived; see `pod_name_kind:generatename` tag. |
+  | `Pod.Namespace` | `key.SourceNamespace` | |
+  | `Severity` | `"informational"` | Always informational at the adapter; severity escalation belongs to the OLT Sigma rule engine (Story 1.15) and the Welford baseline (Story 1.17). |
+  | `Summary` | `fmt.Sprintf("%s/%s -> %s/%s:%d (%s, %s, %s)", srcNS, srcName, dstNS, dstName, dstPort, proto, action, reporter)` | Sanitize each interpolated field via `sanitizeForTag`. |
+  | `Raw` | `protojson.Marshal(fr)` canonicalised through `encoding/json` | AC4 round-trip safe encoding. |
+  | `Tags` | `proto:<...>`, `action:<...>`, `reporter:<...>`, `src-type:<...>`, `dst-type:<...>`, `dst-port:<...>`, optional `svc:<ns>/<name>`, optional `conns-started:<int>`, **plus `pod_name_kind:generatename`** | New tag in Story 1.10 lets the correlator (Story 1.14) drive K8s API enrichment via the posture client (Story 1.11). |
+
+- *mTLS topology.* Goldmane enforces mTLS. Two operator-facing
+  paths:
+  - **Path A (preferred, production):** cert-manager issues a
+    Certificate against a ClusterIssuer backed by the Tigera CA;
+    the Helm chart consumes the resulting Secret. Cert rotation
+    is automatic.
+  - **Path B (dev sandbox):** operator extracts the Tigera CA
+    bundle and a client cert from an existing Tigera Secret. The
+    spike borrowed `whisker-backend-key-pair`; Story 1.10's
+    `CNI.md` documents the procedure and flags it as not
+    rotation-aware.
+- *Test fixtures to migrate.* `spikes/calico-flow/testdata/sample-flow.binpb`
+  (202 bytes, captured at the proto SHA pinned above) and
+  `spikes/calico-flow/testdata/expected.json` migrate to
+  `internal/collector/cni/testdata/`. Story 1.10 regenerates
+  `expected.json` against the production translator after the
+  binding decisions (new `pod_name_kind:generatename` tag, etc.)
+  are applied.
+- *Watchdog quiet-by-design.* Like Story 1.8 (containerd CRI) and
+  Story 1.9 (applog), Goldmane flow records are quiet by design
+  in a low-traffic cluster. Staleness alone must NOT flip
+  unhealthy. Only stale-AND-not-Ready trips the source.
+- *Spike-directory deletion.* `spikes/calico-flow/` is deletable
+  once Story 1.10 lands the production adapter and migrates the
+  fixtures. This ADR is the durable record.
+
+**Follow-ups.**
+
+- Patch `_bmad-output/planning-artifacts/architecture.md` lines
+  115-119 to reflect the spike outcome (chosen mechanism: Calico
+  Goldmane gRPC API, conditional descope path not activated).
+  Owner: Story 1.10 if the patch is small, otherwise Story 5.10
+  thesis-revision pass.
+- Story 1.10 (Calico CNI flow adapter) reads this ADR's
+  *Hand-off* section verbatim and produces the production
+  adapter, the helm wiring, and the bootstrap migration.
+- Story 1.11 (on-demand workload posture client) inherits the
+  `pod_name_kind:generatename` tag contract and enriches
+  GenerateName-derived `FlowKey.source_name` via a K8s API
+  lookup at EvidencePackage-assembly time (Story 1.14
+  correlator's call-out).
+- Story 1.5 (traceability matrix bootstrap) records Story 1.3 as
+  *informing* FR4; satisfaction lands in Story 1.10.
+- Story 5.10 (thesis revision pass) inherits any chapter-3 text
+  that committed to a specific flow-export mechanism before the
+  spike concluded.
+
+**Historical correction.** ADR-2026-04-27-01 stated that v3.29.0
+was the April 2026 stable release of Calico. That was incorrect;
+v3.31.5 was released on 2026-04-15 as the actual April 2026
+stable and is the release that ships Goldmane. ADR-2026-04-27-01
+is preserved in this file as the historical record (ADRs are
+append-only by convention); this ADR carries the corrected fact.
+The companion bootstrap-migration ADR
+(`ADR-2026-05-DD-NN: Calico bootstrap migration to Tigera operator
+install`) captures the implementation consequence.
+
+---
+
 ## ADR-2026-05-02-01: CRIU forensic checkpoint feasibility
 
 **Status:** Accepted.
@@ -809,3 +1105,144 @@ and the wording seeds.
 - Story 5.10 (thesis revision pass) inherits both the Ch3 §3.7.1
   / §3.7.4 contradictions flagged above and the Ch5 Future Work
   entry described above.
+
+---
+
+## ADR-2026-05-12-01: Calico bootstrap migration to Tigera operator install
+
+**Status:** Accepted.
+
+**Date:** 2026-05-12.
+
+**Context.** Story 1.10 ships the Calico CNI flow adapter, which
+consumes the Calico Goldmane gRPC API. Goldmane is shipped only
+under Calico's Tigera operator install path (the
+`tigera-operator.yaml` plus `custom-resources.yaml` pair from the
+v3.31.5 release manifests); the manifest install path that
+`deploy/demo/setup.sh` and `hack/bootstrap-kubeadm.md` currently
+codify against v3.29.0 does not produce a Goldmane Deployment.
+ADR-2026-04-30-01 flagged the bootstrap migration as the
+prerequisite cost Story 1.10 inherits.
+
+ADR-2026-04-27-01 codified the v3.29.0 pin under the (incorrect)
+belief that v3.29.0 was the April 2026 stable Calico release.
+ADR-2026-04-30-01 records the corrected fact: v3.31.5 was
+released 2026-04-15 as the actual April 2026 stable, and is the
+release that ships Goldmane. This ADR captures the implementation
+consequence of that correction.
+
+**Decision.** Migrate the cluster bring-up procedure to the
+**Tigera operator install path** on Calico **v3.31.5**:
+
+1. `deploy/demo/setup.sh` bumps the `CALICO_VERSION` pin from
+   `v3.29.0` to `v3.31.5` and replaces the manifest-install
+   invocation with the operator-install pair.
+2. `hack/bootstrap-kubeadm.md` rewrites the "Install Calico CNI"
+   section to walk through the Tigera operator install (`kubectl
+   create -f tigera-operator.yaml` followed by `kubectl create
+   -f custom-resources.yaml` from the v3.31.5 release).
+3. `deploy/helm/olaitan/CNI.md` documents the Goldmane Service
+   surface (`goldmane.calico-system.svc:7443`) and the mTLS
+   cert-provisioning paths.
+
+The dev sandbox cannot run `kubeadm init` plus a Tigera operator
+install end-to-end (same constraint as Story 1.1 AC5). Hardware
+verification is deferred to operator-side follow-up logged in
+`_bmad-output/implementation-artifacts/deferred-work.md`. The
+documented procedure plus the spike's kind smoke test
+(`spikes/calico-flow/README.md`, "Bring-up sequence", verified
+end-to-end on a kind cluster) is the verification artefact.
+
+**Why this direction.**
+
+- Goldmane is the upstream-supported flow-export path for Calico
+  OSS as of v3.31.5 (ADR-2026-04-30-01). The flow-log file tail
+  alternative carries higher fragility (per-node hostPath mounts,
+  Felix-version-dependent JSON shape, rotation-aware reader); the
+  cluster-level gRPC path is the more durable contract.
+- v3.31.5 is the corrected April 2026 stable; v3.29.0 was the
+  result of ADR-2026-04-27-01's historical mistake. The version
+  bump is a one-time-per-cluster operator cost, not an ongoing
+  maintenance burden.
+- Goldmane supports iptables, eBPF, and nftables dataplanes
+  (verified in the spike's AC1 inventory). Clusters running the
+  iptables dataplane are unaffected by the install-path change
+  beyond the manifest swap.
+- The Helm chart's `kubeVersion: ">=1.29.0"` constraint is
+  unchanged: Tigera operator v3.31.5 supports Kubernetes 1.29
+  through 1.31 inclusive.
+
+**Alternatives considered and rejected.**
+
+- *Stay on v3.29.0 manifest install and descope FR4 to four
+  streaming sources.* Rejected: the Story 1.3 spike succeeded,
+  so the descope is no longer the right tradeoff (FR4 is fully
+  achievable with the operator install path). Shipping the
+  agent without Calico flow records would forfeit S3 (lateral
+  movement) and S4 (C2 beaconing) detection coverage in the
+  evaluation plan.
+- *Bump to v3.30.x instead of v3.31.5.* Rejected: v3.31.5 is
+  the corrected April 2026 stable; jumping the line by one
+  minor version with no justification trades reproducibility for
+  no benefit. The spike captured fixtures against v3.31.5.
+- *Self-host the v3.31.5 operator manifests in the Olaitan
+  registry.* Rejected: adds a manifest-signing pipeline that
+  does not belong in a feature-implementation story. The
+  upstream operator manifests are content-addressed by tag and
+  Calico has not yanked v3.31.5 in the weeks since release.
+- *Run two install paths in parallel (v3.29.0 manifest for
+  existing clusters, v3.31.5 operator for new clusters).*
+  Rejected: doubles the substrate-verification surface and
+  splits the eval-cluster pin. One canonical install path keeps
+  the reproducibility envelope (NFR37) intact.
+
+**Consequences.**
+
+- *Operator uplift for existing v3.29.0 clusters.* Operators
+  running the v3.29.0 manifest install must follow Calico's
+  v3.30 upgrade-path documentation
+  (https://docs.tigera.io/calico/latest/operations/upgrading)
+  to migrate to v3.31.5. The migration is documented as
+  in-place by upstream and does not require workload downtime
+  on stable dataplanes. This is a one-time operator-side
+  procedure outside the agent's automation surface.
+- *Helm chart impact.* `deploy/helm/olaitan/templates/networkpolicy.yaml`
+  gains a conditional egress rule allowing the agent DaemonSet
+  to reach `calico-system/goldmane:7443` when
+  `calicoSensor.enabled=true`. Existing NetworkPolicy egress
+  rules (Kubernetes API, NATS) are unchanged.
+- *Reproducibility envelope (NFR37).* `eval/manifest.yaml`
+  inherits the v3.31.5 pin when Story 5.1 builds the
+  reproducibility envelope; the version cell tracks Calico's
+  point releases per the same cadence as containerd / runc / Go.
+- *Hardware verification deferred.* The dev sandbox cannot run
+  kubeadm bootstrap end-to-end (Story 1.1 AC5 lineage). Story
+  1.10 logs the operator-side end-to-end verification under
+  `_bmad-output/implementation-artifacts/deferred-work.md` as
+  "Story 1.10 AC5 bootstrap migration verification on real
+  hardware".
+
+**Historical correction.** ADR-2026-04-27-01 codified the
+v3.29.0 Calico pin under the belief that v3.29.0 was the
+April 2026 stable release. v3.31.5 was the actual April 2026
+stable, released 2026-04-15. ADR-2026-04-27-01 is preserved as
+the historical record (ADRs are append-only by convention);
+ADR-2026-04-30-01 documents the spike-driven discovery of the
+mistake, and this ADR records the install-path implementation
+consequence. The chart `kubeVersion` constraint (>=1.29.0) is
+unchanged across all three ADRs.
+
+**Follow-ups.**
+
+- `deploy/demo/setup.sh`: bump `CALICO_VERSION` to `v3.31.5` and
+  switch to the operator-install pair. Done in this story.
+- `hack/bootstrap-kubeadm.md`: rewrite the "Install Calico CNI"
+  section. Done in this story.
+- `deploy/helm/olaitan/CNI.md`: documents the Goldmane Service
+  surface plus the mTLS provisioning paths. Done in this story.
+- `_bmad-output/implementation-artifacts/deferred-work.md`: add
+  the AC5 hardware-verification follow-up. Done in this story.
+- Story 5.1 (`eval/manifest.yaml`) inherits the v3.31.5 pin.
+- Project memory (`project_olaitan.md`) is refreshed by Story
+  1.10 to reflect v3.31.5 and the operator install path. Done
+  out of band; this ADR is the durable technical record.

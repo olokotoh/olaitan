@@ -596,6 +596,30 @@ func TestStreamConfigsCoversAppLogSubject(t *testing.T) {
 		subjects.RawAppLog)
 }
 
+// TestStreamConfigsCoversNetworkFlowSubject asserts that the
+// EVENTS_RAW stream coverage includes the per-source subject the
+// Story 1.10 Calico CNI flow adapter publishes on. The assertion is
+// symbolic against subjects.RawNetwork (rather than the literal
+// string) so a future rename flowing through the constant keeps the
+// regression visible. The wildcard test above covers the general case;
+// this test names the binding so a reader looking for "where does FR4
+// prove its raw-subject coverage?" finds it directly. With this test,
+// the regression net now covers all five raw-source subjects
+// explicitly: RawFalco (Story 1.6), RawAudit (Story 1.7), RawRuntime
+// (Story 1.8), RawAppLog (Story 1.9), and RawNetwork (Story 1.10).
+func TestStreamConfigsCoversNetworkFlowSubject(t *testing.T) {
+	configs := natsclient.StreamConfigs()
+	for _, cfg := range configs {
+		for _, subj := range cfg.Subjects {
+			if subj == subjects.RawNetwork || subj == subjects.RawPrefix+">" {
+				return
+			}
+		}
+	}
+	t.Fatalf("StreamConfigs: no stream covers subjects.RawNetwork (%q) or its wildcard parent",
+		subjects.RawNetwork)
+}
+
 func TestStreamConfigsDeepCopy(t *testing.T) {
 	a := natsclient.StreamConfigs()
 	b := natsclient.StreamConfigs()

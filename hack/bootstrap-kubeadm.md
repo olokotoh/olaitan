@@ -133,18 +133,47 @@ sudo chown $(id -u):$(id -g) $HOME/.kube/config
 The `kubeadm init` output contains a `kubeadm join` command with a
 token and discovery hash. Note it down; the worker nodes need it.
 
-## Install Calico CNI
+## Install Calico CNI (Tigera operator install)
+
+Story 1.10 introduces the Calico CNI flow adapter, which subscribes
+to Calico's Goldmane gRPC API. Goldmane ships only under the
+**Tigera operator install path on Calico v3.31.5+**. Story 1.10's
+ADR-2026-05-12-01 records the migration rationale; the canonical
+upstream install steps are below.
 
 ```bash
-kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.29.0/manifests/calico.yaml
+# 1. Install the Tigera operator (the controller that reconciles
+# Calico's Installation + APIServer + Goldmane + Whisker custom
+# resources).
+kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.5/manifests/tigera-operator.yaml
+kubectl -n tigera-operator rollout status deployment/tigera-operator --timeout=180s
 
-# Wait for Calico pods to come up.
-kubectl -n kube-system wait --for=condition=Ready pod -l k8s-app=calico-node --timeout=180s
+# 2. Apply the default custom-resources manifest (creates the
+# Installation CR with the iptables dataplane, the APIServer CR
+# enabling Calico API resources, the Goldmane CR enabling the flow
+# API, and the Whisker CR exposing the flow UI).
+kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.5/manifests/custom-resources.yaml
+
+# 3. Wait for the operator to reconcile.
+kubectl -n calico-system rollout status deployment/calico-typha --timeout=180s
+kubectl -n calico-system rollout status deployment/calico-kube-controllers --timeout=180s
+kubectl -n calico-system rollout status deployment/goldmane --timeout=300s
+
+# 4. Verify the data-plane DaemonSet is healthy.
+kubectl -n calico-system wait --for=condition=Ready pod -l k8s-app=calico-node --timeout=180s
 ```
 
-Note: Calico is pinned at v3.29.0 (April 2026 release). The original
-architecture document referenced v3.27. The bump and the reasons are
-recorded in `docs/deferred-decisions.md`.
+Note: Calico is pinned at v3.31.5 (the April 2026 stable release).
+The history of the version pin (v3.27 to v3.29.0 mistake, corrected
+to v3.31.5) is recorded in `docs/deferred-decisions.md` (ADR-2026-04-27-01,
+ADR-2026-04-30-01, ADR-2026-05-12-01).
+
+The Tigera operator install path is required, not optional, because
+Goldmane is not produced by the legacy `calico.yaml` manifest install.
+Operators on existing v3.29.0 manifest-install clusters must follow
+Calico's v3.30 upgrade-path documentation to migrate to v3.31.5
+before consuming the Olaitan CNI flow adapter; see
+`deploy/helm/olaitan/CNI.md`.
 
 ## Join worker nodes
 
@@ -205,14 +234,20 @@ A complete bootstrap is verified when all of the following hold:
   Olaitan ships with. On older kernels the Falco subchart can be
   reconfigured to use the kernel module, but Olaitan's evaluation
   numbers were collected under eBPF only.
-- The Calico v3.29.0 manifest is the upstream `calico.yaml` (operator
-  install). Production overlays may prefer the Tigera Operator install,
-  which is not used by the evaluation harness.
+- The Calico v3.31.5 install path is the Tigera operator (the
+  upstream `tigera-operator.yaml` + `custom-resources.yaml` pair).
+  This is required by Story 1.10's CNI flow adapter, which consumes
+  the Goldmane gRPC API only produced under the operator install.
+  See `docs/deferred-decisions.md` ADR-2026-05-12-01 for the
+  migration rationale.
 
 ## References
 
-- `deploy/demo/setup.sh` — the executable companion to this document.
-- `deploy/helm/README.md` — operator-facing chart configuration guide.
-- `docs/deferred-decisions.md` — the Calico v3.27 to v3.29.0 ADR.
+- `deploy/demo/setup.sh` -- the executable companion to this document.
+- `deploy/helm/README.md` -- operator-facing chart configuration guide.
+- `deploy/helm/olaitan/CNI.md` -- Calico Goldmane flow adapter
+  operator workflow (Story 1.10).
+- `docs/deferred-decisions.md` -- Calico version-pin history
+  (ADR-2026-04-27-01, ADR-2026-04-30-01, ADR-2026-05-12-01).
 - Architecture: `_bmad-output/planning-artifacts/architecture.md` in
   the FYP repository.
