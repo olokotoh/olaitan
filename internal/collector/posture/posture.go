@@ -337,7 +337,14 @@ func basePosture(identity schema.WorkloadIdentity, isOrphan bool, capturedAt tim
 // classify and mark Unavailable.
 func (c *Client) fetchPosture(ctx context.Context, pod *corev1.Pod, identity schema.WorkloadIdentity, isOrphan bool) (*schema.WorkloadPosture, error) {
 	posture := basePosture(identity, isOrphan, c.nowFn())
-	posture.ServiceAccount = pod.Spec.ServiceAccountName
+	// Store the effective ServiceAccount on the posture struct so the
+	// LLM-bound payload reflects the same identity the RBAC lookups
+	// resolved against. K8s admission rewrites an empty
+	// spec.serviceAccountName to "default" before the pod runs; the
+	// posture surface must mirror that so consumers do not see
+	// service_account:"" while RoleBindings/ClusterRoleBindings carry
+	// the default-SA bindings.
+	posture.ServiceAccount = effectiveServiceAccount(pod.Spec.ServiceAccountName)
 
 	roleBindings, err := c.listRoleBindings(ctx, pod.Namespace, posture.ServiceAccount)
 	if err != nil {
@@ -763,34 +770,71 @@ func classify(err error) string {
 	return schema.PostureUnavailablePermanent
 }
 
-// cloneWorkloadPosture returns a shallow clone of p with independent
-// slice headers and a fresh PodSecurityContext pointer. The cache
-// stores a single pointer per workload and any caller mutation would
-// leak across subsequent Get calls; cloning at Get time keeps the
-// cached entry read-only from the caller's perspective without
-// requiring a deep copy of every leaf field.
+// cloneWorkloadPosture returns a deep clone of p with independent
+// slice headers at every nesting level and a fresh PodSecurityContext
+// pointer. The cache stores a single pointer per workload and any
+// caller mutation would leak across subsequent Get calls; cloning at
+// Get time keeps the cached entry read-only from the caller's
+// perspective. Nested string slices on each ref (Verbs, Resources,
+// PolicyTypes, Added/DroppedCapabilities, SupplementalGroups) are
+// also cloned so a caller appending to the slice header of a
+// RoleBindingRef.Verbs does not race the next cache read.
 func cloneWorkloadPosture(p *schema.WorkloadPosture) *schema.WorkloadPosture {
 	if p == nil {
 		return nil
 	}
 	out := *p
 	if p.RoleBindings != nil {
-		out.RoleBindings = append([]schema.RoleBindingRef(nil), p.RoleBindings...)
+		out.RoleBindings = make([]schema.RoleBindingRef, len(p.RoleBindings))
+		for i, rb := range p.RoleBindings {
+			out.RoleBindings[i] = rb
+			out.RoleBindings[i].Verbs = cloneStrings(rb.Verbs)
+			out.RoleBindings[i].Resources = cloneStrings(rb.Resources)
+		}
 	}
 	if p.ClusterRoleBindings != nil {
-		out.ClusterRoleBindings = append([]schema.ClusterRoleBindingRef(nil), p.ClusterRoleBindings...)
+		out.ClusterRoleBindings = make([]schema.ClusterRoleBindingRef, len(p.ClusterRoleBindings))
+		for i, crb := range p.ClusterRoleBindings {
+			out.ClusterRoleBindings[i] = crb
+			out.ClusterRoleBindings[i].Verbs = cloneStrings(crb.Verbs)
+			out.ClusterRoleBindings[i].Resources = cloneStrings(crb.Resources)
+		}
 	}
 	if p.NetworkPolicies != nil {
-		out.NetworkPolicies = append([]schema.NetworkPolicyRef(nil), p.NetworkPolicies...)
+		out.NetworkPolicies = make([]schema.NetworkPolicyRef, len(p.NetworkPolicies))
+		for i, np := range p.NetworkPolicies {
+			out.NetworkPolicies[i] = np
+			out.NetworkPolicies[i].PolicyTypes = cloneStrings(np.PolicyTypes)
+		}
 	}
 	if p.ContainerSecurityContexts != nil {
-		out.ContainerSecurityContexts = append([]schema.ContainerSecurityContextSummary(nil), p.ContainerSecurityContexts...)
+		out.ContainerSecurityContexts = make([]schema.ContainerSecurityContextSummary, len(p.ContainerSecurityContexts))
+		for i, c := range p.ContainerSecurityContexts {
+			out.ContainerSecurityContexts[i] = c
+			out.ContainerSecurityContexts[i].AddedCapabilities = cloneStrings(c.AddedCapabilities)
+			out.ContainerSecurityContexts[i].DroppedCapabilities = cloneStrings(c.DroppedCapabilities)
+		}
 	}
 	if p.PodSecurityContext != nil {
 		psc := *p.PodSecurityContext
+		if psc.SupplementalGroups != nil {
+			psc.SupplementalGroups = append([]int64(nil), psc.SupplementalGroups...)
+		}
 		out.PodSecurityContext = &psc
 	}
 	return &out
+}
+
+// cloneStrings returns a fresh slice with the same elements; nil
+// stays nil so the cloned WorkloadPosture matches the original's
+// "absent" vs "empty" semantics under JSON marshal.
+func cloneStrings(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	out := make([]string, len(in))
+	copy(out, in)
+	return out
 }
 
 // PostureCacheHits returns the cumulative cache-hit count. Story

@@ -1916,8 +1916,11 @@ func TestPostureCacheTTLAboveCeilingFails(t *testing.T) {
 
 // TestPostureCacheTTLAtCeilingAcceptsMinuteForms asserts the chart-
 // side guard does NOT reject equivalent representations of exactly
-// 60s (Copilot review: `1m`, `1m0s`, `0m60s` should all be accepted
-// because the rule is "<= 60s", not "Ns-only").
+// 60s. The TTL ceiling rule is "<= 60s", not "Ns-only", so `1m`,
+// `1m0s`, `0m60s`, and `60s` must all be accepted as equivalent
+// Go-duration forms at the ceiling. The minute-form regex used to
+// fail every `Nm[Ns]?` value unconditionally, blocking legitimate
+// at-ceiling configurations; this test locks in the fix.
 func TestPostureCacheTTLAtCeilingAcceptsMinuteForms(t *testing.T) {
 	for _, ttl := range []string{"1m", "1m0s", "0m60s", "60s"} {
 		ttl := ttl

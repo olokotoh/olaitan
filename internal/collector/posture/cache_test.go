@@ -31,9 +31,6 @@ func TestCache_HitWithinTTL(t *testing.T) {
 	if got != posture {
 		t.Errorf("Get returned a different pointer; pointer-equality required for hot-path")
 	}
-	if c.Hits() != 1 {
-		t.Errorf("Hits: got %d, want 1", c.Hits())
-	}
 }
 
 func TestCache_MissAfterTTL(t *testing.T) {
@@ -56,9 +53,6 @@ func TestCache_MissAfterTTL(t *testing.T) {
 	}
 	if c.Len() != 0 {
 		t.Errorf("Len after stale-evict: got %d, want 0", c.Len())
-	}
-	if c.Hits() != 0 {
-		t.Errorf("Hits: got %d, want 0 (miss should not increment)", c.Hits())
 	}
 }
 
@@ -95,16 +89,13 @@ func TestCache_Reset(t *testing.T) {
 	c.Put("a", &schema.WorkloadPosture{}, 60*time.Second, fixedClock(t0))
 	c.Put("b", &schema.WorkloadPosture{}, 60*time.Second, fixedClock(t0))
 	_, _ = c.Get("a", fixedClock(t0))
-	if c.Len() != 2 || c.Hits() == 0 {
-		t.Fatalf("precondition: Len=%d Hits=%d", c.Len(), c.Hits())
+	if c.Len() != 2 {
+		t.Fatalf("precondition: Len=%d", c.Len())
 	}
 
 	c.Reset()
 	if c.Len() != 0 {
 		t.Errorf("Len after Reset: got %d, want 0", c.Len())
-	}
-	if c.Hits() != 0 {
-		t.Errorf("Hits after Reset: got %d, want 0", c.Hits())
 	}
 }
 

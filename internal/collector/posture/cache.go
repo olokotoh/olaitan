@@ -2,7 +2,6 @@ package posture
 
 import (
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/olokotoh/olaitan/internal/schema"
@@ -21,14 +20,14 @@ import (
 // If a future cluster scale increase requires bounding, swap to an
 // lru.Cache in a single-file change.
 //
-// Hits are counted via an atomic.Int64; the Client exposes
-// PostureCacheHits() for the Story 1.12 Prometheus binding to a
-// CounterFunc.
+// Hit counting is the Client's responsibility: Client.cacheHits is
+// the single authoritative counter and is what Client.PostureCacheHits
+// reports. The cache deliberately does NOT track hits itself to keep
+// the counter contract single-source and rule out the
+// double-counting risk that two counters would invite.
 type cache struct {
 	mu      sync.RWMutex
 	entries map[string]cacheEntry
-
-	hits atomic.Int64
 }
 
 type cacheEntry struct {
@@ -43,8 +42,8 @@ func newCache() *cache {
 // Get returns the cached posture for workloadID if a fresh entry
 // exists. The freshness check uses now(); callers can inject a clock
 // in tests. A stale entry is deleted lazily under the write-lock and
-// the call returns (nil, false). The atomic hit counter increments
-// only on the cache-hit-with-fresh-entry path.
+// the call returns (nil, false). Hit counting is up to the caller
+// (Client.cacheHits is the authoritative counter for the package).
 func (c *cache) Get(workloadID string, now func() time.Time) (*schema.WorkloadPosture, bool) {
 	c.mu.RLock()
 	entry, ok := c.entries[workloadID]
@@ -55,7 +54,6 @@ func (c *cache) Get(workloadID string, now func() time.Time) (*schema.WorkloadPo
 
 	t := now()
 	if t.Before(entry.expiresAt) {
-		c.hits.Add(1)
 		return entry.posture, true
 	}
 
@@ -66,7 +64,6 @@ func (c *cache) Get(workloadID string, now func() time.Time) (*schema.WorkloadPo
 	defer c.mu.Unlock()
 	if cur, stillOK := c.entries[workloadID]; stillOK && t.Before(cur.expiresAt) {
 		// Refreshed by a concurrent Put; honour it.
-		c.hits.Add(1)
 		return cur.posture, true
 	}
 	delete(c.entries, workloadID)
@@ -90,7 +87,6 @@ func (c *cache) Reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.entries = make(map[string]cacheEntry)
-	c.hits.Store(0)
 }
 
 // Len returns the current entry count. Concurrent-use safe.
@@ -98,10 +94,4 @@ func (c *cache) Len() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.entries)
-}
-
-// Hits returns the cumulative hit count. The counter is monotonic
-// over the cache's lifetime; Reset clears it.
-func (c *cache) Hits() int64 {
-	return c.hits.Load()
 }

@@ -235,19 +235,45 @@ func runRingCtx(ctx context.Context, ring string, args []string, stderr io.Write
 var kubeClientFactory = defaultKubeClientFactory
 
 func defaultKubeClientFactory(log *slog.Logger) (kubernetes.Interface, error) {
-	if cfg, err := rest.InClusterConfig(); err == nil {
+	cfg, inClusterErr := rest.InClusterConfig()
+	if inClusterErr == nil {
 		return kubernetes.NewForConfig(cfg)
 	}
 	// Out-of-cluster fallback: KUBECONFIG env var or the default
 	// loading rules. This path supports `make deploy-kind` smoke
 	// tests run from an operator workstation; production Pods always
 	// have InClusterConfig.
+	//
+	// If we are running in-cluster and InClusterConfig nevertheless
+	// failed (RBAC mis-mount, projected-token absent, malformed
+	// CA), the fallback's failure would mask the real cause. Wrap
+	// both errors so operators see why InClusterConfig was
+	// rejected before learning that KUBECONFIG could not be
+	// loaded either.
 	rules := clientcmd.NewDefaultClientConfigLoadingRules()
 	overrides := &clientcmd.ConfigOverrides{}
 	clientCfg := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides)
 	cfg, err := clientCfg.ClientConfig()
 	if err != nil {
-		return nil, fmt.Errorf("k8s rest config: %w", err)
+		// errors.Join (Go 1.20+) carries both causes through %w
+		// chains so operators inspecting the wrapped error see
+		// the in-cluster reason alongside the KUBECONFIG reason.
+		log.Warn("kube client: in-cluster config rejected; KUBECONFIG fallback also failed",
+			"in_cluster_err", inClusterErr.Error(),
+			"kubeconfig_err", err.Error(),
+		)
+		return nil, fmt.Errorf("k8s rest config: in-cluster: %w; kubeconfig fallback: %w", inClusterErr, err)
+	}
+	if os.Getenv("KUBECONFIG") == "" {
+		// We are most likely running in-cluster but InClusterConfig
+		// failed and we resolved a kubeconfig from the default
+		// loading rules anyway. Log the in-cluster failure so the
+		// operator can spot a mis-mounted projected-token before it
+		// becomes a "why is my pod talking to the wrong apiserver"
+		// puzzle later.
+		log.Warn("kube client: in-cluster config rejected, using kubeconfig fallback",
+			"in_cluster_err", inClusterErr.Error(),
+		)
 	}
 	return kubernetes.NewForConfig(cfg)
 }
@@ -274,12 +300,12 @@ var postureClient atomic.Pointer[posture.Client]
 // correlator) should treat nil as "posture unavailable, emit a
 // degraded EvidencePackage". The getter is the discipline pattern for
 // reading the atomic.Pointer; Story 1.14's correlator goroutine should
-// call this rather than touching the package variable directly.
+// call this rather than touching the package variable directly. The
+// function is unused as of Story 1.11 -- it is shipped now so the
+// atomic-pointer read-side pattern is established before the first
+// reader lands.
 //
-// atomic-pointer read-side discipline is part of the Story 1.11
-// substrate even though no caller exists yet.
-//
-//nolint:unused // wired by Story 1.14 (correlator); kept here so the
+//nolint:unused // Story 1.14 (correlator) is the first caller.
 func getPostureClient() *posture.Client { return postureClient.Load() }
 
 // startAggregatorRing performs the Story 1.11 wiring: construct a
