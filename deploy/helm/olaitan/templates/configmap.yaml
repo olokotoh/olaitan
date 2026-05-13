@@ -211,6 +211,22 @@ data:
     {{- $cfg = regexReplaceAll $pFt $cfg (printf "${1}fetch_timeout: %q" $ps.fetchTimeout) }}
     {{- end }}
     {{- end }}
+    {{- /*
+    Story 1.12: bridge the chart-side metrics.address knob into the
+    rendered metrics block. The address knob is mandatory at the Go
+    side (guardrail 27); the chart's default ":9090" matches the
+    containerPort below so a single --set metrics.containerPort=N
+    plus --set metrics.address=:N keeps the two in sync. Anchor is
+    mustRegexFind-guarded per the Story 1.10 P28 pattern.
+    */ -}}
+    {{- if .Values.metrics }}
+    {{- $m := .Values.metrics }}
+    {{- if $m.address }}
+    {{- $pMa := "(?s)(metrics:[[:space:]]*\\n[[:space:]]+)address:[[:space:]]+\"[^\"]*\"" -}}
+    {{- if not (mustRegexFind $pMa $cfg) }}{{- fail (printf "helm bridge: metrics.address anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pMa) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pMa $cfg (printf "${1}address: %q" $m.address) }}
+    {{- end }}
+    {{- end }}
     {{- $cfg | nindent 4 }}
 ---
 apiVersion: v1

@@ -638,6 +638,24 @@ func (s *slowPublisher) PublishJS(ctx context.Context, subject string, data any,
 	}
 }
 
+func TestEventsTotal_ZeroOnConstruct(t *testing.T) {
+	a := newTestAdapter(t, newStubPublisher())
+	if got := a.EventsTotal(); got != 0 {
+		t.Errorf("EventsTotal on fresh Adapter: got %d, want 0", got)
+	}
+	if got := a.DroppedEvents(); got != 0 {
+		t.Errorf("DroppedEvents on fresh Adapter: got %d, want 0", got)
+	}
+}
+
+func TestEventsTotal_ReflectsIncrement(t *testing.T) {
+	a := newTestAdapter(t, newStubPublisher())
+	a.eventsPublished.Add(7)
+	if got := a.EventsTotal(); got != 7 {
+		t.Errorf("EventsTotal after Add(7): got %d, want 7", got)
+	}
+}
+
 func TestIsPermanentPublishError_RecognisesTypedErrors(t *testing.T) {
 	cases := []struct {
 		name string

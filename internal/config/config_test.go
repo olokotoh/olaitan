@@ -558,3 +558,54 @@ func TestPostureConfigZeroBlockWhenDisabledAccepted(t *testing.T) {
 		t.Errorf("posture block with enabled:false should validate: %v", err)
 	}
 }
+
+// TestMetricsConfigOmittedSubstitutesDefault asserts the Story 1.12
+// default-on-omission behaviour: a chart-deploy that has not yet
+// adopted the metrics block still gets a valid Address binding.
+func TestMetricsConfigOmittedSubstitutesDefault(t *testing.T) {
+	path := writeConfig(t, validYAML)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Metrics.Address != config.DefaultMetricsAddress {
+		t.Errorf("Metrics.Address: got %q, want %q",
+			cfg.Metrics.Address, config.DefaultMetricsAddress)
+	}
+}
+
+// TestMetricsConfigExplicitAddressHonoured asserts the operator-set
+// address survives Load.
+func TestMetricsConfigExplicitAddressHonoured(t *testing.T) {
+	body := validYAML + "\nmetrics:\n  address: \"127.0.0.1:9092\"\n"
+	path := writeConfig(t, body)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Metrics.Address != "127.0.0.1:9092" {
+		t.Errorf("Metrics.Address: got %q, want 127.0.0.1:9092", cfg.Metrics.Address)
+	}
+}
+
+// TestMetricsConfigValidateRejectsEmptyAddress exercises Validate
+// directly so the guardrail-27 invariant is locked in independent of
+// the Load default-substitution. Callers that construct Config in
+// memory (cmd/olaitan/metrics.go tests; future programmatic config
+// builders) hit this path before the metrics server is started.
+func TestMetricsConfigValidateRejectsEmptyAddress(t *testing.T) {
+	// Reuse the validYAML path to construct a fully-populated Config,
+	// then zero out the Metrics.Address to exercise Validate's
+	// rejection independent of the Load default-substitution.
+	path := writeConfig(t, validYAML)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	cfg.Metrics.Address = ""
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate with empty Metrics.Address: got nil, want rejection")
+	} else if !strings.Contains(err.Error(), "metrics.address") {
+		t.Errorf("error does not mention metrics.address: %v", err)
+	}
+}

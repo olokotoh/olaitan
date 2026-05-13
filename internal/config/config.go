@@ -40,7 +40,27 @@ type Config struct {
 	Detection DetectionConfig `yaml:"detection"`
 	Response  ResponseConfig  `yaml:"response"`
 	Analyst   AnalystConfig   `yaml:"analyst"`
+	// Metrics configures the Story 1.12 Prometheus surface. Omission
+	// substitutes the package default (":9090") at Load time; explicit
+	// empty Address is rejected by Validate per guardrail 27 (the FR50
+	// surface is mandatory, not optional).
+	Metrics MetricsConfig `yaml:"metrics,omitempty"`
 }
+
+// MetricsConfig configures the Story 1.12 Prometheus surface bound at
+// :9090/metrics on every Olaitan ring (collector DaemonSet and
+// aggregator Deployment). Address follows net.Listen conventions
+// (":9090" for all interfaces, "127.0.0.1:9090" for localhost-only,
+// ":0" for the OS-assigned free port used in integration tests).
+type MetricsConfig struct {
+	Address string `yaml:"address,omitempty"`
+}
+
+// DefaultMetricsAddress is the Helm-aligned default. Load substitutes
+// this when the operator omits the metrics block; Validate rejects an
+// explicit empty Address so a typo cannot silently disable the
+// surface.
+const DefaultMetricsAddress = ":9090"
 
 // DetectionConfig -- see architecture.md:420 (confidence bands +
 // baseline window). The bands gate the five-state pod FSM transitions;
@@ -375,6 +395,16 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
+	// Substitute the metrics-address default before Validate so an
+	// operator who omits the metrics block (the expected case for
+	// chart-deploys that have not yet adopted the Story 1.12 block)
+	// is not rejected. Explicit empty (operator typed
+	// `metrics.address: ""`) still fails Validate below per guardrail
+	// 27.
+	if cfg != nil && cfg.Metrics.Address == "" {
+		cfg.Metrics.Address = DefaultMetricsAddress
+	}
+
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("config: validate %q: %w", path, err)
 	}
@@ -418,6 +448,24 @@ func (c *Config) Validate() error {
 	}
 	if err := c.Analyst.validate(); err != nil {
 		return err
+	}
+	if err := c.Metrics.validate(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validate enforces MetricsConfig invariants. Empty Address is rejected
+// (the Story 1.12 Prometheus surface is mandatory per FR50 and
+// guardrail 27); ":0" is accepted because integration tests bind to the
+// OS-assigned free port. Any net.Listen-acceptable string is otherwise
+// honoured; we deliberately do NOT pre-validate the host:port shape so
+// IPv6 literal addresses ("[::1]:9090") and unix sockets ("unix:/...")
+// can land in a future story without amending the validator.
+func (m MetricsConfig) validate() error {
+	if m.Address == "" {
+		return fmt.Errorf("metrics.address: must not be empty (FR50; guardrail 27); default %q is substituted by Load when the block is omitted",
+			DefaultMetricsAddress)
 	}
 	return nil
 }

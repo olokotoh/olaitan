@@ -295,6 +295,11 @@ type Adapter struct {
 	publishDrops    atomic.Int64
 	oversizeDropped atomic.Int64
 
+	// eventsPublished is the Story 1.12 Prometheus reader-side
+	// counter, incremented per successful publishWithRetry.
+	// Exposed via EventsTotal as the int64 snapshot.
+	eventsPublished atomic.Int64
+
 	// lastOversizeLog is the wall-clock time of the most recent
 	// oversize-drop ERROR log. Story 1.10 code-review patch P18
 	// rate-limits the log so a stream of oversize flows does not
@@ -465,6 +470,11 @@ func (a *Adapter) OversizeDropped() int64 { return a.oversizeDropped.Load() }
 // surface so operators can detect a Goldmane-side EOF storm without
 // the adapter escalating to CrashLoop.
 func (a *Adapter) ConsecutiveEOFs() int64 { return a.consecutiveEOFs.Load() }
+
+// EventsTotal returns the cumulative count of flow events successfully
+// published to subjects.RawNetwork. Story 1.12 binds this via
+// prometheus.NewCounterFunc to olaitan_sensor_events_total{source="network"}.
+func (a *Adapter) EventsTotal() int64 { return a.eventsPublished.Load() }
 
 // Run blocks until ctx is cancelled. The connect-loop retry strategy
 // supplied via Config governs reconnect cadence on Goldmane
@@ -771,6 +781,7 @@ func (a *Adapter) connectAndStream(ctx context.Context) error {
 			a.health.MarkUnhealthy(perr)
 			return fmt.Errorf("cni: publish: %w", perr)
 		}
+		a.eventsPublished.Add(1)
 
 		// Note: lastEventTime now advances on stream.Recv success
 		// above (P13). The publish-side update that used to live

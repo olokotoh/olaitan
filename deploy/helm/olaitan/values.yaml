@@ -559,6 +559,35 @@ posture:
   # budget pressure.
   fetchTimeout: "5s"
 
+# Story 1.12: Prometheus metrics surface (FR8, FR50). Every Olaitan
+# process exposes Prometheus metrics on :9090/metrics from a dedicated
+# http.Server. The two surfaces (this one and the :8080/healthz kubelet
+# probe served by internal/health) never share a port because the
+# kubelet probe SLO and the Prometheus scrape SLO have different
+# consumer expectations.
+metrics:
+  # Listen address for the metrics http.Server. Follows net.Listen
+  # conventions; ":9090" binds all interfaces (the default expected
+  # by the prometheus.io/port: "9090" pod annotation below). Use
+  # "127.0.0.1:9090" to restrict to loopback. Empty values are
+  # rejected by config.Validate per guardrail 27.
+  address: ":9090"
+
+  # Container port exposed on every olaitan ring pod. Must match the
+  # numeric port in `address` above (the Helm template wires both
+  # from this knob so a single --set keeps them in sync).
+  containerPort: 9090
+
+  # Prometheus scrape annotations on every olaitan ring pod. When
+  # true the pod carries:
+  #   prometheus.io/scrape: "true"
+  #   prometheus.io/port:   "<metrics.containerPort>"
+  #   prometheus.io/path:   "/metrics"
+  # Set to false for clusters running a ServiceMonitor-based
+  # Prometheus Operator deployment (Story 1.18 may add a
+  # ServiceMonitor resource as a follow-up).
+  scrapeAnnotations: true
+
 # --- Subchart overrides ------------------------------------------------
 # Only opinions we impose on the downstream charts live here -- upstream
 # defaults are otherwise preserved. To see every available knob, consult

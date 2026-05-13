@@ -340,15 +340,25 @@ func TestStartAggregator_BuildsPostureClientWhenEnabled(t *testing.T) {
 		Detection: config.DetectionConfig{
 			Posture: config.PostureConfig{Enabled: true},
 		},
+		// Story 1.12: startAggregatorRing now starts the Prometheus
+		// surface under the errgroup. ":0" lets the kernel pick a free
+		// port so parallel tests do not collide.
+		Metrics: config.MetricsConfig{Address: "127.0.0.1:0"},
 	}
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
 
-	if err := startAggregatorRing(context.Background(), log, cfg); err != nil {
+	ctx, cancel := context.WithCancel(context.Background())
+	g, gctx := errgroup.WithContext(ctx)
+	if err := startAggregatorRing(gctx, g, log, cfg); err != nil {
+		cancel()
+		_ = g.Wait()
 		t.Fatalf("startAggregatorRing: %v", err)
 	}
 	if postureClient.Load() == nil {
 		t.Errorf("postureClient: got nil, want non-nil")
 	}
+	cancel()
+	_ = g.Wait()
 }
 
 // TestStartAggregator_PostureDisabledLeavesClientNil exercises the
@@ -372,14 +382,21 @@ func TestStartAggregator_PostureDisabledLeavesClientNil(t *testing.T) {
 		Detection: config.DetectionConfig{
 			Posture: config.PostureConfig{Enabled: false},
 		},
+		Metrics: config.MetricsConfig{Address: "127.0.0.1:0"},
 	}
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	if err := startAggregatorRing(context.Background(), log, cfg); err != nil {
+	ctx, cancel := context.WithCancel(context.Background())
+	g, gctx := errgroup.WithContext(ctx)
+	if err := startAggregatorRing(gctx, g, log, cfg); err != nil {
+		cancel()
+		_ = g.Wait()
 		t.Fatalf("startAggregatorRing: %v", err)
 	}
 	if postureClient.Load() != nil {
 		t.Errorf("postureClient: got non-nil, want nil")
 	}
+	cancel()
+	_ = g.Wait()
 }
 
 // TestStartAggregator_KubeClientFailureWrapsError exercises the
@@ -402,9 +419,12 @@ func TestStartAggregator_KubeClientFailureWrapsError(t *testing.T) {
 		Detection: config.DetectionConfig{
 			Posture: config.PostureConfig{Enabled: true},
 		},
+		Metrics: config.MetricsConfig{Address: "127.0.0.1:0"},
 	}
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	err := startAggregatorRing(context.Background(), log, cfg)
+	g, gctx := errgroup.WithContext(context.Background())
+	_ = g // group is not exercised on the early-return failure path
+	err := startAggregatorRing(gctx, g, log, cfg)
 	if err == nil {
 		t.Fatalf("expected error from startAggregatorRing under kube-client failure")
 	}

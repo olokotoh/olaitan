@@ -182,6 +182,11 @@ type Adapter struct {
 	// log+drops. Story 1.12 will bind this to a Prometheus counter.
 	publishDrops atomic.Int64
 
+	// eventsPublished is the Story 1.12 Prometheus reader-side counter,
+	// incremented per successful publishWithRetry. Exposed via
+	// EventsTotal as the int64 snapshot.
+	eventsPublished atomic.Int64
+
 	// dialFn is a test seam: the production grpc.NewClient cannot be
 	// pointed at a bufconn dialer through public API alone. Tests
 	// override this; production callers leave it nil and defaultDial
@@ -269,6 +274,11 @@ func (a *Adapter) TranslateErrors() int64 { return a.translateErrors.Load() }
 // attempt returned a permanent error (e.g. oversize). Exposed for
 // Story 1.12's Prometheus surface.
 func (a *Adapter) PublishDrops() int64 { return a.publishDrops.Load() }
+
+// EventsTotal returns the cumulative count of CRI lifecycle events
+// successfully published to subjects.RawRuntime. Story 1.12 binds this
+// via prometheus.NewCounterFunc to olaitan_sensor_events_total{source="runtime"}.
+func (a *Adapter) EventsTotal() int64 { return a.eventsPublished.Load() }
 
 // Run blocks until ctx is cancelled. The connect-loop retry strategy
 // supplied via Config governs reconnect cadence on containerd
@@ -423,6 +433,7 @@ func (a *Adapter) connectAndConsume(ctx context.Context) error {
 			a.health.MarkUnhealthy(perr)
 			return fmt.Errorf("cri: publish: %w", perr)
 		}
+		a.eventsPublished.Add(1)
 	}
 }
 

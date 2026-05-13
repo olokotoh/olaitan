@@ -174,6 +174,31 @@ func TestNew_DefaultsApplied(t *testing.T) {
 	}
 }
 
+// TestEventsTotal_AdvancesAfterIncrement gates the Story 1.12 getter
+// contract independent of the gRPC stream loop. The integration test
+// exercises the full publish path; this test asserts the int64
+// snapshot semantics so a refactor that swaps the atomic backing type
+// cannot silently break the Prometheus reader.
+func TestEventsTotal_AdvancesAfterIncrement(t *testing.T) {
+	a, err := New(Config{SocketPath: "/x", Hostname: "n"}, &stubPublisher{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := a.EventsTotal(); got != 0 {
+		t.Errorf("EventsTotal on fresh Adapter: got %d, want 0", got)
+	}
+	a.eventsPublished.Add(5)
+	if got := a.EventsTotal(); got != 5 {
+		t.Errorf("EventsTotal after Add(5): got %d, want 5", got)
+	}
+	// TranslateErrors and PublishDrops must remain independent of
+	// eventsPublished so dashboards can plot the three counters
+	// separately.
+	if a.TranslateErrors() != 0 || a.PublishDrops() != 0 {
+		t.Errorf("TranslateErrors/PublishDrops leaked: %d/%d", a.TranslateErrors(), a.PublishDrops())
+	}
+}
+
 func TestRun_ContextCancelExitsCleanly(t *testing.T) {
 	pub := &stubPublisher{}
 	a, err := New(quickConfig(), pub, nil)

@@ -219,6 +219,11 @@ type Adapter struct {
 	// successful publish ever".
 	lastPublishOKUnixNano atomic.Int64
 
+	// eventsPublished is the Story 1.12 Prometheus reader-side counter,
+	// incremented per successful PublishJS PubAck. Exposed via
+	// EventsTotal as the int64 snapshot.
+	eventsPublished atomic.Int64
+
 	rejected *rejectedCounters
 
 	// nowFn is a test seam for time-dependent assertions in
@@ -310,6 +315,22 @@ func (a *Adapter) Health() sourcehealth.Reader {
 // can iterate without mutex coordination.
 func (a *Adapter) Rejected() map[string]uint64 {
 	return a.rejected.Snapshot()
+}
+
+// RejectedByReason returns the same snapshot as Rejected but keyed by
+// the six canonical reason labels in a stable order. Story 1.12 uses
+// this directly when binding olaitan_sensor_audit_rejected_total{reason}.
+// Returning a fresh map keeps callers from racing the underlying
+// atomics.
+func (a *Adapter) RejectedByReason() map[string]uint64 {
+	return a.rejected.Snapshot()
+}
+
+// EventsTotal returns the cumulative count of audit events successfully
+// published to subjects.RawAudit. Story 1.12 binds this via
+// prometheus.NewCounterFunc to olaitan_sensor_events_total{source="audit"}.
+func (a *Adapter) EventsTotal() int64 {
+	return a.eventsPublished.Load()
 }
 
 // Run binds the receiver, starts the staleness watchdog, and blocks
@@ -617,6 +638,7 @@ func (a *Adapter) handleAudit(w http.ResponseWriter, r *http.Request) {
 
 	if published > 0 {
 		a.lastPublishOKUnixNano.Store(a.nowFn().UnixNano())
+		a.eventsPublished.Add(int64(published))
 		a.health.MarkHealthy()
 	}
 

@@ -282,6 +282,12 @@ func TestRun_FirstFlowFlipsHealthy(t *testing.T) {
 	if msg.optsLen < 1 {
 		t.Errorf("publish opts: got %d, want >= 1 (WithMsgID must be passed)", msg.optsLen)
 	}
+	// Story 1.12: EventsTotal must reflect the successful publish so
+	// the Prometheus counter advances exactly once per successful
+	// stream.Recv+publish cycle.
+	if got := a.EventsTotal(); got != 1 {
+		t.Errorf("EventsTotal: got %d, want 1", got)
+	}
 }
 
 func TestRun_DialFailureMarksUnhealthy(t *testing.T) {

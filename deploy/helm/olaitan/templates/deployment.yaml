@@ -43,6 +43,16 @@ spec:
     metadata:
       labels:
         {{- include "olaitan.aggregator.selectorLabels" . | nindent 8 }}
+      {{- /* Story 1.12: Prometheus scrape annotations, gated by
+             metrics.scrapeAnnotations so a Prometheus-Operator-driven
+             deployment can disable them and rely on a ServiceMonitor
+             resource (future Story 1.18 follow-up). */ -}}
+      {{- if and .Values.metrics .Values.metrics.scrapeAnnotations }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.metrics.containerPort | quote }}
+        prometheus.io/path: "/metrics"
+      {{- end }}
     spec:
       serviceAccountName: {{ include "olaitan.aggregator.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
@@ -81,6 +91,13 @@ spec:
           ports:
             - name: health
               containerPort: 8080
+              protocol: TCP
+            # Story 1.12: Prometheus metrics surface (FR8, FR50). The
+            # aggregator exposes posture counters here; Story 1.14 +
+            # 1.18 will register correlator and detection metrics on
+            # the same Registry.
+            - name: metrics
+              containerPort: {{ .Values.metrics.containerPort }}
               protocol: TCP
           env:
             - name: NATS_URL

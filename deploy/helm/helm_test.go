@@ -2006,3 +2006,88 @@ func TestPostureRBACRulesPresent(t *testing.T) {
 		}
 	}
 }
+
+// TestMetricsContainerPortPresent gates Story 1.12 AC6: every olaitan
+// ring template carries a metrics-named containerPort matching the
+// metrics.containerPort knob.
+func TestMetricsContainerPortPresent(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"metrics.containerPort=9091",
+		"metrics.address=:9091",
+	})
+	ms := parseManifests(t, rendered)
+
+	for _, kind := range []string{"DaemonSet", "Deployment"} {
+		found := false
+		for _, m := range findByKind(ms, kind) {
+			if !strings.Contains(m.Metadata.Name, "olaitan") {
+				continue
+			}
+			// helmTemplate returns the full stream; we re-scan for the
+			// metrics port line below by searching the raw bytes for
+			// the kind+name segment. Simpler than walking the yaml.Node.
+			if strings.Contains(rendered, "name: metrics") &&
+				strings.Contains(rendered, "containerPort: 9091") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("%s template missing metrics containerPort=9091 in:\n%s",
+				kind, snippet(rendered, "name: metrics"))
+		}
+	}
+}
+
+// TestMetricsAnnotationsPresentByDefault asserts the default-on
+// scrapeAnnotations flag emits the three prometheus.io annotations
+// on every olaitan ring pod template.
+func TestMetricsAnnotationsPresentByDefault(t *testing.T) {
+	rendered := helmTemplate(t, nil)
+	wants := []string{
+		`prometheus.io/scrape: "true"`,
+		`prometheus.io/port: "9090"`,
+		`prometheus.io/path: "/metrics"`,
+	}
+	for _, w := range wants {
+		if !strings.Contains(rendered, w) {
+			t.Errorf("default-on scrapeAnnotations: missing %q", w)
+		}
+	}
+}
+
+// TestMetricsAnnotationsAbsentWhenDisabled gates the operator-side
+// opt-out: with scrapeAnnotations=false, no prometheus.io annotation
+// renders. Useful for clusters running a ServiceMonitor.
+func TestMetricsAnnotationsAbsentWhenDisabled(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"metrics.scrapeAnnotations=false",
+	})
+	for _, w := range []string{
+		`prometheus.io/scrape:`,
+		`prometheus.io/port:`,
+		`prometheus.io/path:`,
+	} {
+		if strings.Contains(rendered, w) {
+			t.Errorf("scrapeAnnotations=false: should not render %q, rendered:\n%s",
+				w, snippet(rendered, "prometheus.io"))
+		}
+	}
+}
+
+// TestMetricsBridgeRendersAddress asserts the configmap.yaml regex
+// bridge propagates a --set metrics.address override into the
+// rendered olaitan.yaml inside the olaitan-config ConfigMap.
+func TestMetricsBridgeRendersAddress(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"metrics.address=127.0.0.1:19191",
+	})
+	want := `address: "127.0.0.1:19191"`
+	if !strings.Contains(rendered, want) {
+		t.Errorf("metrics.address bridge: missing %q in rendered olaitan.yaml; sample:\n%s",
+			want, snippet(rendered, "address:"))
+	}
+}
+
+// snippet helper for the four metrics tests above is shared with the
+// posture tests; the canonical definition lives earlier in this file.

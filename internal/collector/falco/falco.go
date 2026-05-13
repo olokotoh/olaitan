@@ -46,6 +46,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -150,6 +151,13 @@ type Adapter struct {
 	log    *slog.Logger
 	health SourceHealth
 
+	// eventsPublished is the Story 1.12 Prometheus reader-side counter:
+	// incremented on every publishWithRetry success in the receive
+	// loop, never decremented, exposed via EventsTotal as the int64
+	// snapshot. Per guardrail 26 the metrics layer never owns a
+	// writeable counter; this atomic is the single source of truth.
+	eventsPublished atomic.Int64
+
 	// dialFn is a test seam: the production grpc.NewClient cannot be
 	// pointed at a bufconn dialer through public API alone. Tests
 	// override this; production callers leave it nil and the default
@@ -213,6 +221,15 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 // MarkUnhealthy.
 func (a *Adapter) Health() sourcehealth.Reader {
 	return &a.health
+}
+
+// EventsTotal returns the cumulative count of events successfully
+// published to subjects.RawFalco. Story 1.12 binds this via
+// prometheus.NewCounterFunc to olaitan_sensor_events_total{source="falco"}.
+// Returning the int64 snapshot (not the atomic) keeps the metrics
+// layer a pure reader (guardrail 26).
+func (a *Adapter) EventsTotal() int64 {
+	return a.eventsPublished.Load()
 }
 
 // Run blocks until ctx is cancelled. The retry strategy supplied via
@@ -384,6 +401,7 @@ func (a *Adapter) connectAndConsume(ctx context.Context) error {
 			a.health.MarkUnhealthy(err)
 			return fmt.Errorf("falco: publish: %w", err)
 		}
+		a.eventsPublished.Add(1)
 	}
 }
 
