@@ -222,8 +222,15 @@ func TestGet_BypassCacheForcesRefetch(t *testing.T) {
 	if c.PostureCacheHits() != 0 {
 		t.Errorf("PostureCacheHits: got %d, want 0 (bypass skips cache)", c.PostureCacheHits())
 	}
-	if c.PostureCacheMisses() != 2 {
-		t.Errorf("PostureCacheMisses: got %d, want 2", c.PostureCacheMisses())
+	// First Get is a natural cache miss; the second is an explicit
+	// bypass and is counted on the bypass counter instead, so the
+	// hit-rate KPI reflects natural cache eligibility, not
+	// LLM-eligible refetch policy.
+	if c.PostureCacheMisses() != 1 {
+		t.Errorf("PostureCacheMisses: got %d, want 1 (only the first Get is a natural miss)", c.PostureCacheMisses())
+	}
+	if c.PostureCacheBypasses() != 1 {
+		t.Errorf("PostureCacheBypasses: got %d, want 1", c.PostureCacheBypasses())
 	}
 }
 

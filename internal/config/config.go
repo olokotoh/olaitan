@@ -73,9 +73,11 @@ type PostureConfig struct {
 }
 
 // validate enforces PostureConfig invariants. A zero block is allowed
-// when Enabled is false; with Enabled=true positive durations are
-// required and CacheTTL is bounded above by 60s per architecture.md
-// :324 and Story 1.11 AC3 (cache TTL "no greater than 60 seconds").
+// when Enabled is false; with Enabled=true CacheTTL and FetchTimeout
+// must be non-negative (a zero value means "use the package default":
+// 60s for CacheTTL and 5s for FetchTimeout, both applied downstream
+// in startAggregatorRing). CacheTTL is bounded above by 60s per
+// architecture.md:324 and Story 1.11 AC3 ("no greater than 60 seconds").
 func (p PostureConfig) validate() error {
 	if !p.Enabled {
 		return nil

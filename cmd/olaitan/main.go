@@ -259,7 +259,28 @@ func defaultKubeClientFactory(log *slog.Logger) (kubernetes.Interface, error) {
 // only when posture.enabled=true in the loaded config and the K8s
 // client construction succeeds; otherwise it stays nil and downstream
 // callers fall through to a degraded posture (Unavailable=true).
-var postureClient *posture.Client
+//
+// atomic.Pointer guards the read/write seam against the inevitable
+// future case where startAggregatorRing is invoked more than once
+// (hot-reload, test re-entry) while a correlator goroutine concurrently
+// reads the client. Without the atomic, `go test -race` flags the
+// concurrent access; with it, the read-side load is a single 8-byte
+// MOV on every modern architecture, so the cost is zero compared to
+// a guarded read of a plain pointer.
+var postureClient atomic.Pointer[posture.Client]
+
+// getPostureClient returns the currently registered posture.Client, or
+// nil if posture is disabled / not yet wired. Callers (Story 1.14
+// correlator) should treat nil as "posture unavailable, emit a
+// degraded EvidencePackage". The getter is the discipline pattern for
+// reading the atomic.Pointer; Story 1.14's correlator goroutine should
+// call this rather than touching the package variable directly.
+//
+// atomic-pointer read-side discipline is part of the Story 1.11
+// substrate even though no caller exists yet.
+//
+//nolint:unused // wired by Story 1.14 (correlator); kept here so the
+func getPostureClient() *posture.Client { return postureClient.Load() }
 
 // startAggregatorRing performs the Story 1.11 wiring: construct a
 // posture.Client backed by an in-cluster (or KUBECONFIG-backed) K8s
@@ -301,7 +322,7 @@ func startAggregatorRing(ctx context.Context, log *slog.Logger, cfg *config.Conf
 	if err != nil {
 		return fmt.Errorf("posture: client init: %w", err)
 	}
-	postureClient = client
+	postureClient.Store(client)
 	log.Info("aggregator: posture client constructed",
 		"cache_ttl", pCfg.CacheTTL,
 		"fetch_timeout", pCfg.FetchTimeout,

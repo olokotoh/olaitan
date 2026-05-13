@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/url"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -19,6 +22,19 @@ import (
 	"github.com/olokotoh/olaitan/internal/keys"
 	"github.com/olokotoh/olaitan/internal/schema"
 )
+
+// defaultServiceAccount is the implicit K8s admission default. A pod
+// with spec.serviceAccountName empty is admitted with ServiceAccount
+// "default" in the pod's namespace; the posture client treats the
+// empty case as "default" so RBAC bound to the default SA is surfaced
+// for the LLM-bound payload.
+const defaultServiceAccount = "default"
+
+// listPageLimit caps each List call to a single page. fetch loops
+// continue until the apiserver's continue token is empty, so a
+// namespace with >500 bindings does not silently truncate the
+// posture surface.
+const listPageLimit = 500
 
 // DefaultCacheTTL is the default posture cache staleness budget.
 // architecture.md:324 pins this at 60 seconds; AC3 ratifies the
@@ -99,11 +115,12 @@ type Client struct {
 	nowFn        func() time.Time
 	log          *slog.Logger
 
-	cacheHits   atomic.Int64
-	cacheMisses atomic.Int64
-	apiErrors   atomic.Int64
-	orphanPods  atomic.Int64
-	unavailable atomic.Int64
+	cacheHits     atomic.Int64
+	cacheMisses   atomic.Int64
+	cacheBypasses atomic.Int64
+	apiErrors     atomic.Int64
+	orphanPods    atomic.Int64
+	unavailable   atomic.Int64
 }
 
 // New constructs a Client. Validate is called on cfg; cs must be
@@ -188,7 +205,15 @@ func (c *Client) Get(ctx context.Context, pod *corev1.Pod, opts ...Option) (*sch
 		opt(options)
 	}
 
-	identity, err := ResolveWorkloadIdentity(ctx, c.cs, pod)
+	// Owner resolution issues up to two K8s API GETs (architecture.md
+	// :457 + Story 1.11 guardrail 23). Apply the per-Get fetch budget
+	// here so an unhealthy apiserver cannot block resolution past the
+	// LLM critical-path window. The fetchPosture call below uses the
+	// same fetchCtx so the total budget covers both phases.
+	fetchCtx, cancel := context.WithTimeout(ctx, c.fetchTimeout)
+	defer cancel()
+
+	identity, err := ResolveWorkloadIdentity(fetchCtx, c.cs, pod)
 	if err != nil && !errors.Is(err, ErrControllerNotFound) {
 		c.apiErrors.Add(1)
 		c.unavailable.Add(1)
@@ -199,6 +224,12 @@ func (c *Client) Get(ctx context.Context, pod *corev1.Pod, opts ...Option) (*sch
 			slog.String("error_class", class),
 			slog.String("error", err.Error()),
 		)
+		// Synthesise an orphan-pod-shaped identity so the
+		// correlator can still log workload_id, and set OrphanPod
+		// to mirror that synthesis. Without this, consumers branch
+		// on OrphanPod=false while Identity.OwnerKind="Pod" — an
+		// inconsistent payload that the schema docstring explicitly
+		// forbids.
 		return &schema.WorkloadPosture{
 			Identity: schema.WorkloadIdentity{
 				Namespace: pod.Namespace,
@@ -206,11 +237,21 @@ func (c *Client) Get(ctx context.Context, pod *corev1.Pod, opts ...Option) (*sch
 				OwnerName: pod.Name,
 				PodName:   pod.Name,
 			},
-			OrphanPod:         identity.OwnerKind == "Pod",
+			OrphanPod:         true,
 			Unavailable:       true,
 			UnavailableReason: class,
 			CapturedAt:        c.nowFn(),
 		}, err
+	}
+	if errors.Is(err, ErrControllerNotFound) {
+		// Surface the controller-NotFound classification for
+		// operator visibility before falling through to the
+		// orphan-pod fallback path.
+		c.log.Info("posture: controller not found, falling back to orphan-pod identity",
+			slog.String("namespace", pod.Namespace),
+			slog.String("pod_name", pod.Name),
+			slog.String("error", err.Error()),
+		)
 	}
 
 	isOrphan := identity.OwnerKind == "Pod"
@@ -231,16 +272,20 @@ func (c *Client) Get(ctx context.Context, pod *corev1.Pod, opts ...Option) (*sch
 	}
 
 	bypass := options.bypassCache || (options.bypassCacheFor != "" && options.bypassCacheFor == workloadID)
-	if !bypass {
+	if bypass {
+		c.cacheBypasses.Add(1)
+	} else {
 		if cached, ok := c.cache.Get(workloadID, c.nowFn); ok {
 			c.cacheHits.Add(1)
-			return cached, nil
+			// Defensive copy: the cache stores a single pointer
+			// per workload and any consumer mutation would leak
+			// into subsequent Get callers. Return a shallow clone
+			// so the cached entry is read-only from the caller's
+			// perspective.
+			return cloneWorkloadPosture(cached), nil
 		}
+		c.cacheMisses.Add(1)
 	}
-	c.cacheMisses.Add(1)
-
-	fetchCtx, cancel := context.WithTimeout(ctx, c.fetchTimeout)
-	defer cancel()
 
 	posture, fetchErr := c.fetchPosture(fetchCtx, pod, identity, isOrphan)
 	if fetchErr != nil {
@@ -262,7 +307,9 @@ func (c *Client) Get(ctx context.Context, pod *corev1.Pod, opts ...Option) (*sch
 	}
 
 	c.cache.Put(workloadID, posture, c.cacheTTL, c.nowFn)
-	return posture, nil
+	// Return a clone so concurrent readers do not race on the
+	// pointer stored inside the cache.
+	return cloneWorkloadPosture(posture), nil
 }
 
 // workloadIDFor builds the canonical cache key for an identity,
@@ -316,99 +363,153 @@ func (c *Client) fetchPosture(ctx context.Context, pod *corev1.Pod, identity sch
 	return posture, nil
 }
 
+// effectiveServiceAccount returns the ServiceAccount name the K8s
+// admission controller would have assigned to the pod. An empty
+// pod.spec.serviceAccountName is replaced with "default" so the
+// posture client surfaces RBAC bound to the implicit default SA
+// (a common attack-surface target).
+func effectiveServiceAccount(sa string) string {
+	if sa == "" {
+		return defaultServiceAccount
+	}
+	return sa
+}
+
 // listRoleBindings returns the namespaced RoleBindings whose subjects
-// include the given ServiceAccount. For each match, the referenced
-// Role (or ClusterRole) is fetched and its verbs/resources flattened
-// into the union surface, capped at MaxRoleVerbsCap entries.
+// include the given ServiceAccount or a group that transitively
+// includes it (system:serviceaccounts, system:serviceaccounts:<ns>,
+// system:authenticated). For each match, the referenced Role (or
+// ClusterRole) is fetched and its verbs/resources flattened into the
+// union surface, capped at MaxRoleVerbsCap entries.
+//
+// The List call paginates via Limit/Continue so namespaces with
+// >listPageLimit bindings do not silently truncate. Each binding is
+// inspected after its page lands; the per-page cost is bounded by
+// listPageLimit.
 func (c *Client) listRoleBindings(ctx context.Context, namespace, serviceAccount string) ([]schema.RoleBindingRef, error) {
-	if serviceAccount == "" {
-		return nil, nil
-	}
-	list, err := c.cs.RbacV1().RoleBindings(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, err
-	}
-	out := make([]schema.RoleBindingRef, 0, len(list.Items))
-	for i := range list.Items {
-		rb := &list.Items[i]
-		if !subjectsContainServiceAccount(rb.Subjects, namespace, serviceAccount) {
-			continue
+	sa := effectiveServiceAccount(serviceAccount)
+	out := []schema.RoleBindingRef{}
+	cont := ""
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		ref := schema.RoleBindingRef{
-			Name:     rb.Name,
-			RoleKind: rb.RoleRef.Kind,
-			RoleName: rb.RoleRef.Name,
+		list, err := c.cs.RbacV1().RoleBindings(namespace).List(ctx, metav1.ListOptions{
+			Limit:    listPageLimit,
+			Continue: cont,
+		})
+		if err != nil {
+			return nil, err
 		}
-		verbs, resources, lookupErr := c.lookupRoleSurface(ctx, namespace, rb.RoleRef.Kind, rb.RoleRef.Name)
-		if lookupErr != nil {
-			// Best-effort: surface the binding even when the role
-			// fetch fails, so the LLM can still reason about
-			// "binding exists" even when verbs are unknown. Log
-			// the lookup failure for operator visibility.
-			c.log.Warn("posture: rolebinding role lookup failed",
-				slog.String("namespace", namespace),
-				slog.String("rolebinding", rb.Name),
-				slog.String("role_kind", rb.RoleRef.Kind),
-				slog.String("role_name", rb.RoleRef.Name),
-				slog.String("error", lookupErr.Error()),
-			)
+		for i := range list.Items {
+			rb := &list.Items[i]
+			if !subjectsContainServiceAccount(rb.Subjects, namespace, sa) {
+				continue
+			}
+			ref := schema.RoleBindingRef{
+				Name:     rb.Name,
+				RoleKind: rb.RoleRef.Kind,
+				RoleName: rb.RoleRef.Name,
+			}
+			verbs, resources, truncated, lookupErr := c.lookupRoleSurface(ctx, namespace, rb.RoleRef.Kind, rb.RoleRef.Name)
+			if lookupErr != nil {
+				// Best-effort: surface the binding even when the
+				// role fetch fails, but flag VerbsUnavailable so
+				// the LLM can distinguish "binding exists with
+				// no rules" from "binding exists, rules unknown".
+				c.log.Warn("posture: rolebinding role lookup failed",
+					slog.String("namespace", namespace),
+					slog.String("rolebinding", rb.Name),
+					slog.String("role_kind", rb.RoleRef.Kind),
+					slog.String("role_name", rb.RoleRef.Name),
+					slog.String("error", lookupErr.Error()),
+				)
+				ref.VerbsUnavailable = true
+			}
+			ref.Verbs = verbs
+			ref.Resources = resources
+			ref.VerbsTruncated = truncated
+			out = append(out, ref)
 		}
-		ref.Verbs = verbs
-		ref.Resources = resources
-		out = append(out, ref)
+		cont = list.Continue
+		if cont == "" {
+			break
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	if len(out) == 0 {
+		return nil, nil
+	}
 	return out, nil
 }
 
 // listClusterRoleBindings returns the ClusterRoleBindings whose
 // subjects include the given ServiceAccount with the workload's
-// namespace.
+// namespace, or a group that transitively includes it. The List call
+// paginates via Limit/Continue.
 func (c *Client) listClusterRoleBindings(ctx context.Context, namespace, serviceAccount string) ([]schema.ClusterRoleBindingRef, error) {
-	if serviceAccount == "" {
-		return nil, nil
-	}
-	list, err := c.cs.RbacV1().ClusterRoleBindings().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, err
-	}
-	out := make([]schema.ClusterRoleBindingRef, 0, len(list.Items))
-	for i := range list.Items {
-		crb := &list.Items[i]
-		if !subjectsContainServiceAccount(crb.Subjects, namespace, serviceAccount) {
-			continue
+	sa := effectiveServiceAccount(serviceAccount)
+	out := []schema.ClusterRoleBindingRef{}
+	cont := ""
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		ref := schema.ClusterRoleBindingRef{
-			Name:     crb.Name,
-			RoleName: crb.RoleRef.Name,
+		list, err := c.cs.RbacV1().ClusterRoleBindings().List(ctx, metav1.ListOptions{
+			Limit:    listPageLimit,
+			Continue: cont,
+		})
+		if err != nil {
+			return nil, err
 		}
-		verbs, resources, lookupErr := c.lookupRoleSurface(ctx, "", "ClusterRole", crb.RoleRef.Name)
-		if lookupErr != nil {
-			c.log.Warn("posture: clusterrolebinding role lookup failed",
-				slog.String("clusterrolebinding", crb.Name),
-				slog.String("role_name", crb.RoleRef.Name),
-				slog.String("error", lookupErr.Error()),
-			)
+		for i := range list.Items {
+			crb := &list.Items[i]
+			if !subjectsContainServiceAccount(crb.Subjects, namespace, sa) {
+				continue
+			}
+			ref := schema.ClusterRoleBindingRef{
+				Name:     crb.Name,
+				RoleName: crb.RoleRef.Name,
+			}
+			verbs, resources, truncated, lookupErr := c.lookupRoleSurface(ctx, "", "ClusterRole", crb.RoleRef.Name)
+			if lookupErr != nil {
+				c.log.Warn("posture: clusterrolebinding role lookup failed",
+					slog.String("clusterrolebinding", crb.Name),
+					slog.String("role_name", crb.RoleRef.Name),
+					slog.String("error", lookupErr.Error()),
+				)
+				ref.VerbsUnavailable = true
+			}
+			ref.Verbs = verbs
+			ref.Resources = resources
+			ref.VerbsTruncated = truncated
+			out = append(out, ref)
 		}
-		ref.Verbs = verbs
-		ref.Resources = resources
-		out = append(out, ref)
+		cont = list.Continue
+		if cont == "" {
+			break
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	if len(out) == 0 {
+		return nil, nil
+	}
 	return out, nil
 }
 
 // lookupRoleSurface fetches a Role or ClusterRole by name and
 // flattens its rules into the verbs/resources union, capped per
-// guardrail.
-func (c *Client) lookupRoleSurface(ctx context.Context, namespace, kind, name string) (verbs, resources []string, err error) {
+// guardrail. truncated reports whether bounded had to trim either
+// slice; callers surface this on RoleBindingRef.VerbsTruncated so the
+// LLM consumer can tell that the surface is incomplete.
+func (c *Client) lookupRoleSurface(ctx context.Context, namespace, kind, name string) (verbs, resources []string, truncated bool, err error) {
 	verbSet := make(map[string]struct{})
 	resSet := make(map[string]struct{})
 	switch kind {
 	case "Role":
 		role, fetchErr := c.cs.RbacV1().Roles(namespace).Get(ctx, name, metav1.GetOptions{})
 		if fetchErr != nil {
-			return nil, nil, fetchErr
+			return nil, nil, false, fetchErr
 		}
 		for _, rule := range role.Rules {
 			for _, v := range rule.Verbs {
@@ -421,7 +522,7 @@ func (c *Client) lookupRoleSurface(ctx context.Context, namespace, kind, name st
 	case "ClusterRole":
 		cr, fetchErr := c.cs.RbacV1().ClusterRoles().Get(ctx, name, metav1.GetOptions{})
 		if fetchErr != nil {
-			return nil, nil, fetchErr
+			return nil, nil, false, fetchErr
 		}
 		for _, rule := range cr.Rules {
 			for _, v := range rule.Verbs {
@@ -432,18 +533,20 @@ func (c *Client) lookupRoleSurface(ctx context.Context, namespace, kind, name st
 			}
 		}
 	default:
-		return nil, nil, fmt.Errorf("posture: unknown role kind %q", kind)
+		return nil, nil, false, fmt.Errorf("posture: unknown role kind %q", kind)
 	}
 
-	verbs = bounded(verbSet, MaxRoleVerbsCap)
-	resources = bounded(resSet, MaxRoleResourcesCap)
-	return verbs, resources, nil
+	verbs, verbsTruncated := bounded(verbSet, MaxRoleVerbsCap)
+	resources, resourcesTruncated := bounded(resSet, MaxRoleResourcesCap)
+	return verbs, resources, verbsTruncated || resourcesTruncated, nil
 }
 
-// bounded converts a set to a sorted slice capped at limit.
-func bounded(set map[string]struct{}, limit int) []string {
+// bounded converts a set to a sorted slice capped at limit. truncated
+// reports whether the original set exceeded limit (so a caller can
+// surface the truncation on the wire schema).
+func bounded(set map[string]struct{}, limit int) ([]string, bool) {
 	if len(set) == 0 {
-		return nil
+		return nil, false
 	}
 	out := make([]string, 0, len(set))
 	for s := range set {
@@ -451,18 +554,42 @@ func bounded(set map[string]struct{}, limit int) []string {
 	}
 	sort.Strings(out)
 	if len(out) > limit {
-		out = out[:limit]
+		return out[:limit], true
 	}
-	return out
+	return out, false
 }
 
-// subjectsContainServiceAccount returns true when any subject in
-// the binding's Subjects slice is a ServiceAccount with the given
-// name in the given namespace.
+// subjectsContainServiceAccount returns true when any subject in the
+// binding's Subjects slice grants the workload's ServiceAccount
+// permission. Three subject shapes resolve to the SA:
+//
+//  1. Kind=ServiceAccount, Name=<sa>, Namespace=<ns> — direct binding.
+//  2. Kind=Group, Name=system:serviceaccounts — bound to every SA
+//     in the cluster.
+//  3. Kind=Group, Name=system:serviceaccounts:<ns> — bound to every
+//     SA in the workload's namespace.
+//  4. Kind=Group, Name=system:authenticated — bound to every
+//     authenticated principal, which includes every SA.
+//
+// Without (2)/(3)/(4), bindings that transitively grant cluster-admin-
+// equivalent privileges via the well-known service-account groups
+// would be silently dropped from the posture surface and the LLM
+// consumer would under-report effective RBAC.
 func subjectsContainServiceAccount(subjects []rbacv1.Subject, namespace, serviceAccount string) bool {
+	nsGroup := "system:serviceaccounts:" + namespace
 	for _, s := range subjects {
-		if s.Kind == "ServiceAccount" && s.Name == serviceAccount && s.Namespace == namespace {
-			return true
+		switch s.Kind {
+		case "ServiceAccount":
+			if s.Name == serviceAccount && s.Namespace == namespace {
+				return true
+			}
+		case "Group":
+			switch s.Name {
+			case "system:serviceaccounts",
+				"system:authenticated",
+				nsGroup:
+				return true
+			}
 		}
 	}
 	return false
@@ -514,7 +641,10 @@ func summarisePodSecurityContext(psc *corev1.PodSecurityContext) *schema.PodSecu
 
 // summariseContainerSecurityContexts projects per-container
 // SecurityContexts across init, regular, and ephemeral containers.
-// Containers without SecurityContext are skipped.
+// A container with no SecurityContext set is preserved as an entry
+// with Inherits=true so the LLM consumer can distinguish "container
+// inherits pod-level defaults" (a posture finding in its own right)
+// from "container does not exist in the pod".
 func summariseContainerSecurityContexts(pod *corev1.Pod) []schema.ContainerSecurityContextSummary {
 	out := make([]schema.ContainerSecurityContextSummary, 0)
 	for i := range pod.Spec.InitContainers {
@@ -525,10 +655,7 @@ func summariseContainerSecurityContexts(pod *corev1.Pod) []schema.ContainerSecur
 	}
 	for i := range pod.Spec.EphemeralContainers {
 		ec := &pod.Spec.EphemeralContainers[i]
-		summary := projectContainerSecurityContext(ec.Name, schema.ContainerKindEphemeral, ec.SecurityContext)
-		if summary != nil {
-			out = append(out, *summary)
-		}
+		out = append(out, projectContainerSecurityContext(ec.Name, schema.ContainerKindEphemeral, ec.SecurityContext))
 	}
 	if len(out) == 0 {
 		return nil
@@ -536,34 +663,32 @@ func summariseContainerSecurityContexts(pod *corev1.Pod) []schema.ContainerSecur
 	return out
 }
 
-// appendContainer projects a single container's SecurityContext if
-// present.
+// appendContainer projects a single container's SecurityContext and
+// appends the resulting summary (with Inherits=true when sc is nil).
 func appendContainer(out []schema.ContainerSecurityContextSummary, ctr *corev1.Container, kind string) []schema.ContainerSecurityContextSummary {
-	summary := projectContainerSecurityContext(ctr.Name, kind, ctr.SecurityContext)
-	if summary != nil {
-		return append(out, *summary)
-	}
-	return out
+	return append(out, projectContainerSecurityContext(ctr.Name, kind, ctr.SecurityContext))
 }
 
 // projectContainerSecurityContext maps corev1.SecurityContext (or
 // the ephemeral variant) to schema.ContainerSecurityContextSummary.
-// Returns nil when sc is nil so callers can decide whether to omit
-// the entry entirely.
-func projectContainerSecurityContext(name, kind string, sc *corev1.SecurityContext) *schema.ContainerSecurityContextSummary {
+// A nil SecurityContext produces a summary with Inherits=true and
+// all other fields nil so the consumer knows the container is
+// inheriting pod-level settings unmodified.
+func projectContainerSecurityContext(name, kind string, sc *corev1.SecurityContext) schema.ContainerSecurityContextSummary {
+	summary := schema.ContainerSecurityContextSummary{
+		ContainerName: name,
+		Kind:          kind,
+	}
 	if sc == nil {
-		return nil
+		summary.Inherits = true
+		return summary
 	}
-	summary := &schema.ContainerSecurityContextSummary{
-		ContainerName:            name,
-		Kind:                     kind,
-		Privileged:               sc.Privileged,
-		AllowPrivilegeEscalation: sc.AllowPrivilegeEscalation,
-		ReadOnlyRootFilesystem:   sc.ReadOnlyRootFilesystem,
-		RunAsUser:                sc.RunAsUser,
-		RunAsGroup:               sc.RunAsGroup,
-		RunAsNonRoot:             sc.RunAsNonRoot,
-	}
+	summary.Privileged = sc.Privileged
+	summary.AllowPrivilegeEscalation = sc.AllowPrivilegeEscalation
+	summary.ReadOnlyRootFilesystem = sc.ReadOnlyRootFilesystem
+	summary.RunAsUser = sc.RunAsUser
+	summary.RunAsGroup = sc.RunAsGroup
+	summary.RunAsNonRoot = sc.RunAsNonRoot
 	if sc.Capabilities != nil {
 		for _, c := range sc.Capabilities.Add {
 			summary.AddedCapabilities = append(summary.AddedCapabilities, string(c))
@@ -581,22 +706,91 @@ func projectContainerSecurityContext(name, kind string, sc *corev1.SecurityConte
 // classify maps a K8s API error to one of the four UnavailableReason
 // classes per AC4 + NFR15. The returned class is what flows into the
 // LLM-bound posture payload; the raw err.Error() is logged separately.
+//
+// Beyond the four typed apierrors checks, this also handles:
+//
+//   - 401 Unauthorized → permission_denied (apierrors.IsUnauthorized).
+//     A revoked or rotated token is a permissions failure from the
+//     workload's perspective, not a permanent fault.
+//   - 429 Too Many Requests → transient (apierrors.IsTooManyRequests).
+//     The K8s Priority and Fairness signal is a retry-after-backoff
+//     class, not a permanent fault.
+//   - net.Error timeouts and connection-refused / EOF / TLS-handshake
+//     errors → transient. These are raised by the rest-client at the
+//     transport layer and never wrap as IsTimeout(); classifying them
+//     as "permanent" would falsely tell the LLM the workload is
+//     permanently un-postureable during a kube-apiserver restart.
+//   - net/url.Error wrapping a timeout → transient.
 func classify(err error) string {
 	if err == nil {
 		return ""
 	}
 	switch {
-	case apierrors.IsForbidden(err):
+	case apierrors.IsForbidden(err), apierrors.IsUnauthorized(err):
 		return schema.PostureUnavailablePermissionDenied
 	case apierrors.IsNotFound(err):
 		return schema.PostureUnavailableNotFound
-	case apierrors.IsTimeout(err), apierrors.IsServerTimeout(err), apierrors.IsServiceUnavailable(err):
+	case apierrors.IsTimeout(err),
+		apierrors.IsServerTimeout(err),
+		apierrors.IsServiceUnavailable(err),
+		apierrors.IsTooManyRequests(err):
 		return schema.PostureUnavailableTransient
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		return schema.PostureUnavailableTransient
-	default:
-		return schema.PostureUnavailablePermanent
 	}
+	// Transport-layer errors: net.Error.Timeout, dial-refused, EOF,
+	// TLS handshake timeout, url.Error-wrapped timeouts. None of
+	// these are typed apierrors, so we inspect via errors.As + a
+	// last-resort string match against well-known suffixes from
+	// net/http's transport layer.
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return schema.PostureUnavailableTransient
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Timeout() {
+		return schema.PostureUnavailableTransient
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "connection refused"),
+		strings.Contains(msg, "EOF"),
+		strings.Contains(msg, "TLS handshake timeout"),
+		strings.Contains(msg, "no such host"),
+		strings.Contains(msg, "i/o timeout"):
+		return schema.PostureUnavailableTransient
+	}
+	return schema.PostureUnavailablePermanent
+}
+
+// cloneWorkloadPosture returns a shallow clone of p with independent
+// slice headers and a fresh PodSecurityContext pointer. The cache
+// stores a single pointer per workload and any caller mutation would
+// leak across subsequent Get calls; cloning at Get time keeps the
+// cached entry read-only from the caller's perspective without
+// requiring a deep copy of every leaf field.
+func cloneWorkloadPosture(p *schema.WorkloadPosture) *schema.WorkloadPosture {
+	if p == nil {
+		return nil
+	}
+	out := *p
+	if p.RoleBindings != nil {
+		out.RoleBindings = append([]schema.RoleBindingRef(nil), p.RoleBindings...)
+	}
+	if p.ClusterRoleBindings != nil {
+		out.ClusterRoleBindings = append([]schema.ClusterRoleBindingRef(nil), p.ClusterRoleBindings...)
+	}
+	if p.NetworkPolicies != nil {
+		out.NetworkPolicies = append([]schema.NetworkPolicyRef(nil), p.NetworkPolicies...)
+	}
+	if p.ContainerSecurityContexts != nil {
+		out.ContainerSecurityContexts = append([]schema.ContainerSecurityContextSummary(nil), p.ContainerSecurityContexts...)
+	}
+	if p.PodSecurityContext != nil {
+		psc := *p.PodSecurityContext
+		out.PodSecurityContext = &psc
+	}
+	return &out
 }
 
 // PostureCacheHits returns the cumulative cache-hit count. Story
@@ -604,8 +798,20 @@ func classify(err error) string {
 // olaitan_sensor_posture_cache_hit_total.
 func (c *Client) PostureCacheHits() int64 { return c.cacheHits.Load() }
 
-// PostureCacheMisses returns the cumulative cache-miss count.
+// PostureCacheMisses returns the cumulative cache-miss count. A
+// miss is a cache-eligible Get with no fresh entry; explicit
+// bypass-cache calls do not contribute to this counter (they are
+// counted separately via PostureCacheBypasses) so the hit-rate KPI
+// reflects natural cache eligibility, not LLM-eligible refetch
+// policy.
 func (c *Client) PostureCacheMisses() int64 { return c.cacheMisses.Load() }
+
+// PostureCacheBypasses returns the cumulative count of Get calls
+// that bypassed the cache via WithBypassCache or WithBypassCacheFor.
+// Story 1.12 binds this getter to a Prometheus counter so operators
+// can observe LLM-eligible fresh-fetch volume independently of the
+// natural hit/miss split.
+func (c *Client) PostureCacheBypasses() int64 { return c.cacheBypasses.Load() }
 
 // PostureAPIErrors returns the cumulative K8s-API-error count.
 func (c *Client) PostureAPIErrors() int64 { return c.apiErrors.Load() }

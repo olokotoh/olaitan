@@ -15,12 +15,17 @@ CHART_FILES      := $(CHART_DIR)/files/olaitan.yaml $(CHART_DIR)/files/audit-pol
 # Story 1.11 posture-client integration tests (and any future
 # envtest-driven tests) need. Resulting tree at bin/k8s/.
 ENVTEST_K8S_VERSION ?= 1.29.x
+# Pinned setup-envtest release-branch to keep `make envtest-bin`
+# reproducible across CI and local checkouts. The release-branch tag
+# tracks the controller-runtime minor pinned in go.mod
+# (sigs.k8s.io/controller-runtime v0.24.x).
+SETUP_ENVTEST_VERSION ?= release-0.24
 
 envtest-bin: bin/setup-envtest
 	bin/setup-envtest use $(ENVTEST_K8S_VERSION) --bin-dir bin/k8s >/dev/null
 
 bin/setup-envtest:
-	GOBIN=$(CURDIR)/bin go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+	GOBIN=$(CURDIR)/bin go install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION)
 
 build:
 	go build $(LDFLAGS) -o $(BINARY) ./cmd/olaitan

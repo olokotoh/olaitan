@@ -325,16 +325,16 @@ func TestStartAggregator_BuildsPostureClientWhenEnabled(t *testing.T) {
 	// Save and restore the package-level seam so this test does not
 	// leak into other tests in the suite.
 	prevFactory := kubeClientFactory
-	prevClient := postureClient
+	prevClient := postureClient.Load()
 	t.Cleanup(func() {
 		kubeClientFactory = prevFactory
-		postureClient = prevClient
+		postureClient.Store(prevClient)
 	})
 
 	kubeClientFactory = func(*slog.Logger) (kubernetes.Interface, error) {
 		return kubefake.NewSimpleClientset(), nil
 	}
-	postureClient = nil
+	postureClient.Store(nil)
 
 	cfg := &config.Config{
 		Detection: config.DetectionConfig{
@@ -346,7 +346,7 @@ func TestStartAggregator_BuildsPostureClientWhenEnabled(t *testing.T) {
 	if err := startAggregatorRing(context.Background(), log, cfg); err != nil {
 		t.Fatalf("startAggregatorRing: %v", err)
 	}
-	if postureClient == nil {
+	if postureClient.Load() == nil {
 		t.Errorf("postureClient: got nil, want non-nil")
 	}
 }
@@ -356,17 +356,17 @@ func TestStartAggregator_BuildsPostureClientWhenEnabled(t *testing.T) {
 // postureClient stays nil, no error.
 func TestStartAggregator_PostureDisabledLeavesClientNil(t *testing.T) {
 	prevFactory := kubeClientFactory
-	prevClient := postureClient
+	prevClient := postureClient.Load()
 	t.Cleanup(func() {
 		kubeClientFactory = prevFactory
-		postureClient = prevClient
+		postureClient.Store(prevClient)
 	})
 
 	kubeClientFactory = func(*slog.Logger) (kubernetes.Interface, error) {
 		t.Fatalf("kube client factory must not be called when posture disabled")
 		return nil, nil
 	}
-	postureClient = nil
+	postureClient.Store(nil)
 
 	cfg := &config.Config{
 		Detection: config.DetectionConfig{
@@ -377,7 +377,7 @@ func TestStartAggregator_PostureDisabledLeavesClientNil(t *testing.T) {
 	if err := startAggregatorRing(context.Background(), log, cfg); err != nil {
 		t.Fatalf("startAggregatorRing: %v", err)
 	}
-	if postureClient != nil {
+	if postureClient.Load() != nil {
 		t.Errorf("postureClient: got non-nil, want nil")
 	}
 }
@@ -387,16 +387,16 @@ func TestStartAggregator_PostureDisabledLeavesClientNil(t *testing.T) {
 // wrapped error and leaves postureClient nil.
 func TestStartAggregator_KubeClientFailureWrapsError(t *testing.T) {
 	prevFactory := kubeClientFactory
-	prevClient := postureClient
+	prevClient := postureClient.Load()
 	t.Cleanup(func() {
 		kubeClientFactory = prevFactory
-		postureClient = prevClient
+		postureClient.Store(prevClient)
 	})
 
 	kubeClientFactory = func(*slog.Logger) (kubernetes.Interface, error) {
 		return nil, fmt.Errorf("simulated rest.InClusterConfig failure")
 	}
-	postureClient = nil
+	postureClient.Store(nil)
 
 	cfg := &config.Config{
 		Detection: config.DetectionConfig{
@@ -411,7 +411,7 @@ func TestStartAggregator_KubeClientFailureWrapsError(t *testing.T) {
 	if !strings.Contains(err.Error(), "posture: kube client") {
 		t.Errorf("err: got %q, want wrap with %q", err, "posture: kube client")
 	}
-	if postureClient != nil {
+	if postureClient.Load() != nil {
 		t.Errorf("postureClient: got non-nil, want nil on failure path")
 	}
 }

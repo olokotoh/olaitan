@@ -142,3 +142,17 @@ func TestPodFallbackIDOwnerKindIsLiteralPod(t *testing.T) {
 		t.Errorf("pod-fallback-id %q: missing /Pod/ literal owner-kind sentinel", id)
 	}
 }
+
+// TestWorkloadIDRejectsPodOwnerKind guards the orphan-pod sentinel.
+// WorkloadID must refuse owner-kind "Pod" so a string-compare on the
+// second segment unambiguously distinguishes resolved workloads from
+// PodFallbackID's orphan-pod fallback.
+func TestWorkloadIDRejectsPodOwnerKind(t *testing.T) {
+	_, err := keys.WorkloadID("default", "Pod", "lone-pod")
+	if err == nil {
+		t.Fatalf("expected error rejecting owner-kind \"Pod\", got nil")
+	}
+	if !strings.Contains(err.Error(), "reserved for PodFallbackID") {
+		t.Errorf("err %q does not mention PodFallbackID reservation", err)
+	}
+}

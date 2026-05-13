@@ -168,21 +168,38 @@ data:
     {{- if hasKey $ps "enabled" }}
     {{- $pEn := "(posture:[[:space:]]*\\n[[:space:]]+)enabled:[[:space:]]+(?:true|false)" -}}
     {{- if not (mustRegexFind $pEn $cfg) }}{{- fail (printf "helm bridge: posture.enabled anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pEn) }}{{- end }}
-    {{- $cfg = regexReplaceAll $pEn $cfg (printf "${1}enabled: %t" $ps.enabled) }}
+    {{- /* Normalise the chart-side enabled value to a literal bool
+            string. Helm `--set posture.enabled=true` arrives as a
+            string, and `printf "%t"` on a string emits
+            `%!t(string=true)` which would break the rendered YAML.
+            Use an `if` to project to the literal "true"/"false". */ -}}
+    {{- $pEnVal := "false" }}
+    {{- if $ps.enabled }}{{- $pEnVal = "true" }}{{- end }}
+    {{- $cfg = regexReplaceAll $pEn $cfg (printf "${1}enabled: %s" $pEnVal) }}
     {{- end }}
     {{- if $ps.cacheTTL }}
     {{- /* Cache TTL ceiling: architecture.md:324 + Story 1.11 AC3.
-            Go-style duration parser inside the chart is heavy; we
-            simply reject anything not in {"Ns","Nm60s","60s"} that
-            exceeds the documented ceiling. Negative or empty
-            strings fall through to the regex substitution which
-            leaves invalid values to the Go-side validator. */ -}}
-    {{- if regexMatch "^([0-9]+s)$" $ps.cacheTTL }}
-    {{- $secs := int (regexReplaceAll "[^0-9]+" $ps.cacheTTL "") }}
-    {{- if gt $secs 60 }}{{- fail (printf "posture.cacheTTL must be <= 60s per architecture.md:324 + Story 1.11 AC3 (got %s)" $ps.cacheTTL) }}{{- end }}
+            Accepts seconds-only ("Ns") and minute-plus-second
+            combinations ("Nm", "NmNs", "NmNs", "0m30s", "1m0s") up
+            to a 60s total budget. Anything outside that grammar
+            falls through to the regex substitution and the Go-side
+            validator catches it at boot. The chart-side ceiling
+            stays in sync with the Go-side ceiling in
+            internal/config/config.go PostureConfig.validate. */ -}}
+    {{- $ttl := $ps.cacheTTL }}
+    {{- $ttlSecs := -1 }}
+    {{- if regexMatch "^([0-9]+s)$" $ttl }}
+    {{- $ttlSecs = int (regexReplaceAll "[^0-9]+" $ttl "") }}
+    {{- else if regexMatch "^([0-9]+)m$" $ttl }}
+    {{- $mins := int (regexReplaceAll "[^0-9]+" $ttl "") }}
+    {{- $ttlSecs = mul $mins 60 }}
+    {{- else if regexMatch "^([0-9]+)m([0-9]+)s$" $ttl }}
+    {{- $mins := int (first (regexFindAll "[0-9]+" $ttl 2)) }}
+    {{- $secs := int (index (regexFindAll "[0-9]+" $ttl 2) 1) }}
+    {{- $ttlSecs = add (mul $mins 60) $secs }}
     {{- end }}
-    {{- if regexMatch "^([0-9]+m[0-9]*s?)$" $ps.cacheTTL }}
-    {{- fail (printf "posture.cacheTTL must be <= 60s per architecture.md:324 + Story 1.11 AC3 (got %s)" $ps.cacheTTL) }}
+    {{- if and (ge $ttlSecs 0) (gt $ttlSecs 60) }}
+    {{- fail (printf "posture.cacheTTL must be <= 60s per architecture.md:324 + Story 1.11 AC3 (got %s)" $ttl) }}
     {{- end }}
     {{- $pCt := "(?s)(posture:.{0,256}?\\n[[:space:]]+)cache_ttl:[[:space:]]+\"[^\"]*\"" -}}
     {{- if not (mustRegexFind $pCt $cfg) }}{{- fail (printf "helm bridge: posture.cache_ttl anchor not found (pattern %q)" $pCt) }}{{- end }}

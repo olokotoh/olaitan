@@ -88,22 +88,36 @@ const (
 // workload's ServiceAccount. The Verbs and Resources slices are the
 // flattened union across the referenced Role's rules, capped at the
 // caller's union-cap (default 32 entries each, bounded by memory).
+//
+// VerbsTruncated signals to the LLM consumer that the verbs/resources
+// slices were trimmed to the cap; without this flag, an alphabetically-
+// late dangerous verb (e.g., "update", "watch") could be silently
+// dropped and the consumer would reason about an incomplete privilege
+// set. VerbsUnavailable signals that the referenced Role could not be
+// resolved (deletion, RBAC denial, transient apiserver error) and
+// distinguishes "binding exists with no rules" from "binding exists,
+// rules unknown" for the NFR15 honesty boundary.
 type RoleBindingRef struct {
-	Name      string   `json:"name"`
-	RoleKind  string   `json:"role_kind"` // "Role" or "ClusterRole"
-	RoleName  string   `json:"role_name"`
-	Verbs     []string `json:"verbs,omitempty"`
-	Resources []string `json:"resources,omitempty"`
+	Name             string   `json:"name"`
+	RoleKind         string   `json:"role_kind"` // "Role" or "ClusterRole"
+	RoleName         string   `json:"role_name"`
+	Verbs            []string `json:"verbs,omitempty"`
+	Resources        []string `json:"resources,omitempty"`
+	VerbsTruncated   bool     `json:"verbs_truncated,omitempty"`
+	VerbsUnavailable bool     `json:"verbs_unavailable,omitempty"`
 }
 
 // ClusterRoleBindingRef references a ClusterRoleBinding whose subjects
 // include the workload's ServiceAccount (with the workload's
-// namespace).
+// namespace). VerbsTruncated and VerbsUnavailable have the same
+// semantics as on RoleBindingRef.
 type ClusterRoleBindingRef struct {
-	Name      string   `json:"name"`
-	RoleName  string   `json:"role_name"`
-	Verbs     []string `json:"verbs,omitempty"`
-	Resources []string `json:"resources,omitempty"`
+	Name             string   `json:"name"`
+	RoleName         string   `json:"role_name"`
+	Verbs            []string `json:"verbs,omitempty"`
+	Resources        []string `json:"resources,omitempty"`
+	VerbsTruncated   bool     `json:"verbs_truncated,omitempty"`
+	VerbsUnavailable bool     `json:"verbs_unavailable,omitempty"`
 }
 
 // NetworkPolicyRef references a NetworkPolicy whose spec.podSelector
@@ -145,9 +159,18 @@ type PodSecurityContextSummary struct {
 // container (init, regular, ephemeral). Container-level fields
 // override the pod-level equivalents per K8s semantics; consumers must
 // merge with the pod-level summary at evaluation time.
+//
+// Inherits=true is set when the container has no SecurityContext set
+// at all (the K8s default: all pod-level settings apply unmodified).
+// This is preserved in the surface because the absence of an override
+// is itself a posture finding (operators who omit SecurityContext are
+// inheriting defaults that may be permissive). All pointer fields are
+// nil in that case; consumers MUST consult Inherits before reasoning
+// about specific values.
 type ContainerSecurityContextSummary struct {
 	ContainerName            string   `json:"container_name"`
 	Kind                     string   `json:"kind"` // "init", "regular", "ephemeral"
+	Inherits                 bool     `json:"inherits,omitempty"`
 	Privileged               *bool    `json:"privileged,omitempty"`
 	AllowPrivilegeEscalation *bool    `json:"allow_privilege_escalation,omitempty"`
 	ReadOnlyRootFilesystem   *bool    `json:"read_only_root_filesystem,omitempty"`
