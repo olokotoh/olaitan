@@ -522,6 +522,43 @@ applogSidecar:
     # the Issuer). Raw base64 string (NOT double-quoted).
     caBundle: ""
 
+# --- Workload posture client (FR7) -----------------------------------
+# Story 1.11 -- sixth Ring 1 source, read-on-demand rather than
+# streaming. The aggregator queries the K8s API on demand for each
+# investigated workload's RBAC bindings, applicable NetworkPolicies,
+# and PodSecurityContext per architecture.md:324, :751 (production
+# path) and architecture.md:45 (five streaming + one read-on-demand).
+#
+# Results are cached in-process for cacheTTL seconds keyed by the
+# canonical workload identity (`namespace/owner-kind/owner-name`,
+# URL-encoded, with `namespace/Pod/<pod-name>` for orphan pods per
+# architecture.md:457). The cacheTTL ceiling is 60s per
+# architecture.md:324 + Story 1.11 AC3; the chart rejects higher
+# values via the fail-fast guard in templates/configmap.yaml.
+#
+# The Story 3.x orchestrator's fresh-fetch policy for LLM-eligible
+# packages (architecture.md:326) is wired through the
+# `posture.Client.WithBypassCache()` Go API; the Helm chart has no
+# knob for it (the policy is code-side, not configuration).
+posture:
+  # Whether the aggregator constructs a posture.Client at startup.
+  # Disabling here makes the aggregator skip posture queries; the
+  # correlator still publishes EvidencePackages but with no posture
+  # context. Default on because FR7 declares posture as load-bearing
+  # for the multi-agent LLM chain.
+  enabled: true
+
+  # Maximum staleness for cached postures. AC3 ceiling is 60s; the
+  # chart rejects any value above the ceiling because the
+  # read-on-demand pattern depends on staleness staying under the
+  # freshness budget.
+  cacheTTL: "60s"
+
+  # Per-Get K8s API context timeout. Posture is on the investigation
+  # chain critical path; an unbounded fetch would compound LLM
+  # budget pressure.
+  fetchTimeout: "5s"
+
 # --- Subchart overrides ------------------------------------------------
 # Only opinions we impose on the downstream charts live here -- upstream
 # defaults are otherwise preserved. To see every available knob, consult

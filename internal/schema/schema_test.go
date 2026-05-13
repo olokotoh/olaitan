@@ -425,3 +425,168 @@ func TestThreatContextRoundTrip(t *testing.T) {
 		t.Errorf("PriorAssessment.ThreatType: got %q, want %q", decoded.PriorAssessment.ThreatType, "reconnaissance")
 	}
 }
+
+func TestWorkloadPosturePopulatedRoundTrip(t *testing.T) {
+	runAsNonRoot := true
+	allowEsc := false
+	readOnlyRootFS := true
+	runAsUser := int64(1000)
+	posture := WorkloadPosture{
+		Identity: WorkloadIdentity{
+			Namespace: "payments",
+			OwnerKind: "Deployment",
+			OwnerName: "payments-api",
+		},
+		CapturedAt:     time.Date(2026, 5, 12, 22, 0, 0, 0, time.UTC),
+		ServiceAccount: "payments-sa",
+		RoleBindings: []RoleBindingRef{
+			{Name: "payments-rb", RoleKind: "Role", RoleName: "payments-role", Verbs: []string{"get", "list"}, Resources: []string{"secrets"}},
+		},
+		ClusterRoleBindings: []ClusterRoleBindingRef{
+			{Name: "payments-crb", RoleName: "node-reader", Verbs: []string{"get"}, Resources: []string{"nodes"}},
+		},
+		NetworkPolicies: []NetworkPolicyRef{
+			{Name: "allow-frontend", PolicyTypes: []string{"Ingress"}, IngressRules: 1, EgressRules: 0},
+		},
+		PodSecurityContext: &PodSecurityContextSummary{
+			RunAsUser:    &runAsUser,
+			RunAsNonRoot: &runAsNonRoot,
+		},
+		ContainerSecurityContexts: []ContainerSecurityContextSummary{
+			{
+				ContainerName:            "api",
+				Kind:                     ContainerKindRegular,
+				AllowPrivilegeEscalation: &allowEsc,
+				ReadOnlyRootFilesystem:   &readOnlyRootFS,
+				DroppedCapabilities:      []string{"ALL"},
+			},
+		},
+	}
+
+	data, err := json.Marshal(posture)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var decoded WorkloadPosture
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if decoded.Identity.OwnerKind != "Deployment" || decoded.Identity.OwnerName != "payments-api" {
+		t.Errorf("Identity: got %+v, want owner Deployment/payments-api", decoded.Identity)
+	}
+	if decoded.ServiceAccount != "payments-sa" {
+		t.Errorf("ServiceAccount: got %q, want %q", decoded.ServiceAccount, "payments-sa")
+	}
+	if len(decoded.RoleBindings) != 1 || decoded.RoleBindings[0].RoleKind != "Role" {
+		t.Errorf("RoleBindings: got %+v", decoded.RoleBindings)
+	}
+	if len(decoded.ClusterRoleBindings) != 1 {
+		t.Errorf("ClusterRoleBindings: got %d, want 1", len(decoded.ClusterRoleBindings))
+	}
+	if len(decoded.NetworkPolicies) != 1 || decoded.NetworkPolicies[0].IngressRules != 1 {
+		t.Errorf("NetworkPolicies: got %+v", decoded.NetworkPolicies)
+	}
+	if decoded.PodSecurityContext == nil || decoded.PodSecurityContext.RunAsNonRoot == nil || !*decoded.PodSecurityContext.RunAsNonRoot {
+		t.Errorf("PodSecurityContext.RunAsNonRoot: got %+v, want non-nil true", decoded.PodSecurityContext)
+	}
+	if len(decoded.ContainerSecurityContexts) != 1 {
+		t.Fatalf("ContainerSecurityContexts: got %d, want 1", len(decoded.ContainerSecurityContexts))
+	}
+	csc := decoded.ContainerSecurityContexts[0]
+	if csc.AllowPrivilegeEscalation == nil || *csc.AllowPrivilegeEscalation {
+		t.Errorf("AllowPrivilegeEscalation: got %+v, want non-nil false", csc.AllowPrivilegeEscalation)
+	}
+	if decoded.OrphanPod || decoded.Unavailable {
+		t.Errorf("OrphanPod/Unavailable: got %v/%v, want both false", decoded.OrphanPod, decoded.Unavailable)
+	}
+}
+
+func TestWorkloadPostureOrphanFallbackRoundTrip(t *testing.T) {
+	posture := WorkloadPosture{
+		Identity: WorkloadIdentity{
+			Namespace: "scratch",
+			OwnerKind: "Pod",
+			OwnerName: "lone-pod",
+			PodName:   "lone-pod",
+		},
+		OrphanPod:  true,
+		CapturedAt: time.Date(2026, 5, 12, 22, 5, 0, 0, time.UTC),
+	}
+
+	data, err := json.Marshal(posture)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded WorkloadPosture
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !decoded.OrphanPod {
+		t.Errorf("OrphanPod: got false, want true")
+	}
+	if decoded.Identity.PodName != "lone-pod" {
+		t.Errorf("Identity.PodName: got %q, want lone-pod", decoded.Identity.PodName)
+	}
+	if decoded.Identity.OwnerKind != "Pod" {
+		t.Errorf("Identity.OwnerKind: got %q, want Pod", decoded.Identity.OwnerKind)
+	}
+}
+
+func TestWorkloadPostureUnavailableRoundTrip(t *testing.T) {
+	posture := WorkloadPosture{
+		Identity: WorkloadIdentity{
+			Namespace: "payments",
+			OwnerKind: "Deployment",
+			OwnerName: "payments-api",
+		},
+		Unavailable:       true,
+		UnavailableReason: PostureUnavailableTransient,
+		CapturedAt:        time.Date(2026, 5, 12, 22, 10, 0, 0, time.UTC),
+	}
+	data, err := json.Marshal(posture)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded WorkloadPosture
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !decoded.Unavailable || decoded.UnavailableReason != PostureUnavailableTransient {
+		t.Errorf("unavailable: got (%v,%q), want (true,%q)", decoded.Unavailable, decoded.UnavailableReason, PostureUnavailableTransient)
+	}
+}
+
+func TestWorkloadPostureOmitemptyDropsZeroFields(t *testing.T) {
+	posture := WorkloadPosture{
+		Identity: WorkloadIdentity{
+			Namespace: "ns",
+			OwnerKind: "Deployment",
+			OwnerName: "app",
+		},
+		CapturedAt: time.Date(2026, 5, 12, 22, 15, 0, 0, time.UTC),
+	}
+	data, err := json.Marshal(posture)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got := string(data)
+	for _, banned := range []string{"orphan_pod", "unavailable", "unavailable_reason", "service_account", "role_bindings", "cluster_role_bindings", "network_policies", "pod_security_context", "container_security_contexts"} {
+		if contains(got, banned) {
+			t.Errorf("zero-value posture serialised contained %q; expected omitempty drop. JSON: %s", banned, got)
+		}
+	}
+	if !contains(got, "captured_at") {
+		t.Errorf("captured_at missing from serialised posture: %s", got)
+	}
+}
+
+func contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}

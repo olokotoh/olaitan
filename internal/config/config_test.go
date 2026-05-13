@@ -501,3 +501,60 @@ func TestProviderCaseInsensitive(t *testing.T) {
 		t.Errorf("provider=API should validate (case-insensitive): %v", err)
 	}
 }
+
+func TestPostureConfigOmittedAccepted(t *testing.T) {
+	// Omitting the posture block should validate; it is omitempty
+	// and downstream callers receive a zero-valued PostureConfig.
+	path := writeConfig(t, validYAML)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Detection.Posture.Enabled {
+		t.Errorf("Posture.Enabled: got true (default zero), want false")
+	}
+}
+
+func TestPostureConfigValidDefaults(t *testing.T) {
+	body := strings.Replace(validYAML, "  baseline_window: 24h", "  baseline_window: 24h\n  posture:\n    enabled: true\n    cache_ttl: 60s\n    fetch_timeout: 5s", 1)
+	path := writeConfig(t, body)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Detection.Posture.Enabled {
+		t.Errorf("Posture.Enabled: got false, want true")
+	}
+	if cfg.Detection.Posture.CacheTTL.Duration() != 60*time.Second {
+		t.Errorf("cache_ttl: got %s, want 60s", cfg.Detection.Posture.CacheTTL.Duration())
+	}
+}
+
+func TestPostureConfigCacheTTLAboveCeilingRejected(t *testing.T) {
+	body := strings.Replace(validYAML, "  baseline_window: 24h", "  baseline_window: 24h\n  posture:\n    enabled: true\n    cache_ttl: 90s\n    fetch_timeout: 5s", 1)
+	path := writeConfig(t, body)
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatalf("expected validate error for cache_ttl > 60s")
+	}
+	if !strings.Contains(err.Error(), "cache_ttl") {
+		t.Errorf("err %q should mention cache_ttl", err)
+	}
+}
+
+func TestPostureConfigNegativeFetchTimeoutRejected(t *testing.T) {
+	body := strings.Replace(validYAML, "  baseline_window: 24h", "  baseline_window: 24h\n  posture:\n    enabled: true\n    cache_ttl: 60s\n    fetch_timeout: -1s", 1)
+	path := writeConfig(t, body)
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatalf("expected validate error for negative fetch_timeout")
+	}
+}
+
+func TestPostureConfigZeroBlockWhenDisabledAccepted(t *testing.T) {
+	body := strings.Replace(validYAML, "  baseline_window: 24h", "  baseline_window: 24h\n  posture:\n    enabled: false", 1)
+	path := writeConfig(t, body)
+	if _, err := config.Load(path); err != nil {
+		t.Errorf("posture block with enabled:false should validate: %v", err)
+	}
+}

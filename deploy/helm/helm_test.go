@@ -1869,3 +1869,140 @@ func TestCalicoSensorConfigMapBridgesValues(t *testing.T) {
 			snippet(rendered, "calico:"))
 	}
 }
+
+// TestPostureConfigMapBridgesValues asserts that overriding the
+// chart-side posture knobs flows through into the rendered
+// detection.posture ConfigMap block (Story 1.11 AC3 + Helm wiring).
+func TestPostureConfigMapBridgesValues(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"posture.enabled=true",
+		"posture.cacheTTL=45s",
+		"posture.fetchTimeout=3s",
+	})
+	if !strings.Contains(rendered, `cache_ttl: "45s"`) {
+		t.Errorf("ConfigMap bridge did not propagate cacheTTL; sample:\n%s",
+			snippet(rendered, "cache_ttl"))
+	}
+	if !strings.Contains(rendered, `fetch_timeout: "3s"`) {
+		t.Errorf("ConfigMap bridge did not propagate fetchTimeout; sample:\n%s",
+			snippet(rendered, "fetch_timeout"))
+	}
+	// posture.enabled stays true; the bridge substitutes the bool
+	// value, regardless of upstream yaml default.
+	if !strings.Contains(strings.ReplaceAll(rendered, " ", ""), "posture:\nenabled:true") {
+		t.Errorf("ConfigMap bridge did not flip posture.enabled; sample:\n%s",
+			snippet(rendered, "posture:"))
+	}
+}
+
+// TestPostureCacheTTLAboveCeilingFails asserts the chart-side
+// fail-fast guard (Story 1.11 AC3 + architecture.md:324) rejects
+// values above the 60s ceiling at render time, so a misconfigured
+// operator value never reaches the Go-side validator.
+func TestPostureCacheTTLAboveCeilingFails(t *testing.T) {
+	cmd := exec.Command("helm", "template", chartDir(t),
+		"--set", "secrets.redisPassword=test",
+		"--set", "posture.cacheTTL=120s",
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("expected helm template to fail when posture.cacheTTL exceeds 60s ceiling")
+	}
+	if !strings.Contains(stderr.String(), "posture.cacheTTL must be <= 60s") {
+		t.Errorf("expected fail-fast message naming the ceiling; stderr:\n%s", stderr.String())
+	}
+}
+
+// TestPostureCacheTTLAtCeilingAcceptsMinuteForms asserts the chart-
+// side guard does NOT reject equivalent representations of exactly
+// 60s. The TTL ceiling rule is "<= 60s", not "Ns-only", so `1m`,
+// `1m0s`, `0m60s`, and `60s` must all be accepted as equivalent
+// Go-duration forms at the ceiling. The minute-form regex used to
+// fail every `Nm[Ns]?` value unconditionally, blocking legitimate
+// at-ceiling configurations; this test locks in the fix.
+func TestPostureCacheTTLAtCeilingAcceptsMinuteForms(t *testing.T) {
+	for _, ttl := range []string{"1m", "1m0s", "0m60s", "60s"} {
+		ttl := ttl
+		t.Run(ttl, func(t *testing.T) {
+			rendered := helmTemplate(t, []string{
+				"posture.enabled=true",
+				"posture.cacheTTL=" + ttl,
+			})
+			want := `cache_ttl: "` + ttl + `"`
+			if !strings.Contains(rendered, want) {
+				t.Errorf("expected rendered cache_ttl to be %q at the ceiling; sample:\n%s",
+					ttl, snippet(rendered, "cache_ttl"))
+			}
+		})
+	}
+}
+
+// TestPostureCacheTTLMinuteFormAboveCeilingFails asserts the chart-
+// side guard rejects minute-plus-second forms that exceed 60s.
+func TestPostureCacheTTLMinuteFormAboveCeilingFails(t *testing.T) {
+	for _, ttl := range []string{"2m", "1m30s", "10m"} {
+		ttl := ttl
+		t.Run(ttl, func(t *testing.T) {
+			cmd := exec.Command("helm", "template", chartDir(t),
+				"--set", "secrets.redisPassword=test",
+				"--set", "posture.cacheTTL="+ttl,
+			)
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			if err := cmd.Run(); err == nil {
+				t.Fatalf("expected helm template to fail for posture.cacheTTL=%s", ttl)
+			}
+			if !strings.Contains(stderr.String(), "posture.cacheTTL must be <= 60s") {
+				t.Errorf("expected fail-fast message; stderr:\n%s", stderr.String())
+			}
+		})
+	}
+}
+
+// TestPostureEnabledViaSetIsRenderedAsBoolLiteral asserts the bridge
+// emits a literal `enabled: true` even when the value arrives via
+// `--set posture.enabled=true` (a string in Helm coercion semantics).
+// A direct `printf "%t"` on a string would emit `%!t(string=true)`
+// and break the rendered YAML; the bridge uses an explicit `if` to
+// project to "true"/"false".
+func TestPostureEnabledViaSetIsRenderedAsBoolLiteral(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"posture.enabled=true",
+	})
+	if strings.Contains(rendered, "%!t(string=") {
+		t.Errorf("printf-on-string artefact leaked into ConfigMap; sample:\n%s",
+			snippet(rendered, "posture:"))
+	}
+	if !strings.Contains(strings.ReplaceAll(rendered, " ", ""), "posture:\nenabled:true") {
+		t.Errorf("ConfigMap bridge did not render literal `enabled: true`; sample:\n%s",
+			snippet(rendered, "posture:"))
+	}
+}
+
+// TestPostureRBACRulesPresent asserts the aggregator ClusterRole
+// carries the Story 1.11 read-only RBAC rules so the posture client
+// can list bindings, network policies, and the owner-controller chain
+// per architecture.md:257.
+func TestPostureRBACRulesPresent(t *testing.T) {
+	rendered := helmTemplate(t, nil)
+	// Locate the aggregator ClusterRole rules block. The simplest
+	// substring check is sufficient because the verbs/resources are
+	// emitted as YAML lines with stable formatting.
+	mustHave := []string{
+		// rbac.authorization.k8s.io group rules for bindings + roles
+		`["rolebindings", "clusterrolebindings", "roles", "clusterroles"]`,
+		// apps group rules
+		`["deployments", "replicasets", "statefulsets", "daemonsets"]`,
+		// batch group rules
+		`["jobs", "cronjobs"]`,
+		// serviceaccounts read
+		`["serviceaccounts"]`,
+	}
+	for _, want := range mustHave {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("aggregator ClusterRole missing posture rule resources %q; sample:\n%s",
+				want, snippet(rendered, "rolebindings"))
+		}
+	}
+}

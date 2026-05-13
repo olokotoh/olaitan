@@ -55,6 +55,43 @@ type DetectionConfig struct {
 	ConfidenceBands ConfidenceBands `yaml:"confidence_bands"`
 	BaselineWindow  DurationYAML    `yaml:"baseline_window"`
 	Sources         SourcesConfig   `yaml:"sources,omitempty"`
+	// Story 1.11: posture sub-block configures the read-on-demand
+	// workload posture client (FR7). architecture.md:324 pins the
+	// 60s cache TTL ceiling; validate enforces it.
+	Posture PostureConfig `yaml:"posture,omitempty"`
+}
+
+// PostureConfig configures the Story 1.11 read-on-demand workload
+// posture client. When Enabled is true the aggregator constructs a
+// posture.Client and exposes its cache-hit counter; when false the
+// block may stay zero-valued and downstream callers receive a
+// degraded Unavailable=true posture for every query.
+type PostureConfig struct {
+	Enabled      bool         `yaml:"enabled"`
+	CacheTTL     DurationYAML `yaml:"cache_ttl,omitempty"`
+	FetchTimeout DurationYAML `yaml:"fetch_timeout,omitempty"`
+}
+
+// validate enforces PostureConfig invariants. A zero block is allowed
+// when Enabled is false; with Enabled=true CacheTTL and FetchTimeout
+// must be non-negative (a zero value means "use the package default":
+// 60s for CacheTTL and 5s for FetchTimeout, both applied downstream
+// in startAggregatorRing). CacheTTL is bounded above by 60s per
+// architecture.md:324 and Story 1.11 AC3 ("no greater than 60 seconds").
+func (p PostureConfig) validate() error {
+	if !p.Enabled {
+		return nil
+	}
+	if p.CacheTTL.Duration() < 0 {
+		return fmt.Errorf("detection.posture.cache_ttl: must be >= 0 (0 means default; got %s)", p.CacheTTL.Duration())
+	}
+	if p.CacheTTL.Duration() > 60*time.Second {
+		return fmt.Errorf("detection.posture.cache_ttl: must be <= 60s per architecture.md:324 + Story 1.11 AC3 (got %s)", p.CacheTTL.Duration())
+	}
+	if p.FetchTimeout.Duration() < 0 {
+		return fmt.Errorf("detection.posture.fetch_timeout: must be >= 0 (0 means default; got %s)", p.FetchTimeout.Duration())
+	}
+	return nil
 }
 
 // SourcesConfig groups per-source adapter configuration. Each entry is
@@ -412,6 +449,9 @@ func (d DetectionConfig) validate() error {
 		return err
 	}
 	if err := d.Sources.Calico.validate(); err != nil {
+		return err
+	}
+	if err := d.Posture.validate(); err != nil {
 		return err
 	}
 	return nil

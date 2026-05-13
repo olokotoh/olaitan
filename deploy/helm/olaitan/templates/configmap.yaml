@@ -155,6 +155,62 @@ data:
     {{- if hasKey $pr "maxAttempts" }}{{- $p := "(?s)(calico:.{0,999}?publish_retry:.{0,256}?\\n[[:space:]]+)max_attempts:[[:space:]]+[0-9]+" -}}{{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: calico.publish_retry.max_attempts anchor not found (pattern %q)" $p) }}{{- end }}{{- $cfg = regexReplaceAll $p $cfg (printf "${1}max_attempts: %v" $pr.maxAttempts) }}{{- end }}
     {{- end }}
     {{- end }}
+    {{- /*
+    Story 1.11: bridge the chart-side posture knobs into the
+    rendered detection.posture block. The cacheTTL ceiling is 60s
+    per architecture.md:324 + AC3; the chart fails render if a
+    higher value is supplied. mustRegexFind precedes every
+    regexReplaceAll so a missing anchor surfaces as a clear render
+    error rather than a silent miss (Story 1.10 P28 pattern).
+    */ -}}
+    {{- if .Values.posture }}
+    {{- $ps := .Values.posture }}
+    {{- if hasKey $ps "enabled" }}
+    {{- $pEn := "(posture:[[:space:]]*\\n[[:space:]]+)enabled:[[:space:]]+(?:true|false)" -}}
+    {{- if not (mustRegexFind $pEn $cfg) }}{{- fail (printf "helm bridge: posture.enabled anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pEn) }}{{- end }}
+    {{- /* Normalise the chart-side enabled value to a literal bool
+            string. Helm `--set posture.enabled=true` arrives as a
+            string, and `printf "%t"` on a string emits
+            `%!t(string=true)` which would break the rendered YAML.
+            Use an `if` to project to the literal "true"/"false". */ -}}
+    {{- $pEnVal := "false" }}
+    {{- if $ps.enabled }}{{- $pEnVal = "true" }}{{- end }}
+    {{- $cfg = regexReplaceAll $pEn $cfg (printf "${1}enabled: %s" $pEnVal) }}
+    {{- end }}
+    {{- if $ps.cacheTTL }}
+    {{- /* Cache TTL ceiling: architecture.md:324 + Story 1.11 AC3.
+            Accepts seconds-only ("Ns") and minute-plus-second
+            combinations ("Nm", "NmNs", "NmNs", "0m30s", "1m0s") up
+            to a 60s total budget. Anything outside that grammar
+            falls through to the regex substitution and the Go-side
+            validator catches it at boot. The chart-side ceiling
+            stays in sync with the Go-side ceiling in
+            internal/config/config.go PostureConfig.validate. */ -}}
+    {{- $ttl := $ps.cacheTTL }}
+    {{- $ttlSecs := -1 }}
+    {{- if regexMatch "^([0-9]+s)$" $ttl }}
+    {{- $ttlSecs = int (regexReplaceAll "[^0-9]+" $ttl "") }}
+    {{- else if regexMatch "^([0-9]+)m$" $ttl }}
+    {{- $mins := int (regexReplaceAll "[^0-9]+" $ttl "") }}
+    {{- $ttlSecs = mul $mins 60 }}
+    {{- else if regexMatch "^([0-9]+)m([0-9]+)s$" $ttl }}
+    {{- $mins := int (first (regexFindAll "[0-9]+" $ttl 2)) }}
+    {{- $secs := int (index (regexFindAll "[0-9]+" $ttl 2) 1) }}
+    {{- $ttlSecs = add (mul $mins 60) $secs }}
+    {{- end }}
+    {{- if and (ge $ttlSecs 0) (gt $ttlSecs 60) }}
+    {{- fail (printf "posture.cacheTTL must be <= 60s per architecture.md:324 + Story 1.11 AC3 (got %s)" $ttl) }}
+    {{- end }}
+    {{- $pCt := "(?s)(posture:.{0,256}?\\n[[:space:]]+)cache_ttl:[[:space:]]+\"[^\"]*\"" -}}
+    {{- if not (mustRegexFind $pCt $cfg) }}{{- fail (printf "helm bridge: posture.cache_ttl anchor not found (pattern %q)" $pCt) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pCt $cfg (printf "${1}cache_ttl: %q" $ps.cacheTTL) }}
+    {{- end }}
+    {{- if $ps.fetchTimeout }}
+    {{- $pFt := "(?s)(posture:.{0,512}?\\n[[:space:]]+)fetch_timeout:[[:space:]]+\"[^\"]*\"" -}}
+    {{- if not (mustRegexFind $pFt $cfg) }}{{- fail (printf "helm bridge: posture.fetch_timeout anchor not found (pattern %q)" $pFt) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pFt $cfg (printf "${1}fetch_timeout: %q" $ps.fetchTimeout) }}
+    {{- end }}
+    {{- end }}
     {{- $cfg | nindent 4 }}
 ---
 apiVersion: v1
