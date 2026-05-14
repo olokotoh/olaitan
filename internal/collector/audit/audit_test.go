@@ -333,7 +333,7 @@ func mustEventList(t *testing.T) []byte {
 func TestReceiver_HappyPath_Publishes_204(t *testing.T) {
 	t.Parallel()
 	pub := &stubPublisher{}
-	_, url, tc, _ := startAdapter(t, pub, nil)
+	a, url, tc, _ := startAdapter(t, pub, nil)
 
 	client := mtlsClient(t, tc, true)
 	resp, err := client.Post(url, "application/json", bytes.NewReader(mustEventList(t)))
@@ -350,6 +350,15 @@ func TestReceiver_HappyPath_Publishes_204(t *testing.T) {
 	}
 	if calls[0].subject != subjects.RawAudit {
 		t.Errorf("subject: got %q, want %q", calls[0].subject, subjects.RawAudit)
+	}
+	// Story 1.12: EventsTotal must reflect the successful publish so
+	// the Prometheus counter advances. The reject buckets stay empty
+	// on a happy-path event.
+	if got := a.EventsTotal(); got != 1 {
+		t.Errorf("EventsTotal: got %d, want 1", got)
+	}
+	if rb := a.RejectedByReason(); len(rb) != 0 {
+		t.Errorf("RejectedByReason on happy path: got %v, want empty", rb)
 	}
 }
 
@@ -369,6 +378,16 @@ func TestReceiver_Rejects_NonPOST(t *testing.T) {
 	}
 	if a.Rejected()["method_not_allowed"] != 1 {
 		t.Errorf("rejected counter not incremented: %v", a.Rejected())
+	}
+	// RejectedByReasonValue must agree with Rejected() for the same
+	// bucket and must return 0 for an unfired bucket. This is the hot
+	// path the Story 1.12 Prometheus surface reads per scrape (Copilot
+	// review CR1 on PR #21).
+	if got := a.RejectedByReasonValue("method_not_allowed"); got != 1 {
+		t.Errorf("RejectedByReasonValue(method_not_allowed): got %d, want 1", got)
+	}
+	if got := a.RejectedByReasonValue("translate_failed"); got != 0 {
+		t.Errorf("RejectedByReasonValue(translate_failed) on unfired bucket: got %d, want 0", got)
 	}
 }
 

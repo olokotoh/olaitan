@@ -52,6 +52,16 @@ spec:
     metadata:
       labels:
         {{- include "olaitan.collector.selectorLabels" . | nindent 8 }}
+      {{- /* Story 1.12: Prometheus scrape annotations, gated by
+             metrics.scrapeAnnotations so a Prometheus-Operator-driven
+             deployment can disable them and rely on a ServiceMonitor
+             resource (future Story 1.18 follow-up). */ -}}
+      {{- if and .Values.metrics .Values.metrics.scrapeAnnotations }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.metrics.containerPort | quote }}
+        prometheus.io/path: "/metrics"
+      {{- end }}
     spec:
       serviceAccountName: {{ include "olaitan.collector.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
@@ -97,6 +107,20 @@ spec:
             - name: health
               containerPort: 8080
               protocol: TCP
+            # Story 1.12: Prometheus metrics surface (FR8, FR50). The
+            # port is mandatory because the metrics surface is the
+            # single source of truth for source health and event-rate
+            # observability; downstream Stories 1.13/1.14/1.18 inherit
+            # this exposition by registering against the same
+            # internal/metrics.Registry. The if-guard mirrors the
+            # configmap.yaml pattern so a chart deploy with `--set
+            # metrics=null` fails fast at render rather than panicking
+            # on nil .Values.metrics.containerPort (Review P4).
+            {{- if .Values.metrics }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.containerPort }}
+              protocol: TCP
+            {{- end }}
             {{- if .Values.auditWebhook.enabled }}
             # Story 1.7 audit-webhook receiver port. The kube-apiserver
             # dials this port via the Service FQDN baked into the

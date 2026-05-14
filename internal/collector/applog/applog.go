@@ -161,6 +161,11 @@ type Adapter struct {
 	// will bind to a Prometheus counter.
 	lostOnShutdown atomic.Int64
 
+	// eventsPublished is the Story 1.12 Prometheus reader-side
+	// counter, incremented per successful publishWithRetry. Exposed
+	// via EventsTotal as the int64 snapshot.
+	eventsPublished atomic.Int64
+
 	// shed is the back-pressure shed-state tracker for the line
 	// channel. Both reader goroutines share it; the consumer drains
 	// the channel.
@@ -331,6 +336,19 @@ func (a *Adapter) LinesShed() int64 {
 // publishWithRetry was cancelled mid-flight by ctx.Done. Exposed for
 // Story 1.12's Prometheus surface.
 func (a *Adapter) LostOnShutdown() int64 { return a.lostOnShutdown.Load() }
+
+// EventsTotal returns the cumulative count of application-log events
+// successfully published to subjects.RawAppLog. Story 1.12 binds this
+// via prometheus.NewCounterFunc to
+// olaitan_sensor_events_total{source="applog"}.
+func (a *Adapter) EventsTotal() int64 { return a.eventsPublished.Load() }
+
+// DroppedEvents is an alias of LinesShed retained for symmetry with the
+// other adapters' getter naming convention. Story 1.12's Prometheus
+// surface uses LinesShed directly; DroppedEvents is provided so
+// downstream callers can choose the verb that matches their
+// vocabulary.
+func (a *Adapter) DroppedEvents() int64 { return a.LinesShed() }
 
 // Run blocks until ctx is cancelled or every reader goroutine has
 // exited. The adapter owns three goroutines under an errgroup: one
@@ -506,6 +524,7 @@ func (a *Adapter) consume(ctx context.Context, lineCh <-chan LineRecord) error {
 			// lastEventTime even though no event reaches JetStream).
 			t := a.nowFn()
 			a.lastEventTime.Store(&t)
+			a.eventsPublished.Add(1)
 			// First successful publish: flip healthy. Subsequent
 			// publishes are no-op-equivalent at the tracker layer
 			// (MarkHealthy is idempotent).

@@ -88,3 +88,28 @@ func TestHealth_ReturnsTrackerInZeroState(t *testing.T) {
 // embedded-NATS integration test in falco_integration_test.go landed
 // under Task 8. The unit tests above stop at config-time invariants so
 // this file does not depend on the gRPC plumbing.
+
+func TestEventsTotal_ZeroOnConstruct(t *testing.T) {
+	a, err := New(Config{Endpoint: "unix:///x", Hostname: "node"}, stubPub{}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got := a.EventsTotal(); got != 0 {
+		t.Errorf("EventsTotal on fresh Adapter: got %d, want 0", got)
+	}
+}
+
+func TestEventsTotal_IncrementsOnPublishSuccess(t *testing.T) {
+	a, err := New(Config{Endpoint: "unix:///x", Hostname: "node"}, stubPub{}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// Direct atomic increments simulate the inline a.eventsPublished.Add(1)
+	// in the publishWithRetry success path; the full receive loop is
+	// covered in the integration test. This unit gates the getter
+	// contract independent of the gRPC plumbing.
+	a.eventsPublished.Add(3)
+	if got := a.EventsTotal(); got != 3 {
+		t.Errorf("EventsTotal after Add(3): got %d, want 3", got)
+	}
+}

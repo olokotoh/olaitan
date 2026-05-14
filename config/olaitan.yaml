@@ -94,6 +94,15 @@ detection:
     cache_ttl: "60s"
     fetch_timeout: "5s"
 
+# Story 1.12: Prometheus metrics surface (FR8, FR50). Every Olaitan
+# process exposes Prometheus metrics on :9090/metrics from a dedicated
+# http.Server running alongside the kubelet probe surface at
+# :8080/healthz. The two surfaces have different consumer SLOs so they
+# never share a port. Validation rejects an empty address per
+# guardrail 27 (the surface is mandatory, not optional).
+metrics:
+  address: ":9090"
+
 response:
   excluded_namespaces:
     - kube-system

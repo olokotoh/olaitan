@@ -43,6 +43,7 @@ import (
 	"github.com/olokotoh/olaitan/internal/health"
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
 	"github.com/olokotoh/olaitan/internal/retry"
+	"github.com/olokotoh/olaitan/internal/schema"
 )
 
 var version = "dev"
@@ -199,7 +200,7 @@ func runRingCtx(ctx context.Context, ring string, args []string, stderr io.Write
 			return 1
 		}
 	case "aggregator":
-		if err := startAggregatorRing(ringCtx, log, mgr.Get()); err != nil {
+		if err := startAggregatorRing(gctx, g, log, mgr.Get()); err != nil {
 			log.Error("startup: aggregator ring wiring", "err", err)
 			ringCancel()
 			_ = g.Wait()
@@ -325,39 +326,48 @@ func getPostureClient() *posture.Client { return postureClient.Load() }
 //     intentionally-enabled posture must not silently degrade.
 //   - posture.enabled=false -> log "posture disabled", leave
 //     postureClient nil, return nil.
-func startAggregatorRing(ctx context.Context, log *slog.Logger, cfg *config.Config) error {
-	if !cfg.Detection.Posture.Enabled {
+func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger, cfg *config.Config) error {
+	var client *posture.Client
+	if cfg.Detection.Posture.Enabled {
+		cs, err := kubeClientFactory(log)
+		if err != nil {
+			return fmt.Errorf("posture: kube client: %w", err)
+		}
+
+		pCfg := posture.DefaultConfig()
+		if d := cfg.Detection.Posture.CacheTTL.Duration(); d > 0 {
+			pCfg.CacheTTL = d
+		}
+		if d := cfg.Detection.Posture.FetchTimeout.Duration(); d > 0 {
+			pCfg.FetchTimeout = d
+		}
+
+		client, err = posture.New(pCfg, cs, log)
+		if err != nil {
+			return fmt.Errorf("posture: client init: %w", err)
+		}
+		postureClient.Store(client)
+		log.Info("aggregator: posture client constructed",
+			"cache_ttl", pCfg.CacheTTL,
+			"fetch_timeout", pCfg.FetchTimeout,
+		)
+	} else {
 		log.Info("aggregator: posture client disabled in config; skipping")
-		return nil
 	}
 
-	cs, err := kubeClientFactory(log)
-	if err != nil {
-		return fmt.Errorf("posture: kube client: %w", err)
+	// Story 1.12: Prometheus metrics surface for the aggregator ring.
+	// No streaming adapters yet (Story 1.14 lands the correlator); the
+	// surface exists so the posture counters (or the posture_disabled
+	// gauge) can be scraped, and so future aggregator-side adapters
+	// inherit the wiring.
+	if _, merr := startMetricsServer(ctx, g, log, cfg, nil, client); merr != nil {
+		return fmt.Errorf("aggregator: metrics: %w", merr)
 	}
 
-	pCfg := posture.DefaultConfig()
-	if d := cfg.Detection.Posture.CacheTTL.Duration(); d > 0 {
-		pCfg.CacheTTL = d
-	}
-	if d := cfg.Detection.Posture.FetchTimeout.Duration(); d > 0 {
-		pCfg.FetchTimeout = d
-	}
-
-	client, err := posture.New(pCfg, cs, log)
-	if err != nil {
-		return fmt.Errorf("posture: client init: %w", err)
-	}
-	postureClient.Store(client)
-	log.Info("aggregator: posture client constructed",
-		"cache_ttl", pCfg.CacheTTL,
-		"fetch_timeout", pCfg.FetchTimeout,
-	)
 	// Future Story 1.14: wire postureClient into the correlator
 	// goroutine here. The ctx is plumbed through for the lifecycle
 	// hand-off so the correlator can scope per-Get contexts under
 	// ringCtx.
-	_ = ctx
 	return nil
 }
 
@@ -387,6 +397,14 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 	if nodeName == "" {
 		return errors.New("collector: K8S_NODE_NAME env var is empty (set by Helm chart's downward API)")
 	}
+
+	// metricsSources collects every constructed adapter so the metrics
+	// surface can bind them once at the end. Each insertion uses the
+	// canonical schema.Source* constant as the label value so
+	// dashboards can join on the enum without renaming (binding
+	// interpretation: AC1's "network_flow" enumerand is overridden to
+	// "network" to match the existing schema.SourceNetwork constant).
+	metricsSources := map[string]adapterMetrics{}
 
 	natsCfg := natsclient.DefaultConfig()
 	natsCfg.URL = natsURL
@@ -425,6 +443,7 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 		closeNATS()
 		return fmt.Errorf("collector: falco adapter: %w", err)
 	}
+	metricsSources[string(schema.SourceFalco)] = adapter
 
 	// Falco adapter goroutine. NATS drain happens after g.Wait()
 	// returns (see runRingCtx) so the adapter has fully exited before
@@ -476,6 +495,7 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 			closeNATS()
 			return fmt.Errorf("collector: audit adapter: %w", aerr)
 		}
+		metricsSources[string(schema.SourceAudit)] = auditAdapter
 		g.Go(func() error {
 			if err := auditAdapter.Run(ctx); err != nil {
 				return fmt.Errorf("collector: audit run: %w", err)
@@ -506,6 +526,7 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 			closeNATS()
 			return fmt.Errorf("collector: cri adapter: %w", cerr)
 		}
+		metricsSources[string(schema.SourceRuntime)] = criAdapter
 		g.Go(func() error {
 			if err := criAdapter.Run(ctx); err != nil {
 				// P22: clean shutdown surfaces context.Canceled
@@ -550,6 +571,7 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 			closeNATS()
 			return fmt.Errorf("collector: cni adapter: %w", nerr)
 		}
+		metricsSources[string(schema.SourceNetwork)] = cniAdapter
 		g.Go(func() error {
 			if err := cniAdapter.Run(ctx); err != nil {
 				if errors.Is(err, context.Canceled) {
@@ -561,6 +583,21 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 		})
 		log.Info("collector: ring 1 wired (calico cni)",
 			"goldmane_addr", cniCfg.GoldmaneAddr)
+	}
+
+	// Story 1.12: Prometheus metrics surface on :9090/metrics.
+	// startMetricsServer registers the per-adapter source_healthy gauge,
+	// sensor_events_total counter, and per-adapter detail counters in
+	// that order BEFORE the HTTP server goroutine starts accepting
+	// scrapes (Review P2: closes the scrape window where a scrape would
+	// otherwise see source_healthy without audit_rejected, cri_*, cni_*).
+	// Posture lives in the aggregator ring, so postureCli is nil here;
+	// the disabled gauge is suppressed in the collector to avoid
+	// double-registering across the two rings (the aggregator registers
+	// it).
+	if _, merr := startMetricsServer(ctx, g, log, cfg, metricsSources, nil); merr != nil {
+		closeNATS()
+		return fmt.Errorf("collector: metrics: %w", merr)
 	}
 
 	log.Info("collector: ring 1 wired", "falco_socket", falcoSocket, "node", nodeName)
