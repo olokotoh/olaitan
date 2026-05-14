@@ -73,6 +73,19 @@ func (r *rejectedCounters) Snapshot() map[string]uint64 {
 	return out
 }
 
+// Load returns the cumulative count for a single reason bucket
+// without allocating a map or copying every counter. Returns 0 if
+// the bucket has never fired (atomic creation is lazy in Inc, so an
+// unseen reason has no counter yet).
+func (r *rejectedCounters) Load(reason string) uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if c := r.counters[reason]; c != nil {
+		return c.Load()
+	}
+	return 0
+}
+
 // natsPublisher is the minimal NATS surface the adapter consumes.
 // Mirrors the falco package's interface so tests can supply a stub.
 type natsPublisher interface {
@@ -317,9 +330,20 @@ func (a *Adapter) Rejected() map[string]uint64 {
 	return a.rejected.Snapshot()
 }
 
+// RejectedByReasonValue returns the cumulative count for a single
+// reason bucket without allocating a map or copying every counter.
+// Story 1.12's Prometheus surface uses this in each per-reason
+// CounterFunc so a /metrics scrape is O(1) per reason instead of
+// allocating six fresh maps + acquiring six RLocks per scrape (Copilot
+// review CR1 on PR #21). Returns 0 if the reason has never fired.
+func (a *Adapter) RejectedByReasonValue(reason string) uint64 {
+	return a.rejected.Load(reason)
+}
+
 // RejectedByReason returns the same snapshot as Rejected but keyed by
-// the six canonical reason labels in a stable order. Story 1.12 uses
-// this directly when binding olaitan_sensor_audit_rejected_total{reason}.
+// the six canonical reason labels in a stable order. Retained for tests
+// and operator-side introspection; the Story 1.12 Prometheus surface
+// uses RejectedByReasonValue per-reason to avoid per-scrape allocation.
 // Returning a fresh map keeps callers from racing the underlying
 // atomics.
 func (a *Adapter) RejectedByReason() map[string]uint64 {

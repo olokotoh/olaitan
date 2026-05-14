@@ -286,3 +286,47 @@ func (r *Registry) RegisterCounter(name, source, help string, labels prometheus.
 	}
 	return nil
 }
+
+// GaugeReader is the structural-typed contract for an adapter-side
+// gauge-valued counter that can decrease (resets to 0 on success,
+// fluctuates with backlog, etc.). Use this for values that violate the
+// Prometheus counter monotonicity contract.
+type GaugeReader = func() int64
+
+// RegisterGauge binds a gauge metric to the Prometheus surface. Use
+// RegisterCounter for monotonically-increasing values; use RegisterGauge
+// for values that can decrease such as consecutive-EOF counters that
+// reset on a successful Recv (Copilot review CR2 on PR #21). Naming
+// convention: gauges do NOT carry the _total suffix; counters do.
+func (r *Registry) RegisterGauge(name, source, help string, labels prometheus.Labels, get GaugeReader) error {
+	if r == nil {
+		return ErrNilRegistry
+	}
+	if get == nil {
+		return fmt.Errorf("metrics: nil getter for %q", name)
+	}
+	if name == "" {
+		return errors.New("metrics: empty metric name")
+	}
+
+	merged := prometheus.Labels{}
+	if source != "" {
+		merged["source"] = source
+	}
+	for k, v := range labels {
+		merged[k] = v
+	}
+
+	g := prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name:        name,
+			Help:        help,
+			ConstLabels: merged,
+		},
+		func() float64 { return float64(get()) },
+	)
+	if err := r.reg.Register(g); err != nil {
+		return fmt.Errorf("metrics: register %s: %w", name, err)
+	}
+	return nil
+}

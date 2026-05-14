@@ -308,6 +308,55 @@ func TestRegisterCounter_NilGetterRejected(t *testing.T) {
 	}
 }
 
+// TestRegisterGauge_RendersAsGauge locks in the CR2 (Copilot review on
+// PR #21) contract: gauges have `# TYPE ... gauge`, no _total suffix,
+// and reflect the current getter value rather than monotonic history.
+// The CNI consecutive_eofs metric is the canonical use case (resets
+// to 0 on Recv success).
+func TestRegisterGauge_RendersAsGauge(t *testing.T) {
+	t.Parallel()
+	r := metrics.NewRegistry()
+	var n atomic.Int64
+	n.Store(3)
+	err := r.RegisterGauge(
+		"olaitan_sensor_cni_consecutive_eofs",
+		"network",
+		"EOFs since last successful Recv (resets on success).",
+		nil,
+		n.Load,
+	)
+	if err != nil {
+		t.Fatalf("RegisterGauge: %v", err)
+	}
+	body := scrape(t, r)
+	if !strings.Contains(body, "# TYPE olaitan_sensor_cni_consecutive_eofs gauge") {
+		t.Errorf("expected TYPE line declaring gauge, body:\n%s", body)
+	}
+	if !strings.Contains(body, `olaitan_sensor_cni_consecutive_eofs{source="network"} 3`) {
+		t.Errorf("expected initial gauge value 3, body:\n%s", body)
+	}
+
+	// Gauge decreases to 0 on the next read (mimicking ConsecutiveEOFs
+	// reset on a successful Recv). A counter could not represent this
+	// transition without violating Prometheus monotonicity.
+	n.Store(0)
+	body = scrape(t, r)
+	if !strings.Contains(body, `olaitan_sensor_cni_consecutive_eofs{source="network"} 0`) {
+		t.Errorf("expected gauge value 0 after reset, body:\n%s", body)
+	}
+}
+
+func TestRegisterGauge_NilGetterRejected(t *testing.T) {
+	t.Parallel()
+	r := metrics.NewRegistry()
+	if err := r.RegisterGauge("x", "", "h", nil, nil); err == nil {
+		t.Error("nil getter: got nil error, want rejection")
+	}
+	if err := r.RegisterGauge("", "", "h", nil, func() int64 { return 0 }); err == nil {
+		t.Error("empty name: got nil error, want rejection")
+	}
+}
+
 // scrape renders the metrics surface to text/plain via the same
 // HandlerFor path Server uses. Tests fail fast on body-read or
 // non-empty error.

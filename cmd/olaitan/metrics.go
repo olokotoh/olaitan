@@ -8,6 +8,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/olokotoh/olaitan/internal/collector/applog"
 	"github.com/olokotoh/olaitan/internal/collector/audit"
 	"github.com/olokotoh/olaitan/internal/collector/cni"
 	"github.com/olokotoh/olaitan/internal/collector/cri"
@@ -129,6 +130,10 @@ func registerAdapterCounters(reg *metrics.Registry, source string, ad adapterMet
 		// boundary). Register every bucket up front so a zero-value bucket
 		// still gets a CounterFunc; otherwise dashboards see a missing
 		// series until the first rejection arrives.
+		//
+		// Each CounterFunc reads RejectedByReasonValue (O(1) per call) so
+		// a /metrics scrape acquires six RLocks rather than allocating six
+		// fresh maps via Snapshot (Copilot review CR1 on PR #21).
 		reasons := []string{"method_not_allowed", "unsupported_media_type", "payload_too_large", "decode_error", "trailing_json", "translate_failed"}
 		for _, r := range reasons {
 			r := r
@@ -137,7 +142,7 @@ func registerAdapterCounters(reg *metrics.Registry, source string, ad adapterMet
 				source,
 				"Audit-webhook receiver events rejected at HTTP/translate boundary, bucketed by reason (Story 1.7).",
 				prometheus.Labels{"reason": r},
-				func() int64 { return int64(a.RejectedByReason()[r]) },
+				func() int64 { return int64(a.RejectedByReasonValue(r)) },
 			)
 			if err != nil {
 				return fmt.Errorf("metrics: register audit_rejected_total[%s]: %w", r, err)
@@ -175,9 +180,13 @@ func registerAdapterCounters(reg *metrics.Registry, source string, ad adapterMet
 			nil, a.OversizeDropped); err != nil {
 			return err
 		}
-		if err := reg.RegisterCounter(
+		// Registered as a gauge (not a counter) because ConsecutiveEOFs
+		// resets to 0 on every successful Recv; that violates Prometheus
+		// counter monotonicity. Gauge naming convention omits _total
+		// (Copilot review CR2 on PR #21).
+		if err := reg.RegisterGauge(
 			"olaitan_sensor_cni_consecutive_eofs", source,
-			"EOFs from Goldmane stream.Recv since the last successful Recv (Story 1.10).",
+			"EOFs from Goldmane stream.Recv since the last successful Recv; resets to 0 on success (Story 1.10).",
 			nil, a.ConsecutiveEOFs); err != nil {
 			return err
 		}
@@ -186,6 +195,38 @@ func registerAdapterCounters(reg *metrics.Registry, source string, ad adapterMet
 		// the source_healthy gauge and sensor_events_total counter are
 		// sufficient. Listed in the switch for symmetry so a future
 		// addition lands here.
+	case *applog.Adapter:
+		// Story 1.9 detail counters. Story 1.12 does NOT pass an applog
+		// Adapter into startCollectorRing's metricsSources because applog
+		// runs in a per-pod sidecar process rather than the agent pod;
+		// the registration here is the future-proofing hook for the
+		// deferred sidecar metrics surface (deferred-work W7) so the
+		// sidecar binary inherits the detail counter wiring without a
+		// second per-adapter change (Copilot review CR3 on PR #21).
+		if err := reg.RegisterCounter(
+			"olaitan_sensor_applog_translate_errors_total", source,
+			"Applog records that failed translation and were log+dropped (Story 1.9).",
+			nil, a.TranslateErrors); err != nil {
+			return err
+		}
+		if err := reg.RegisterCounter(
+			"olaitan_sensor_applog_publish_drops_total", source,
+			"Applog events whose publish attempt returned a permanent error and were dropped (Story 1.9).",
+			nil, a.PublishDrops); err != nil {
+			return err
+		}
+		if err := reg.RegisterCounter(
+			"olaitan_sensor_applog_lines_shed_total", source,
+			"LineRecords dropped due to back-pressure shedding under a stalled consumer (Story 1.9).",
+			nil, a.LinesShed); err != nil {
+			return err
+		}
+		if err := reg.RegisterCounter(
+			"olaitan_sensor_applog_lost_on_shutdown_total", source,
+			"Applog events whose publishWithRetry was cancelled mid-flight by ctx.Done (Story 1.9).",
+			nil, a.LostOnShutdown); err != nil {
+			return err
+		}
 	}
 	return nil
 }
