@@ -162,6 +162,16 @@ func TestRegisterAdapter_ConcurrentIncrementsNoDataRace(t *testing.T) {
 	}
 }
 
+// TestRegisterAllFiveAdaptersRendered is a Registry-contract test: it
+// verifies that the Registry renders olaitan_source_healthy and
+// olaitan_sensor_events_total for each of the five canonical source
+// label values when wired with a generic fakeAdapter. Production wiring
+// only registers four of these (falco, audit, runtime, network) from
+// cmd/olaitan/main.go startCollectorRing; the applog source is
+// per-pod-sidecar (cmd/olaitan/applog.go runApplogSidecar) and has no
+// production metrics surface as of Story 1.12. See Dev Notes binding
+// interpretation #8 in the story file for the rationale and the
+// deferred-work entry for the applog sidecar metrics surface.
 func TestRegisterAllFiveAdaptersRendered(t *testing.T) {
 	t.Parallel()
 	r := metrics.NewRegistry()

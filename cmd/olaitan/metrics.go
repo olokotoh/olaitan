@@ -52,7 +52,6 @@ func startMetricsServer(
 	sources map[string]adapterMetrics,
 	postureCli *posture.Client,
 ) (*metrics.Registry, error) {
-	_ = ctx // currently unused; future story may scope per-scrape contexts here.
 	if cfg == nil {
 		return nil, fmt.Errorf("metrics: nil config")
 	}
@@ -65,6 +64,14 @@ func startMetricsServer(
 	for source, ad := range sources {
 		if err := reg.RegisterAdapter(source, ad.Health(), ad.EventsTotal); err != nil {
 			return nil, fmt.Errorf("metrics: register adapter %q: %w", source, err)
+		}
+		// Register per-adapter detail counters here, before the HTTP server
+		// starts accepting scrapes. A scrape that lands between the
+		// adapter registration and the detail-counter registration would
+		// otherwise see source_healthy + sensor_events_total but missing
+		// audit_rejected, cri_translate_errors, cni_*, etc.
+		if err := registerAdapterCounters(reg, source, ad); err != nil {
+			return nil, fmt.Errorf("metrics: register detail counters %q: %w", source, err)
 		}
 	}
 
@@ -116,11 +123,13 @@ func startMetricsServer(
 func registerAdapterCounters(reg *metrics.Registry, source string, ad adapterMetrics) error {
 	switch a := ad.(type) {
 	case *audit.Adapter:
-		// Six canonical reason buckets per Story 1.7. Iterate over the
-		// current snapshot so a zero-value bucket still gets a
-		// CounterFunc (otherwise dashboards see a missing series until
-		// the first rejection arrives).
-		reasons := []string{"malformed", "missing_fields", "oversize", "unsupported_verb", "auth_failed", "decode_failed", "translate_failed"}
+		// Six canonical reason buckets per Story 1.7, mirroring the
+		// rejectedCounters type comment in internal/collector/audit/audit.go
+		// (the adapter increments exactly these keys at the HTTP/translate
+		// boundary). Register every bucket up front so a zero-value bucket
+		// still gets a CounterFunc; otherwise dashboards see a missing
+		// series until the first rejection arrives.
+		reasons := []string{"method_not_allowed", "unsupported_media_type", "payload_too_large", "decode_error", "trailing_json", "translate_failed"}
 		for _, r := range reasons {
 			r := r
 			err := reg.RegisterCounter(

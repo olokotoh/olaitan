@@ -585,23 +585,19 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 			"goldmane_addr", cniCfg.GoldmaneAddr)
 	}
 
-	// Story 1.12: Prometheus metrics surface on :9090/metrics. Bind
-	// the per-adapter source_healthy gauge + sensor_events_total
-	// counter via startMetricsServer, then layer the per-adapter
-	// detail counters via registerAdapterCounters. Posture lives in
-	// the aggregator ring, so postureCli is nil here; the disabled
-	// gauge is suppressed in the collector to avoid double-registering
-	// across the two rings (the aggregator registers it).
-	reg, merr := startMetricsServer(ctx, g, log, cfg, metricsSources, nil)
-	if merr != nil {
+	// Story 1.12: Prometheus metrics surface on :9090/metrics.
+	// startMetricsServer registers the per-adapter source_healthy gauge,
+	// sensor_events_total counter, and per-adapter detail counters in
+	// that order BEFORE the HTTP server goroutine starts accepting
+	// scrapes (Review P2: closes the scrape window where a scrape would
+	// otherwise see source_healthy without audit_rejected, cri_*, cni_*).
+	// Posture lives in the aggregator ring, so postureCli is nil here;
+	// the disabled gauge is suppressed in the collector to avoid
+	// double-registering across the two rings (the aggregator registers
+	// it).
+	if _, merr := startMetricsServer(ctx, g, log, cfg, metricsSources, nil); merr != nil {
 		closeNATS()
 		return fmt.Errorf("collector: metrics: %w", merr)
-	}
-	for source, ad := range metricsSources {
-		if err := registerAdapterCounters(reg, source, ad); err != nil {
-			closeNATS()
-			return fmt.Errorf("collector: metrics detail counters %q: %w", source, err)
-		}
 	}
 
 	log.Info("collector: ring 1 wired", "falco_socket", falcoSocket, "node", nodeName)

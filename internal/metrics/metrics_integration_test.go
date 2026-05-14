@@ -156,6 +156,22 @@ func TestIntegration_DualServerGracefulShutdown(t *testing.T) {
 // labels, and unit. promlint flags violations like missing-help-text
 // or counter-name-without-_total which would otherwise sneak past
 // unit tests that only check for substring presence.
+//
+// Substrate note: this test deliberately uses scrapeViaServer (an
+// in-process handler dispatch) rather than a real httptest.NewServer.
+// promlint is a static check on the rendered text format -- the network
+// substrate adds nothing to the lint result and would force this test
+// to bind a TCP port for no analytical gain. The other three
+// TestIntegration_* tests in this file (HealthGauge, DualServer,
+// ConcurrentScrapes) do exercise the real HTTP surface, so NFR36
+// substrate compliance is met overall. AC7 binding interpretation #9
+// in the story Dev Notes documents the carve-out (Review D2).
+//
+// Coverage note: this test registers a fake "applog" source against
+// the same Registry the production code uses. Production only wires
+// four streaming sources from startCollectorRing (falco, audit,
+// runtime, network); applog runs in a per-pod sidecar that has no
+// metrics surface as of Story 1.12. See AC1 binding interpretation #8.
 func TestIntegration_PromlintZeroProblems(t *testing.T) {
 	t.Parallel()
 

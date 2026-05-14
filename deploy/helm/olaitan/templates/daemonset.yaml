@@ -112,10 +112,15 @@ spec:
             # single source of truth for source health and event-rate
             # observability; downstream Stories 1.13/1.14/1.18 inherit
             # this exposition by registering against the same
-            # internal/metrics.Registry.
+            # internal/metrics.Registry. The if-guard mirrors the
+            # configmap.yaml pattern so a chart deploy with `--set
+            # metrics=null` fails fast at render rather than panicking
+            # on nil .Values.metrics.containerPort (Review P4).
+            {{- if .Values.metrics }}
             - name: metrics
               containerPort: {{ .Values.metrics.containerPort }}
               protocol: TCP
+            {{- end }}
             {{- if .Values.auditWebhook.enabled }}
             # Story 1.7 audit-webhook receiver port. The kube-apiserver
             # dials this port via the Service FQDN baked into the

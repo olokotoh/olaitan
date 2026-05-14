@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -204,7 +203,6 @@ func TestStartMetricsServer_PropagatesRegistrationError(t *testing.T) {
 
 	// Sanity: errgroup did not start a server on the empty-config
 	// path (no goroutines to wait on).
-	_ = errors.New
 	cancel()
 	_ = g.Wait()
 }

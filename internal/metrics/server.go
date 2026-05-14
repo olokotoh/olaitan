@@ -107,13 +107,28 @@ func (s *Server) Start(ctx context.Context) error {
 		s.mu.Lock()
 		srv := s.srv
 		s.mu.Unlock()
+		var shutdownErr error
 		if err := srv.Shutdown(shutdownCtx); err != nil {
+			// Log + return: a Shutdown timeout signals the 5s budget
+			// was insufficient (slow scrape client, deadlock). The
+			// caller's errgroup needs to see this so the pod restarts
+			// rather than silently leaving half-drained connections.
 			s.log.Error("metrics: shutdown", "err", err)
+			shutdownErr = fmt.Errorf("metrics: shutdown: %w", err)
 		}
-		<-serveErrCh
+		serveErr := <-serveErrCh
 		s.mu.Lock()
 		s.srv = nil
 		s.mu.Unlock()
+		if shutdownErr != nil {
+			return shutdownErr
+		}
+		// ErrServerClosed is the expected return from Serve after
+		// Shutdown; everything else is an actual serve-side error
+		// worth surfacing.
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			return serveErr
+		}
 		return nil
 	case err := <-serveErrCh:
 		s.mu.Lock()

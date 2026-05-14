@@ -95,10 +95,15 @@ spec:
             # Story 1.12: Prometheus metrics surface (FR8, FR50). The
             # aggregator exposes posture counters here; Story 1.14 +
             # 1.18 will register correlator and detection metrics on
-            # the same Registry.
+            # the same Registry. The if-guard mirrors the configmap.yaml
+            # pattern so a chart deploy with `--set metrics=null` fails
+            # fast at render rather than panicking on nil
+            # .Values.metrics.containerPort (Review P4).
+            {{- if .Values.metrics }}
             - name: metrics
               containerPort: {{ .Values.metrics.containerPort }}
               protocol: TCP
+            {{- end }}
           env:
             - name: NATS_URL
               value: {{ include "olaitan.endpoints.nats" . | quote }}
