@@ -13,6 +13,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
+	"github.com/olokotoh/olaitan/internal/ratelimit"
 	"github.com/olokotoh/olaitan/internal/retry"
 	"github.com/olokotoh/olaitan/internal/schema"
 	"github.com/olokotoh/olaitan/internal/sourcehealth"
@@ -94,6 +95,11 @@ type Config struct {
 	// MarkUnhealthy when staleness AND a non-EOF reader error coincide
 	// in the same window. Defaults to 30m when zero-valued.
 	StalenessTimeout time.Duration
+
+	// RateLimit is the Story 1.13 per-source per-node circuit breaker
+	// instance the consumer consults on every translated event before
+	// publish. Nil constructs a disabled fallback in New().
+	RateLimit *ratelimit.Limiter
 }
 
 // DefaultPublishRetry returns the per-publish bounded retry strategy.
@@ -166,6 +172,13 @@ type Adapter struct {
 	// via EventsTotal as the int64 snapshot.
 	eventsPublished atomic.Int64
 
+	// limiter is the Story 1.13 rate-limit circuit breaker consulted
+	// pre-publish in the consumer loop. Always non-nil after New.
+	limiter *ratelimit.Limiter
+
+	// droppedBySampling counts events dropped while engaged.
+	droppedBySampling atomic.Int64
+
 	// shed is the back-pressure shed-state tracker for the line
 	// channel. Both reader goroutines share it; the consumer drains
 	// the channel.
@@ -237,6 +250,18 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 		return nil, fmt.Errorf("applog: new: publish retry: %w", err)
 	}
 
+	limiter := cfg.RateLimit
+	if limiter == nil {
+		fallback, err := ratelimit.New(ratelimit.Options{
+			Source:  string(schema.SourceAppLog),
+			Enabled: false,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("applog: new: rate-limit fallback: %w", err)
+		}
+		limiter = fallback
+	}
+
 	a := &Adapter{
 		cfg: cfg,
 		pub: nc,
@@ -244,7 +269,8 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 		shed: newShedState(cfg.ChannelBuffer).
 			withLogger(log).
 			withStallTimeout(cfg.PublishStallTimeout),
-		nowFn: time.Now,
+		nowFn:   time.Now,
+		limiter: limiter,
 	}
 	// Default tail functions point at runFileTail with the configured
 	// paths; tests can replace either via the Adapter's exported
@@ -349,6 +375,20 @@ func (a *Adapter) EventsTotal() int64 { return a.eventsPublished.Load() }
 // downstream callers can choose the verb that matches their
 // vocabulary.
 func (a *Adapter) DroppedEvents() int64 { return a.LinesShed() }
+
+// EngagedTotal returns the cumulative count of rate-limit circuit
+// breaker engage transitions. Bound by Story 1.12's metric registry as
+// olaitan_sensor_circuit_breaker_engaged_total{source="applog", node=...}.
+func (a *Adapter) EngagedTotal() int64 { return a.limiter.EngagedTotal() }
+
+// DroppedBySampling returns the cumulative count of events the rate
+// limiter dropped while engaged.
+func (a *Adapter) DroppedBySampling() int64 { return a.droppedBySampling.Load() }
+
+// Limiter returns the rate-limit circuit breaker the adapter is wired
+// to so cmd/olaitan/main.go can mutate thresholds via Update* on
+// config reload per FR49.
+func (a *Adapter) Limiter() *ratelimit.Limiter { return a.limiter }
 
 // Run blocks until ctx is cancelled or every reader goroutine has
 // exited. The adapter owns three goroutines under an errgroup: one
@@ -478,6 +518,16 @@ func (a *Adapter) consume(ctx context.Context, lineCh <-chan LineRecord) error {
 					"stream", rec.Stream,
 					"container", rec.Container)
 				continue
+			}
+			// Story 1.13: per-source rate-limit circuit breaker.
+			d := a.limiter.Allow(ev.ID)
+			if !d.Publish {
+				a.droppedBySampling.Add(1)
+				continue
+			}
+			if d.Sampled {
+				ev.Sampled = true
+				ev.SamplingRate = d.SamplingRate
 			}
 			if perr := a.publishWithRetry(ctx, ev); perr != nil {
 				// Distinguish three failure shapes:

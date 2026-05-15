@@ -30,6 +30,7 @@ import (
 
 	"github.com/olokotoh/olaitan/internal/collector/cni/goldmanepb"
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
+	"github.com/olokotoh/olaitan/internal/ratelimit"
 	"github.com/olokotoh/olaitan/internal/retry"
 	"github.com/olokotoh/olaitan/internal/schema"
 	"github.com/olokotoh/olaitan/internal/sourcehealth"
@@ -145,6 +146,11 @@ type Config struct {
 	// every emitted Event.Pod.Node. Sourced from the K8S_NODE_NAME
 	// env var the Helm chart's downward API injects.
 	Hostname string
+
+	// RateLimit is the Story 1.13 per-source per-node circuit breaker
+	// instance the adapter consults on every translated event before
+	// publish. Nil constructs a disabled fallback in New().
+	RateLimit *ratelimit.Limiter
 }
 
 // DefaultConnectRetry returns the outer connect-loop backoff strategy
@@ -300,6 +306,13 @@ type Adapter struct {
 	// Exposed via EventsTotal as the int64 snapshot.
 	eventsPublished atomic.Int64
 
+	// limiter is the Story 1.13 rate-limit circuit breaker consulted
+	// pre-publish. Always non-nil after New.
+	limiter *ratelimit.Limiter
+
+	// droppedBySampling counts events dropped while engaged.
+	droppedBySampling atomic.Int64
+
 	// lastOversizeLog is the wall-clock time of the most recent
 	// oversize-drop ERROR log. Story 1.10 code-review patch P18
 	// rate-limits the log so a stream of oversize flows does not
@@ -420,6 +433,18 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 		return nil, fmt.Errorf("cni: new: publish retry: %w", err)
 	}
 
+	limiter := cfg.RateLimit
+	if limiter == nil {
+		fallback, err := ratelimit.New(ratelimit.Options{
+			Source:  string(schema.SourceNetwork),
+			Enabled: false,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("cni: new: rate-limit fallback: %w", err)
+		}
+		limiter = fallback
+	}
+
 	a := &Adapter{
 		cfg:         cfg,
 		pub:         nc,
@@ -427,6 +452,7 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 		dialFn:      defaultDial,
 		newClientFn: defaultNewClient,
 		nowFn:       time.Now,
+		limiter:     limiter,
 	}
 	// tlsLoaderFn defaults to the on-disk loader so the production
 	// adapter picks up cert-manager rotations without restart. Tests
@@ -475,6 +501,20 @@ func (a *Adapter) ConsecutiveEOFs() int64 { return a.consecutiveEOFs.Load() }
 // published to subjects.RawNetwork. Story 1.12 binds this via
 // prometheus.NewCounterFunc to olaitan_sensor_events_total{source="network"}.
 func (a *Adapter) EventsTotal() int64 { return a.eventsPublished.Load() }
+
+// EngagedTotal returns the cumulative count of rate-limit circuit
+// breaker engage transitions. Bound by Story 1.12's metric registry as
+// olaitan_sensor_circuit_breaker_engaged_total{source="network", node=...}.
+func (a *Adapter) EngagedTotal() int64 { return a.limiter.EngagedTotal() }
+
+// DroppedBySampling returns the cumulative count of events dropped
+// while engaged.
+func (a *Adapter) DroppedBySampling() int64 { return a.droppedBySampling.Load() }
+
+// Limiter returns the rate-limit circuit breaker the adapter is wired
+// to so cmd/olaitan/main.go can mutate thresholds via Update* on
+// config reload per FR49.
+func (a *Adapter) Limiter() *ratelimit.Limiter { return a.limiter }
 
 // Run blocks until ctx is cancelled. The connect-loop retry strategy
 // supplied via Config governs reconnect cadence on Goldmane
@@ -766,6 +806,17 @@ func (a *Adapter) connectAndStream(ctx context.Context) error {
 				"err", terr,
 				"flow_id", fr.GetId())
 			continue
+		}
+
+		// Story 1.13: per-source rate-limit circuit breaker.
+		d := a.limiter.Allow(ev.ID)
+		if !d.Publish {
+			a.droppedBySampling.Add(1)
+			continue
+		}
+		if d.Sampled {
+			ev.Sampled = true
+			ev.SamplingRate = d.SamplingRate
 		}
 
 		if perr := a.publishWithRetry(ctx, ev); perr != nil {

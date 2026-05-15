@@ -2091,3 +2091,67 @@ func TestMetricsBridgeRendersAddress(t *testing.T) {
 
 // snippet helper for the four metrics tests above is shared with the
 // posture tests; the canonical definition lives earlier in this file.
+
+// TestRateLimitDefaultsRendered asserts the production defaults
+// (enabled=true, threshold=1000, cooldown=60, sampling_rate=0.1) land
+// in the rendered olaitan-config ConfigMap when no --set overrides
+// are supplied. Story 1.13 AC4.
+func TestRateLimitDefaultsRendered(t *testing.T) {
+	rendered := helmTemplate(t, nil)
+	idx := strings.Index(rendered, "rate_limit:")
+	if idx == -1 {
+		t.Fatalf("rate_limit block missing in rendered olaitan.yaml")
+	}
+	window := rendered[idx:]
+	if end := strings.Index(window, "\nresponse:"); end > 0 {
+		window = window[:end]
+	}
+	wants := []string{
+		"enabled: true",
+		"threshold_events_per_sec: 1000",
+		"cooldown_seconds: 60",
+		"sampling_rate: 0.1",
+	}
+	for _, w := range wants {
+		if !strings.Contains(window, w) {
+			t.Errorf("rateLimit defaults: missing %q in rate_limit block; got:\n%s", w, window)
+		}
+	}
+}
+
+// TestRateLimitBridgeRendersThreshold asserts the configmap.yaml regex
+// bridge propagates a --set rateLimit.thresholdEventsPerSec override
+// into the rendered olaitan.yaml inside the olaitan-config ConfigMap.
+// Story 1.13 AC4.
+func TestRateLimitBridgeRendersThreshold(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"rateLimit.thresholdEventsPerSec=500",
+	})
+	want := "threshold_events_per_sec: 500"
+	if !strings.Contains(rendered, want) {
+		t.Errorf("rateLimit.thresholdEventsPerSec bridge: missing %q in rendered olaitan.yaml; sample:\n%s",
+			want, snippet(rendered, "threshold_events_per_sec"))
+	}
+}
+
+// TestRateLimitDisabledRendered asserts --set rateLimit.enabled=false
+// propagates as `enabled: false` in the rate_limit block of the
+// rendered olaitan.yaml. Story 1.13 AC4.
+func TestRateLimitDisabledRendered(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"rateLimit.enabled=false",
+	})
+	// Anchor on the rate_limit block specifically because plenty of
+	// other blocks also carry `enabled: true|false` lines.
+	idx := strings.Index(rendered, "rate_limit:")
+	if idx == -1 {
+		t.Fatalf("rate_limit block missing in rendered olaitan.yaml")
+	}
+	window := rendered[idx:]
+	if end := strings.Index(window, "\nresponse:"); end > 0 {
+		window = window[:end]
+	}
+	if !strings.Contains(window, "enabled: false") {
+		t.Errorf("rateLimit.enabled=false: rate_limit block does not render 'enabled: false'; got:\n%s", window)
+	}
+}

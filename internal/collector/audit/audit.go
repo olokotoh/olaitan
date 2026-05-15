@@ -20,6 +20,7 @@ import (
 	auditv1 "k8s.io/apiserver/pkg/apis/audit/v1"
 
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
+	"github.com/olokotoh/olaitan/internal/ratelimit"
 	"github.com/olokotoh/olaitan/internal/retry"
 	"github.com/olokotoh/olaitan/internal/schema"
 	"github.com/olokotoh/olaitan/internal/sourcehealth"
@@ -190,6 +191,14 @@ type Config struct {
 	// not abort an in-flight retry budget; this knob bounds the
 	// detached path so a stuck NATS does not orphan a goroutine.
 	PublishWallClockBudget time.Duration
+
+	// RateLimit is the Story 1.13 per-source per-node circuit breaker
+	// instance the adapter consults on every translated event before
+	// publish. Nil constructs a disabled fallback in New(); the
+	// production path is a non-nil pre-constructed limiter owned by
+	// cmd/olaitan/main.go so threshold/cooldown/sampling-rate edits
+	// hot-reload via the config.Manager.Subscribe callback per FR49.
+	RateLimit *ratelimit.Limiter
 }
 
 // DefaultPublishRetry returns the per-publish bounded retry strategy.
@@ -238,6 +247,18 @@ type Adapter struct {
 	eventsPublished atomic.Int64
 
 	rejected *rejectedCounters
+
+	// limiter is the Story 1.13 rate-limit circuit breaker consulted
+	// per translated event in the publish loop. Always non-nil after
+	// New (a disabled fallback is constructed when cfg.RateLimit is
+	// nil) so the hot path can avoid a nil-check.
+	limiter *ratelimit.Limiter
+
+	// droppedBySampling counts events the limiter dropped while
+	// engaged. Exposed via DroppedBySampling() for a future Story
+	// 1.18 Prometheus binding; the atomic is the single source of
+	// truth per guardrail 26.
+	droppedBySampling atomic.Int64
 
 	// nowFn is a test seam for time-dependent assertions in
 	// staleness-watchdog tests.
@@ -303,6 +324,17 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 	if len(cfg.ClientCNAllow) == 0 {
 		cfg.ClientCNAllow = append([]string(nil), defaultClientCNs...)
 	}
+	limiter := cfg.RateLimit
+	if limiter == nil {
+		fallback, err := ratelimit.New(ratelimit.Options{
+			Source:  string(schema.SourceAudit),
+			Enabled: false,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("audit: new: rate-limit fallback: %w", err)
+		}
+		limiter = fallback
+	}
 
 	return &Adapter{
 		cfg:      cfg,
@@ -310,6 +342,7 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 		log:      log,
 		nowFn:    time.Now,
 		rejected: newRejectedCounters(),
+		limiter:  limiter,
 	}, nil
 }
 
@@ -355,6 +388,27 @@ func (a *Adapter) RejectedByReason() map[string]uint64 {
 // prometheus.NewCounterFunc to olaitan_sensor_events_total{source="audit"}.
 func (a *Adapter) EventsTotal() int64 {
 	return a.eventsPublished.Load()
+}
+
+// EngagedTotal returns the cumulative count of rate-limit circuit
+// breaker engage transitions. Bound by Story 1.12's metric registry as
+// olaitan_sensor_circuit_breaker_engaged_total{source="audit", node=...}.
+func (a *Adapter) EngagedTotal() int64 {
+	return a.limiter.EngagedTotal()
+}
+
+// DroppedBySampling returns the cumulative count of events the rate
+// limiter dropped during engagement. Story 1.18 will bind this via
+// the metrics registry; the atomic remains the single source of truth.
+func (a *Adapter) DroppedBySampling() int64 {
+	return a.droppedBySampling.Load()
+}
+
+// Limiter returns the rate-limit circuit breaker the adapter is wired
+// to so cmd/olaitan/main.go's hot-reload Subscribe callback can mutate
+// thresholds without a process restart per FR49.
+func (a *Adapter) Limiter() *ratelimit.Limiter {
+	return a.limiter
 }
 
 // Run binds the receiver, starts the staleness watchdog, and blocks
@@ -643,6 +697,21 @@ func (a *Adapter) handleAudit(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		processed++
+
+		// Story 1.13: per-source rate-limit circuit breaker. Engagement
+		// is per-source; one engagement covers every in-flight batch
+		// event. The limiter is called per emitted event (not per HTTP
+		// batch) so the engage transition is observed at event-rate
+		// granularity, not batch-rate.
+		d := a.limiter.Allow(schemaEv.ID)
+		if !d.Publish {
+			a.droppedBySampling.Add(1)
+			continue
+		}
+		if d.Sampled {
+			schemaEv.Sampled = true
+			schemaEv.SamplingRate = d.SamplingRate
+		}
 
 		if perr := a.publishWithRetry(publishCtx, schemaEv); perr != nil {
 			if isPermanentPublishError(perr) {

@@ -7,6 +7,7 @@ import (
 
 	natsjs "github.com/nats-io/nats.go/jetstream"
 
+	"github.com/olokotoh/olaitan/internal/ratelimit"
 	"github.com/olokotoh/olaitan/internal/retry"
 )
 
@@ -111,5 +112,48 @@ func TestEventsTotal_IncrementsOnPublishSuccess(t *testing.T) {
 	a.eventsPublished.Add(3)
 	if got := a.EventsTotal(); got != 3 {
 		t.Errorf("EventsTotal after Add(3): got %d, want 3", got)
+	}
+}
+
+func TestNew_RateLimitFallbackDisabledWhenNil(t *testing.T) {
+	a, err := New(Config{Endpoint: "unix:///x", Hostname: "node"}, stubPub{}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if a.limiter == nil {
+		t.Fatal("New: limiter is nil despite RateLimit being unset")
+	}
+	if a.limiter.Enabled() {
+		t.Error("New: fallback limiter should be disabled when cfg.RateLimit is nil")
+	}
+	if a.EngagedTotal() != 0 {
+		t.Errorf("EngagedTotal on fresh Adapter: got %d, want 0", a.EngagedTotal())
+	}
+}
+
+func TestNew_PreservesCallerSuppliedLimiter(t *testing.T) {
+	lim, err := ratelimit.New(ratelimit.Options{
+		Source: "falco", Node: "node-a", Enabled: true,
+		Threshold: 1000, Cooldown: time.Minute, SamplingRate: 0.1,
+	})
+	if err != nil {
+		t.Fatalf("ratelimit.New: %v", err)
+	}
+	a, err := New(Config{Endpoint: "unix:///x", Hostname: "node", RateLimit: lim}, stubPub{}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if a.Limiter() != lim {
+		t.Errorf("Limiter(): got %p, want %p", a.Limiter(), lim)
+	}
+}
+
+func TestDroppedBySampling_ZeroOnConstruct(t *testing.T) {
+	a, err := New(Config{Endpoint: "unix:///x", Hostname: "node"}, stubPub{}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got := a.DroppedBySampling(); got != 0 {
+		t.Errorf("DroppedBySampling on fresh Adapter: got %d, want 0", got)
 	}
 }
