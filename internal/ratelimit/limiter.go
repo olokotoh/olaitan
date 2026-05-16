@@ -457,14 +457,12 @@ func (l *Limiter) Allow(eventID string) Decision {
 		return Decision{Publish: true, Sampled: false, SamplingRate: 1.0}
 	}
 
-	bound := int(samplingRate * 100)
-	if bound < 0 {
-		bound = 0
+	const samplingScale = 1_000_000
+	bound := uint64(math.Ceil(samplingRate * samplingScale))
+	if bound > samplingScale {
+		bound = samplingScale
 	}
-	if bound > 100 {
-		bound = 100
-	}
-	if int(hashEventID(eventID)%100) < bound {
+	if hashEventID(eventID)%samplingScale < bound {
 		return Decision{Publish: true, Sampled: true, SamplingRate: samplingRate}
 	}
 	return Decision{Publish: false, Sampled: false, SamplingRate: samplingRate}

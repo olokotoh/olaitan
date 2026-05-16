@@ -125,6 +125,14 @@ spec:
               value: {{ .Values.applogSidecar.publishStallTimeout | quote }}
             - name: OLAITAN_WEBHOOK_SIDECAR_STALENESS_TIMEOUT
               value: {{ .Values.applogSidecar.stalenessTimeout | quote }}
+            - name: OLAITAN_WEBHOOK_RATE_LIMIT_ENABLED
+              value: {{ .Values.rateLimit.enabled | quote }}
+            - name: OLAITAN_WEBHOOK_RATE_LIMIT_THRESHOLD_EVENTS_PER_SEC
+              value: {{ .Values.rateLimit.thresholdEventsPerSec | quote }}
+            - name: OLAITAN_WEBHOOK_RATE_LIMIT_COOLDOWN_SECONDS
+              value: {{ .Values.rateLimit.cooldownSeconds | quote }}
+            - name: OLAITAN_WEBHOOK_RATE_LIMIT_SAMPLING_RATE
+              value: {{ .Values.rateLimit.samplingRate | quote }}
           volumeMounts:
             - name: tls
               mountPath: /etc/olaitan/tls

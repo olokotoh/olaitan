@@ -351,6 +351,39 @@ func TestAllow_SampledFractionWithinTolerance(t *testing.T) {
 	}
 }
 
+func TestAllow_FractionalSamplingBelowOnePercent(t *testing.T) {
+	clock := newFakeClock(origin)
+	l := newTestLimiter(t, clock, nil, func(o *Options) {
+		o.Threshold = 1
+		o.SamplingRate = 0.005
+	})
+
+	// Cross the tiny threshold so subsequent events exercise the
+	// engaged sampling path.
+	l.Allow("bootstrap-0")
+	l.Allow("bootstrap-1")
+	if !l.IsEngaged() {
+		t.Fatal("limiter not engaged before fractional sampling test")
+	}
+
+	var sampled, dropped int
+	for i := 0; i < 10000; i++ {
+		d := l.Allow(fmt.Sprintf("fractional-%d", i))
+		switch {
+		case d.Publish && d.Sampled:
+			sampled++
+		case !d.Publish:
+			dropped++
+		}
+	}
+	if sampled == 0 {
+		t.Fatalf("sampling rate below 1 percent published no events; dropped=%d", dropped)
+	}
+	if sampled < 20 || sampled > 80 {
+		t.Fatalf("sampled fraction for 0.5%% rate: got %d/10000, want roughly 20..80", sampled)
+	}
+}
+
 func TestAllow_SamplingDeterministic(t *testing.T) {
 	run := func() []bool {
 		clock := newFakeClock(origin)
