@@ -590,3 +590,76 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+// TestEventSampledOmitemptyBackwardsCompatible locks in the Story 1.13
+// invariant that an unsampled event's JSON wire form is byte-identical
+// to the pre-1.13 form. Both Sampled (bool zero) and SamplingRate
+// (float64 zero) carry json:"omitempty" tags so the additive schema
+// change does not eat into the EVENTS_RAW MaxMsgSize budget for the
+// steady-state case.
+func TestEventSampledOmitemptyBackwardsCompatible(t *testing.T) {
+	ev := Event{
+		ID:        "01ABCDEF-1234-7890-ABCD-1234567890AB",
+		Timestamp: time.Date(2026, 5, 15, 10, 0, 0, 0, time.UTC),
+		Source:    SourceFalco,
+		Pod:       PodRef{Name: "p", Namespace: "ns", UID: "u"},
+		Category:  CategorySyscall,
+		Summary:   "test",
+	}
+	data, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got := string(data)
+	if contains(got, "\"sampled\"") {
+		t.Errorf("zero-value Sampled rendered: %s", got)
+	}
+	if contains(got, "\"sampling_rate\"") {
+		t.Errorf("zero-value SamplingRate rendered: %s", got)
+	}
+}
+
+// TestEventSampledExplicitlySet confirms Sampled=true with a non-zero
+// SamplingRate marshals both keys; the Sampled field is included even
+// at boolean true so dashboards can detect the engagement boundary.
+func TestEventSampledExplicitlySet(t *testing.T) {
+	ev := Event{
+		ID:           "01ABCDEF-1234-7890-ABCD-1234567890AB",
+		Timestamp:    time.Date(2026, 5, 15, 10, 0, 0, 0, time.UTC),
+		Source:       SourceFalco,
+		Pod:          PodRef{Name: "p", Namespace: "ns", UID: "u"},
+		Category:     CategorySyscall,
+		Summary:      "test",
+		Sampled:      true,
+		SamplingRate: 0.1,
+	}
+	data, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got := string(data)
+	if !contains(got, "\"sampled\":true") {
+		t.Errorf("Sampled=true not rendered: %s", got)
+	}
+	if !contains(got, "\"sampling_rate\":0.1") {
+		t.Errorf("SamplingRate=0.1 not rendered: %s", got)
+	}
+}
+
+// TestEventPre113WireFormUnmarshals confirms a JSON payload produced
+// before Story 1.13 (no sampled/sampling_rate keys) unmarshals cleanly
+// with Sampled=false and SamplingRate=0.0; the unknown-fields decoder
+// does not reject the absence of the new keys.
+func TestEventPre113WireFormUnmarshals(t *testing.T) {
+	pre := `{"id":"01A","timestamp":"2026-05-15T10:00:00Z","source":"falco","pod":{"name":"p","namespace":"ns","uid":"u"},"category":"syscall","summary":"test"}`
+	var ev Event
+	if err := json.Unmarshal([]byte(pre), &ev); err != nil {
+		t.Fatalf("unmarshal pre-1.13 form: %v", err)
+	}
+	if ev.Sampled {
+		t.Errorf("Sampled: got true, want false")
+	}
+	if ev.SamplingRate != 0.0 {
+		t.Errorf("SamplingRate: got %v, want 0.0", ev.SamplingRate)
+	}
+}

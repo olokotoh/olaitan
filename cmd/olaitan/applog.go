@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"github.com/olokotoh/olaitan/internal/admission/applog"
 	collectorapplog "github.com/olokotoh/olaitan/internal/collector/applog"
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
+	"github.com/olokotoh/olaitan/internal/ratelimit"
 	"github.com/olokotoh/olaitan/internal/schema"
 )
 
@@ -46,6 +48,10 @@ import (
 //   - OLAITAN_APPLOG_STDERR_PATH   default /var/log/app/stderr.log
 //   - OLAITAN_APPLOG_CHANNEL_BUFFER  default 1024
 //   - OLAITAN_APPLOG_STALENESS_TIMEOUT  default 30m
+//   - OLAITAN_RATE_LIMIT_ENABLED   default true
+//   - OLAITAN_RATE_LIMIT_THRESHOLD_EVENTS_PER_SEC  default 1000
+//   - OLAITAN_RATE_LIMIT_COOLDOWN_SECONDS  default 60
+//   - OLAITAN_RATE_LIMIT_SAMPLING_RATE  default 0.1
 //
 // The sidecar exits with code 0 on graceful SIGTERM (kubelet
 // terminating the workload pod) or on a panic recovered by the
@@ -117,6 +123,12 @@ func runApplogSidecar(ctx context.Context, args []string, stderr io.Writer) int 
 		}
 		cfg.StalenessTimeout = d
 	}
+	limiter, err := buildAppLogRateLimiter(log)
+	if err != nil {
+		log.Error("startup: applog rate-limit", "err", err)
+		return 1
+	}
+	cfg.RateLimit = limiter
 
 	natsCfg := natsclient.DefaultConfig()
 	natsCfg.URL = os.Getenv("NATS_URL")
@@ -152,6 +164,35 @@ func runApplogSidecar(ctx context.Context, args []string, stderr io.Writer) int 
 	}
 	log.Info("applog-sidecar: graceful shutdown")
 	return 0
+}
+
+func buildAppLogRateLimiter(log *slog.Logger) (*ratelimit.Limiter, error) {
+	enabled, err := getenvBoolDefault("OLAITAN_RATE_LIMIT_ENABLED", true)
+	if err != nil {
+		return nil, err
+	}
+	threshold, err := getenvIntDefault("OLAITAN_RATE_LIMIT_THRESHOLD_EVENTS_PER_SEC", ratelimit.DefaultThreshold)
+	if err != nil {
+		return nil, err
+	}
+	cooldownSeconds, err := getenvIntDefault("OLAITAN_RATE_LIMIT_COOLDOWN_SECONDS", int(ratelimit.DefaultCooldown/time.Second))
+	if err != nil {
+		return nil, err
+	}
+	samplingRate, err := getenvFloatDefault("OLAITAN_RATE_LIMIT_SAMPLING_RATE", ratelimit.DefaultSamplingRate)
+	if err != nil {
+		return nil, err
+	}
+
+	return ratelimit.New(ratelimit.Options{
+		Source:       string(schema.SourceAppLog),
+		Node:         os.Getenv("K8S_NODE_NAME"),
+		Enabled:      enabled,
+		Threshold:    threshold,
+		Cooldown:     time.Duration(cooldownSeconds) * time.Second,
+		SamplingRate: samplingRate,
+		OnTransition: makeRateLimitTransitionLogger(log),
+	})
 }
 
 // runApplogWebhook is the cmd/olaitan applog-webhook entry-point. The
@@ -232,6 +273,10 @@ func runApplogWebhook(ctx context.Context, args []string, stderr io.Writer) int 
 		SidecarMaxLineBytes:        os.Getenv("OLAITAN_WEBHOOK_SIDECAR_MAX_LINE_BYTES"),
 		SidecarPublishStallTimeout: os.Getenv("OLAITAN_WEBHOOK_SIDECAR_PUBLISH_STALL_TIMEOUT"),
 		SidecarStalenessTimeout:    os.Getenv("OLAITAN_WEBHOOK_SIDECAR_STALENESS_TIMEOUT"),
+		SidecarRateLimitEnabled:    os.Getenv("OLAITAN_WEBHOOK_RATE_LIMIT_ENABLED"),
+		SidecarRateLimitThreshold:  os.Getenv("OLAITAN_WEBHOOK_RATE_LIMIT_THRESHOLD_EVENTS_PER_SEC"),
+		SidecarRateLimitCooldown:   os.Getenv("OLAITAN_WEBHOOK_RATE_LIMIT_COOLDOWN_SECONDS"),
+		SidecarRateLimitSampling:   os.Getenv("OLAITAN_WEBHOOK_RATE_LIMIT_SAMPLING_RATE"),
 	}
 
 	srv, err := applog.NewWebhook(cfg, log)
@@ -258,6 +303,45 @@ func getenvDefault(name, def string) string {
 		return v
 	}
 	return def
+}
+
+func getenvBoolDefault(name string, def bool) (bool, error) {
+	v := os.Getenv(name)
+	if v == "" {
+		return def, nil
+	}
+	switch strings.ToLower(v) {
+	case "true", "1", "yes":
+		return true, nil
+	case "false", "0", "no":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s must be a boolean (got %q)", name, v)
+	}
+}
+
+func getenvIntDefault(name string, def int) (int, error) {
+	v := os.Getenv(name)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer (got %q): %w", name, v, err)
+	}
+	return n, nil
+}
+
+func getenvFloatDefault(name string, def float64) (float64, error) {
+	v := os.Getenv(name)
+	if v == "" {
+		return def, nil
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a float (got %q): %w", name, v, err)
+	}
+	return f, nil
 }
 
 // parseLabelsFromEnv reads pod labels from a downward-API projected

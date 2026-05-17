@@ -59,6 +59,7 @@ import (
 
 	"github.com/olokotoh/olaitan/internal/collector/falco/falcopb"
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
+	"github.com/olokotoh/olaitan/internal/ratelimit"
 	"github.com/olokotoh/olaitan/internal/retry"
 	"github.com/olokotoh/olaitan/internal/schema"
 	"github.com/olokotoh/olaitan/internal/sourcehealth"
@@ -101,6 +102,16 @@ type Config struct {
 	// emitting during the recovery window. Defaults to
 	// DefaultPublishRetry() when zero-valued.
 	PublishRetry retry.Strategy
+
+	// RateLimit is the Story 1.13 per-source per-node circuit breaker
+	// instance the adapter consults on every successful Recv before
+	// publish. Nil means a disabled fallback limiter is constructed in
+	// New(); a non-nil pre-constructed Limiter is the production path
+	// (main.go owns construction so the OnTransition callback can
+	// carry the source-aware slog logger and the hot-reload Subscribe
+	// callback can mutate the limiter's thresholds without a process
+	// restart per FR49).
+	RateLimit *ratelimit.Limiter
 }
 
 // DefaultRetry returns the connect-loop backoff strategy used by the
@@ -158,6 +169,18 @@ type Adapter struct {
 	// writeable counter; this atomic is the single source of truth.
 	eventsPublished atomic.Int64
 
+	// limiter is the Story 1.13 rate-limit circuit breaker consulted
+	// on the pre-publish path. Always non-nil after New (a disabled
+	// fallback is constructed when cfg.RateLimit is nil) so the Allow
+	// hot path can avoid a nil-check.
+	limiter *ratelimit.Limiter
+
+	// droppedBySampling counts events that the limiter elected to
+	// drop while engaged. Exposed via DroppedBySampling() as a future
+	// Prometheus counter (Story 1.18); the atomic is the single
+	// source of truth per guardrail 26.
+	droppedBySampling atomic.Int64
+
 	// dialFn is a test seam: the production grpc.NewClient cannot be
 	// pointed at a bufconn dialer through public API alone. Tests
 	// override this; production callers leave it nil and the default
@@ -204,12 +227,24 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 	if err := cfg.PublishRetry.Validate(); err != nil {
 		return nil, fmt.Errorf("falco: new: publish retry: %w", err)
 	}
+	limiter := cfg.RateLimit
+	if limiter == nil {
+		fallback, err := ratelimit.New(ratelimit.Options{
+			Source:  string(schema.SourceFalco),
+			Enabled: false,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("falco: new: rate-limit fallback: %w", err)
+		}
+		limiter = fallback
+	}
 	return &Adapter{
 		cfg:         cfg,
 		pub:         nc,
 		log:         log,
 		dialFn:      defaultDial,
 		newClientFn: falcopb.NewServiceClient,
+		limiter:     limiter,
 	}, nil
 }
 
@@ -230,6 +265,32 @@ func (a *Adapter) Health() sourcehealth.Reader {
 // layer a pure reader (guardrail 26).
 func (a *Adapter) EventsTotal() int64 {
 	return a.eventsPublished.Load()
+}
+
+// EngagedTotal returns the cumulative count of rate-limit circuit
+// breaker engage transitions. Story 1.12's metrics.Registry.RegisterCounter
+// reads this via prometheus.NewCounterFunc to bind
+// olaitan_sensor_circuit_breaker_engaged_total{source="falco", node=...}.
+// Re-engage-during-cooldown is treated as a continuous engagement and
+// does not advance the counter (guardrail 29).
+func (a *Adapter) EngagedTotal() int64 {
+	return a.limiter.EngagedTotal()
+}
+
+// DroppedBySampling returns the cumulative count of events the
+// limiter dropped during engagement. Story 1.18 will bind this via
+// prometheus.NewCounterFunc; the atomic is the single source of
+// truth (guardrail 26).
+func (a *Adapter) DroppedBySampling() int64 {
+	return a.droppedBySampling.Load()
+}
+
+// Limiter returns the rate-limit circuit breaker the adapter is
+// wired to. Used by cmd/olaitan/main.go's config.Manager.Subscribe
+// callback to push thresholds and sampling-rate changes through the
+// limiter's Update* mutators without a process restart per FR49.
+func (a *Adapter) Limiter() *ratelimit.Limiter {
+	return a.limiter
 }
 
 // Run blocks until ctx is cancelled. The retry strategy supplied via
@@ -378,6 +439,22 @@ func (a *Adapter) connectAndConsume(ctx context.Context) error {
 			a.log.Warn("falco: translate skipped malformed message",
 				"err", err, "rule", resp.GetRule())
 			continue
+		}
+
+		// Story 1.13: per-source rate-limit circuit breaker. When the
+		// breaker is engaged the limiter rolls FNV-1a(ev.ID) mod 100
+		// against the current sampling rate; events that lose the roll
+		// are dropped (counter incremented for Story 1.18 visibility),
+		// events that win are annotated so the downstream correlator
+		// and DFIR report writer can disclose the degradation honestly.
+		d := a.limiter.Allow(ev.ID)
+		if !d.Publish {
+			a.droppedBySampling.Add(1)
+			continue
+		}
+		if d.Sampled {
+			ev.Sampled = true
+			ev.SamplingRate = d.SamplingRate
 		}
 
 		if err := a.publishWithRetry(ctx, ev); err != nil {

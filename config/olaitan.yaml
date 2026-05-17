@@ -103,6 +103,20 @@ detection:
 metrics:
   address: ":9090"
 
+# Story 1.13: per-source per-node rate-limit circuit breaker (FR51
+# sensing half; NFR22). Engages above threshold_events_per_sec and
+# switches to deterministic hash-based sampling at sampling_rate;
+# surviving events carry Sampled=true so downstream consumers (Story
+# 1.14 correlator, Story 1.18 detection observability, Story 4.x DFIR
+# report writer) can honestly disclose degradation. The four knobs are
+# Helm-tunable and hot-reload via the config.Manager.Subscribe callback
+# per FR49.
+rate_limit:
+  enabled: true
+  threshold_events_per_sec: 1000
+  cooldown_seconds: 60
+  sampling_rate: 0.1
+
 response:
   excluded_namespaces:
     - kube-system

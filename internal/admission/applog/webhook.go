@@ -152,6 +152,14 @@ type WebhookConfig struct {
 	// threshold. Empty falls back to the adapter default (30 m). Go
 	// time.Duration string.
 	SidecarStalenessTimeout string
+
+	// SidecarRateLimit* forwards the cluster-wide Story 1.13
+	// rate-limit knobs into injected applog sidecars. Empty values
+	// fall back to the sidecar's compiled defaults.
+	SidecarRateLimitEnabled   string
+	SidecarRateLimitThreshold string
+	SidecarRateLimitCooldown  string
+	SidecarRateLimitSampling  string
 }
 
 // Webhook is the HTTPS admission server.
@@ -473,6 +481,10 @@ func (w *Webhook) review(review *admissionv1.AdmissionReview) *admissionv1.Admis
 		SidecarMaxLineBytes:        w.cfg.SidecarMaxLineBytes,
 		SidecarPublishStallTimeout: w.cfg.SidecarPublishStallTimeout,
 		SidecarStalenessTimeout:    w.cfg.SidecarStalenessTimeout,
+		SidecarRateLimitEnabled:    w.cfg.SidecarRateLimitEnabled,
+		SidecarRateLimitThreshold:  w.cfg.SidecarRateLimitThreshold,
+		SidecarRateLimitCooldown:   w.cfg.SidecarRateLimitCooldown,
+		SidecarRateLimitSampling:   w.cfg.SidecarRateLimitSampling,
 	})
 	if err != nil {
 		w.log.Warn("applog/webhook: inject", "err", err)

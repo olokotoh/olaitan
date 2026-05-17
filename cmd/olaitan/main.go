@@ -42,6 +42,7 @@ import (
 	"github.com/olokotoh/olaitan/internal/config"
 	"github.com/olokotoh/olaitan/internal/health"
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
+	"github.com/olokotoh/olaitan/internal/ratelimit"
 	"github.com/olokotoh/olaitan/internal/retry"
 	"github.com/olokotoh/olaitan/internal/schema"
 )
@@ -189,7 +190,7 @@ func runRingCtx(ctx context.Context, ring string, args []string, stderr io.Write
 	// The aggregator subcommand's wiring lands in Epic 2.
 	switch ring {
 	case "collector":
-		if err := startCollectorRing(gctx, g, log, mgr.Get()); err != nil {
+		if err := startCollectorRing(gctx, g, log, mgr.Get(), mgr.Subscribe); err != nil {
 			log.Error("startup: collector ring wiring", "err", err)
 			// Cancel ringCtx (the parent of gctx) so the health server
 			// and any goroutines already registered on g unblock; then
@@ -360,7 +361,7 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	// surface exists so the posture counters (or the posture_disabled
 	// gauge) can be scraped, and so future aggregator-side adapters
 	// inherit the wiring.
-	if _, merr := startMetricsServer(ctx, g, log, cfg, nil, client); merr != nil {
+	if _, merr := startMetricsServer(ctx, g, log, cfg, "", nil, client); merr != nil {
 		return fmt.Errorf("aggregator: metrics: %w", merr)
 	}
 
@@ -384,7 +385,13 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 // The audit-webhook adapter is gated on cfg.Detection.Sources.Audit.
 // Enabled, so a chart deploy with the default
 // auditWebhook.enabled=false leaves the receiver dormant.
-func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger, cfg *config.Config) error {
+//
+// subscribe is the config.Manager.Subscribe entry point; the ring
+// registers a callback against it so a `helm upgrade --set
+// rateLimit.thresholdEventsPerSec=500` propagates per-adapter rate-limit
+// updates without a process restart per FR49 (Story 1.13). Tests pass
+// nil to skip the subscription wiring.
+func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger, cfg *config.Config, subscribe func(func(*config.Config))) error {
 	natsURL := os.Getenv("NATS_URL")
 	if natsURL == "" {
 		return errors.New("collector: NATS_URL env var is empty (set by Helm chart)")
@@ -405,6 +412,36 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 	// interpretation: AC1's "network_flow" enumerand is overridden to
 	// "network" to match the existing schema.SourceNetwork constant).
 	metricsSources := map[string]adapterMetrics{}
+
+	// Story 1.13: per-source per-node rate-limit limiters. Constructed
+	// once per source from the current cfg.RateLimit; each adapter is
+	// handed a pointer to its limiter via the Config struct so the
+	// hot-reload Subscribe callback below can mutate threshold /
+	// cooldown / sampling-rate values without a process restart.
+	rateLimiters := map[string]*ratelimit.Limiter{}
+	buildLimiter := func(source string) (*ratelimit.Limiter, error) {
+		return ratelimit.New(ratelimit.Options{
+			Source:       source,
+			Node:         nodeName,
+			Enabled:      cfg.RateLimit.EnabledOrDefault(),
+			Threshold:    cfg.RateLimit.ThresholdEventsPerSec,
+			Cooldown:     time.Duration(cfg.RateLimit.CooldownSeconds) * time.Second,
+			SamplingRate: cfg.RateLimit.SamplingRate,
+			OnTransition: makeRateLimitTransitionLogger(log),
+		})
+	}
+	for _, source := range []string{
+		string(schema.SourceFalco),
+		string(schema.SourceAudit),
+		string(schema.SourceRuntime),
+		string(schema.SourceNetwork),
+	} {
+		l, err := buildLimiter(source)
+		if err != nil {
+			return fmt.Errorf("collector: rate-limit %s: %w", source, err)
+		}
+		rateLimiters[source] = l
+	}
 
 	natsCfg := natsclient.DefaultConfig()
 	natsCfg.URL = natsURL
@@ -436,8 +473,9 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 	}
 
 	adapter, err := falco.New(falco.Config{
-		Endpoint: falcoSocket,
-		Hostname: nodeName,
+		Endpoint:  falcoSocket,
+		Hostname:  nodeName,
+		RateLimit: rateLimiters[string(schema.SourceFalco)],
 	}, nc, log)
 	if err != nil {
 		closeNATS()
@@ -489,6 +527,7 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 			MaxPayloadBytes:  cfg.Detection.Sources.Audit.MaxPayloadBytes,
 			StalenessTimeout: cfg.Detection.Sources.Audit.StalenessTimeout.Duration(),
 			PublishRetry:     toRetryStrategy(cfg.Detection.Sources.Audit.PublishRetry),
+			RateLimit:        rateLimiters[string(schema.SourceAudit)],
 		}
 		auditAdapter, aerr := audit.New(auditCfg, nc, log)
 		if aerr != nil {
@@ -520,6 +559,7 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 			StalenessTimeout: cfg.Detection.Sources.Containerd.StalenessTimeout.Duration(),
 			ConnectRetry:     toRetryStrategy(cfg.Detection.Sources.Containerd.ConnectRetry),
 			PublishRetry:     toRetryStrategy(cfg.Detection.Sources.Containerd.PublishRetry),
+			RateLimit:        rateLimiters[string(schema.SourceRuntime)],
 		}
 		criAdapter, cerr := cri.New(criCfg, nc, log)
 		if cerr != nil {
@@ -565,6 +605,7 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 			StartTimeGte:        cfg.Detection.Sources.Calico.StartTimeGte,
 			AggregationInterval: cfg.Detection.Sources.Calico.AggregationInterval,
 			Hostname:            nodeName,
+			RateLimit:           rateLimiters[string(schema.SourceNetwork)],
 		}
 		cniAdapter, nerr := cni.New(cniCfg, nc, log)
 		if nerr != nil {
@@ -595,13 +636,85 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 	// the disabled gauge is suppressed in the collector to avoid
 	// double-registering across the two rings (the aggregator registers
 	// it).
-	if _, merr := startMetricsServer(ctx, g, log, cfg, metricsSources, nil); merr != nil {
+	if _, merr := startMetricsServer(ctx, g, log, cfg, nodeName, metricsSources, nil); merr != nil {
 		closeNATS()
 		return fmt.Errorf("collector: metrics: %w", merr)
 	}
 
-	log.Info("collector: ring 1 wired", "falco_socket", falcoSocket, "node", nodeName)
+	// Story 1.13: hot-reload rate-limit knobs via config.Manager.
+	// Subscribe per FR49. The callback runs synchronously on the
+	// watcher goroutine; Limiter.Update* is atomic so steady-state
+	// traffic is not paused by the threshold swap. subscribe may be
+	// nil in tests that bypass the Manager.
+	if subscribe != nil {
+		subscribe(func(newCfg *config.Config) {
+			if newCfg == nil {
+				return
+			}
+			applyRateLimitReload(log, rateLimiters, newCfg.RateLimit)
+		})
+	}
+
+	log.Info("collector: ring 1 wired",
+		"falco_socket", falcoSocket,
+		"node", nodeName,
+		"rate_limit_enabled", cfg.RateLimit.EnabledOrDefault(),
+		"rate_limit_threshold", cfg.RateLimit.ThresholdEventsPerSec,
+		"rate_limit_cooldown", cfg.RateLimit.CooldownSeconds,
+		"rate_limit_sampling", cfg.RateLimit.SamplingRate,
+	)
 	return nil
+}
+
+// makeRateLimitTransitionLogger returns the OnTransition callback every
+// rate-limit limiter is constructed with. The callback emits a single
+// info-level structured log line per engage/disengage transition per
+// guardrail 29 (sustained engagement does not log; only the edges do).
+func makeRateLimitTransitionLogger(log *slog.Logger) ratelimit.TransitionFn {
+	return func(tr ratelimit.Transition) {
+		if tr.Engaged {
+			log.Info("rate_limit: engaged",
+				"source", tr.Source,
+				"node", tr.Node,
+				"events_per_second", tr.EventsPerSecond,
+				"threshold", tr.Threshold,
+				"sampling_rate", tr.SamplingRate,
+			)
+			return
+		}
+		log.Info("rate_limit: disengaged",
+			"source", tr.Source,
+			"node", tr.Node,
+			"engaged_for_seconds", tr.EngagedFor.Seconds(),
+		)
+	}
+}
+
+// applyRateLimitReload pushes the four rate-limit knobs from a freshly
+// loaded RateLimitConfig into every adapter's *ratelimit.Limiter. Each
+// Update* call is atomic (config.Manager guarantees Validate ran before
+// the callback fires), so the hot path is never paused during the swap.
+// Per-knob failures (which would only happen if Validate is bypassed)
+// are logged at warn level without aborting the rest of the reload.
+func applyRateLimitReload(log *slog.Logger, limiters map[string]*ratelimit.Limiter, rl config.RateLimitConfig) {
+	for source, l := range limiters {
+		if err := l.UpdateThreshold(rl.ThresholdEventsPerSec); err != nil {
+			log.Warn("rate_limit: reload threshold rejected", "source", source, "err", err)
+		}
+		if err := l.UpdateCooldown(time.Duration(rl.CooldownSeconds) * time.Second); err != nil {
+			log.Warn("rate_limit: reload cooldown rejected", "source", source, "err", err)
+		}
+		if err := l.UpdateSamplingRate(rl.SamplingRate); err != nil {
+			log.Warn("rate_limit: reload sampling_rate rejected", "source", source, "err", err)
+		}
+		l.UpdateEnabled(rl.EnabledOrDefault())
+	}
+	log.Info("rate_limit: hot-reload applied",
+		"enabled", rl.EnabledOrDefault(),
+		"threshold", rl.ThresholdEventsPerSec,
+		"cooldown", rl.CooldownSeconds,
+		"sampling_rate", rl.SamplingRate,
+	)
 }
 
 // toRetryStrategy materialises the YAML-shaped RetryStrategyConfig as

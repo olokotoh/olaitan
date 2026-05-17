@@ -19,10 +19,12 @@ import (
 type fakeAdapter struct {
 	tracker sourcehealth.Tracker
 	events  atomic.Int64
+	engaged atomic.Int64
 }
 
 func (f *fakeAdapter) Health() sourcehealth.Reader { return &f.tracker }
 func (f *fakeAdapter) EventsTotal() int64          { return f.events.Load() }
+func (f *fakeAdapter) EngagedTotal() int64         { return f.engaged.Load() }
 
 func quietTestLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -31,7 +33,7 @@ func quietTestLogger() *slog.Logger {
 func TestStartMetricsServer_NilConfigRejected(t *testing.T) {
 	t.Parallel()
 	g, _ := errgroup.WithContext(context.Background())
-	if _, err := startMetricsServer(context.Background(), g, quietTestLogger(), nil, nil, nil); err == nil {
+	if _, err := startMetricsServer(context.Background(), g, quietTestLogger(), nil, "node", nil, nil); err == nil {
 		t.Error("nil config: got nil error, want rejection")
 	}
 }
@@ -40,7 +42,7 @@ func TestStartMetricsServer_EmptyAddressRejected(t *testing.T) {
 	t.Parallel()
 	cfg := &config.Config{Metrics: config.MetricsConfig{Address: ""}}
 	g, _ := errgroup.WithContext(context.Background())
-	if _, err := startMetricsServer(context.Background(), g, quietTestLogger(), cfg, nil, nil); err == nil {
+	if _, err := startMetricsServer(context.Background(), g, quietTestLogger(), cfg, "node", nil, nil); err == nil {
 		t.Error("empty address: got nil error, want rejection")
 	}
 }
@@ -63,7 +65,7 @@ func TestStartMetricsServer_RegistersStreamingAdapters(t *testing.T) {
 		"audit": a2,
 	}
 
-	reg, err := startMetricsServer(gctx, g, quietTestLogger(), cfg, sources, nil)
+	reg, err := startMetricsServer(gctx, g, quietTestLogger(), cfg, "node-a", sources, nil)
 	if err != nil {
 		t.Fatalf("startMetricsServer: %v", err)
 	}
@@ -84,6 +86,7 @@ func TestStartMetricsServer_RegistersStreamingAdapters(t *testing.T) {
 	wantNames := []string{
 		"olaitan_source_healthy",
 		"olaitan_sensor_events_total",
+		"olaitan_sensor_circuit_breaker_engaged_total",
 		"olaitan_sensor_posture_disabled", // posture disabled by default in cfg
 	}
 	for _, n := range wantNames {
@@ -105,7 +108,7 @@ func TestStartMetricsServer_PostureDisabledGaugeRegistered(t *testing.T) {
 	cfg := &config.Config{Metrics: config.MetricsConfig{Address: "127.0.0.1:0"}}
 	// Posture disabled (default), so posture_disabled gauge appears
 	// rather than the six counters.
-	reg, err := startMetricsServer(gctx, g, quietTestLogger(), cfg, nil, nil)
+	reg, err := startMetricsServer(gctx, g, quietTestLogger(), cfg, "", nil, nil)
 	if err != nil {
 		t.Fatalf("startMetricsServer: %v", err)
 	}
@@ -143,7 +146,7 @@ func TestStartMetricsServer_DuplicateAdapterRegistrationSurfaces(t *testing.T) {
 	// duplicate path via two sequential calls in the same way the
 	// production wiring would (e.g. a future Story 1.14 retry-wires
 	// the collector against an already-registered Registry).
-	reg, err := startMetricsServer(gctx, g, quietTestLogger(), cfg,
+	reg, err := startMetricsServer(gctx, g, quietTestLogger(), cfg, "node-a",
 		map[string]adapterMetrics{"falco": a}, nil)
 	if err != nil {
 		t.Fatalf("startMetricsServer: %v", err)
@@ -156,24 +159,29 @@ func TestStartMetricsServer_DuplicateAdapterRegistrationSurfaces(t *testing.T) {
 	_ = g.Wait()
 }
 
-func TestRegisterAdapterCounters_FalcoIsNoOp(t *testing.T) {
+func TestRegisterAdapterCounters_FalcoBindsCircuitBreaker(t *testing.T) {
 	t.Parallel()
-	// Falco only contributes the source_healthy / sensor_events_total
-	// pair; detail counters are nil. Asserts the switch path does not
-	// fall through to a misregistered counter or panic on the
-	// pseudo-default case.
+	// Falco's switch case has no per-adapter detail counters beyond the
+	// circuit-breaker counter Story 1.13 added before the switch. This
+	// test asserts the switch path does not panic on the pseudo-default
+	// fall-through and that calling registerAdapterCounters directly on
+	// a pre-built registry surfaces the duplicate-registration error.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	g, gctx := errgroup.WithContext(ctx)
 	cfg := &config.Config{Metrics: config.MetricsConfig{Address: "127.0.0.1:0"}}
 	a := &fakeAdapter{}
-	reg, err := startMetricsServer(gctx, g, quietTestLogger(), cfg,
+	reg, err := startMetricsServer(gctx, g, quietTestLogger(), cfg, "node-a",
 		map[string]adapterMetrics{"falco": a}, nil)
 	if err != nil {
 		t.Fatalf("startMetricsServer: %v", err)
 	}
-	if err := registerAdapterCounters(reg, "falco", a); err != nil {
-		t.Errorf("registerAdapterCounters(falco) returned %v on a fake adapter, want nil (no-op fall-through)", err)
+	// Calling registerAdapterCounters a second time on the same registry
+	// must surface the duplicate-counter error rather than silently
+	// double-registering: defensive lock-in against a future refactor
+	// that re-enters the helper on retry.
+	if err := registerAdapterCounters(reg, "falco", "node-a", a); err == nil {
+		t.Errorf("registerAdapterCounters(falco) returned nil on a re-registration; want duplicate-counter rejection")
 	}
 	cancel()
 	_ = g.Wait()
@@ -190,7 +198,7 @@ func TestStartMetricsServer_PropagatesRegistrationError(t *testing.T) {
 	// source" rejection. The helper must surface this rather than
 	// proceeding to bind a server on a half-registered registry.
 	a := &fakeAdapter{}
-	_, err := startMetricsServer(gctx, g, quietTestLogger(), cfg,
+	_, err := startMetricsServer(gctx, g, quietTestLogger(), cfg, "node-a",
 		map[string]adapterMetrics{"": a}, nil)
 	if err == nil {
 		t.Errorf("startMetricsServer with empty source: got nil error, want propagation of RegisterAdapter rejection")

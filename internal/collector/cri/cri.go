@@ -22,6 +22,7 @@ import (
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
+	"github.com/olokotoh/olaitan/internal/ratelimit"
 	"github.com/olokotoh/olaitan/internal/retry"
 	"github.com/olokotoh/olaitan/internal/schema"
 	"github.com/olokotoh/olaitan/internal/sourcehealth"
@@ -90,6 +91,11 @@ type Config struct {
 	// state coincide -- "no events" alone never trips it. Defaults
 	// to 5m when zero-valued.
 	StalenessTimeout time.Duration
+
+	// RateLimit is the Story 1.13 per-source per-node circuit breaker
+	// instance the adapter consults on every translated event before
+	// publish. Nil constructs a disabled fallback in New().
+	RateLimit *ratelimit.Limiter
 }
 
 // DefaultConnectRetry returns the outer connect-loop backoff strategy
@@ -187,6 +193,13 @@ type Adapter struct {
 	// EventsTotal as the int64 snapshot.
 	eventsPublished atomic.Int64
 
+	// limiter is the Story 1.13 rate-limit circuit breaker consulted
+	// pre-publish. Always non-nil after New.
+	limiter *ratelimit.Limiter
+
+	// droppedBySampling counts events dropped while engaged.
+	droppedBySampling atomic.Int64
+
 	// dialFn is a test seam: the production grpc.NewClient cannot be
 	// pointed at a bufconn dialer through public API alone. Tests
 	// override this; production callers leave it nil and defaultDial
@@ -244,6 +257,17 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 	if err := cfg.PublishRetry.Validate(); err != nil {
 		return nil, fmt.Errorf("cri: new: publish retry: %w", err)
 	}
+	limiter := cfg.RateLimit
+	if limiter == nil {
+		fallback, err := ratelimit.New(ratelimit.Options{
+			Source:  string(schema.SourceRuntime),
+			Enabled: false,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("cri: new: rate-limit fallback: %w", err)
+		}
+		limiter = fallback
+	}
 	return &Adapter{
 		cfg:         cfg,
 		pub:         nc,
@@ -251,6 +275,7 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 		dialFn:      defaultDial,
 		newClientFn: defaultNewClient,
 		nowFn:       time.Now,
+		limiter:     limiter,
 	}, nil
 }
 
@@ -279,6 +304,20 @@ func (a *Adapter) PublishDrops() int64 { return a.publishDrops.Load() }
 // successfully published to subjects.RawRuntime. Story 1.12 binds this
 // via prometheus.NewCounterFunc to olaitan_sensor_events_total{source="runtime"}.
 func (a *Adapter) EventsTotal() int64 { return a.eventsPublished.Load() }
+
+// EngagedTotal returns the cumulative count of rate-limit circuit
+// breaker engage transitions. Bound by Story 1.12's metric registry as
+// olaitan_sensor_circuit_breaker_engaged_total{source="runtime", node=...}.
+func (a *Adapter) EngagedTotal() int64 { return a.limiter.EngagedTotal() }
+
+// DroppedBySampling returns the cumulative count of events dropped
+// while engaged.
+func (a *Adapter) DroppedBySampling() int64 { return a.droppedBySampling.Load() }
+
+// Limiter returns the rate-limit circuit breaker the adapter is wired
+// to so cmd/olaitan/main.go can mutate thresholds via Update* on
+// config reload per FR49.
+func (a *Adapter) Limiter() *ratelimit.Limiter { return a.limiter }
 
 // Run blocks until ctx is cancelled. The connect-loop retry strategy
 // supplied via Config governs reconnect cadence on containerd
@@ -406,6 +445,17 @@ func (a *Adapter) connectAndConsume(ctx context.Context) error {
 		// watchdog instantly.
 		now := a.nowFn()
 		a.lastEventTime.Store(&now)
+
+		// Story 1.13: per-source rate-limit circuit breaker.
+		d := a.limiter.Allow(schemaEv.ID)
+		if !d.Publish {
+			a.droppedBySampling.Add(1)
+			continue
+		}
+		if d.Sampled {
+			schemaEv.Sampled = true
+			schemaEv.SamplingRate = d.SamplingRate
+		}
 
 		if perr := a.publishWithRetry(ctx, schemaEv); perr != nil {
 			if isPermanentPublishError(perr) {

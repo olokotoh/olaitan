@@ -290,7 +290,7 @@ func TestStartCollectorRing_WiresCalicoAdapter(t *testing.T) {
 			g, gctx := errgroup.WithContext(ctx)
 			log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-			if err := startCollectorRing(gctx, g, log, cfg); err != nil {
+			if err := startCollectorRing(gctx, g, log, cfg, nil); err != nil {
 				if strings.Contains(err.Error(), "insufficient storage resources available") {
 					t.Skipf("skipping: production StreamConfigs need ~160 GiB MaxStore; embedded NATS reports %v", err)
 				}

@@ -227,6 +227,38 @@ data:
     {{- $cfg = regexReplaceAll $pMa $cfg (printf "${1}address: %q" $m.address) }}
     {{- end }}
     {{- end }}
+    {{- /*
+    Story 1.13 P28: bridge the chart-side rateLimit knobs into the
+    rendered rate_limit block. Each knob is anchored by its YAML key
+    inside the rate_limit block; an anchor mismatch fails render with a
+    clear message rather than silently dropping the operator's --set.
+    Booleans are rendered as YAML literals via `printf %t`. Numeric
+    fields use the operator-supplied value verbatim so an integer
+    threshold is bridged without quotes.
+    */ -}}
+    {{- if .Values.rateLimit }}
+    {{- $rl := .Values.rateLimit }}
+    {{- if hasKey $rl "enabled" }}
+    {{- $pRle := "(?s)(rate_limit:[[:space:]]*\\n([[:space:]]+[^\\n]*\\n)*?[[:space:]]+)enabled:[[:space:]]+(true|false)" -}}
+    {{- if not (mustRegexFind $pRle $cfg) }}{{- fail (printf "helm bridge: rateLimit.enabled anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pRle) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pRle $cfg (printf "${1}enabled: %t" $rl.enabled) }}
+    {{- end }}
+    {{- if $rl.thresholdEventsPerSec }}
+    {{- $pRlt := "(?s)(rate_limit:[[:space:]]*\\n([[:space:]]+[^\\n]*\\n)*?[[:space:]]+)threshold_events_per_sec:[[:space:]]+[0-9]+" -}}
+    {{- if not (mustRegexFind $pRlt $cfg) }}{{- fail (printf "helm bridge: rateLimit.thresholdEventsPerSec anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pRlt) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pRlt $cfg (printf "${1}threshold_events_per_sec: %d" (int $rl.thresholdEventsPerSec)) }}
+    {{- end }}
+    {{- if $rl.cooldownSeconds }}
+    {{- $pRlc := "(?s)(rate_limit:[[:space:]]*\\n([[:space:]]+[^\\n]*\\n)*?[[:space:]]+)cooldown_seconds:[[:space:]]+[0-9]+" -}}
+    {{- if not (mustRegexFind $pRlc $cfg) }}{{- fail (printf "helm bridge: rateLimit.cooldownSeconds anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pRlc) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pRlc $cfg (printf "${1}cooldown_seconds: %d" (int $rl.cooldownSeconds)) }}
+    {{- end }}
+    {{- if $rl.samplingRate }}
+    {{- $pRls := "(?s)(rate_limit:[[:space:]]*\\n([[:space:]]+[^\\n]*\\n)*?[[:space:]]+)sampling_rate:[[:space:]]+[0-9.]+" -}}
+    {{- if not (mustRegexFind $pRls $cfg) }}{{- fail (printf "helm bridge: rateLimit.samplingRate anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pRls) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pRls $cfg (printf "${1}sampling_rate: %v" $rl.samplingRate) }}
+    {{- end }}
+    {{- end }}
     {{- $cfg | nindent 4 }}
 ---
 apiVersion: v1

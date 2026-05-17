@@ -146,6 +146,41 @@ func TestInject_NativeSidecarPatchShape(t *testing.T) {
 	}
 }
 
+func TestInject_ForwardsRateLimitEnv(t *testing.T) {
+	pod := samplePod()
+	opts := defaultInjectOpts()
+	opts.SidecarRateLimitEnabled = "true"
+	opts.SidecarRateLimitThreshold = "500"
+	opts.SidecarRateLimitCooldown = "30"
+	opts.SidecarRateLimitSampling = "0.005"
+
+	patch, err := Inject(pod, opts)
+	if err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+	var ops []jsonPatchOp
+	if err := json.Unmarshal(patch, &ops); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	sidecar := decodeInjectedSidecar(t, ops, "/spec/initContainers/-")
+	env := map[string]string{}
+	for _, e := range sidecar.Env {
+		env[e.Name] = e.Value
+	}
+	want := map[string]string{
+		"OLAITAN_RATE_LIMIT_ENABLED":                  "true",
+		"OLAITAN_RATE_LIMIT_THRESHOLD_EVENTS_PER_SEC": "500",
+		"OLAITAN_RATE_LIMIT_COOLDOWN_SECONDS":         "30",
+		"OLAITAN_RATE_LIMIT_SAMPLING_RATE":            "0.005",
+	}
+	for k, v := range want {
+		if env[k] != v {
+			t.Errorf("env[%s]: got %q, want %q", k, env[k], v)
+		}
+	}
+}
+
 func TestInject_FallbackToContainers_WhenNativeSidecarDisabled(t *testing.T) {
 	pod := samplePod()
 	opts := defaultInjectOpts()
@@ -173,6 +208,26 @@ func TestInject_FallbackToContainers_WhenNativeSidecarDisabled(t *testing.T) {
 	if !found {
 		t.Errorf("fallback mode must add to /spec/containers/-, ops=%+v", ops)
 	}
+}
+
+func decodeInjectedSidecar(t *testing.T, ops []jsonPatchOp, path string) corev1.Container {
+	t.Helper()
+	for i := range ops {
+		if ops[i].Path != path {
+			continue
+		}
+		body, err := json.Marshal(ops[i].Value)
+		if err != nil {
+			t.Fatalf("marshal sidecar: %v", err)
+		}
+		var c corev1.Container
+		if err := json.Unmarshal(body, &c); err != nil {
+			t.Fatalf("decode sidecar: %v", err)
+		}
+		return c
+	}
+	t.Fatalf("sidecar op %q not found: ops=%+v", path, ops)
+	return corev1.Container{}
 }
 
 func TestInject_VolumeMountedOnPeerContainer(t *testing.T) {

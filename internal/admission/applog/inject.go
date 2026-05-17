@@ -40,6 +40,10 @@ type InjectOptions struct {
 	SidecarMaxLineBytes        string
 	SidecarPublishStallTimeout string
 	SidecarStalenessTimeout    string
+	SidecarRateLimitEnabled    string
+	SidecarRateLimitThreshold  string
+	SidecarRateLimitCooldown   string
+	SidecarRateLimitSampling   string
 }
 
 // jsonPatchOp models a single JSON Patch (RFC 6902) operation. Only
@@ -277,6 +281,18 @@ func buildSidecarContainer(opts InjectOptions, peerContainerName string) (corev1
 	}
 	if v := opts.SidecarStalenessTimeout; v != "" {
 		env = append(env, corev1.EnvVar{Name: "OLAITAN_APPLOG_STALENESS_TIMEOUT", Value: v})
+	}
+	if v := opts.SidecarRateLimitEnabled; v != "" {
+		env = append(env, corev1.EnvVar{Name: "OLAITAN_RATE_LIMIT_ENABLED", Value: v})
+	}
+	if v := opts.SidecarRateLimitThreshold; v != "" {
+		env = append(env, corev1.EnvVar{Name: "OLAITAN_RATE_LIMIT_THRESHOLD_EVENTS_PER_SEC", Value: v})
+	}
+	if v := opts.SidecarRateLimitCooldown; v != "" {
+		env = append(env, corev1.EnvVar{Name: "OLAITAN_RATE_LIMIT_COOLDOWN_SECONDS", Value: v})
+	}
+	if v := opts.SidecarRateLimitSampling; v != "" {
+		env = append(env, corev1.EnvVar{Name: "OLAITAN_RATE_LIMIT_SAMPLING_RATE", Value: v})
 	}
 
 	resources, err := buildResourceRequirements(opts)

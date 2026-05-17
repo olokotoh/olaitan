@@ -588,6 +588,43 @@ metrics:
   # ServiceMonitor resource as a follow-up).
   scrapeAnnotations: true
 
+# Story 1.13: per-source per-node rate-limit circuit breaker
+# (FR51 sensing half; NFR22). The breaker engages when any of the five
+# streaming sensor adapters (falco / audit / runtime / network / applog)
+# exceed thresholdEventsPerSec on this node and switches to
+# deterministic FNV-1a hash sampling at samplingRate; surviving events
+# carry `Sampled=true` and `SamplingRate` so the downstream correlator
+# (Story 1.14) and DFIR report writer (Story 4.x) can honestly disclose
+# the degradation. The four knobs hot-reload via the
+# config.Manager.Subscribe callback per FR49; a `helm upgrade --set
+# rateLimit.thresholdEventsPerSec=500` propagates within the watcher's
+# debounce window without a process restart.
+rateLimit:
+  # When false the breaker short-circuits for every adapter: Allow
+  # always returns Publish=true / Sampled=false / SamplingRate=1.0.
+  # The Prometheus counter olaitan_sensor_circuit_breaker_engaged_total
+  # stays at 0; a startup log line records the disable.
+  enabled: true
+
+  # Strict-greater-than threshold for engagement, measured on a
+  # sliding 1-second window per (source, node). NFR22 / PRD line 439
+  # default is 1000; lower values engage the breaker earlier under
+  # bursty traffic.
+  thresholdEventsPerSec: 1000
+
+  # Contiguous below-threshold seconds before disengagement. PRD line
+  # 439 default is 60; the rate must stay below threshold for the full
+  # cooldown for the breaker to disengage. A re-burst within the
+  # cooldown window resets the timer and the breaker remains engaged
+  # (treated as a continuous engagement per guardrail 29).
+  cooldownSeconds: 60
+
+  # Fraction in (0, 1] of events that survive the sampling roll while
+  # engaged. PRD line 439 default is 0.1 (10%). The sampling decision
+  # is deterministic: FNV-1a(event.ID) mod 100 < samplingRate*100 so
+  # Epic 5 evaluation re-runs are reproducible (NFR42; guardrail 28).
+  samplingRate: 0.1
+
 # --- Subchart overrides ------------------------------------------------
 # Only opinions we impose on the downstream charts live here -- upstream
 # defaults are otherwise preserved. To see every available knob, consult

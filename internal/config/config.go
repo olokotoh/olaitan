@@ -45,6 +45,13 @@ type Config struct {
 	// empty Address is rejected by Validate per guardrail 27 (the FR50
 	// surface is mandatory, not optional).
 	Metrics MetricsConfig `yaml:"metrics,omitempty"`
+	// RateLimit configures the Story 1.13 per-source per-node
+	// circuit breaker (FR51 sensing half; NFR22). Omission of the
+	// block at Load time leaves the four defaults in force (enabled
+	// true, 1000 events/sec threshold, 60s cooldown, 0.1 sampling
+	// rate) so a chart deploy that has not yet adopted the block
+	// inherits production behaviour.
+	RateLimit RateLimitConfig `yaml:"rate_limit,omitempty"`
 }
 
 // MetricsConfig configures the Story 1.12 Prometheus surface bound at
@@ -61,6 +68,82 @@ type MetricsConfig struct {
 // explicit empty Address so a typo cannot silently disable the
 // surface.
 const DefaultMetricsAddress = ":9090"
+
+// RateLimitConfig configures the Story 1.13 per-source per-node
+// circuit breaker. The four knobs are Helm-tunable per AC4 and
+// hot-reload via the config.Manager.Subscribe callback wired by
+// cmd/olaitan/main.go.
+//
+// Field semantics:
+//
+//   - Enabled toggles the breaker cluster-wide. When false the
+//     per-adapter limiter short-circuits in Allow and the engagement
+//     counter never advances.
+//   - ThresholdEventsPerSec is the strict-greater-than threshold for
+//     engagement. NFR22 / PRD line 439 default is 1000.
+//   - CooldownSeconds is the contiguous below-threshold duration
+//     required for disengagement. PRD line 439 default is 60.
+//   - SamplingRate is the fraction in (0, 1] of events that survive
+//     the sampling roll while engaged. PRD line 439 default is 0.1.
+type RateLimitConfig struct {
+	Enabled               *bool   `yaml:"enabled,omitempty"`
+	ThresholdEventsPerSec int     `yaml:"threshold_events_per_sec,omitempty"`
+	CooldownSeconds       int     `yaml:"cooldown_seconds,omitempty"`
+	SamplingRate          float64 `yaml:"sampling_rate,omitempty"`
+}
+
+// DefaultRateLimit returns the production defaults for the four rate
+// limit knobs. Load substitutes these when the corresponding YAML field
+// is omitted (or, for SamplingRate, when the omitempty-tagged float is
+// zero). The enabled toggle defaults to true: a chart deploy that has
+// not yet adopted the rateLimit block inherits production backpressure
+// rather than silently disabling the breaker.
+func DefaultRateLimit() RateLimitConfig {
+	t := true
+	return RateLimitConfig{
+		Enabled:               &t,
+		ThresholdEventsPerSec: 1000,
+		CooldownSeconds:       60,
+		SamplingRate:          0.1,
+	}
+}
+
+// EnabledOrDefault reports the effective enabled state, treating a nil
+// pointer as "use the default" (true). Callers in main.go consult this
+// when building the ratelimit.Options.
+func (r RateLimitConfig) EnabledOrDefault() bool {
+	if r.Enabled == nil {
+		return true
+	}
+	return *r.Enabled
+}
+
+// validate enforces RateLimitConfig invariants. The four knobs default
+// at Load when omitted; Validate rejects out-of-range values so a
+// chart deploy with `--set rateLimit.threshold_events_per_sec=-1`
+// crash-loops loudly rather than silently disabling the breaker.
+func (r RateLimitConfig) validate() error {
+	if !r.EnabledOrDefault() {
+		// When disabled the other knobs are ignored at runtime; do not
+		// reject negative thresholds in this case, but do reject
+		// obviously broken sampling rates so a future re-enable does
+		// not pick up an invalid value silently.
+		if r.SamplingRate < 0 || r.SamplingRate > 1 {
+			return fmt.Errorf("rate_limit.sampling_rate: must be in [0, 1] (got %v)", r.SamplingRate)
+		}
+		return nil
+	}
+	if r.ThresholdEventsPerSec < 1 {
+		return fmt.Errorf("rate_limit.threshold_events_per_sec: must be >= 1 when enabled=true (got %d)", r.ThresholdEventsPerSec)
+	}
+	if r.CooldownSeconds < 1 {
+		return fmt.Errorf("rate_limit.cooldown_seconds: must be >= 1 when enabled=true (got %d)", r.CooldownSeconds)
+	}
+	if r.SamplingRate <= 0 || r.SamplingRate > 1 {
+		return fmt.Errorf("rate_limit.sampling_rate: must be in (0, 1] when enabled=true (got %v)", r.SamplingRate)
+	}
+	return nil
+}
 
 // DetectionConfig -- see architecture.md:420 (confidence bands +
 // baseline window). The bands gate the five-state pod FSM transitions;
@@ -405,6 +488,29 @@ func Load(path string) (*Config, error) {
 		cfg.Metrics.Address = DefaultMetricsAddress
 	}
 
+	// Substitute rate-limit defaults before Validate so an operator
+	// who omits the rate_limit block inherits the Story 1.13
+	// production defaults (Enabled=true, threshold=1000, cooldown=60s,
+	// sampling=0.1). Explicit zero values for the int fields are
+	// indistinguishable from omitted-omitempty fields, so omitted is
+	// treated as default; an operator who actually wants threshold=0
+	// must instead set enabled=false.
+	if cfg != nil {
+		def := DefaultRateLimit()
+		if cfg.RateLimit.Enabled == nil {
+			cfg.RateLimit.Enabled = def.Enabled
+		}
+		if cfg.RateLimit.ThresholdEventsPerSec == 0 {
+			cfg.RateLimit.ThresholdEventsPerSec = def.ThresholdEventsPerSec
+		}
+		if cfg.RateLimit.CooldownSeconds == 0 {
+			cfg.RateLimit.CooldownSeconds = def.CooldownSeconds
+		}
+		if cfg.RateLimit.SamplingRate == 0 {
+			cfg.RateLimit.SamplingRate = def.SamplingRate
+		}
+	}
+
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("config: validate %q: %w", path, err)
 	}
@@ -450,6 +556,9 @@ func (c *Config) Validate() error {
 		return err
 	}
 	if err := c.Metrics.validate(); err != nil {
+		return err
+	}
+	if err := c.RateLimit.validate(); err != nil {
 		return err
 	}
 	return nil
