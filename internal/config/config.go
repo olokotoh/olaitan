@@ -155,13 +155,49 @@ func (r RateLimitConfig) validate() error {
 // flow sources under the same parent. The block is omitempty: clusters
 // running only the Falco adapter (Story 1.6) need not declare it.
 type DetectionConfig struct {
-	ConfidenceBands ConfidenceBands `yaml:"confidence_bands"`
-	BaselineWindow  DurationYAML    `yaml:"baseline_window"`
-	Sources         SourcesConfig   `yaml:"sources,omitempty"`
+	ConfidenceBands ConfidenceBands  `yaml:"confidence_bands"`
+	BaselineWindow  DurationYAML     `yaml:"baseline_window"`
+	Correlator      CorrelatorConfig `yaml:"correlator,omitempty"`
+	Sources         SourcesConfig    `yaml:"sources,omitempty"`
 	// Story 1.11: posture sub-block configures the read-on-demand
 	// workload posture client (FR7). architecture.md:324 pins the
 	// 60s cache TTL ceiling; validate enforces it.
 	Posture PostureConfig `yaml:"posture,omitempty"`
+}
+
+// CorrelatorConfig controls the Story 1.14 Ring-2 sliding-window
+// correlator and EvidencePackage assembler.
+type CorrelatorConfig struct {
+	WindowDuration        DurationYAML `yaml:"window_duration,omitempty"`
+	MaxPackageBytes       int          `yaml:"max_package_bytes,omitempty"`
+	MultiSignalMinSources int          `yaml:"multi_signal_min_sources,omitempty"`
+	HighSeverityThreshold int          `yaml:"high_severity_threshold,omitempty"`
+}
+
+// DefaultCorrelator returns Story 1.14's production defaults.
+func DefaultCorrelator() CorrelatorConfig {
+	return CorrelatorConfig{
+		WindowDuration:        DurationYAML(60 * time.Second),
+		MaxPackageBytes:       128 * 1024,
+		MultiSignalMinSources: 2,
+		HighSeverityThreshold: 50,
+	}
+}
+
+func (c CorrelatorConfig) validate() error {
+	if c.WindowDuration.Duration() <= 0 {
+		return fmt.Errorf("detection.correlator.window_duration: must be > 0 (got %s)", c.WindowDuration.Duration())
+	}
+	if c.MaxPackageBytes != 128*1024 {
+		return fmt.Errorf("detection.correlator.max_package_bytes: must be 131072 bytes for Story 1.14 wire cap (got %d)", c.MaxPackageBytes)
+	}
+	if c.MultiSignalMinSources < 2 {
+		return fmt.Errorf("detection.correlator.multi_signal_min_sources: must be >= 2 (got %d)", c.MultiSignalMinSources)
+	}
+	if c.HighSeverityThreshold < 0 || c.HighSeverityThreshold > 100 {
+		return fmt.Errorf("detection.correlator.high_severity_threshold: must be in [0,100] (got %d)", c.HighSeverityThreshold)
+	}
+	return nil
 }
 
 // PostureConfig configures the Story 1.11 read-on-demand workload
@@ -496,6 +532,20 @@ func Load(path string) (*Config, error) {
 	// treated as default; an operator who actually wants threshold=0
 	// must instead set enabled=false.
 	if cfg != nil {
+		defCorrelator := DefaultCorrelator()
+		if cfg.Detection.Correlator.WindowDuration == 0 {
+			cfg.Detection.Correlator.WindowDuration = defCorrelator.WindowDuration
+		}
+		if cfg.Detection.Correlator.MaxPackageBytes == 0 {
+			cfg.Detection.Correlator.MaxPackageBytes = defCorrelator.MaxPackageBytes
+		}
+		if cfg.Detection.Correlator.MultiSignalMinSources == 0 {
+			cfg.Detection.Correlator.MultiSignalMinSources = defCorrelator.MultiSignalMinSources
+		}
+		if cfg.Detection.Correlator.HighSeverityThreshold == 0 {
+			cfg.Detection.Correlator.HighSeverityThreshold = defCorrelator.HighSeverityThreshold
+		}
+
 		def := DefaultRateLimit()
 		if cfg.RateLimit.Enabled == nil {
 			cfg.RateLimit.Enabled = def.Enabled
@@ -582,6 +632,9 @@ func (m MetricsConfig) validate() error {
 func (d DetectionConfig) validate() error {
 	if d.BaselineWindow.Duration() <= 0 {
 		return fmt.Errorf("detection.baseline_window: must be > 0 (got %s)", d.BaselineWindow.Duration())
+	}
+	if err := d.Correlator.validate(); err != nil {
+		return err
 	}
 	b := d.ConfidenceBands
 	if err := bandRange("detection.confidence_bands.watch", b.Watch); err != nil {

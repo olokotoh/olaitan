@@ -143,6 +143,8 @@ func TestRunRing_GracefulShutdown(t *testing.T) {
 	t.Cleanup(func() { healthAddr = prevAddr })
 
 	cfgPath := writeTestConfig(t)
+	natsSrv := startTestNATSForMain(t)
+	t.Setenv("NATS_URL", natsSrv.ClientURL())
 
 	// Drive runRingCtx directly with our own cancellable context — no
 	// real signals involved. This avoids the SIGINT-to-test-process
@@ -349,7 +351,9 @@ func TestStartAggregator_BuildsPostureClientWhenEnabled(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	g, gctx := errgroup.WithContext(ctx)
-	if err := startAggregatorRing(gctx, g, log, cfg); err != nil {
+	natsSrv := startTestNATSForMain(t)
+	t.Setenv("NATS_URL", natsSrv.ClientURL())
+	if err := startAggregatorRing(gctx, g, log, cfg, nil); err != nil {
 		cancel()
 		_ = g.Wait()
 		t.Fatalf("startAggregatorRing: %v", err)
@@ -387,7 +391,9 @@ func TestStartAggregator_PostureDisabledLeavesClientNil(t *testing.T) {
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	ctx, cancel := context.WithCancel(context.Background())
 	g, gctx := errgroup.WithContext(ctx)
-	if err := startAggregatorRing(gctx, g, log, cfg); err != nil {
+	natsSrv := startTestNATSForMain(t)
+	t.Setenv("NATS_URL", natsSrv.ClientURL())
+	if err := startAggregatorRing(gctx, g, log, cfg, nil); err != nil {
 		cancel()
 		_ = g.Wait()
 		t.Fatalf("startAggregatorRing: %v", err)
@@ -424,7 +430,7 @@ func TestStartAggregator_KubeClientFailureWrapsError(t *testing.T) {
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	g, gctx := errgroup.WithContext(context.Background())
 	_ = g // group is not exercised on the early-return failure path
-	err := startAggregatorRing(gctx, g, log, cfg)
+	err := startAggregatorRing(gctx, g, log, cfg, nil)
 	if err == nil {
 		t.Fatalf("expected error from startAggregatorRing under kube-client failure")
 	}

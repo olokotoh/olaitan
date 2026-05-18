@@ -4,17 +4,17 @@ import "time"
 
 // Incident ties together everything about a detected threat — events, assessment, transitions, and evidence.
 type Incident struct {
-	ID          string            `json:"id"`
-	CreatedAt   time.Time         `json:"created_at"`
-	Pod         PodRef            `json:"pod"`
-	Events      []Event           `json:"events"`
-	Assessment  ThreatAssessment  `json:"assessment"`
-	Transitions []StateTransition `json:"transitions"`
-	Evidence    *EvidencePackage  `json:"evidence,omitempty"`
+	ID          string               `json:"id"`
+	CreatedAt   time.Time            `json:"created_at"`
+	Pod         PodRef               `json:"pod"`
+	Events      []Event              `json:"events"`
+	Assessment  ThreatAssessment     `json:"assessment"`
+	Transitions []StateTransition    `json:"transitions"`
+	Evidence    *ContainmentEvidence `json:"evidence,omitempty"`
 }
 
-// EvidencePackage contains forensic data captured during containment.
-type EvidencePackage struct {
+// ContainmentEvidence contains forensic data captured during containment.
+type ContainmentEvidence struct {
 	IncidentID    string    `json:"incident_id"`
 	CapturedAt    time.Time `json:"captured_at"`
 	OverlayDiff   string    `json:"overlay_diff,omitempty"`

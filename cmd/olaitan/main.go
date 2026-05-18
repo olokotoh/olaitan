@@ -40,6 +40,8 @@ import (
 	"github.com/olokotoh/olaitan/internal/collector/falco"
 	"github.com/olokotoh/olaitan/internal/collector/posture"
 	"github.com/olokotoh/olaitan/internal/config"
+	"github.com/olokotoh/olaitan/internal/correlator"
+	correlatorasm "github.com/olokotoh/olaitan/internal/correlator/assembler"
 	"github.com/olokotoh/olaitan/internal/health"
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
 	"github.com/olokotoh/olaitan/internal/ratelimit"
@@ -201,7 +203,7 @@ func runRingCtx(ctx context.Context, ring string, args []string, stderr io.Write
 			return 1
 		}
 	case "aggregator":
-		if err := startAggregatorRing(gctx, g, log, mgr.Get()); err != nil {
+		if err := startAggregatorRing(gctx, g, log, mgr.Get(), mgr.Subscribe); err != nil {
 			log.Error("startup: aggregator ring wiring", "err", err)
 			ringCancel()
 			_ = g.Wait()
@@ -327,10 +329,12 @@ func getPostureClient() *posture.Client { return postureClient.Load() }
 //     intentionally-enabled posture must not silently degrade.
 //   - posture.enabled=false -> log "posture disabled", leave
 //     postureClient nil, return nil.
-func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger, cfg *config.Config) error {
+func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger, cfg *config.Config, subscribe func(func(*config.Config))) error {
 	var client *posture.Client
+	var cs kubernetes.Interface
 	if cfg.Detection.Posture.Enabled {
-		cs, err := kubeClientFactory(log)
+		var err error
+		cs, err = kubeClientFactory(log)
 		if err != nil {
 			return fmt.Errorf("posture: kube client: %w", err)
 		}
@@ -365,10 +369,79 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		return fmt.Errorf("aggregator: metrics: %w", merr)
 	}
 
-	// Future Story 1.14: wire postureClient into the correlator
-	// goroutine here. The ctx is plumbed through for the lifecycle
-	// hand-off so the correlator can scope per-Get contexts under
-	// ringCtx.
+	natsURL := os.Getenv("NATS_URL")
+	if natsURL == "" {
+		return errors.New("aggregator: NATS_URL env var is empty (set by Helm chart)")
+	}
+	natsCfg := natsclient.DefaultConfig()
+	natsCfg.URL = natsURL
+	natsCfg.Name = "olaitan-aggregator"
+	nc, err := natsclient.NewClient(natsCfg)
+	if err != nil {
+		return fmt.Errorf("aggregator: nats: %w", err)
+	}
+	closeNATS := func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := nc.Close(closeCtx); err != nil {
+			log.Warn("aggregator: nats close", "err", err)
+		}
+	}
+
+	streamsCtx, streamsCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer streamsCancel()
+	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigs()); err != nil {
+		closeNATS()
+		if ctx.Err() != nil {
+			return nil
+		}
+		return fmt.Errorf("aggregator: ensure streams: %w", err)
+	}
+
+	corrAssembler := correlatorasm.New(correlatorasm.Config{
+		Kube:                  cs,
+		Posture:               client,
+		MaxPackageBytes:       cfg.Detection.Correlator.MaxPackageBytes,
+		HighSeverityThreshold: cfg.Detection.Correlator.HighSeverityThreshold,
+	})
+	corr, err := correlator.New(correlator.Config{
+		NATS:                  nc,
+		Kube:                  cs,
+		Assembler:             corrAssembler,
+		WindowDuration:        cfg.Detection.Correlator.WindowDuration.Duration(),
+		MultiSignalMinSources: cfg.Detection.Correlator.MultiSignalMinSources,
+		Log:                   log,
+	})
+	if err != nil {
+		closeNATS()
+		return fmt.Errorf("aggregator: correlator: %w", err)
+	}
+	if subscribe != nil {
+		subscribe(func(newCfg *config.Config) {
+			if newCfg == nil {
+				return
+			}
+			corr.UpdateConfig(
+				newCfg.Detection.Correlator.WindowDuration.Duration(),
+				newCfg.Detection.Correlator.MultiSignalMinSources,
+			)
+		})
+	}
+	g.Go(func() error {
+		if err := corr.Run(ctx); err != nil {
+			return fmt.Errorf("aggregator: correlator run: %w", err)
+		}
+		return nil
+	})
+	g.Go(func() error {
+		<-ctx.Done()
+		closeNATS()
+		return nil
+	})
+	log.Info("aggregator: correlator wired",
+		"window_duration", cfg.Detection.Correlator.WindowDuration.Duration(),
+		"max_package_bytes", cfg.Detection.Correlator.MaxPackageBytes,
+		"multi_signal_min_sources", cfg.Detection.Correlator.MultiSignalMinSources)
 	return nil
 }
 

@@ -226,8 +226,8 @@ func TestValidTransition(t *testing.T) {
 	}
 }
 
-func TestEvidencePackageRoundTrip(t *testing.T) {
-	original := EvidencePackage{
+func TestContainmentEvidenceRoundTrip(t *testing.T) {
+	original := ContainmentEvidence{
 		IncidentID:    "incident-001",
 		CapturedAt:    time.Date(2026, 4, 8, 13, 0, 0, 0, time.UTC),
 		OverlayDiff:   "diff content here",
@@ -242,7 +242,7 @@ func TestEvidencePackageRoundTrip(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 
-	var decoded EvidencePackage
+	var decoded ContainmentEvidence
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
@@ -252,6 +252,59 @@ func TestEvidencePackageRoundTrip(t *testing.T) {
 	}
 	if decoded.IntegrityHash != original.IntegrityHash {
 		t.Errorf("IntegrityHash: got %q, want %q", decoded.IntegrityHash, original.IntegrityHash)
+	}
+}
+
+func TestEvidencePackageRoundTrip(t *testing.T) {
+	original := EvidencePackage{
+		SchemaVersion: "evidence.v1",
+		PackageID:     "pkg-001",
+		WorkloadID:    "payments/Deployment/api",
+		WorkloadIdentity: WorkloadIdentity{
+			Namespace: "payments",
+			OwnerKind: "Deployment",
+			OwnerName: "api",
+		},
+		AssembledAt: time.Date(2026, 5, 18, 10, 0, 0, 0, time.UTC),
+		WindowStart: time.Date(2026, 5, 18, 9, 59, 0, 0, time.UTC),
+		WindowEnd:   time.Date(2026, 5, 18, 10, 0, 0, 0, time.UTC),
+		Trigger: EvidenceTrigger{
+			Type:            "multi_signal",
+			DistinctSources: []EventSource{SourceAudit, SourceFalco},
+			FiredAt:         time.Date(2026, 5, 18, 10, 0, 0, 0, time.UTC),
+		},
+		Events: []Event{
+			{ID: "evt-1", Source: SourceAudit, Category: CategoryAudit, Summary: "secret read"},
+			{ID: "evt-2", Source: SourceFalco, Category: CategorySyscall, Summary: "shell"},
+		},
+		WorkloadPosture: &WorkloadPosture{
+			Identity: WorkloadIdentity{Namespace: "payments", OwnerKind: "Deployment", OwnerName: "api"},
+		},
+	}
+
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got := string(data)
+	for _, key := range []string{"schema_version", "package_id", "workload_id", "workload_identity", "window_start", "window_end", "workload_posture"} {
+		if !contains(got, key) {
+			t.Errorf("EvidencePackage JSON missing snake_case key %q: %s", key, got)
+		}
+	}
+
+	var decoded EvidencePackage
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.PackageID != original.PackageID {
+		t.Errorf("PackageID: got %q, want %q", decoded.PackageID, original.PackageID)
+	}
+	if len(decoded.Events) != 2 {
+		t.Errorf("Events: got %d, want 2", len(decoded.Events))
+	}
+	if decoded.WorkloadPosture == nil {
+		t.Fatal("WorkloadPosture: got nil, want non-nil")
 	}
 }
 

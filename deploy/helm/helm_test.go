@@ -2155,3 +2155,58 @@ func TestRateLimitDisabledRendered(t *testing.T) {
 		t.Errorf("rateLimit.enabled=false: rate_limit block does not render 'enabled: false'; got:\n%s", window)
 	}
 }
+
+func TestCorrelatorConfigMapBridgesValues(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"correlator.windowDuration=45s",
+		"correlator.maxPackageBytes=131072",
+		"correlator.multiSignalMinSources=3",
+		"correlator.highSeverityThreshold=60",
+	})
+	idx := strings.Index(rendered, "correlator:")
+	if idx == -1 {
+		t.Fatalf("correlator block missing in rendered olaitan.yaml")
+	}
+	window := rendered[idx:]
+	if end := strings.Index(window, "\n  sources:"); end > 0 {
+		window = window[:end]
+	}
+	for _, want := range []string{
+		`window_duration: "45s"`,
+		"max_package_bytes: 131072",
+		"multi_signal_min_sources: 3",
+		"high_severity_threshold: 60",
+	} {
+		if !strings.Contains(window, want) {
+			t.Errorf("rendered correlator block missing %q; got:\n%s", want, window)
+		}
+	}
+}
+
+func TestCorrelatorInvalidValuesFailFast(t *testing.T) {
+	cases := []struct {
+		name    string
+		set     string
+		wantErr string
+	}{
+		{"cap", "correlator.maxPackageBytes=65536", "correlator.maxPackageBytes"},
+		{"sources", "correlator.multiSignalMinSources=1", "correlator.multiSignalMinSources"},
+		{"threshold", "correlator.highSeverityThreshold=101", "correlator.highSeverityThreshold"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command("helm", "template", "olaitan", chartDir(t),
+				"--set", "secrets.redisPassword=test-password",
+				"--set", tc.set,
+			)
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			if err := cmd.Run(); err == nil {
+				t.Fatalf("helm template succeeded for %s; expected correlator fail-fast", tc.set)
+			}
+			if !strings.Contains(stderr.String(), tc.wantErr) {
+				t.Errorf("stderr did not mention %q:\n%s", tc.wantErr, stderr.String())
+			}
+		})
+	}
+}
