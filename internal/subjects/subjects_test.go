@@ -94,7 +94,7 @@ func TestEvidencePackagesConstant(t *testing.T) {
 		t.Fatalf("Evidence(packages): %v", err)
 	}
 	if subjects.EvidencePackages != got {
-		t.Errorf("EvidencePackages: got %q, want %q", subjects.EvidencePackages, got)
+		t.Errorf("EvidencePackages: got %q, want %q", got, subjects.EvidencePackages)
 	}
 }
 

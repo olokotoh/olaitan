@@ -5,6 +5,16 @@ import "time"
 // EvidencePackage is the Ring-2 sliding-window evidence bundle emitted
 // by the correlator for downstream rule, baseline, analyst, and DFIR
 // consumers.
+//
+// SamplingActive and SampledSources are package-level honesty
+// indicators: when the Story 1.13 rate-limit breaker engages for one
+// or more sources contributing to the window, the per-event Sampled
+// flag is set on each affected event. The cap-enforcement pass may
+// later drop those events to fit the 128 KiB wire budget, so the
+// package-level indicators are computed before size-cap reduction and
+// survive it. Downstream consumers must treat SamplingActive=true as
+// "this window's coverage was degraded" regardless of which events
+// remain attached.
 type EvidencePackage struct {
 	SchemaVersion      string              `json:"schema_version"`
 	PackageID          string              `json:"package_id"`
@@ -19,6 +29,8 @@ type EvidencePackage struct {
 	BaselineDeviations []BaselineDeviation `json:"baseline_deviations,omitempty"`
 	WorkloadPosture    *WorkloadPosture    `json:"workload_posture,omitempty"`
 	DegradedSources    []string            `json:"degraded_sources,omitempty"`
+	SamplingActive     bool                `json:"sampling_active,omitempty"`
+	SampledSources     []EventSource       `json:"sampled_sources,omitempty"`
 	Overflow           *EvidenceOverflow   `json:"overflow,omitempty"`
 }
 

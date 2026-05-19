@@ -401,15 +401,16 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	corrAssembler := correlatorasm.New(correlatorasm.Config{
 		Kube:                  cs,
 		Posture:               client,
-		MaxPackageBytes:       cfg.Detection.Correlator.MaxPackageBytes,
-		HighSeverityThreshold: cfg.Detection.Correlator.HighSeverityThreshold,
+		MaxPackageBytes:       cfg.Detection.Correlator.MaxPackageBytesOrDefault(),
+		HighSeverityThreshold: cfg.Detection.Correlator.HighSeverityThresholdOrDefault(),
+		Log:                   log,
 	})
 	corr, err := correlator.New(correlator.Config{
 		NATS:                  nc,
 		Kube:                  cs,
 		Assembler:             corrAssembler,
 		WindowDuration:        cfg.Detection.Correlator.WindowDuration.Duration(),
-		MultiSignalMinSources: cfg.Detection.Correlator.MultiSignalMinSources,
+		MultiSignalMinSources: cfg.Detection.Correlator.MultiSignalMinSourcesOrDefault(),
 		Log:                   log,
 	})
 	if err != nil {
@@ -423,7 +424,7 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 			}
 			corr.UpdateConfig(
 				newCfg.Detection.Correlator.WindowDuration.Duration(),
-				newCfg.Detection.Correlator.MultiSignalMinSources,
+				newCfg.Detection.Correlator.MultiSignalMinSourcesOrDefault(),
 			)
 		})
 	}
@@ -440,8 +441,8 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	})
 	log.Info("aggregator: correlator wired",
 		"window_duration", cfg.Detection.Correlator.WindowDuration.Duration(),
-		"max_package_bytes", cfg.Detection.Correlator.MaxPackageBytes,
-		"multi_signal_min_sources", cfg.Detection.Correlator.MultiSignalMinSources)
+		"max_package_bytes", cfg.Detection.Correlator.MaxPackageBytesOrDefault(),
+		"multi_signal_min_sources", cfg.Detection.Correlator.MultiSignalMinSourcesOrDefault())
 	return nil
 }
 

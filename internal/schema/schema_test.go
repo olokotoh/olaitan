@@ -274,12 +274,14 @@ func TestEvidencePackageRoundTrip(t *testing.T) {
 			FiredAt:         time.Date(2026, 5, 18, 10, 0, 0, 0, time.UTC),
 		},
 		Events: []Event{
-			{ID: "evt-1", Source: SourceAudit, Category: CategoryAudit, Summary: "secret read"},
+			{ID: "evt-1", Source: SourceAudit, Category: CategoryAudit, Summary: "secret read", Sampled: true, SamplingRate: 0.1},
 			{ID: "evt-2", Source: SourceFalco, Category: CategorySyscall, Summary: "shell"},
 		},
 		WorkloadPosture: &WorkloadPosture{
 			Identity: WorkloadIdentity{Namespace: "payments", OwnerKind: "Deployment", OwnerName: "api"},
 		},
+		SamplingActive: true,
+		SampledSources: []EventSource{SourceAudit},
 	}
 
 	data, err := json.Marshal(original)
@@ -287,7 +289,7 @@ func TestEvidencePackageRoundTrip(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 	got := string(data)
-	for _, key := range []string{"schema_version", "package_id", "workload_id", "workload_identity", "window_start", "window_end", "workload_posture"} {
+	for _, key := range []string{"schema_version", "package_id", "workload_id", "workload_identity", "window_start", "window_end", "workload_posture", "sampling_active", "sampled_sources"} {
 		if !contains(got, key) {
 			t.Errorf("EvidencePackage JSON missing snake_case key %q: %s", key, got)
 		}
@@ -305,6 +307,34 @@ func TestEvidencePackageRoundTrip(t *testing.T) {
 	}
 	if decoded.WorkloadPosture == nil {
 		t.Fatal("WorkloadPosture: got nil, want non-nil")
+	}
+	if !decoded.SamplingActive {
+		t.Errorf("SamplingActive: got false, want true")
+	}
+	if len(decoded.SampledSources) != 1 || decoded.SampledSources[0] != SourceAudit {
+		t.Errorf("SampledSources: got %v, want [audit]", decoded.SampledSources)
+	}
+}
+
+// TestEvidencePackageSamplingOmitemptyDropsZero locks in the P26
+// omitempty contract: an unsampled package's wire form must not carry
+// the sampling_active / sampled_sources keys at all.
+func TestEvidencePackageSamplingOmitemptyDropsZero(t *testing.T) {
+	pkg := EvidencePackage{
+		SchemaVersion:    "evidence.v1",
+		PackageID:        "pkg-002",
+		WorkloadID:       "payments/Deployment/api",
+		WorkloadIdentity: WorkloadIdentity{Namespace: "payments", OwnerKind: "Deployment", OwnerName: "api"},
+		AssembledAt:      time.Date(2026, 5, 18, 10, 0, 0, 0, time.UTC),
+		Trigger:          EvidenceTrigger{Type: "rule_match", FiredAt: time.Date(2026, 5, 18, 10, 0, 0, 0, time.UTC)},
+	}
+	data, err := json.Marshal(pkg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got := string(data)
+	if contains(got, "sampling_active") || contains(got, "sampled_sources") {
+		t.Errorf("zero sampling fields rendered into JSON: %s", got)
 	}
 }
 
