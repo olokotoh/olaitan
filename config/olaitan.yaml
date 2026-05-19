@@ -9,6 +9,14 @@ detection:
     alert: 70
     act: 90
   baseline_window: 24h
+  # Story 1.14: Ring-2 sliding-window correlator and EvidencePackage
+  # assembler. The window duration is hot-reloadable; max_package_bytes
+  # is pinned to the 128 KiB on-wire cap from AC3.
+  correlator:
+    window_duration: "60s"
+    max_package_bytes: 131072
+    multi_signal_min_sources: 2
+    high_severity_threshold: 50
   # Story 1.7: per-source adapter configuration. The audit-webhook
   # receiver is gated on enabled; chart deploys with
   # auditWebhook.enabled=false leave this block at its zero value and

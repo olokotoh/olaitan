@@ -77,6 +77,17 @@ aggregator:
   nodeSelector: {}
   tolerations: []
 
+# --- Ring-2 correlator ------------------------------------------------
+# Story 1.14 -- per-workload sliding-window buffer and EvidencePackage
+# assembler. Values are bridged into detection.correlator in the
+# rendered olaitan.yaml ConfigMap. maxPackageBytes is intentionally
+# fixed at 131072 unless the architecture changes.
+correlator:
+  windowDuration: "60s"
+  maxPackageBytes: 131072
+  multiSignalMinSources: 2
+  highSeverityThreshold: 50
+
 # --- Service endpoints -------------------------------------------------
 # Where Olaitan dials its dependencies. Empty by default -- the templates
 # fall back to release-name-derived subchart Service names via the

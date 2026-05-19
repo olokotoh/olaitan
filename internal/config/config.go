@@ -90,12 +90,62 @@ type RateLimitConfig struct {
 	ThresholdEventsPerSec int     `yaml:"threshold_events_per_sec,omitempty"`
 	CooldownSeconds       int     `yaml:"cooldown_seconds,omitempty"`
 	SamplingRate          float64 `yaml:"sampling_rate,omitempty"`
+
+	thresholdSet bool
+	cooldownSet  bool
+	samplingSet  bool
+}
+
+// UnmarshalYAML tracks whether scalar knobs were omitted or explicitly
+// set to zero. yaml's omitempty-shaped int/float fields otherwise
+// collapse both cases to the Go zero value, which would make Load
+// silently replace an operator's invalid zero with the production
+// default instead of rejecting it.
+func (r *RateLimitConfig) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("rate_limit: expected mapping, got %s", node.ShortTag())
+	}
+	for i := 0; i < len(node.Content); i += 2 {
+		key := node.Content[i].Value
+		val := node.Content[i+1]
+		switch key {
+		case "enabled":
+			var v bool
+			if err := val.Decode(&v); err != nil {
+				return fmt.Errorf("rate_limit.enabled: %w", err)
+			}
+			r.Enabled = &v
+		case "threshold_events_per_sec":
+			var v int
+			if err := val.Decode(&v); err != nil {
+				return fmt.Errorf("rate_limit.threshold_events_per_sec: %w", err)
+			}
+			r.ThresholdEventsPerSec = v
+			r.thresholdSet = true
+		case "cooldown_seconds":
+			var v int
+			if err := val.Decode(&v); err != nil {
+				return fmt.Errorf("rate_limit.cooldown_seconds: %w", err)
+			}
+			r.CooldownSeconds = v
+			r.cooldownSet = true
+		case "sampling_rate":
+			var v float64
+			if err := val.Decode(&v); err != nil {
+				return fmt.Errorf("rate_limit.sampling_rate: %w", err)
+			}
+			r.SamplingRate = v
+			r.samplingSet = true
+		default:
+			return fmt.Errorf("field %s not found in type config.RateLimitConfig", key)
+		}
+	}
+	return nil
 }
 
 // DefaultRateLimit returns the production defaults for the four rate
 // limit knobs. Load substitutes these when the corresponding YAML field
-// is omitted (or, for SamplingRate, when the omitempty-tagged float is
-// zero). The enabled toggle defaults to true: a chart deploy that has
+// is omitted. The enabled toggle defaults to true: a chart deploy that has
 // not yet adopted the rateLimit block inherits production backpressure
 // rather than silently disabling the breaker.
 func DefaultRateLimit() RateLimitConfig {
@@ -155,13 +205,94 @@ func (r RateLimitConfig) validate() error {
 // flow sources under the same parent. The block is omitempty: clusters
 // running only the Falco adapter (Story 1.6) need not declare it.
 type DetectionConfig struct {
-	ConfidenceBands ConfidenceBands `yaml:"confidence_bands"`
-	BaselineWindow  DurationYAML    `yaml:"baseline_window"`
-	Sources         SourcesConfig   `yaml:"sources,omitempty"`
+	ConfidenceBands ConfidenceBands  `yaml:"confidence_bands"`
+	BaselineWindow  DurationYAML     `yaml:"baseline_window"`
+	Correlator      CorrelatorConfig `yaml:"correlator,omitempty"`
+	Sources         SourcesConfig    `yaml:"sources,omitempty"`
 	// Story 1.11: posture sub-block configures the read-on-demand
 	// workload posture client (FR7). architecture.md:324 pins the
 	// 60s cache TTL ceiling; validate enforces it.
 	Posture PostureConfig `yaml:"posture,omitempty"`
+}
+
+// CorrelatorConfig controls the Story 1.14 Ring-2 sliding-window
+// correlator and EvidencePackage assembler.
+//
+// The three int knobs are pointers so the YAML loader can
+// distinguish "operator omitted the field, substitute the default"
+// from "operator set 0 explicitly". Without that distinction, an
+// operator who writes `high_severity_threshold: 0` would have their
+// explicit value silently replaced by the default 50; with pointers,
+// the explicit 0 reaches validate() and either passes (0 is in the
+// permitted range for high_severity_threshold) or is rejected
+// (max_package_bytes=0 fails the "must be 131072" guard). The
+// UnmarshalYAML hook below tracks which fields were present in the
+// source YAML.
+type CorrelatorConfig struct {
+	WindowDuration        DurationYAML `yaml:"window_duration,omitempty"`
+	MaxPackageBytes       *int         `yaml:"max_package_bytes,omitempty"`
+	MultiSignalMinSources *int         `yaml:"multi_signal_min_sources,omitempty"`
+	HighSeverityThreshold *int         `yaml:"high_severity_threshold,omitempty"`
+}
+
+// DefaultCorrelator returns Story 1.14's production defaults.
+func DefaultCorrelator() CorrelatorConfig {
+	return CorrelatorConfig{
+		WindowDuration:        DurationYAML(60 * time.Second),
+		MaxPackageBytes:       intPtr(128 * 1024),
+		MultiSignalMinSources: intPtr(2),
+		HighSeverityThreshold: intPtr(50),
+	}
+}
+
+func intPtr(v int) *int { return &v }
+
+// MaxPackageBytesOrDefault returns the effective max-package byte cap,
+// substituting the production default when the operator omitted the
+// field. Callers in cmd/olaitan/main.go consult this when constructing
+// the assembler so the dereference site cannot panic on a nil pointer.
+func (c CorrelatorConfig) MaxPackageBytesOrDefault() int {
+	if c.MaxPackageBytes == nil {
+		return 128 * 1024
+	}
+	return *c.MaxPackageBytes
+}
+
+// MultiSignalMinSourcesOrDefault returns the effective multi-signal
+// threshold, substituting the default when omitted.
+func (c CorrelatorConfig) MultiSignalMinSourcesOrDefault() int {
+	if c.MultiSignalMinSources == nil {
+		return 2
+	}
+	return *c.MultiSignalMinSources
+}
+
+// HighSeverityThresholdOrDefault returns the effective severity
+// threshold, substituting the default when omitted.
+func (c CorrelatorConfig) HighSeverityThresholdOrDefault() int {
+	if c.HighSeverityThreshold == nil {
+		return 50
+	}
+	return *c.HighSeverityThreshold
+}
+
+func (c CorrelatorConfig) validate() error {
+	if c.WindowDuration.Duration() <= 0 {
+		return fmt.Errorf("detection.correlator.window_duration: must be > 0 (got %s)", c.WindowDuration.Duration())
+	}
+	if c.MaxPackageBytes != nil && *c.MaxPackageBytes != 128*1024 {
+		return fmt.Errorf("detection.correlator.max_package_bytes: must be 131072 bytes for Story 1.14 wire cap (got %d)", *c.MaxPackageBytes)
+	}
+	if c.MultiSignalMinSources != nil && *c.MultiSignalMinSources < 2 {
+		return fmt.Errorf("detection.correlator.multi_signal_min_sources: must be >= 2 (got %d)", *c.MultiSignalMinSources)
+	}
+	if c.HighSeverityThreshold != nil {
+		v := *c.HighSeverityThreshold
+		if v < 0 || v > 100 {
+			return fmt.Errorf("detection.correlator.high_severity_threshold: must be in [0,100] (got %d)", v)
+		}
+	}
+	return nil
 }
 
 // PostureConfig configures the Story 1.11 read-on-demand workload
@@ -491,22 +622,39 @@ func Load(path string) (*Config, error) {
 	// Substitute rate-limit defaults before Validate so an operator
 	// who omits the rate_limit block inherits the Story 1.13
 	// production defaults (Enabled=true, threshold=1000, cooldown=60s,
-	// sampling=0.1). Explicit zero values for the int fields are
-	// indistinguishable from omitted-omitempty fields, so omitted is
-	// treated as default; an operator who actually wants threshold=0
-	// must instead set enabled=false.
+	// sampling=0.1). The RateLimitConfig UnmarshalYAML hook preserves
+	// field-presence bits, so explicit zero values are left intact and
+	// rejected by Validate when enabled=true.
 	if cfg != nil {
+		defCorrelator := DefaultCorrelator()
+		if cfg.Detection.Correlator.WindowDuration == 0 {
+			cfg.Detection.Correlator.WindowDuration = defCorrelator.WindowDuration
+		}
+		// Pointer-tagged knobs: nil means "operator omitted, use
+		// default"; a non-nil 0 means "operator explicitly set 0,
+		// hand it to Validate". This split closes P24 (silent override
+		// of operator intent).
+		if cfg.Detection.Correlator.MaxPackageBytes == nil {
+			cfg.Detection.Correlator.MaxPackageBytes = defCorrelator.MaxPackageBytes
+		}
+		if cfg.Detection.Correlator.MultiSignalMinSources == nil {
+			cfg.Detection.Correlator.MultiSignalMinSources = defCorrelator.MultiSignalMinSources
+		}
+		if cfg.Detection.Correlator.HighSeverityThreshold == nil {
+			cfg.Detection.Correlator.HighSeverityThreshold = defCorrelator.HighSeverityThreshold
+		}
+
 		def := DefaultRateLimit()
 		if cfg.RateLimit.Enabled == nil {
 			cfg.RateLimit.Enabled = def.Enabled
 		}
-		if cfg.RateLimit.ThresholdEventsPerSec == 0 {
+		if !cfg.RateLimit.thresholdSet {
 			cfg.RateLimit.ThresholdEventsPerSec = def.ThresholdEventsPerSec
 		}
-		if cfg.RateLimit.CooldownSeconds == 0 {
+		if !cfg.RateLimit.cooldownSet {
 			cfg.RateLimit.CooldownSeconds = def.CooldownSeconds
 		}
-		if cfg.RateLimit.SamplingRate == 0 {
+		if !cfg.RateLimit.samplingSet {
 			cfg.RateLimit.SamplingRate = def.SamplingRate
 		}
 	}
@@ -582,6 +730,9 @@ func (m MetricsConfig) validate() error {
 func (d DetectionConfig) validate() error {
 	if d.BaselineWindow.Duration() <= 0 {
 		return fmt.Errorf("detection.baseline_window: must be > 0 (got %s)", d.BaselineWindow.Duration())
+	}
+	if err := d.Correlator.validate(); err != nil {
+		return err
 	}
 	b := d.ConfidenceBands
 	if err := bandRange("detection.confidence_bands.watch", b.Watch); err != nil {

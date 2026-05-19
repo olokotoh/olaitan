@@ -88,32 +88,44 @@ func TestEvidence(t *testing.T) {
 	}
 }
 
+func TestEvidencePackagesConstant(t *testing.T) {
+	got, err := subjects.Evidence("packages")
+	if err != nil {
+		t.Fatalf("Evidence(packages): %v", err)
+	}
+	if subjects.EvidencePackages != got {
+		t.Errorf("EvidencePackages: got %q, want %q", got, subjects.EvidencePackages)
+	}
+}
+
 func TestConstants(t *testing.T) {
 	want := map[string]string{
-		"RawFalco":        "olaitan.events.raw.falco",
-		"RawAudit":        "olaitan.events.raw.audit",
-		"RawRuntime":      "olaitan.events.raw.runtime",
-		"RawNetwork":      "olaitan.events.raw.network",
-		"RawAppLog":       "olaitan.events.raw.applog",
-		"Normalised":      "olaitan.events.normalised",
-		"ThreatsWatch":    "olaitan.threats.watch",
-		"ThreatsAlert":    "olaitan.threats.alert",
-		"ThreatsAct":      "olaitan.threats.act",
-		"ThreatsIsolate":  "olaitan.threats.isolate",
-		"HealthHeartbeat": "olaitan.health.heartbeat",
+		"RawFalco":         "olaitan.events.raw.falco",
+		"RawAudit":         "olaitan.events.raw.audit",
+		"RawRuntime":       "olaitan.events.raw.runtime",
+		"RawNetwork":       "olaitan.events.raw.network",
+		"RawAppLog":        "olaitan.events.raw.applog",
+		"Normalised":       "olaitan.events.normalised",
+		"ThreatsWatch":     "olaitan.threats.watch",
+		"ThreatsAlert":     "olaitan.threats.alert",
+		"ThreatsAct":       "olaitan.threats.act",
+		"ThreatsIsolate":   "olaitan.threats.isolate",
+		"EvidencePackages": "olaitan.evidence.packages",
+		"HealthHeartbeat":  "olaitan.health.heartbeat",
 	}
 	got := map[string]string{
-		"RawFalco":        subjects.RawFalco,
-		"RawAudit":        subjects.RawAudit,
-		"RawRuntime":      subjects.RawRuntime,
-		"RawNetwork":      subjects.RawNetwork,
-		"RawAppLog":       subjects.RawAppLog,
-		"Normalised":      subjects.Normalised,
-		"ThreatsWatch":    subjects.ThreatsWatch,
-		"ThreatsAlert":    subjects.ThreatsAlert,
-		"ThreatsAct":      subjects.ThreatsAct,
-		"ThreatsIsolate":  subjects.ThreatsIsolate,
-		"HealthHeartbeat": subjects.HealthHeartbeat,
+		"RawFalco":         subjects.RawFalco,
+		"RawAudit":         subjects.RawAudit,
+		"RawRuntime":       subjects.RawRuntime,
+		"RawNetwork":       subjects.RawNetwork,
+		"RawAppLog":        subjects.RawAppLog,
+		"Normalised":       subjects.Normalised,
+		"ThreatsWatch":     subjects.ThreatsWatch,
+		"ThreatsAlert":     subjects.ThreatsAlert,
+		"ThreatsAct":       subjects.ThreatsAct,
+		"ThreatsIsolate":   subjects.ThreatsIsolate,
+		"EvidencePackages": subjects.EvidencePackages,
+		"HealthHeartbeat":  subjects.HealthHeartbeat,
 	}
 	for k, v := range want {
 		if got[k] != v {

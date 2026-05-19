@@ -156,6 +156,45 @@ data:
     {{- end }}
     {{- end }}
     {{- /*
+    Story 1.14: bridge Ring-2 correlator knobs into detection.
+    correlator. maxPackageBytes is pinned to the AC3 128 KiB wire cap;
+    the chart fails fast if an operator attempts to render a divergent
+    value. Every replacement is anchor-guarded to avoid silent drift
+    between values.yaml and config/olaitan.yaml.
+    */ -}}
+    {{- if .Values.correlator }}
+    {{- $co := .Values.correlator }}
+    {{- if and (hasKey $co "maxPackageBytes") (ne (int $co.maxPackageBytes) 131072) }}
+    {{- fail (printf "correlator.maxPackageBytes must remain 131072 bytes for Story 1.14 AC3 (got %d)" (int $co.maxPackageBytes)) }}
+    {{- end }}
+    {{- if and (hasKey $co "multiSignalMinSources") (lt (int $co.multiSignalMinSources) 2) }}
+    {{- fail (printf "correlator.multiSignalMinSources must be >= 2 (got %d)" (int $co.multiSignalMinSources)) }}
+    {{- end }}
+    {{- if and (hasKey $co "highSeverityThreshold") (or (lt (int $co.highSeverityThreshold) 0) (gt (int $co.highSeverityThreshold) 100)) }}
+    {{- fail (printf "correlator.highSeverityThreshold must be in [0,100] (got %d)" (int $co.highSeverityThreshold)) }}
+    {{- end }}
+    {{- if $co.windowDuration }}
+    {{- $pCw := "(?s)(correlator:.{0,256}?\\n[[:space:]]+)window_duration:[[:space:]]+\"[^\"]*\"" -}}
+    {{- if not (mustRegexFind $pCw $cfg) }}{{- fail (printf "helm bridge: correlator.window_duration anchor not found (pattern %q)" $pCw) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pCw $cfg (printf "${1}window_duration: %q" $co.windowDuration) }}
+    {{- end }}
+    {{- if hasKey $co "maxPackageBytes" }}
+    {{- $pCm := "(?s)(correlator:.{0,256}?\\n[[:space:]]+)max_package_bytes:[[:space:]]+[0-9]+" -}}
+    {{- if not (mustRegexFind $pCm $cfg) }}{{- fail (printf "helm bridge: correlator.max_package_bytes anchor not found (pattern %q)" $pCm) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pCm $cfg (printf "${1}max_package_bytes: %d" (int $co.maxPackageBytes)) }}
+    {{- end }}
+    {{- if hasKey $co "multiSignalMinSources" }}
+    {{- $pCs := "(?s)(correlator:.{0,256}?\\n[[:space:]]+)multi_signal_min_sources:[[:space:]]+[0-9]+" -}}
+    {{- if not (mustRegexFind $pCs $cfg) }}{{- fail (printf "helm bridge: correlator.multi_signal_min_sources anchor not found (pattern %q)" $pCs) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pCs $cfg (printf "${1}multi_signal_min_sources: %d" (int $co.multiSignalMinSources)) }}
+    {{- end }}
+    {{- if hasKey $co "highSeverityThreshold" }}
+    {{- $pCh := "(?s)(correlator:.{0,256}?\\n[[:space:]]+)high_severity_threshold:[[:space:]]+[0-9]+" -}}
+    {{- if not (mustRegexFind $pCh $cfg) }}{{- fail (printf "helm bridge: correlator.high_severity_threshold anchor not found (pattern %q)" $pCh) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pCh $cfg (printf "${1}high_severity_threshold: %d" (int $co.highSeverityThreshold)) }}
+    {{- end }}
+    {{- end }}
+    {{- /*
     Story 1.11: bridge the chart-side posture knobs into the
     rendered detection.posture block. The cacheTTL ceiling is 60s
     per architecture.md:324 + AC3; the chart fails render if a
@@ -238,22 +277,35 @@ data:
     */ -}}
     {{- if .Values.rateLimit }}
     {{- $rl := .Values.rateLimit }}
+    {{- $rateLimitEnabled := true -}}
+    {{- if hasKey $rl "enabled" }}{{- $rateLimitEnabled = $rl.enabled }}{{- end }}
+    {{- if $rateLimitEnabled }}
+    {{- if and (hasKey $rl "thresholdEventsPerSec") (lt (int $rl.thresholdEventsPerSec) 1) }}
+    {{- fail (printf "rateLimit.thresholdEventsPerSec must be >= 1 when enabled=true (got %d)" (int $rl.thresholdEventsPerSec)) }}
+    {{- end }}
+    {{- if and (hasKey $rl "cooldownSeconds") (lt (int $rl.cooldownSeconds) 1) }}
+    {{- fail (printf "rateLimit.cooldownSeconds must be >= 1 when enabled=true (got %d)" (int $rl.cooldownSeconds)) }}
+    {{- end }}
+    {{- if and (hasKey $rl "samplingRate") (or (le (float64 $rl.samplingRate) 0.0) (gt (float64 $rl.samplingRate) 1.0)) }}
+    {{- fail (printf "rateLimit.samplingRate must be in (0, 1] when enabled=true (got %v)" $rl.samplingRate) }}
+    {{- end }}
+    {{- end }}
     {{- if hasKey $rl "enabled" }}
     {{- $pRle := "(?s)(rate_limit:[[:space:]]*\\n([[:space:]]+[^\\n]*\\n)*?[[:space:]]+)enabled:[[:space:]]+(true|false)" -}}
     {{- if not (mustRegexFind $pRle $cfg) }}{{- fail (printf "helm bridge: rateLimit.enabled anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pRle) }}{{- end }}
     {{- $cfg = regexReplaceAll $pRle $cfg (printf "${1}enabled: %t" $rl.enabled) }}
     {{- end }}
-    {{- if $rl.thresholdEventsPerSec }}
+    {{- if hasKey $rl "thresholdEventsPerSec" }}
     {{- $pRlt := "(?s)(rate_limit:[[:space:]]*\\n([[:space:]]+[^\\n]*\\n)*?[[:space:]]+)threshold_events_per_sec:[[:space:]]+[0-9]+" -}}
     {{- if not (mustRegexFind $pRlt $cfg) }}{{- fail (printf "helm bridge: rateLimit.thresholdEventsPerSec anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pRlt) }}{{- end }}
     {{- $cfg = regexReplaceAll $pRlt $cfg (printf "${1}threshold_events_per_sec: %d" (int $rl.thresholdEventsPerSec)) }}
     {{- end }}
-    {{- if $rl.cooldownSeconds }}
+    {{- if hasKey $rl "cooldownSeconds" }}
     {{- $pRlc := "(?s)(rate_limit:[[:space:]]*\\n([[:space:]]+[^\\n]*\\n)*?[[:space:]]+)cooldown_seconds:[[:space:]]+[0-9]+" -}}
     {{- if not (mustRegexFind $pRlc $cfg) }}{{- fail (printf "helm bridge: rateLimit.cooldownSeconds anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pRlc) }}{{- end }}
     {{- $cfg = regexReplaceAll $pRlc $cfg (printf "${1}cooldown_seconds: %d" (int $rl.cooldownSeconds)) }}
     {{- end }}
-    {{- if $rl.samplingRate }}
+    {{- if hasKey $rl "samplingRate" }}
     {{- $pRls := "(?s)(rate_limit:[[:space:]]*\\n([[:space:]]+[^\\n]*\\n)*?[[:space:]]+)sampling_rate:[[:space:]]+[0-9.]+" -}}
     {{- if not (mustRegexFind $pRls $cfg) }}{{- fail (printf "helm bridge: rateLimit.samplingRate anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pRls) }}{{- end }}
     {{- $cfg = regexReplaceAll $pRls $cfg (printf "${1}sampling_rate: %v" $rl.samplingRate) }}

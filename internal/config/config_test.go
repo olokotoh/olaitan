@@ -515,6 +515,114 @@ func TestPostureConfigOmittedAccepted(t *testing.T) {
 	}
 }
 
+func TestCorrelatorConfigOmittedSubstitutesDefault(t *testing.T) {
+	path := writeConfig(t, validYAML)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Detection.Correlator.WindowDuration.Duration() != 60*time.Second {
+		t.Errorf("WindowDuration: got %s, want 60s", cfg.Detection.Correlator.WindowDuration.Duration())
+	}
+	if got := cfg.Detection.Correlator.MaxPackageBytesOrDefault(); got != 128*1024 {
+		t.Errorf("MaxPackageBytes: got %d, want 131072", got)
+	}
+	if got := cfg.Detection.Correlator.MultiSignalMinSourcesOrDefault(); got != 2 {
+		t.Errorf("MultiSignalMinSources: got %d, want 2", got)
+	}
+	if got := cfg.Detection.Correlator.HighSeverityThresholdOrDefault(); got != 50 {
+		t.Errorf("HighSeverityThreshold: got %d, want 50", got)
+	}
+}
+
+func TestCorrelatorConfigExplicitKnobsHonoured(t *testing.T) {
+	body := strings.Replace(validYAML, "  baseline_window: 24h", "  baseline_window: 24h\n  correlator:\n    window_duration: 45s\n    max_package_bytes: 131072\n    multi_signal_min_sources: 3\n    high_severity_threshold: 60", 1)
+	path := writeConfig(t, body)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Detection.Correlator.WindowDuration.Duration() != 45*time.Second {
+		t.Errorf("WindowDuration: got %s, want 45s", cfg.Detection.Correlator.WindowDuration.Duration())
+	}
+	if got := cfg.Detection.Correlator.MultiSignalMinSourcesOrDefault(); got != 3 {
+		t.Errorf("MultiSignalMinSources: got %d, want 3", got)
+	}
+}
+
+// TestCorrelatorMaxPackageBytesExplicitZeroRejected covers the P24
+// closure: an operator who explicitly sets max_package_bytes to 0
+// must be rejected by Validate, not silently overridden by the Load
+// default substitution.
+func TestCorrelatorMaxPackageBytesExplicitZeroRejected(t *testing.T) {
+	body := strings.Replace(validYAML, "  baseline_window: 24h", "  baseline_window: 24h\n  correlator:\n    max_package_bytes: 0", 1)
+	path := writeConfig(t, body)
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("Load: got nil, want rejection for explicit max_package_bytes=0")
+	}
+	if !strings.Contains(err.Error(), "max_package_bytes") {
+		t.Errorf("error does not mention max_package_bytes: %v", err)
+	}
+}
+
+// TestCorrelatorHighSeverityThresholdExplicitZeroPreserved covers P24:
+// an operator who sets high_severity_threshold to 0 must have the
+// explicit zero survive Load (0 is inside the [0,100] band), not be
+// silently replaced by the default 50.
+func TestCorrelatorHighSeverityThresholdExplicitZeroPreserved(t *testing.T) {
+	body := strings.Replace(validYAML, "  baseline_window: 24h", "  baseline_window: 24h\n  correlator:\n    high_severity_threshold: 0", 1)
+	path := writeConfig(t, body)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Detection.Correlator.HighSeverityThresholdOrDefault(); got != 0 {
+		t.Errorf("HighSeverityThreshold: got %d, want 0 (explicit zero must be honoured)", got)
+	}
+}
+
+// TestCorrelatorMultiSignalMinSourcesExplicitOneRejected covers P24:
+// an explicit 1 must fail Validate's >=2 guard, not be silently
+// replaced by the default 2.
+func TestCorrelatorMultiSignalMinSourcesExplicitOneRejected(t *testing.T) {
+	body := strings.Replace(validYAML, "  baseline_window: 24h", "  baseline_window: 24h\n  correlator:\n    multi_signal_min_sources: 1", 1)
+	path := writeConfig(t, body)
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("Load: got nil, want rejection for multi_signal_min_sources=1")
+	}
+	if !strings.Contains(err.Error(), "multi_signal_min_sources") {
+		t.Errorf("error does not mention multi_signal_min_sources: %v", err)
+	}
+}
+
+func TestCorrelatorConfigRejectsInvalidKnobs(t *testing.T) {
+	cases := []struct {
+		name   string
+		block  string
+		wantIn string
+	}{
+		{"negative window", "window_duration: -1s\n    max_package_bytes: 131072\n    multi_signal_min_sources: 2\n    high_severity_threshold: 50", "window_duration"},
+		{"wrong cap", "window_duration: 60s\n    max_package_bytes: 65536\n    multi_signal_min_sources: 2\n    high_severity_threshold: 50", "max_package_bytes"},
+		{"one source", "window_duration: 60s\n    max_package_bytes: 131072\n    multi_signal_min_sources: 1\n    high_severity_threshold: 50", "multi_signal_min_sources"},
+		{"threshold high", "window_duration: 60s\n    max_package_bytes: 131072\n    multi_signal_min_sources: 2\n    high_severity_threshold: 101", "high_severity_threshold"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := strings.Replace(validYAML, "  baseline_window: 24h", "  baseline_window: 24h\n  correlator:\n    "+tc.block, 1)
+			path := writeConfig(t, body)
+			_, err := config.Load(path)
+			if err == nil {
+				t.Fatalf("Load: got nil, want error containing %q", tc.wantIn)
+			}
+			if !strings.Contains(err.Error(), tc.wantIn) {
+				t.Errorf("error %q missing %q", err, tc.wantIn)
+			}
+		})
+	}
+}
+
 func TestPostureConfigValidDefaults(t *testing.T) {
 	body := strings.Replace(validYAML, "  baseline_window: 24h", "  baseline_window: 24h\n  posture:\n    enabled: true\n    cache_ttl: 60s\n    fetch_timeout: 5s", 1)
 	path := writeConfig(t, body)
@@ -663,7 +771,7 @@ func TestRateLimitExplicitlySetHonoured(t *testing.T) {
 // bound; the runtime layer short-circuits to "publish unmodified" so
 // the validator should not block a sampling_rate=0 disable.
 func TestRateLimitDisabledShortCircuitsValidation(t *testing.T) {
-	body := validYAML + "\nrate_limit:\n  enabled: false\n  threshold_events_per_sec: 0\n  cooldown_seconds: 0\n"
+	body := validYAML + "\nrate_limit:\n  enabled: false\n  threshold_events_per_sec: 0\n  cooldown_seconds: 0\n  sampling_rate: 0\n"
 	path := writeConfig(t, body)
 	if _, err := config.Load(path); err != nil {
 		t.Fatalf("Load: got %v, want nil (disabled state should not require positive thresholds)", err)
@@ -698,23 +806,12 @@ func TestRateLimitValidateRejectsBadKnobs(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			path := writeConfig(t, tc.body)
-			// The default substitution at Load fills zero ints with the
-			// production defaults, so the "zero" cases above need a
-			// post-Load tweak to actually exercise Validate's rejection.
 			_, err := config.Load(path)
-			if tc.wantIn == "sampling_rate" {
-				if err == nil {
-					t.Fatal("Load: got nil, want rejection")
-				}
-				if !strings.Contains(err.Error(), tc.wantIn) {
-					t.Errorf("error does not mention %q: %v", tc.wantIn, err)
-				}
-				return
+			if err == nil {
+				t.Fatal("Load: got nil, want rejection")
 			}
-			// For the int-zero cases, Load substitutes the default; we
-			// must call Validate directly on a tweaked Config.
-			if err != nil {
-				t.Fatalf("Load: %v (default substitution should have made this valid)", err)
+			if !strings.Contains(err.Error(), tc.wantIn) {
+				t.Errorf("error does not mention %q: %v", tc.wantIn, err)
 			}
 		})
 	}
@@ -728,6 +825,7 @@ func TestRateLimitValidateRejectsBadKnobs(t *testing.T) {
 			Detection: config.DetectionConfig{
 				ConfidenceBands: config.ConfidenceBands{Watch: 40, Alert: 70, Act: 90},
 				BaselineWindow:  config.DurationYAML(24 * time.Hour),
+				Correlator:      config.DefaultCorrelator(),
 			},
 			Analyst: config.AnalystConfig{
 				Provider: "api",
@@ -748,4 +846,15 @@ func TestRateLimitValidateRejectsBadKnobs(t *testing.T) {
 			t.Errorf("error: %v", err)
 		}
 	})
+}
+
+func TestRateLimitUnknownKeyRejected(t *testing.T) {
+	path := writeConfig(t, validYAML+"\nrate_limit:\n  threshold_events_per_second: 500\n")
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("Load: got nil, want unknown-key rejection")
+	}
+	if !strings.Contains(err.Error(), "threshold_events_per_second") {
+		t.Errorf("error does not mention unknown key: %v", err)
+	}
 }

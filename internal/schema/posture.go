@@ -188,3 +188,116 @@ const (
 	ContainerKindRegular   = "regular"
 	ContainerKindEphemeral = "ephemeral"
 )
+
+// Clone returns a deep copy of p. The posture client's cache may
+// return the same *WorkloadPosture to multiple concurrent callers; if
+// the correlator attaches that pointer directly to an EvidencePackage,
+// a later cache refresh can mutate the package between assembly and
+// JSON marshalling. Clone breaks that aliasing so a downstream consumer
+// sees a stable snapshot.
+func (p *WorkloadPosture) Clone() *WorkloadPosture {
+	if p == nil {
+		return nil
+	}
+	out := *p
+	if p.Identity != (WorkloadIdentity{}) {
+		out.Identity = p.Identity
+	}
+	if len(p.RoleBindings) > 0 {
+		out.RoleBindings = make([]RoleBindingRef, len(p.RoleBindings))
+		for i, rb := range p.RoleBindings {
+			cp := rb
+			if len(rb.Verbs) > 0 {
+				cp.Verbs = append([]string(nil), rb.Verbs...)
+			}
+			if len(rb.Resources) > 0 {
+				cp.Resources = append([]string(nil), rb.Resources...)
+			}
+			out.RoleBindings[i] = cp
+		}
+	}
+	if len(p.ClusterRoleBindings) > 0 {
+		out.ClusterRoleBindings = make([]ClusterRoleBindingRef, len(p.ClusterRoleBindings))
+		for i, crb := range p.ClusterRoleBindings {
+			cp := crb
+			if len(crb.Verbs) > 0 {
+				cp.Verbs = append([]string(nil), crb.Verbs...)
+			}
+			if len(crb.Resources) > 0 {
+				cp.Resources = append([]string(nil), crb.Resources...)
+			}
+			out.ClusterRoleBindings[i] = cp
+		}
+	}
+	if len(p.NetworkPolicies) > 0 {
+		out.NetworkPolicies = make([]NetworkPolicyRef, len(p.NetworkPolicies))
+		for i, np := range p.NetworkPolicies {
+			cp := np
+			if len(np.PolicyTypes) > 0 {
+				cp.PolicyTypes = append([]string(nil), np.PolicyTypes...)
+			}
+			out.NetworkPolicies[i] = cp
+		}
+	}
+	if p.PodSecurityContext != nil {
+		pscCopy := *p.PodSecurityContext
+		if p.PodSecurityContext.RunAsUser != nil {
+			v := *p.PodSecurityContext.RunAsUser
+			pscCopy.RunAsUser = &v
+		}
+		if p.PodSecurityContext.RunAsGroup != nil {
+			v := *p.PodSecurityContext.RunAsGroup
+			pscCopy.RunAsGroup = &v
+		}
+		if p.PodSecurityContext.RunAsNonRoot != nil {
+			v := *p.PodSecurityContext.RunAsNonRoot
+			pscCopy.RunAsNonRoot = &v
+		}
+		if p.PodSecurityContext.FSGroup != nil {
+			v := *p.PodSecurityContext.FSGroup
+			pscCopy.FSGroup = &v
+		}
+		if len(p.PodSecurityContext.SupplementalGroups) > 0 {
+			pscCopy.SupplementalGroups = append([]int64(nil), p.PodSecurityContext.SupplementalGroups...)
+		}
+		out.PodSecurityContext = &pscCopy
+	}
+	if len(p.ContainerSecurityContexts) > 0 {
+		out.ContainerSecurityContexts = make([]ContainerSecurityContextSummary, len(p.ContainerSecurityContexts))
+		for i, csc := range p.ContainerSecurityContexts {
+			cp := csc
+			if csc.Privileged != nil {
+				v := *csc.Privileged
+				cp.Privileged = &v
+			}
+			if csc.AllowPrivilegeEscalation != nil {
+				v := *csc.AllowPrivilegeEscalation
+				cp.AllowPrivilegeEscalation = &v
+			}
+			if csc.ReadOnlyRootFilesystem != nil {
+				v := *csc.ReadOnlyRootFilesystem
+				cp.ReadOnlyRootFilesystem = &v
+			}
+			if csc.RunAsUser != nil {
+				v := *csc.RunAsUser
+				cp.RunAsUser = &v
+			}
+			if csc.RunAsGroup != nil {
+				v := *csc.RunAsGroup
+				cp.RunAsGroup = &v
+			}
+			if csc.RunAsNonRoot != nil {
+				v := *csc.RunAsNonRoot
+				cp.RunAsNonRoot = &v
+			}
+			if len(csc.AddedCapabilities) > 0 {
+				cp.AddedCapabilities = append([]string(nil), csc.AddedCapabilities...)
+			}
+			if len(csc.DroppedCapabilities) > 0 {
+				cp.DroppedCapabilities = append([]string(nil), csc.DroppedCapabilities...)
+			}
+			out.ContainerSecurityContexts[i] = cp
+		}
+	}
+	return &out
+}

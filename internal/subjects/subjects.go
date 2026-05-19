@@ -51,6 +51,9 @@ const StatePrefix = "olaitan.state."
 // Use Evidence(kind) to build a subject.
 const EvidencePrefix = "olaitan.evidence."
 
+// EvidencePackages is the Ring-2 EvidencePackage subject.
+const EvidencePackages = EvidencePrefix + "packages"
+
 // Health: per-ring health status.
 const (
 	HealthPrefix    = "olaitan.health."
