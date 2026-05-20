@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -213,6 +214,11 @@ type DetectionConfig struct {
 	// workload posture client (FR7). architecture.md:324 pins the
 	// 60s cache TTL ceiling; validate enforces it.
 	Posture PostureConfig `yaml:"posture,omitempty"`
+	// Story 1.15: rules sub-block configures the OLT Sigma rule
+	// engine (FR15, FR49). Enabled is a pointer so the loader can
+	// distinguish "operator omitted enabled, default to true" from
+	// "operator explicitly set false" per the Story 1.14 D2 pattern.
+	Rules RulesConfig `yaml:"rules,omitempty"`
 }
 
 // CorrelatorConfig controls the Story 1.14 Ring-2 sliding-window
@@ -324,6 +330,69 @@ func (p PostureConfig) validate() error {
 	}
 	if p.FetchTimeout.Duration() < 0 {
 		return fmt.Errorf("detection.posture.fetch_timeout: must be >= 0 (0 means default; got %s)", p.FetchTimeout.Duration())
+	}
+	return nil
+}
+
+// RulesConfig configures the Story 1.15 OLT Sigma rule engine.
+//
+// Enabled is a pointer (per the Story 1.14 D2 pointer-field
+// precedent) so the loader distinguishes "operator omitted the
+// field, default to enabled=true" from "operator explicitly set
+// false". A sensing-only mode disables the engine entirely; the
+// JetStream consumer olaitan-rules-engine is not created in that
+// case and startAggregatorRing skips the engine goroutine.
+//
+// Path is the absolute directory the rule loader watches; it must
+// match the aggregator Deployment's ConfigMap volumeMount. The
+// engine's fsnotify watcher handles ConfigMap projected-volume
+// swaps, so changing the ConfigMap contents reloads the rule
+// corpus without restarting the controller. Changing Path itself
+// goes through the config.Manager.Subscribe hot-reload callback
+// and re-instantiates the loader (operationally rare).
+type RulesConfig struct {
+	Enabled *bool  `yaml:"enabled,omitempty"`
+	Path    string `yaml:"path,omitempty"`
+}
+
+// DefaultRules returns the Story 1.15 production defaults: engine
+// enabled, rule corpus mounted at the canonical /etc/olaitan/rules.
+func DefaultRules() RulesConfig {
+	t := true
+	return RulesConfig{
+		Enabled: &t,
+		Path:    "/etc/olaitan/rules",
+	}
+}
+
+// EnabledOrDefault reports the effective enabled state, treating a
+// nil pointer as the default (true) per RateLimitConfig precedent.
+func (r RulesConfig) EnabledOrDefault() bool {
+	if r.Enabled == nil {
+		return true
+	}
+	return *r.Enabled
+}
+
+// validate enforces RulesConfig invariants. When enabled=true the
+// path must be non-empty and absolute. When enabled=false the block
+// may stay zero-valued; the engine is not constructed and the path
+// is unused. A nil Enabled pointer means the operator did not
+// declare the block and Load did not run (e.g. an in-memory Config
+// constructed by tests); skip validation in that case so tests can
+// build a minimal valid Config without populating every sub-block.
+func (r RulesConfig) validate() error {
+	if r.Enabled == nil {
+		return nil
+	}
+	if !*r.Enabled {
+		return nil
+	}
+	if r.Path == "" {
+		return errors.New("detection.rules.path: required when rules.enabled=true")
+	}
+	if !filepath.IsAbs(r.Path) {
+		return fmt.Errorf("detection.rules.path: must be an absolute path (got %q)", r.Path)
 	}
 	return nil
 }
@@ -657,6 +726,18 @@ func Load(path string) (*Config, error) {
 		if !cfg.RateLimit.samplingSet {
 			cfg.RateLimit.SamplingRate = def.SamplingRate
 		}
+
+		// Story 1.15: substitute rules defaults before Validate so an
+		// operator who omits the block inherits engine-enabled with
+		// the canonical /etc/olaitan/rules path. The pointer-tagged
+		// Enabled lets an explicit `enabled: false` survive intact.
+		defRules := DefaultRules()
+		if cfg.Detection.Rules.Enabled == nil {
+			cfg.Detection.Rules.Enabled = defRules.Enabled
+		}
+		if cfg.Detection.Rules.Path == "" {
+			cfg.Detection.Rules.Path = defRules.Path
+		}
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -760,6 +841,9 @@ func (d DetectionConfig) validate() error {
 		return err
 	}
 	if err := d.Posture.validate(); err != nil {
+		return err
+	}
+	if err := d.Rules.validate(); err != nil {
 		return err
 	}
 	return nil

@@ -293,6 +293,54 @@ func (r *Registry) RegisterCounter(name, source, help string, labels prometheus.
 // Prometheus counter monotonicity contract.
 type GaugeReader = func() int64
 
+// RegisterHistogram binds a histogram metric to the Prometheus
+// surface and returns the prometheus.Histogram handle so the caller
+// can Observe() per event on the hot path. Unlike RegisterCounter /
+// RegisterGauge, the histogram is a writeable instrument: registries
+// of pre-existing atomics do not compose with the histogram shape,
+// so the caller takes ownership of the returned handle.
+//
+// Story 1.15 (FR50 alignment) introduces this helper so the OLT
+// Sigma rule engine can register
+// olaitan_decision_rules_evaluation_seconds with buckets sized
+// against the NFR3 100 ms p99 gate. Naming convention: histograms
+// carry the unit suffix (e.g., _seconds, _bytes); they do NOT carry
+// _total.
+//
+// buckets must be in strictly increasing order; the prometheus
+// client validates this internally and the Register call returns an
+// error on violation. An empty buckets slice falls back to
+// prometheus.DefBuckets (10 ms..10 s, ten buckets) which is rarely
+// what an Olaitan caller wants — supply buckets matched to the
+// SLO being observed.
+func (r *Registry) RegisterHistogram(name, source, help string, labels prometheus.Labels, buckets []float64) (prometheus.Histogram, error) {
+	if r == nil {
+		return nil, ErrNilRegistry
+	}
+	if name == "" {
+		return nil, errors.New("metrics: empty metric name")
+	}
+
+	merged := prometheus.Labels{}
+	if source != "" {
+		merged["source"] = source
+	}
+	for k, v := range labels {
+		merged[k] = v
+	}
+
+	h := prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:        name,
+		Help:        help,
+		ConstLabels: merged,
+		Buckets:     buckets,
+	})
+	if err := r.reg.Register(h); err != nil {
+		return nil, fmt.Errorf("metrics: register %s: %w", name, err)
+	}
+	return h, nil
+}
+
 // RegisterGauge binds a gauge metric to the Prometheus surface. Use
 // RegisterCounter for monotonically-increasing values; use RegisterGauge
 // for values that can decrease such as consecutive-EOF counters that

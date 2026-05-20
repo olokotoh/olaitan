@@ -415,6 +415,96 @@ func gatherCount(r *metrics.Registry) (int, error) {
 // silently drop the test dependency.
 var _ = testutil.CollectAndCount
 
+// TestRegisterHistogram_BasicObserve verifies the histogram is
+// registered, the returned handle accepts Observe calls, and the
+// gathered output reports the configured buckets.
+func TestRegisterHistogram_BasicObserve(t *testing.T) {
+	t.Parallel()
+	r := metrics.NewRegistry()
+	buckets := []float64{0.001, 0.005, 0.010}
+	h, err := r.RegisterHistogram(
+		"olaitan_decision_rules_evaluation_seconds_test",
+		"",
+		"test histogram",
+		nil,
+		buckets,
+	)
+	if err != nil {
+		t.Fatalf("RegisterHistogram: %v", err)
+	}
+	h.Observe(0.002)
+	h.Observe(0.007)
+	h.Observe(0.020)
+
+	mfs, err := r.Gatherer().Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	if len(mfs) != 1 {
+		t.Fatalf("metric family count = %d, want 1", len(mfs))
+	}
+	mf := mfs[0]
+	if mf.GetType().String() != "HISTOGRAM" {
+		t.Errorf("type = %s, want HISTOGRAM", mf.GetType())
+	}
+	if got := *mf.Metric[0].Histogram.SampleCount; got != 3 {
+		t.Errorf("sample count = %d, want 3", got)
+	}
+	if got := len(mf.Metric[0].Histogram.Bucket); got != len(buckets) {
+		t.Errorf("bucket count = %d, want %d", got, len(buckets))
+	}
+}
+
+// TestRegisterHistogram_DuplicateNameRejected verifies the
+// underlying prometheus.Registry refuses to register the same name
+// twice.
+func TestRegisterHistogram_DuplicateNameRejected(t *testing.T) {
+	t.Parallel()
+	r := metrics.NewRegistry()
+	if _, err := r.RegisterHistogram("oltm_dup", "", "h", nil, []float64{0.1}); err != nil {
+		t.Fatalf("first register: %v", err)
+	}
+	if _, err := r.RegisterHistogram("oltm_dup", "", "h", nil, []float64{0.1}); err == nil {
+		t.Errorf("second register: expected error, got nil")
+	}
+}
+
+// TestRegisterHistogram_SourceLabelMerged verifies that supplying a
+// non-empty source argument merges a source label onto the histogram.
+func TestRegisterHistogram_SourceLabelMerged(t *testing.T) {
+	t.Parallel()
+	r := metrics.NewRegistry()
+	if _, err := r.RegisterHistogram("oltm_with_source", "rules", "h", nil, []float64{0.1}); err != nil {
+		t.Fatalf("RegisterHistogram: %v", err)
+	}
+	mfs, err := r.Gatherer().Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	var labelValues []string
+	for _, lp := range mfs[0].Metric[0].Label {
+		labelValues = append(labelValues, lp.GetName()+"="+lp.GetValue())
+	}
+	found := false
+	for _, lv := range labelValues {
+		if lv == "source=rules" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected source=rules label, got %v", labelValues)
+	}
+}
+
+// TestRegisterHistogram_NilRegistry verifies the nil-registry guard.
+func TestRegisterHistogram_NilRegistry(t *testing.T) {
+	t.Parallel()
+	var r *metrics.Registry
+	if _, err := r.RegisterHistogram("x", "", "h", nil, []float64{0.1}); !errors.Is(err, metrics.ErrNilRegistry) {
+		t.Errorf("err = %v, want ErrNilRegistry", err)
+	}
+}
+
 func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }

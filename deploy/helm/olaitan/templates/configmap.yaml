@@ -6,10 +6,12 @@ Two ConfigMaps:
     chart remains portable: an operator with only the packaged chart
     (no repo checkout) can still install without the source tree.
 
-  olaitan-rules — the detection rules bundle. Empty in Story 1.7; Story
-    3.4 populates it. We ship the mount surface now so the Deployment's
-    volumeMount is stable across releases — avoiding a "no such path"
-    pod restart when rules first land.
+  olaitan-rules: the detection rules bundle. Empty in Story 1.7; Story
+    1.16 populates it with the initial OLT rule corpus. We ship the
+    mount surface now so the Deployment's volumeMount is stable across
+    releases, avoiding a "no such path" pod restart when rules first
+    land. Story 1.15 wires the in-process rule engine that watches this
+    mount for fsnotify-driven hot reloads.
 
 ConfigMap mount pattern: whole-directory, NOT subPath. subPath breaks
 kubelet's symlink-rotation atomic swap (it snapshots the file at pod-
@@ -311,6 +313,29 @@ data:
     {{- $cfg = regexReplaceAll $pRls $cfg (printf "${1}sampling_rate: %v" $rl.samplingRate) }}
     {{- end }}
     {{- end }}
+    {{- /*
+    Story 1.15: bridge the chart-side rules knobs into detection.rules.
+    The block lives under `detection:` in the rendered olaitan.yaml; the
+    anchor is the literal "rules:" indented by detection's spacing.
+    Both knobs are anchor-guarded via mustRegexFind so a missing anchor
+    fails render rather than silently dropping the operator's --set
+    (mirrors the Story 1.10 P28 pattern).
+    */ -}}
+    {{- if .Values.rules }}
+    {{- $rs := .Values.rules }}
+    {{- if hasKey $rs "enabled" }}
+    {{- $pRen := "(rules:[[:space:]]*\\n[[:space:]]+)enabled:[[:space:]]+(?:true|false)" -}}
+    {{- if not (mustRegexFind $pRen $cfg) }}{{- fail (printf "helm bridge: rules.enabled anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pRen) }}{{- end }}
+    {{- $rEnVal := "false" }}
+    {{- if $rs.enabled }}{{- $rEnVal = "true" }}{{- end }}
+    {{- $cfg = regexReplaceAll $pRen $cfg (printf "${1}enabled: %s" $rEnVal) }}
+    {{- end }}
+    {{- if $rs.path }}
+    {{- $pRp := "(?s)(rules:.{0,128}?\\n[[:space:]]+)path:[[:space:]]+\"[^\"]*\"" -}}
+    {{- if not (mustRegexFind $pRp $cfg) }}{{- fail (printf "helm bridge: rules.path anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pRp) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pRp $cfg (printf "${1}path: %q" $rs.path) }}
+    {{- end }}
+    {{- end }}
     {{- $cfg | nindent 4 }}
 ---
 apiVersion: v1
@@ -320,8 +345,9 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "olaitan.labels" . | nindent 4 }}
-# Empty for now — populated by Story 3.4 (detection rules engine). We
-# render `data: {}` explicitly: Kubernetes accepts both forms, but an
-# explicit empty map prevents `helm diff` from showing churn the first
-# time Story 3.4 lands a real entry.
+# Empty for now: Story 1.15 wires the rule engine that watches this
+# mount; Story 1.16 populates the corpus. We render `data: {}`
+# explicitly: Kubernetes accepts both forms, but an explicit empty map
+# prevents `helm diff` from showing churn the first time Story 1.16
+# lands a real entry.
 data: {}

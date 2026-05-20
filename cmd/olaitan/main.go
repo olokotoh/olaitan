@@ -42,6 +42,8 @@ import (
 	"github.com/olokotoh/olaitan/internal/config"
 	"github.com/olokotoh/olaitan/internal/correlator"
 	correlatorasm "github.com/olokotoh/olaitan/internal/correlator/assembler"
+	"github.com/olokotoh/olaitan/internal/decision/rules"
+	rulesloader "github.com/olokotoh/olaitan/internal/decision/rules/loader"
 	"github.com/olokotoh/olaitan/internal/health"
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
 	"github.com/olokotoh/olaitan/internal/ratelimit"
@@ -364,8 +366,11 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	// No streaming adapters yet (Story 1.14 lands the correlator); the
 	// surface exists so the posture counters (or the posture_disabled
 	// gauge) can be scraped, and so future aggregator-side adapters
-	// inherit the wiring.
-	if _, merr := startMetricsServer(ctx, g, log, cfg, "", nil, client); merr != nil {
+	// inherit the wiring. Story 1.15 reuses the returned registry to
+	// register the rule-engine counters and the
+	// evaluation_seconds histogram.
+	metricsReg, merr := startMetricsServer(ctx, g, log, cfg, "", nil, client)
+	if merr != nil {
 		return fmt.Errorf("aggregator: metrics: %w", merr)
 	}
 
@@ -434,6 +439,50 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		}
 		return nil
 	})
+
+	// Story 1.15: OLT Sigma rule engine wiring. The engine consumes
+	// EvidencePackages from EVIDENCE.packages, evaluates them against
+	// the loaded rule corpus, and re-emits matches through the
+	// correlator's FireRuleMatch entry point (the correlator
+	// satisfies the rules.RuleMatchEmitter interface by signature).
+	// When rules.enabled=false the engine is skipped entirely; the
+	// JetStream consumer olaitan-rules-engine is not created.
+	if cfg.Detection.Rules.EnabledOrDefault() {
+		rl := rulesloader.New(cfg.Detection.Rules.Path, log)
+		if err := rl.Load(); err != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: rules loader: %w", err)
+		}
+		engine, err := rules.New(rules.Config{
+			NATS:    nc,
+			Loader:  rl,
+			Emitter: corr,
+			Metrics: metricsReg,
+			Log:     log,
+		})
+		if err != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: rules engine: %w", err)
+		}
+		g.Go(func() error {
+			if err := rl.Watch(ctx); err != nil {
+				return fmt.Errorf("aggregator: rules watcher: %w", err)
+			}
+			return nil
+		})
+		g.Go(func() error {
+			if err := engine.Run(ctx); err != nil {
+				return fmt.Errorf("aggregator: rules engine run: %w", err)
+			}
+			return nil
+		})
+		log.Info("aggregator: rules engine wired",
+			"path", cfg.Detection.Rules.Path,
+			"count", rl.Get().Len())
+	} else {
+		log.Info("aggregator: rules engine disabled in config; skipping")
+	}
+
 	g.Go(func() error {
 		<-ctx.Done()
 		closeNATS()

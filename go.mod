@@ -5,11 +5,13 @@ go 1.26.0
 require (
 	github.com/alicebob/miniredis/v2 v2.37.0
 	github.com/fsnotify/fsnotify v1.9.0
+	github.com/leanovate/gopter v0.2.11
 	github.com/nats-io/nats-server/v2 v2.11.15
 	github.com/nats-io/nats.go v1.50.0
 	github.com/nxadm/tail v1.4.8
 	github.com/prometheus/client_golang v1.23.2
 	github.com/redis/go-redis/v9 v9.18.0
+	github.com/runreveal/sigmalite v0.0.0-20250918190104-f180cb50a6a1
 	golang.org/x/sync v0.20.0
 	google.golang.org/grpc v1.81.0
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af
