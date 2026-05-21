@@ -450,8 +450,29 @@ func TestRegisterHistogram_BasicObserve(t *testing.T) {
 	if got := *mf.Metric[0].Histogram.SampleCount; got != 3 {
 		t.Errorf("sample count = %d, want 3", got)
 	}
-	if got := len(mf.Metric[0].Histogram.Bucket); got != len(buckets) {
-		t.Errorf("bucket count = %d, want %d", got, len(buckets))
+	// Assert the explicit upper bounds match the configured slice
+	// rather than relying on a count equality. Different prometheus
+	// client versions report the implicit +Inf bucket differently:
+	// some include it in Bucket, some report it via SampleCount only
+	// (code-review P9). Asserting the explicit bounds is robust
+	// across both behaviours and is a strictly stronger assertion.
+	gotBuckets := mf.Metric[0].Histogram.Bucket
+	if len(gotBuckets) < len(buckets) {
+		t.Errorf("explicit bucket count = %d, want >= %d", len(gotBuckets), len(buckets))
+	}
+	for i, want := range buckets {
+		if i >= len(gotBuckets) {
+			break
+		}
+		if got := gotBuckets[i].GetUpperBound(); got != want {
+			t.Errorf("bucket[%d] upper bound = %g, want %g", i, got, want)
+		}
+	}
+	// Either len(buckets) (the +Inf bucket is implicit) or
+	// len(buckets)+1 (the +Inf is materialised as an explicit
+	// bucket). Anything outside this range indicates a real drift.
+	if got := len(gotBuckets); got != len(buckets) && got != len(buckets)+1 {
+		t.Errorf("bucket slice length = %d, want %d or %d (+Inf included)", got, len(buckets), len(buckets)+1)
 	}
 }
 

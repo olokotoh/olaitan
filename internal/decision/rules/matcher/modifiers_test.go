@@ -1,13 +1,30 @@
 package matcher
 
 import (
-	"strings"
+	"sync"
 	"testing"
 
 	sigma "github.com/runreveal/sigmalite"
 
 	"github.com/olokotoh/olaitan/internal/decision/rules/parser"
 )
+
+// modifierCoverageMu and modifierCovered back the
+// TestModifierCoverageMatrix gate. Each per-modifier test calls
+// noteModifierCovered at the top with the canonical modifier name;
+// the matrix at the end of this file asserts every modifier in the
+// expected set was exercised. Replaces the prior tautological
+// implementation (code-review P6).
+var (
+	modifierCoverageMu sync.Mutex
+	modifierCovered    = map[string]bool{}
+)
+
+func noteModifierCovered(name string) {
+	modifierCoverageMu.Lock()
+	defer modifierCoverageMu.Unlock()
+	modifierCovered[name] = true
+}
 
 func ruleFor(t *testing.T, body string) *parser.Rule {
 	t.Helper()
@@ -32,6 +49,7 @@ func mustMatch(t *testing.T, r *parser.Rule, ev map[string]string, placeholders 
 }
 
 func TestModifier_Contains(t *testing.T) {
+	noteModifierCovered("contains")
 	rule := ruleFor(t, `
 title: t
 id: OLT-EXEC-001
@@ -46,6 +64,7 @@ detection:
 }
 
 func TestModifier_All(t *testing.T) {
+	noteModifierCovered("all")
 	rule := ruleFor(t, `
 title: t
 id: OLT-EXEC-002
@@ -62,6 +81,7 @@ detection:
 }
 
 func TestModifier_StartsWith(t *testing.T) {
+	noteModifierCovered("startswith")
 	rule := ruleFor(t, `
 title: t
 id: OLT-EXEC-003
@@ -76,6 +96,7 @@ detection:
 }
 
 func TestModifier_EndsWith(t *testing.T) {
+	noteModifierCovered("endswith")
 	rule := ruleFor(t, `
 title: t
 id: OLT-EXEC-004
@@ -90,6 +111,7 @@ detection:
 }
 
 func TestModifier_Windash(t *testing.T) {
+	noteModifierCovered("windash")
 	rule := ruleFor(t, `
 title: t
 id: OLT-EXEC-005
@@ -103,6 +125,7 @@ detection:
 }
 
 func TestModifier_Base64(t *testing.T) {
+	noteModifierCovered("base64")
 	// sigmalite's |base64 modifier base64-encodes the search literal
 	// and then performs an exact match against the field. The
 	// trailing "=" padding is included; matching against an exact
@@ -124,6 +147,7 @@ detection:
 }
 
 func TestModifier_Base64Offset(t *testing.T) {
+	noteModifierCovered("base64offset")
 	rule := ruleFor(t, `
 title: t
 id: OLT-EXEC-007
@@ -139,6 +163,7 @@ detection:
 }
 
 func TestModifier_Re(t *testing.T) {
+	noteModifierCovered("re")
 	rule := ruleFor(t, `
 title: t
 id: OLT-EXEC-008
@@ -153,6 +178,7 @@ detection:
 }
 
 func TestModifier_CIDR(t *testing.T) {
+	noteModifierCovered("cidr")
 	rule := ruleFor(t, `
 title: t
 id: OLT-NET-001
@@ -167,6 +193,7 @@ detection:
 }
 
 func TestModifier_Expand(t *testing.T) {
+	noteModifierCovered("expand")
 	// |expand resolves placeholder lookups against
 	// MatchOptions.Placeholders. The placeholder name must be wrapped
 	// in %...% per the sigma spec; combining with |contains is not
@@ -197,17 +224,36 @@ detection:
 // case. If a modifier gets renamed upstream this test surfaces the
 // gap immediately rather than letting AC5 false-pass.
 func TestModifierCoverageMatrix(t *testing.T) {
-	covered := []string{
+	expected := []string{
 		"contains", "all", "startswith", "endswith", "windash",
 		"base64", "base64offset", "re", "cidr", "expand",
 	}
-	// We assert by name only here: the per-modifier sub-tests above
-	// drive the actual behaviour. This guard exists so a future
-	// refactor that deletes a sub-test surfaces here as a naming
-	// gap.
-	for _, m := range covered {
-		if !strings.Contains(strings.Join(covered, ","), m) {
-			t.Errorf("missing coverage for modifier %q", m)
+	// Assert against the runtime registry populated by each
+	// TestModifier_* test. A deleted per-modifier test surfaces here
+	// because the corresponding noteModifierCovered call never runs
+	// and the expected modifier is reported as missing (code-review
+	// P6). The matrix test must run AFTER all per-modifier tests;
+	// Go's testing package runs top-level tests in source order, so
+	// keeping this function last in the file is load-bearing.
+	modifierCoverageMu.Lock()
+	defer modifierCoverageMu.Unlock()
+	for _, m := range expected {
+		if !modifierCovered[m] {
+			t.Errorf("modifier %q: no TestModifier_* test exercised it (or noteModifierCovered call missing)", m)
+		}
+	}
+	// Surface registry-only entries so a typo in expected vs the
+	// note call is caught both directions.
+	for m := range modifierCovered {
+		found := false
+		for _, e := range expected {
+			if e == m {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("modifier %q: registered via noteModifierCovered but not in the expected list", m)
 		}
 	}
 }

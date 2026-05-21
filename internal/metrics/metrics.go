@@ -311,7 +311,7 @@ type GaugeReader = func() int64
 // client validates this internally and the Register call returns an
 // error on violation. An empty buckets slice falls back to
 // prometheus.DefBuckets (10 ms..10 s, ten buckets) which is rarely
-// what an Olaitan caller wants — supply buckets matched to the
+// what an Olaitan caller wants - supply buckets matched to the
 // SLO being observed.
 func (r *Registry) RegisterHistogram(name, source, help string, labels prometheus.Labels, buckets []float64) (prometheus.Histogram, error) {
 	if r == nil {

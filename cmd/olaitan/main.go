@@ -448,6 +448,16 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	// When rules.enabled=false the engine is skipped entirely; the
 	// JetStream consumer olaitan-rules-engine is not created.
 	if cfg.Detection.Rules.EnabledOrDefault() {
+		// Defensive: validate() skips the Path check when Enabled is
+		// nil (so test-bypass Configs can omit the block). If a
+		// caller reaches here with a nil Enabled (treated as the
+		// default true) and an empty Path, fail loud rather than
+		// crashing inside the loader's WalkDir("") later
+		// (code-review P22).
+		if cfg.Detection.Rules.Path == "" {
+			closeNATS()
+			return errors.New("aggregator: detection.rules.path is empty but rules engine is enabled")
+		}
 		rl := rulesloader.New(cfg.Detection.Rules.Path, log)
 		if err := rl.Load(); err != nil {
 			closeNATS()
@@ -464,6 +474,17 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 			closeNATS()
 			return fmt.Errorf("aggregator: rules engine: %w", err)
 		}
+		// Wire the loader's reject path to the engine's
+		// rejected-counter hook so olaitan_decision_rules_reloads_total
+		// {outcome="rejected"} stays in sync with reload-rejected log
+		// lines (code-review P1).
+		rl.SubscribeRejected(func(error) { engine.NoteReloadRejected() })
+		// Note: rules.path and rules.enabled changes are intentionally
+		// not wired through config.Manager.Subscribe (code-review D3).
+		// The loader path is a K8s volume mountPath; changing it via
+		// helm upgrade rewrites the Deployment spec which K8s rolls
+		// anyway, so "hot-reload" of path is architecturally
+		// meaningless. The enabled toggle is restart-required by design.
 		g.Go(func() error {
 			if err := rl.Watch(ctx); err != nil {
 				return fmt.Errorf("aggregator: rules watcher: %w", err)

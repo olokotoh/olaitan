@@ -326,6 +326,60 @@ func TestParseRule_RuleIDGrammar(t *testing.T) {
 	}
 }
 
+// TestParseRule_MissingTitle asserts a rule without the required
+// title key fails parse. sigmalite delegates the requirement; the
+// OLT parser propagates the error verbatim (code-review P14 /
+// AC5(b)).
+func TestParseRule_MissingTitle(t *testing.T) {
+	body := `
+id: OLT-EXEC-001
+attack: [T1234]
+detection:
+  sel:
+    process.exe|contains: 'curl'
+  condition: sel
+`
+	_, err := ParseRule([]byte(body))
+	if err == nil {
+		t.Fatal("expected error for missing title, got nil")
+	}
+}
+
+// TestParseRule_MissingDetection asserts a rule without the detection
+// key fails parse. sigmalite enforces the requirement (code-review
+// P14 / AC5(b)).
+func TestParseRule_MissingDetection(t *testing.T) {
+	body := `
+title: t
+id: OLT-EXEC-001
+attack: [T1234]
+`
+	_, err := ParseRule([]byte(body))
+	if err == nil {
+		t.Fatal("expected error for missing detection, got nil")
+	}
+}
+
+// TestParseRule_EmptyDetectionClause asserts a rule with detection
+// declared but containing zero selection clauses (i.e. only the
+// `condition:` key) fails parse. A rule with no clauses cannot
+// produce matches and its evaluation behaviour under sigmalite is
+// undefined; reject at parse time so operators get a clear error
+// rather than a silently never-matching rule (code-review P20).
+func TestParseRule_EmptyDetectionClause(t *testing.T) {
+	body := `
+title: t
+id: OLT-EXEC-001
+attack: [T1234]
+detection:
+  condition: sel
+`
+	_, err := ParseRule([]byte(body))
+	if err == nil {
+		t.Fatal("expected error for detection containing only a condition (no selection clauses)")
+	}
+}
+
 func TestParseRule_MalformedYAML(t *testing.T) {
 	cases := []string{
 		"   not valid: yaml: at: all:",

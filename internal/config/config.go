@@ -381,6 +381,9 @@ func (r RulesConfig) EnabledOrDefault() bool {
 // declare the block and Load did not run (e.g. an in-memory Config
 // constructed by tests); skip validation in that case so tests can
 // build a minimal valid Config without populating every sub-block.
+// startAggregatorRing layers a defensive Path-non-empty check at
+// engine-construction time (cmd/olaitan/main.go:startAggregatorRing)
+// to catch the rare bypass case (code-review P22 defense in depth).
 func (r RulesConfig) validate() error {
 	if r.Enabled == nil {
 		return nil

@@ -643,17 +643,27 @@ rateLimit:
 # mode); the JetStream consumer olaitan-rules-engine is not created in
 # that case. Hot-reload watches the directory for ConfigMap ..data
 # symlink swaps and applies new rules without restarting the pod.
+#
+# Restart semantics (code-review D3):
+# - rule corpus contents (the YAML files under `path`): hot-reloaded
+#   via fsnotify, no pod restart.
+# - rules.path: a K8s volume mountPath; changing this value rewrites
+#   the aggregator Deployment spec which K8s rolls anyway. Treated as
+#   restart-required by design; the aggregator pod is recreated.
+# - rules.enabled: restart-required. Flipping this between true and
+#   false drives a new startAggregatorRing wiring; the aggregator
+#   pod must be recreated. Use `kubectl rollout restart deploy/
+#   olaitan-aggregator` after `helm upgrade --set rules.enabled=...`.
 rules:
   # Whether startAggregatorRing constructs the rule engine. Disabling
   # is the sensing-only mode used in the Epic 5 four-way evaluation
-  # comparison (config RS).
+  # comparison (config RS). Restart-required (see comment above).
   enabled: true
 
   # Absolute path the rule loader watches. Must match the aggregator
   # Deployment's ConfigMap volumeMount path. Hot-reload tolerates an
-  # in-place ConfigMap data swap; changing the path itself triggers a
-  # loader re-instantiation through the config.Manager.Subscribe
-  # callback (operationally rare).
+  # in-place ConfigMap data swap; changing the path value itself is a
+  # Deployment-spec change so the pod rolls (restart-required).
   path: "/etc/olaitan/rules"
 
 # --- Subchart overrides ------------------------------------------------

@@ -128,10 +128,15 @@ func PostureFields(p *schema.WorkloadPosture) map[string]string {
 	if p.ServiceAccount != "" {
 		out["k8s.pod.serviceaccount"] = p.ServiceAccount
 	}
-	// First container's image (container.image is the canonical
-	// scalar in the dialect spec; multi-container exposure goes via
-	// rules using `all` or `any` on the container array, future work
-	// once a rule actually needs it).
+	// First container's name. docs/sigma-extensions.md §3 also lists
+	// k8s.container.image as a supported posture field, but
+	// schema.WorkloadPosture has no Image field today (Story 1.11
+	// scope). Story 1.16 rule-corpus authors should consult
+	// docs/sigma-extensions.md and, if they need k8s.container.image,
+	// plumb an Image field onto WorkloadPosture via the posture
+	// client and project it here. Until then, rules referencing
+	// k8s.container.image silently miss; this is a known gap
+	// recorded as code-review D2 against Story 1.15.
 	if len(p.ContainerSecurityContexts) > 0 {
 		out["k8s.container.name"] = p.ContainerSecurityContexts[0].ContainerName
 	}
@@ -150,8 +155,29 @@ func PostureFields(p *schema.WorkloadPosture) map[string]string {
 // returned map before handing it to NewResolver (the spike POC's
 // loadFixture does this for JSON fixtures; the engine path lets each
 // adapter supply its own flattener).
+//
+// Precedence: schema-canonical fields (event.id, event.source, etc.)
+// always win over a Raw-JSON field of the same name. The Raw flatten
+// runs first, then the canonical projection overwrites; otherwise an
+// adapter-emitted "event.id" key in Raw would silently shadow the
+// schema-authoritative ev.ID.
 func EventFields(ev schema.Event) map[string]string {
 	out := map[string]string{}
+	// Flatten Event.Raw if it's a JSON object. The OLT adapter
+	// contract (Stories 1.6-1.10) is that Raw carries an
+	// adapter-specific snake_case JSON object; flattening it onto
+	// the resolver lets rules reference adapter-specific fields
+	// (process.exe, network.dst_port, etc.) by their canonical names.
+	if len(ev.Raw) > 0 {
+		var flat map[string]any
+		if err := json.Unmarshal(ev.Raw, &flat); err == nil {
+			for k, v := range flat {
+				out[k] = stringify(v)
+			}
+		}
+	}
+	// Canonical projection runs AFTER the Raw flatten so the
+	// schema-authoritative event fields always win.
 	if ev.ID != "" {
 		out["event.id"] = ev.ID
 	}
@@ -166,19 +192,6 @@ func EventFields(ev schema.Event) map[string]string {
 	}
 	if ev.Summary != "" {
 		out["event.summary"] = ev.Summary
-	}
-	// Flatten Event.Raw if it's a JSON object. The OLT adapter
-	// contract (Stories 1.6-1.10) is that Raw carries an
-	// adapter-specific snake_case JSON object; flattening it onto
-	// the resolver lets rules reference adapter-specific fields
-	// (process.exe, network.dst_port, etc.) by their canonical names.
-	if len(ev.Raw) > 0 {
-		var flat map[string]any
-		if err := json.Unmarshal(ev.Raw, &flat); err == nil {
-			for k, v := range flat {
-				out[k] = stringify(v)
-			}
-		}
 	}
 	return out
 }

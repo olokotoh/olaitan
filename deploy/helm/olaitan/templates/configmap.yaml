@@ -315,24 +315,30 @@ data:
     {{- end }}
     {{- /*
     Story 1.15: bridge the chart-side rules knobs into detection.rules.
-    The block lives under `detection:` in the rendered olaitan.yaml; the
-    anchor is the literal "rules:" indented by detection's spacing.
-    Both knobs are anchor-guarded via mustRegexFind so a missing anchor
-    fails render rather than silently dropping the operator's --set
-    (mirrors the Story 1.10 P28 pattern).
+    The block lives under `detection:` in the rendered olaitan.yaml at
+    exact 2-space indent (`  rules:`) with 4-space-indented children
+    (`    enabled:`, `    path:`). Anchoring on that precise indent
+    structure rather than a literal `detection:` prefix avoids both
+    the Go-regex {0,N} repetition limit and the Falco-subchart
+    `rules:` collision the auditor flagged (code-review P23): a
+    subchart renders its `rules:` at a different scope and indent so
+    these anchors will not match it. Each knob is anchor-guarded via
+    mustRegexFind so a missing anchor fails render rather than
+    silently dropping the operator's --set (mirrors the Story 1.10
+    P28 pattern).
     */ -}}
     {{- if .Values.rules }}
     {{- $rs := .Values.rules }}
     {{- if hasKey $rs "enabled" }}
-    {{- $pRen := "(rules:[[:space:]]*\\n[[:space:]]+)enabled:[[:space:]]+(?:true|false)" -}}
-    {{- if not (mustRegexFind $pRen $cfg) }}{{- fail (printf "helm bridge: rules.enabled anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pRen) }}{{- end }}
+    {{- $pRen := "(\\n  rules:[[:space:]]*\\n    )enabled:[[:space:]]+(?:true|false)" -}}
+    {{- if not (mustRegexFind $pRen $cfg) }}{{- fail (printf "helm bridge: detection.rules.enabled anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pRen) }}{{- end }}
     {{- $rEnVal := "false" }}
     {{- if $rs.enabled }}{{- $rEnVal = "true" }}{{- end }}
     {{- $cfg = regexReplaceAll $pRen $cfg (printf "${1}enabled: %s" $rEnVal) }}
     {{- end }}
     {{- if $rs.path }}
-    {{- $pRp := "(?s)(rules:.{0,128}?\\n[[:space:]]+)path:[[:space:]]+\"[^\"]*\"" -}}
-    {{- if not (mustRegexFind $pRp $cfg) }}{{- fail (printf "helm bridge: rules.path anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pRp) }}{{- end }}
+    {{- $pRp := "(?s)(\\n  rules:[[:space:]]*\\n    enabled:[[:space:]]+(?:true|false)\\n    )path:[[:space:]]+\"[^\"]*\"" -}}
+    {{- if not (mustRegexFind $pRp $cfg) }}{{- fail (printf "helm bridge: detection.rules.path anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pRp) }}{{- end }}
     {{- $cfg = regexReplaceAll $pRp $cfg (printf "${1}path: %q" $rs.path) }}
     {{- end }}
     {{- end }}

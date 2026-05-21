@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,6 +39,12 @@ import (
 // 50 ms value matches internal/config/watcher.go; see its commentary
 // for why the value sits where it does.
 const debounceWindow = 50 * time.Millisecond
+
+// maxRuleFileBytes caps a single rule YAML at 1 MiB. The OLT dialect
+// rules in the spike POC are well under 4 KiB; the cap defends
+// against an oversized or maliciously crafted ConfigMap entry that
+// would otherwise let parser.ParseRule OOM the aggregator.
+const maxRuleFileBytes = 1 << 20
 
 // ErrWatcherRunning is returned when Watch is called on a Loader
 // that already has a live watcher goroutine.
@@ -74,8 +81,9 @@ type Loader struct {
 	cur atomic.Pointer[Corpus]
 	log *slog.Logger
 
-	subsMu sync.Mutex
-	subs   []func(*Corpus)
+	subsMu       sync.Mutex
+	subs         []func(*Corpus)
+	rejectedSubs []func(error)
 
 	running atomic.Bool
 }
@@ -123,10 +131,11 @@ func (l *Loader) Get() *Corpus {
 }
 
 // Subscribe registers a callback fired after every successful
-// reload. The callback runs synchronously on the watcher goroutine
-// under defer/recover so a single panicking subscriber does not
-// silence the rest. NewManager-style "fired on initial load too"
-// is intentionally not provided: callers already hold the pointer
+// reload. The callback runs on the timer goroutine spawned by
+// time.AfterFunc (not the fsnotify select-loop goroutine) under
+// defer/recover so a single panicking subscriber does not silence
+// the rest. NewManager-style "fired on initial load too" is
+// intentionally not provided: callers already hold the pointer
 // returned by Load.
 func (l *Loader) Subscribe(fn func(*Corpus)) {
 	if l == nil || fn == nil {
@@ -134,6 +143,20 @@ func (l *Loader) Subscribe(fn func(*Corpus)) {
 	}
 	l.subsMu.Lock()
 	l.subs = append(l.subs, fn)
+	l.subsMu.Unlock()
+}
+
+// SubscribeRejected registers a callback fired after every reload
+// that fails parser/validation. Runs on the same timer goroutine as
+// Subscribe under the same defer/recover discipline. The engine uses
+// this hook to keep the olaitan_decision_rules_reloads_total{outcome=
+// "rejected"} counter in sync with the loader's log-rejected path.
+func (l *Loader) SubscribeRejected(fn func(error)) {
+	if l == nil || fn == nil {
+		return
+	}
+	l.subsMu.Lock()
+	l.rejectedSubs = append(l.rejectedSubs, fn)
 	l.subsMu.Unlock()
 }
 
@@ -216,6 +239,13 @@ func (l *Loader) reload() {
 	corpus, err := l.loadOnce()
 	if err != nil {
 		l.log.Error("rules: reload rejected", "dir", l.dir, "err", err)
+		l.subsMu.Lock()
+		rsnap := make([]func(error), len(l.rejectedSubs))
+		copy(rsnap, l.rejectedSubs)
+		l.subsMu.Unlock()
+		for _, fn := range rsnap {
+			l.callRejectedSubscriber(fn, err)
+		}
 		return
 	}
 	l.cur.Store(corpus)
@@ -241,6 +271,16 @@ func (l *Loader) callSubscriber(fn func(*Corpus), corpus *Corpus) {
 	fn(corpus)
 }
 
+func (l *Loader) callRejectedSubscriber(fn func(error), err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			l.log.Error("rules: rejected-subscriber panic",
+				"dir", l.dir, "panic", r, "stack", string(debug.Stack()))
+		}
+	}()
+	fn(err)
+}
+
 // loadOnce walks l.dir, parses every YAML, and assembles a *Corpus
 // without touching the active pointer. Used by both the eager Load
 // and the watcher's reload path. Duplicate IDs are rejected with a
@@ -257,12 +297,30 @@ func (l *Loader) loadOnce() (*Corpus, error) {
 		if walkErr != nil {
 			return walkErr
 		}
+		// Skip K8s ConfigMap projected-volume hidden "dotdot"
+		// directories (e.g. `..2026_05_21_00_00_00_000000001`); the
+		// loader only consumes the canonical top-level files, which
+		// are symlinks pointing into the rev dir via `..data`.
+		// Without this skip the same rule would be loaded twice
+		// (once via the top-level symlink, once via the rev-dir
+		// path) and the duplicate-ID gate would reject the corpus.
 		if d.IsDir() {
+			base := filepath.Base(path)
+			if strings.HasPrefix(base, "..") && path != l.dir {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		ext := filepath.Ext(path)
 		if ext != ".yaml" && ext != ".yml" {
 			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return fmt.Errorf("rules: stat %s: %w", path, err)
+		}
+		if info.Size() > maxRuleFileBytes {
+			return fmt.Errorf("rules: %s exceeds %d-byte cap (got %d)", path, maxRuleFileBytes, info.Size())
 		}
 		bytes, err := os.ReadFile(path)
 		if err != nil {

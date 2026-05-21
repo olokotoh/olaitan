@@ -22,13 +22,14 @@ func (stubEmitter) FireRuleMatch(_ context.Context, _ string, _ schema.RuleMatch
 	return nil, nil
 }
 
-// TestNew_RegistersAllMetrics drives the New() constructor with a
-// real metrics.Registry. Asserts no error on metric registration
-// and that the gauge / counter / histogram surface is bound. This
-// closes the registerMetrics coverage gap that unit tests on
-// evaluatePackage do not reach (those use a bare Engine without
-// metrics).
-func TestNew_RegistersAllMetrics(t *testing.T) {
+// TestNew_RejectsNilNATS asserts that New() returns an explicit
+// error when the NATS client is nil, before any metric registration
+// runs. Renamed from TestNew_RegistersAllMetrics in code-review P7:
+// the prior name claimed coverage that was never exercised (the
+// nil-NATS branch short-circuits before registerMetrics). The
+// happy-path metric registration is covered by
+// TestNew_HappyPathWithMetricsRegistry below.
+func TestNew_RejectsNilNATS(t *testing.T) {
 	dir := t.TempDir()
 	l := loader.New(dir, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err := l.Load(); err != nil {
@@ -36,13 +37,12 @@ func TestNew_RegistersAllMetrics(t *testing.T) {
 	}
 	reg := metrics.NewRegistry()
 	e, err := New(Config{
-		NATS:    nil, // forces nil-nats validation to short-circuit
+		NATS:    nil,
 		Loader:  l,
 		Emitter: stubEmitter{},
 		Metrics: reg,
 		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
-	// NATS nil is an explicit error from New(); we expect that.
 	if err == nil {
 		t.Fatalf("New with nil NATS: expected error, got nil")
 	}
@@ -116,6 +116,7 @@ func TestNew_HappyPathWithMetricsRegistry(t *testing.T) {
 	want := map[string]bool{
 		"olaitan_decision_rules_loaded":             false,
 		"olaitan_decision_rules_evaluations_total":  false,
+		"olaitan_decision_rules_matches_total":      false,
 		"olaitan_decision_rules_reloads_total":      false,
 		"olaitan_decision_rules_skipped_self_total": false,
 		"olaitan_decision_rules_evaluation_seconds": false,

@@ -2210,8 +2210,18 @@ func TestRulesConfigMapMountedOnAggregator(t *testing.T) {
 		t.Errorf("aggregator Deployment does not mount rules at /etc/olaitan/rules")
 	}
 	roIdx := strings.Index(dep, "mountPath: /etc/olaitan/rules")
-	if roIdx == -1 || !strings.Contains(dep[roIdx:roIdx+200], "readOnly: true") {
-		t.Errorf("rules mount is not readOnly: true; window:\n%s", dep[roIdx:roIdx+200])
+	if roIdx == -1 {
+		t.Errorf("rules mount not found in Deployment")
+		return
+	}
+	// Bound the slice end against len(dep) so a short rendering does
+	// not panic the test (code-review P10).
+	roEnd := roIdx + 200
+	if roEnd > len(dep) {
+		roEnd = len(dep)
+	}
+	if !strings.Contains(dep[roIdx:roEnd], "readOnly: true") {
+		t.Errorf("rules mount is not readOnly: true; window:\n%s", dep[roIdx:roEnd])
 	}
 }
 

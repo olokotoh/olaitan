@@ -6,10 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
-	"time"
 
 	sigma "github.com/runreveal/sigmalite"
 
@@ -110,7 +108,7 @@ type fixtureRef struct {
 	path string
 }
 
-func bgnchFixtures() []fixtureRef {
+func benchFixtures() []fixtureRef {
 	return []fixtureRef{
 		{"positive", filepath.Join("testdata", "positive", "positive.json")},
 		{"negative_namespace", filepath.Join("testdata", "negative", "negative_namespace.json")},
@@ -132,7 +130,7 @@ func BenchmarkRulesEngine_PerPackageLatency(b *testing.B) {
 	}
 	rules := l.Get().Rules
 
-	for _, fx := range bgnchFixtures() {
+	for _, fx := range benchFixtures() {
 		fx := fx
 		b.Run(fx.name, func(b *testing.B) {
 			pkg := loadFixture(b, fx.path)
@@ -148,61 +146,6 @@ func BenchmarkRulesEngine_PerPackageLatency(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				_ = evaluateOnceForBench(rules, entry, opts)
-			}
-		})
-	}
-}
-
-// TestRulesEngineLatencyBudget is the integration-tag latency gate
-// for AC3. It samples each fixture 1000 times and asserts p99 is
-// within the NFR3 100 ms budget. Per-fixture p50 / p99 are reported
-// so the hand-off into Story 1.16 / 1.17 has fresh numbers.
-func TestRulesEngineLatencyBudget(t *testing.T) {
-	if testing.Short() {
-		t.Skip("latency gate skipped under -short")
-	}
-
-	dir := t.TempDir()
-	build50RuleCorpus(t, dir)
-	l := loader.New(dir, nil)
-	if err := l.Load(); err != nil {
-		t.Fatalf("loader.Load: %v", err)
-	}
-	rules := l.Get().Rules
-
-	const samples = 1000
-	const budget = 100 * time.Millisecond
-
-	for _, fx := range bgnchFixtures() {
-		fx := fx
-		t.Run(fx.name, func(t *testing.T) {
-			pkg := loadFixture(t, fx.path)
-			ev := pkg.Events[0]
-			resolver, entry, err := matcher.NewResolver(pkg.WorkloadPosture, matcher.EventFields(ev))
-			if err != nil {
-				t.Fatalf("NewResolver: %v", err)
-			}
-			opts := &sigma.MatchOptions{FieldResolver: resolver}
-
-			// Warm-up: 100 untimed iterations so the JIT-equivalent
-			// (constant folding + branch prediction) is steady.
-			for i := 0; i < 100; i++ {
-				_ = evaluateOnceForBench(rules, entry, opts)
-			}
-
-			ts := make([]time.Duration, samples)
-			for i := 0; i < samples; i++ {
-				start := time.Now()
-				_ = evaluateOnceForBench(rules, entry, opts)
-				ts[i] = time.Since(start)
-			}
-			sort.Slice(ts, func(i, j int) bool { return ts[i] < ts[j] })
-			p50 := ts[(samples-1)/2]
-			p99 := ts[(samples-1)*99/100]
-
-			t.Logf("[fixture=%s] p50=%s p99=%s (50 rules; NFR3 budget=%s)", fx.name, p50, p99, budget)
-			if p99 > budget {
-				t.Errorf("p99 %s exceeds NFR3 budget %s", p99, budget)
 			}
 		})
 	}

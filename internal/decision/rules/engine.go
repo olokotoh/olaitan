@@ -37,6 +37,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -112,6 +113,7 @@ type Engine struct {
 	evalMatch      atomic.Int64
 	evalMiss       atomic.Int64
 	evalError      atomic.Int64
+	matchesTotal   atomic.Int64
 	reloadSuccess  atomic.Int64
 	reloadRejected atomic.Int64
 	skippedSelf    atomic.Int64
@@ -186,12 +188,21 @@ func (e *Engine) registerMetrics(reg *metrics.Registry) error {
 		if err := reg.RegisterCounter(
 			"olaitan_decision_rules_evaluations_total",
 			"",
-			"Cumulative rule evaluations grouped by outcome (FR50).",
+			"Per-package rule-evaluation outcome counter (FR50). One outcome per handled package: match (>=1 rule fired and every fan-out emit succeeded), miss (no rules fired), or error (package decode failed or any per-match emit failed). For per-match cardinality see olaitan_decision_rules_matches_total.",
 			prometheus.Labels{"outcome": out},
 			getter,
 		); err != nil {
 			return err
 		}
+	}
+	if err := reg.RegisterCounter(
+		"olaitan_decision_rules_matches_total",
+		"",
+		"Cumulative rule matches emitted by the engine; increments by the number of matches per handled package (per-match cardinality, complementing the per-package evaluations_total{outcome=match}).",
+		nil,
+		func() int64 { return e.matchesTotal.Load() },
+	); err != nil {
+		return err
 	}
 	for _, outcome := range []string{"success", "rejected"} {
 		out := outcome
@@ -251,6 +262,18 @@ func (e *Engine) refreshLoadedGauge() {
 // startAggregatorRing connects them.
 func (e *Engine) NoteReloadRejected() { e.reloadRejected.Add(1) }
 
+// applyReEntrancyGuard returns true and bumps skippedSelf if pkg is
+// a rule_match-triggered package that the engine must not
+// re-evaluate. Split out from handle() so unit tests can exercise
+// the guard contract without mocking jetstream.Msg (code-review P8).
+func (e *Engine) applyReEntrancyGuard(pkg *schema.EvidencePackage) bool {
+	if pkg.Trigger.Type == trigger.TypeRuleMatch {
+		e.skippedSelf.Add(1)
+		return true
+	}
+	return false
+}
+
 // Run subscribes to subjects.EvidencePackages and dispatches matches
 // until ctx is cancelled. Returns nil on graceful shutdown, a
 // wrapped error if stream/consumer setup fails.
@@ -300,13 +323,19 @@ func (e *Engine) drainAndStop(_ jetstream.Consumer) error { return nil }
 // handle decodes the inbound message, applies the re-entrancy guard,
 // runs every rule against the package, fans out per-match
 // FireRuleMatch calls, and acks. Permanent decoding errors and
-// per-rule evaluation errors are treated as drop-and-ack: a bad
-// package must not crash-loop the ring (mirrors the correlator's
-// Story 1.14 P1 closure).
+// per-match emit errors are treated as drop-and-ack: a bad package
+// must not crash-loop the ring, and a transient publish failure does
+// not warrant blocking the consumer (mirrors the correlator's Story
+// 1.14 P1 closure and the correlator's publishTrigger drop-and-ack
+// at correlator.go:261-262). Advisory routing to a future Story 1.18
+// DLQ surface is shared with the correlator path; until that lands,
+// emit failures are observable via the warn log and the per-package
+// evaluations_total{outcome=error} counter.
 func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
 	start := time.Now()
+	observed := false
 	defer func() {
-		if e.evalSeconds != nil {
+		if observed && e.evalSeconds != nil {
 			e.evalSeconds.Observe(time.Since(start).Seconds())
 		}
 	}()
@@ -319,11 +348,17 @@ func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
 		return
 	}
 
-	if pkg.Trigger.Type == trigger.TypeRuleMatch {
-		e.skippedSelf.Add(1)
+	if e.applyReEntrancyGuard(&pkg) {
+		// Re-entrancy guard: do NOT observe the evaluation histogram
+		// for self-skipped packages so the latency distribution stays
+		// honest (code-review P16).
 		_ = msg.Ack()
 		return
 	}
+
+	// Everything past the re-entrancy guard counts as an evaluation;
+	// observe latency on the way out.
+	observed = true
 
 	corpus := e.loader.Get()
 	if corpus == nil || corpus.Len() == 0 {
@@ -342,15 +377,26 @@ func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
 		return
 	}
 
-	e.evalMatch.Add(int64(len(matches)))
+	// Per-package outcome accounting (code-review P3). evalMatch
+	// counts once per package with matches, regardless of how many
+	// matches fired; matchesTotal carries per-match cardinality. If
+	// any FireRuleMatch emit fails, the package outcome is downgraded
+	// from match to error.
+	e.matchesTotal.Add(int64(len(matches)))
+	emitFailed := false
 	for _, m := range matches {
 		fireCtx, cancel := context.WithTimeout(ctx, publishAttemptTimeout)
 		if _, err := e.emit.FireRuleMatch(fireCtx, pkg.WorkloadID, m); err != nil {
-			e.evalError.Add(1)
+			emitFailed = true
 			e.log.Warn("rules: emit FireRuleMatch failed",
 				"workload_id", pkg.WorkloadID, "rule_id", m.RuleID, "err", err)
 		}
 		cancel()
+	}
+	if emitFailed {
+		e.evalError.Add(1)
+	} else {
+		e.evalMatch.Add(1)
 	}
 	_ = msg.Ack()
 }
@@ -374,14 +420,35 @@ func (e *Engine) evaluatePackage(pkg *schema.EvidencePackage, corpus *loader.Cor
 	events := pkg.Events
 	if len(events) == 0 {
 		// No streaming events: evaluate once against an empty event
-		// map so rules that only reference k8s.* fields can still
-		// fire. The triggering event ID falls back to the package
-		// ID per the AC1 contract.
-		matches, _ := e.evaluateOnce(pkg, schema.Event{ID: pkg.PackageID}, corpus.Rules)
+		// so rules that only reference k8s.* fields can still fire.
+		// We leave event.id unset on the synthetic event (code-review
+		// D4) so a rule referencing event.id resolves to nil and
+		// fails-open as a miss; RuleMatch.EventID still falls back to
+		// pkg.PackageID via chooseEventID, preserving the AC1
+		// "package ID when matched on package-level metadata"
+		// contract.
+		matches, err := e.evaluateOnce(pkg, schema.Event{}, corpus.Rules)
+		if err != nil {
+			e.log.Warn("rules: evaluate empty-event package failed",
+				"workload_id", pkg.WorkloadID, "package_id", pkg.PackageID, "err", err)
+			e.evalError.Add(1)
+			return nil
+		}
 		return matches
 	}
 	for _, ev := range events {
-		matches, _ := e.evaluateOnce(pkg, ev, corpus.Rules)
+		matches, err := e.evaluateOnce(pkg, ev, corpus.Rules)
+		if err != nil {
+			// Per-event resolver-construction failure (e.g.
+			// case-collision on event keys): log and skip this
+			// event, but continue evaluating the rest of the
+			// package so a single malformed event does not silence
+			// every match (code-review P2).
+			e.log.Warn("rules: evaluate event failed",
+				"workload_id", pkg.WorkloadID, "event_id", ev.ID, "err", err)
+			e.evalError.Add(1)
+			continue
+		}
 		out = append(out, matches...)
 	}
 	return out
@@ -410,7 +477,7 @@ func (e *Engine) evaluateOnce(pkg *schema.EvidencePackage, ev schema.Event, rule
 				RuleID:    r.ID,
 				RuleName:  r.Title,
 				Severity:  r.SeverityString(),
-				MitreTags: r.Attack,
+				MitreTags: slices.Clone(r.Attack),
 				EventID:   chooseEventID(ev.ID, pkg.PackageID),
 			})
 		}

@@ -11,6 +11,17 @@ import (
 	"github.com/olokotoh/olaitan/internal/schema"
 )
 
+const ruleEventID = `
+title: Match if event has any event.id
+id: OLT-EXEC-001
+attack:
+  - T1059
+detection:
+  sel:
+    event.id|re: '.+'
+  condition: sel
+`
+
 const ruleProcExe = `
 title: Cryptominer pattern
 id: OLT-IMPACT-005
@@ -197,17 +208,79 @@ func TestChooseEventID(t *testing.T) {
 	}
 }
 
-// TestReEntrancyGuard verifies that a package with Trigger.Type ==
-// TypeRuleMatch is short-circuited by the handle() path. We cannot
-// drive a real JetStream consumer here, so we exercise the guard via
-// the standalone TestEngine_ReEntrancyGuard_SkipsRuleMatchPackages
-// helper that mirrors handle()'s contract.
+// TestReEntrancyGuard_ContractStability pins the constant so a
+// future refactor of trigger.TypeRuleMatch surfaces here rather than
+// silently breaking the engine guard.
 func TestReEntrancyGuard_ContractStability(t *testing.T) {
-	// Pin the constant so a future refactor of trigger.TypeRuleMatch
-	// surfaces here rather than silently breaking the engine guard.
 	if trigger.TypeRuleMatch != "rule_match" {
 		t.Errorf("trigger.TypeRuleMatch = %q, want %q (engine.handle() relies on this)",
 			trigger.TypeRuleMatch, "rule_match")
+	}
+}
+
+// TestApplyReEntrancyGuard_SkipsRuleMatchPackages exercises the
+// guard logic directly: a rule_match-triggered package must be
+// skipped and the skippedSelf counter must bump; any other trigger
+// type must pass through (code-review P8). The integration test
+// TestIntegration_ReEntrancyGuardSkipsRuleMatchPackages still
+// covers the full handle() pipeline end-to-end.
+// TestEvaluatePackage_ZeroEvents_EventIDIsUnsetInSynthetic exercises
+// code-review D4: when pkg.Events is empty, evaluatePackage now
+// synthesises schema.Event{} (no ID), so a rule referencing
+// event.id resolves to nil and fails-open as a miss. Posture-only
+// rules still fire via the resolver's k8s.* half (covered by
+// TestEvaluatePackage_PostureOnlyRule).
+func TestEvaluatePackage_ZeroEvents_EventIDIsUnsetInSynthetic(t *testing.T) {
+	dir := t.TempDir()
+	writeRule(t, dir, "olt-exec-001.yaml", ruleEventID)
+	l := loader.New(dir, nil)
+	if err := l.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	e := &Engine{loader: l}
+
+	pkg := &schema.EvidencePackage{
+		PackageID:  "pkg-1",
+		WorkloadID: "ns/Deployment/web",
+		// Events deliberately empty
+	}
+	matches := e.evaluatePackage(pkg, l.Get())
+	if len(matches) != 0 {
+		t.Errorf("matches = %d, want 0 (event.id should be unset in the synthetic event)", len(matches))
+	}
+}
+
+func TestApplyReEntrancyGuard_SkipsRuleMatchPackages(t *testing.T) {
+	e := &Engine{}
+	pkg := schema.EvidencePackage{
+		PackageID: "pkg-1",
+		Trigger:   schema.EvidenceTrigger{Type: trigger.TypeRuleMatch},
+	}
+	if !e.applyReEntrancyGuard(&pkg) {
+		t.Errorf("applyReEntrancyGuard(rule_match): got false, want true")
+	}
+	if got := e.skippedSelf.Load(); got != 1 {
+		t.Errorf("skippedSelf after rule_match guard: got %d, want 1", got)
+	}
+}
+
+func TestApplyReEntrancyGuard_PassesThroughOtherTriggers(t *testing.T) {
+	e := &Engine{}
+	for _, ty := range []string{
+		"", // zero value
+		trigger.TypeMultiSignal,
+		trigger.TypeBaselineDeviation,
+	} {
+		pkg := schema.EvidencePackage{
+			PackageID: "pkg-1",
+			Trigger:   schema.EvidenceTrigger{Type: ty},
+		}
+		if e.applyReEntrancyGuard(&pkg) {
+			t.Errorf("applyReEntrancyGuard(%q): got true, want false (only rule_match should skip)", ty)
+		}
+	}
+	if got := e.skippedSelf.Load(); got != 0 {
+		t.Errorf("skippedSelf after non-rule_match guards: got %d, want 0", got)
 	}
 }
 
