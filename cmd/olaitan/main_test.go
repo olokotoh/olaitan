@@ -34,6 +34,8 @@ func writeTestConfig(t *testing.T) string {
     alert: 70
     act: 90
   baseline_window: 24h
+  rules:
+    enabled: false
 response:
   excluded_namespaces:
     - kube-system
@@ -338,9 +340,11 @@ func TestStartAggregator_BuildsPostureClientWhenEnabled(t *testing.T) {
 	}
 	postureClient.Store(nil)
 
+	rulesDisabled := false
 	cfg := &config.Config{
 		Detection: config.DetectionConfig{
 			Posture: config.PostureConfig{Enabled: true},
+			Rules:   config.RulesConfig{Enabled: &rulesDisabled},
 		},
 		// Story 1.12: startAggregatorRing now starts the Prometheus
 		// surface under the errgroup. ":0" lets the kernel pick a free
@@ -382,9 +386,11 @@ func TestStartAggregator_PostureDisabledLeavesClientNil(t *testing.T) {
 	}
 	postureClient.Store(nil)
 
+	rulesDisabled := false
 	cfg := &config.Config{
 		Detection: config.DetectionConfig{
 			Posture: config.PostureConfig{Enabled: false},
+			Rules:   config.RulesConfig{Enabled: &rulesDisabled},
 		},
 		Metrics: config.MetricsConfig{Address: "127.0.0.1:0"},
 	}
@@ -403,6 +409,98 @@ func TestStartAggregator_PostureDisabledLeavesClientNil(t *testing.T) {
 	}
 	cancel()
 	_ = g.Wait()
+}
+
+// TestStartAggregator_RulesEngineEnabledWiresGoroutines exercises
+// the Story 1.15 wiring: when detection.rules.enabled=true and the
+// rule directory exists, startAggregatorRing spawns the rule-engine
+// run + watch goroutines and returns nil. The errgroup-goroutine
+// count cannot be asserted directly (errgroup keeps its tally
+// private), so we assert "no error" + "clean cancel" as the binding
+// indicator the wire-up landed.
+func TestStartAggregator_RulesEngineEnabledWiresGoroutines(t *testing.T) {
+	prevFactory := kubeClientFactory
+	prevClient := postureClient.Load()
+	t.Cleanup(func() {
+		kubeClientFactory = prevFactory
+		postureClient.Store(prevClient)
+	})
+	kubeClientFactory = func(*slog.Logger) (kubernetes.Interface, error) {
+		return kubefake.NewSimpleClientset(), nil
+	}
+	postureClient.Store(nil)
+
+	rulesDir := t.TempDir()
+	rulesEnabled := true
+	postureDisabled := config.PostureConfig{Enabled: false}
+	cfg := &config.Config{
+		Detection: config.DetectionConfig{
+			Posture: postureDisabled,
+			Rules:   config.RulesConfig{Enabled: &rulesEnabled, Path: rulesDir},
+		},
+		Metrics: config.MetricsConfig{Address: "127.0.0.1:0"},
+	}
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	g, gctx := errgroup.WithContext(ctx)
+	natsSrv := startTestNATSForMain(t)
+	t.Setenv("NATS_URL", natsSrv.ClientURL())
+	if err := startAggregatorRing(gctx, g, log, cfg, nil); err != nil {
+		cancel()
+		_ = g.Wait()
+		t.Fatalf("startAggregatorRing: %v", err)
+	}
+	cancel()
+	// Allow up to 5s for the rule-engine + watcher + correlator
+	// goroutines to unwind cleanly on ctx cancel.
+	done := make(chan error, 1)
+	go func() { done <- g.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("errgroup did not unwind within 5s")
+	}
+}
+
+// TestStartAggregator_RulesEngineDisabledSkipsWiring exercises the
+// Story 1.15 short-circuit: when detection.rules.enabled=false the
+// rule engine is not constructed and no rule directory is required.
+// A bogus path is supplied to prove the loader is never invoked.
+func TestStartAggregator_RulesEngineDisabledSkipsWiring(t *testing.T) {
+	prevFactory := kubeClientFactory
+	prevClient := postureClient.Load()
+	t.Cleanup(func() {
+		kubeClientFactory = prevFactory
+		postureClient.Store(prevClient)
+	})
+	postureClient.Store(nil)
+
+	rulesDisabled := false
+	cfg := &config.Config{
+		Detection: config.DetectionConfig{
+			Posture: config.PostureConfig{Enabled: false},
+			Rules:   config.RulesConfig{Enabled: &rulesDisabled, Path: "/nonexistent/path/that/would/break/loader"},
+		},
+		Metrics: config.MetricsConfig{Address: "127.0.0.1:0"},
+	}
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	g, gctx := errgroup.WithContext(ctx)
+	natsSrv := startTestNATSForMain(t)
+	t.Setenv("NATS_URL", natsSrv.ClientURL())
+	if err := startAggregatorRing(gctx, g, log, cfg, nil); err != nil {
+		cancel()
+		_ = g.Wait()
+		t.Fatalf("startAggregatorRing with rules disabled: %v (loader must NOT be invoked)", err)
+	}
+	cancel()
+	done := make(chan error, 1)
+	go func() { done <- g.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("errgroup did not unwind within 5s")
+	}
 }
 
 // TestStartAggregator_KubeClientFailureWrapsError exercises the

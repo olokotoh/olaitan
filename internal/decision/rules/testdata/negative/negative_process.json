@@ -1,0 +1,6 @@
+{
+  "process.exe": "/usr/local/bin/redis-server",
+  "k8s.pod.namespace": "tenant-acme",
+  "k8s.workload.owner_kind": "Deployment",
+  "network.dst_port": 3333
+}

@@ -1,0 +1,11 @@
+Olaitan
+Copyright 2026 Habeeb Olokoto
+
+This package wraps github.com/runreveal/sigmalite (Apache License 2.0,
+Copyright 2024 RunReveal, Inc.) and includes that work under Apache
+License, Version 2.0. The NOTICE requirement of section 4(d) is
+discharged by this file. The Olaitan project as a whole is MIT-licensed
+(see LICENSE in the repository root); this NOTICE applies to the
+parser package only.
+
+Upstream commit pinned: f180cb50a6a1bba454874c844500bd79f4b30a41

@@ -17,6 +17,7 @@ package helm_test
 
 import (
 	"bytes"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -2179,6 +2180,103 @@ func TestCorrelatorConfigMapBridgesValues(t *testing.T) {
 	} {
 		if !strings.Contains(window, want) {
 			t.Errorf("rendered correlator block missing %q; got:\n%s", want, window)
+		}
+	}
+}
+
+// TestRulesConfigMapMountedOnAggregator verifies the aggregator
+// Deployment template mounts the olaitan-rules ConfigMap at the
+// canonical /etc/olaitan/rules path read-only. Story 1.15 AC2.
+func TestRulesConfigMapMountedOnAggregator(t *testing.T) {
+	rendered := helmTemplate(t, nil)
+	// Walk every document looking for the aggregator Deployment
+	// specifically. `name: olaitan-aggregator` also appears on the
+	// PDB / ServiceAccount / Role / RoleBinding objects, so we have
+	// to match on kind+name in the same document.
+	var dep string
+	for _, doc := range strings.Split(rendered, "\n---") {
+		if strings.Contains(doc, "kind: Deployment") && strings.Contains(doc, "name: olaitan-aggregator") {
+			dep = doc
+			break
+		}
+	}
+	if dep == "" {
+		t.Fatalf("aggregator Deployment not rendered")
+	}
+	if !strings.Contains(dep, "- name: rules") {
+		t.Errorf("aggregator Deployment does not declare the rules volume; got:\n%s", snippet(dep, "rules"))
+	}
+	if !strings.Contains(dep, "mountPath: /etc/olaitan/rules") {
+		t.Errorf("aggregator Deployment does not mount rules at /etc/olaitan/rules")
+	}
+	roIdx := strings.Index(dep, "mountPath: /etc/olaitan/rules")
+	if roIdx == -1 {
+		t.Errorf("rules mount not found in Deployment")
+		return
+	}
+	// Bound the slice end against len(dep) so a short rendering does
+	// not panic the test (code-review P10).
+	roEnd := roIdx + 200
+	if roEnd > len(dep) {
+		roEnd = len(dep)
+	}
+	if !strings.Contains(dep[roIdx:roEnd], "readOnly: true") {
+		t.Errorf("rules mount is not readOnly: true; window:\n%s", dep[roIdx:roEnd])
+	}
+}
+
+// TestRulesValuesBridgedIntoConfigMap propagates --set rules.enabled
+// and --set rules.path overrides through the configmap.yaml bridge
+// into the rendered olaitan.yaml. Story 1.15 AC2.
+func TestRulesValuesBridgedIntoConfigMap(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"rules.enabled=false",
+		"rules.path=/custom/rules/path",
+	})
+	// Anchor on the rules-block path literal so we land inside the
+	// rendered olaitan-config ConfigMap rather than any of the
+	// Falco subchart's `rules:` blocks. The path literal under the
+	// detection.rules block is uniquely-formed in the chart.
+	pathIdx := strings.Index(rendered, `path: "/custom/rules/path"`)
+	if pathIdx == -1 {
+		t.Fatalf("rules.path override did not propagate into rendered olaitan.yaml; sample:\n%s",
+			snippet(rendered, "rules"))
+	}
+	// Look in a 200-byte window around the path literal for the
+	// enabled: false sibling. The two lines render adjacent inside
+	// the bridge, so the window comfortably covers both.
+	from := pathIdx - 200
+	if from < 0 {
+		from = 0
+	}
+	to := pathIdx + 200
+	if to > len(rendered) {
+		to = len(rendered)
+	}
+	window := rendered[from:to]
+	if !strings.Contains(window, "enabled: false") {
+		t.Errorf("rules.enabled=false did not propagate near rules.path; window:\n%s", window)
+	}
+}
+
+// TestRulesAnchorsPresentInOlaitanYAML asserts the literal anchors
+// the configmap.yaml bridge depends on remain in
+// config/olaitan.yaml's chart-side copy. Without this guard a
+// future edit to the rules block in olaitan.yaml could silently
+// break the bridge and operator --set values would be dropped.
+// Mirrors Story 1.13's TestHelmRateLimitAnchorsPresent pattern.
+func TestRulesAnchorsPresentInOlaitanYAML(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join(chartDir(t), "files", "olaitan.yaml"))
+	if err != nil {
+		t.Fatalf("read olaitan.yaml: %v", err)
+	}
+	for _, want := range []string{
+		"  rules:",
+		"    enabled: true",
+		`    path: "/etc/olaitan/rules"`,
+	} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("rules-block anchor missing in chart olaitan.yaml: %q", want)
 		}
 	}
 }

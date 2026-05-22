@@ -858,3 +858,115 @@ func TestRateLimitUnknownKeyRejected(t *testing.T) {
 		t.Errorf("error does not mention unknown key: %v", err)
 	}
 }
+
+// TestRulesDefaultsAppliedOnOmittedBlock asserts that an operator
+// who omits the detection.rules block ends up with the Story 1.15
+// production defaults (enabled=true, path=/etc/olaitan/rules) after
+// Load substitution. Mirrors the Story 1.13 rate-limit defaulting
+// test pattern.
+func TestRulesDefaultsAppliedOnOmittedBlock(t *testing.T) {
+	path := writeConfig(t, validYAML)
+	c, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Detection.Rules.Enabled == nil || !*c.Detection.Rules.Enabled {
+		t.Errorf("Rules.Enabled = %v, want non-nil true after default substitution", c.Detection.Rules.Enabled)
+	}
+	if c.Detection.Rules.Path != "/etc/olaitan/rules" {
+		t.Errorf("Rules.Path = %q, want /etc/olaitan/rules", c.Detection.Rules.Path)
+	}
+}
+
+// TestRulesExplicitDisableHonoured asserts that an operator-supplied
+// enabled=false survives Load's defaulting and propagates through
+// EnabledOrDefault(). The pointer field is the load-bearing
+// mechanism: a plain bool would collapse `enabled: false` into the
+// zero value.
+func TestRulesExplicitDisableHonoured(t *testing.T) {
+	// Replace validYAML's `baseline_window:` line with a block that
+	// adds a rules: sibling under detection:. The substitution
+	// preserves the rest of validYAML's structure so we exercise
+	// the full validate path.
+	body := strings.Replace(
+		validYAML,
+		"  baseline_window: 24h",
+		"  baseline_window: 24h\n  rules:\n    enabled: false\n    path: \"/etc/olaitan/rules\"",
+		1,
+	)
+	path := writeConfig(t, body)
+	c, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Detection.Rules.EnabledOrDefault() {
+		t.Errorf("EnabledOrDefault() = true, want false (operator explicitly disabled)")
+	}
+}
+
+// TestRulesValidateRejectsEmptyPathWhenEnabled asserts that an
+// explicit enabled=true with no path fails validation. Pointer-true
+// Enabled must reach validate; the load-side substitution covers
+// only the omitted-block case.
+func TestRulesValidateRejectsEmptyPathWhenEnabled(t *testing.T) {
+	enabled := true
+	c := &config.Config{
+		Detection: config.DetectionConfig{
+			ConfidenceBands: config.ConfidenceBands{Watch: 40, Alert: 70, Act: 90},
+			BaselineWindow:  config.DurationYAML(24 * time.Hour),
+			Correlator:      config.DefaultCorrelator(),
+			Rules:           config.RulesConfig{Enabled: &enabled, Path: ""},
+		},
+		Analyst: config.AnalystConfig{
+			Provider: "api",
+			ScoreCap: 35,
+			Timeout:  config.DurationYAML(10 * time.Second),
+		},
+		Metrics: config.MetricsConfig{Address: ":9090"},
+	}
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("Validate: got nil, want rejection of empty Path with Enabled=true")
+	}
+	if !strings.Contains(err.Error(), "detection.rules.path") {
+		t.Errorf("error does not mention detection.rules.path: %v", err)
+	}
+}
+
+// TestRulesValidateRejectsRelativePath asserts that an explicit
+// relative path is rejected at validate. The loader resolves the
+// directory eagerly from the absolute path; a relative path would
+// be ambiguous against the controller's working directory.
+func TestRulesValidateRejectsRelativePath(t *testing.T) {
+	enabled := true
+	c := &config.Config{
+		Detection: config.DetectionConfig{
+			ConfidenceBands: config.ConfidenceBands{Watch: 40, Alert: 70, Act: 90},
+			BaselineWindow:  config.DurationYAML(24 * time.Hour),
+			Correlator:      config.DefaultCorrelator(),
+			Rules:           config.RulesConfig{Enabled: &enabled, Path: "rules"},
+		},
+		Analyst: config.AnalystConfig{
+			Provider: "api",
+			ScoreCap: 35,
+			Timeout:  config.DurationYAML(10 * time.Second),
+		},
+		Metrics: config.MetricsConfig{Address: ":9090"},
+	}
+	if err := c.Validate(); err == nil {
+		t.Fatal("Validate: got nil, want rejection of relative path")
+	}
+}
+
+// TestRulesEnabledOrDefault verifies the nil-defaults-to-true
+// contract used by callers that do not go through Load (in-memory
+// Config construction in tests or hot-reload diff checks).
+func TestRulesEnabledOrDefault(t *testing.T) {
+	if !(config.RulesConfig{}.EnabledOrDefault()) {
+		t.Errorf("zero-value RulesConfig: EnabledOrDefault() = false, want true (nil pointer is treated as enabled)")
+	}
+	disabled := false
+	if (config.RulesConfig{Enabled: &disabled}).EnabledOrDefault() {
+		t.Errorf("explicit disabled: EnabledOrDefault() = true, want false")
+	}
+}

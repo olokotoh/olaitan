@@ -101,6 +101,15 @@ detection:
     enabled: true
     cache_ttl: "60s"
     fetch_timeout: "5s"
+  # Story 1.15: OLT Sigma rule engine. The engine reads its rule
+  # corpus from `path` (a ConfigMap-projected directory mounted into
+  # the aggregator pod) and reloads on fsnotify-driven ConfigMap
+  # ..data symlink swaps. Setting enabled=false leaves the engine
+  # out of startAggregatorRing entirely so a sensing-only deployment
+  # never spawns the JetStream consumer.
+  rules:
+    enabled: true
+    path: "/etc/olaitan/rules"
 
 # Story 1.12: Prometheus metrics surface (FR8, FR50). Every Olaitan
 # process exposes Prometheus metrics on :9090/metrics from a dedicated

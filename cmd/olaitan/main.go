@@ -42,6 +42,8 @@ import (
 	"github.com/olokotoh/olaitan/internal/config"
 	"github.com/olokotoh/olaitan/internal/correlator"
 	correlatorasm "github.com/olokotoh/olaitan/internal/correlator/assembler"
+	"github.com/olokotoh/olaitan/internal/decision/rules"
+	rulesloader "github.com/olokotoh/olaitan/internal/decision/rules/loader"
 	"github.com/olokotoh/olaitan/internal/health"
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
 	"github.com/olokotoh/olaitan/internal/ratelimit"
@@ -364,8 +366,11 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	// No streaming adapters yet (Story 1.14 lands the correlator); the
 	// surface exists so the posture counters (or the posture_disabled
 	// gauge) can be scraped, and so future aggregator-side adapters
-	// inherit the wiring.
-	if _, merr := startMetricsServer(ctx, g, log, cfg, "", nil, client); merr != nil {
+	// inherit the wiring. Story 1.15 reuses the returned registry to
+	// register the rule-engine counters and the
+	// evaluation_seconds histogram.
+	metricsReg, merr := startMetricsServer(ctx, g, log, cfg, "", nil, client)
+	if merr != nil {
 		return fmt.Errorf("aggregator: metrics: %w", merr)
 	}
 
@@ -434,6 +439,71 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		}
 		return nil
 	})
+
+	// Story 1.15: OLT Sigma rule engine wiring. The engine consumes
+	// EvidencePackages from EVIDENCE.packages, evaluates them against
+	// the loaded rule corpus, and re-emits matches through the
+	// correlator's FireRuleMatch entry point (the correlator
+	// satisfies the rules.RuleMatchEmitter interface by signature).
+	// When rules.enabled=false the engine is skipped entirely; the
+	// JetStream consumer olaitan-rules-engine is not created.
+	if cfg.Detection.Rules.EnabledOrDefault() {
+		// Defensive: validate() skips the Path check when Enabled is
+		// nil (so test-bypass Configs can omit the block). If a
+		// caller reaches here with a nil Enabled (treated as the
+		// default true) and an empty Path, fail loud rather than
+		// crashing inside the loader's WalkDir("") later
+		// (code-review P22).
+		if cfg.Detection.Rules.Path == "" {
+			closeNATS()
+			return errors.New("aggregator: detection.rules.path is empty but rules engine is enabled")
+		}
+		rl := rulesloader.New(cfg.Detection.Rules.Path, log)
+		if err := rl.Load(); err != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: rules loader: %w", err)
+		}
+		engine, err := rules.New(rules.Config{
+			NATS:    nc,
+			Loader:  rl,
+			Emitter: corr,
+			Metrics: metricsReg,
+			Log:     log,
+		})
+		if err != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: rules engine: %w", err)
+		}
+		// Wire the loader's reject path to the engine's
+		// rejected-counter hook so olaitan_decision_rules_reloads_total
+		// {outcome="rejected"} stays in sync with reload-rejected log
+		// lines (code-review P1).
+		rl.SubscribeRejected(func(error) { engine.NoteReloadRejected() })
+		// Note: rules.path and rules.enabled changes are intentionally
+		// not wired through config.Manager.Subscribe (code-review D3).
+		// The loader path is a K8s volume mountPath; changing it via
+		// helm upgrade rewrites the Deployment spec which K8s rolls
+		// anyway, so "hot-reload" of path is architecturally
+		// meaningless. The enabled toggle is restart-required by design.
+		g.Go(func() error {
+			if err := rl.Watch(ctx); err != nil {
+				return fmt.Errorf("aggregator: rules watcher: %w", err)
+			}
+			return nil
+		})
+		g.Go(func() error {
+			if err := engine.Run(ctx); err != nil {
+				return fmt.Errorf("aggregator: rules engine run: %w", err)
+			}
+			return nil
+		})
+		log.Info("aggregator: rules engine wired",
+			"path", cfg.Detection.Rules.Path,
+			"count", rl.Get().Len())
+	} else {
+		log.Info("aggregator: rules engine disabled in config; skipping")
+	}
+
 	g.Go(func() error {
 		<-ctx.Done()
 		closeNATS()
