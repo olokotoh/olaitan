@@ -13,7 +13,7 @@
   "trigger": {
     "type": "multi_signal",
     "fired_at": "2026-05-22T10:00:00Z",
-    "distinct_sources": ["audit", "falco"]
+    "distinct_sources": ["audit"]
   },
   "workload_posture": {
     "identity": {

@@ -2299,24 +2299,34 @@ type olaitanRulesConfigMap struct {
 }
 
 // findRulesConfigMap locates the olaitan-rules ConfigMap doc in the
-// rendered manifest stream and unmarshals it. Bails the test if the
-// doc is absent or malformed.
+// rendered manifest stream and unmarshals it. Uses a proper multi-doc
+// YAML decoder (not strings.Split on "\n---", which is brittle to
+// leading "---" at byte 0 and to "---" inside YAML string values) and
+// rejects ambiguous matches if more than one ConfigMap in the stream
+// happens to be named "olaitan-rules". Bails the test if the doc is
+// absent, malformed, or ambiguous.
 func findRulesConfigMap(t *testing.T, rendered string) olaitanRulesConfigMap {
 	t.Helper()
-	for _, doc := range strings.Split(rendered, "\n---") {
-		if !strings.Contains(doc, "kind: ConfigMap") {
-			continue
-		}
-		if !strings.Contains(doc, "name: olaitan-rules") {
-			continue
-		}
+	dec := yaml.NewDecoder(strings.NewReader(rendered))
+	var hits []olaitanRulesConfigMap
+	for {
 		var cm olaitanRulesConfigMap
-		if err := yaml.Unmarshal([]byte(doc), &cm); err != nil {
-			t.Fatalf("unmarshal olaitan-rules ConfigMap doc: %v\n%s", err, doc)
+		if err := dec.Decode(&cm); err != nil {
+			break
 		}
-		return cm
+		if cm.Kind != "ConfigMap" || cm.Metadata.Name != "olaitan-rules" {
+			continue
+		}
+		hits = append(hits, cm)
 	}
-	t.Fatalf("olaitan-rules ConfigMap not found in rendered output")
+	switch len(hits) {
+	case 0:
+		t.Fatalf("olaitan-rules ConfigMap not found in rendered output")
+	case 1:
+		return hits[0]
+	default:
+		t.Fatalf("olaitan-rules ConfigMap rendered %d times; expected exactly one", len(hits))
+	}
 	return olaitanRulesConfigMap{}
 }
 
@@ -2339,12 +2349,15 @@ func TestRulesConfigMapPopulatedFromCorpus(t *testing.T) {
 			t.Errorf("ConfigMap key %q does not match OLT rule-ID filename regex", key)
 		}
 	}
-	body, ok := cm.Data["OLT-IMPACT-005.yaml"]
-	if !ok {
-		t.Fatalf("ConfigMap olaitan-rules missing OLT-IMPACT-005.yaml key")
-	}
-	if _, err := parser.ParseRule([]byte(body)); err != nil {
-		t.Errorf("OLT-IMPACT-005.yaml staged content fails parser.ParseRule: %v", err)
+	// Round-trip EVERY staged rule through parser.ParseRule so a
+	// staging corruption affecting any rule (encoding mutation, CRLF
+	// injection, indentation drift from the template's nindent) is
+	// surfaced. Previously only OLT-IMPACT-005 was checked, which let
+	// drift on the other nine rules slip past helm CI.
+	for key, body := range cm.Data {
+		if _, err := parser.ParseRule([]byte(body)); err != nil {
+			t.Errorf("ConfigMap key %q: staged content fails parser.ParseRule: %v", key, err)
+		}
 	}
 }
 

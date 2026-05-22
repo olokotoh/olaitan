@@ -1,5 +1,3 @@
-//go:build integration
-
 package rules
 
 import (
@@ -8,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"testing"
@@ -17,17 +16,21 @@ import (
 )
 
 // TestIntegration_CorpusMatchesScenarioFixture verifies AC3: each of
-// the five evaluation scenarios has at least two rules from the
-// production corpus that fire against a representative hand-built
-// EvidencePackage fixture. The expected rule IDs per scenario are
-// pinned in the §Dev Notes corpus inventory; this test is the
-// AC3-bounded check that the corpus actually delivers them.
+// the five evaluation scenarios has exactly the expected pair of
+// rules from the production corpus firing against a representative
+// hand-built EvidencePackage fixture. The expected rule IDs per
+// scenario are pinned in the §Dev Notes corpus inventory; this test
+// is the AC3-bounded check that the corpus actually delivers them.
 //
 // The test loads the production corpus from the repo-root rules/
 // directory via loader.New (the same code path the engine runs at
 // startup), constructs a bare Engine to access the package-level
 // evaluatePackage entry point without the JetStream consumer
-// scaffolding, and table-walks the five scenario fixtures.
+// scaffolding, and table-walks the five scenario fixtures. The
+// TestIntegration_* function-name prefix is semantic only (multiple
+// components exercised together); no build tag is set because the
+// test has no external dependencies and runs in milliseconds, so it
+// belongs in the default `go test ./...` CI gate.
 func TestIntegration_CorpusMatchesScenarioFixture(t *testing.T) {
 	root := corpusRoot(t)
 	l := loader.New(root, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -65,11 +68,17 @@ func TestIntegration_CorpusMatchesScenarioFixture(t *testing.T) {
 			for _, m := range matches {
 				got[m.RuleID] = true
 			}
-			for _, want := range tc.wantIDs {
-				if !got[want] {
-					t.Errorf("rule %s did not fire for %s; got rule IDs: %v",
-						want, tc.scenario, sortedRuleIDs(got))
-				}
+			gotIDs := sortedRuleIDs(got)
+			wantIDs := append([]string(nil), tc.wantIDs...)
+			sort.Strings(wantIDs)
+			// Exact match-set assertion: AC3 is satisfied iff the
+			// expected pair fires AND no other rule fires. The earlier
+			// "subset" form (only checking the wanted IDs are present)
+			// admitted regressions where every rule misfired on every
+			// fixture; the expected pair would still be in the set.
+			if !reflect.DeepEqual(gotIDs, wantIDs) {
+				t.Errorf("scenario %s: got rule IDs %v, want exactly %v",
+					tc.scenario, gotIDs, wantIDs)
 			}
 		})
 	}

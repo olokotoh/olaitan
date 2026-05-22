@@ -12,7 +12,13 @@ attack:
 severity: 75
 detection:
   host_bind_exec:
-    process.exe|startswith: '/host/'
+    process.exe|startswith:
+      - '/host/bin/'
+      - '/host/sbin/'
+      - '/host/usr/bin/'
+      - '/host/usr/sbin/'
+      - '/host/usr/local/bin/'
+      - '/host/usr/local/sbin/'
   proc_filesystem_read:
     file.path|re: '^/proc/[0-9]+/(exe|root)$'
   tenant_namespace:

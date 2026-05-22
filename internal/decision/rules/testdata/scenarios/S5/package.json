@@ -36,6 +36,20 @@
         "process.exe": "/usr/local/bin/xmrig",
         "network.dst_port": 3333
       }
+    },
+    {
+      "id": "ev-s5-2",
+      "timestamp": "2026-05-22T10:00:01Z",
+      "source": "network",
+      "category": "flow",
+      "severity": "WARNING",
+      "summary": "Outbound flow to stratum mining pool port flagged by CNI",
+      "raw": {
+        "event.category": "flow",
+        "event.severity": "WARNING",
+        "network.dst_port": 3333,
+        "k8s.pod.namespace": "tenant-acme"
+      }
     }
   ]
 }

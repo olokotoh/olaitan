@@ -13,7 +13,7 @@
   "trigger": {
     "type": "multi_signal",
     "fired_at": "2026-05-22T10:00:00Z",
-    "distinct_sources": ["falco", "network"]
+    "distinct_sources": ["falco"]
   },
   "workload_posture": {
     "identity": {

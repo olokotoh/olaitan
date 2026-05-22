@@ -366,7 +366,7 @@ metadata:
 data:
 {{- range $path, $bytes := $rules }}
   {{ base $path }}: |
-{{ $.Files.Get $path | indent 4 }}
+    {{- $.Files.Get $path | nindent 4 }}
 {{- end }}
 {{- else }}
 data: {}

@@ -12,7 +12,7 @@ attack:
 severity: 75
 detection:
   kubectl_exec:
-    process.exe|endswith: 'kubectl'
+    process.exe|endswith: '/kubectl'
   workload_kind:
     k8s.workload.owner_kind: Deployment
   tenant_namespace:

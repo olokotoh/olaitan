@@ -9,7 +9,7 @@ CONFIG_SRC       := config/olaitan.yaml
 AUDIT_POLICY_SRC := config/audit-policy-default.yaml
 CHART_FILES      := $(CHART_DIR)/files/olaitan.yaml $(CHART_DIR)/files/audit-policy-default.yaml
 
-.PHONY: build test lint docker-build clean helm-prepare helm-prepare-rules helm-lint helm-template helm-deps version-tag envtest-bin
+.PHONY: build test lint docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-lint helm-template helm-deps version-tag envtest-bin
 
 # envtest-bin downloads the kube-apiserver and etcd binaries that the
 # Story 1.11 posture-client integration tests (and any future
@@ -79,9 +79,28 @@ $(CHART_DIR)/files/audit-policy-default.yaml: $(AUDIT_POLICY_SRC)
 # repo-root rules/<category>/; the staged copy is a build artefact and
 # is covered by the deploy/helm/olaitan/files/ wildcard in .gitignore.
 RULE_SRCS := $(wildcard rules/*/*.yaml)
-RULE_STAGED := $(patsubst %,$(CHART_DIR)/files/rules/%,$(notdir $(RULE_SRCS)))
+RULE_BASENAMES := $(notdir $(RULE_SRCS))
+# Fail-fast collision check: $(eval) silently deduplicates targets, so
+# two rule files sharing a basename across categories (e.g.
+# rules/exec/OLT-DUP.yaml and rules/net/OLT-DUP.yaml) would otherwise
+# stage only the last-evaluated source. The shell snippet emits the
+# duplicate basenames; the ifneq guard converts that into a Make-time
+# error before $(foreach $(eval)) runs.
+RULE_DUPES := $(shell printf '%s\n' $(RULE_BASENAMES) | sort | uniq -d)
+ifneq ($(strip $(RULE_DUPES)),)
+$(error rule basename collision across categories: $(RULE_DUPES))
+endif
+RULE_STAGED := $(patsubst %,$(CHART_DIR)/files/rules/%,$(RULE_BASENAMES))
 
-helm-prepare-rules: $(RULE_STAGED)
+# clean-staged-rules removes the staged rules dir before staging so a
+# rule deleted from rules/<category>/ does not linger in the chart and
+# get packaged into the ConfigMap on the next helm-prepare. Cheap (the
+# files are tiny build artefacts) and unconditional, so it doubles as
+# a force-rebuild on dependency-skew edge cases.
+clean-staged-rules:
+	@rm -rf $(CHART_DIR)/files/rules
+
+helm-prepare-rules: clean-staged-rules $(RULE_STAGED)
 
 # Per-rule copy target. The foreach + eval below generates one rule per
 # source file so Make tracks per-file dependencies and re-stages only

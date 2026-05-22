@@ -4,11 +4,37 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"testing"
 
 	"github.com/olokotoh/olaitan/internal/decision/rules/parser"
 )
+
+// countCorpusYAMLs counts every *.yaml / *.yml file under root by
+// walking the tree, without touching the parser. Used as the on-disk
+// authority for the AC1 ">=10 rules" check: if walkAndParse drops a
+// file via t.Errorf on a parse failure, the count check below catches
+// the divergence before the >=10 gate runs against the parsed subset.
+func countCorpusYAMLs(t *testing.T, root string) int {
+	t.Helper()
+	n := 0
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		ext := filepath.Ext(path)
+		if ext == ".yaml" || ext == ".yml" {
+			n++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("count corpus yamls under %s: %v", root, err)
+	}
+	return n
+}
 
 // scenarioTechniques pins the AC1 scenario-to-technique mapping. A
 // rule's scenario membership is computed from its attack: list using
@@ -33,12 +59,17 @@ var scenarioTechniques = map[string][]string{
 // .github/workflows/ci.yml change (story Task 7).
 func TestCorpusLint_AllRulesParse(t *testing.T) {
 	root := corpusRoot(t)
+	onDisk := countCorpusYAMLs(t, root)
 	rules := walkAndParse(t, root)
+	if len(rules) != onDisk {
+		t.Fatalf("parsed %d rules but %d *.yaml files on disk; parse failures hidden by walkAndParse", len(rules), onDisk)
+	}
 	if len(rules) < 10 {
 		t.Fatalf("corpus has %d rules; AC1 requires >=10", len(rules))
 	}
 
 	counts := map[string]int{}
+	rulesWithScenario := map[string]bool{}
 	for _, r := range rules {
 		hit := map[string]bool{}
 		for _, attackID := range r.Attack {
@@ -53,10 +84,25 @@ func TestCorpusLint_AllRulesParse(t *testing.T) {
 		for scenario := range hit {
 			counts[scenario]++
 		}
+		if len(hit) > 0 {
+			rulesWithScenario[r.ID] = true
+		}
 	}
 	for scenario := range scenarioTechniques {
 		if counts[scenario] < 2 {
 			t.Errorf("scenario %s covered by %d rules; AC1 requires >=2", scenario, counts[scenario])
+		}
+	}
+
+	// AC1 reciprocal: every parsed rule must map to at least one
+	// scenario via scenarioTechniques. An orphan-technique rule (e.g.
+	// attack: [T9999]) would parse cleanly and satisfy AC2 but
+	// contribute to no scenario, defeating the corpus inventory's
+	// purpose. The reciprocal gate forces every future rule addition
+	// to extend scenarioTechniques (or be removed) before lint passes.
+	for _, r := range rules {
+		if !rulesWithScenario[r.ID] {
+			t.Errorf("rule %s attack:%v maps to no scenario in scenarioTechniques; either fix the rule's attack list or extend scenarioTechniques", r.ID, r.Attack)
 		}
 	}
 
@@ -75,35 +121,63 @@ func TestCorpusLint_AllRulesParse(t *testing.T) {
 }
 
 // TestCorpusLint_FailsOnMissingAttackAnnotation locks the AC4 gate in
-// by constructing an in-memory invalid rule (no attack: field) in a
-// tempdir and asserting parser.ParseRule returns the exact error
-// string the engine startup gate relies on. If a future contributor
-// changes the parser's error string, this test breaks before a PR
-// with a malformed rule could ever pass CI.
+// by table-driving three malformed-rule shapes (missing key, explicit
+// null, empty list) through parser.ParseRule and asserting the EXACT
+// parser error string the engine startup gate relies on. Equality
+// (not Contains) is the deliberate contract: if the parser ever wraps
+// or rephrases the error, the dev who made that change must update
+// this test, which surfaces the breaking change at code-review time
+// rather than letting CI silently accept the regression.
 func TestCorpusLint_FailsOnMissingAttackAnnotation(t *testing.T) {
-	dir := t.TempDir()
-	bad := []byte(`title: missing attack field
+	const (
+		titleAndDetection = `title: missing attack field
 id: OLT-IMPACT-999
 detection:
   s:
     process.exe|endswith: 'xmrig'
   condition: s
-`)
-	path := filepath.Join(dir, "bad.yaml")
-	if err := os.WriteFile(path, bad, 0o600); err != nil {
-		t.Fatalf("write bad rule: %v", err)
+`
+	)
+	cases := []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{
+			name: "missing_attack_key",
+			yaml: titleAndDetection,
+			want: "attack: required field is missing",
+		},
+		{
+			name: "attack_explicit_null",
+			yaml: "attack: null\n" + titleAndDetection,
+			want: "attack: must be a non-empty list",
+		},
+		{
+			name: "attack_empty_list",
+			yaml: "attack: []\n" + titleAndDetection,
+			want: "attack: must be a non-empty list",
+		},
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read bad rule: %v", err)
-	}
-	_, parseErr := parser.ParseRule(data)
-	if parseErr == nil {
-		t.Fatalf("parser accepted rule without attack: field; AC4 gate broken")
-	}
-	const want = "attack: required field is missing"
-	if !strings.Contains(parseErr.Error(), want) {
-		t.Errorf("got error %q, want substring %q", parseErr.Error(), want)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "bad.yaml")
+			if err := os.WriteFile(path, []byte(tc.yaml), 0o600); err != nil {
+				t.Fatalf("write bad rule: %v", err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read bad rule: %v", err)
+			}
+			_, parseErr := parser.ParseRule(data)
+			if parseErr == nil {
+				t.Fatalf("parser accepted malformed rule; AC4 gate broken")
+			}
+			if got := parseErr.Error(); got != tc.want {
+				t.Errorf("got error %q, want exact %q", got, tc.want)
+			}
+		})
 	}
 }
 

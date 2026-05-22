@@ -16,9 +16,11 @@ detection:
     verb: 'list'
     objectRef.resource: 'pods'
     objectRef.namespace: ''
+  service_account:
+    user.username|startswith: 'system:serviceaccount:'
   system_sa:
     user.username|startswith: 'system:serviceaccount:kube-system:'
-  condition: list_pods_cluster_scope and not system_sa
+  condition: list_pods_cluster_scope and service_account and not system_sa
 falsepositives:
   - Cluster autoscaler ServiceAccount lists pods cluster wide; allowlist via a user.username shape
   - Monitoring stacks (Prometheus, kube-state-metrics) with read only ClusterRoles; allowlist via a dedicated ServiceAccount
