@@ -1,0 +1,34 @@
+title: Outbound traffic to non-private destination from tenant Pod
+id: OLT-NET-001
+description: |
+  Detects an outbound flow whose destination IP lies outside RFC1918
+  private space and whose payload size is small (below 1000 bytes),
+  originating from a tenant Pod. The small payload heuristic in
+  combination with a public destination is the canonical signature
+  of beaconing C2 traffic that intentionally avoids attention by
+  keeping individual flows tiny.
+status: experimental
+attack:
+  - T1071
+severity: 50
+detection:
+  outbound_flow:
+    event.category: 'flow'
+  rfc1918_a:
+    network.dst_ip|cidr: '10.0.0.0/8'
+  rfc1918_b:
+    network.dst_ip|cidr: '172.16.0.0/12'
+  rfc1918_c:
+    network.dst_ip|cidr: '192.168.0.0/16'
+  tenant_namespace:
+    k8s.pod.namespace|startswith: 'tenant-'
+  small_payload:
+    network.bytes_out|re: '^[0-9]{1,3}$'
+  condition: outbound_flow and not (rfc1918_a or rfc1918_b or rfc1918_c) and tenant_namespace and small_payload
+falsepositives:
+  - DNS probes to public resolvers such as 8.8.8.8 or 1.1.1.1; allowlist via a dedicated outbound NetworkPolicy
+  - Health check pings to cloud SaaS endpoints; allowlist via a FQDN resolved CIDR set
+fields:
+  - network.dst_ip
+  - network.bytes_out
+  - k8s.pod.namespace

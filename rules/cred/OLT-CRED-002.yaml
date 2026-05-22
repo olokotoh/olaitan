@@ -1,0 +1,29 @@
+title: Cloud instance metadata IP reached from workload Pod
+id: OLT-CRED-002
+description: |
+  Detects an outbound connection to the cloud instance metadata
+  endpoint at 169.254.169.254 from a workload Pod outside the system
+  namespaces. Workload Pods have no legitimate reason to query the
+  node's instance metadata service because the IMDSv2 token path
+  returns cloud side credentials that grant lateral movement beyond
+  the cluster boundary.
+status: experimental
+attack:
+  - T1552.005
+severity: 50
+detection:
+  metadata_dst:
+    network.dst_ip: '169.254.169.254'
+  system_namespace:
+    k8s.pod.namespace:
+      - 'kube-system'
+      - 'kube-public'
+      - 'kube-node-lease'
+      - 'olaitan'
+  condition: metadata_dst and not system_namespace
+falsepositives:
+  - Node local IMDS proxies running in kube-system; excluded by the namespace filter
+  - Cloud controller manager Pods running in kube-system; excluded by the namespace filter
+fields:
+  - network.dst_ip
+  - k8s.pod.namespace

@@ -1,0 +1,29 @@
+title: Cluster wide Pod listing by non-system ServiceAccount
+id: OLT-RECON-001
+description: |
+  Detects a Kubernetes API list call against pods at cluster scope
+  performed by a ServiceAccount outside kube-system. The pattern is
+  characteristic of in cluster reconnaissance where a compromised
+  Pod's identity enumerates every workload visible to its bound RBAC.
+  Workload Pods scoped to a single namespace have no reason to list
+  pods cluster wide.
+status: experimental
+attack:
+  - T1613
+severity: 50
+detection:
+  list_pods_cluster_scope:
+    verb: 'list'
+    objectRef.resource: 'pods'
+    objectRef.namespace: ''
+  system_sa:
+    user.username|startswith: 'system:serviceaccount:kube-system:'
+  condition: list_pods_cluster_scope and not system_sa
+falsepositives:
+  - Cluster autoscaler ServiceAccount lists pods cluster wide; allowlist via a user.username shape
+  - Monitoring stacks (Prometheus, kube-state-metrics) with read only ClusterRoles; allowlist via a dedicated ServiceAccount
+fields:
+  - verb
+  - objectRef.resource
+  - objectRef.namespace
+  - user.username

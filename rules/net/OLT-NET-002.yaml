@@ -1,0 +1,31 @@
+title: Outbound TLS to C2 favoured port from tenant Pod
+id: OLT-NET-002
+description: |
+  Detects an outbound TCP connection from a tenant Pod to a port set
+  associated with command and control channels (alternate HTTPS, IRC
+  TLS, common Bitcoin SPV). The port set is intentionally narrow: it
+  catches the canonical evasion pattern where C2 hides behind a port
+  number that resembles legitimate web traffic while avoiding the
+  default 443 that gateway controls already inspect.
+status: experimental
+attack:
+  - T1071.001
+severity: 50
+detection:
+  c2_port:
+    network.dst_port:
+      - 8443
+      - 6697
+      - 8333
+  tcp_protocol:
+    network.protocol: 'TCP'
+  tenant_namespace:
+    k8s.pod.namespace|startswith: 'tenant-'
+  condition: c2_port and tcp_protocol and tenant_namespace
+falsepositives:
+  - Legitimate alternate HTTPS workloads labelled `app.kubernetes.io/component=alt-https`
+  - IRC bridges or bitcoin aware payment services intentionally connecting on 6697 or 8333
+fields:
+  - network.dst_port
+  - network.protocol
+  - k8s.pod.namespace

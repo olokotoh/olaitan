@@ -1,0 +1,27 @@
+title: Kubernetes API client launched in tenant Pod
+id: OLT-LATERAL-001
+description: |
+  Detects an execution of kubectl, or a similar Kubernetes API
+  client, inside a Pod whose namespace begins with tenant-. Tenant
+  workloads should never carry kubectl; its presence implies either
+  an injected toolchain or a debug override that lateral movement
+  playbooks commonly rely on.
+status: experimental
+attack:
+  - T1613
+severity: 75
+detection:
+  kubectl_exec:
+    process.exe|endswith: 'kubectl'
+  workload_kind:
+    k8s.workload.owner_kind: Deployment
+  tenant_namespace:
+    k8s.pod.namespace|startswith: 'tenant-'
+  condition: kubectl_exec and workload_kind and tenant_namespace
+falsepositives:
+  - Debug images deliberately shipped with kubectl for break glass operator workflows; pin via a dedicated namespace shape
+  - GitOps controllers that ship kubectl in their image; allowlist via a dedicated ServiceAccount
+fields:
+  - process.exe
+  - k8s.pod.namespace
+  - k8s.workload.owner_kind

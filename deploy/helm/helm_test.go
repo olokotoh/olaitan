@@ -20,11 +20,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/olokotoh/olaitan/internal/decision/rules/parser"
 )
 
 // chartDir resolves to <this-test-file>/../olaitan, independent of the
@@ -2277,6 +2280,86 @@ func TestRulesAnchorsPresentInOlaitanYAML(t *testing.T) {
 	} {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("rules-block anchor missing in chart olaitan.yaml: %q", want)
+		}
+	}
+}
+
+// olaitanRulesConfigMap deserialises the Story 1.16 olaitan-rules
+// ConfigMap doc emitted by the chart. The Data map carries one entry
+// per staged rule: key is the basename (OLT-<CAT>-NNN.yaml), value is
+// the full YAML body so a round-trip parser.ParseRule confirms the
+// chart did not corrupt the staged corpus.
+type olaitanRulesConfigMap struct {
+	APIVersion string `yaml:"apiVersion"`
+	Kind       string `yaml:"kind"`
+	Metadata   struct {
+		Name string `yaml:"name"`
+	} `yaml:"metadata"`
+	Data map[string]string `yaml:"data"`
+}
+
+// findRulesConfigMap locates the olaitan-rules ConfigMap doc in the
+// rendered manifest stream and unmarshals it. Bails the test if the
+// doc is absent or malformed.
+func findRulesConfigMap(t *testing.T, rendered string) olaitanRulesConfigMap {
+	t.Helper()
+	for _, doc := range strings.Split(rendered, "\n---") {
+		if !strings.Contains(doc, "kind: ConfigMap") {
+			continue
+		}
+		if !strings.Contains(doc, "name: olaitan-rules") {
+			continue
+		}
+		var cm olaitanRulesConfigMap
+		if err := yaml.Unmarshal([]byte(doc), &cm); err != nil {
+			t.Fatalf("unmarshal olaitan-rules ConfigMap doc: %v\n%s", err, doc)
+		}
+		return cm
+	}
+	t.Fatalf("olaitan-rules ConfigMap not found in rendered output")
+	return olaitanRulesConfigMap{}
+}
+
+// TestRulesConfigMapPopulatedFromCorpus verifies Story 1.16 AC1: the
+// olaitan-rules ConfigMap carries every rule staged from repo-root
+// rules/<category>/, keyed by basename, and each value is faithful
+// enough to round-trip through parser.ParseRule. The test also
+// confirms every key matches the OLT rule-ID filename regex; a
+// regression in the helm-prepare-rules Makefile flatten step would
+// surface here with a clean diagnostic.
+func TestRulesConfigMapPopulatedFromCorpus(t *testing.T) {
+	rendered := helmTemplate(t, nil)
+	cm := findRulesConfigMap(t, rendered)
+	if len(cm.Data) < 10 {
+		t.Fatalf("olaitan-rules ConfigMap has %d keys; Story 1.16 AC1 requires >=10", len(cm.Data))
+	}
+	keyRegex := regexp.MustCompile(`^OLT-(EXEC|NET|FILE|PRIV|IMPACT|RECON|PERSIST|EXFIL|CRED|LATERAL)-[0-9]{3}\.yaml$`)
+	for key := range cm.Data {
+		if !keyRegex.MatchString(key) {
+			t.Errorf("ConfigMap key %q does not match OLT rule-ID filename regex", key)
+		}
+	}
+	body, ok := cm.Data["OLT-IMPACT-005.yaml"]
+	if !ok {
+		t.Fatalf("ConfigMap olaitan-rules missing OLT-IMPACT-005.yaml key")
+	}
+	if _, err := parser.ParseRule([]byte(body)); err != nil {
+		t.Errorf("OLT-IMPACT-005.yaml staged content fails parser.ParseRule: %v", err)
+	}
+}
+
+// TestRulesConfigMapKeysAreFlatNoDirectory asserts no ConfigMap key
+// contains a path separator. Kubernetes rejects ConfigMap data keys
+// with `/` at apply time, but a regression in the Makefile flatten
+// step would surface that failure deep in `helm install` rather than
+// at chart-rendering time. The test catches it earlier with a clean
+// diagnostic.
+func TestRulesConfigMapKeysAreFlatNoDirectory(t *testing.T) {
+	rendered := helmTemplate(t, nil)
+	cm := findRulesConfigMap(t, rendered)
+	for key := range cm.Data {
+		if strings.Contains(key, "/") {
+			t.Errorf("ConfigMap key %q contains '/'; K8s data keys cannot contain slashes", key)
 		}
 	}
 }

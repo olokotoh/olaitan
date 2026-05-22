@@ -1,0 +1,42 @@
+{
+  "schema_version": "1",
+  "package_id": "pkg-s2-credential-exfiltration",
+  "workload_id": "tenant-acme/Deployment/web",
+  "workload_identity": {
+    "namespace": "tenant-acme",
+    "owner_kind": "Deployment",
+    "owner_name": "web"
+  },
+  "assembled_at": "2026-05-22T10:00:00Z",
+  "window_start": "2026-05-22T09:59:00Z",
+  "window_end": "2026-05-22T10:00:00Z",
+  "trigger": {
+    "type": "multi_signal",
+    "fired_at": "2026-05-22T10:00:00Z",
+    "distinct_sources": ["falco", "network"]
+  },
+  "workload_posture": {
+    "identity": {
+      "namespace": "tenant-acme",
+      "owner_kind": "Deployment",
+      "owner_name": "web"
+    },
+    "captured_at": "2026-05-22T10:00:00Z",
+    "service_account": "default"
+  },
+  "events": [
+    {
+      "id": "ev-s2-1",
+      "timestamp": "2026-05-22T10:00:00Z",
+      "source": "falco",
+      "category": "syscall",
+      "severity": "ERROR",
+      "summary": "ServiceAccount token read by non-system process and outbound to cloud metadata endpoint",
+      "raw": {
+        "file.path": "/run/secrets/kubernetes.io/serviceaccount/token",
+        "process.exe": "/usr/bin/curl",
+        "network.dst_ip": "169.254.169.254"
+      }
+    }
+  ]
+}

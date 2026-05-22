@@ -1,0 +1,33 @@
+title: Outbound traffic to stratum mining pool port from tenant Pod
+id: OLT-IMPACT-006
+description: |
+  Detects an outbound TCP flow from a tenant Pod whose destination
+  port lies in the standard stratum mining pool port set and whose
+  event severity is WARNING. The combination indicates the egress
+  half of a cryptomining workload: a process inside the Pod has
+  established a long lived TCP connection to a pool endpoint while
+  the CNI flow exporter flagged the volume as anomalous.
+status: experimental
+attack:
+  - T1496
+severity: 75
+detection:
+  pool_port:
+    network.dst_port:
+      - 3333
+      - 4444
+      - 5555
+      - 7777
+      - 14444
+  warning_severity:
+    event.severity: 'WARNING'
+  tenant_namespace:
+    k8s.pod.namespace|startswith: 'tenant-'
+  condition: pool_port and warning_severity and tenant_namespace
+falsepositives:
+  - Genuine mining workloads in dedicated namespaces; allowlist via a dedicated tenant namespace shape
+  - Game servers reusing the 7777 port for tunnelled traffic
+fields:
+  - network.dst_port
+  - event.severity
+  - k8s.pod.namespace

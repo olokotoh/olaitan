@@ -1,0 +1,36 @@
+title: Privileged capability acquisition in workload Pod
+id: OLT-PRIV-001
+description: |
+  Detects a container process that acquires CAP_SYS_ADMIN or
+  CAP_SYS_PTRACE inside a Deployment or StatefulSet workload Pod
+  outside the system namespaces. These capabilities are sufficient
+  for a container escape via privileged syscalls and are not held by
+  typical application workloads, so their presence in a tenant
+  controller is a strong indicator of an in-progress escape attempt.
+status: experimental
+attack:
+  - T1611
+severity: 90
+detection:
+  cap_acquired:
+    process.cap_effective|contains:
+      - 'CAP_SYS_ADMIN'
+      - 'CAP_SYS_PTRACE'
+  workload_kind:
+    k8s.workload.owner_kind:
+      - Deployment
+      - StatefulSet
+  system_namespace:
+    k8s.pod.namespace:
+      - 'kube-system'
+      - 'kube-public'
+      - 'kube-node-lease'
+      - 'olaitan'
+  condition: cap_acquired and workload_kind and not system_namespace
+falsepositives:
+  - Privileged DaemonSets such as CNI or CSI plugins; excluded by the workload_kind filter
+  - Security testing workloads inside dedicated namespaces; allowlist via a dedicated namespace shape
+fields:
+  - process.cap_effective
+  - k8s.pod.namespace
+  - k8s.workload.owner_kind
