@@ -297,6 +297,14 @@ func (c *Correlator) publishTrigger(ctx context.Context, tr trigger.Trigger, sna
 	if c.metrics.windowSizeBytes != nil {
 		if data, mErr := json.Marshal(pkg); mErr == nil {
 			c.metrics.windowSizeBytes.Observe(float64(len(data)))
+		} else {
+			// PublishJS already marshalled pkg successfully a moment
+			// ago; a failure here implies concurrent mutation of pkg
+			// between the two marshals (a real bug). Log loud so the
+			// dropped histogram observation does not hide the
+			// underlying issue.
+			c.log.Warn("correlator: window_size_bytes observe skipped, re-marshal failed",
+				"workload_id", tr.WorkloadID, "trigger_type", tr.Type, "err", mErr)
 		}
 	}
 	if pkg.Overflow != nil {

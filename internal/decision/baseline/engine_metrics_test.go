@@ -14,11 +14,16 @@ import (
 
 // TestEngine_DeviationsVecLabelledBySigmaBucket covers Story 1.18
 // AC3: a deviation emission bumps olaitan_decision_baseline_deviations_total
-// under the correct {metric, sigma_bucket} label tuple. We drive the
-// per-deviation increment path directly (no JetStream consumer) by
-// constructing an Engine with a stub emitter and calling
-// HandleForBench against pre-warmed Welford state with three
-// different sigma magnitudes.
+// under the correct {metric, sigma_bucket} label tuple, with at least
+// one increment in EACH of the three bucket labels.
+//
+// The harness uses three distinct workloads (one per target bucket) so
+// Welford state updates from one driven package never bleed into the
+// next workload's sigma computation. Pre-warm uses values alternating
+// 15 and 25 (mean = 20, Bessel-corrected stddev about 5.085) so the
+// driven unique-IP counts 37 / 50 / 80 land at sigma about 3.34 / 5.90
+// / 11.80 respectively, deterministically populating "3-5", "5-10",
+// and "10+".
 func TestEngine_DeviationsVecLabelledBySigmaBucket(t *testing.T) {
 	store, warmup := newRealStoreAndWarmup(t)
 
@@ -36,47 +41,60 @@ func TestEngine_DeviationsVecLabelledBySigmaBucket(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	// Pre-warm an obvious deviation: Welford state with Mean=2,
-	// StdDev=~0.1 so a value of (2 + N*0.1) lands at sigma N.
-	wf := &Welford{}
-	for i := 0; i < 30; i++ {
-		// Tight cluster of values around 2 to keep StdDev small.
-		v := 2.0
-		if i%2 == 0 {
-			v = 2.1
-		}
-		wf.Update(v)
-	}
-	preload := map[string]*Welford{}
-	for _, n := range MetricNames() {
-		preload[n] = &Welford{}
-	}
-	preload["outbound_unique_dst_ips"] = wf
-	if err := store.Save(context.Background(), "default", "Deployment-svc", preload); err != nil {
-		t.Fatalf("Save: %v", err)
+	cases := []struct {
+		namespace string
+		pod       string
+		workload  string
+		dsts      int
+		want      string
+	}{
+		{"default", "Deployment-a", "default/Deployment/a", 37, "3-5"},
+		{"default", "Deployment-b", "default/Deployment/b", 50, "5-10"},
+		{"default", "Deployment-c", "default/Deployment/c", 80, "10+"},
 	}
 
-	// Drive three packages with deviations sized to land in each
-	// bucket: ~3.5 sigma -> "3-5", ~7 sigma -> ">=5", ~15 sigma ->
-	// ">=10". The exact dst-IP counts hit the sigma magnitudes
-	// approximately given the pre-warm distribution above.
-	for _, dsts := range []int{30, 60, 120} {
-		pkg := makeFlowPkg(dsts)
+	for _, tc := range cases {
+		wf := &Welford{}
+		for i := 0; i < 30; i++ {
+			v := 15.0
+			if i%2 == 0 {
+				v = 25.0
+			}
+			wf.Update(v)
+		}
+		preload := map[string]*Welford{}
+		for _, n := range MetricNames() {
+			preload[n] = &Welford{}
+		}
+		preload["outbound_unique_dst_ips"] = wf
+		if err := store.Save(context.Background(), tc.namespace, tc.pod, preload); err != nil {
+			t.Fatalf("Save(%s): %v", tc.workload, err)
+		}
+
+		pkg := makeFlowPkg(tc.dsts)
+		pkg.WorkloadID = tc.workload
+		pkg.WorkloadIdentity = schema.WorkloadIdentity{
+			Namespace: tc.namespace,
+			OwnerKind: "Deployment",
+			OwnerName: tc.pod[len("Deployment-"):],
+		}
 		if _, err := e.HandleForBench(context.Background(), &pkg); err != nil {
-			t.Fatalf("HandleForBench: %v", err)
+			t.Fatalf("HandleForBench(%s): %v", tc.workload, err)
 		}
 	}
 
 	got35 := testutil.ToFloat64(e.deviationsVec.WithLabelValues("outbound_unique_dst_ips", "3-5"))
-	got510 := testutil.ToFloat64(e.deviationsVec.WithLabelValues("outbound_unique_dst_ips", ">=5"))
-	got10p := testutil.ToFloat64(e.deviationsVec.WithLabelValues("outbound_unique_dst_ips", ">=10"))
-	total := got35 + got510 + got10p
-	if total < 3 {
-		t.Errorf("expected at least 3 deviation emissions across buckets, got %v + %v + %v = %v",
-			got35, got510, got10p, total)
+	got510 := testutil.ToFloat64(e.deviationsVec.WithLabelValues("outbound_unique_dst_ips", "5-10"))
+	got10p := testutil.ToFloat64(e.deviationsVec.WithLabelValues("outbound_unique_dst_ips", "10+"))
+
+	if got35 < 1 {
+		t.Errorf("expected at least one deviation in the 3-5 bucket from the 37-dst spike, got %v", got35)
+	}
+	if got510 < 1 {
+		t.Errorf("expected at least one deviation in the 5-10 bucket from the 50-dst spike, got %v", got510)
 	}
 	if got10p < 1 {
-		t.Errorf("expected at least one deviation in >=10 bucket from the 120-dst spike, got %v", got10p)
+		t.Errorf("expected at least one deviation in the 10+ bucket from the 80-dst spike, got %v", got10p)
 	}
 }
 
