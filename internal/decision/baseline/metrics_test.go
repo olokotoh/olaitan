@@ -269,6 +269,11 @@ func TestHasRestartAttemptTag(t *testing.T) {
 		{[]string{"attempt:42"}, true},
 		{[]string{"attempt:abc"}, false},
 		{[]string{"foo:bar", "attempt:2"}, true},
+		// Copilot C3 + Edge Case Hunter E2 regression: a malformed
+		// attempt tag preceding a valid one must not short-circuit
+		// the scan.
+		{[]string{"attempt:abc", "attempt:1"}, true},
+		{[]string{"attempt:abc", "attempt:0"}, false},
 		{nil, false},
 	}
 	for _, c := range cases {

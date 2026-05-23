@@ -4,31 +4,58 @@ package baseline_test
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"sort"
 	"testing"
 	"time"
 
+	natsserver "github.com/nats-io/nats-server/v2/server"
+
 	"github.com/olokotoh/olaitan/internal/decision/baseline"
+	natsclient "github.com/olokotoh/olaitan/internal/nats"
 	"github.com/olokotoh/olaitan/internal/schema"
 )
 
 // TestIntegration_BaselineEngineLatencyBudget locks AC6: the
 // per-package evaluation p99 must remain at or below 100 ms (NFR3).
-// The bench drives baseline.HandleForBench (a test surface exposing
-// the in-process handle() path without standing up a JetStream
-// consumer) against 1,000 EvidencePackages on a 50-workload corpus
-// of pre-warmed Welford state.
+// The bench drives baseline.Engine.HandleForBench against 1,000
+// EvidencePackages on a 50-workload corpus of pre-warmed Welford
+// state. HandleForBench is the same code path handle() runs on real
+// JetStream messages (minus the msg.Ack), so the latency gate
+// measures production semantics rather than a hoisted shortcut
+// (Copilot C4 + Blind Hunter B11 + Story 1.15 P4+P5 closure
+// precedent).
 //
 // The bench does not exercise the JetStream consumer because the
 // inbound subscribe latency is unbounded by AC6 (NFR3 explicitly
 // scopes "evaluation per EvidencePackage", not end-to-end consumer
 // latency). Story 1.18 owns the consumer-side budget.
 func TestIntegration_BaselineEngineLatencyBudget(t *testing.T) {
+	srv := startBenchNATSServer(t)
+	nc, err := natsclient.NewClient(natsclient.ClientConfig{URL: srv.ClientURL(), Name: "baseline-bench"})
+	if err != nil {
+		t.Fatalf("nats: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = nc.Close(ctx)
+	})
+
 	mr := startMiniredis(t)
 	rc := newRedis(t, mr.Addr())
 	store, _ := baseline.NewStore(rc)
 	w, _ := baseline.NewWarmup(store, baseline.WarmupConfig{Duration: 30 * time.Minute})
 	emit := newRecordingEmitter()
+
+	engine, err := baseline.New(baseline.Config{
+		NATS: nc, Store: store, Warmup: w, Emitter: emit,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("baseline.New: %v", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -53,27 +80,12 @@ func TestIntegration_BaselineEngineLatencyBudget(t *testing.T) {
 	const N = 1000
 	durations := make([]time.Duration, 0, N)
 	for i := 0; i < N; i++ {
-		pod := "svc-" + itoa(i%workloads)
 		pkg := packageWithFlows("pkg-bench-"+itoa(i), []string{"10.0.0." + itoa(i%256), "10.0.0." + itoa((i+1)%256)})
 		pkg.WorkloadIdentity = schema.WorkloadIdentity{Namespace: "default", OwnerKind: "Deployment", OwnerName: "svc-" + itoa(i%workloads)}
-		_ = pod
 
 		start := time.Now()
-		// Inline the engine handle path's logic: load, update, save.
-		baselines, err := store.Load(ctx, pkg.WorkloadIdentity.Namespace, "Deployment-"+pkg.WorkloadIdentity.OwnerName, baseline.MetricNames())
-		if err != nil {
-			t.Fatalf("Load: %v", err)
-		}
-		for _, name := range baseline.MetricNames() {
-			ex := baseline.DefaultExtractors()[name]
-			value, present := ex(&pkg)
-			if !present {
-				continue
-			}
-			baselines[name].Update(value)
-		}
-		if err := store.Save(ctx, pkg.WorkloadIdentity.Namespace, "Deployment-"+pkg.WorkloadIdentity.OwnerName, baselines); err != nil {
-			t.Fatalf("Save: %v", err)
+		if _, err := engine.HandleForBench(ctx, &pkg); err != nil {
+			t.Fatalf("HandleForBench[%d]: %v", i, err)
 		}
 		durations = append(durations, time.Since(start))
 	}
@@ -88,6 +100,12 @@ func TestIntegration_BaselineEngineLatencyBudget(t *testing.T) {
 	if p99 > 100*time.Millisecond {
 		t.Errorf("p99 latency = %s, exceeds AC6/NFR3 100ms gate", p99)
 	}
-	_ = w
-	_ = emit
+}
+
+// startBenchNATSServer mirrors startTestNATSServer but is local to
+// the bench file so it does not conflict with the helper in
+// engine_integration_test.go when the integration build tag is on.
+func startBenchNATSServer(t *testing.T) *natsserver.Server {
+	t.Helper()
+	return startTestNATSServer(t)
 }

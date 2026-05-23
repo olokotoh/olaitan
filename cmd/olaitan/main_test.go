@@ -36,6 +36,8 @@ func writeTestConfig(t *testing.T) string {
   baseline_window: 24h
   rules:
     enabled: false
+  baselines:
+    enabled: false
 response:
   excluded_namespaces:
     - kube-system

@@ -36,6 +36,18 @@ import (
 	"strconv"
 )
 
+// invalidSampleErr is returned by extractor-side guards (and surfaced
+// by the engine's per-extractor sample-quality counter) when an
+// observation is NaN or +/-Inf. The engine treats this as an
+// extractor-side reject and skips the Welford update so a malformed
+// adapter value cannot poison the running mean and silently disarm
+// the metric stream (per Robust Perception NaN guidance and the
+// Prometheus NaN-is-observable convention).
+//
+// This sentinel lives in the welford package because the guard's
+// contract (reject pre-Update) is part of the algorithm's safety
+// contract, not the engine's hot path.
+
 // Welford holds the running count, mean, and sum-of-squared-deltas
 // for a single metric stream. The zero value is the empty state
 // (count zero, mean zero, m2 zero) and is safe to Update.
@@ -51,7 +63,20 @@ type Welford struct {
 // product of the pre-update delta and the post-update delta. The
 // algorithm is numerically stable for streams of any length and
 // reproduces batch (mean, variance) to within float64 round-off.
+//
+// Defence in depth: NaN/+/-Inf samples are silently rejected at
+// Update time. The engine's per-extractor guard rejects these at
+// the metric boundary first (with a counter increment), so this
+// branch is structural insurance against a future caller that
+// bypasses the boundary check. Without the guard a single NaN
+// sample would propagate to Mean/M2/StdDev/Sigma permanently,
+// silently disarming the metric stream until the 48h Redis TTL
+// expires (per the Welford NaN-poison analysis in the Story 1.17
+// code-review web validation).
 func (w *Welford) Update(x float64) {
+	if math.IsNaN(x) || math.IsInf(x, 0) {
+		return
+	}
 	n := w.Count + 1
 	delta := x - w.Mean
 	w.Mean += delta / float64(n)
@@ -107,11 +132,11 @@ func (w *Welford) Reset() {
 }
 
 // MarshalRedisHash emits the three-field hash representation of
-// the Welford state. Fields are encoded as decimal strings via
-// fmt.Sprintf("%g", ...) for the floats so round-trip via
-// UnmarshalRedisHash preserves the float64 bit pattern across
-// Redis's text-on-the-wire HSET/HGETALL surface. The "count"
-// field is emitted as a base-10 integer string.
+// the Welford state. Floats are encoded via strconv.FormatFloat
+// with precision=-1 so round-trip via UnmarshalRedisHash preserves
+// the float64 bit pattern (Copilot C1: fmt.Sprintf("%g", ...) caps
+// precision at 6 digits and silently truncates many real values).
+// The "count" field is emitted as a base-10 integer string.
 //
 // The returned map keys are bare ("count", "mean", "m2"); the
 // caller (store.go) prefixes them with the metric name and merges
@@ -119,8 +144,8 @@ func (w *Welford) Reset() {
 func (w *Welford) MarshalRedisHash() map[string]any {
 	return map[string]any{
 		"count": strconv.FormatInt(w.Count, 10),
-		"mean":  fmt.Sprintf("%g", w.Mean),
-		"m2":    fmt.Sprintf("%g", w.M2),
+		"mean":  strconv.FormatFloat(w.Mean, 'g', -1, 64),
+		"m2":    strconv.FormatFloat(w.M2, 'g', -1, 64),
 	}
 }
 

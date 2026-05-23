@@ -2,6 +2,8 @@ package baseline
 
 import (
 	"encoding/json"
+	"math"
+	"strconv"
 	"strings"
 
 	"github.com/olokotoh/olaitan/internal/schema"
@@ -180,6 +182,13 @@ func extractContainerRestartsPerHour(pkg *schema.EvidencePackage) (float64, bool
 // "attempt:N" entry with N > 0. The CRI adapter emits this tag on
 // CONTAINER_STARTED_EVENT records whose meta.Attempt > 0 per
 // internal/collector/cri/translate.go:51-57.
+//
+// Copilot C3 + Edge Case Hunter E2: a malformed attempt tag (e.g.
+// "attempt:abc") must NOT short-circuit the scan; a later valid
+// "attempt:N" entry in the same slice would otherwise be missed,
+// silently suppressing restart detection (and the per-package
+// restarts/hour metric) for the whole event. Continue past the bad
+// tag instead of returning false.
 func hasRestartAttemptTag(tags []string) bool {
 	for _, t := range tags {
 		if !strings.HasPrefix(t, "attempt:") {
@@ -189,15 +198,22 @@ func hasRestartAttemptTag(tags []string) bool {
 		if rest == "" || rest == "0" {
 			continue
 		}
-		// A non-zero numeric suffix counts as a restart.
+		// A non-zero numeric suffix counts as a restart. A non-digit
+		// rune inside the suffix means the tag is malformed; ignore
+		// it and keep scanning the rest of the slice.
 		nonZero := false
+		malformed := false
 		for _, r := range rest {
 			if r < '0' || r > '9' {
-				return false
+				malformed = true
+				break
 			}
 			if r != '0' {
 				nonZero = true
 			}
+		}
+		if malformed {
+			continue
 		}
 		if nonZero {
 			return true
@@ -296,28 +312,44 @@ func stringOf(v any) string {
 	return ""
 }
 
+// numberOf coerces a JSON-decoded value into a float64 sample for
+// metric aggregation. NaN and +/-Inf are explicitly rejected (per
+// Edge Case Hunter E7 + the Story 1.17 NaN web-validation): a
+// stringified "NaN" or "Inf" from a malformed adapter would
+// otherwise feed Welford.Update and silently disarm the metric.
+// numberOf also rejects negative byte values for non-negative
+// counters (Blind Hunter B10) at the extractor boundary if the
+// caller passes a guard, but this function itself stays
+// metric-agnostic.
 func numberOf(v any) (float64, bool) {
+	var f float64
 	switch x := v.(type) {
 	case float64:
-		return x, true
+		f = x
 	case int:
-		return float64(x), true
+		f = float64(x)
 	case int64:
-		return float64(x), true
+		f = float64(x)
 	case json.Number:
-		f, err := x.Float64()
+		var err error
+		f, err = x.Float64()
 		if err != nil {
 			return 0, false
 		}
-		return f, true
 	case string:
-		// Some adapters stringify numerics; tolerate that shape.
-		var f float64
-		if _, err := json.Number(x).Float64(); err == nil {
-			f, _ = json.Number(x).Float64()
-			return f, true
+		// Some adapters stringify numerics; tolerate that shape via
+		// strconv.ParseFloat (json.Number.Float64 returns no error
+		// for "NaN"/"Inf", which would defeat the NaN guard below).
+		var err error
+		f, err = strconv.ParseFloat(x, 64)
+		if err != nil {
+			return 0, false
 		}
+	default:
 		return 0, false
 	}
-	return 0, false
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, false
+	}
+	return f, true
 }

@@ -28,10 +28,22 @@ const (
 	consumerMaxDeliver = 5
 
 	// publishAttemptTimeout caps a single FireBaselineDeviation
-	// invocation. Mirrors the correlator's publishAttemptTimeout so
-	// the engine cannot accidentally block longer than the inbound
-	// consumer's AckWait window.
+	// invocation. The realistic worst case is up to 5 deviations per
+	// package, so cap the inbound consumer's AckWait at strictly
+	// above 5 * publishAttemptTimeout + Redis Load + Save. See
+	// consumerAckWait below.
 	publishAttemptTimeout = 2 * time.Second
+
+	// consumerAckWait sizes the inbound consumer's AckWait window.
+	// Per the Story 1.17 review web validation: worst-case wall-time
+	// is ~13 s (5 metric emits at 2 s + Redis HGETALL + HSET + GC),
+	// and the oneuptime jetstream-consumer guide recommends
+	// AckWait = 3-6x p95 processing time. 60 s is the explicit
+	// upper bound chosen so a slow handle() never races the AckWait
+	// timer and triggers a spurious redelivery while the engine is
+	// still working. Blind Hunter B7 + Edge Case Hunter E4 surfaced
+	// the implicit-30s-default footgun.
+	consumerAckWait = 60 * time.Second
 
 	// fetchBackoff is the bounded sleep between consumer.Next attempts
 	// after a non-timeout error. The engine honours context
@@ -98,6 +110,11 @@ type Engine struct {
 // Returns an error if any required dependency is nil or if metric
 // registration fails. The constructor does not subscribe to NATS;
 // Run does.
+//
+// Copilot C6: validation reaches into Store.client and Warmup.store
+// so a caller that passes a zero-valued &Store{} / &Warmup{} (a
+// realistic test-fixture mistake) fails fast at construction
+// instead of panicking on the first inbound package.
 func New(cfg Config) (*Engine, error) {
 	if cfg.NATS == nil {
 		return nil, errors.New("baseline: nats client is nil")
@@ -105,8 +122,17 @@ func New(cfg Config) (*Engine, error) {
 	if cfg.Store == nil {
 		return nil, errors.New("baseline: store is nil")
 	}
+	if cfg.Store.client == nil {
+		return nil, errors.New("baseline: store.client is nil (Store must be constructed via NewStore)")
+	}
 	if cfg.Warmup == nil {
 		return nil, errors.New("baseline: warmup is nil")
+	}
+	if cfg.Warmup.store == nil {
+		return nil, errors.New("baseline: warmup.store is nil (Warmup must be constructed via NewWarmup)")
+	}
+	if cfg.Warmup.cfg.Load() == nil {
+		return nil, errors.New("baseline: warmup.cfg is nil (Warmup must be constructed via NewWarmup)")
 	}
 	if cfg.Emitter == nil {
 		return nil, errors.New("baseline: emitter is nil")
@@ -158,6 +184,21 @@ func (e *Engine) SetSigmaMultiplier(v float64) {
 		return
 	}
 	e.sigmaMul.Store(&v)
+}
+
+// SetWarmupDuration forwards a hot-reloaded warm-up window length
+// to the embedded Warmup controller. The aggregator's
+// config.Manager.Subscribe callback calls this so BI-3's
+// "warmupDuration is hot-reloadable" promise actually takes effect
+// (previously the subscribe callback only updated sigma, leaving
+// warmup_duration silently restart-required despite the BI-3 + helm
+// values docs claiming hot-reload). Copilot C5 + Edge Case Hunter
+// E1 + Acceptance Auditor A1.
+func (e *Engine) SetWarmupDuration(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	e.warmup.SetConfig(WarmupConfig{Duration: d})
 }
 
 // SigmaMultiplier returns the currently-active threshold. Test-only
@@ -260,11 +301,19 @@ func (e *Engine) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("baseline: stream EVIDENCE: %w", err)
 	}
+	// MaxAckPending = 1 makes the single-threaded handle() shape an
+	// explicit consumer-side invariant: even if a future refactor
+	// introduces concurrent dispatch the consumer will still serialise
+	// per-pending-message (per the byronruth jetstream-consumer guide
+	// and the oneuptime best-practices article cited in the Story 1.17
+	// review web validation).
 	consumer, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
 		Durable:       "olaitan-baseline-engine",
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		FilterSubject: subjects.EvidencePackages,
 		MaxDeliver:    consumerMaxDeliver,
+		AckWait:       consumerAckWait,
+		MaxAckPending: 1,
 	})
 	if err != nil {
 		return fmt.Errorf("baseline: consumer: %w", err)
@@ -310,6 +359,23 @@ func (e *Engine) sampleWarmupGauge(ctx context.Context) {
 	}
 }
 
+// HandleForBench exposes the in-process per-package evaluation path
+// to integration tests + benchmarks so the AC6 / NFR3 100ms p99
+// gate is measured against the same code the production consumer
+// runs (mirrors Story 1.15 P4+P5 closure: latency budgets must
+// drive the real evaluatePackage / handle path, not a hoisted
+// shortcut). Copilot C4 + Blind Hunter B11 surfaced the previous
+// bench's drift from production code.
+//
+// The function shares everything with handle() except: it accepts
+// a decoded *EvidencePackage rather than a JetStream msg, never
+// calls msg.Ack, and returns the per-package outcome string so the
+// bench can sanity-check it. The histogram is still observed via
+// the regular evalSeconds path.
+func (e *Engine) HandleForBench(ctx context.Context, pkg *schema.EvidencePackage) (outcome string, err error) {
+	return e.handleDecoded(ctx, pkg)
+}
+
 // handle decodes the inbound message, applies the re-entrancy guard,
 // performs restart detection, extracts metrics, updates Welford
 // state, and emits deviations through cfg.Emitter. Permanent decode
@@ -318,6 +384,26 @@ func (e *Engine) sampleWarmupGauge(ctx context.Context) {
 // routing to a future Story 1.18 DLQ surface is shared with the
 // rules engine.
 func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
+	var pkg schema.EvidencePackage
+	if err := json.Unmarshal(msg.Data(), &pkg); err != nil {
+		e.log.Warn("baseline: dropping malformed package", "err", err)
+		e.evalError.Add(1)
+		_ = msg.Ack()
+		return
+	}
+	_, _ = e.handleDecoded(ctx, &pkg)
+	_ = msg.Ack()
+}
+
+// handleDecoded is the pure in-process per-package evaluation path
+// shared by handle() (which adds msg decode + ack) and
+// HandleForBench() (which exposes the same code to integration
+// tests / benchmarks). Returns the per-package outcome string
+// ("deviation" / "normal" / "error" / "skipped_self" /
+// "missing_identity") + any persistent error encountered. Callers
+// never need to act on the error; counters and logs are emitted
+// internally to match the production observability contract.
+func (e *Engine) handleDecoded(ctx context.Context, pkg *schema.EvidencePackage) (string, error) {
 	start := time.Now()
 	observed := false
 	defer func() {
@@ -326,68 +412,81 @@ func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
 		}
 	}()
 
-	var pkg schema.EvidencePackage
-	if err := json.Unmarshal(msg.Data(), &pkg); err != nil {
-		e.log.Warn("baseline: dropping malformed package", "err", err)
-		e.evalError.Add(1)
-		_ = msg.Ack()
-		return
-	}
-
-	if e.applyReEntrancyGuard(&pkg) {
-		_ = msg.Ack()
-		return
+	if e.applyReEntrancyGuard(pkg) {
+		return "skipped_self", nil
 	}
 	observed = true
 
-	namespace, pod := resolveWorkloadKey(&pkg)
+	namespace, pod := resolveWorkloadKey(pkg)
 	if namespace == "" || pod == "" {
 		// No workload identity: nothing to baseline against. Treat as
 		// normal so the per-package histogram still observes the no-op
 		// path; ack and move on.
 		e.log.Warn("baseline: package missing workload identity, skipping", "workload_id", pkg.WorkloadID)
 		e.evalNormal.Add(1)
-		_ = msg.Ack()
-		return
+		return "missing_identity", nil
 	}
 
 	// Restart detection: a CRI lifecycle event with attempt:N (N>0)
 	// triggers warm-up + Welford reset BEFORE this evaluation folds
 	// in the package's observations.
-	if e.detectRestart(&pkg) {
-		if err := e.warmup.Begin(ctx, namespace, pod); err != nil {
-			e.log.Warn("baseline: warmup Begin failed", "namespace", namespace, "pod", pod, "err", err)
+	//
+	// Acceptance Auditor A10 dedupe: skip Begin+zero-Save when warm-up
+	// is already active for the workload. The same restart can show
+	// up across consecutive packages while the correlator's 60s
+	// sliding window absorbs the lifecycle event; without this
+	// dedupe each repeat would extend the warm-up window indefinitely
+	// and re-zero the Welford state, defeating AC3's bounded
+	// suppression.
+	//
+	// Blind Hunter B14 + Edge Case Hunter E6 atomicity: write zero
+	// Welford state FIRST then warmup.Begin so a process crash
+	// between the two leaves the durable hash in the zero-baseline
+	// state rather than a warm-up-active + stale-baseline pair.
+	//
+	// Blind Hunter B1: after the reset, fall THROUGH to the extract
+	// loop below so the package's other observations are folded into
+	// the freshly-zeroed Welford state. Warm-up suppression below
+	// then prevents any emission, satisfying AC3's "observations are
+	// recorded but no anomaly results are emitted" clause.
+	if e.detectRestart(pkg) {
+		alreadyActive, isActiveErr := e.warmup.IsActive(ctx, namespace, pod)
+		if isActiveErr != nil {
+			e.log.Warn("baseline: warmup IsActive failed during restart", "namespace", namespace, "pod", pod, "err", isActiveErr)
 			e.evalError.Add(1)
-			_ = msg.Ack()
-			return
+			return "error", isActiveErr
 		}
-		zero := make(map[string]*Welford, len(e.metricList))
-		for _, n := range e.metricList {
-			zero[n] = &Welford{}
+		if !alreadyActive {
+			zero := make(map[string]*Welford, len(e.metricList))
+			for _, n := range e.metricList {
+				zero[n] = &Welford{}
+			}
+			if err := e.store.Save(ctx, namespace, pod, zero); err != nil {
+				e.log.Warn("baseline: zero-store after restart failed", "namespace", namespace, "pod", pod, "err", err)
+				e.evalError.Add(1)
+				return "error", err
+			}
+			if err := e.warmup.Begin(ctx, namespace, pod); err != nil {
+				e.log.Warn("baseline: warmup Begin failed", "namespace", namespace, "pod", pod, "err", err)
+				e.evalError.Add(1)
+				return "error", err
+			}
+			e.log.Info("baseline: workload restart detected; warm-up engaged", "namespace", namespace, "pod", pod)
 		}
-		if err := e.store.Save(ctx, namespace, pod, zero); err != nil {
-			e.log.Warn("baseline: zero-store after restart failed", "namespace", namespace, "pod", pod, "err", err)
-			e.evalError.Add(1)
-			_ = msg.Ack()
-			return
-		}
-		e.log.Info("baseline: workload restart detected; warm-up engaged", "namespace", namespace, "pod", pod)
 	}
 
 	baselines, err := e.store.Load(ctx, namespace, pod, e.metricList)
 	if err != nil {
 		e.log.Warn("baseline: store load failed", "namespace", namespace, "pod", pod, "err", err)
 		e.evalError.Add(1)
-		_ = msg.Ack()
-		return
+		return "error", err
 	}
 
 	active, err := e.warmup.IsActive(ctx, namespace, pod)
 	if err != nil {
 		e.log.Warn("baseline: warmup IsActive failed", "namespace", namespace, "pod", pod, "err", err)
 		e.evalError.Add(1)
-		_ = msg.Ack()
-		return
+		return "error", err
 	}
 
 	sigmaMul := e.SigmaMultiplier()
@@ -399,7 +498,7 @@ func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
 		if !ok {
 			continue
 		}
-		value, present := ex(&pkg)
+		value, present := ex(pkg)
 		if !present {
 			continue
 		}
@@ -431,15 +530,14 @@ func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
 			Mean:   preMean,
 			StdDev: preStd,
 			Sigma:  sigma,
-			PodUID: resolvePodUID(&pkg),
+			PodUID: resolvePodUID(pkg),
 		})
 	}
 
 	if err := e.store.Save(ctx, namespace, pod, baselines); err != nil {
 		e.log.Warn("baseline: store save failed", "namespace", namespace, "pod", pod, "err", err)
 		e.evalError.Add(1)
-		_ = msg.Ack()
-		return
+		return "error", err
 	}
 
 	for _, dev := range deviations {
@@ -459,12 +557,14 @@ func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
 	switch {
 	case emitFailed:
 		e.evalError.Add(1)
+		return "error", nil
 	case len(deviations) > 0:
 		e.evalDeviation.Add(1)
+		return "deviation", nil
 	default:
 		e.evalNormal.Add(1)
+		return "normal", nil
 	}
-	_ = msg.Ack()
 }
 
 // resolveWorkloadKey returns the (namespace, pod) pair used to

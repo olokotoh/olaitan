@@ -131,10 +131,13 @@ func (w *Warmup) IsActive(ctx context.Context, namespace, pod string) (bool, err
 }
 
 // Begin records a new warm-up window starting at now() for the
-// workload. The cache is updated first, then the durable Store; a
-// crash between the two writes leaves the cache entry which will
-// vanish on controller restart, so the durable Store write is the
-// authoritative source of truth.
+// workload. The durable Store is written first, then the cache; a
+// crash after the SaveWarmup but before the cache.Store leaves the
+// authoritative state in Redis where the next IsActive call (after
+// controller restart) reloads it via the store fall-through path.
+// Inverting this order would risk a cache-only entry that vanishes
+// on restart, defeating AC4. Copilot C2 corrected the prior
+// docstring which described the inverted order.
 func (w *Warmup) Begin(ctx context.Context, namespace, pod string) error {
 	dur := w.cfg.Load().DurationOrDefault()
 	now := w.now().UTC()

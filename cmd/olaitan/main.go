@@ -535,10 +535,12 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 					return
 				}
 				baselineEngine.SetSigmaMultiplier(newCfg.Detection.Baselines.SigmaMultiplierOrDefault())
-				// WarmupDuration is hot-reloadable on the controller
-				// itself; the engine carries the controller pointer so
-				// SetSigmaMultiplier above and the controller's
-				// SetConfig below together cover BI-3.
+				baselineEngine.SetWarmupDuration(newCfg.Detection.Baselines.WarmupDurationOrDefault())
+				// Copilot C5 + Edge Case Hunter E1 + Acceptance
+				// Auditor A1: both knobs are hot-reloadable per BI-3.
+				// Without the SetWarmupDuration call, warmupDuration
+				// was silently restart-required despite the helm
+				// values comment + BI-3 docstring claiming hot-reload.
 			})
 		}
 		g.Go(func() error {

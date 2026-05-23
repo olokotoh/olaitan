@@ -6,12 +6,45 @@ import (
 	"log/slog"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/alicebob/miniredis/v2"
 
 	"github.com/olokotoh/olaitan/internal/correlator/trigger"
 	"github.com/olokotoh/olaitan/internal/metrics"
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
+	redisclient "github.com/olokotoh/olaitan/internal/redis"
 	"github.com/olokotoh/olaitan/internal/schema"
 )
+
+// newRealStoreAndWarmup constructs a Store + Warmup backed by an
+// in-process miniredis instance. The deeper nil-validation in New()
+// (Copilot C6) rejects zero-valued &Store{} and &Warmup{}, so the
+// happy-path tests need real-but-disposable infrastructure.
+func newRealStoreAndWarmup(t *testing.T) (*Store, *Warmup) {
+	t.Helper()
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("miniredis: %v", err)
+	}
+	t.Cleanup(mr.Close)
+	cfg := redisclient.DefaultConfig()
+	cfg.Addr = mr.Addr()
+	rc, err := redisclient.NewClient(cfg)
+	if err != nil {
+		t.Fatalf("redis client: %v", err)
+	}
+	t.Cleanup(func() { _ = rc.Close(context.Background()) })
+	store, err := NewStore(rc)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	warmup, err := NewWarmup(store, WarmupConfig{Duration: 30 * time.Minute})
+	if err != nil {
+		t.Fatalf("NewWarmup: %v", err)
+	}
+	return store, warmup
+}
 
 type stubEmitter struct {
 	calls atomic.Int64
@@ -41,39 +74,63 @@ func testEngine(t *testing.T) *Engine {
 }
 
 func TestNew_RejectsNilNATS(t *testing.T) {
-	_, err := New(Config{NATS: nil, Store: &Store{}, Warmup: &Warmup{}, Emitter: &stubEmitter{}})
+	store, warmup := newRealStoreAndWarmup(t)
+	_, err := New(Config{NATS: nil, Store: store, Warmup: warmup, Emitter: &stubEmitter{}})
 	if err == nil {
 		t.Errorf("New(nil NATS) should error")
 	}
 }
 
 func TestNew_RejectsNilStore(t *testing.T) {
-	_, err := New(Config{NATS: &natsclient.Client{}, Store: nil, Warmup: &Warmup{}, Emitter: &stubEmitter{}})
+	_, warmup := newRealStoreAndWarmup(t)
+	_, err := New(Config{NATS: &natsclient.Client{}, Store: nil, Warmup: warmup, Emitter: &stubEmitter{}})
 	if err == nil {
 		t.Errorf("New(nil Store) should error")
 	}
 }
 
 func TestNew_RejectsNilWarmup(t *testing.T) {
-	_, err := New(Config{NATS: &natsclient.Client{}, Store: &Store{}, Warmup: nil, Emitter: &stubEmitter{}})
+	store, _ := newRealStoreAndWarmup(t)
+	_, err := New(Config{NATS: &natsclient.Client{}, Store: store, Warmup: nil, Emitter: &stubEmitter{}})
 	if err == nil {
 		t.Errorf("New(nil Warmup) should error")
 	}
 }
 
 func TestNew_RejectsNilEmitter(t *testing.T) {
-	_, err := New(Config{NATS: &natsclient.Client{}, Store: &Store{}, Warmup: &Warmup{}, Emitter: nil})
+	store, warmup := newRealStoreAndWarmup(t)
+	_, err := New(Config{NATS: &natsclient.Client{}, Store: store, Warmup: warmup, Emitter: nil})
 	if err == nil {
 		t.Errorf("New(nil Emitter) should error")
 	}
 }
 
+// Copilot C6 regression: zero-valued &Store{} / &Warmup{} (a
+// realistic test-fixture mistake) must fail fast at construction
+// instead of panicking on the first inbound package.
+func TestNew_RejectsZeroValuedStore(t *testing.T) {
+	_, warmup := newRealStoreAndWarmup(t)
+	_, err := New(Config{NATS: &natsclient.Client{}, Store: &Store{}, Warmup: warmup, Emitter: &stubEmitter{}})
+	if err == nil {
+		t.Errorf("New(&Store{}) should error on missing client")
+	}
+}
+
+func TestNew_RejectsZeroValuedWarmup(t *testing.T) {
+	store, _ := newRealStoreAndWarmup(t)
+	_, err := New(Config{NATS: &natsclient.Client{}, Store: store, Warmup: &Warmup{}, Emitter: &stubEmitter{}})
+	if err == nil {
+		t.Errorf("New(&Warmup{}) should error on missing store")
+	}
+}
+
 func TestNew_HappyPath_RegistersAllMetrics(t *testing.T) {
+	store, warmup := newRealStoreAndWarmup(t)
 	reg := metrics.NewRegistry()
 	e, err := New(Config{
 		NATS:    &natsclient.Client{},
-		Store:   &Store{},
-		Warmup:  &Warmup{},
+		Store:   store,
+		Warmup:  warmup,
 		Emitter: &stubEmitter{},
 		Metrics: reg,
 		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
