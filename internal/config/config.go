@@ -1046,9 +1046,14 @@ func (r ResponseConfig) validate() error {
 
 func (a AnalystConfig) validate() error {
 	switch strings.ToLower(a.Provider) {
-	case "api", "local":
+	case "api", "local", "none":
+		// "none" is the LLM-tier-bypass sentinel used by the Epic 5 F
+		// and RS evaluation arms (Story 1.19 / FR53). The aggregator
+		// does not construct an analyst ring when provider="none";
+		// the rest of the AnalystConfig fields are accepted and
+		// validated as usual but are inert at runtime.
 	default:
-		return fmt.Errorf("analyst.provider: must be one of [api local] (got %q)", a.Provider)
+		return fmt.Errorf("analyst.provider: must be one of [api local none] (got %q)", a.Provider)
 	}
 	if a.ScoreCap < 0 || a.ScoreCap > 100 {
 		return fmt.Errorf("analyst.score_cap: must be in [0,100] (got %d)", a.ScoreCap)
