@@ -584,6 +584,14 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 func wireBaselineEngine(ctx context.Context, cfg *config.Config, nc *natsclient.Client, emit baseline.BaselineDeviationEmitter, metricsReg *metrics.Registry, log *slog.Logger) (*baseline.Engine, func(), error) {
 	rcfg := redisclient.DefaultConfig()
 	rcfg.Addr = cfg.Detection.Baselines.RedisAddr
+	// NFR8: Redis AUTH is mandatory. The Helm chart's olaitan-secrets
+	// Secret carries the password under key `redis-password`; the
+	// aggregator Deployment surfaces it as the REDIS_PASSWORD env var
+	// via valueFrom.secretKeyRef. Empty env var is permitted (operator
+	// running an externally-managed unauthenticated Redis); a real
+	// password mismatch surfaces at PING time as NOAUTH and CrashLoops
+	// the pod loudly.
+	rcfg.Password = os.Getenv("REDIS_PASSWORD")
 	rc, err := redisclient.NewClient(rcfg)
 	if err != nil {
 		return nil, func() {}, fmt.Errorf("aggregator: baseline redis: %w", err)
