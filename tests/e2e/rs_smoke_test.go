@@ -317,7 +317,13 @@ func TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation(t *testing.T) {
 	requireKindCluster(t)
 	waitForPodsReady(t)
 	portForward(t, "svc/"+defaultReleaseName+"-nats", natsLocalPort, "4222")
-	portForward(t, "svc/"+defaultReleaseName+"-aggregator", metricsLocalPort, "9090")
+	// The aggregator Deployment exposes containerPort 9090 but the
+	// chart does not render a Service for the aggregator (Story 1.18
+	// observability is scrape-annotation-based, no ServiceMonitor or
+	// metrics Service is rendered). Port-forward to the Deployment
+	// directly so the test does not depend on a Service that does
+	// not exist.
+	portForward(t, "deploy/"+defaultReleaseName+"-aggregator", metricsLocalPort, "9090")
 	nc, err := nats.Connect("nats://localhost:" + natsLocalPort)
 	if err != nil {
 		t.Fatalf("NATS connect: %v", err)
