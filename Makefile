@@ -156,6 +156,7 @@ e2e-local: helm-prepare helm-deps docker-build
 		--set baselines.warmupDuration=5s \
 		--set secrets.redisPassword=ci-test \
 		--set falco.enabled=false \
+		--set endpoints.falco=tcp://127.0.0.1:0 \
 		--set nats.config.jetstream.fileStore.maxSize=200GB \
 		--wait --timeout 5m
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) go test -tags=e2e -v -count=1 ./tests/e2e/...
