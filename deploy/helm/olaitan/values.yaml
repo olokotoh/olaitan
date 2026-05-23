@@ -713,8 +713,13 @@ baselines:
   # Redis address the Store and Warmup controllers dial for persisted
   # per-workload state (`baseline:<namespace>:<pod>:metrics`). The
   # 48h key-family TTL is enforced server-side by the Olaitan redis
-  # wrapper. Restart-required.
-  redisAddr: "redis:6379"
+  # wrapper. Restart-required. Empty (default) falls back to the
+  # `olaitan.endpoints.redis` helper that resolves to
+  # `<release>-redis-master:6379` when the bundled Bitnami Redis
+  # subchart is enabled; matches the env-var path the main aggregator
+  # Redis client uses (REDIS_ADDR via templates/daemonset.yaml). Set
+  # explicitly to point at externally-managed Redis when redis.enabled=false.
+  redisAddr: ""
 
 # Story 1.19: Evaluation matrix configuration (FR53). One-flag switch
 # that places the chart into one of the canonical evaluation arms (F,

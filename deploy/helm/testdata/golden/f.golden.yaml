@@ -725,7 +725,7 @@ data:
         enabled: false
         warmup_duration: "30m"
         sigma_multiplier: 3
-        redis_addr: "redis:6379"
+        redis_addr: "olaitan-redis-master:6379"
     
     # Story 1.12: Prometheus metrics surface (FR8, FR50). Every Olaitan
     # process exposes Prometheus metrics on :9090/metrics from a dedicated
