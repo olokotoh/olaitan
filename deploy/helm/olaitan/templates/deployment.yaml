@@ -111,6 +111,16 @@ spec:
               value: {{ include "olaitan.endpoints.redis" . | quote }}
             - name: FALCO_SOCKET
               value: {{ .Values.endpoints.falco | quote }}
+            # NFR8: Redis AUTH is mandatory. The baseline engine and
+            # any future aggregator-side Redis client read the password
+            # from this env var rather than parsing the mounted Secret
+            # file directly; matches the established 12-factor pattern
+            # already used by the subchart for its own Redis pods.
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "olaitan.fullname" . }}-secrets
+                  key: redis-password
           livenessProbe:
             httpGet:
               path: /healthz
