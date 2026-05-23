@@ -666,6 +666,44 @@ rules:
   # Deployment-spec change so the pod rolls (restart-required).
   path: "/etc/olaitan/rules"
 
+# Story 1.17: Welford baseline engine. Maintains per-workload Gaussian
+# baselines for five default metrics (outbound_unique_dst_ips,
+# distinct_exec_paths, outbound_bytes, audit_events_per_min,
+# container_restarts_per_hour) via Welford's online algorithm and
+# emits BaselineDeviation triggers when an observation crosses
+# sigmaMultiplier above the rolling mean. Restart-aware warm-up (FR18)
+# suppresses emissions for warmupDuration after a container restart so
+# the post-restart pattern does not contaminate the baseline.
+#
+# Restart semantics:
+# - warmupDuration: hot-reloadable. Mid-window changes do not retroactively
+#   shorten or extend an active warm-up; new restarts pick up the new value.
+# - sigmaMultiplier: hot-reloadable. Applied on the next handle() call.
+# - enabled: restart-required. Toggling this drives a new
+#   startAggregatorRing wiring; use `kubectl rollout restart deploy/
+#   olaitan-aggregator` after `helm upgrade --set baselines.enabled=...`.
+# - redisAddr: restart-required. The aggregator dials Redis at startup;
+#   moving the target requires a pod rollout.
+baselines:
+  # Whether startAggregatorRing constructs the baseline engine. Setting
+  # to false leaves the Redis client out of the aggregator ring and the
+  # JetStream consumer olaitan-baseline-engine is not created.
+  enabled: true
+
+  # Warm-up window applied after each detected container restart. AC3
+  # default is 30 minutes. Hot-reloadable.
+  warmupDuration: "30m"
+
+  # Number of standard deviations above the rolling mean at which a
+  # BaselineDeviation is emitted. AC2 default is 3.0. Hot-reloadable.
+  sigmaMultiplier: 3.0
+
+  # Redis address the Store and Warmup controllers dial for persisted
+  # per-workload state (`baseline:<namespace>:<pod>:metrics`). The
+  # 48h key-family TTL is enforced server-side by the Olaitan redis
+  # wrapper. Restart-required.
+  redisAddr: "redis:6379"
+
 # --- Subchart overrides ------------------------------------------------
 # Only opinions we impose on the downstream charts live here -- upstream
 # defaults are otherwise preserved. To see every available knob, consult

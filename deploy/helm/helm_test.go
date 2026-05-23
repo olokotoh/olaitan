@@ -2444,6 +2444,76 @@ func TestRulesConfigMapKeysAreFlatNoDirectory(t *testing.T) {
 	}
 }
 
+// TestBaselinesConfigMapBridgedFromValues propagates --set
+// baselines.warmupDuration and --set baselines.sigmaMultiplier
+// through the configmap.yaml bridge into the rendered olaitan.yaml.
+// Story 1.17 AC1/AC2.
+func TestBaselinesConfigMapBridgedFromValues(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"baselines.warmupDuration=15m",
+		"baselines.sigmaMultiplier=2.5",
+	})
+	if !strings.Contains(rendered, `warmup_duration: "15m"`) {
+		t.Errorf("baselines.warmupDuration override did not propagate; snippet:\n%s",
+			snippet(rendered, "baselines:"))
+	}
+	if !strings.Contains(rendered, `sigma_multiplier: 2.5`) {
+		t.Errorf("baselines.sigmaMultiplier override did not propagate; snippet:\n%s",
+			snippet(rendered, "baselines:"))
+	}
+}
+
+// TestBaselinesAnchorsPresentInOlaitanYAML asserts the literal
+// anchors the configmap.yaml bridge depends on remain in
+// config/olaitan.yaml's chart-side copy. Without this guard a future
+// edit to the baselines block could silently break the bridge and
+// operator --set values would be dropped. Mirrors the Story 1.15
+// TestRulesAnchorsPresentInOlaitanYAML pattern.
+func TestBaselinesAnchorsPresentInOlaitanYAML(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join(chartDir(t), "files", "olaitan.yaml"))
+	if err != nil {
+		t.Fatalf("read olaitan.yaml: %v", err)
+	}
+	for _, want := range []string{
+		"  baselines:",
+		"    enabled: true",
+		`    warmup_duration: "30m"`,
+		"    sigma_multiplier: 3.0",
+		`    redis_addr: "redis:6379"`,
+	} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("baselines-block anchor missing in chart olaitan.yaml: %q", want)
+		}
+	}
+}
+
+// TestBaselinesEnabledFalseDisablesAggregatorBlock renders the chart
+// with `--set baselines.enabled=false` and asserts the engine is
+// disabled while the WarmupDuration / SigmaMultiplier remain at the
+// chart-internal defaults (the runtime engine is skipped by
+// startAggregatorRing). Story 1.17 AC1/AC3 lock-in for sensing-only
+// deployments.
+func TestBaselinesEnabledFalseDisablesAggregatorBlock(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"baselines.enabled=false",
+	})
+	// Locate the baselines block in the rendered olaitan.yaml.
+	idx := strings.Index(rendered, "  baselines:")
+	if idx == -1 {
+		t.Fatalf("baselines block missing from rendered ConfigMap; sample:\n%s",
+			snippet(rendered, "baselines"))
+	}
+	// Window the next ~200 bytes after the block header.
+	end := idx + 250
+	if end > len(rendered) {
+		end = len(rendered)
+	}
+	window := rendered[idx:end]
+	if !strings.Contains(window, "enabled: false") {
+		t.Errorf("baselines.enabled=false did not propagate; window:\n%s", window)
+	}
+}
+
 func TestCorrelatorInvalidValuesFailFast(t *testing.T) {
 	cases := []struct {
 		name    string
