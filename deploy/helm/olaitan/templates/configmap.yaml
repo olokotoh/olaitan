@@ -27,6 +27,13 @@ metadata:
     {{- include "olaitan.labels" . | nindent 4 }}
 data:
   olaitan.yaml: |-
+    {{- /*
+    Story 1.19: fail-fast validation of the evaluation matrix surface.
+    Runs before any rendering work so an invalid evaluation.config or
+    analyst.provider surfaces as a clear render error rather than a
+    downstream bridge panic.
+    */ -}}
+    {{- include "olaitan.evaluation.validate" . -}}
     {{- $cfg := required "files/olaitan.yaml is empty -- run `make helm-prepare` to copy config/olaitan.yaml into the chart" (.Files.Get "files/olaitan.yaml") }}
     {{- /*
     Dual-flag bridge (post-bmad-code-review fix C11): keep
@@ -374,6 +381,41 @@ data:
     {{- $cfg = regexReplaceAll $pBra $cfg (printf "${1}redis_addr: %q" $bs.redisAddr) }}
     {{- end }}
     {{- end }}
+    {{- /*
+    Story 1.19: Evaluation-matrix overlay (FR53). Replace the file-side
+    defaults for detection.rules.enabled, detection.baselines.enabled,
+    and analyst.provider with the effective values computed by the
+    evaluation-matrix helpers in _helpers.tpl. Setting
+    evaluation.config to a canonical arm (F / RS / RSL / RSLT)
+    overlays the per-arm canonical values; an empty evaluation.config
+    falls through to the operator's individual rules.enabled,
+    baselines.enabled, and analyst.provider knobs (which the bridges
+    above have already overlaid onto the file-side defaults). These
+    three overlays therefore run AFTER the Story 1.15 / 1.17 bridges so
+    the evaluation arm takes precedence when set, and is a no-op when
+    not set.
+
+    Anchors:
+    - rules.enabled and baselines.enabled use the same indent-anchored
+      patterns the Story 1.15 / 1.17 bridges use (`\n  rules:` and
+      `\n  baselines:` are 2-space-indented children of `detection:`).
+    - analyst.provider sits at column 0 in config/olaitan.yaml (see
+      lines around `analyst:`), so the anchor uses `\nanalyst:\n  `
+      (one newline, no leading whitespace before `analyst:`) to match
+      the top-level block rather than a nested substring.
+    */ -}}
+    {{- $rulesEnabled := include "olaitan.evaluation.effectiveRulesEnabled" . -}}
+    {{- $baselinesEnabled := include "olaitan.evaluation.effectiveBaselinesEnabled" . -}}
+    {{- $analystProvider := include "olaitan.evaluation.effectiveAnalystProvider" . -}}
+    {{- $pEvRules := "(\\n  rules:[[:space:]]*\\n    )enabled:[[:space:]]+(?:true|false)" -}}
+    {{- if not (mustRegexFind $pEvRules $cfg) }}{{- fail (printf "helm bridge: evaluation overlay anchor for detection.rules.enabled not found (pattern %q)" $pEvRules) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pEvRules $cfg (printf "${1}enabled: %s" $rulesEnabled) }}
+    {{- $pEvBaselines := "(\\n  baselines:[[:space:]]*\\n    )enabled:[[:space:]]+(?:true|false)" -}}
+    {{- if not (mustRegexFind $pEvBaselines $cfg) }}{{- fail (printf "helm bridge: evaluation overlay anchor for detection.baselines.enabled not found (pattern %q)" $pEvBaselines) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pEvBaselines $cfg (printf "${1}enabled: %s" $baselinesEnabled) }}
+    {{- $pEvAnalyst := "(\\nanalyst:[[:space:]]*\\n  )provider:[[:space:]]+[a-z]+" -}}
+    {{- if not (mustRegexFind $pEvAnalyst $cfg) }}{{- fail (printf "helm bridge: evaluation overlay anchor for analyst.provider not found (pattern %q)" $pEvAnalyst) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pEvAnalyst $cfg (printf "${1}provider: %s" $analystProvider) }}
     {{- $cfg | nindent 4 }}
 ---
 apiVersion: v1
