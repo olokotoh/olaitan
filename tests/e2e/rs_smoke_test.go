@@ -48,7 +48,18 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 )
+
+// init wires the prometheus/common metric-name validator. v0.67.x
+// leaves model.NameValidationScheme defaulted to Unset and panics
+// inside TextParser.TextToMetricFamilies when the first metric name
+// is checked. Set Legacy validation (matches the historical
+// metric-name regexp the Olaitan codebase relies on; the metrics
+// surface does not use UTF-8-extended names).
+func init() {
+	model.NameValidationScheme = model.LegacyValidation
+}
 
 const (
 	defaultKindCluster   = "olaitan-e2e"
