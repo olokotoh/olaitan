@@ -100,10 +100,17 @@ type Engine struct {
 	evalDeviation    atomic.Int64
 	evalNormal       atomic.Int64
 	evalError        atomic.Int64
-	deviationsTotal  map[string]*atomic.Int64
 	skippedSelf      atomic.Int64
 	evalSeconds      prometheus.Histogram
 	warmupActiveCard atomic.Int64
+
+	// Story 1.18 AC3: labelled per-deviation counter. Replaces the
+	// Story 1.17 per-metric atomic map with a {metric, sigma_bucket}
+	// CounterVec. Cardinality 5 (metrics) × 3 (buckets) = 15 series,
+	// bounded for the lifetime of the project. Per BI-2 of Story
+	// 1.18, the warmup_active gauge stays unlabelled (architecture
+	// forbids the {workload} label suggested by the AC text).
+	deviationsVec *prometheus.CounterVec
 }
 
 // New constructs an Engine wired against the given dependencies.
@@ -153,18 +160,13 @@ func New(cfg Config) (*Engine, error) {
 	sort.Strings(names)
 
 	e := &Engine{
-		nc:              cfg.NATS,
-		store:           cfg.Store,
-		warmup:          cfg.Warmup,
-		emit:            cfg.Emitter,
-		log:             cfg.Log.With("component", "baseline-engine"),
-		extractors:      cfg.Extractors,
-		metricList:      names,
-		deviationsTotal: make(map[string]*atomic.Int64, len(names)),
-	}
-	for _, n := range names {
-		var c atomic.Int64
-		e.deviationsTotal[n] = &c
+		nc:         cfg.NATS,
+		store:      cfg.Store,
+		warmup:     cfg.Warmup,
+		emit:       cfg.Emitter,
+		log:        cfg.Log.With("component", "baseline-engine"),
+		extractors: cfg.Extractors,
+		metricList: names,
 	}
 	sigma := cfg.SigmaMultiplier
 	e.sigmaMul.Store(&sigma)
@@ -234,19 +236,21 @@ func (e *Engine) registerMetrics(reg *metrics.Registry) error {
 			return err
 		}
 	}
-	for _, name := range e.metricList {
-		n := name
-		ctr := e.deviationsTotal[n]
-		if err := reg.RegisterCounter(
-			"olaitan_decision_baseline_deviations_total",
-			"",
-			"Cumulative baseline deviations emitted by the engine; per-metric cardinality complementing the per-package evaluations_total{outcome=deviation}.",
-			prometheus.Labels{"metric": n},
-			func() int64 { return ctr.Load() },
-		); err != nil {
-			return err
-		}
+	// Story 1.18 AC3: labelled per-deviation counter. The Story 1.17
+	// per-metric atomic map is replaced with a {metric, sigma_bucket}
+	// CounterVec so dashboards can slice deviation rates by both the
+	// metric being baselined and the magnitude of the deviation. The
+	// cartesian is bounded at 5 metrics x 3 sigma buckets = 15
+	// series.
+	dv, err := reg.RegisterCounterVec(
+		"olaitan_decision_baseline_deviations_total",
+		"Per-(metric, sigma_bucket) baseline-deviation counter. Story 1.17 introduced the unlabelled-per-metric form; Story 1.18 AC3 adds the sigma_bucket label (one of \"3-5\", \">=5\", \">=10\"). Complements per-package evaluations_total{outcome=deviation}.",
+		[]string{"metric", "sigma_bucket"},
+	)
+	if err != nil {
+		return err
 	}
+	e.deviationsVec = dv
 	if err := reg.RegisterCounter(
 		"olaitan_decision_baseline_skipped_self_total",
 		"",
@@ -547,8 +551,11 @@ func (e *Engine) handleDecoded(ctx context.Context, pkg *schema.EvidencePackage)
 			e.log.Warn("baseline: emit FireBaselineDeviation failed",
 				"workload_id", pkg.WorkloadID, "metric", dev.Metric, "err", err)
 		} else {
-			if c, ok := e.deviationsTotal[dev.Metric]; ok {
-				c.Add(1)
+			// Story 1.18 AC3 per-(metric, sigma_bucket) bump. nil-
+			// guarded for tests that constructed the engine without a
+			// metrics registry.
+			if e.deviationsVec != nil {
+				e.deviationsVec.WithLabelValues(dev.Metric, sigmaBucket(dev.Sigma)).Inc()
 			}
 		}
 		cancel()

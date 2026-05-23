@@ -60,13 +60,8 @@ func (s *stubEmitter) FireBaselineDeviation(_ context.Context, _ string, dev sch
 func testEngine(t *testing.T) *Engine {
 	t.Helper()
 	e := &Engine{
-		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
-		metricList:      MetricNames(),
-		deviationsTotal: map[string]*atomic.Int64{},
-	}
-	for _, n := range e.metricList {
-		var c atomic.Int64
-		e.deviationsTotal[n] = &c
+		log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		metricList: MetricNames(),
 	}
 	sigma := DefaultSigmaMultiplier
 	e.sigmaMul.Store(&sigma)
@@ -141,6 +136,12 @@ func TestNew_HappyPath_RegistersAllMetrics(t *testing.T) {
 	if e == nil {
 		t.Fatalf("Engine: nil")
 	}
+	// Story 1.18: prime the CounterVec families so they surface in
+	// Gather(). A CounterVec with no observed series is registered
+	// but invisible to a from-scratch Gather; this test only needs
+	// to assert the registration call succeeded so a single touch is
+	// enough.
+	e.deviationsVec.WithLabelValues("outbound_unique_dst_ips", "3-5").Add(0)
 	mfs, err := reg.Gatherer().Gather()
 	if err != nil {
 		t.Fatalf("Gather: %v", err)

@@ -420,6 +420,7 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		WindowDuration:        cfg.Detection.Correlator.WindowDuration.Duration(),
 		MultiSignalMinSources: cfg.Detection.Correlator.MultiSignalMinSourcesOrDefault(),
 		Log:                   log,
+		MetricsRegistry:       metricsReg,
 	})
 	if err != nil {
 		closeNATS()

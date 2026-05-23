@@ -22,6 +22,7 @@ import (
 	"github.com/olokotoh/olaitan/internal/correlator/trigger"
 	"github.com/olokotoh/olaitan/internal/correlator/window"
 	"github.com/olokotoh/olaitan/internal/keys"
+	"github.com/olokotoh/olaitan/internal/metrics"
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
 	"github.com/olokotoh/olaitan/internal/schema"
 	"github.com/olokotoh/olaitan/internal/subjects"
@@ -60,6 +61,12 @@ type Config struct {
 	WindowDuration        time.Duration
 	MultiSignalMinSources int
 	Log                   *slog.Logger
+	// MetricsRegistry is optional. When non-nil, Correlator.New
+	// registers the Story 1.18 deterministic-detection observability
+	// surface (the three olaitan_correlator_* metrics) against this
+	// registry. When nil, the correlator runs without metrics (tests,
+	// multi-process eval harness, future eval-only deployments).
+	MetricsRegistry *metrics.Registry
 }
 
 // Correlator owns the per-workload window and evidence publish path.
@@ -73,6 +80,14 @@ type Correlator struct {
 
 	identityCache    sync.Map // map[string]identityCacheEntry, key = namespace + "/" + podName
 	identityCacheTTL time.Duration
+
+	// Story 1.18 observability surface. metrics handles are nil when
+	// cfg.MetricsRegistry was nil at construction time; every hot-path
+	// observation in publishTrigger is nil-guarded. overflowSummarisedCount
+	// backs the olaitan_correlator_overflow_summarised_total reader-callback
+	// counter (Story 1.15 e.skippedSelf pattern at engine.go:225-233).
+	metrics                 correlatorMetrics
+	overflowSummarisedCount atomic.Int64
 }
 
 type identityCacheEntry struct {
@@ -111,6 +126,11 @@ func New(cfg Config) (*Correlator, error) {
 		identityCacheTTL: ttl,
 	}
 	c.minSources.Store(int64(cfg.MultiSignalMinSources))
+	if cfg.MetricsRegistry != nil {
+		if err := c.registerMetrics(cfg.MetricsRegistry); err != nil {
+			return nil, fmt.Errorf("correlator: register metrics: %w", err)
+		}
+	}
 	return c, nil
 }
 
@@ -260,6 +280,27 @@ func (c *Correlator) publishTrigger(ctx context.Context, tr trigger.Trigger, sna
 	defer cancel()
 	if _, err := c.nc.PublishJS(pubCtx, subjects.EvidencePackages, pkg, jetstream.WithMsgID(pkg.PackageID)); err != nil {
 		return nil, fmt.Errorf("correlator: publish evidence: %w", err)
+	}
+
+	// Story 1.18 deterministic-detection observability surface.
+	// Observe AFTER the successful PublishJS so a publish failure does
+	// not pollute the metric surface with packages that never reached
+	// EVIDENCE.packages. Per BI-5, re-marshal once here to surface the
+	// on-wire byte length to the windowSizeBytes histogram; the cost
+	// is one additional JSON pass per publish (~1 ms p99 at the 128
+	// KiB ceiling) and is below the NFR2 trigger-to-publish budget.
+	// Every handle is nil-guarded so the correlator can run without a
+	// metrics registry (tests, eval harness).
+	if c.metrics.evidencePackages != nil {
+		c.metrics.evidencePackages.WithLabelValues(tr.Type).Inc()
+	}
+	if c.metrics.windowSizeBytes != nil {
+		if data, mErr := json.Marshal(pkg); mErr == nil {
+			c.metrics.windowSizeBytes.Observe(float64(len(data)))
+		}
+	}
+	if pkg.Overflow != nil {
+		c.overflowSummarisedCount.Add(1)
 	}
 	return pkg, nil
 }

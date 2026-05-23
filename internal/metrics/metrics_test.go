@@ -526,6 +526,128 @@ func TestRegisterHistogram_NilRegistry(t *testing.T) {
 	}
 }
 
+// TestRegisterCounterVec_BasicIncrement verifies the CounterVec is
+// registered, accepts WithLabelValues(...).Inc() calls, and the
+// gathered output reports one sample per distinct label tuple.
+func TestRegisterCounterVec_BasicIncrement(t *testing.T) {
+	t.Parallel()
+	r := metrics.NewRegistry()
+	v, err := r.RegisterCounterVec(
+		"oltm_test_counter_vec",
+		"test counter vec",
+		[]string{"rule_id", "severity_bucket"},
+	)
+	if err != nil {
+		t.Fatalf("RegisterCounterVec: %v", err)
+	}
+	v.WithLabelValues("OLT-PRIV-001", "critical").Inc()
+	v.WithLabelValues("OLT-PRIV-001", "critical").Inc()
+	v.WithLabelValues("OLT-EXEC-001", "high").Inc()
+
+	mfs, err := r.Gatherer().Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	if len(mfs) != 1 {
+		t.Fatalf("metric family count = %d, want 1", len(mfs))
+	}
+	mf := mfs[0]
+	if mf.GetType().String() != "COUNTER" {
+		t.Errorf("type = %s, want COUNTER", mf.GetType())
+	}
+	if got := len(mf.Metric); got != 2 {
+		t.Errorf("series count = %d, want 2", got)
+	}
+}
+
+// TestRegisterCounterVec_NilRegistry verifies the nil-receiver guard.
+func TestRegisterCounterVec_NilRegistry(t *testing.T) {
+	t.Parallel()
+	var r *metrics.Registry
+	if _, err := r.RegisterCounterVec("x", "h", []string{"a"}); !errors.Is(err, metrics.ErrNilRegistry) {
+		t.Errorf("err = %v, want ErrNilRegistry", err)
+	}
+}
+
+// TestRegisterCounterVec_EmptyNameRejected verifies an empty name
+// fails fast at registration time rather than silently surfacing as
+// a wrapped Prometheus error later.
+func TestRegisterCounterVec_EmptyNameRejected(t *testing.T) {
+	t.Parallel()
+	r := metrics.NewRegistry()
+	if _, err := r.RegisterCounterVec("", "h", []string{"a"}); err == nil {
+		t.Errorf("expected error on empty name")
+	}
+}
+
+// TestRegisterCounterVec_DuplicateNameRejected verifies the
+// underlying prometheus.Registry refuses to register the same name
+// twice.
+func TestRegisterCounterVec_DuplicateNameRejected(t *testing.T) {
+	t.Parallel()
+	r := metrics.NewRegistry()
+	if _, err := r.RegisterCounterVec("oltm_dup_vec", "h", []string{"a"}); err != nil {
+		t.Fatalf("first register: %v", err)
+	}
+	if _, err := r.RegisterCounterVec("oltm_dup_vec", "h", []string{"a"}); err == nil {
+		t.Errorf("second register: expected error, got nil")
+	}
+}
+
+// TestRegisterHistogramVec_BasicObserve verifies the HistogramVec is
+// registered and per-label-tuple Observe surfaces distinct series.
+func TestRegisterHistogramVec_BasicObserve(t *testing.T) {
+	t.Parallel()
+	r := metrics.NewRegistry()
+	buckets := []float64{0.001, 0.01, 0.1}
+	v, err := r.RegisterHistogramVec(
+		"oltm_test_histogram_vec",
+		"test histogram vec",
+		[]string{"provider"},
+		buckets,
+	)
+	if err != nil {
+		t.Fatalf("RegisterHistogramVec: %v", err)
+	}
+	v.WithLabelValues("anthropic").Observe(0.002)
+	v.WithLabelValues("openai").Observe(0.05)
+	v.WithLabelValues("anthropic").Observe(0.003)
+
+	mfs, err := r.Gatherer().Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	if len(mfs) != 1 {
+		t.Fatalf("metric family count = %d, want 1", len(mfs))
+	}
+	mf := mfs[0]
+	if mf.GetType().String() != "HISTOGRAM" {
+		t.Errorf("type = %s, want HISTOGRAM", mf.GetType())
+	}
+	if got := len(mf.Metric); got != 2 {
+		t.Errorf("series count = %d, want 2", got)
+	}
+}
+
+// TestRegisterHistogramVec_NilRegistry verifies the nil-receiver guard.
+func TestRegisterHistogramVec_NilRegistry(t *testing.T) {
+	t.Parallel()
+	var r *metrics.Registry
+	if _, err := r.RegisterHistogramVec("x", "h", []string{"a"}, []float64{0.1}); !errors.Is(err, metrics.ErrNilRegistry) {
+		t.Errorf("err = %v, want ErrNilRegistry", err)
+	}
+}
+
+// TestRegisterHistogramVec_EmptyNameRejected verifies an empty name
+// fails fast.
+func TestRegisterHistogramVec_EmptyNameRejected(t *testing.T) {
+	t.Parallel()
+	r := metrics.NewRegistry()
+	if _, err := r.RegisterHistogramVec("", "h", []string{"a"}, []float64{0.1}); err == nil {
+		t.Errorf("expected error on empty name")
+	}
+}
+
 func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
