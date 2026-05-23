@@ -106,14 +106,20 @@ func kubectl(t *testing.T, args ...string) string {
 	return stdout.String()
 }
 
-// waitForPodsReady blocks until at least one collector and one
-// aggregator pod report Ready, up to 120 seconds. Matches the chart's
-// label selector `app.kubernetes.io/name=olaitan`.
+// waitForPodsReady blocks until the aggregator pod reports Ready, up
+// to 120 seconds. Scoped to the aggregator only: the smoke test
+// injects synthetic events directly into NATS via port-forward so the
+// collector DaemonSet is not on the critical path. Falco's eBPF probe
+// cannot load inside kind nodes (kind nodes are containers; eBPF is
+// host-scoped) and the collector pod is run with endpoints.falco set
+// to a tcp:// target so the /run/falco hostPath mount is skipped --
+// the collector starts but never connects to Falco. None of that
+// blocks the aggregator-side pipeline the test exercises.
 func waitForPodsReady(t *testing.T) {
 	t.Helper()
 	kubectl(t, "wait", "--for=condition=Ready",
 		"-n", defaultNamespace,
-		"--selector=app.kubernetes.io/name=olaitan",
+		"--selector=app.kubernetes.io/component=aggregator",
 		"--timeout=120s", "pods")
 }
 
