@@ -110,6 +110,17 @@ detection:
   rules:
     enabled: true
     path: "/etc/olaitan/rules"
+  # Story 1.17: Welford baseline engine (FR16/FR17/FR18). Maintains
+  # per-workload Gaussian baselines for five default metrics and emits
+  # BaselineDeviation triggers when an observation exceeds
+  # sigma_multiplier above the rolling mean. warmup_duration and
+  # sigma_multiplier are hot-reloadable; enabled and redis_addr are
+  # restart-required because they reconfigure startAggregatorRing.
+  baselines:
+    enabled: true
+    warmup_duration: "30m"
+    sigma_multiplier: 3.0
+    redis_addr: "redis:6379"
 
 # Story 1.12: Prometheus metrics surface (FR8, FR50). Every Olaitan
 # process exposes Prometheus metrics on :9090/metrics from a dedicated

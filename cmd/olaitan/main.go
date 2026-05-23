@@ -42,11 +42,14 @@ import (
 	"github.com/olokotoh/olaitan/internal/config"
 	"github.com/olokotoh/olaitan/internal/correlator"
 	correlatorasm "github.com/olokotoh/olaitan/internal/correlator/assembler"
+	"github.com/olokotoh/olaitan/internal/decision/baseline"
 	"github.com/olokotoh/olaitan/internal/decision/rules"
 	rulesloader "github.com/olokotoh/olaitan/internal/decision/rules/loader"
 	"github.com/olokotoh/olaitan/internal/health"
+	"github.com/olokotoh/olaitan/internal/metrics"
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
 	"github.com/olokotoh/olaitan/internal/ratelimit"
+	redisclient "github.com/olokotoh/olaitan/internal/redis"
 	"github.com/olokotoh/olaitan/internal/retry"
 	"github.com/olokotoh/olaitan/internal/schema"
 )
@@ -504,6 +507,61 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		log.Info("aggregator: rules engine disabled in config; skipping")
 	}
 
+	// Story 1.17: Welford baseline engine wiring. The engine consumes
+	// EvidencePackages from EVIDENCE.packages, maintains per-workload
+	// Welford state for the five default metrics, and re-emits
+	// deviations through the correlator's FireBaselineDeviation entry
+	// point (the correlator satisfies the BaselineDeviationEmitter
+	// interface by signature). When baselines.enabled=false the engine
+	// is skipped entirely; the JetStream consumer
+	// olaitan-baseline-engine is not created and Redis is not dialled.
+	if cfg.Detection.Baselines.EnabledOrDefault() {
+		// Defensive Path-non-empty equivalent (Story 1.15 P22 pattern):
+		// validate() skips the RedisAddr check when Enabled is nil.
+		// Fail loud if we reach this branch with an empty addr rather
+		// than crashing inside the redis client constructor.
+		if cfg.Detection.Baselines.RedisAddr == "" {
+			closeNATS()
+			return errors.New("aggregator: detection.baselines.redis_addr is empty but baseline engine is enabled")
+		}
+		baselineEngine, baselineCloser, berr := wireBaselineEngine(ctx, cfg, nc, corr, metricsReg, log)
+		if berr != nil {
+			closeNATS()
+			return berr
+		}
+		if subscribe != nil {
+			subscribe(func(newCfg *config.Config) {
+				if newCfg == nil {
+					return
+				}
+				baselineEngine.SetSigmaMultiplier(newCfg.Detection.Baselines.SigmaMultiplierOrDefault())
+				baselineEngine.SetWarmupDuration(newCfg.Detection.Baselines.WarmupDurationOrDefault())
+				// Copilot C5 + Edge Case Hunter E1 + Acceptance
+				// Auditor A1: both knobs are hot-reloadable per BI-3.
+				// Without the SetWarmupDuration call, warmupDuration
+				// was silently restart-required despite the helm
+				// values comment + BI-3 docstring claiming hot-reload.
+			})
+		}
+		g.Go(func() error {
+			if err := baselineEngine.Run(ctx); err != nil {
+				return fmt.Errorf("aggregator: baseline engine run: %w", err)
+			}
+			return nil
+		})
+		g.Go(func() error {
+			<-ctx.Done()
+			baselineCloser()
+			return nil
+		})
+		log.Info("aggregator: baseline engine wired",
+			"path", "baseline:",
+			"warmup_duration", cfg.Detection.Baselines.WarmupDurationOrDefault(),
+			"sigma_multiplier", cfg.Detection.Baselines.SigmaMultiplierOrDefault())
+	} else {
+		log.Info("aggregator: baseline engine disabled in config; skipping")
+	}
+
 	g.Go(func() error {
 		<-ctx.Done()
 		closeNATS()
@@ -514,6 +572,55 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		"max_package_bytes", cfg.Detection.Correlator.MaxPackageBytesOrDefault(),
 		"multi_signal_min_sources", cfg.Detection.Correlator.MultiSignalMinSourcesOrDefault())
 	return nil
+}
+
+// wireBaselineEngine constructs the Story 1.17 baseline engine and
+// its Redis-backed Store + Warmup controller. Returns the engine, a
+// closer that should be deferred for graceful shutdown, and any
+// construction error. Centralised here so startAggregatorRing stays
+// readable and the engine+store+warmup triple is wired in a single
+// place.
+func wireBaselineEngine(ctx context.Context, cfg *config.Config, nc *natsclient.Client, emit baseline.BaselineDeviationEmitter, metricsReg *metrics.Registry, log *slog.Logger) (*baseline.Engine, func(), error) {
+	rcfg := redisclient.DefaultConfig()
+	rcfg.Addr = cfg.Detection.Baselines.RedisAddr
+	rc, err := redisclient.NewClient(rcfg)
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("aggregator: baseline redis: %w", err)
+	}
+	closer := func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := rc.Close(closeCtx); err != nil {
+			log.Warn("aggregator: baseline redis close", "err", err)
+		}
+	}
+	store, err := baseline.NewStore(rc)
+	if err != nil {
+		closer()
+		return nil, func() {}, fmt.Errorf("aggregator: baseline store: %w", err)
+	}
+	warmup, err := baseline.NewWarmup(store, baseline.WarmupConfig{
+		Duration: cfg.Detection.Baselines.WarmupDurationOrDefault(),
+	})
+	if err != nil {
+		closer()
+		return nil, func() {}, fmt.Errorf("aggregator: baseline warmup: %w", err)
+	}
+	engine, err := baseline.New(baseline.Config{
+		NATS:            nc,
+		Store:           store,
+		Warmup:          warmup,
+		Emitter:         emit,
+		Metrics:         metricsReg,
+		Log:             log,
+		SigmaMultiplier: cfg.Detection.Baselines.SigmaMultiplierOrDefault(),
+	})
+	if err != nil {
+		closer()
+		return nil, func() {}, fmt.Errorf("aggregator: baseline engine: %w", err)
+	}
+	_ = ctx
+	return engine, closer, nil
 }
 
 // startCollectorRing wires the Ring 1 sensor adapters into the supplied

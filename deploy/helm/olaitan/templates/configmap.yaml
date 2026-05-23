@@ -342,6 +342,38 @@ data:
     {{- $cfg = regexReplaceAll $pRp $cfg (printf "${1}path: %q" $rs.path) }}
     {{- end }}
     {{- end }}
+    {{- /*
+    Story 1.17 baselines block bridge. Mirrors the Story 1.15 rules
+    bridge pattern: each knob is anchor-guarded against the indent
+    structure inside `detection.baselines:` so a chart upgrade that
+    drops one of the anchor fields fails render rather than silently
+    discarding the operator's --set.
+    */ -}}
+    {{- if .Values.baselines }}
+    {{- $bs := .Values.baselines }}
+    {{- if hasKey $bs "enabled" }}
+    {{- $pBen := "(\\n  baselines:[[:space:]]*\\n    )enabled:[[:space:]]+(?:true|false)" -}}
+    {{- if not (mustRegexFind $pBen $cfg) }}{{- fail (printf "helm bridge: detection.baselines.enabled anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pBen) }}{{- end }}
+    {{- $bEnVal := "false" }}
+    {{- if $bs.enabled }}{{- $bEnVal = "true" }}{{- end }}
+    {{- $cfg = regexReplaceAll $pBen $cfg (printf "${1}enabled: %s" $bEnVal) }}
+    {{- end }}
+    {{- if $bs.warmupDuration }}
+    {{- $pBwd := "(?s)(\\n  baselines:[[:space:]]*\\n    enabled:[[:space:]]+(?:true|false)\\n    )warmup_duration:[[:space:]]+\"[^\"]*\"" -}}
+    {{- if not (mustRegexFind $pBwd $cfg) }}{{- fail (printf "helm bridge: detection.baselines.warmup_duration anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pBwd) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pBwd $cfg (printf "${1}warmup_duration: %q" $bs.warmupDuration) }}
+    {{- end }}
+    {{- if hasKey $bs "sigmaMultiplier" }}
+    {{- $pBsm := "(?s)(\\n    warmup_duration:[[:space:]]+\"[^\"]*\"\\n    )sigma_multiplier:[[:space:]]+[0-9.]+" -}}
+    {{- if not (mustRegexFind $pBsm $cfg) }}{{- fail (printf "helm bridge: detection.baselines.sigma_multiplier anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pBsm) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pBsm $cfg (printf "${1}sigma_multiplier: %v" $bs.sigmaMultiplier) }}
+    {{- end }}
+    {{- if $bs.redisAddr }}
+    {{- $pBra := "(?s)(\\n    sigma_multiplier:[[:space:]]+[0-9.]+\\n    )redis_addr:[[:space:]]+\"[^\"]*\"" -}}
+    {{- if not (mustRegexFind $pBra $cfg) }}{{- fail (printf "helm bridge: detection.baselines.redis_addr anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pBra) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pBra $cfg (printf "${1}redis_addr: %q" $bs.redisAddr) }}
+    {{- end }}
+    {{- end }}
     {{- $cfg | nindent 4 }}
 ---
 apiVersion: v1

@@ -219,6 +219,12 @@ type DetectionConfig struct {
 	// distinguish "operator omitted enabled, default to true" from
 	// "operator explicitly set false" per the Story 1.14 D2 pattern.
 	Rules RulesConfig `yaml:"rules,omitempty"`
+	// Story 1.17: baselines sub-block configures the Welford
+	// baseline engine (FR16/FR17/FR18). Mirrors the Story 1.15
+	// RulesConfig pattern: Enabled and SigmaMultiplier are pointers
+	// so the loader can distinguish operator omission from explicit
+	// zero/false.
+	Baselines BaselinesConfig `yaml:"baselines,omitempty"`
 }
 
 // CorrelatorConfig controls the Story 1.14 Ring-2 sliding-window
@@ -396,6 +402,96 @@ func (r RulesConfig) validate() error {
 	}
 	if !filepath.IsAbs(r.Path) {
 		return fmt.Errorf("detection.rules.path: must be an absolute path (got %q)", r.Path)
+	}
+	return nil
+}
+
+// BaselinesConfig configures the Story 1.17 Welford baseline engine.
+//
+// Enabled is a pointer (Story 1.14 D2 / Story 1.15 RulesConfig
+// precedent) so the loader distinguishes "operator omitted, default
+// to enabled=true" from "operator explicitly set false". Sensing-only
+// mode disables the engine entirely; the JetStream consumer
+// olaitan-baseline-engine is not created in that case and
+// startAggregatorRing skips the engine goroutine.
+//
+// WarmupDuration and SigmaMultiplier are hot-reloadable via the
+// config.Manager.Subscribe callback because they are pure in-process
+// state with no Deployment-spec dependency. Enabled and RedisAddr are
+// restart-required by design: toggling the engine or its Redis target
+// rewires the aggregator ring.
+type BaselinesConfig struct {
+	Enabled         *bool        `yaml:"enabled,omitempty"`
+	WarmupDuration  DurationYAML `yaml:"warmup_duration,omitempty"`
+	SigmaMultiplier *float64     `yaml:"sigma_multiplier,omitempty"`
+	RedisAddr       string       `yaml:"redis_addr,omitempty"`
+}
+
+// DefaultBaselines returns the Story 1.17 production defaults:
+// engine enabled, 30-minute warm-up, 3-sigma threshold, Redis at the
+// canonical "redis:6379" address.
+func DefaultBaselines() BaselinesConfig {
+	t := true
+	s := 3.0
+	return BaselinesConfig{
+		Enabled:         &t,
+		WarmupDuration:  DurationYAML(30 * time.Minute),
+		SigmaMultiplier: &s,
+		RedisAddr:       "redis:6379",
+	}
+}
+
+// EnabledOrDefault reports the effective enabled state, treating a
+// nil pointer as the default (true) per RulesConfig precedent.
+func (b BaselinesConfig) EnabledOrDefault() bool {
+	if b.Enabled == nil {
+		return true
+	}
+	return *b.Enabled
+}
+
+// WarmupDurationOrDefault returns the effective warm-up window,
+// substituting the 30-minute default when omitted.
+func (b BaselinesConfig) WarmupDurationOrDefault() time.Duration {
+	if b.WarmupDuration.Duration() > 0 {
+		return b.WarmupDuration.Duration()
+	}
+	return 30 * time.Minute
+}
+
+// SigmaMultiplierOrDefault returns the effective sigma threshold,
+// substituting the default 3.0 when omitted.
+func (b BaselinesConfig) SigmaMultiplierOrDefault() float64 {
+	if b.SigmaMultiplier == nil {
+		return 3.0
+	}
+	return *b.SigmaMultiplier
+}
+
+// validate enforces BaselinesConfig invariants. When Enabled is nil
+// (operator did not declare the block) validation is skipped so
+// in-memory test fixtures can omit it. When Enabled=false the block
+// may stay zero-valued. When Enabled=true the WarmupDuration must be
+// positive, SigmaMultiplier must be positive, and RedisAddr must be
+// non-empty.
+func (b BaselinesConfig) validate() error {
+	if b.Enabled == nil {
+		return nil
+	}
+	if !*b.Enabled {
+		return nil
+	}
+	if b.WarmupDuration.Duration() <= 0 {
+		return fmt.Errorf("detection.baselines.warmup_duration: must be > 0 when baselines.enabled=true (got %s)", b.WarmupDuration.Duration())
+	}
+	if b.SigmaMultiplier == nil {
+		return errors.New("detection.baselines.sigma_multiplier: required when baselines.enabled=true")
+	}
+	if *b.SigmaMultiplier <= 0 {
+		return fmt.Errorf("detection.baselines.sigma_multiplier: must be > 0 (got %v)", *b.SigmaMultiplier)
+	}
+	if b.RedisAddr == "" {
+		return errors.New("detection.baselines.redis_addr: required when baselines.enabled=true")
 	}
 	return nil
 }
@@ -741,6 +837,25 @@ func Load(path string) (*Config, error) {
 		if cfg.Detection.Rules.Path == "" {
 			cfg.Detection.Rules.Path = defRules.Path
 		}
+
+		// Story 1.17: substitute baseline defaults before Validate so
+		// an operator who omits the block inherits engine-enabled with
+		// the canonical 30m / 3-sigma / redis:6379 defaults. The
+		// pointer-tagged Enabled lets an explicit `enabled: false`
+		// survive intact.
+		defBaselines := DefaultBaselines()
+		if cfg.Detection.Baselines.Enabled == nil {
+			cfg.Detection.Baselines.Enabled = defBaselines.Enabled
+		}
+		if cfg.Detection.Baselines.WarmupDuration.Duration() <= 0 {
+			cfg.Detection.Baselines.WarmupDuration = defBaselines.WarmupDuration
+		}
+		if cfg.Detection.Baselines.SigmaMultiplier == nil {
+			cfg.Detection.Baselines.SigmaMultiplier = defBaselines.SigmaMultiplier
+		}
+		if cfg.Detection.Baselines.RedisAddr == "" {
+			cfg.Detection.Baselines.RedisAddr = defBaselines.RedisAddr
+		}
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -847,6 +962,9 @@ func (d DetectionConfig) validate() error {
 		return err
 	}
 	if err := d.Rules.validate(); err != nil {
+		return err
+	}
+	if err := d.Baselines.validate(); err != nil {
 		return err
 	}
 	return nil
