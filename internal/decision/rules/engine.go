@@ -38,6 +38,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -50,6 +51,7 @@ import (
 	"github.com/olokotoh/olaitan/internal/decision/rules/loader"
 	"github.com/olokotoh/olaitan/internal/decision/rules/matcher"
 	"github.com/olokotoh/olaitan/internal/decision/rules/parser"
+	"github.com/olokotoh/olaitan/internal/decision/severitybucket"
 	"github.com/olokotoh/olaitan/internal/metrics"
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
 	"github.com/olokotoh/olaitan/internal/schema"
@@ -119,6 +121,14 @@ type Engine struct {
 	skippedSelf    atomic.Int64
 
 	evalSeconds prometheus.Histogram
+
+	// Story 1.18 AC2: labelled per-match counter. CounterVec carrying
+	// {rule_id, severity_bucket, attack_technique}. Registered under
+	// the _by_attribute_total suffix to avoid a metric-name collision
+	// with the existing unlabelled matchesTotal aggregate that the
+	// Story 1.15 dashboards already scrape. Per BI-4, multi-MitreTag
+	// rules emit one bump per (rule, severity, technique) triple.
+	matchesVec *prometheus.CounterVec
 }
 
 // New constructs an Engine wired against the given dependencies.
@@ -242,6 +252,24 @@ func (e *Engine) registerMetrics(reg *metrics.Registry) error {
 		return err
 	}
 	e.evalSeconds = h
+
+	// Story 1.18 AC2: labelled per-match counter alongside the
+	// unlabelled matchesTotal aggregate. The {rule_id,
+	// severity_bucket, attack_technique} cartesian is bounded by
+	// corpus_size x 4 x ~30 ATT&CK techniques; real usage stays at
+	// ~corpus_size series because each rule typically tags one
+	// primary technique. Per BI-4, multi-tag rules emit one bump per
+	// (rule, severity, technique) triple; empty MitreTags emits one
+	// bump with attack_technique="unknown" (the sentinel value).
+	mv, err := reg.RegisterCounterVec(
+		"olaitan_decision_rules_matches_by_attribute_total",
+		"Per-(rule_id, severity_bucket, attack_technique) rule-match counter (AC2 of Story 1.18). Complements the unlabelled olaitan_decision_rules_matches_total: sum without (rule_id, severity_bucket, attack_technique)(rate(matches_by_attribute_total[5m])) reproduces the aggregate. A rule carrying N MitreTags increments this counter N times (one per technique); a rule with empty MitreTags emits one bump with attack_technique=\"unknown\".",
+		[]string{"rule_id", "severity_bucket", "attack_technique"},
+	)
+	if err != nil {
+		return err
+	}
+	e.matchesVec = mv
 	return nil
 }
 
@@ -390,6 +418,14 @@ func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
 			emitFailed = true
 			e.log.Warn("rules: emit FireRuleMatch failed",
 				"workload_id", pkg.WorkloadID, "rule_id", m.RuleID, "err", err)
+		} else {
+			// Story 1.18 AC2: per-(rule, severity, technique) bump.
+			// Done only on emit success so the labelled counter stays
+			// consistent with the per-package outcome (a partial-emit
+			// package is downgraded to error and the matchesVec is not
+			// double-charged for the successful half). Per BI-4,
+			// multi-MitreTag rules fan out across techniques.
+			e.bumpMatchesVec(m)
 		}
 		cancel()
 	}
@@ -483,6 +519,34 @@ func (e *Engine) evaluateOnce(pkg *schema.EvidencePackage, ev schema.Event, rule
 		}
 	}
 	return out, nil
+}
+
+// bumpMatchesVec records one counter increment per
+// (rule_id, severity_bucket, attack_technique) triple for a single
+// RuleMatch. Empty MitreTags emits one bump with the "unknown"
+// sentinel so a rule that fires without an ATT&CK tag is still
+// observable. matchesVec is nil-guarded for callers (or tests) that
+// constructed the engine without a metrics registry.
+//
+// severity_bucket derivation: schema.RuleMatch.Severity is the
+// rule's 0-100 integer score rendered as a decimal string by
+// parser.Rule.SeverityString. Parse back to int and call
+// severitybucket.Bucket; a parse error falls back to "low" via
+// Bucket(0) (defensive; SeverityString only renders parseable
+// decimals).
+func (e *Engine) bumpMatchesVec(m schema.RuleMatch) {
+	if e.matchesVec == nil {
+		return
+	}
+	score, _ := strconv.Atoi(m.Severity)
+	bucket := severitybucket.Bucket(score)
+	if len(m.MitreTags) == 0 {
+		e.matchesVec.WithLabelValues(m.RuleID, bucket, "unknown").Inc()
+		return
+	}
+	for _, tech := range m.MitreTags {
+		e.matchesVec.WithLabelValues(m.RuleID, bucket, tech).Inc()
+	}
 }
 
 func chooseEventID(eventID, packageID string) string {

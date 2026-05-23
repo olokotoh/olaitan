@@ -341,6 +341,71 @@ func (r *Registry) RegisterHistogram(name, source, help string, labels prometheu
 	return h, nil
 }
 
+// RegisterCounterVec binds a labelled counter to the Prometheus
+// surface and returns the *prometheus.CounterVec handle so the
+// caller can do .WithLabelValues(...).Inc() on the hot path.
+//
+// Story 1.18 introduces this helper so the rules engine can register
+// olaitan_decision_rules_matches_by_attribute_total with the AC2
+// label set {rule_id, severity_bucket, attack_technique} and the
+// baseline engine can register olaitan_decision_baseline_deviations_total
+// with the AC3 label set {metric, sigma_bucket}. Unlike RegisterCounter
+// (which wraps an in-process atomic via NewCounterFunc), CounterVec
+// is a writeable instrument that the caller owns; this matches the
+// RegisterHistogram ownership shape.
+//
+// Cardinality guidance (per architecture.md:476): callers MUST NOT
+// pass `workload_id`, `pod_uid`, or any other per-pod identifier as
+// a label name. Use this helper only when the label cartesian
+// product is statically bounded and small (single-digit to low
+// hundreds of series per family).
+func (r *Registry) RegisterCounterVec(name, help string, labels []string) (*prometheus.CounterVec, error) {
+	if r == nil {
+		return nil, ErrNilRegistry
+	}
+	if name == "" {
+		return nil, errors.New("metrics: empty metric name")
+	}
+
+	v := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: name,
+		Help: help,
+	}, labels)
+	if err := r.reg.Register(v); err != nil {
+		return nil, fmt.Errorf("metrics: register %s: %w", name, err)
+	}
+	return v, nil
+}
+
+// RegisterHistogramVec binds a labelled histogram to the Prometheus
+// surface and returns the *prometheus.HistogramVec handle. Shares
+// the same ownership contract as RegisterCounterVec and the same
+// cardinality guidance.
+//
+// Story 1.18 does NOT currently use HistogramVec; the helper is
+// landed alongside RegisterCounterVec so Stories 2.9 (FSM transition
+// latency by from/to state) and 3.15 (LLM latency by provider/role)
+// inherit a consistent registration surface without duplicating the
+// pattern. Forbidden labels are the same as RegisterCounterVec.
+func (r *Registry) RegisterHistogramVec(name, help string, labels []string, buckets []float64) (*prometheus.HistogramVec, error) {
+	if r == nil {
+		return nil, ErrNilRegistry
+	}
+	if name == "" {
+		return nil, errors.New("metrics: empty metric name")
+	}
+
+	v := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    name,
+		Help:    help,
+		Buckets: buckets,
+	}, labels)
+	if err := r.reg.Register(v); err != nil {
+		return nil, fmt.Errorf("metrics: register %s: %w", name, err)
+	}
+	return v, nil
+}
+
 // RegisterGauge binds a gauge metric to the Prometheus surface. Use
 // RegisterCounter for monotonically-increasing values; use RegisterGauge
 // for values that can decrease such as consecutive-EOF counters that

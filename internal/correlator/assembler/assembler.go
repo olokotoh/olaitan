@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"sort"
 	"strconv"
-	"strings"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -25,6 +24,7 @@ import (
 	"github.com/olokotoh/olaitan/internal/collector/posture"
 	"github.com/olokotoh/olaitan/internal/correlator/trigger"
 	"github.com/olokotoh/olaitan/internal/correlator/window"
+	"github.com/olokotoh/olaitan/internal/decision/severitybucket"
 	"github.com/olokotoh/olaitan/internal/keys"
 	"github.com/olokotoh/olaitan/internal/schema"
 )
@@ -353,7 +353,7 @@ func summariseEvents(events []schema.Event, highSeverityThreshold int) []schema.
 	for _, ev := range events {
 		ev.Raw = nil
 		ev.Summary = truncateSummaryUTF8(ev.Summary, summaryByteCap)
-		if severityScore(ev.Severity) >= highSeverityThreshold {
+		if severitybucket.Score(ev.Severity) >= highSeverityThreshold {
 			out = append(out, ev)
 		}
 	}
@@ -376,7 +376,7 @@ func truncateSummaryUTF8(s string, maxBytes int) string {
 
 func sortForOverflow(events []schema.Event) {
 	sort.SliceStable(events, func(i, j int) bool {
-		si, sj := severityScore(events[i].Severity), severityScore(events[j].Severity)
+		si, sj := severitybucket.Score(events[i].Severity), severitybucket.Score(events[j].Severity)
 		if si != sj {
 			return si > sj
 		}
@@ -417,62 +417,10 @@ func countEvents(events []schema.Event) []schema.EvidenceCount {
 	return out
 }
 
-// severityScore maps a free-form severity label or numeric code to a
-// stable 0-100 ranking used by the overflow priority sort. Numeric
-// values are interpreted as syslog 0-7 (0=emerg, 7=debug) per RFC 5424;
-// numeric values outside that range fall through to keyword matching.
-// Unknown labels default to 10 so genuinely-low events keep a small
-// non-zero rank, leaving room above zero for explicit "none" tags
-// should the schema ever introduce one.
-func severityScore(severity string) int {
-	s := strings.ToLower(strings.TrimSpace(severity))
-	if s == "" {
-		return 10
-	}
-	if n, err := strconv.Atoi(s); err == nil {
-		if n >= 0 && n <= 7 {
-			return syslogSeverityScore(n)
-		}
-		// Numeric but outside syslog range: fall through to keyword
-		// matching so an analyst-supplied "-1" or "8" lands on the
-		// default-low score rather than producing a misleading
-		// large-magnitude rank.
-	}
-	switch s {
-	case "emergency", "fatal", "critical":
-		return 100
-	case "alert", "error", "err", "high":
-		return 80
-	case "warning", "warn", "medium":
-		return 50
-	case "notice", "low":
-		return 30
-	default:
-		return 10
-	}
-}
-
-func syslogSeverityScore(n int) int {
-	switch n {
-	case 0:
-		return 100
-	case 1:
-		return 90
-	case 2:
-		return 80
-	case 3:
-		return 70
-	case 4:
-		return 50
-	case 5:
-		return 40
-	case 6:
-		return 30
-	case 7:
-		return 10
-	}
-	return 10
-}
+// Story 1.18 moved the severityScore and syslogSeverityScore
+// helpers into internal/decision/severitybucket so the rules engine
+// emission path can share the same bucketisation as the overflow
+// priority sort here. Call sites above use severitybucket.Score.
 
 func size(pkg *schema.EvidencePackage) int {
 	data, err := json.Marshal(pkg)

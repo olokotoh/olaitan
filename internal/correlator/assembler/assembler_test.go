@@ -19,6 +19,7 @@ import (
 	"github.com/olokotoh/olaitan/internal/collector/posture"
 	"github.com/olokotoh/olaitan/internal/correlator/trigger"
 	"github.com/olokotoh/olaitan/internal/correlator/window"
+	"github.com/olokotoh/olaitan/internal/decision/severitybucket"
 	"github.com/olokotoh/olaitan/internal/schema"
 )
 
@@ -122,7 +123,7 @@ func TestEnforceSizeCapDeterministic(t *testing.T) {
 		if ev.Raw != nil {
 			t.Fatalf("overflow event retained raw payload")
 		}
-		if severityScore(ev.Severity) < 50 {
+		if severitybucket.Score(ev.Severity) < 50 {
 			t.Fatalf("low-priority event survived overflow: %+v", ev)
 		}
 	}
@@ -292,8 +293,8 @@ func TestSeverityScoreSyslogAndKeywords(t *testing.T) {
 		{"", 10},
 	}
 	for _, tc := range cases {
-		if got := severityScore(tc.in); got != tc.want {
-			t.Errorf("severityScore(%q) = %d, want %d", tc.in, got, tc.want)
+		if got := severitybucket.Score(tc.in); got != tc.want {
+			t.Errorf("severitybucket.Score(%q) = %d, want %d", tc.in, got, tc.want)
 		}
 	}
 }
