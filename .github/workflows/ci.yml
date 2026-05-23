@@ -157,7 +157,14 @@ jobs:
       - name: Install chart under RS arm
         run: |
           tag=$(make -s version-tag)
+          # image.repository must match what `make docker-build` produces
+          # (the bare `olaitan` name from Makefile IMAGE:=olaitan) AND what
+          # `kind load docker-image` loaded above; the chart default of
+          # ghcr.io/olokotoh/olaitan would resolve to a registry path that
+          # is not present on the node and `pullPolicy: Never` would then
+          # fail with ErrImageNeverPull.
           helm install olaitan ./deploy/helm/olaitan \
+            --set image.repository=olaitan \
             --set image.tag="$tag" \
             --set image.pullPolicy=Never \
             --set evaluation.config=RS \
