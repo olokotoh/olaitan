@@ -654,6 +654,12 @@ rateLimit:
 #   false drives a new startAggregatorRing wiring; the aggregator
 #   pod must be recreated. Use `kubectl rollout restart deploy/
 #   olaitan-aggregator` after `helm upgrade --set rules.enabled=...`.
+#
+# Story 1.19 cross-reference: when `evaluation.config` (below) is set to
+# a canonical arm (F / RS / RSL / RSLT), the chart overlays this knob
+# with the arm's canonical value; the operator-supplied `rules.enabled`
+# is intentionally clobbered. See the `evaluation:` block at the bottom
+# of this file for the full arm semantics.
 rules:
   # Whether startAggregatorRing constructs the rule engine. Disabling
   # is the sensing-only mode used in the Epic 5 four-way evaluation
@@ -684,6 +690,12 @@ rules:
 #   olaitan-aggregator` after `helm upgrade --set baselines.enabled=...`.
 # - redisAddr: restart-required. The aggregator dials Redis at startup;
 #   moving the target requires a pod rollout.
+#
+# Story 1.19 cross-reference: when `evaluation.config` (below) is set to
+# a canonical arm (F / RS / RSL / RSLT), the chart overlays this knob
+# with the arm's canonical value; the operator-supplied
+# `baselines.enabled` is intentionally clobbered. See the `evaluation:`
+# block at the bottom of this file for the full arm semantics.
 baselines:
   # Whether startAggregatorRing constructs the baseline engine. Setting
   # to false leaves the Redis client out of the aggregator ring and the
@@ -703,6 +715,63 @@ baselines:
   # 48h key-family TTL is enforced server-side by the Olaitan redis
   # wrapper. Restart-required.
   redisAddr: "redis:6379"
+
+# Story 1.19: Evaluation matrix configuration (FR53). One-flag switch
+# that places the chart into one of the canonical evaluation arms (F,
+# RS, RSL, RSLT-full). Empty default means "no override; individual
+# rules.enabled, baselines.enabled, and analyst.provider knobs apply
+# verbatim". Setting evaluation.config to a canonical string OVERLAYS
+# the corresponding canonical knob values; the operator-supplied
+# overrides for those three knobs are intentionally clobbered to make
+# the evaluation arm reproducible.
+#
+# Canonical arms:
+#   "F"    -- Falco-only baseline. rules.enabled=false,
+#             baselines.enabled=false, analyst.provider=none. Only the
+#             Falco sensor adapter is active. Used to measure Falco
+#             alone in the Epic 5 four-way comparison.
+#   "RS"   -- Rules + Statistics. rules.enabled=true,
+#             baselines.enabled=true, analyst.provider=none. LLM tier
+#             bypassed; the deterministic detection layer runs
+#             end-to-end. This is the Epic 1 closure target.
+#   "RSL"  -- RS plus single-LLM analyst. Reserved for Epic 3 Story 3.x
+#             once analyst.provider=api wiring lands. Setting "RSL"
+#             today is accepted by the validator but functionally
+#             equivalent to "RS" because the LLM driver does not exist
+#             yet; the chart-side bridge still flips analyst.provider
+#             to "api" so the Epic 3 wire-up is a single-line story.
+#   "RSLT" -- RS plus full multi-agent chain (L1 + L2 + Senior).
+#             Reserved for Epic 3 Story 3.x; same caveat as RSL.
+#
+# Restart semantics: changing evaluation.config drives changes to
+# rules.enabled, baselines.enabled, and analyst.provider, which are all
+# restart-required (see their per-block comments and the Story 1.15 /
+# 1.17 restart semantics). Use `kubectl rollout restart deploy/
+# olaitan-aggregator` after `helm upgrade --set evaluation.config=...`.
+evaluation:
+  # One of: "" (default), "F", "RS", "RSL", "RSLT". Chart fails render
+  # with a clear message on any other value (see _helpers.tpl
+  # olaitan.evaluation.validate).
+  config: ""
+
+# Story 1.19: Analyst tier provider selection. Mirrors the
+# config/olaitan.yaml analyst.provider field. The chart-side default is
+# "none" until Epic 3 Story 3.x lands the L1/L2/Senior chain; the
+# in-repo config/olaitan.yaml default of "api" is preserved as the
+# future-default and the chart's configmap.yaml bridge overlays the
+# chart-side value over the file-side value at render time.
+#
+# One of: "none" (LLM tier bypassed), "api" (OpenAI-compatible /
+# Anthropic via internal/agent/provider/api -- not yet wired; Story
+# 3.x), "local" (Ollama for air-gapped fallback -- not yet wired;
+# Story 3.x). Chart fails render on any other value.
+#
+# Restart-required: the analyst ring is constructed at startup; a
+# provider change drives a new startAggregatorRing wiring. Use
+# `kubectl rollout restart deploy/olaitan-aggregator` after
+# `helm upgrade --set analyst.provider=...`.
+analyst:
+  provider: "none"
 
 # --- Subchart overrides ------------------------------------------------
 # Only opinions we impose on the downstream charts live here -- upstream

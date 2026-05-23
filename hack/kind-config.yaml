@@ -1,0 +1,31 @@
+# kind cluster config for the Story 1.19 RS smoke test (tests/e2e/).
+#
+# Single-node control-plane cluster sized at 4 vCPU / 6 GiB to match
+# the kubeadm cluster spec the rest of the chart targets. The
+# architecture's three-node test cluster is over-spec for a smoke test
+# that exercises a single workload identity, so we accept the
+# single-node simplification here; full per-node behaviour is the
+# concern of the Epic 5 evaluation harness against a real kubeadm
+# cluster, not this kind-based smoke loop.
+#
+# Used by:
+#   `make e2e-local` (developer workflow)
+#   `.github/workflows/ci.yml` `e2e` job (via helm/kind-action@v1.12.0)
+#
+# Falco's eBPF probe is unavailable inside kind nodes (kind nodes are
+# containers; eBPF is host-scoped); chart installs in this cluster
+# therefore set `falco.enabled=false`. See tests/e2e/rs_smoke_test.go
+# header for the synthetic-event injection rationale.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: olaitan-e2e
+nodes:
+  - role: control-plane
+    # kubeadm config patch keeps the kubelet at a sane resource budget
+    # so a containerised cluster on a developer laptop does not OOM.
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            system-reserved: "cpu=200m,memory=512Mi"

@@ -9,7 +9,7 @@ CONFIG_SRC       := config/olaitan.yaml
 AUDIT_POLICY_SRC := config/audit-policy-default.yaml
 CHART_FILES      := $(CHART_DIR)/files/olaitan.yaml $(CHART_DIR)/files/audit-policy-default.yaml
 
-.PHONY: build test lint docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-lint helm-template helm-deps version-tag envtest-bin
+.PHONY: build test lint docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-down
 
 # envtest-bin downloads the kube-apiserver and etcd binaries that the
 # Story 1.11 posture-client integration tests (and any future
@@ -129,3 +129,30 @@ helm-lint: helm-prepare
 # schema validation (see deploy/helm/README.md).
 helm-template: helm-prepare
 	helm template olaitan $(CHART_DIR)
+
+# --- Story 1.19: kind-based RS smoke test ----------------------------
+# `make e2e-local` spins up a single-node kind cluster, builds the
+# Olaitan image, loads it into the cluster, installs the chart under
+# the RS evaluation arm with Falco disabled (eBPF unavailable inside
+# kind nodes), and runs the e2e smoke test. `make e2e-local-down`
+# tears the cluster back down. KIND_CLUSTER_NAME is overridable so a
+# developer can run two smoke clusters side-by-side without collision.
+
+KIND_CLUSTER_NAME ?= olaitan-e2e
+
+e2e-local: helm-prepare helm-deps docker-build
+	kind create cluster --name $(KIND_CLUSTER_NAME) --config hack/kind-config.yaml
+	kind load docker-image $(IMAGE):$(TAG) --name $(KIND_CLUSTER_NAME)
+	helm install olaitan $(CHART_DIR) \
+		--set image.repository=$(IMAGE) \
+		--set image.tag=$(TAG) \
+		--set image.pullPolicy=Never \
+		--set evaluation.config=RS \
+		--set baselines.warmupDuration=5s \
+		--set secrets.redisPassword=ci-test \
+		--set falco.enabled=false \
+		--wait --timeout 5m
+	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) go test -tags=e2e -v -count=1 ./tests/e2e/...
+
+e2e-local-down:
+	kind delete cluster --name $(KIND_CLUSTER_NAME)

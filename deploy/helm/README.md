@@ -95,6 +95,25 @@ go test ./deploy/helm/... -tags=helm -v
 
 CI runs the same gates in `.github/workflows/ci.yml` under the `helm` job.
 
+### Golden-file diff (Story 1.19)
+
+The `helm` test suite includes three byte-stable golden snapshots at
+`deploy/helm/testdata/golden/` (`default`, `rs`, `f`) covering the
+canonical Epic 5 evaluation arms. A chart edit that materially changes
+rendered output trips the golden diff in CI; regenerate intentionally
+with:
+
+```bash
+HELM_GOLDEN_UPDATE=1 go test -tags=helm -run TestGoldenFile \
+  ./deploy/helm/... -count=1
+git diff deploy/helm/testdata/golden/   # review the diff before commit
+```
+
+The `Source:` helm metadata comments and `helm.sh/chart` /
+`app.kubernetes.io/version` labels are normalised out of the diff so
+chart-version bumps do not force a churn. See
+`deploy/helm/helm_test.go:normaliseGolden` for the redaction list.
+
 ## Uninstall
 
 ```bash

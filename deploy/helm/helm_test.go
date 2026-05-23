@@ -2541,3 +2541,389 @@ func TestCorrelatorInvalidValuesFailFast(t *testing.T) {
 		})
 	}
 }
+
+// --- Story 1.19: Evaluation-matrix and golden-file tests -------------
+//
+// The chart exposes a single top-level `evaluation.config` knob
+// enumerating the canonical evaluation arms (F, RS, RSL, RSLT). When
+// set, configmap.yaml's overlay bridges (driven by the four helpers in
+// _helpers.tpl) clobber the operator-supplied rules.enabled,
+// baselines.enabled, and analyst.provider with the per-arm canonical
+// values. When unset, the operator's individual knobs flow through.
+//
+// These tests pin AC1 (default install), AC2 (F arm), AC3 (RS arm),
+// AC4 (helm lint + golden-file diff, golden tests below), and the
+// fail-fast guards behind invalid enum values.
+
+// evalConfigBlock returns the segment of rendered olaitan.yaml between
+// the `data.olaitan.yaml: |-` literal marker and the next ConfigMap
+// boundary so assertions on rules/baselines/analyst do not collide
+// with the chart-internal documentation block (which mentions the
+// same knob names in comments).
+func evalConfigBlock(t *testing.T, rendered string) string {
+	t.Helper()
+	idx := strings.Index(rendered, "olaitan.yaml: |-")
+	if idx == -1 {
+		t.Fatalf("olaitan.yaml literal block not found in render; got:\n%s", snippet(rendered, "olaitan-config"))
+	}
+	end := strings.Index(rendered[idx:], "\n---\n")
+	if end == -1 {
+		return rendered[idx:]
+	}
+	return rendered[idx : idx+end]
+}
+
+// findEvalLine returns the first `key: value` line under the named
+// parent block (e.g. parent="rules", key="enabled") within the
+// embedded olaitan.yaml literal. Used by the matrix tests below to
+// assert the overlay landed on the right line.
+func findEvalLine(t *testing.T, rendered, parent, key string) string {
+	t.Helper()
+	block := evalConfigBlock(t, rendered)
+	// Match the parent header at any indent followed by the keyed line
+	// directly underneath. Parent and key are both literal field names
+	// from config/olaitan.yaml so no regex meta-escaping is needed.
+	re := regexp.MustCompile(`(?m)^[ \t]*` + regexp.QuoteMeta(parent) + `:\s*\n(?:[ \t]*#.*\n)*[ \t]+` + regexp.QuoteMeta(key) + `:\s*(\S.*?)\s*$`)
+	m := re.FindStringSubmatch(block)
+	if m == nil {
+		t.Fatalf("could not locate %s.%s under olaitan.yaml block; block head:\n%s", parent, key, block[:min(800, len(block))])
+	}
+	return m[1]
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// TestEvaluationConfig_Default_NoOverlay locks AC1: with no
+// evaluation.config and no individual overrides, the operator-supplied
+// defaults flow through verbatim. The chart-side analyst.provider
+// default is "none" (Task 2.2), so the analyst line bridges to "none"
+// even with no explicit --set.
+func TestEvaluationConfig_Default_NoOverlay(t *testing.T) {
+	rendered := helmTemplate(t, nil)
+	if got := findEvalLine(t, rendered, "rules", "enabled"); got != "true" {
+		t.Errorf("default render: rules.enabled = %q, want true", got)
+	}
+	if got := findEvalLine(t, rendered, "baselines", "enabled"); got != "true" {
+		t.Errorf("default render: baselines.enabled = %q, want true", got)
+	}
+	if got := findEvalLine(t, rendered, "analyst", "provider"); got != "none" {
+		t.Errorf("default render: analyst.provider = %q, want none", got)
+	}
+}
+
+// TestEvaluationConfig_F_DisablesRulesAndBaselines locks AC2: F mode
+// is the Falco-only baseline arm of the Epic 5 evaluation matrix; the
+// Olaitan rule engine and baseline engine are both disabled.
+func TestEvaluationConfig_F_DisablesRulesAndBaselines(t *testing.T) {
+	rendered := helmTemplate(t, []string{"evaluation.config=F"})
+	if got := findEvalLine(t, rendered, "rules", "enabled"); got != "false" {
+		t.Errorf("F render: rules.enabled = %q, want false", got)
+	}
+	if got := findEvalLine(t, rendered, "baselines", "enabled"); got != "false" {
+		t.Errorf("F render: baselines.enabled = %q, want false", got)
+	}
+	if got := findEvalLine(t, rendered, "analyst", "provider"); got != "none" {
+		t.Errorf("F render: analyst.provider = %q, want none", got)
+	}
+}
+
+// TestEvaluationConfig_RS_EnablesRulesAndBaselinesNoLLM locks AC3:
+// RS mode runs the deterministic detection layer end-to-end with the
+// LLM tier bypassed.
+func TestEvaluationConfig_RS_EnablesRulesAndBaselinesNoLLM(t *testing.T) {
+	rendered := helmTemplate(t, []string{"evaluation.config=RS"})
+	if got := findEvalLine(t, rendered, "rules", "enabled"); got != "true" {
+		t.Errorf("RS render: rules.enabled = %q, want true", got)
+	}
+	if got := findEvalLine(t, rendered, "baselines", "enabled"); got != "true" {
+		t.Errorf("RS render: baselines.enabled = %q, want true", got)
+	}
+	if got := findEvalLine(t, rendered, "analyst", "provider"); got != "none" {
+		t.Errorf("RS render: analyst.provider = %q, want none", got)
+	}
+}
+
+// TestEvaluationConfig_RSL_RaisesProviderToApi confirms the chart-side
+// overlay wires RSL today even though the LLM driver does not yet
+// exist (Epic 3 Story 3.x). Functionally equivalent to RS until the
+// analyst chain lands; recorded here so the future Epic 3 wiring is a
+// single-line story.
+func TestEvaluationConfig_RSL_RaisesProviderToApi(t *testing.T) {
+	rendered := helmTemplate(t, []string{"evaluation.config=RSL"})
+	if got := findEvalLine(t, rendered, "rules", "enabled"); got != "true" {
+		t.Errorf("RSL render: rules.enabled = %q, want true", got)
+	}
+	if got := findEvalLine(t, rendered, "baselines", "enabled"); got != "true" {
+		t.Errorf("RSL render: baselines.enabled = %q, want true", got)
+	}
+	if got := findEvalLine(t, rendered, "analyst", "provider"); got != "api" {
+		t.Errorf("RSL render: analyst.provider = %q, want api", got)
+	}
+}
+
+// TestEvaluationConfig_RSLT_RaisesProviderToApi mirrors the RSL test
+// for the full multi-agent arm. RSLT vs RSL chain shape is decided by
+// config/olaitan.yaml's analyst.chain.enabled, not by the provider
+// selector, so both arms share the api provider.
+func TestEvaluationConfig_RSLT_RaisesProviderToApi(t *testing.T) {
+	rendered := helmTemplate(t, []string{"evaluation.config=RSLT"})
+	if got := findEvalLine(t, rendered, "rules", "enabled"); got != "true" {
+		t.Errorf("RSLT render: rules.enabled = %q, want true", got)
+	}
+	if got := findEvalLine(t, rendered, "baselines", "enabled"); got != "true" {
+		t.Errorf("RSLT render: baselines.enabled = %q, want true", got)
+	}
+	if got := findEvalLine(t, rendered, "analyst", "provider"); got != "api" {
+		t.Errorf("RSLT render: analyst.provider = %q, want api", got)
+	}
+}
+
+// TestEvaluationConfig_OperatorKnobs_RespectedWhenEmpty confirms the
+// "no overlay; individual knobs apply verbatim" semantic in
+// values.yaml. With evaluation.config="" the operator's
+// rules.enabled / baselines.enabled / analyst.provider flow through.
+func TestEvaluationConfig_OperatorKnobs_RespectedWhenEmpty(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"evaluation.config=",
+		"rules.enabled=false",
+		"baselines.enabled=false",
+		"analyst.provider=api",
+	})
+	if got := findEvalLine(t, rendered, "rules", "enabled"); got != "false" {
+		t.Errorf("empty-overlay render: rules.enabled = %q, want false", got)
+	}
+	if got := findEvalLine(t, rendered, "baselines", "enabled"); got != "false" {
+		t.Errorf("empty-overlay render: baselines.enabled = %q, want false", got)
+	}
+	if got := findEvalLine(t, rendered, "analyst", "provider"); got != "api" {
+		t.Errorf("empty-overlay render: analyst.provider = %q, want api", got)
+	}
+}
+
+// TestEvaluationConfig_FailsFast_OnInvalidConfig asserts the chart
+// rejects an unknown evaluation.config value at render time rather
+// than silently letting the bridge fall through.
+func TestEvaluationConfig_FailsFast_OnInvalidConfig(t *testing.T) {
+	cmd := exec.Command("helm", "template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+		"--set", "evaluation.config=Q",
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("helm template succeeded with evaluation.config=Q; expected fail-fast")
+	}
+	if !strings.Contains(stderr.String(), `evaluation.config must be one of`) {
+		t.Errorf("stderr did not mention evaluation.config guard:\n%s", stderr.String())
+	}
+}
+
+// TestEvaluationConfig_FailsFast_OnInvalidProvider asserts the chart
+// rejects an unknown analyst.provider value at render time.
+func TestEvaluationConfig_FailsFast_OnInvalidProvider(t *testing.T) {
+	cmd := exec.Command("helm", "template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+		"--set", "analyst.provider=openai",
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("helm template succeeded with analyst.provider=openai; expected fail-fast")
+	}
+	if !strings.Contains(stderr.String(), `analyst.provider must be one of`) {
+		t.Errorf("stderr did not mention analyst.provider guard:\n%s", stderr.String())
+	}
+}
+
+// TestAnalystProviderNone_StandaloneFlag confirms AC1's standalone
+// --set analyst.provider=none install path independent of the
+// evaluation matrix. With no evaluation.config but explicit
+// analyst.provider=none, the rendered analyst block carries "none".
+func TestAnalystProviderNone_StandaloneFlag(t *testing.T) {
+	rendered := helmTemplate(t, []string{"analyst.provider=none"})
+	if got := findEvalLine(t, rendered, "analyst", "provider"); got != "none" {
+		t.Errorf("standalone analyst.provider=none: got %q, want none", got)
+	}
+}
+
+// TestEvaluationAnchorsPresentInOlaitanYAML asserts the literal
+// anchors the evaluation overlay depends on remain in
+// config/olaitan.yaml's chart-side copy. Without this guard a future
+// edit to the rules / baselines / analyst blocks could silently break
+// the overlay and operator --set values would be dropped. Mirrors the
+// Story 1.15 / 1.17 anchor-presence tests.
+func TestEvaluationAnchorsPresentInOlaitanYAML(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join(chartDir(t), "files", "olaitan.yaml"))
+	if err != nil {
+		t.Fatalf("read olaitan.yaml: %v", err)
+	}
+	for _, want := range []string{
+		"  rules:",
+		"  baselines:",
+		"\nanalyst:\n",
+		"  provider: api",
+	} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("evaluation overlay anchor missing in chart olaitan.yaml: %q", want)
+		}
+	}
+}
+
+// --- Story 1.19 Task 6: Golden-file helm template diff harness -------
+//
+// Architecture.md:1008 makes "every PR runs helm template golden-file
+// diff" a mandatory CI invariant. The golden files at
+// deploy/helm/testdata/golden/ are byte-stable snapshots of the
+// rendered chart for three canonical permutations: the F-arm
+// (rules+baselines off, analyst.provider=none), the RS-arm
+// (rules+baselines on, analyst.provider=none), and the default
+// permutation (no evaluation.config overlay). Mismatch fails the test
+// with a unified diff so a chart edit that materially changes
+// rendered output is surfaced loudly in PR review.
+//
+// To regenerate after an intentional chart change, run:
+//
+//   HELM_GOLDEN_UPDATE=1 go test -tags=helm -run TestGoldenFile \
+//     ./deploy/helm/... -count=1
+//
+// then commit the updated golden files.
+
+// normaliseGolden strips dynamic fields from the rendered manifest so
+// chart-version bumps and appVersion bumps do not force a golden
+// refresh. Stripped fields:
+//   - `# Source: olaitan/templates/...` comment lines (helm metadata)
+//   - `helm.sh/chart: olaitan-<semver>` -> CHART_VERSION_REDACTED
+//   - `app.kubernetes.io/version: "<semver>"` -> APP_VERSION_REDACTED
+//
+// Subchart helm.sh/chart labels are LEFT INTACT because those track
+// the subchart pin in Chart.yaml; a subchart bump should force a
+// golden refresh (NFR13 reproducibility invariant).
+func normaliseGolden(rendered string) string {
+	out := rendered
+	// Strip every `# Source:` comment line (the entire line including
+	// trailing newline).
+	srcLine := regexp.MustCompile(`(?m)^# Source:.*\n`)
+	out = srcLine.ReplaceAllString(out, "")
+	// Redact olaitan-only chart-version label. The subchart labels use
+	// `helm.sh/chart: redis-25.3.11` etc and remain intact.
+	chartLbl := regexp.MustCompile(`helm\.sh/chart: olaitan-[0-9]+\.[0-9]+\.[0-9]+`)
+	out = chartLbl.ReplaceAllString(out, "helm.sh/chart: olaitan-CHART_VERSION_REDACTED")
+	// Redact olaitan app-version label. The subcharts emit
+	// `app.kubernetes.io/version: <semver>` (no quotes for some);
+	// match both forms and only when the surrounding chart context is
+	// olaitan-managed.
+	// app.kubernetes.io/version appears on every olaitan-templated
+	// manifest at a 4-space indent under metadata.labels; strip both
+	// quoted and unquoted forms.
+	verLbl := regexp.MustCompile(`app\.kubernetes\.io/version: "?[^"\n]+"?`)
+	// Only redact under olaitan template markers; subchart versions
+	// stay byte-stable per chart-pin contract. We achieve this
+	// post-Source-stripping by gating the redact on co-occurrence with
+	// olaitan's selector label. Simpler approach: redact ONLY the
+	// olaitan app-version (which is always quoted to the chart's
+	// appVersion default "0.1.0"). The subchart versions are not
+	// quoted in their templates (e.g. `app.kubernetes.io/version:
+	// 8.6.2`), so a quote-anchored pattern leaves them intact.
+	out = regexp.MustCompile(`app\.kubernetes\.io/version: "[0-9]+\.[0-9]+\.[0-9]+"`).
+		ReplaceAllString(out, `app.kubernetes.io/version: "APP_VERSION_REDACTED"`)
+	_ = verLbl // referenced for documentation only
+	return out
+}
+
+// goldenPath returns the absolute path to the golden file for the
+// given permutation slug. Lives under deploy/helm/testdata/golden/
+// rather than under the chart itself so `helm package` outputs stay
+// minimal.
+func goldenPath(t *testing.T, slug string) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatalf("runtime.Caller(0) failed")
+	}
+	return filepath.Join(filepath.Dir(thisFile), "testdata", "golden", slug+".golden.yaml")
+}
+
+// goldenUpdate is true when the developer has requested a regeneration
+// pass via HELM_GOLDEN_UPDATE=1. We use an env var rather than a Go
+// flag because `go test` injects test-only flags via the test binary
+// and a custom flag conflicts with the parallel-execution harness.
+func goldenUpdate() bool { return os.Getenv("HELM_GOLDEN_UPDATE") == "1" }
+
+// runGolden renders the chart with the given --set values, normalises
+// the output, and diffs against the file at deploy/helm/testdata/
+// golden/<slug>.golden.yaml. Pass an empty sets slice for the default
+// permutation.
+func runGolden(t *testing.T, slug string, sets []string) {
+	t.Helper()
+	rendered := helmTemplate(t, sets)
+	got := normaliseGolden(rendered)
+	path := goldenPath(t, slug)
+	if goldenUpdate() {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir golden dir: %v", err)
+		}
+		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
+			t.Fatalf("write golden file: %v", err)
+		}
+		t.Logf("regenerated golden file: %s", path)
+		return
+	}
+	wantBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read golden file %s: %v (regenerate with HELM_GOLDEN_UPDATE=1)", path, err)
+	}
+	want := string(wantBytes)
+	if got == want {
+		return
+	}
+	// Surface a short unified-diff-like preview so a CI failure log
+	// is informative without dumping the whole render. Find the first
+	// divergent line + 20 lines either side.
+	const ctx = 20
+	gotLines := strings.Split(got, "\n")
+	wantLines := strings.Split(want, "\n")
+	firstDiff := 0
+	for firstDiff < len(gotLines) && firstDiff < len(wantLines) && gotLines[firstDiff] == wantLines[firstDiff] {
+		firstDiff++
+	}
+	lo := firstDiff - ctx
+	if lo < 0 {
+		lo = 0
+	}
+	gotEnd := firstDiff + ctx
+	if gotEnd > len(gotLines) {
+		gotEnd = len(gotLines)
+	}
+	wantEnd := firstDiff + ctx
+	if wantEnd > len(wantLines) {
+		wantEnd = len(wantLines)
+	}
+	t.Errorf("golden mismatch for %s at line %d. Regenerate with HELM_GOLDEN_UPDATE=1.\n--- want (%s:%d-%d)\n%s\n--- got (line %d-%d)\n%s",
+		slug, firstDiff+1, path, lo+1, wantEnd, strings.Join(wantLines[lo:wantEnd], "\n"),
+		lo+1, gotEnd, strings.Join(gotLines[lo:gotEnd], "\n"))
+}
+
+// TestGoldenFile_Default pins the rendered chart with no
+// evaluation.config overlay; the operator-supplied defaults flow
+// through (rules+baselines enabled) and the chart-side
+// analyst.provider="none" overlay applies.
+func TestGoldenFile_Default(t *testing.T) {
+	runGolden(t, "default", nil)
+}
+
+// TestGoldenFile_RS pins the rendered chart with the RS evaluation
+// arm: rules+baselines enabled, LLM tier bypassed.
+func TestGoldenFile_RS(t *testing.T) {
+	runGolden(t, "rs", []string{"evaluation.config=RS"})
+}
+
+// TestGoldenFile_F pins the rendered chart with the F (Falco-only)
+// evaluation arm: rules+baselines disabled, LLM tier bypassed.
+func TestGoldenFile_F(t *testing.T) {
+	runGolden(t, "f", []string{"evaluation.config=F"})
+}

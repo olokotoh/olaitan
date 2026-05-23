@@ -107,6 +107,72 @@ jobs:
             *) echo "smoke: unexpected version output: $out" >&2; exit 1 ;;
           esac
 
+  # Story 1.19: kind-based RS smoke test. Boots a single-node kind
+  # cluster via helm/kind-action@v1.12.0 (kind v0.26.0, released
+  # 2025-12-23), installs the chart under the RS evaluation arm with
+  # Falco disabled (eBPF unavailable inside kind nodes), and runs the
+  # synthetic-event smoke test at tests/e2e/. Expected runtime
+  # ~5-7 minutes; the four CI jobs run in parallel so e2e is the
+  # critical path when it lands. Third-party actions are pinned by
+  # major+minor for consistency with azure/setup-helm@v4 above; a
+  # future hardening pass to pin by SHA digest is out of scope.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: Build Olaitan image
+        run: make docker-build
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1.12.0
+        with:
+          version: v0.26.0
+          cluster_name: olaitan-e2e
+          config: hack/kind-config.yaml
+
+      - name: Load image into kind
+        run: |
+          tag=$(make -s version-tag)
+          kind load docker-image olaitan:"$tag" --name olaitan-e2e
+
+      - name: Prepare chart
+        run: make helm-prepare
+
+      - name: Fetch subchart dependencies
+        run: |
+          helm repo add falcosecurity https://falcosecurity.github.io/charts
+          helm repo add nats https://nats-io.github.io/k8s/helm/charts/
+          helm repo update
+          helm dependency update deploy/helm/olaitan
+
+      - name: Install chart under RS arm
+        run: |
+          tag=$(make -s version-tag)
+          helm install olaitan ./deploy/helm/olaitan \
+            --set image.tag="$tag" \
+            --set image.pullPolicy=Never \
+            --set evaluation.config=RS \
+            --set baselines.warmupDuration=5s \
+            --set secrets.redisPassword=ci-test \
+            --set falco.enabled=false \
+            --wait --timeout 5m
+
+      - name: Run smoke test
+        run: go test -tags=e2e -v -count=1 ./tests/e2e/...
+
+      - name: Debug logs on failure
+        if: failure()
+        run: kubectl logs -l app.kubernetes.io/name=olaitan --tail=200 --all-containers
+
   # Traceability matrix gate (NFR42). Runs only on pull_request events
   # because a push to main has no PR body to read. The gate enforces the
   # matrix-or-rationale rule: every PR must either update

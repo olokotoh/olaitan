@@ -118,6 +118,102 @@ operator has not set an explicit override in `endpoints.<name>`.
 {{- end -}}
 
 {{/*
+Story 1.19: Evaluation-matrix helpers. The chart exposes a single
+top-level `evaluation.config` value enumerating the canonical arms (F,
+RS, RSL, RSLT). When set, the chart overlays the per-arm canonical
+values onto three downstream knobs (`rules.enabled`,
+`baselines.enabled`, `analyst.provider`); when empty the operator's
+individual knobs flow through verbatim. The four helpers below are the
+single source of truth for that overlay; configmap.yaml invokes them
+to compute the effective values that then feed the regex bridges.
+
+See deploy/helm/olaitan/values.yaml `evaluation:` block for the
+operator-facing semantics of each arm.
+*/}}
+
+{{/*
+olaitan.evaluation.validate -- fail-fast guard invoked once at the top
+of configmap.yaml. Returns the empty string on success; calls fail
+with a clear message on invalid input. Pattern mirrors the
+auditWebhook.caBundle and aggregator.replicas guards (loud chart-render
+error rather than silent runtime trap).
+*/}}
+{{- define "olaitan.evaluation.validate" -}}
+{{- $cfg := .Values.evaluation.config | default "" -}}
+{{- $valid := list "" "F" "RS" "RSL" "RSLT" -}}
+{{- if not (has $cfg $valid) -}}
+{{- fail (printf "evaluation.config must be one of [\"\", \"F\", \"RS\", \"RSL\", \"RSLT\"] (got %q). See deploy/helm/olaitan/values.yaml for the canonical evaluation matrix arms." $cfg) -}}
+{{- end -}}
+{{- $ap := .Values.analyst.provider | default "none" -}}
+{{- $validProviders := list "none" "api" "local" -}}
+{{- if not (has $ap $validProviders) -}}
+{{- fail (printf "analyst.provider must be one of [\"none\", \"api\", \"local\"] (got %q). \"api\" / \"local\" are reserved for Epic 3 Story 3.x; use \"none\" for the Epic 1/2 RS evaluation arm." $ap) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+olaitan.evaluation.effectiveRulesEnabled -- returns the literal string
+"true" or "false" for the rendered olaitan.yaml. Receiver is the regex
+bridge which compares against the literal text, not a Go bool.
+
+Mapping:
+  evaluation.config="F"                       -> "false"
+  evaluation.config in {RS, RSL, RSLT}        -> "true"
+  evaluation.config=""  (no overlay)          -> operator-supplied
+                                                 .Values.rules.enabled
+*/}}
+{{- define "olaitan.evaluation.effectiveRulesEnabled" -}}
+{{- $cfg := .Values.evaluation.config | default "" -}}
+{{- if eq $cfg "F" -}}false
+{{- else if or (eq $cfg "RS") (eq $cfg "RSL") (eq $cfg "RSLT") -}}true
+{{- else -}}{{ printf "%t" .Values.rules.enabled }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+olaitan.evaluation.effectiveBaselinesEnabled -- same shape as
+effectiveRulesEnabled. The F-mode collapse and RS/RSL/RSLT raise are
+symmetric with rules because the Epic 5 evaluation arms always pair
+the two engines (architecture.md "rules-and-stats Olaitan").
+
+Mapping:
+  evaluation.config="F"                       -> "false"
+  evaluation.config in {RS, RSL, RSLT}        -> "true"
+  evaluation.config=""  (no overlay)          -> operator-supplied
+                                                 .Values.baselines.enabled
+*/}}
+{{- define "olaitan.evaluation.effectiveBaselinesEnabled" -}}
+{{- $cfg := .Values.evaluation.config | default "" -}}
+{{- if eq $cfg "F" -}}false
+{{- else if or (eq $cfg "RS") (eq $cfg "RSL") (eq $cfg "RSLT") -}}true
+{{- else -}}{{ printf "%t" .Values.baselines.enabled }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+olaitan.evaluation.effectiveAnalystProvider -- returns the literal
+provider string for the rendered analyst.provider line.
+
+Mapping:
+  evaluation.config in {F, RS}                -> "none"
+  evaluation.config in {RSL, RSLT}            -> "api" (RSLT chain
+                                                 shape is decided by
+                                                 analyst.chain.enabled
+                                                 in config/olaitan.yaml,
+                                                 not by the provider
+                                                 selector)
+  evaluation.config=""  (no overlay)          -> operator-supplied
+                                                 .Values.analyst.provider
+*/}}
+{{- define "olaitan.evaluation.effectiveAnalystProvider" -}}
+{{- $cfg := .Values.evaluation.config | default "" -}}
+{{- if or (eq $cfg "F") (eq $cfg "RS") -}}none
+{{- else if or (eq $cfg "RSL") (eq $cfg "RSLT") -}}api
+{{- else -}}{{ .Values.analyst.provider }}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Audit-webhook Service FQDN -- used by the kubeconfig Secret to tell the
 kube-apiserver where to push audit batches. Story 1.7 (Kubernetes
 audit-webhook receiver). Resolves to:
