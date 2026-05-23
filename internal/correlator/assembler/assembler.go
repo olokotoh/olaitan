@@ -417,11 +417,6 @@ func countEvents(events []schema.Event) []schema.EvidenceCount {
 	return out
 }
 
-// Story 1.18 moved the severityScore and syslogSeverityScore
-// helpers into internal/decision/severitybucket so the rules engine
-// emission path can share the same bucketisation as the overflow
-// priority sort here. Call sites above use severitybucket.Score.
-
 func size(pkg *schema.EvidencePackage) int {
 	data, err := json.Marshal(pkg)
 	if err != nil {

@@ -263,7 +263,7 @@ func (e *Engine) registerMetrics(reg *metrics.Registry) error {
 	// bump with attack_technique="unknown" (the sentinel value).
 	mv, err := reg.RegisterCounterVec(
 		"olaitan_decision_rules_matches_by_attribute_total",
-		"Per-(rule_id, severity_bucket, attack_technique) rule-match counter (AC2 of Story 1.18). Complements the unlabelled olaitan_decision_rules_matches_total: sum without (rule_id, severity_bucket, attack_technique)(rate(matches_by_attribute_total[5m])) reproduces the aggregate. A rule carrying N MitreTags increments this counter N times (one per technique); a rule with empty MitreTags emits one bump with attack_technique=\"unknown\".",
+		"Per-(rule_id, severity_bucket, attack_technique) rule-match counter (AC2 of Story 1.18). Complements the unlabelled olaitan_decision_rules_matches_total but does NOT reproduce it under aggregation: a rule carrying N MitreTags increments this counter N times (one bump per technique, BI-4) while matches_total increments once per match. Use sum by (rule_id)(rate(matches_by_attribute_total[5m])) / count(group by rule_id) for technique-deduplicated comparisons, or rely on matches_total when an exact per-match rate is required. A rule with empty MitreTags emits one bump with attack_technique=\"unknown\".",
 		[]string{"rule_id", "severity_bucket", "attack_technique"},
 	)
 	if err != nil {

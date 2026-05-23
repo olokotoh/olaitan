@@ -60,7 +60,7 @@ var windowSizeBytesBuckets = []float64{
 func (c *Correlator) registerMetrics(reg *metrics.Registry) error {
 	v, err := reg.RegisterCounterVec(
 		"olaitan_correlator_evidence_packages_total",
-		"Cumulative EvidencePackage publish attempts grouped by trigger type. Label values are the three trigger.TypeMultiSignal/TypeRuleMatch/TypeBaselineDeviation constants (multi_signal, rule_match, baseline_deviation).",
+		"Cumulative EvidencePackages successfully published to EVIDENCE.packages grouped by trigger type. The counter is bumped only after the JetStream publish returns no error, so the rate reflects published-to-bus packages, not assemble attempts. Label values are the three trigger.TypeMultiSignal/TypeRuleMatch/TypeBaselineDeviation constants (multi_signal, rule_match, baseline_deviation).",
 		[]string{"trigger_type"},
 	)
 	if err != nil {

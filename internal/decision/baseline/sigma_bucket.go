@@ -1,15 +1,18 @@
 package baseline
 
-// sigma bucket boundaries per Story 1.18 Task 7.2:
+// sigma bucket boundaries per Story 1.18 Task 7.2 (relabelled in the
+// PR #27 review follow-up):
 //
 //	[3, 5)  -> "3-5"
-//	[5, 10) -> ">=5"
-//	>= 10   -> ">=10"
+//	[5, 10) -> "5-10"
+//	>= 10   -> "10+"
 //
-// The lower bound of 3 reflects the default SigmaMultiplier = 3.0
-// (DefaultSigmaMultiplier). Deviations below 3 are not emitted by
-// engine.handleDecoded (the sigma check at engine.go:520-524 gates
-// on `sigma >= sigmaMul > 0`), so there is no "<3" bucket.
+// Labels are non-overlapping ranges so an operator query for any
+// single label returns the observations that genuinely fall in that
+// range, not a superset. The lower bound of 3 reflects the default
+// SigmaMultiplier = 3.0 (DefaultSigmaMultiplier); deviations below 3
+// are not emitted by engine.handleDecoded (the sigma gate enforces
+// `sigma >= sigmaMul > 0`), so there is no "<3" bucket.
 //
 // The helper is private to the baseline package because no other
 // component bucketises sigma; if Story 2.x or 3.x needs the same
@@ -17,8 +20,8 @@ package baseline
 // shared-package precedent.
 const (
 	sigmaBucket3to5  = "3-5"
-	sigmaBucket5to10 = ">=5"
-	sigmaBucketGe10  = ">=10"
+	sigmaBucket5to10 = "5-10"
+	sigmaBucketGe10  = "10+"
 )
 
 // sigmaBucket returns the canonical bucket label for a deviation's

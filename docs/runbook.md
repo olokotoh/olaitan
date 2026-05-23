@@ -2,7 +2,7 @@
 
 Scope: this runbook is the operator-facing reference for the Olaitan deterministic-detection layer. Story 1.18 lays down **Section 1 only** (the metric catalogue). Sections 2 through 10 cover the ten common operational scenarios from NFR34 (incident triage, false-positive tuning, rule corpus management, baseline reset, etc.) and are filled in by Story 6.8.
 
-Audience: SREs, on-call engineers, and SOC analysts consuming the Prometheus surface at `:9090/metrics`. The runbook assumes familiarity with PromQL, Kubernetes, and the Olaitan three-ring (collector, correlator, decision) architecture described in `docs/architecture.md`.
+Audience: SREs, on-call engineers, and SOC analysts consuming the Prometheus surface at `:9090/metrics`. The runbook assumes familiarity with PromQL, Kubernetes, and the Olaitan three-ring (collector, correlator, decision) architecture documented in the FYP planning artefacts under `_bmad-output/planning-artifacts/` and the per-PR §3.4 chapter under `report/chapter-3-methodology.md`.
 
 References: FR50 (Prometheus surface mandatory), NFR32 (every metric documented with type, unit, label set), NFR34 (operator runbook covers 10 scenarios), NFR42 (traceability matrix update required per PR).
 
@@ -14,7 +14,7 @@ This section enumerates every metric registered by the deterministic-detection l
 
 The catalogue is organised by registering ring + story, in commit chronology so the reader can correlate names with the introducing PR.
 
-### 1.1 Collector ring (Story 1.12)
+### 1.1 Collector ring (Stories 1.12, 1.13)
 
 #### `olaitan_source_healthy`
 
@@ -51,6 +51,68 @@ The catalogue is organised by registering ring + story, in commit chronology so 
 - **Help:** Set to 1.0 when posture.enabled=false; the six olaitan_sensor_posture_*_total counters are not registered in this case.
 - **Sample PromQL (aggregate):** `olaitan_sensor_posture_disabled` (presence indicator on dashboards).
 
+#### `olaitan_sensor_circuit_breaker_engaged_total` (Story 1.13)
+
+- **Type:** counter
+- **Unit:** count
+- **Labels:** `source` (one of `falco`, `audit`, `runtime`, `network`, `applog`; cardinality 5), `node` (the K8S_NODE_NAME of this DaemonSet pod; cardinality 1 per pod, bounded by node count)
+- **Help:** Cumulative count of per-source rate-limit circuit-breaker engage transitions on this node (Story 1.13). One increment per CLOSED to OPEN transition; OPEN to CLOSED transitions are not counted.
+- **Sample PromQL (aggregate):** `sum(rate(olaitan_sensor_circuit_breaker_engaged_total[1h])) by (source)` (per-source breaker activity).
+- **Sample PromQL (alert):** `rate(olaitan_sensor_circuit_breaker_engaged_total[15m]) > 0` for 15 minutes (page on sustained breaker engagement suggesting an over-aggressive upstream or a stuck adapter).
+
+#### `olaitan_sensor_audit_rejected_total` (Story 1.7 / 1.13)
+
+- **Type:** counter
+- **Unit:** count
+- **Labels:** `source` (constant `audit`), `reason` (one of `method_not_allowed`, `unsupported_media_type`, `payload_too_large`, `decode_error`, `trailing_json`, `translate_failed`; cardinality 6)
+- **Help:** Audit-webhook receiver events rejected at HTTP/translate boundary, bucketed by reason (Story 1.7).
+- **Sample PromQL (aggregate):** `sum(rate(olaitan_sensor_audit_rejected_total[5m])) by (reason)` (per-reason rejection rate).
+- **Sample PromQL (alert):** `rate(olaitan_sensor_audit_rejected_total{reason="decode_error"}[5m]) > 0.1` for 10 minutes (page on sustained decode failures suggesting an API-server payload schema change).
+
+#### `olaitan_sensor_cri_translate_errors_total` and `olaitan_sensor_cri_publish_drops_total` (Story 1.8)
+
+- **Type:** counter (one family each)
+- **Unit:** count
+- **Labels:** `source` (constant `runtime`)
+- **Help (translate):** CRI lifecycle events that failed translation and were log+dropped (Story 1.8).
+- **Help (publish):** CRI events whose publish attempt returned a permanent error and were dropped (Story 1.8).
+- **Sample PromQL (aggregate):** `rate(olaitan_sensor_cri_translate_errors_total[5m]) + rate(olaitan_sensor_cri_publish_drops_total[5m])` (combined CRI loss rate).
+- **Sample PromQL (alert):** `rate(olaitan_sensor_cri_publish_drops_total[15m]) > 0.05` for 15 minutes (page on sustained CRI publish drops; either NATS is degraded or the runtime is producing malformed events).
+
+#### `olaitan_sensor_cni_translate_errors_total`, `olaitan_sensor_cni_publish_drops_total`, and `olaitan_sensor_cni_oversize_dropped_total` (Story 1.10)
+
+- **Type:** counter (three families)
+- **Unit:** count
+- **Labels:** `source` (constant `network`)
+- **Help (translate):** Calico flow records that failed translation and were log+dropped.
+- **Help (publish):** Calico events whose publish attempt returned a permanent error and were dropped.
+- **Help (oversize):** Calico events rejected at translate time because the marshalled form exceeded MaxEventBytes.
+- **Sample PromQL (aggregate):** `sum(rate(olaitan_sensor_cni_translate_errors_total[5m]) + rate(olaitan_sensor_cni_publish_drops_total[5m]) + rate(olaitan_sensor_cni_oversize_dropped_total[5m]))` (combined CNI loss rate).
+- **Sample PromQL (alert):** `rate(olaitan_sensor_cni_oversize_dropped_total[15m]) > 0.05` for 15 minutes (page on sustained oversize-flow drops suggesting a misconfigured Goldmane payload shape).
+
+#### `olaitan_sensor_cni_consecutive_eofs` (Story 1.10)
+
+- **Type:** gauge (not counter; resets to 0 on every successful Recv per Copilot CR2 of PR #21)
+- **Unit:** count
+- **Labels:** `source` (constant `network`)
+- **Help:** EOFs from Goldmane stream.Recv since the last successful Recv; resets to 0 on success (Story 1.10).
+- **Sample PromQL (aggregate):** `olaitan_sensor_cni_consecutive_eofs` (current EOF streak).
+- **Sample PromQL (alert):** `olaitan_sensor_cni_consecutive_eofs > 10` for 5 minutes (page on a stuck stream; Goldmane endpoint likely unreachable).
+
+#### `olaitan_sensor_applog_translate_errors_total`, `olaitan_sensor_applog_publish_drops_total`, `olaitan_sensor_applog_lines_shed_total`, and `olaitan_sensor_applog_lost_on_shutdown_total` (Story 1.9)
+
+- **Type:** counter (four families)
+- **Unit:** count
+- **Labels:** `source` (constant `applog`)
+- **Help (translate):** Applog records that failed translation and were log+dropped.
+- **Help (publish):** Applog events whose publish attempt returned a permanent error and were dropped.
+- **Help (shed):** LineRecords dropped due to back-pressure shedding under a stalled consumer.
+- **Help (lost):** Applog events whose publishWithRetry was cancelled mid-flight by ctx.Done.
+- **Sample PromQL (aggregate):** `sum(rate(olaitan_sensor_applog_translate_errors_total[5m]) + rate(olaitan_sensor_applog_publish_drops_total[5m]) + rate(olaitan_sensor_applog_lines_shed_total[5m]) + rate(olaitan_sensor_applog_lost_on_shutdown_total[5m]))` (combined applog loss rate).
+- **Sample PromQL (alert):** `rate(olaitan_sensor_applog_lines_shed_total[15m]) > 1` for 15 minutes (page on sustained back-pressure shedding; the sidecar is producing lines faster than the consumer can drain them).
+
+Wiring of the rate-limit counters above is in `cmd/olaitan/metrics.go:140-260` via `registerAdapterCounters`; the per-adapter detail counters (translate / publish / shed / lost / oversize / consecutive-EOFs) are sourced from `internal/collector/<source>/`.
+
 ### 1.2 Correlator ring (Story 1.18 NEW)
 
 #### `olaitan_correlator_evidence_packages_total`
@@ -58,7 +120,7 @@ The catalogue is organised by registering ring + story, in commit chronology so 
 - **Type:** counter_vec
 - **Unit:** count
 - **Labels:** `trigger_type` (one of `multi_signal`, `rule_match`, `baseline_deviation`; cardinality 3)
-- **Help:** Cumulative EvidencePackage publish attempts grouped by trigger type. Label values are the three trigger.TypeMultiSignal/TypeRuleMatch/TypeBaselineDeviation constants (multi_signal, rule_match, baseline_deviation).
+- **Help:** Cumulative EvidencePackages successfully published to EVIDENCE.packages grouped by trigger type. The counter is bumped only after the JetStream publish returns no error, so the rate reflects published-to-bus packages, not assemble attempts. Label values are the three trigger.TypeMultiSignal/TypeRuleMatch/TypeBaselineDeviation constants (multi_signal, rule_match, baseline_deviation).
 - **Sample PromQL (aggregate):** `sum(rate(olaitan_correlator_evidence_packages_total[5m])) by (trigger_type)` (per-trigger-type publish rate).
 - **Sample PromQL (alert):** `rate(olaitan_correlator_evidence_packages_total{trigger_type="multi_signal"}[15m]) > 10` for 5 minutes (page on multi-signal storm suggesting a noisy adapter).
 
@@ -69,7 +131,7 @@ The catalogue is organised by registering ring + story, in commit chronology so 
 - **Labels:** none (buckets `[1024, 4096, 8192, 16384, 32768, 65536, 131072, 262144]`)
 - **Help:** On-wire size in bytes of the EvidencePackage at publish time (post-overflow-summarisation). Buckets cover the assembler.DefaultMaxPackageBytes 128 KiB cap; observations above 131072 indicate the cap-enforcement path was bypassed or failed.
 - **Sample PromQL (aggregate):** `histogram_quantile(0.99, sum(rate(olaitan_correlator_window_size_bytes_bucket[5m])) by (le))` (p99 publish size).
-- **Sample PromQL (alert):** `histogram_quantile(0.99, sum(rate(olaitan_correlator_window_size_bytes_bucket[5m])) by (le)) > 131072` for 5 minutes (page on the 128 KiB cap being bypassed).
+- **Sample PromQL (alert):** `sum(rate(olaitan_correlator_window_size_bytes_bucket{le="+Inf"}[5m])) - sum(rate(olaitan_correlator_window_size_bytes_bucket{le="131072"}[5m])) > 0` for 5 minutes (count-based cap-bypass detector: any rate of observations strictly above the 128 KiB cap indicates the size-cap enforcement path was bypassed or failed; preferred over a quantile threshold because `histogram_quantile` interpolates within the open-ended top bucket and would false-positive at exactly the documented cap).
 
 #### `olaitan_correlator_overflow_summarised_total`
 
@@ -113,7 +175,7 @@ The catalogue is organised by registering ring + story, in commit chronology so 
 - **Type:** counter_vec
 - **Unit:** count
 - **Labels:** `rule_id` (bounded by corpus size; ~50 at FYP scale), `severity_bucket` (one of `low`, `medium`, `high`, `critical`; cardinality 4), `attack_technique` (MITRE ATT&CK technique ID, bounded by ATT&CK for Containers; ~30 leaf techniques as of ATT&CK v18, plus the sentinel `unknown` for empty MitreTags)
-- **Help:** Per-(rule_id, severity_bucket, attack_technique) rule-match counter (AC2 of Story 1.18). Complements the unlabelled olaitan_decision_rules_matches_total: `sum without (rule_id, severity_bucket, attack_technique)(rate(matches_by_attribute_total[5m]))` reproduces the aggregate. A rule carrying N MitreTags increments this counter N times (one per technique); a rule with empty MitreTags emits one bump with `attack_technique="unknown"`.
+- **Help:** Per-(rule_id, severity_bucket, attack_technique) rule-match counter (AC2 of Story 1.18). Complements the unlabelled olaitan_decision_rules_matches_total but does NOT reproduce it under aggregation: a rule carrying N MitreTags increments this counter N times (one bump per technique, BI-4) while matches_total increments once per match. Use `sum by (rule_id)(rate(matches_by_attribute_total[5m])) / count(group by (rule_id) (olaitan_decision_rules_matches_by_attribute_total))` for technique-deduplicated comparisons, or rely on matches_total when an exact per-match rate is required. A rule with empty MitreTags emits one bump with `attack_technique="unknown"`.
 - **Sample PromQL (aggregate):** `topk(10, sum(rate(olaitan_decision_rules_matches_by_attribute_total[1h])) by (rule_id))` (top-10 most-firing rules).
 - **Sample PromQL (alert):** `rate(olaitan_decision_rules_matches_by_attribute_total{severity_bucket="critical"}[5m]) > 0.1` for 5 minutes (page on sustained critical-severity rule-match rate).
 
@@ -158,10 +220,10 @@ The catalogue is organised by registering ring + story, in commit chronology so 
 
 - **Type:** counter_vec
 - **Unit:** count
-- **Labels:** `metric` (one of the five default extractors: `outbound_unique_dst_ips`, `distinct_exec_paths`, `outbound_bytes`, `audit_events_per_min`, `container_restarts_per_hour`; cardinality 5), `sigma_bucket` (one of `3-5`, `>=5`, `>=10`; cardinality 3)
-- **Help:** Per-(metric, sigma_bucket) baseline-deviation counter. Story 1.17 introduced the unlabelled-per-metric form; Story 1.18 AC3 adds the sigma_bucket label (one of "3-5", ">=5", ">=10"). Complements per-package evaluations_total{outcome=deviation}.
+- **Labels:** `metric` (one of the five default extractors: `outbound_unique_dst_ips`, `distinct_exec_paths`, `outbound_bytes`, `audit_events_per_min`, `container_restarts_per_hour`; cardinality 5), `sigma_bucket` (non-overlapping ranges: `3-5`, `5-10`, `10+`; cardinality 3)
+- **Help:** Per-(metric, sigma_bucket) baseline-deviation counter. Story 1.17 introduced the unlabelled-per-metric form; Story 1.18 AC3 adds the sigma_bucket label. Labels are non-overlapping ranges so an operator query for any single label returns the observations that genuinely fall in that range, not a superset. Complements per-package evaluations_total{outcome=deviation}.
 - **Sample PromQL (aggregate):** `sum(rate(olaitan_decision_baseline_deviations_total[5m])) by (metric, sigma_bucket)`.
-- **Sample PromQL (alert):** `rate(olaitan_decision_baseline_deviations_total{sigma_bucket=">=10"}[5m]) > 0.05` for 10 minutes (page on sustained >=10 sigma deviation rate suggesting an unusual workload pattern).
+- **Sample PromQL (alert):** `rate(olaitan_decision_baseline_deviations_total{sigma_bucket="10+"}[5m]) > 0.05` for 10 minutes (page on sustained 10+ sigma deviation rate suggesting an unusual workload pattern).
 
 #### `olaitan_decision_baseline_skipped_self_total`
 

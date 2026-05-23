@@ -10,15 +10,13 @@ func TestSigmaBucket_Boundaries(t *testing.T) {
 		3.0:             "3-5",
 		3.5:             "3-5",
 		4.999:           "3-5",
-		5.0:             ">=5",
-		7.0:             ">=5",
-		9.999:           "3-5", // boundary check; anything <10 and >=5 is ">=5"
-		10.0:            ">=10",
-		100.0:           ">=10",
-		math.MaxFloat64: ">=10",
+		5.0:             "5-10",
+		7.0:             "5-10",
+		9.999:           "5-10",
+		10.0:            "10+",
+		100.0:           "10+",
+		math.MaxFloat64: "10+",
 	}
-	// fix the 9.999 case: it should be ">=5", not "3-5"
-	cases[9.999] = ">=5"
 	for in, want := range cases {
 		if got := sigmaBucket(in); got != want {
 			t.Errorf("sigmaBucket(%v) = %q, want %q", in, got, want)
