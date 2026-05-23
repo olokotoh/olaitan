@@ -229,5 +229,9 @@ SIGMA-HQ parsing and the modifier set; OLT extensions ride on
 sigmalite's existing extension surfaces (`Extra` map for `attack:`
 and `severity:`, `FieldResolver` for `k8s.*`).
 
-Story 1.16 authors the initial corpus of ten rules covering S1-S5;
-each rule MUST conform to this dialect and pass the CI lint tool.
+Story 1.16 landed the initial corpus of ten rules covering S1-S5 at
+`rules/<category>/OLT-<CATEGORY>-NNN.yaml` from repo root; each rule
+conforms to this dialect and passes `corpus_lint_test.go` (the
+default-tag walk over `rules/` that re-uses `parser.ParseRule` and
+asserts the AC1 distribution invariants plus the AC2 falsepositives
+gate).

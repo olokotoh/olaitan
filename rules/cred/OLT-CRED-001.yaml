@@ -1,0 +1,29 @@
+title: ServiceAccount token read by non-system process
+id: OLT-CRED-001
+description: |
+  Detects a read against the projected ServiceAccount token file by a
+  process whose executable does not belong to the system process
+  allowlist (kubelet, kube-proxy, coredns). Workload Pods rarely read
+  the token directly because the standard client libraries handle the
+  mount internally; an explicit open call is a strong indicator of
+  credential theft.
+status: experimental
+attack:
+  - T1552
+severity: 75
+detection:
+  sa_token_read_runtime:
+    file.path|startswith: '/run/secrets/kubernetes.io/serviceaccount/'
+  sa_token_read_legacy:
+    file.path|startswith: '/var/run/secrets/kubernetes.io/serviceaccount/'
+  system_process:
+    process.exe|re: '^/(usr/)?(local/)?s?bin/(kubelet|kube-proxy|coredns)$'
+  condition: (sa_token_read_runtime or sa_token_read_legacy) and not system_process
+falsepositives:
+  - In cluster sidecars that read the token to seed a custom HTTP client; pin via a process.exe allowlist in operator overlay
+  - Service mesh proxies (Linkerd, Envoy) that proxy the apiserver; allowlist via a dedicated namespace shape
+  - The system_process allowlist is anchored to FHS paths (/bin, /sbin, /usr/{,local/}{,s}bin) only. Non FHS K8s installs (RKE2 at /var/lib/rancher/rke2/bin, snap based installs at /snap/kubelet/, custom packagings under /opt/bin) will not match the allowlist and the legitimate system kubelet/kube-proxy/coredns process will trigger the rule. Operators on non FHS distributions should extend the allowlist via overlay, or accept the noise under status experimental.
+fields:
+  - file.path
+  - process.exe
+  - k8s.pod.namespace

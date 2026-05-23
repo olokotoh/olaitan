@@ -1,0 +1,32 @@
+title: Cryptominer process pattern in unprivileged Pod
+id: OLT-IMPACT-005
+description: |
+  Detects xmrig / minerd-style executable launches in workload Pods
+  not labelled as crypto workloads, with elevated CPU and outbound
+  traffic to a known mining pool port range.
+status: experimental
+attack:
+  - T1496
+severity: 75
+detection:
+  process_match:
+    process.exe|endswith:
+      - 'xmrig'
+      - 'minerd'
+      - 'cpuminer'
+  k8s_context:
+    k8s.workload.owner_kind: Deployment
+    k8s.pod.namespace|startswith: 'tenant-'
+  network_match:
+    network.dst_port:
+      - 3333
+      - 4444
+      - 5555
+  condition: process_match and k8s_context and network_match
+falsepositives:
+  - Legitimate crypto-bridge workloads (label `app.kubernetes.io/component=crypto`)
+fields:
+  - process.exe
+  - k8s.pod.namespace
+  - k8s.workload.owner_kind
+  - network.dst_port

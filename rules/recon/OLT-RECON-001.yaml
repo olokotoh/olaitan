@@ -1,0 +1,32 @@
+title: Cluster wide Pod listing by non-system ServiceAccount
+id: OLT-RECON-001
+description: |
+  Detects a Kubernetes API list call against pods at cluster scope
+  performed by a ServiceAccount outside kube-system. The pattern is
+  characteristic of in cluster reconnaissance where a compromised
+  Pod's identity enumerates every workload visible to its bound RBAC.
+  Workload Pods scoped to a single namespace have no reason to list
+  pods cluster wide.
+status: experimental
+attack:
+  - T1613
+severity: 50
+detection:
+  list_pods_cluster_scope:
+    verb: 'list'
+    objectRef.resource: 'pods'
+    objectRef.namespace: ''
+  service_account:
+    user.username|startswith: 'system:serviceaccount:'
+  system_sa:
+    user.username|startswith: 'system:serviceaccount:kube-system:'
+  condition: list_pods_cluster_scope and service_account and not system_sa
+falsepositives:
+  - Cluster autoscaler ServiceAccount lists pods cluster wide; allowlist via a user.username shape
+  - Monitoring stacks (Prometheus, kube-state-metrics) with read only ClusterRoles; allowlist via a dedicated ServiceAccount
+  - Real K8s audit events for cluster scope list calls omit the objectRef.namespace field rather than emit it as an empty string; this rule's objectRef.namespace selector therefore depends on the audit adapter normalising absent fields to empty string (Binding Interpretation BI-1 follow-up tracked under deferred-work.md W1/W2 and Round 2 W1). Until that lands, the rule reaches production only via the hand built S3 scenario fixture which inlines the empty string explicitly.
+fields:
+  - verb
+  - objectRef.resource
+  - objectRef.namespace
+  - user.username

@@ -1,0 +1,44 @@
+{
+  "schema_version": "1",
+  "package_id": "pkg-s3-lateral-movement",
+  "workload_id": "tenant-acme/Deployment/web",
+  "workload_identity": {
+    "namespace": "tenant-acme",
+    "owner_kind": "Deployment",
+    "owner_name": "web"
+  },
+  "assembled_at": "2026-05-22T10:00:00Z",
+  "window_start": "2026-05-22T09:59:00Z",
+  "window_end": "2026-05-22T10:00:00Z",
+  "trigger": {
+    "type": "multi_signal",
+    "fired_at": "2026-05-22T10:00:00Z",
+    "distinct_sources": ["audit"]
+  },
+  "workload_posture": {
+    "identity": {
+      "namespace": "tenant-acme",
+      "owner_kind": "Deployment",
+      "owner_name": "web"
+    },
+    "captured_at": "2026-05-22T10:00:00Z",
+    "service_account": "default"
+  },
+  "events": [
+    {
+      "id": "ev-s3-1",
+      "timestamp": "2026-05-22T10:00:00Z",
+      "source": "audit",
+      "category": "audit",
+      "severity": "INFO",
+      "summary": "Cluster-scope pod listing by tenant ServiceAccount and kubectl exec inside Pod",
+      "raw": {
+        "verb": "list",
+        "objectRef.resource": "pods",
+        "objectRef.namespace": "",
+        "user.username": "system:serviceaccount:tenant-acme:default",
+        "process.exe": "/usr/local/bin/kubectl"
+      }
+    }
+  ]
+}

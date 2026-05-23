@@ -1,0 +1,34 @@
+title: Host PID namespace entry from workload container
+id: OLT-EXEC-001
+description: |
+  Detects a workload container process that executes a binary under
+  the host filesystem bind path or that opens another process's
+  /proc/<pid>/exe or /proc/<pid>/root entry. Either path is the
+  textbook last step of a container escape because it grants the
+  container direct visibility into host side processes.
+status: experimental
+attack:
+  - T1611
+severity: 75
+detection:
+  host_bind_exec:
+    process.exe|startswith:
+      - '/host/bin/'
+      - '/host/sbin/'
+      - '/host/usr/bin/'
+      - '/host/usr/sbin/'
+      - '/host/usr/local/bin/'
+      - '/host/usr/local/sbin/'
+  proc_filesystem_read:
+    file.path|re: '^/proc/[0-9]+/(exe|root)$'
+  tenant_namespace:
+    k8s.pod.namespace|startswith: 'tenant-'
+  condition: (host_bind_exec or proc_filesystem_read) and tenant_namespace
+falsepositives:
+  - Host side diagnostic Pods deliberately launched into the host PID namespace; allowlist via a dedicated namespace
+  - Container runtime supervision processes within kube-system; excluded by the tenant_namespace filter
+  - Detection is scoped to FHS executable directories under /host/. Container escape via exec from non FHS host paths (for example /host/opt/, /host/var/lib/, /host/tmp/, or custom bind mounts) will not match host_bind_exec and the rule will fall through to proc_filesystem_read; an attacker who avoids /proc reads and stays on a non FHS host prefix evades the rule. Documented evasion vector; widening the prefix list reopens the legitimate /host/data sidecar false positive that D10 closed.
+fields:
+  - process.exe
+  - file.path
+  - k8s.pod.namespace

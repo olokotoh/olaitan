@@ -351,9 +351,23 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "olaitan.labels" . | nindent 4 }}
-# Empty for now: Story 1.15 wires the rule engine that watches this
-# mount; Story 1.16 populates the corpus. We render `data: {}`
-# explicitly: Kubernetes accepts both forms, but an explicit empty map
-# prevents `helm diff` from showing churn the first time Story 1.16
-# lands a real entry.
+# Populated by Story 1.16: every *.yaml under deploy/helm/olaitan/files/rules/
+# is enumerated via .Files.Glob and emitted as a ConfigMap key whose
+# basename matches the OLT rule-ID regex (OLT-<CAT>-NNN.yaml). The
+# files/ tree is staged by `make helm-prepare-rules` from the canonical
+# repo-root rules/<category>/ corpus; the staging step is required
+# because Helm's .Files.Glob uses path.Match and does not support
+# recursive globbing. The else branch renders `data: {}` explicitly so
+# a freshly-cloned chart (before `make helm-prepare-rules` runs) still
+# produces a parseable ConfigMap and Story 1.15's loader sees an empty
+# but valid corpus directory.
+{{- $rules := .Files.Glob "files/rules/*.yaml" }}
+{{- if $rules }}
+data:
+{{- range $path, $bytes := $rules }}
+  {{ base $path }}: |
+    {{- $.Files.Get $path | nindent 4 }}
+{{- end }}
+{{- else }}
 data: {}
+{{- end }}

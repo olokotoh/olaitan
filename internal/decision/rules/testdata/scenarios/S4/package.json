@@ -1,0 +1,43 @@
+{
+  "schema_version": "1",
+  "package_id": "pkg-s4-c2-beaconing",
+  "workload_id": "tenant-acme/Deployment/web",
+  "workload_identity": {
+    "namespace": "tenant-acme",
+    "owner_kind": "Deployment",
+    "owner_name": "web"
+  },
+  "assembled_at": "2026-05-22T10:00:00Z",
+  "window_start": "2026-05-22T09:59:00Z",
+  "window_end": "2026-05-22T10:00:00Z",
+  "trigger": {
+    "type": "multi_signal",
+    "fired_at": "2026-05-22T10:00:00Z",
+    "distinct_sources": ["network"]
+  },
+  "workload_posture": {
+    "identity": {
+      "namespace": "tenant-acme",
+      "owner_kind": "Deployment",
+      "owner_name": "web"
+    },
+    "captured_at": "2026-05-22T10:00:00Z",
+    "service_account": "default"
+  },
+  "events": [
+    {
+      "id": "ev-s4-1",
+      "timestamp": "2026-05-22T10:00:00Z",
+      "source": "network",
+      "category": "flow",
+      "severity": "INFO",
+      "summary": "Outbound TCP to public IP on alternate HTTPS port with small payload",
+      "raw": {
+        "network.dst_ip": "203.0.113.10",
+        "network.dst_port": 8443,
+        "network.protocol": "TCP",
+        "network.bytes_out": 256
+      }
+    }
+  ]
+}
