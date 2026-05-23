@@ -375,11 +375,21 @@ data:
     {{- if not (mustRegexFind $pBsm $cfg) }}{{- fail (printf "helm bridge: detection.baselines.sigma_multiplier anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pBsm) }}{{- end }}
     {{- $cfg = regexReplaceAll $pBsm $cfg (printf "${1}sigma_multiplier: %v" $bs.sigmaMultiplier) }}
     {{- end }}
-    {{- if $bs.redisAddr }}
+    {{- /* baselines.redisAddr defaults to empty in values.yaml so the
+           default install (subchart Redis enabled) resolves to the
+           subchart's `<release>-redis-master:6379` Service via the
+           olaitan.endpoints.redis helper; the file-side default of
+           "redis:6379" in config/olaitan.yaml is a development-host
+           shorthand that does not match the chart's Service naming.
+           Operators with externally-managed Redis set baselines.redisAddr
+           explicitly. */}}
+    {{- $effectiveRedisAddr := $bs.redisAddr }}
+    {{- if not $effectiveRedisAddr }}
+    {{- $effectiveRedisAddr = include "olaitan.endpoints.redis" . }}
+    {{- end }}
     {{- $pBra := "(?s)(\\n    sigma_multiplier:[[:space:]]+[0-9.]+\\n    )redis_addr:[[:space:]]+\"[^\"]*\"" -}}
     {{- if not (mustRegexFind $pBra $cfg) }}{{- fail (printf "helm bridge: detection.baselines.redis_addr anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pBra) }}{{- end }}
-    {{- $cfg = regexReplaceAll $pBra $cfg (printf "${1}redis_addr: %q" $bs.redisAddr) }}
-    {{- end }}
+    {{- $cfg = regexReplaceAll $pBra $cfg (printf "${1}redis_addr: %q" $effectiveRedisAddr) }}
     {{- end }}
     {{- /*
     Story 1.19: Evaluation-matrix overlay (FR53). Replace the file-side
