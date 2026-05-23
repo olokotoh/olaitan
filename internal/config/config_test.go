@@ -502,6 +502,20 @@ func TestProviderCaseInsensitive(t *testing.T) {
 	}
 }
 
+// TestProviderNoneAccepted asserts the Story 1.19 LLM-tier-bypass
+// sentinel "none" is accepted by the validator. The Helm chart bridges
+// analyst.provider=none into the rendered olaitan.yaml when an operator
+// selects evaluation.config=F or evaluation.config=RS (FR53 Epic 5
+// evaluation arms); a validator that rejected "none" would CrashLoop
+// the aggregator on those installs.
+func TestProviderNoneAccepted(t *testing.T) {
+	body := strings.Replace(validYAML, "provider: api", "provider: none", 1)
+	path := writeConfig(t, body)
+	if _, err := config.Load(path); err != nil {
+		t.Errorf("provider=none should validate (Story 1.19 LLM-tier-bypass sentinel): %v", err)
+	}
+}
+
 func TestPostureConfigOmittedAccepted(t *testing.T) {
 	// Omitting the posture block should validate; it is omitempty
 	// and downstream callers receive a zero-valued PostureConfig.
