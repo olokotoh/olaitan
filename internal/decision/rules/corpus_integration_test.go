@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"reflect"
 	"runtime"
 	"sort"
 	"testing"
@@ -76,9 +75,16 @@ func TestIntegration_CorpusMatchesScenarioFixture(t *testing.T) {
 			// "subset" form (only checking the wanted IDs are present)
 			// admitted regressions where every rule misfired on every
 			// fixture; the expected pair would still be in the set.
-			if !reflect.DeepEqual(gotIDs, wantIDs) {
-				t.Errorf("scenario %s: got rule IDs %v, want exactly %v",
-					tc.scenario, gotIDs, wantIDs)
+			//
+			// Diagnostic format names the symmetric difference
+			// (missing-from-got AND unexpected-in-got) so a five
+			// scenario, ten plus rule failure points at the specific
+			// IDs that diverged rather than dumping two slices and
+			// asking the reader to diff them by eye.
+			missing, unexpected := symmetricDifference(wantIDs, gotIDs)
+			if len(missing) > 0 || len(unexpected) > 0 {
+				t.Errorf("scenario %s: rule-match set diverged from expected\n  missing  (in want, not in got): %v\n  unexpected (in got, not in want): %v\n  got:  %v\n  want: %v",
+					tc.scenario, missing, unexpected, gotIDs, wantIDs)
 			}
 		})
 	}
@@ -115,4 +121,32 @@ func sortedRuleIDs(got map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// symmetricDifference returns the two halves of (want, got) that
+// disagree: missing is the IDs in want but not in got; unexpected is
+// the IDs in got but not in want. Inputs are assumed already sorted;
+// outputs are sorted by construction. Used by the AC3 scenario gate
+// to name exactly which rule IDs diverged rather than dumping both
+// sets and asking the reader to spot the difference.
+func symmetricDifference(want, got []string) (missing, unexpected []string) {
+	w := map[string]bool{}
+	for _, id := range want {
+		w[id] = true
+	}
+	g := map[string]bool{}
+	for _, id := range got {
+		g[id] = true
+	}
+	for _, id := range want {
+		if !g[id] {
+			missing = append(missing, id)
+		}
+	}
+	for _, id := range got {
+		if !w[id] {
+			unexpected = append(unexpected, id)
+		}
+	}
+	return missing, unexpected
 }

@@ -4,10 +4,23 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/olokotoh/olaitan/internal/decision/rules/parser"
 )
+
+// canonicalYAMLExt returns true for *.yaml / *.yml in any case. The
+// chart's helm-prepare-rules Makefile glob `rules/*/*.yaml` is
+// case-sensitive on Linux but case-insensitive on macOS; the lint
+// walker matches the most permissive of the two so a rule named
+// OLT-FOO.YAML or .Yml fails lint at PR-review time rather than
+// silently slipping into divergent on-disk vs staged corpora across
+// developer platforms.
+func canonicalYAMLExt(path string) bool {
+	ext := filepath.Ext(path)
+	return strings.EqualFold(ext, ".yaml") || strings.EqualFold(ext, ".yml")
+}
 
 // countCorpusYAMLs counts every *.yaml / *.yml file under root by
 // walking the tree, without touching the parser. Used as the on-disk
@@ -24,8 +37,7 @@ func countCorpusYAMLs(t *testing.T, root string) int {
 		if d.IsDir() {
 			return nil
 		}
-		ext := filepath.Ext(path)
-		if ext == ".yaml" || ext == ".yml" {
+		if canonicalYAMLExt(path) {
 			n++
 		}
 		return nil
@@ -68,11 +80,51 @@ func TestCorpusLint_AllRulesParse(t *testing.T) {
 		t.Fatalf("corpus has %d rules; AC1 requires >=10", len(rules))
 	}
 
+	// AC1 unique-ID gate: two rules sharing an ID would silently
+	// dedupe through any map keyed on r.ID, masking a real corpus
+	// duplication. Fail lint at the first collision with both source
+	// paths so the contributor sees which two files clash.
+	idToPath := map[string]string{}
+	for _, r := range rules {
+		if prev, dup := idToPath[r.ID]; dup {
+			t.Errorf("rule ID %q appears in two files: %s and %s", r.ID, prev, r.SourcePath)
+		}
+		idToPath[r.ID] = r.SourcePath
+	}
+
+	// AC1 attack-technique closed-world gate: every technique a rule
+	// declares must be present in scenarioTechniques. An orphan ID
+	// like T9999 (typo, unmapped technique, future ATT&CK revision)
+	// would parse cleanly and pass the per-scenario count gate via a
+	// sibling technique, but silently inflate the corpus with rules
+	// that don't actually belong to any tracked scenario. Forcing the
+	// extension of scenarioTechniques on every new technique keeps
+	// the inventory and the lint table aligned.
+	knownTechniques := map[string]bool{}
+	for _, techs := range scenarioTechniques {
+		for _, t := range techs {
+			knownTechniques[t] = true
+		}
+	}
+
+	// AC1 per-scenario distinct-rules gate. counts[scenario] is the
+	// number of distinct rule SOURCE PATHS that hit each scenario, not
+	// the number of attack-technique increments; a single multi
+	// technique rule like attack:[T1611, T1552] contributes once to
+	// S1 and once to S2 (one count per rule per scenario it hits),
+	// not twice to one scenario. Keying on r.SourcePath (instead of
+	// r.ID) plus the unique-ID gate above means the count is a true
+	// distinct-rules-per-scenario tally even if a contributor
+	// accidentally reuses an ID.
 	counts := map[string]int{}
-	rulesWithScenario := map[string]bool{}
+	rulesByPath := map[string]bool{}
 	for _, r := range rules {
 		hit := map[string]bool{}
 		for _, attackID := range r.Attack {
+			if !knownTechniques[attackID] {
+				t.Errorf("rule %s declares unknown attack technique %q; either fix the typo or extend scenarioTechniques", r.ID, attackID)
+				continue
+			}
 			for scenario, techs := range scenarioTechniques {
 				for _, want := range techs {
 					if attackID == want {
@@ -85,24 +137,25 @@ func TestCorpusLint_AllRulesParse(t *testing.T) {
 			counts[scenario]++
 		}
 		if len(hit) > 0 {
-			rulesWithScenario[r.ID] = true
+			rulesByPath[r.SourcePath] = true
 		}
 	}
 	for scenario := range scenarioTechniques {
 		if counts[scenario] < 2 {
-			t.Errorf("scenario %s covered by %d rules; AC1 requires >=2", scenario, counts[scenario])
+			t.Errorf("scenario %s covered by %d distinct rules; AC1 requires >=2", scenario, counts[scenario])
 		}
 	}
 
 	// AC1 reciprocal: every parsed rule must map to at least one
-	// scenario via scenarioTechniques. An orphan-technique rule (e.g.
-	// attack: [T9999]) would parse cleanly and satisfy AC2 but
-	// contribute to no scenario, defeating the corpus inventory's
-	// purpose. The reciprocal gate forces every future rule addition
-	// to extend scenarioTechniques (or be removed) before lint passes.
+	// scenario via scenarioTechniques. Keyed on r.SourcePath (not
+	// r.ID) so two rules sharing an ID are not silently collapsed
+	// here before the unique-ID gate above flags them. The closed
+	// world gate already catches unknown techniques; this gate
+	// catches the rarer case of a rule whose entire attack list maps
+	// outside scenarioTechniques' covered techniques.
 	for _, r := range rules {
-		if !rulesWithScenario[r.ID] {
-			t.Errorf("rule %s attack:%v maps to no scenario in scenarioTechniques; either fix the rule's attack list or extend scenarioTechniques", r.ID, r.Attack)
+		if !rulesByPath[r.SourcePath] {
+			t.Errorf("rule %s (%s) attack:%v maps to no scenario in scenarioTechniques; either fix the rule's attack list or extend scenarioTechniques", r.ID, r.SourcePath, r.Attack)
 		}
 	}
 
@@ -195,9 +248,20 @@ func walkAndParse(t *testing.T, root string) []*parser.Rule {
 		if d.IsDir() {
 			return nil
 		}
-		ext := filepath.Ext(path)
-		if ext != ".yaml" && ext != ".yml" {
+		if !canonicalYAMLExt(path) {
 			return nil
+		}
+		// AC1 flatness gate: the chart's helm-prepare-rules Makefile
+		// uses `wildcard rules/*/*.yaml` which does not recurse, so a
+		// nested rule at rules/<cat>/sub/OLT-FOO.yaml would parse and
+		// satisfy AC1 here but be silently absent from the staged
+		// ConfigMap. Fail lint at the first nested file so the
+		// divergence surfaces at PR-review time.
+		if rel, relErr := filepath.Rel(root, path); relErr == nil {
+			if depth := strings.Count(rel, string(filepath.Separator)); depth != 1 {
+				t.Errorf("rule path %q is %d directories deep under rules/; must be exactly rules/<category>/<file>.yaml (the Makefile glob `rules/*/*.yaml` does not recurse)", rel, depth)
+				return nil
+			}
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {

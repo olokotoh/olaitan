@@ -104,9 +104,13 @@ helm-prepare-rules: clean-staged-rules $(RULE_STAGED)
 
 # Per-rule copy target. The foreach + eval below generates one rule per
 # source file so Make tracks per-file dependencies and re-stages only
-# the rules an operator just edited.
+# the rules an operator just edited. The order-only `|` prerequisite on
+# clean-staged-rules guarantees the rm always completes before any cp
+# under `make -jN`; without it a parallel scheduler could interleave
+# rm -rf and per-file cp recipes, corrupting the staged directory with
+# no error.
 define stage_rule
-$(CHART_DIR)/files/rules/$(notdir $(1)): $(1)
+$(CHART_DIR)/files/rules/$(notdir $(1)): $(1) | clean-staged-rules
 	@mkdir -p $$(@D)
 	cp $$< $$@
 endef

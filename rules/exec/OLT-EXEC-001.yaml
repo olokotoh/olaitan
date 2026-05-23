@@ -27,6 +27,7 @@ detection:
 falsepositives:
   - Host side diagnostic Pods deliberately launched into the host PID namespace; allowlist via a dedicated namespace
   - Container runtime supervision processes within kube-system; excluded by the tenant_namespace filter
+  - Detection is scoped to FHS executable directories under /host/. Container escape via exec from non FHS host paths (for example /host/opt/, /host/var/lib/, /host/tmp/, or custom bind mounts) will not match host_bind_exec and the rule will fall through to proc_filesystem_read; an attacker who avoids /proc reads and stays on a non FHS host prefix evades the rule. Documented evasion vector; widening the prefix list reopens the legitimate /host/data sidecar false positive that D10 closed.
 fields:
   - process.exe
   - file.path

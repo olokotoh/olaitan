@@ -17,6 +17,8 @@ package helm_test
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2311,8 +2313,18 @@ func findRulesConfigMap(t *testing.T, rendered string) olaitanRulesConfigMap {
 	var hits []olaitanRulesConfigMap
 	for {
 		var cm olaitanRulesConfigMap
-		if err := dec.Decode(&cm); err != nil {
+		err := dec.Decode(&cm)
+		if errors.Is(err, io.EOF) {
 			break
+		}
+		if err != nil {
+			// A malformed doc earlier in the stream than the
+			// olaitan-rules ConfigMap would previously surface as
+			// "ConfigMap not found"; the typed-EOF branch above
+			// terminates the loop on EOF only, so non-EOF errors
+			// now produce an actionable diagnostic pointing at the
+			// real failure.
+			t.Fatalf("yaml decode in rendered manifest stream: %v", err)
 		}
 		if cm.Kind != "ConfigMap" || cm.Metadata.Name != "olaitan-rules" {
 			continue
@@ -2338,10 +2350,34 @@ func findRulesConfigMap(t *testing.T, rendered string) olaitanRulesConfigMap {
 // regression in the helm-prepare-rules Makefile flatten step would
 // surface here with a clean diagnostic.
 func TestRulesConfigMapPopulatedFromCorpus(t *testing.T) {
+	// Precondition: the chart's olaitan-rules ConfigMap is populated
+	// from deploy/helm/olaitan/files/rules/ which is staged by
+	// `make helm-prepare-rules`. A developer running the helm test
+	// suite standalone without first running the prep target would
+	// otherwise see a `len(cm.Data) < 10` failure that points at
+	// "missing rules" rather than at the actual cause. Check the
+	// staged dir up front so the diagnostic is actionable.
+	stagedDir := filepath.Join(chartDir(t), "files", "rules")
+	stagedEntries, err := os.ReadDir(stagedDir)
+	if err != nil || len(stagedEntries) == 0 {
+		t.Fatalf("staged rules dir %s is missing or empty (err=%v); run `make helm-prepare-rules` from repo root before running the helm test suite", stagedDir, err)
+	}
+
+	// Canonical authority for the expected ConfigMap key count is the
+	// repo-root rules/ tree. Counting on-disk rules separately from
+	// the staged dir lets the assertion below catch a silent
+	// rule-dropping bug in either the Makefile flatten step or the
+	// chart's .Files.Glob; len(cm.Data) >= 10 alone would still
+	// pass if the corpus had 11 rules on disk and one was silently
+	// dropped, hiding the regression.
+	onDiskCount := countOnDiskRules(t)
 	rendered := helmTemplate(t, nil)
 	cm := findRulesConfigMap(t, rendered)
 	if len(cm.Data) < 10 {
 		t.Fatalf("olaitan-rules ConfigMap has %d keys; Story 1.16 AC1 requires >=10", len(cm.Data))
+	}
+	if len(cm.Data) != onDiskCount {
+		t.Errorf("olaitan-rules ConfigMap has %d keys but repo-root rules/ tree carries %d *.yaml files; the Makefile flatten step or the chart's .Files.Glob is silently dropping a rule", len(cm.Data), onDiskCount)
 	}
 	keyRegex := regexp.MustCompile(`^OLT-(EXEC|NET|FILE|PRIV|IMPACT|RECON|PERSIST|EXFIL|CRED|LATERAL)-[0-9]{3}\.yaml$`)
 	for key := range cm.Data {
@@ -2359,6 +2395,37 @@ func TestRulesConfigMapPopulatedFromCorpus(t *testing.T) {
 			t.Errorf("ConfigMap key %q: staged content fails parser.ParseRule: %v", key, err)
 		}
 	}
+}
+
+// countOnDiskRules walks the repo-root rules/ tree and returns the
+// number of *.yaml / *.yml files (case-insensitive on the extension to
+// match the corpus_lint walker). Used as the authoritative key-count
+// expectation for TestRulesConfigMapPopulatedFromCorpus.
+func countOnDiskRules(t *testing.T) int {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatalf("runtime.Caller(0) failed; cannot resolve repo root")
+	}
+	root := filepath.Join(filepath.Dir(thisFile), "..", "..", "rules")
+	n := 0
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(path))
+		if ext == ".yaml" || ext == ".yml" {
+			n++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk repo-root rules/ tree under %s: %v", root, err)
+	}
+	return n
 }
 
 // TestRulesConfigMapKeysAreFlatNoDirectory asserts no ConfigMap key
