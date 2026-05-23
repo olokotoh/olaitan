@@ -263,7 +263,12 @@ func scrapeMetrics(t *testing.T) map[string]*metricFamily {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("scrape metrics: HTTP %d", resp.StatusCode)
 	}
-	parser := expfmt.TextParser{}
+	// expfmt.TextParser carries its own scheme field; the zero value is
+	// UnsetValidation and panics on the first metric-name check. Use
+	// NewTextParser to pin the scheme explicitly. (The package-level
+	// model.NameValidationScheme set in init is only used by callers
+	// that read the package var; TextParser does not.)
+	parser := expfmt.NewTextParser(model.LegacyValidation)
 	parsed, err := parser.TextToMetricFamilies(resp.Body)
 	if err != nil {
 		t.Fatalf("parse metrics: %v", err)
