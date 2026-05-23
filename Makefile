@@ -143,6 +143,11 @@ KIND_CLUSTER_NAME ?= olaitan-e2e
 e2e-local: helm-prepare helm-deps docker-build
 	kind create cluster --name $(KIND_CLUSTER_NAME) --config hack/kind-config.yaml
 	kind load docker-image $(IMAGE):$(TAG) --name $(KIND_CLUSTER_NAME)
+	# fileStore.maxSize override mirrors ci.yml: internal/nats/streams.go
+	# requests 160 GiB across streams; default jetstream max_file_store
+	# is the PVC size (10 GiB), causing JetStream err 10047 on stream
+	# creation. 200GB headroom unblocks CreateOrUpdateStream without
+	# changing the PVC backing.
 	helm install olaitan $(CHART_DIR) \
 		--set image.repository=$(IMAGE) \
 		--set image.tag=$(TAG) \
@@ -151,6 +156,7 @@ e2e-local: helm-prepare helm-deps docker-build
 		--set baselines.warmupDuration=5s \
 		--set secrets.redisPassword=ci-test \
 		--set falco.enabled=false \
+		--set nats.config.jetstream.fileStore.maxSize=200GB \
 		--wait --timeout 5m
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) go test -tags=e2e -v -count=1 ./tests/e2e/...
 

@@ -163,6 +163,16 @@ jobs:
           # ghcr.io/olokotoh/olaitan would resolve to a registry path that
           # is not present on the node and `pullPolicy: Never` would then
           # fail with ErrImageNeverPull.
+          # nats.config.jetstream.fileStore.maxSize defaults to the PVC
+          # size (10Gi), but internal/nats/streams.go declares stream
+          # MaxBytes totalling 160 GiB across EVENTS / EVENTS_RAW /
+          # EVIDENCE; JetStream rejects stream creation with err 10047
+          # "insufficient storage resources" when the requested limits
+          # exceed the account file-store limit. Override to 200GB so
+          # CreateOrUpdateStream succeeds; actual on-disk usage during
+          # the smoke test stays under a few hundred KB (100 synthetic
+          # events) so the 10Gi PVC backing is never approached. Match
+          # this in Makefile's e2e-local target.
           helm install olaitan ./deploy/helm/olaitan \
             --set image.repository=olaitan \
             --set image.tag="$tag" \
@@ -171,6 +181,7 @@ jobs:
             --set baselines.warmupDuration=5s \
             --set secrets.redisPassword=ci-test \
             --set falco.enabled=false \
+            --set nats.config.jetstream.fileStore.maxSize=200GB \
             --wait --timeout 5m
 
       - name: Run smoke test
