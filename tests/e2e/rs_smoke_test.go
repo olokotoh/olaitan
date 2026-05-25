@@ -47,6 +47,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
 )
@@ -255,7 +256,21 @@ spec:
 // Posture identity is set so `extractOutboundUniqueDstIPs` does not
 // blank out on the package-level k8s.* path and so the package keys
 // resolve cleanly via `resolveWorkloadKey`.
-func publishSyntheticEvidencePackages(t *testing.T, nc *nats.Conn, podName string) {
+// publishJS publishes via JetStream so the test fails loudly if the
+// subject is not bound to any stream (core NATS publish silently
+// drops in that case, which is exactly the failure mode that hid the
+// "no stream subscribed to this subject" defect under the prior
+// nc.Publish-only path).
+func publishJS(t *testing.T, js jetstream.JetStream, subject string, payload []byte) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := js.Publish(ctx, subject, payload); err != nil {
+		t.Fatalf("jetstream publish %s: %v", subject, err)
+	}
+}
+
+func publishSyntheticEvidencePackages(t *testing.T, js jetstream.JetStream, podName string) {
 	t.Helper()
 	now := time.Now().UTC()
 	posture := map[string]any{
@@ -315,17 +330,11 @@ func publishSyntheticEvidencePackages(t *testing.T, nc *nats.Conn, podName strin
 	// 10 priming packages: alternate distinct=1 / distinct=2 so std > 0.
 	pattern := []int{1, 2, 1, 2, 1, 2, 1, 2, 1, 2}
 	for i, distinct := range pattern {
-		payload := makePkg(fmt.Sprintf("preseed-pkg-%d", i), distinct)
-		if err := nc.Publish("olaitan.evidence.packages", payload); err != nil {
-			t.Fatalf("publish preseed package %d: %v", i, err)
-		}
+		publishJS(t, js, "olaitan.evidence.packages", makePkg(fmt.Sprintf("preseed-pkg-%d", i), distinct))
 	}
 	// 1 spike package: distinct=50 lands in the >=10 sigma bucket
 	// (Story 1.18 P1 boundary).
-	spikePayload := makePkg("preseed-pkg-spike", 50)
-	if err := nc.Publish("olaitan.evidence.packages", spikePayload); err != nil {
-		t.Fatalf("publish preseed spike package: %v", err)
-	}
+	publishJS(t, js, "olaitan.evidence.packages", makePkg("preseed-pkg-spike", 50))
 }
 
 // publishCorrelatorTrigger publishes one network and one falco raw
@@ -335,7 +344,7 @@ func publishSyntheticEvidencePackages(t *testing.T, nc *nats.Conn, podName strin
 // counter increments. The baseline-deviation assertion is satisfied
 // by `publishSyntheticEvidencePackages` above; this function is the
 // rules-engine + correlator-counter half of AC5.
-func publishCorrelatorTrigger(t *testing.T, nc *nats.Conn, podName string) {
+func publishCorrelatorTrigger(t *testing.T, js jetstream.JetStream, podName string) {
 	t.Helper()
 	pod := map[string]any{
 		"name":      podName,
@@ -358,9 +367,7 @@ func publishCorrelatorTrigger(t *testing.T, nc *nats.Conn, podName string) {
 		"pod":       pod,
 	}
 	netPayload, _ := json.Marshal(netEvent)
-	if err := nc.Publish("olaitan.events.raw.network", netPayload); err != nil {
-		t.Fatalf("publish correlator network event: %v", err)
-	}
+	publishJS(t, js, "olaitan.events.raw.network", netPayload)
 	// Falco event with CAP_SYS_ADMIN: second source, rising edge fires,
 	// correlator emits an EvidencePackage onto EVIDENCE.packages; rules
 	// engine matches OLT-PRIV-001 against this event.
@@ -380,9 +387,7 @@ func publishCorrelatorTrigger(t *testing.T, nc *nats.Conn, podName string) {
 		"pod":       pod,
 	}
 	falcoPayload, _ := json.Marshal(falcoEvent)
-	if err := nc.Publish("olaitan.events.raw.falco", falcoPayload); err != nil {
-		t.Fatalf("publish correlator falco event: %v", err)
-	}
+	publishJS(t, js, "olaitan.events.raw.falco", falcoPayload)
 }
 
 // scrapeMetrics fetches the aggregator's Prometheus surface and
@@ -485,6 +490,10 @@ func TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation(t *testing.T) {
 		t.Fatalf("NATS connect: %v", err)
 	}
 	t.Cleanup(nc.Close)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("JetStream context: %v", err)
+	}
 	// Pre-seed the per-workload baseline by publishing 11 synthetic
 	// EvidencePackages directly onto EVIDENCE.packages. The correlator
 	// only emits one package per rising-edge transition per workload
@@ -492,10 +501,7 @@ func TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation(t *testing.T) {
 	// for the baseline engine (preCount<2, preStd=0) to ever fire a
 	// deviation in the 30s assertion budget. See the docstring on
 	// publishSyntheticEvidencePackages for the design rationale.
-	publishSyntheticEvidencePackages(t, nc, podName)
-	if err := nc.Flush(); err != nil {
-		t.Fatalf("NATS flush after pre-seed: %v", err)
-	}
+	publishSyntheticEvidencePackages(t, js, podName)
 	// Give the baseline-engine durable consumer time to drain the 11
 	// pre-seed packages before the correlator-emitted Package_A
 	// lands behind them on the EVIDENCE stream. The default
@@ -506,10 +512,7 @@ func TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation(t *testing.T) {
 	// regardless, but this sleep keeps the diagnosis loud if the
 	// consumer is wedged.
 	time.Sleep(3 * time.Second)
-	publishCorrelatorTrigger(t, nc, podName)
-	if err := nc.Flush(); err != nil {
-		t.Fatalf("NATS flush after correlator trigger: %v", err)
-	}
+	publishCorrelatorTrigger(t, js, podName)
 	ctx, cancel := context.WithTimeout(context.Background(), assertionTimeout)
 	defer cancel()
 	var lastErr error
