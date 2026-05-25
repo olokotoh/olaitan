@@ -461,6 +461,7 @@ func TestAssemblerUnavailablePostureNotMarkedOrphanOnTransient(t *testing.T) {
 //   - ReplicaSets.Get / Deployments.Get from the assembler-side
 //     posture.ResolveWorkloadIdentity call must STILL be skipped
 //     (the cached identity is authoritative, no second owner walk).
+//
 // The posture client may do its own owner walk inside Get, but that
 // is bounded by its 60s cache and is the same cost the cold path
 // pays.
