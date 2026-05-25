@@ -265,9 +265,11 @@ func publishJS(t *testing.T, js jetstream.JetStream, subject string, payload []b
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := js.Publish(ctx, subject, payload); err != nil {
+	ack, err := js.Publish(ctx, subject, payload)
+	if err != nil {
 		t.Fatalf("jetstream publish %s: %v", subject, err)
 	}
+	t.Logf("js publish ok subject=%s stream=%s seq=%d", subject, ack.Stream, ack.Sequence)
 }
 
 func publishSyntheticEvidencePackages(t *testing.T, js jetstream.JetStream, podName string) {
@@ -516,9 +518,26 @@ func TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), assertionTimeout)
 	defer cancel()
 	var lastErr error
+	tick := 0
 	for {
 		select {
 		case <-ctx.Done():
+			// Final diagnostic snapshot so the failure log surfaces
+			// every pipeline-side counter we care about, not just the
+			// first one that missed its threshold.
+			final := scrapeMetrics(t)
+			t.Logf("final metrics snapshot:")
+			for _, name := range []string{
+				"olaitan_decision_rules_evaluations_total",
+				"olaitan_decision_rules_matches_total",
+				"olaitan_decision_rules_matches_by_attribute_total",
+				"olaitan_decision_baseline_evaluations_total",
+				"olaitan_decision_baseline_deviations_total",
+				"olaitan_correlator_evidence_packages_total",
+				"olaitan_source_healthy",
+			} {
+				t.Logf("  %s = %v", name, final[name].sumWhere(nil))
+			}
 			t.Fatalf("metric assertions did not pass within %s; last error: %v",
 				assertionTimeout, lastErr)
 		default:
@@ -527,6 +546,13 @@ func TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation(t *testing.T) {
 		matches := metrics["olaitan_decision_rules_matches_by_attribute_total"].sumWhere(map[string]string{"rule_id": "OLT-PRIV-001"})
 		deviations := metrics["olaitan_decision_baseline_deviations_total"].sumWhere(nil)
 		evidence := metrics["olaitan_correlator_evidence_packages_total"].sumWhere(nil)
+		if tick%4 == 0 {
+			t.Logf("poll tick=%d: rules_match[OLT-PRIV-001]=%v baseline_deviations=%v correlator_packages=%v rules_eval_total=%v baseline_eval_total=%v",
+				tick, matches, deviations, evidence,
+				metrics["olaitan_decision_rules_evaluations_total"].sumWhere(nil),
+				metrics["olaitan_decision_baseline_evaluations_total"].sumWhere(nil))
+		}
+		tick++
 		switch {
 		case matches < 1:
 			lastErr = fmt.Errorf("rule matches for OLT-PRIV-001 = %v; want >= 1", matches)
