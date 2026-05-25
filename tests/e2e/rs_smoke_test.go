@@ -300,8 +300,16 @@ func publishSyntheticEvidencePackages(t *testing.T, js jetstream.JetStream, podN
 	makePkg := func(id string, distinctIPs int) []byte {
 		events := make([]map[string]any, 0, distinctIPs)
 		for j := 0; j < distinctIPs; j++ {
+			// `dst_ip` (no prefix) is one of the four candidates
+			// baseline/metrics.go:69 walks: "network.dst_ip" (as a
+			// nested-object path via walkPath -- NOT a flat dotted
+			// key), "dst_ip", "dest_ip", "dest_name". Use the
+			// flat-top-level form so the extractor finds the value;
+			// the dotted "network.dst_ip" form is silently dropped by
+			// walkPath because it splits the key and probes raw["network"]
+			// which is absent.
 			raw := map[string]any{
-				"network.dst_ip": fmt.Sprintf("10.0.0.%d", j+1),
+				"dst_ip": fmt.Sprintf("10.0.0.%d", j+1),
 			}
 			rawJSON, _ := json.Marshal(raw)
 			events = append(events, map[string]any{
@@ -362,9 +370,13 @@ func publishCorrelatorTrigger(t *testing.T, js jetstream.JetStream, podName stri
 		"uid":       "smoke-uid-1",
 	}
 	// Network priming event: makes the correlator window go from 0 to
-	// 1 source. No rising edge yet (MultiSignalMinSources=2).
+	// 1 source. No rising edge yet (MultiSignalMinSources=2). Uses
+	// top-level "dst_ip" (no prefix) so the baseline extractor's
+	// walkPath finds the value -- the dotted "network.dst_ip" form is
+	// only resolvable as nested raw["network"]["dst_ip"], not as a
+	// flat top-level dotted key (baseline/metrics.go:69).
 	netRaw := map[string]any{
-		"network.dst_ip": "10.0.0.1",
+		"dst_ip": "10.0.0.1",
 	}
 	netRawJSON, _ := json.Marshal(netRaw)
 	netEvent := map[string]any{
