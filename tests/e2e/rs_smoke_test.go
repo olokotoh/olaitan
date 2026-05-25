@@ -275,19 +275,27 @@ func publishJS(t *testing.T, js jetstream.JetStream, subject string, payload []b
 func publishSyntheticEvidencePackages(t *testing.T, js jetstream.JetStream, podName string) {
 	t.Helper()
 	now := time.Now().UTC()
+	// PodName is intentionally omitted from both WorkloadIdentity and
+	// WorkloadPosture.Identity. The schema's `pod_name,omitempty` tag
+	// reserves the field for the orphan-pod fallback; Deployment-owned
+	// pods carry PodName="". The baseline engine's resolveWorkloadKey
+	// (engine.go:587) then falls through to namespace + "OwnerKind-
+	// OwnerName" -- the SAME key the correlator's multi_signal package
+	// uses when it lands on EVIDENCE.packages after my correlator
+	// trigger fires. Setting PodName here would split the Welford
+	// state across two keys and the pre-seed history would not apply
+	// to the post-trigger packages.
 	posture := map[string]any{
 		"identity": map[string]any{
 			"namespace":  "tenant-acme",
 			"owner_kind": "Deployment",
 			"owner_name": "web",
-			"pod_name":   podName,
 		},
 	}
 	identity := map[string]any{
 		"namespace":  "tenant-acme",
 		"owner_kind": "Deployment",
 		"owner_name": "web",
-		"pod_name":   podName,
 	}
 	makePkg := func(id string, distinctIPs int) []byte {
 		events := make([]map[string]any, 0, distinctIPs)
