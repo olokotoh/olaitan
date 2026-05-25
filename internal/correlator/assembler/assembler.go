@@ -161,13 +161,40 @@ func (a *Assembler) Assemble(ctx context.Context, tr trigger.Trigger, snap windo
 func (a *Assembler) resolveWorkload(ctx context.Context, tr trigger.Trigger, ref schema.PodRef) (*corev1.Pod, schema.WorkloadIdentity, string, bool, []string) {
 	// Cache-warm path: the correlator already resolved this workload's
 	// identity when it computed the per-event window key. Reusing the
-	// supplied identity here skips a second Pods.Get per event and
-	// closes P11 (k8s API storm under multi-signal).
+	// supplied identity here skips a second posture.ResolveWorkloadIdentity
+	// walk (which costs RS.Get + Deployment.Get) and closes P11 (k8s
+	// API storm under multi-signal).
+	//
+	// We still fetch the pod from kube before handing off to
+	// resolvePosture, because the posture client re-runs
+	// ResolveWorkloadIdentity on the supplied pod object and needs the
+	// real OwnerReferences to walk -- handing it a stub built from
+	// `identity` alone makes metav1.GetControllerOf return nil, the
+	// posture client falls into the orphan-pod fallback (OwnerKind=Pod,
+	// OrphanPod=true), and any rule whose k8s.workload.owner_kind
+	// clause filters on Deployment/StatefulSet silently misses on every
+	// multi-signal package even when the correlator's WorkloadIdentity
+	// is correct (see Story 1.19 e2e: OLT-PRIV-001 vs OLT-EXEC-001
+	// divergence). The posture client's 60s cache amortises the per-pod
+	// fetchPosture so the steady-state cost remains bounded; only the
+	// k8s.Pods.Get is restored on the cache-warm path.
 	if tr.ResolvedIdentity != nil {
 		identity := *tr.ResolvedIdentity
-		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: identity.PodName, Namespace: identity.Namespace, UID: typesUID(ref.UID)}}
-		if pod.Name == "" {
-			pod.Name = ref.Name
+		var pod *corev1.Pod
+		if a.kube != nil && ref.Name != "" && ref.Namespace != "" {
+			got, err := a.kube.CoreV1().Pods(ref.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
+			if err == nil {
+				pod = got
+			} else {
+				a.log.Warn("resolveWorkload: cache-warm pod fetch failed; posture client will run against a stub pod",
+					"namespace", ref.Namespace, "pod", ref.Name, "err", err)
+			}
+		}
+		if pod == nil {
+			pod = &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: identity.PodName, Namespace: identity.Namespace, UID: typesUID(ref.UID)}}
+			if pod.Name == "" {
+				pod.Name = ref.Name
+			}
 		}
 		workloadID, err := workloadIDFor(identity)
 		if err != nil {
