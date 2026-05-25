@@ -160,95 +160,229 @@ func portForward(t *testing.T, target, localPort, remotePort string) {
 	t.Fatalf("port-forward %s did not become reachable on localhost:%s within 10s", target, localPort)
 }
 
-// publishSyntheticRuleEvent injects an event that satisfies
-// `rules/priv/OLT-PRIV-001.yaml` so the rule engine fires
-// `olaitan_decision_rules_matches_by_attribute_total{rule_id="OLT-PRIV-001"}`.
-// The event shape mirrors the existing fixture at
-// `internal/decision/rules/testdata/scenarios/S1/package.json` adapted
-// to the on-wire raw-event JSON the Falco adapter emits.
-func publishSyntheticRuleEvent(t *testing.T, nc *nats.Conn) {
+// applySyntheticWorkload creates a `tenant-acme/web` Deployment so the
+// aggregator's correlator can resolve a real pod via the apiserver and
+// walk its OwnerReferences to a Deployment OwnerKind. Without a real
+// pod, the resolver falls back to a pod-name-keyed identity with
+// OwnerKind="Pod" and the OLT-PRIV-001 rule (which requires
+// owner_kind in [Deployment, StatefulSet]) cannot match.
+//
+// Returns the actual pod name so the test publishes synthetic events
+// against the workload the cluster knows about. The cleanup deletes
+// the namespace (cascading-deletes Deployment + ReplicaSet + Pod).
+//
+// The pod image is `registry.k8s.io/pause:3.10`, which kind nodes
+// already cache as the per-pod sandbox image, so the pod reaches Ready
+// without an upstream pull.
+func applySyntheticWorkload(t *testing.T) string {
 	t.Helper()
-	// Match-fields for OLT-PRIV-001: process.cap_effective contains
-	// CAP_SYS_ADMIN, workload owner_kind=Deployment, namespace=non-system.
-	raw := map[string]any{
-		"process.exe":             "/host/bin/sh",
-		"process.cap_effective":   "CAP_NET_BIND_SERVICE CAP_SYS_ADMIN CAP_SETUID",
-		"k8s.pod.namespace":       "tenant-acme",
-		"k8s.workload.owner_kind": "Deployment",
-		"k8s.workload.owner_name": "web",
+	manifest := `
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-acme
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: tenant-acme
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.10
+`
+	cmd := exec.Command("kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(manifest)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("kubectl apply synthetic workload failed: %v\nstderr:\n%s", err, stderr.String())
 	}
-	rawJSON, err := json.Marshal(raw)
-	if err != nil {
-		t.Fatalf("marshal raw event: %v", err)
+	t.Cleanup(func() {
+		// Best-effort cleanup; do not fail the test on teardown errors
+		// (CI tears the kind cluster down on job end anyway).
+		_ = exec.Command("kubectl", "delete", "namespace", "tenant-acme",
+			"--wait=false", "--ignore-not-found").Run()
+	})
+	kubectl(t, "wait", "--for=condition=Ready",
+		"-n", "tenant-acme",
+		"--selector=app=web",
+		"--timeout=60s", "pods")
+	out := kubectl(t, "get", "pods",
+		"-n", "tenant-acme",
+		"-l", "app=web",
+		"-o", "jsonpath={.items[0].metadata.name}")
+	podName := strings.TrimSpace(out)
+	if podName == "" {
+		t.Fatalf("synthetic workload: pod name not resolvable")
 	}
-	event := map[string]any{
+	return podName
+}
+
+// publishSyntheticEvidencePackages pre-seeds the per-workload baseline
+// store by publishing synthetic EvidencePackages directly to the
+// `olaitan.evidence.packages` subject. This bypasses the correlator's
+// rising-edge constraint -- the correlator only emits ONE package per
+// workload per 60s window (window/window.go:171-184), which would
+// otherwise leave the baseline with Count<3 and `preStd=0` for the
+// entire test budget, so AC5's deviation half cannot fire purely
+// through the streaming path.
+//
+// Eleven packages: ten alternating distinct=1/distinct=2 priming
+// observations (Welford accumulates Count=10, Mean=1.5, Std≈0.527),
+// then one spike at distinct=50. The spike's sigma vs the primed
+// baseline is ~92, well above the 3-sigma deviation gate.
+//
+// Packages carry Trigger.Type="multi_signal" so neither the rules-
+// engine nor the baseline-engine re-entrancy guards filter them. The
+// (Namespace, PodName) key on each package matches the real pod so
+// the baseline store keys line up with the workload the correlator
+// will later resolve on the rule-match path.
+//
+// Network events use the singular `network.dst_ip` field that
+// `extractOutboundUniqueDstIPs` (baseline/metrics.go:69) looks for.
+// Posture identity is set so `extractOutboundUniqueDstIPs` does not
+// blank out on the package-level k8s.* path and so the package keys
+// resolve cleanly via `resolveWorkloadKey`.
+func publishSyntheticEvidencePackages(t *testing.T, nc *nats.Conn, podName string) {
+	t.Helper()
+	now := time.Now().UTC()
+	posture := map[string]any{
+		"identity": map[string]any{
+			"namespace":  "tenant-acme",
+			"owner_kind": "Deployment",
+			"owner_name": "web",
+			"pod_name":   podName,
+		},
+	}
+	identity := map[string]any{
+		"namespace":  "tenant-acme",
+		"owner_kind": "Deployment",
+		"owner_name": "web",
+		"pod_name":   podName,
+	}
+	makePkg := func(id string, distinctIPs int) []byte {
+		events := make([]map[string]any, 0, distinctIPs)
+		for j := 0; j < distinctIPs; j++ {
+			raw := map[string]any{
+				"network.dst_ip": fmt.Sprintf("10.0.0.%d", j+1),
+			}
+			rawJSON, _ := json.Marshal(raw)
+			events = append(events, map[string]any{
+				"id":        fmt.Sprintf("%s-ev-%d", id, j),
+				"timestamp": now.Format(time.RFC3339Nano),
+				"source":    "network",
+				"category":  "flow",
+				"raw":       json.RawMessage(rawJSON),
+				"pod": map[string]any{
+					"name":      podName,
+					"namespace": "tenant-acme",
+				},
+			})
+		}
+		pkg := map[string]any{
+			"schema_version":    "1.0",
+			"package_id":        id,
+			"workload_id":       "tenant-acme/Deployment/web",
+			"workload_identity": identity,
+			"assembled_at":      now.Format(time.RFC3339Nano),
+			"window_start":      now.Add(-30 * time.Second).Format(time.RFC3339Nano),
+			"window_end":        now.Format(time.RFC3339Nano),
+			"trigger": map[string]any{
+				"type":     "multi_signal",
+				"fired_at": now.Format(time.RFC3339Nano),
+			},
+			"events":           events,
+			"workload_posture": posture,
+		}
+		b, err := json.Marshal(pkg)
+		if err != nil {
+			t.Fatalf("marshal preseed package %s: %v", id, err)
+		}
+		return b
+	}
+	// 10 priming packages: alternate distinct=1 / distinct=2 so std > 0.
+	pattern := []int{1, 2, 1, 2, 1, 2, 1, 2, 1, 2}
+	for i, distinct := range pattern {
+		payload := makePkg(fmt.Sprintf("preseed-pkg-%d", i), distinct)
+		if err := nc.Publish("olaitan.evidence.packages", payload); err != nil {
+			t.Fatalf("publish preseed package %d: %v", i, err)
+		}
+	}
+	// 1 spike package: distinct=50 lands in the >=10 sigma bucket
+	// (Story 1.18 P1 boundary).
+	spikePayload := makePkg("preseed-pkg-spike", 50)
+	if err := nc.Publish("olaitan.evidence.packages", spikePayload); err != nil {
+		t.Fatalf("publish preseed spike package: %v", err)
+	}
+}
+
+// publishCorrelatorTrigger publishes one network and one falco raw
+// event so the correlator's multi-source rising-edge fires a package
+// the rules engine matches OLT-PRIV-001 against (counter bump) and
+// the correlator's own `olaitan_correlator_evidence_packages_total`
+// counter increments. The baseline-deviation assertion is satisfied
+// by `publishSyntheticEvidencePackages` above; this function is the
+// rules-engine + correlator-counter half of AC5.
+func publishCorrelatorTrigger(t *testing.T, nc *nats.Conn, podName string) {
+	t.Helper()
+	pod := map[string]any{
+		"name":      podName,
+		"namespace": "tenant-acme",
+		"uid":       "smoke-uid-1",
+	}
+	// Network priming event: makes the correlator window go from 0 to
+	// 1 source. No rising edge yet (MultiSignalMinSources=2).
+	netRaw := map[string]any{
+		"network.dst_ip": "10.0.0.1",
+	}
+	netRawJSON, _ := json.Marshal(netRaw)
+	netEvent := map[string]any{
+		"id":        "smoke-correlator-net-1",
+		"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+		"source":    "network",
+		"category":  "flow",
+		"summary":   "Story 1.19 e2e smoke: synthetic outbound flow priming",
+		"raw":       json.RawMessage(netRawJSON),
+		"pod":       pod,
+	}
+	netPayload, _ := json.Marshal(netEvent)
+	if err := nc.Publish("olaitan.events.raw.network", netPayload); err != nil {
+		t.Fatalf("publish correlator network event: %v", err)
+	}
+	// Falco event with CAP_SYS_ADMIN: second source, rising edge fires,
+	// correlator emits an EvidencePackage onto EVIDENCE.packages; rules
+	// engine matches OLT-PRIV-001 against this event.
+	falcoRaw := map[string]any{
+		"process.exe":           "/host/bin/sh",
+		"process.cap_effective": "CAP_NET_BIND_SERVICE CAP_SYS_ADMIN CAP_SETUID",
+	}
+	falcoRawJSON, _ := json.Marshal(falcoRaw)
+	falcoEvent := map[string]any{
 		"id":        "smoke-rule-match-1",
 		"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
 		"source":    "falco",
 		"category":  "syscall",
 		"severity":  "CRITICAL",
 		"summary":   "Story 1.19 e2e smoke: synthetic CAP_SYS_ADMIN acquisition",
-		"raw":       json.RawMessage(rawJSON),
-		"pod": map[string]any{
-			"name":      "web-7f9b8c4d5-smoke",
-			"namespace": "tenant-acme",
-			"uid":       "smoke-uid-1",
-		},
+		"raw":       json.RawMessage(falcoRawJSON),
+		"pod":       pod,
 	}
-	payload, err := json.Marshal(event)
-	if err != nil {
-		t.Fatalf("marshal event: %v", err)
+	falcoPayload, _ := json.Marshal(falcoEvent)
+	if err := nc.Publish("olaitan.events.raw.falco", falcoPayload); err != nil {
+		t.Fatalf("publish correlator falco event: %v", err)
 	}
-	if err := nc.Publish("olaitan.events.raw.falco", payload); err != nil {
-		t.Fatalf("publish rule-match event: %v", err)
-	}
-}
-
-// publishSyntheticBaselineSpike injects 100 priming events to clear
-// the warm-up window, then a single spike event that the baseline
-// engine should classify as a deviation. The chart install uses
-// `--set baselines.warmupDuration=5s` so the warm-up timer expires
-// well before the test's assertion deadline.
-func publishSyntheticBaselineSpike(t *testing.T, nc *nats.Conn) {
-	t.Helper()
-	pod := map[string]any{
-		"name":      "web-7f9b8c4d5-baseline",
-		"namespace": "tenant-acme",
-		"uid":       "smoke-uid-2",
-	}
-	publish := func(id string, dstIPs []string) {
-		raw := map[string]any{
-			"event.category":          "flow",
-			"network.dst_ips":         dstIPs,
-			"k8s.pod.namespace":       "tenant-acme",
-			"k8s.workload.owner_kind": "Deployment",
-		}
-		rawJSON, _ := json.Marshal(raw)
-		ev := map[string]any{
-			"id":        id,
-			"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
-			"source":    "network",
-			"category":  "flow",
-			"summary":   "Story 1.19 e2e smoke: synthetic outbound flow",
-			"raw":       json.RawMessage(rawJSON),
-			"pod":       pod,
-		}
-		b, _ := json.Marshal(ev)
-		if err := nc.Publish("olaitan.events.raw.network", b); err != nil {
-			t.Fatalf("publish baseline-priming event %s: %v", id, err)
-		}
-	}
-	// 100 priming events with a low, stable distinct-IP count.
-	for i := 0; i < 100; i++ {
-		publish(fmt.Sprintf("smoke-baseline-prime-%d", i), []string{"10.0.0.1"})
-	}
-	// One spike event with a very high distinct-IP count to land in
-	// the >=10 sigma bucket (Story 1.18 P1 boundary).
-	spike := make([]string, 50)
-	for i := range spike {
-		spike[i] = fmt.Sprintf("10.0.0.%d", i+10)
-	}
-	publish("smoke-baseline-spike", spike)
 }
 
 // scrapeMetrics fetches the aggregator's Prometheus surface and
@@ -332,6 +466,12 @@ sample:
 func TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation(t *testing.T) {
 	requireKindCluster(t)
 	waitForPodsReady(t)
+	// Create a real Deployment-owned pod so the aggregator's
+	// correlator/posture resolver returns OwnerKind=Deployment. Without
+	// a real pod the resolver falls back to a pod-name identity with
+	// OwnerKind=Pod, OLT-PRIV-001's owner_kind in [Deployment,
+	// StatefulSet] filter rejects the package, and AC5 fails.
+	podName := applySyntheticWorkload(t)
 	portForward(t, "svc/"+defaultReleaseName+"-nats", natsLocalPort, "4222")
 	// The aggregator Deployment exposes containerPort 9090 but the
 	// chart does not render a Service for the aggregator (Story 1.18
@@ -345,10 +485,30 @@ func TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation(t *testing.T) {
 		t.Fatalf("NATS connect: %v", err)
 	}
 	t.Cleanup(nc.Close)
-	publishSyntheticRuleEvent(t, nc)
-	publishSyntheticBaselineSpike(t, nc)
+	// Pre-seed the per-workload baseline by publishing 11 synthetic
+	// EvidencePackages directly onto EVIDENCE.packages. The correlator
+	// only emits one package per rising-edge transition per workload
+	// in the 60s window, which is insufficient observation history
+	// for the baseline engine (preCount<2, preStd=0) to ever fire a
+	// deviation in the 30s assertion budget. See the docstring on
+	// publishSyntheticEvidencePackages for the design rationale.
+	publishSyntheticEvidencePackages(t, nc, podName)
 	if err := nc.Flush(); err != nil {
-		t.Fatalf("NATS flush: %v", err)
+		t.Fatalf("NATS flush after pre-seed: %v", err)
+	}
+	// Give the baseline-engine durable consumer time to drain the 11
+	// pre-seed packages before the correlator-emitted Package_A
+	// lands behind them on the EVIDENCE stream. The default
+	// FetchMaxWait is 250ms and the engine is single-threaded
+	// (MaxAckPending=1), so 3s comfortably accommodates 11 messages
+	// plus a fetch-loop turnaround. JetStream stream-order guarantees
+	// the pre-seed messages land in the stream before Package_A
+	// regardless, but this sleep keeps the diagnosis loud if the
+	// consumer is wedged.
+	time.Sleep(3 * time.Second)
+	publishCorrelatorTrigger(t, nc, podName)
+	if err := nc.Flush(); err != nil {
+		t.Fatalf("NATS flush after correlator trigger: %v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), assertionTimeout)
 	defer cancel()
