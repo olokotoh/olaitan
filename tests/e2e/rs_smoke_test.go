@@ -442,6 +442,100 @@ type metricSample struct {
 	value  float64
 }
 
+// dumpEvidenceStream reads up to N messages off the EVIDENCE stream
+// via a one-shot ephemeral consumer so we can inspect what the
+// correlator actually emitted. Decodes each payload as a partial
+// EvidencePackage and surfaces the WorkloadIdentity + WorkloadPosture
+// shape that fed the rules-engine resolver.
+func dumpEvidenceStream(t *testing.T, js jetstream.JetStream) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := js.Stream(ctx, "EVIDENCE")
+	if err != nil {
+		t.Logf("dumpEvidenceStream: open EVIDENCE: %v", err)
+		return
+	}
+	cons, err := stream.OrderedConsumer(ctx, jetstream.OrderedConsumerConfig{
+		FilterSubjects: []string{"olaitan.evidence.packages"},
+	})
+	if err != nil {
+		t.Logf("dumpEvidenceStream: create ordered consumer: %v", err)
+		return
+	}
+	batch, err := cons.Fetch(20, jetstream.FetchMaxWait(2*time.Second))
+	if err != nil {
+		t.Logf("dumpEvidenceStream: fetch: %v", err)
+		return
+	}
+	i := 0
+	for msg := range batch.Messages() {
+		i++
+		var pkg struct {
+			PackageID        string `json:"package_id"`
+			WorkloadID       string `json:"workload_id"`
+			WorkloadIdentity struct {
+				Namespace string `json:"namespace"`
+				OwnerKind string `json:"owner_kind"`
+				OwnerName string `json:"owner_name"`
+				PodName   string `json:"pod_name"`
+			} `json:"workload_identity"`
+			WorkloadPosture *struct {
+				Identity struct {
+					Namespace string `json:"namespace"`
+					OwnerKind string `json:"owner_kind"`
+					OwnerName string `json:"owner_name"`
+					PodName   string `json:"pod_name"`
+				} `json:"identity"`
+				Unavailable       bool   `json:"unavailable"`
+				UnavailableReason string `json:"unavailable_reason,omitempty"`
+				OrphanPod         bool   `json:"orphan_pod,omitempty"`
+			} `json:"workload_posture,omitempty"`
+			Trigger struct {
+				Type string `json:"type"`
+			} `json:"trigger"`
+			Events []struct {
+				Source   string `json:"source"`
+				Category string `json:"category"`
+			} `json:"events"`
+		}
+		if err := json.Unmarshal(msg.Data(), &pkg); err != nil {
+			t.Logf("dumpEvidenceStream[%d]: unmarshal: %v", i, err)
+			continue
+		}
+		postureSummary := "<nil>"
+		if pkg.WorkloadPosture != nil {
+			postureSummary = fmt.Sprintf("Identity{ns=%s owner=%s/%s pod=%s} unavailable=%v reason=%q orphan=%v",
+				pkg.WorkloadPosture.Identity.Namespace,
+				pkg.WorkloadPosture.Identity.OwnerKind,
+				pkg.WorkloadPosture.Identity.OwnerName,
+				pkg.WorkloadPosture.Identity.PodName,
+				pkg.WorkloadPosture.Unavailable,
+				pkg.WorkloadPosture.UnavailableReason,
+				pkg.WorkloadPosture.OrphanPod,
+			)
+		}
+		t.Logf("EVIDENCE[%d]: pkg=%s wid=%s trigger=%s identity=%s/%s/%s/%s posture=%s events=%d",
+			i, pkg.PackageID, pkg.WorkloadID, pkg.Trigger.Type,
+			pkg.WorkloadIdentity.Namespace, pkg.WorkloadIdentity.OwnerKind,
+			pkg.WorkloadIdentity.OwnerName, pkg.WorkloadIdentity.PodName,
+			postureSummary, len(pkg.Events))
+	}
+}
+
+func dumpRuleMatchSamples(t *testing.T) {
+	t.Helper()
+	metrics := scrapeMetrics(t)
+	mf := metrics["olaitan_decision_rules_matches_by_attribute_total"]
+	if mf == nil {
+		t.Logf("dumpRuleMatchSamples: family not present")
+		return
+	}
+	for i, s := range mf.samples {
+		t.Logf("rule_matches[%d]: value=%v labels=%v", i, s.value, s.labels)
+	}
+}
+
 // sumWhere returns the sum of sample values whose labels match every
 // (key, value) pair in `match`. Returns 0 when the family is missing
 // or no sample matches.
@@ -518,6 +612,15 @@ func TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), assertionTimeout)
 	defer cancel()
 	var lastErr error
+	// Dump the actual EvidencePackages the correlator emitted so we can
+	// see the WorkloadIdentity / WorkloadPosture that drove rule
+	// resolution. If OwnerKind != Deployment, posture-only k8s.* fields
+	// won't satisfy OLT-PRIV-001's workload_kind clause and the rule
+	// silently misses.
+	dumpEvidenceStream(t, js)
+	// Also print which rules matched (with labels) so we can see *which*
+	// rule fired when matches_total=1 but matches[OLT-PRIV-001]=0.
+	dumpRuleMatchSamples(t)
 	tick := 0
 	for {
 		select {
