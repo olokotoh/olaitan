@@ -3,6 +3,8 @@ package nats
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
@@ -78,16 +80,42 @@ var streamConfigs = []jetstream.StreamConfig{
 // Placement, Republish, etc.) are not currently populated by this package
 // and are therefore not deep-copied; if future configurations set them,
 // extend the copy to cover those fields.
+//
+// When the OLT_NATS_STREAM_MAXBYTES_OVERRIDE env var is set to a
+// positive int64, every stream's MaxBytes is capped at that value.
+// This is the CI/kind escape hatch for Story 1.19 D6: production sums
+// to 160 GiB across streams (10 + 50 + 100), which exceeds the kind
+// node's 10Gi PVC backing and causes JetStream err 10047 on
+// CreateOrUpdateStream. The honest fix is to scale MaxBytes down for
+// constrained environments rather than lie to JetStream about
+// fileStore.maxSize. Production deployments leave the env var unset
+// and size the NATS PVC to accommodate the configured sum.
 func StreamConfigs() []jetstream.StreamConfig {
+	override := streamMaxBytesOverride()
 	out := make([]jetstream.StreamConfig, len(streamConfigs))
 	for i, cfg := range streamConfigs {
 		c := cfg
 		if len(cfg.Subjects) > 0 {
 			c.Subjects = append([]string(nil), cfg.Subjects...)
 		}
+		if override > 0 && (c.MaxBytes == 0 || c.MaxBytes > override) {
+			c.MaxBytes = override
+		}
 		out[i] = c
 	}
 	return out
+}
+
+func streamMaxBytesOverride() int64 {
+	v := os.Getenv("OLT_NATS_STREAM_MAXBYTES_OVERRIDE")
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 // EnsureStreams creates or updates the provided JetStream streams.

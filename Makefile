@@ -141,13 +141,17 @@ helm-template: helm-prepare
 KIND_CLUSTER_NAME ?= olaitan-e2e
 
 e2e-local: helm-prepare helm-deps docker-build
-	kind create cluster --name $(KIND_CLUSTER_NAME) --config hack/kind-config.yaml
+	# Skip cluster create when one with this name already exists so a
+	# repeated `make e2e-local` reuses the previous cluster instead of
+	# erroring on "node(s) already exist for a cluster with the name".
+	kind get clusters | grep -q '^$(KIND_CLUSTER_NAME)$$' || \
+		kind create cluster --name $(KIND_CLUSTER_NAME) --config hack/kind-config.yaml
 	kind load docker-image $(IMAGE):$(TAG) --name $(KIND_CLUSTER_NAME)
-	# fileStore.maxSize override mirrors ci.yml: internal/nats/streams.go
-	# requests 160 GiB across streams; default jetstream max_file_store
-	# is the PVC size (10 GiB), causing JetStream err 10047 on stream
-	# creation. 200GB headroom unblocks CreateOrUpdateStream without
-	# changing the PVC backing.
+	# Story 1.19 D6: instead of lying to JetStream about disk capacity
+	# via fileStore.maxSize=200GB, cap each stream's MaxBytes at 1 GiB
+	# via the OLT_NATS_STREAM_MAXBYTES_OVERRIDE env var (wired through
+	# nats.streamMaxBytesOverride). Sum of caps (3 streams) is 3 GiB,
+	# well under the kind node's PVC backing.
 	helm install olaitan $(CHART_DIR) \
 		--set image.repository=$(IMAGE) \
 		--set image.tag=$(TAG) \
@@ -157,7 +161,7 @@ e2e-local: helm-prepare helm-deps docker-build
 		--set secrets.redisPassword=ci-test \
 		--set falco.enabled=false \
 		--set endpoints.falco=tcp://127.0.0.1:0 \
-		--set nats.config.jetstream.fileStore.maxSize=200GB \
+		--set nats.streamMaxBytesOverride=1073741824 \
 		--wait --timeout 5m
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) go test -tags=e2e -v -count=1 ./tests/e2e/...
 

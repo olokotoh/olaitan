@@ -417,15 +417,50 @@ data:
     {{- $rulesEnabled := include "olaitan.evaluation.effectiveRulesEnabled" . -}}
     {{- $baselinesEnabled := include "olaitan.evaluation.effectiveBaselinesEnabled" . -}}
     {{- $analystProvider := include "olaitan.evaluation.effectiveAnalystProvider" . -}}
+    {{- /* The bridge regexes assume `rules:` and `baselines:` are the
+           only top-level 2-space-indented blocks of those names in
+           config/olaitan.yaml (they currently live exclusively under
+           detection:). `analyst:` is the only top-level block at
+           column 0. If a future config introduces an RBAC-style
+           `rules:` block elsewhere, switch to a parent-anchored
+           pattern. Provider char class widened to `[a-z0-9_-]+` so
+           future names like `api-v2` do not silently break the
+           anchor. */ -}}
     {{- $pEvRules := "(\\n  rules:[[:space:]]*\\n    )enabled:[[:space:]]+(?:true|false)" -}}
     {{- if not (mustRegexFind $pEvRules $cfg) }}{{- fail (printf "helm bridge: evaluation overlay anchor for detection.rules.enabled not found (pattern %q)" $pEvRules) }}{{- end }}
     {{- $cfg = regexReplaceAll $pEvRules $cfg (printf "${1}enabled: %s" $rulesEnabled) }}
     {{- $pEvBaselines := "(\\n  baselines:[[:space:]]*\\n    )enabled:[[:space:]]+(?:true|false)" -}}
     {{- if not (mustRegexFind $pEvBaselines $cfg) }}{{- fail (printf "helm bridge: evaluation overlay anchor for detection.baselines.enabled not found (pattern %q)" $pEvBaselines) }}{{- end }}
     {{- $cfg = regexReplaceAll $pEvBaselines $cfg (printf "${1}enabled: %s" $baselinesEnabled) }}
-    {{- $pEvAnalyst := "(\\nanalyst:[[:space:]]*\\n  )provider:[[:space:]]+[a-z]+" -}}
+    {{- $pEvAnalyst := "(\\nanalyst:[[:space:]]*\\n  )provider:[[:space:]]+[a-z0-9_-]+" -}}
     {{- if not (mustRegexFind $pEvAnalyst $cfg) }}{{- fail (printf "helm bridge: evaluation overlay anchor for analyst.provider not found (pattern %q)" $pEvAnalyst) }}{{- end }}
     {{- $cfg = regexReplaceAll $pEvAnalyst $cfg (printf "${1}provider: %s" $analystProvider) }}
+    {{- /* AC2: under evaluation.config=F the rendered config must keep
+           only the Falco sensor adapter active. Disable audit /
+           containerd / calico source adapters and the posture
+           on-demand sensor so the Epic 5 F-vs-Olaitan comparison
+           measures Falco alone and not Falco + Olaitan-sensors-
+           without-detection. The non-falco enables are best-effort
+           rewrites: a future config that does not declare one of
+           these sources is silently skipped (mustRegexFind would
+           false-on-absent; we use regexReplaceAll here which is a
+           no-op when the pattern does not match). */ -}}
+    {{- if eq (include "olaitan.evaluation.isFArm" .) "true" }}
+    {{- /* Source adapter blocks are 4-space indented children of
+           detection.sources (which is at 2-space). Posture is a
+           2-space child of detection. All four lines are unique in
+           config/olaitan.yaml so the bare-anchor pattern is safe.
+           mustRegexFind guards each so a future rename surfaces
+           loudly rather than silently leaving the source on. */ -}}
+    {{- $pFAudit := "(\\n    audit:[[:space:]]*\\n      )enabled:[[:space:]]+(?:true|false)" -}}
+    {{- if mustRegexFind $pFAudit $cfg }}{{- $cfg = regexReplaceAll $pFAudit $cfg "${1}enabled: false" }}{{- end }}
+    {{- $pFContainerd := "(\\n    containerd:[[:space:]]*\\n      )enabled:[[:space:]]+(?:true|false)" -}}
+    {{- if mustRegexFind $pFContainerd $cfg }}{{- $cfg = regexReplaceAll $pFContainerd $cfg "${1}enabled: false" }}{{- end }}
+    {{- $pFCalico := "(\\n    calico:[[:space:]]*\\n      )enabled:[[:space:]]+(?:true|false)" -}}
+    {{- if mustRegexFind $pFCalico $cfg }}{{- $cfg = regexReplaceAll $pFCalico $cfg "${1}enabled: false" }}{{- end }}
+    {{- $pFPosture := "(\\n  posture:[[:space:]]*\\n    )enabled:[[:space:]]+(?:true|false)" -}}
+    {{- if mustRegexFind $pFPosture $cfg }}{{- $cfg = regexReplaceAll $pFPosture $cfg "${1}enabled: false" }}{{- end }}
+    {{- end }}
     {{- $cfg | nindent 4 }}
 ---
 apiVersion: v1

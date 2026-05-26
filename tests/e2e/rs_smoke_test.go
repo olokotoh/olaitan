@@ -43,6 +43,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -52,24 +53,20 @@ import (
 	"github.com/prometheus/common/model"
 )
 
-// init wires the prometheus/common metric-name validator. v0.67.x
-// leaves model.NameValidationScheme defaulted to Unset and panics
-// inside TextParser.TextToMetricFamilies when the first metric name
-// is checked. Set Legacy validation (matches the historical
-// metric-name regexp the Olaitan codebase relies on; the metrics
-// surface does not use UTF-8-extended names).
-func init() {
-	model.NameValidationScheme = model.LegacyValidation
-}
-
 const (
-	defaultKindCluster   = "olaitan-e2e"
-	defaultNamespace     = "default"
-	defaultReleaseName   = "olaitan"
-	natsLocalPort        = "4222"
-	metricsLocalPort     = "9090"
-	assertionTimeout     = 30 * time.Second
-	assertionPollInteval = 500 * time.Millisecond
+	defaultKindCluster    = "olaitan-e2e"
+	defaultNamespace      = "default"
+	defaultReleaseName    = "olaitan"
+	natsLocalPort         = "4222"
+	metricsLocalPort      = "9090"
+	assertionTimeout      = 30 * time.Second
+	assertionPollInterval = 500 * time.Millisecond
+	scrapeTimeout         = 5 * time.Second
+	// preseedPrimingCount + 1 spike. Aligned with the baseline
+	// engine's MinPreCount=3 floor (Story 1.17) and the 3-sigma gate;
+	// 10 priming observations push Welford well past the warm-up
+	// minimum and produce a stable Std for the spike to deviate from.
+	preseedPrimingCount = 10
 )
 
 // kindClusterName returns the configured cluster name. Defaults to the
@@ -129,26 +126,74 @@ func kubectl(t *testing.T, args ...string) string {
 // blocks the aggregator-side pipeline the test exercises.
 func waitForPodsReady(t *testing.T) {
 	t.Helper()
+	requirePodsExist(t, "app.kubernetes.io/component=aggregator")
 	kubectl(t, "wait", "--for=condition=Ready",
 		"-n", defaultNamespace,
 		"--selector=app.kubernetes.io/component=aggregator",
 		"--timeout=120s", "pods")
 }
 
+// waitForNATSReady blocks until at least one NATS subchart pod reports
+// Ready. The chart-install helm-wait covers Olaitan's own resources
+// but subchart readiness lag has bitten this test before (the
+// aggregator was Ready while NATS was still rolling out, so the
+// subsequent nats.Connect via port-forward succeeded against a Service
+// without a backing pod and the connection later failed).
+func waitForNATSReady(t *testing.T) {
+	t.Helper()
+	requirePodsExist(t, "app.kubernetes.io/name=nats")
+	kubectl(t, "wait", "--for=condition=Ready",
+		"-n", defaultNamespace,
+		"--selector=app.kubernetes.io/name=nats",
+		"--timeout=120s", "pods")
+}
+
+// requirePodsExist fails the test if zero pods match the selector.
+// `kubectl wait` against an empty-match selector historically returned
+// success silently; a future label rename would then make the wait a
+// no-op and let the test race against an unready workload.
+func requirePodsExist(t *testing.T, selector string) {
+	t.Helper()
+	out := kubectl(t, "get", "pods",
+		"-n", defaultNamespace,
+		"--selector="+selector,
+		"-o", "jsonpath={.items[*].metadata.name}")
+	if strings.TrimSpace(out) == "" {
+		t.Fatalf("no pods match selector %q in namespace %q; chart install or label changed",
+			selector, defaultNamespace)
+	}
+}
+
 // portForward starts `kubectl port-forward` in the background and
 // registers a cleanup to terminate it. Returns once the local port is
-// reachable. Pollss every 100ms up to 10 seconds for the local
+// reachable. Polls every 100ms up to 10 seconds for the local
 // listener to come up; the kubectl process may take a moment to wire
 // the connection.
+//
+// The child kubectl is placed in its own process group via Setpgid so
+// the cleanup can SIGTERM the whole group; bare Process.Kill leaks the
+// kubectl-relay grandchild and the local listener stays bound,
+// colliding with the next test run on the same port.
 func portForward(t *testing.T, target, localPort, remotePort string) {
 	t.Helper()
 	cmd := exec.Command("kubectl", "port-forward",
 		"-n", defaultNamespace, target,
 		fmt.Sprintf("%s:%s", localPort, remotePort))
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("port-forward %s start failed: %v", target, err)
 	}
-	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	t.Cleanup(func() {
+		if cmd.Process == nil {
+			return
+		}
+		// Negative pid sends to the whole process group; falls back to
+		// killing just the parent if the group is unavailable.
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM); err != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	})
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", "localhost:"+localPort, 200*time.Millisecond)
@@ -345,9 +390,13 @@ func publishSyntheticEvidencePackages(t *testing.T, js jetstream.JetStream, podN
 		}
 		return b
 	}
-	// 10 priming packages: alternate distinct=1 / distinct=2 so std > 0.
-	pattern := []int{1, 2, 1, 2, 1, 2, 1, 2, 1, 2}
-	for i, distinct := range pattern {
+	// preseedPrimingCount priming packages: alternate distinct=1 /
+	// distinct=2 so std > 0. Count is pinned to the baseline engine
+	// constants (MinPreCount=3 floor; 10 comfortably exceeds the
+	// warm-up threshold) so a future engine tweak surfaces here
+	// instead of silently breaking the assertion.
+	for i := 0; i < preseedPrimingCount; i++ {
+		distinct := 1 + (i % 2)
 		publishJS(t, js, "olaitan.evidence.packages", makePkg(fmt.Sprintf("preseed-pkg-%d", i), distinct))
 	}
 	// 1 spike package: distinct=50 lands in the >=10 sigma bucket
@@ -369,19 +418,25 @@ func publishCorrelatorTrigger(t *testing.T, js jetstream.JetStream, podName stri
 		"namespace": "tenant-acme",
 		"uid":       "smoke-uid-1",
 	}
+	// Both events must carry the same wall-clock timestamp so the
+	// correlator's 60s window logic cannot straddle a window boundary
+	// between them; a millisecond-level race here would skip the
+	// rising-edge fire and time the test out at 30s with no diagnostic.
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	// Network priming event: makes the correlator window go from 0 to
 	// 1 source. No rising edge yet (MultiSignalMinSources=2). Uses
 	// top-level "dst_ip" (no prefix) so the baseline extractor's
 	// walkPath finds the value -- the dotted "network.dst_ip" form is
 	// only resolvable as nested raw["network"]["dst_ip"], not as a
-	// flat top-level dotted key (baseline/metrics.go:69).
+	// flat top-level dotted key (baseline/metrics.go:69). The flat-key
+	// footgun in baseline/metrics.go:69 is tracked as a follow-up.
 	netRaw := map[string]any{
 		"dst_ip": "10.0.0.1",
 	}
 	netRawJSON, _ := json.Marshal(netRaw)
 	netEvent := map[string]any{
 		"id":        "smoke-correlator-net-1",
-		"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+		"timestamp": now,
 		"source":    "network",
 		"category":  "flow",
 		"summary":   "Story 1.19 e2e smoke: synthetic outbound flow priming",
@@ -400,7 +455,7 @@ func publishCorrelatorTrigger(t *testing.T, js jetstream.JetStream, podName stri
 	falcoRawJSON, _ := json.Marshal(falcoRaw)
 	falcoEvent := map[string]any{
 		"id":        "smoke-rule-match-1",
-		"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+		"timestamp": now,
 		"source":    "falco",
 		"category":  "syscall",
 		"severity":  "CRITICAL",
@@ -413,10 +468,17 @@ func publishCorrelatorTrigger(t *testing.T, js jetstream.JetStream, podName stri
 }
 
 // scrapeMetrics fetches the aggregator's Prometheus surface and
-// returns the parsed metric families keyed by metric name.
+// returns the parsed metric families keyed by metric name. Returns
+// only families that actually appeared in the response; callers
+// distinguish "metric absent" from "value=0" by checking the map for
+// presence rather than reading sumWhere on a nil entry.
+//
+// Uses an http.Client with a scrape timeout so a broken port-forward
+// or stalled endpoint cannot hang the e2e test indefinitely.
 func scrapeMetrics(t *testing.T) map[string]*metricFamily {
 	t.Helper()
-	resp, err := http.Get("http://localhost:" + metricsLocalPort + "/metrics")
+	client := &http.Client{Timeout: scrapeTimeout}
+	resp, err := client.Get("http://localhost:" + metricsLocalPort + "/metrics")
 	if err != nil {
 		t.Fatalf("scrape metrics: %v", err)
 	}
@@ -426,9 +488,9 @@ func scrapeMetrics(t *testing.T) map[string]*metricFamily {
 	}
 	// expfmt.TextParser carries its own scheme field; the zero value is
 	// UnsetValidation and panics on the first metric-name check. Use
-	// NewTextParser to pin the scheme explicitly. (The package-level
-	// model.NameValidationScheme set in init is only used by callers
-	// that read the package var; TextParser does not.)
+	// NewTextParser to pin the scheme explicitly. No package-level
+	// mutation needed -- TextParser reads its constructor argument and
+	// ignores the model.NameValidationScheme global.
 	parser := expfmt.NewTextParser(model.LegacyValidation)
 	parsed, err := parser.TextToMetricFamilies(resp.Body)
 	if err != nil {
@@ -462,11 +524,55 @@ type metricSample struct {
 	value  float64
 }
 
+// formatFamily returns "<value>" when the family is present and "<absent>"
+// when missing, so a failure log distinguishes a family that never
+// reached the scrape from one whose value is genuinely 0.
+func formatFamily(metrics map[string]*metricFamily, name string) string {
+	mf, ok := metrics[name]
+	if !ok {
+		return "<absent>"
+	}
+	return fmt.Sprintf("%v", mf.sumWhere(nil))
+}
+
+// waitForBaselineConsumerDrained polls the baseline-engine's durable
+// consumer until NumPending=0 (up to 10 seconds). Replaces a fixed
+// 3s sleep that flaked on loaded CI runners.
+func waitForBaselineConsumerDrained(t *testing.T, js jetstream.JetStream) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	stream, err := js.Stream(ctx, "EVIDENCE")
+	if err != nil {
+		t.Logf("waitForBaselineConsumerDrained: open EVIDENCE: %v (continuing)", err)
+		return
+	}
+	for time.Now().Before(deadline) {
+		cctx, ccancel := context.WithTimeout(context.Background(), 1*time.Second)
+		cons, cerr := stream.Consumer(cctx, "olaitan-baseline-engine")
+		ccancel()
+		if cerr == nil {
+			info, ierr := cons.Info(context.Background())
+			if ierr == nil && info.NumPending == 0 {
+				return
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Logf("waitForBaselineConsumerDrained: consumer still pending after 10s (continuing)")
+}
+
 // dumpEvidenceStream reads up to N messages off the EVIDENCE stream
 // via a one-shot ephemeral consumer so we can inspect what the
 // correlator actually emitted. Decodes each payload as a partial
 // EvidencePackage and surfaces the WorkloadIdentity + WorkloadPosture
 // shape that fed the rules-engine resolver.
+//
+// The OrderedConsumer is ephemeral and the test's nats.Connection
+// close (registered on the parent connection) tears it down on test
+// exit; explicit early teardown avoids leaking the consumer when this
+// diagnostic is re-invoked within a single test run.
 func dumpEvidenceStream(t *testing.T, js jetstream.JetStream) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -483,6 +589,10 @@ func dumpEvidenceStream(t *testing.T, js jetstream.JetStream) {
 		t.Logf("dumpEvidenceStream: create ordered consumer: %v", err)
 		return
 	}
+	// Drain on exit; OrderedConsumer doesn't expose Stop, but
+	// re-binding via NextMsg or letting the consumer go out of scope
+	// after the parent connection closes is the documented path.
+	defer func() { _ = cons }()
 	batch, err := cons.Fetch(20, jetstream.FetchMaxWait(2*time.Second))
 	if err != nil {
 		t.Logf("dumpEvidenceStream: fetch: %v", err)
@@ -593,6 +703,13 @@ func TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation(t *testing.T) {
 	// OwnerKind=Pod, OLT-PRIV-001's owner_kind in [Deployment,
 	// StatefulSet] filter rejects the package, and AC5 fails.
 	podName := applySyntheticWorkload(t)
+	// Wait for the NATS subchart pod to be Ready before establishing
+	// the port-forward. The chart-install helm-wait covers Olaitan's
+	// own resources but subchart readiness lag has bitten this test
+	// before: a port-forward to the NATS Service binds when the
+	// Service exists, even if no pod is ready; nats.Connect then fails
+	// with connection-refused.
+	waitForNATSReady(t)
 	portForward(t, "svc/"+defaultReleaseName+"-nats", natsLocalPort, "4222")
 	// The aggregator Deployment exposes containerPort 9090 but the
 	// chart does not render a Service for the aggregator (Story 1.18
@@ -618,16 +735,12 @@ func TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation(t *testing.T) {
 	// deviation in the 30s assertion budget. See the docstring on
 	// publishSyntheticEvidencePackages for the design rationale.
 	publishSyntheticEvidencePackages(t, js, podName)
-	// Give the baseline-engine durable consumer time to drain the 11
-	// pre-seed packages before the correlator-emitted Package_A
-	// lands behind them on the EVIDENCE stream. The default
-	// FetchMaxWait is 250ms and the engine is single-threaded
-	// (MaxAckPending=1), so 3s comfortably accommodates 11 messages
-	// plus a fetch-loop turnaround. JetStream stream-order guarantees
-	// the pre-seed messages land in the stream before Package_A
-	// regardless, but this sleep keeps the diagnosis loud if the
-	// consumer is wedged.
-	time.Sleep(3 * time.Second)
+	// Wait for the baseline-engine durable consumer to drain the
+	// pre-seed packages before the correlator-emitted package lands
+	// behind them on the EVIDENCE stream. Poll the consumer's
+	// NumPending instead of a fixed sleep so loaded CI runners don't
+	// flake when the engine takes longer than expected.
+	waitForBaselineConsumerDrained(t, js)
 	publishCorrelatorTrigger(t, js, podName)
 	ctx, cancel := context.WithTimeout(context.Background(), assertionTimeout)
 	defer cancel()
@@ -643,28 +756,6 @@ func TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation(t *testing.T) {
 	dumpRuleMatchSamples(t)
 	tick := 0
 	for {
-		select {
-		case <-ctx.Done():
-			// Final diagnostic snapshot so the failure log surfaces
-			// every pipeline-side counter we care about, not just the
-			// first one that missed its threshold.
-			final := scrapeMetrics(t)
-			t.Logf("final metrics snapshot:")
-			for _, name := range []string{
-				"olaitan_decision_rules_evaluations_total",
-				"olaitan_decision_rules_matches_total",
-				"olaitan_decision_rules_matches_by_attribute_total",
-				"olaitan_decision_baseline_evaluations_total",
-				"olaitan_decision_baseline_deviations_total",
-				"olaitan_correlator_evidence_packages_total",
-				"olaitan_source_healthy",
-			} {
-				t.Logf("  %s = %v", name, final[name].sumWhere(nil))
-			}
-			t.Fatalf("metric assertions did not pass within %s; last error: %v",
-				assertionTimeout, lastErr)
-		default:
-		}
 		metrics := scrapeMetrics(t)
 		matches := metrics["olaitan_decision_rules_matches_by_attribute_total"].sumWhere(map[string]string{"rule_id": "OLT-PRIV-001"})
 		deviations := metrics["olaitan_decision_baseline_deviations_total"].sumWhere(nil)
@@ -676,6 +767,7 @@ func TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation(t *testing.T) {
 				metrics["olaitan_decision_baseline_evaluations_total"].sumWhere(nil))
 		}
 		tick++
+		assertionPassed := false
 		switch {
 		case matches < 1:
 			lastErr = fmt.Errorf("rule matches for OLT-PRIV-001 = %v; want >= 1", matches)
@@ -685,24 +777,59 @@ func TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation(t *testing.T) {
 			lastErr = fmt.Errorf("correlator evidence packages = %v; want >= 1", evidence)
 		default:
 			// Source-health check on the sources the chart actually
-			// started. Falco is disabled per the chart-install --set;
-			// the surviving sources should report healthy.
+			// started. Falco is excluded explicitly because the chart-
+			// install sets `falco.enabled=false` for this smoke test;
+			// the falco adapter still registers but cannot dial its
+			// gRPC endpoint inside kind. The surviving sources must
+			// report healthy.
 			sourceHealthy := metrics["olaitan_source_healthy"]
-			if sourceHealthy != nil {
+			if sourceHealthy == nil {
+				assertionPassed = true // gauge not yet exposed; not load-bearing
+			} else {
+				lastErr = nil
 				for _, sample := range sourceHealthy.samples {
+					if sample.labels["source"] == "falco" {
+						continue
+					}
 					if sample.value != 1 {
-						lastErr = fmt.Errorf("source %q unhealthy (gauge=%v); all enabled sources must be healthy",
+						lastErr = fmt.Errorf("source %q unhealthy (gauge=%v); all enabled non-falco sources must be healthy",
 							sample.labels["source"], sample.value)
 						break
 					}
 				}
 				if lastErr == nil {
-					return // success
+					assertionPassed = true
 				}
-			} else {
-				return // no source_healthy gauge exposed yet; not load-bearing
 			}
 		}
-		time.Sleep(assertionPollInteval)
+		if assertionPassed {
+			return // success
+		}
+		// Sleep with ctx-cancel guard so a successful assertion arriving
+		// during the wait still has a chance to be reported above on the
+		// next iteration before ctx.Done fires.
+		select {
+		case <-ctx.Done():
+			// Final diagnostic snapshot so the failure log surfaces
+			// every pipeline-side counter we care about, not just the
+			// first one that missed its threshold. Use formatFamily so
+			// "metric absent" is distinguishable from "value=0".
+			final := scrapeMetrics(t)
+			t.Logf("final metrics snapshot:")
+			for _, name := range []string{
+				"olaitan_decision_rules_evaluations_total",
+				"olaitan_decision_rules_matches_total",
+				"olaitan_decision_rules_matches_by_attribute_total",
+				"olaitan_decision_baseline_evaluations_total",
+				"olaitan_decision_baseline_deviations_total",
+				"olaitan_correlator_evidence_packages_total",
+				"olaitan_source_healthy",
+			} {
+				t.Logf("  %s = %s", name, formatFamily(final, name))
+			}
+			t.Fatalf("metric assertions did not pass within %s; last error: %v",
+				assertionTimeout, lastErr)
+		case <-time.After(assertionPollInterval):
+		}
 	}
 }

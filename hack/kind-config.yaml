@@ -18,7 +18,10 @@
 # header for the synthetic-event injection rationale.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
-name: olaitan-e2e
+# Cluster name is supplied via `kind create cluster --name ...` from
+# the Makefile / helm/kind-action so KIND_CLUSTER_NAME is the single
+# source of truth; do not embed the name here or the override is
+# silently ignored.
 nodes:
   - role: control-plane
     # kubeadm config patch keeps the kubelet at a sane resource budget

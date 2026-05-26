@@ -811,6 +811,14 @@ nats:
   config:
     jetstream:
       enabled: true
+  # Story 1.19 D6 escape hatch: when the kind/CI NATS PVC backing is
+  # smaller than the production streamConfigs sum (160 GiB across
+  # EVENTS/EVENTS_RAW/EVIDENCE), set this to a per-stream byte cap
+  # (e.g. "1073741824" for 1 GiB) so JetStream CreateOrUpdateStream
+  # does not return err 10047 ("not enough storage"). Production
+  # leaves this empty and sizes nats.persistence.size to accommodate
+  # the configured sum, rather than overriding fileStore.maxSize.
+  streamMaxBytesOverride: ""
 
 # Redis -- state store (per-workload baselines, FSM state, checkpoints).
 # Standalone architecture is enough for the single-aggregator MVP;

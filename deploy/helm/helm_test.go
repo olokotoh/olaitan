@@ -18,6 +18,7 @@ package helm_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -2632,6 +2633,64 @@ func TestEvaluationConfig_F_DisablesRulesAndBaselines(t *testing.T) {
 	}
 }
 
+// TestEvaluationConfig_F_DisablesAllNonFalcoSources locks AC2's
+// full intent: "only Falco sensor adapter remains active". Story 1.19
+// D1 closure: the F arm must also disable the audit, containerd,
+// calico source adapters and the posture on-demand sensor so the
+// Epic 5 F-vs-Olaitan comparison measures Falco alone.
+func TestEvaluationConfig_F_DisablesAllNonFalcoSources(t *testing.T) {
+	rendered := helmTemplate(t, []string{"evaluation.config=F"})
+	cases := []struct {
+		parent, key, want string
+	}{
+		{"audit", "enabled", "false"},
+		{"containerd", "enabled", "false"},
+		{"calico", "enabled", "false"},
+		{"posture", "enabled", "false"},
+	}
+	for _, tc := range cases {
+		if got := findEvalLine(t, rendered, tc.parent, tc.key); got != tc.want {
+			t.Errorf("F render: %s.%s = %q, want %q", tc.parent, tc.key, got, tc.want)
+		}
+	}
+}
+
+// TestEvaluationConfig_RS_DoesNotForceNonFalcoSourcesOff confirms the
+// F-arm sources disable is gated to F only. Under RS the operator's
+// audit/containerd/calico values flow through.
+func TestEvaluationConfig_RS_DoesNotForceNonFalcoSourcesOff(t *testing.T) {
+	// Default config/olaitan.yaml has audit/containerd/calico=false,
+	// posture=true. Verify RS leaves posture at its file default.
+	rendered := helmTemplate(t, []string{"evaluation.config=RS"})
+	if got := findEvalLine(t, rendered, "posture", "enabled"); got != "true" {
+		t.Errorf("RS render: posture.enabled = %q, want true (RS must not force-disable posture; that is the F arm's job)", got)
+	}
+}
+
+// TestEvaluationConfig_FailsFast_OnCaseInsensitiveProvider locks the
+// Story 1.19 D7 case-normalisation: analyst.provider=NONE is accepted
+// (normalised to "none") while genuinely-invalid values still fail.
+func TestEvaluationConfig_FailsFast_OnCaseInsensitiveProvider(t *testing.T) {
+	// Upper-case "NONE" should succeed (normalised to "none").
+	rendered := helmTemplate(t, []string{"analyst.provider=NONE"})
+	if got := findEvalLine(t, rendered, "analyst", "provider"); got != "none" {
+		t.Errorf("analyst.provider=NONE rendered as %q, want none (case-normalised)", got)
+	}
+	// Genuinely-invalid value still fails.
+	cmd := exec.Command("helm", "template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+		"--set", "analyst.provider=NopeNope",
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("helm template succeeded with analyst.provider=NopeNope; expected fail-fast")
+	}
+	if !strings.Contains(stderr.String(), `analyst.provider must be one of`) {
+		t.Errorf("stderr did not mention analyst.provider guard:\n%s", stderr.String())
+	}
+}
+
 // TestEvaluationConfig_RS_EnablesRulesAndBaselinesNoLLM locks AC3:
 // RS mode runs the deterministic detection layer end-to-end with the
 // LLM tier bypassed.
@@ -2810,28 +2869,19 @@ func normaliseGolden(rendered string) string {
 	srcLine := regexp.MustCompile(`(?m)^# Source:.*\n`)
 	out = srcLine.ReplaceAllString(out, "")
 	// Redact olaitan-only chart-version label. The subchart labels use
-	// `helm.sh/chart: redis-25.3.11` etc and remain intact.
-	chartLbl := regexp.MustCompile(`helm\.sh/chart: olaitan-[0-9]+\.[0-9]+\.[0-9]+`)
+	// `helm.sh/chart: redis-25.3.11` etc and remain intact. The
+	// optional pre-release suffix accommodates future
+	// `0.1.0-rc1`-style tags.
+	chartLbl := regexp.MustCompile(`helm\.sh/chart: olaitan-[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.]+)?`)
 	out = chartLbl.ReplaceAllString(out, "helm.sh/chart: olaitan-CHART_VERSION_REDACTED")
-	// Redact olaitan app-version label. The subcharts emit
-	// `app.kubernetes.io/version: <semver>` (no quotes for some);
-	// match both forms and only when the surrounding chart context is
-	// olaitan-managed.
-	// app.kubernetes.io/version appears on every olaitan-templated
-	// manifest at a 4-space indent under metadata.labels; strip both
-	// quoted and unquoted forms.
-	verLbl := regexp.MustCompile(`app\.kubernetes\.io/version: "?[^"\n]+"?`)
-	// Only redact under olaitan template markers; subchart versions
-	// stay byte-stable per chart-pin contract. We achieve this
-	// post-Source-stripping by gating the redact on co-occurrence with
-	// olaitan's selector label. Simpler approach: redact ONLY the
-	// olaitan app-version (which is always quoted to the chart's
-	// appVersion default "0.1.0"). The subchart versions are not
-	// quoted in their templates (e.g. `app.kubernetes.io/version:
-	// 8.6.2`), so a quote-anchored pattern leaves them intact.
-	out = regexp.MustCompile(`app\.kubernetes\.io/version: "[0-9]+\.[0-9]+\.[0-9]+"`).
+	// Redact olaitan app-version label only. The chart-side
+	// appVersion is always emitted quoted (`"0.1.0"`); subchart
+	// versions land unquoted (`8.6.2`) by upstream-Bitnami
+	// convention. The quote anchor scopes the redaction to olaitan
+	// and leaves subchart-version labels byte-stable so a subchart
+	// pin bump still surfaces in the golden diff (NFR13).
+	out = regexp.MustCompile(`app\.kubernetes\.io/version: "[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.]+)?"`).
 		ReplaceAllString(out, `app.kubernetes.io/version: "APP_VERSION_REDACTED"`)
-	_ = verLbl // referenced for documentation only
 	return out
 }
 
@@ -2870,6 +2920,10 @@ func runGolden(t *testing.T, slug string, sets []string) {
 		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
 			t.Fatalf("write golden file: %v", err)
 		}
+		// Loud stderr line so accidental HELM_GOLDEN_UPDATE=1 runs
+		// (e.g. CI mis-configuration) cannot silently overwrite a
+		// golden the maintainer did not intend to regenerate.
+		fmt.Fprintf(os.Stderr, "HELM_GOLDEN_UPDATE=1: wrote golden file %s (run `git diff deploy/helm/testdata/golden/` to inspect)\n", path)
 		t.Logf("regenerated golden file: %s", path)
 		return
 	}

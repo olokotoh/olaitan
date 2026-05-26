@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -93,7 +94,12 @@ type Correlator struct {
 type identityCacheEntry struct {
 	workloadID string
 	identity   schema.WorkloadIdentity
-	expiry     time.Time
+	// pod is the cache-warm pod object resolved alongside identity so
+	// the assembler can hand it to the posture client without a second
+	// apiserver Pods.Get (Story 1.14 P11 invariant). nil when the
+	// uncached resolver took the no-kube or PodFallback path.
+	pod    *corev1.Pod
+	expiry time.Time
 }
 
 // New constructs a Correlator.
@@ -234,7 +240,7 @@ func isExpectedFetchTimeout(err error) bool {
 // PodRef are treated as drop-and-continue so a malformed event cannot
 // tear down the ring.
 func (c *Correlator) AddEvent(ctx context.Context, ev schema.Event) (*schema.EvidencePackage, error) {
-	workloadID, identity, err := c.resolveAndCacheIdentity(ctx, ev)
+	workloadID, identity, pod, err := c.resolveAndCacheIdentity(ctx, ev)
 	if err != nil {
 		// P14: validation errors are drop-and-continue. Surface them
 		// as a wrapped error so the caller logs context, but the
@@ -251,6 +257,11 @@ func (c *Correlator) AddEvent(ctx context.Context, ev schema.Event) (*schema.Evi
 	}
 	tr := trigger.MultiSignal(snap, distinctSources(snap.Events), time.Now().UTC())
 	tr.ResolvedIdentity = &identity
+	// Pod is the cache-warm pod object captured at identity-resolution
+	// time. nil when the resolver took the no-kube or PodFallback path;
+	// the assembler degrades to its uncached resolveWorkload in that
+	// case. See trigger.Trigger.Pod and Story 1.14 P11.
+	tr.Pod = pod
 	return c.publishTrigger(ctx, tr, snap)
 }
 
@@ -316,73 +327,76 @@ func (c *Correlator) publishTrigger(ctx context.Context, tr trigger.Trigger, sna
 // resolveAndCacheIdentity returns the workload identity for ev's pod,
 // using a TTL cache so multi-signal bursts don't trigger a Pods.Get
 // storm against the apiserver. Cache key is (namespace, podName);
-// TTL is bounded by identityCacheTTL.
-func (c *Correlator) resolveAndCacheIdentity(ctx context.Context, ev schema.Event) (string, schema.WorkloadIdentity, error) {
+// TTL is bounded by identityCacheTTL. The pod object is cached
+// alongside identity and propagated on the trigger so the assembler
+// never re-fetches it (Story 1.14 P11 invariant).
+func (c *Correlator) resolveAndCacheIdentity(ctx context.Context, ev schema.Event) (string, schema.WorkloadIdentity, *corev1.Pod, error) {
 	ref := ev.Pod
 	if ref.Namespace == "" || ref.Name == "" {
-		return "", schema.WorkloadIdentity{}, fmt.Errorf("event %q missing pod namespace/name", ev.ID)
+		return "", schema.WorkloadIdentity{}, nil, fmt.Errorf("event %q missing pod namespace/name", ev.ID)
 	}
 	key := ref.Namespace + "/" + ref.Name
 	now := time.Now()
 	if entry, ok := c.identityCache.Load(key); ok {
 		ce, _ := entry.(identityCacheEntry)
 		if now.Before(ce.expiry) {
-			return ce.workloadID, ce.identity, nil
+			return ce.workloadID, ce.identity, ce.pod, nil
 		}
 		c.identityCache.Delete(key)
 	}
 
-	workloadID, identity, err := c.resolveIdentityUncached(ctx, ref)
+	workloadID, identity, pod, err := c.resolveIdentityUncached(ctx, ref)
 	if err != nil {
-		return "", schema.WorkloadIdentity{}, err
+		return "", schema.WorkloadIdentity{}, nil, err
 	}
 	c.identityCache.Store(key, identityCacheEntry{
 		workloadID: workloadID,
 		identity:   identity,
+		pod:        pod,
 		expiry:     now.Add(c.identityCacheTTL),
 	})
-	return workloadID, identity, nil
+	return workloadID, identity, pod, nil
 }
 
-func (c *Correlator) resolveIdentityUncached(ctx context.Context, ref schema.PodRef) (string, schema.WorkloadIdentity, error) {
+func (c *Correlator) resolveIdentityUncached(ctx context.Context, ref schema.PodRef) (string, schema.WorkloadIdentity, *corev1.Pod, error) {
 	if c.kube == nil {
 		id, err := keys.PodFallbackID(ref.Namespace, ref.Name)
 		if err != nil {
-			return "", schema.WorkloadIdentity{}, err
+			return "", schema.WorkloadIdentity{}, nil, err
 		}
-		return id, schema.WorkloadIdentity{Namespace: ref.Namespace, OwnerKind: "Pod", OwnerName: ref.Name, PodName: ref.Name}, nil
+		return id, schema.WorkloadIdentity{Namespace: ref.Namespace, OwnerKind: "Pod", OwnerName: ref.Name, PodName: ref.Name}, nil, nil
 	}
 	pod, err := c.kube.CoreV1().Pods(ref.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			id, ferr := keys.PodFallbackID(ref.Namespace, ref.Name)
 			if ferr != nil {
-				return "", schema.WorkloadIdentity{}, ferr
+				return "", schema.WorkloadIdentity{}, nil, ferr
 			}
-			return id, schema.WorkloadIdentity{Namespace: ref.Namespace, OwnerKind: "Pod", OwnerName: ref.Name, PodName: ref.Name}, nil
+			return id, schema.WorkloadIdentity{Namespace: ref.Namespace, OwnerKind: "Pod", OwnerName: ref.Name, PodName: ref.Name}, nil, nil
 		}
-		return "", schema.WorkloadIdentity{}, fmt.Errorf("resolve pod %s/%s: %w", ref.Namespace, ref.Name, err)
+		return "", schema.WorkloadIdentity{}, nil, fmt.Errorf("resolve pod %s/%s: %w", ref.Namespace, ref.Name, err)
 	}
 	identity, err := posture.ResolveWorkloadIdentity(ctx, c.kube, pod)
 	if err != nil {
 		id, ferr := keys.PodFallbackID(ref.Namespace, ref.Name)
 		if ferr != nil {
-			return "", schema.WorkloadIdentity{}, ferr
+			return "", schema.WorkloadIdentity{}, nil, ferr
 		}
-		return id, schema.WorkloadIdentity{Namespace: ref.Namespace, OwnerKind: "Pod", OwnerName: ref.Name, PodName: ref.Name}, nil
+		return id, schema.WorkloadIdentity{Namespace: ref.Namespace, OwnerKind: "Pod", OwnerName: ref.Name, PodName: ref.Name}, pod, nil
 	}
 	if identity.OwnerKind == "Pod" {
 		id, ferr := keys.PodFallbackID(identity.Namespace, identity.OwnerName)
 		if ferr != nil {
-			return "", schema.WorkloadIdentity{}, ferr
+			return "", schema.WorkloadIdentity{}, nil, ferr
 		}
-		return id, identity, nil
+		return id, identity, pod, nil
 	}
 	id, err := keys.WorkloadID(identity.Namespace, identity.OwnerKind, identity.OwnerName)
 	if err != nil {
-		return "", schema.WorkloadIdentity{}, err
+		return "", schema.WorkloadIdentity{}, nil, err
 	}
-	return id, identity, nil
+	return id, identity, pod, nil
 }
 
 func distinctSources(events []schema.Event) []schema.EventSource {
