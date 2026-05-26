@@ -449,23 +449,16 @@ func TestAssemblerUnavailablePostureNotMarkedOrphanOnTransient(t *testing.T) {
 	}
 }
 
-// TestAssemblerCacheWarmSkipsOwnerRefWalk covers the residual P11
-// invariant after the cache-warm path was widened to re-fetch the pod
-// for posture-client correctness. The original P11 closure asserted
-// no kube traffic at all when ResolvedIdentity is supplied; that
-// guarantee silently broke the posture surface when the posture
-// client walked ownerRefs on the stub pod and fell into the orphan
-// fallback (Story 1.19 e2e diagnosis). The widened contract is:
-//   - Pods.Get IS allowed (so the posture client gets real
-//     OwnerReferences to walk).
-//   - ReplicaSets.Get / Deployments.Get from the assembler-side
-//     posture.ResolveWorkloadIdentity call must STILL be skipped
-//     (the cached identity is authoritative, no second owner walk).
-//
-// The posture client may do its own owner walk inside Get, but that
-// is bounded by its 60s cache and is the same cost the cold path
-// pays.
-func TestAssemblerCacheWarmSkipsOwnerRefWalk(t *testing.T) {
+// TestAssemblerSkipsKubeFetchWhenResolvedIdentitySupplied is the
+// Story 1.14 P11 invariant: when the correlator supplies BOTH a
+// ResolvedIdentity AND a cache-warm Pod object on the trigger, the
+// assembler must not issue any kube reads -- no Pods.Get, no
+// ReplicaSets.Get, no Deployments.Get. The cache-warm Pod is the
+// authoritative source the posture client walks; the cached identity
+// is authoritative for workload routing. Restored from the widened
+// "TestAssemblerCacheWarmSkipsOwnerRefWalk" form after Story 1.19
+// chose the pass-pod-through approach (D2).
+func TestAssemblerSkipsKubeFetchWhenResolvedIdentitySupplied(t *testing.T) {
 	now := time.Date(2026, 5, 18, 10, 0, 0, 0, time.UTC)
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "api-pod", Namespace: "payments", UID: "pod-uid"}}
 	kube := kubefake.NewSimpleClientset(pod)
@@ -473,15 +466,14 @@ func TestAssemblerCacheWarmSkipsOwnerRefWalk(t *testing.T) {
 	identity := schema.WorkloadIdentity{Namespace: "payments", OwnerKind: "Deployment", OwnerName: "api"}
 	tr := trigger.MultiSignal(window.Snapshot{WorkloadID: "payments/Deployment/api", Events: []schema.Event{{ID: "evt-1", Timestamp: now, Source: schema.SourceFalco, Pod: schema.PodRef{Name: "api-pod", Namespace: "payments"}, Category: schema.CategorySyscall}, {ID: "evt-2", Timestamp: now, Source: schema.SourceAudit, Pod: schema.PodRef{Name: "api-pod", Namespace: "payments"}, Category: schema.CategoryAudit}}}, []schema.EventSource{schema.SourceAudit, schema.SourceFalco}, now)
 	tr.ResolvedIdentity = &identity
+	tr.Pod = pod
 	snap := window.Snapshot{Events: []schema.Event{{ID: "evt-1", Timestamp: now, Source: schema.SourceFalco, Pod: schema.PodRef{Name: "api-pod", Namespace: "payments"}, Category: schema.CategorySyscall}, {ID: "evt-2", Timestamp: now, Source: schema.SourceAudit, Pod: schema.PodRef{Name: "api-pod", Namespace: "payments"}, Category: schema.CategoryAudit}}}
 	kube.ClearActions()
 	if _, err := asm.Assemble(context.Background(), tr, snap); err != nil {
 		t.Fatalf("Assemble: %v", err)
 	}
 	for _, action := range kube.Actions() {
-		if action.Matches("get", "replicasets") || action.Matches("get", "deployments") || action.Matches("get", "statefulsets") || action.Matches("get", "daemonsets") || action.Matches("get", "jobs") || action.Matches("get", "cronjobs") {
-			t.Fatalf("Assemble issued ownerRef walk despite ResolvedIdentity being supplied: %+v", action)
-		}
+		t.Fatalf("Assemble issued kube request despite ResolvedIdentity+Pod being supplied: %+v", action)
 	}
 }
 

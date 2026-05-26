@@ -163,16 +163,16 @@ jobs:
           # ghcr.io/olokotoh/olaitan would resolve to a registry path that
           # is not present on the node and `pullPolicy: Never` would then
           # fail with ErrImageNeverPull.
-          # nats.config.jetstream.fileStore.maxSize defaults to the PVC
-          # size (10Gi), but internal/nats/streams.go declares stream
-          # MaxBytes totalling 160 GiB across EVENTS / EVENTS_RAW /
-          # EVIDENCE; JetStream rejects stream creation with err 10047
-          # "insufficient storage resources" when the requested limits
-          # exceed the account file-store limit. Override to 200GB so
-          # CreateOrUpdateStream succeeds; actual on-disk usage during
-          # the smoke test stays under a few hundred KB (100 synthetic
-          # events) so the 10Gi PVC backing is never approached. Match
-          # this in Makefile's e2e-local target.
+          # nats.streamMaxBytesOverride=1073741824 (1 GiB per stream)
+          # caps the streamConfigs MaxBytes for the CI kind cluster,
+          # whose NATS PVC backing (10Gi) is smaller than the
+          # production streamConfigs sum (160 GiB across EVENTS /
+          # EVENTS_RAW / EVIDENCE). Story 1.19 D6: this replaces the
+          # earlier `nats.config.jetstream.fileStore.maxSize=200GB`
+          # band-aid which lied to JetStream about actual disk
+          # capacity. Actual on-disk usage during the smoke test stays
+          # well under 1 GiB per stream. Production deployments leave
+          # this empty and size nats.persistence to the configured sum.
           # endpoints.falco overridden to a tcp:// target: with the
           # default unix:///run/falco/falco.sock the collector DaemonSet
           # mounts /run/falco from the host as a `type: Directory`
@@ -193,7 +193,7 @@ jobs:
             --set secrets.redisPassword=ci-test \
             --set falco.enabled=false \
             --set endpoints.falco=tcp://127.0.0.1:0 \
-            --set nats.config.jetstream.fileStore.maxSize=200GB \
+            --set nats.streamMaxBytesOverride=1073741824 \
             --wait --timeout 5m
 
       - name: Run smoke test

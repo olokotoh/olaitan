@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -584,14 +585,20 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 func wireBaselineEngine(ctx context.Context, cfg *config.Config, nc *natsclient.Client, emit baseline.BaselineDeviationEmitter, metricsReg *metrics.Registry, log *slog.Logger) (*baseline.Engine, func(), error) {
 	rcfg := redisclient.DefaultConfig()
 	rcfg.Addr = cfg.Detection.Baselines.RedisAddr
-	// NFR8: Redis AUTH is mandatory. The Helm chart's olaitan-secrets
-	// Secret carries the password under key `redis-password`; the
-	// aggregator Deployment surfaces it as the REDIS_PASSWORD env var
-	// via valueFrom.secretKeyRef. Empty env var is permitted (operator
-	// running an externally-managed unauthenticated Redis); a real
-	// password mismatch surfaces at PING time as NOAUTH and CrashLoops
-	// the pod loudly.
-	rcfg.Password = os.Getenv("REDIS_PASSWORD")
+	// NFR8: Redis AUTH is mandatory when the baseline engine is enabled.
+	// The Helm chart's olaitan-secrets Secret carries the password under
+	// key `redis-password`; the aggregator Deployment surfaces it as the
+	// REDIS_PASSWORD env var via valueFrom.secretKeyRef.
+	//
+	// TrimRight guards against the common secretKeyRef pitfall where the
+	// password value carries a trailing newline (kubectl create secret
+	// --from-file appends one); the trailing \n breaks AUTH against
+	// Redis even though the operator-supplied secret looks correct.
+	pwd := strings.TrimRight(os.Getenv("REDIS_PASSWORD"), "\r\n")
+	if pwd == "" {
+		return nil, func() {}, fmt.Errorf("NFR8: REDIS_PASSWORD env var is required when detection.baselines.enabled=true (set --set secrets.redisPassword or wire a secretKeyRef)")
+	}
+	rcfg.Password = pwd
 	rc, err := redisclient.NewClient(rcfg)
 	if err != nil {
 		return nil, func() {}, fmt.Errorf("aggregator: baseline redis: %w", err)

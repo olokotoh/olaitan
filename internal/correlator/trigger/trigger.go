@@ -7,6 +7,8 @@ import (
 	"sort"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+
 	"github.com/olokotoh/olaitan/internal/correlator/window"
 	"github.com/olokotoh/olaitan/internal/schema"
 )
@@ -30,6 +32,13 @@ const (
 // assembler falls back to its own fetch, preserving the
 // FireRuleMatch / FireBaselineDeviation entry-point behaviour for
 // callers that have not pre-resolved.
+//
+// Pod is the optional cache-warm pod object captured by the correlator
+// at identity-resolution time. When non-nil the assembler hands it to
+// the posture client directly instead of re-fetching it from the
+// apiserver -- this preserves the Story 1.14 P11 "no Pods.Get on
+// cache-warm path" invariant while still giving the posture client the
+// real OwnerReferences it needs to walk RBAC and NetworkPolicy.
 type Trigger struct {
 	Type              string
 	WorkloadID        string
@@ -39,6 +48,7 @@ type Trigger struct {
 	DistinctSources   []schema.EventSource
 	FiredAt           time.Time
 	ResolvedIdentity  *schema.WorkloadIdentity
+	Pod               *corev1.Pod
 }
 
 // RuleMatch constructs an external rule-match trigger.

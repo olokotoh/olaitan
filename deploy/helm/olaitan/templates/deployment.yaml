@@ -121,6 +121,15 @@ spec:
                 secretKeyRef:
                   name: {{ include "olaitan.fullname" . }}-secrets
                   key: redis-password
+            {{- with .Values.nats.streamMaxBytesOverride }}
+            # Story 1.19 D6: caps every JetStream stream's MaxBytes at
+            # the given int64 byte count. Set this in CI/kind where the
+            # NATS PVC backing is smaller than the production
+            # streamConfigs sum (160 GiB). Production deployments leave
+            # this empty and size the NATS PVC instead.
+            - name: OLT_NATS_STREAM_MAXBYTES_OVERRIDE
+              value: {{ . | quote }}
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /healthz

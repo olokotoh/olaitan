@@ -511,8 +511,12 @@ func TestProviderCaseInsensitive(t *testing.T) {
 func TestProviderNoneAccepted(t *testing.T) {
 	body := strings.Replace(validYAML, "provider: api", "provider: none", 1)
 	path := writeConfig(t, body)
-	if _, err := config.Load(path); err != nil {
-		t.Errorf("provider=none should validate (Story 1.19 LLM-tier-bypass sentinel): %v", err)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("provider=none should validate (Story 1.19 LLM-tier-bypass sentinel): %v", err)
+	}
+	if got := cfg.Analyst.Provider; got != "none" {
+		t.Errorf("loader did not preserve provider literal: got %q, want \"none\"", got)
 	}
 }
 

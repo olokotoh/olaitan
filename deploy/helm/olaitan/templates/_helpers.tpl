@@ -139,15 +139,18 @@ auditWebhook.caBundle and aggregator.replicas guards (loud chart-render
 error rather than silent runtime trap).
 */}}
 {{- define "olaitan.evaluation.validate" -}}
-{{- $cfg := .Values.evaluation.config | default "" -}}
+{{- $eval := default (dict) .Values.evaluation -}}
+{{- $cfg := default "" $eval.config -}}
 {{- $valid := list "" "F" "RS" "RSL" "RSLT" -}}
 {{- if not (has $cfg $valid) -}}
 {{- fail (printf "evaluation.config must be one of [\"\", \"F\", \"RS\", \"RSL\", \"RSLT\"] (got %q). See deploy/helm/olaitan/values.yaml for the canonical evaluation matrix arms." $cfg) -}}
 {{- end -}}
-{{- $ap := .Values.analyst.provider | default "none" -}}
+{{- /* Normalise provider to lowercase before the enum check so the Helm validator agrees with the Go-side validator (internal/config/config.go strings.ToLower). Without this an operator passing analyst.provider=NONE would render-fail despite the Go loader accepting it. */ -}}
+{{- $analyst := default (dict) .Values.analyst -}}
+{{- $ap := lower (default "none" $analyst.provider) -}}
 {{- $validProviders := list "none" "api" "local" -}}
 {{- if not (has $ap $validProviders) -}}
-{{- fail (printf "analyst.provider must be one of [\"none\", \"api\", \"local\"] (got %q). \"api\" / \"local\" are reserved for Epic 3 Story 3.x; use \"none\" for the Epic 1/2 RS evaluation arm." $ap) -}}
+{{- fail (printf "analyst.provider must be one of [\"none\", \"api\", \"local\"] (got %q, normalised to %q). \"api\" / \"local\" are reserved for Epic 3 Story 3.x; use \"none\" for the Epic 1/2 RS evaluation arm." (default "none" $analyst.provider) $ap) -}}
 {{- end -}}
 {{- end -}}
 
@@ -163,10 +166,16 @@ Mapping:
                                                  .Values.rules.enabled
 */}}
 {{- define "olaitan.evaluation.effectiveRulesEnabled" -}}
-{{- $cfg := .Values.evaluation.config | default "" -}}
+{{- $eval := default (dict) .Values.evaluation -}}
+{{- $cfg := default "" $eval.config -}}
 {{- if eq $cfg "F" -}}false
 {{- else if or (eq $cfg "RS") (eq $cfg "RSL") (eq $cfg "RSLT") -}}true
-{{- else -}}{{ printf "%t" .Values.rules.enabled }}
+{{- else -}}
+{{- /* Bool literals false=zero-value confuse sprig's `default`, so
+       check Hasley before falling through. .Values.rules is
+       guaranteed by values.yaml; this nil-guard is for `--set
+       rules=null` or chart-overlay edge cases. */ -}}
+{{- if hasKey (default (dict) .Values.rules) "enabled" -}}{{ printf "%t" .Values.rules.enabled }}{{- else -}}true{{- end -}}
 {{- end -}}
 {{- end -}}
 
@@ -183,10 +192,12 @@ Mapping:
                                                  .Values.baselines.enabled
 */}}
 {{- define "olaitan.evaluation.effectiveBaselinesEnabled" -}}
-{{- $cfg := .Values.evaluation.config | default "" -}}
+{{- $eval := default (dict) .Values.evaluation -}}
+{{- $cfg := default "" $eval.config -}}
 {{- if eq $cfg "F" -}}false
 {{- else if or (eq $cfg "RS") (eq $cfg "RSL") (eq $cfg "RSLT") -}}true
-{{- else -}}{{ printf "%t" .Values.baselines.enabled }}
+{{- else -}}
+{{- if hasKey (default (dict) .Values.baselines) "enabled" -}}{{ printf "%t" .Values.baselines.enabled }}{{- else -}}true{{- end -}}
 {{- end -}}
 {{- end -}}
 
@@ -206,11 +217,30 @@ Mapping:
                                                  .Values.analyst.provider
 */}}
 {{- define "olaitan.evaluation.effectiveAnalystProvider" -}}
-{{- $cfg := .Values.evaluation.config | default "" -}}
+{{- $eval := default (dict) .Values.evaluation -}}
+{{- $cfg := default "" $eval.config -}}
+{{- $analyst := default (dict) .Values.analyst -}}
 {{- if or (eq $cfg "F") (eq $cfg "RS") -}}none
 {{- else if or (eq $cfg "RSL") (eq $cfg "RSLT") -}}api
-{{- else -}}{{ .Values.analyst.provider }}
+{{- else -}}{{ lower (default "none" $analyst.provider) }}
 {{- end -}}
+{{- end -}}
+
+{{/*
+olaitan.evaluation.isFArm -- returns "true" when evaluation.config=F,
+empty string otherwise. AC2 requires the F arm to keep only the
+Falco sensor adapter active; the configmap.yaml bridge uses this
+helper to gate the four non-Falco source-adapter disables
+(audit / containerd / calico / posture) so the rendered olaitan.yaml
+under --set evaluation.config=F genuinely measures Falco alone for
+the Epic 5 four-way comparison. Without this gate the F arm would
+silently run audit/cni/containerd/posture sensors alongside Falco,
+contaminating the F-vs-RS / F-vs-RSL / F-vs-RSLT deltas.
+*/}}
+{{- define "olaitan.evaluation.isFArm" -}}
+{{- $eval := default (dict) .Values.evaluation -}}
+{{- $cfg := default "" $eval.config -}}
+{{- if eq $cfg "F" -}}true{{- end -}}
 {{- end -}}
 
 {{/*
