@@ -361,7 +361,7 @@ func TestStartAggregator_BuildsPostureClientWhenEnabled(t *testing.T) {
 	g, gctx := errgroup.WithContext(ctx)
 	natsSrv := startTestNATSForMain(t)
 	t.Setenv("NATS_URL", natsSrv.ClientURL())
-	if err := startAggregatorRing(gctx, g, log, cfg, nil); err != nil {
+	if err := startAggregatorRing(gctx, g, log, cfg, nil, nil); err != nil {
 		cancel()
 		_ = g.Wait()
 		t.Fatalf("startAggregatorRing: %v", err)
@@ -405,7 +405,7 @@ func TestStartAggregator_PostureDisabledLeavesClientNil(t *testing.T) {
 	g, gctx := errgroup.WithContext(ctx)
 	natsSrv := startTestNATSForMain(t)
 	t.Setenv("NATS_URL", natsSrv.ClientURL())
-	if err := startAggregatorRing(gctx, g, log, cfg, nil); err != nil {
+	if err := startAggregatorRing(gctx, g, log, cfg, nil, nil); err != nil {
 		cancel()
 		_ = g.Wait()
 		t.Fatalf("startAggregatorRing: %v", err)
@@ -453,7 +453,7 @@ func TestStartAggregator_RulesEngineEnabledWiresGoroutines(t *testing.T) {
 	g, gctx := errgroup.WithContext(ctx)
 	natsSrv := startTestNATSForMain(t)
 	t.Setenv("NATS_URL", natsSrv.ClientURL())
-	if err := startAggregatorRing(gctx, g, log, cfg, nil); err != nil {
+	if err := startAggregatorRing(gctx, g, log, cfg, nil, nil); err != nil {
 		cancel()
 		_ = g.Wait()
 		t.Fatalf("startAggregatorRing: %v", err)
@@ -498,7 +498,7 @@ func TestStartAggregator_RulesEngineDisabledSkipsWiring(t *testing.T) {
 	g, gctx := errgroup.WithContext(ctx)
 	natsSrv := startTestNATSForMain(t)
 	t.Setenv("NATS_URL", natsSrv.ClientURL())
-	if err := startAggregatorRing(gctx, g, log, cfg, nil); err != nil {
+	if err := startAggregatorRing(gctx, g, log, cfg, nil, nil); err != nil {
 		cancel()
 		_ = g.Wait()
 		t.Fatalf("startAggregatorRing with rules disabled: %v (loader must NOT be invoked)", err)
@@ -538,7 +538,7 @@ func TestStartAggregator_KubeClientFailureWrapsError(t *testing.T) {
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	g, gctx := errgroup.WithContext(context.Background())
 	_ = g // group is not exercised on the early-return failure path
-	err := startAggregatorRing(gctx, g, log, cfg, nil)
+	err := startAggregatorRing(gctx, g, log, cfg, nil, nil)
 	if err == nil {
 		t.Fatalf("expected error from startAggregatorRing under kube-client failure")
 	}

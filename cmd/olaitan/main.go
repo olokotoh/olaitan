@@ -46,6 +46,7 @@ import (
 	"github.com/olokotoh/olaitan/internal/decision/baseline"
 	"github.com/olokotoh/olaitan/internal/decision/rules"
 	rulesloader "github.com/olokotoh/olaitan/internal/decision/rules/loader"
+	"github.com/olokotoh/olaitan/internal/decision/score"
 	"github.com/olokotoh/olaitan/internal/health"
 	"github.com/olokotoh/olaitan/internal/metrics"
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
@@ -209,7 +210,7 @@ func runRingCtx(ctx context.Context, ring string, args []string, stderr io.Write
 			return 1
 		}
 	case "aggregator":
-		if err := startAggregatorRing(gctx, g, log, mgr.Get(), mgr.Subscribe); err != nil {
+		if err := startAggregatorRing(gctx, g, log, mgr.Get(), mgr.Subscribe, mgr); err != nil {
 			log.Error("startup: aggregator ring wiring", "err", err)
 			ringCancel()
 			_ = g.Wait()
@@ -335,7 +336,7 @@ func getPostureClient() *posture.Client { return postureClient.Load() }
 //     intentionally-enabled posture must not silently degrade.
 //   - posture.enabled=false -> log "posture disabled", leave
 //     postureClient nil, return nil.
-func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger, cfg *config.Config, subscribe func(func(*config.Config))) error {
+func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger, cfg *config.Config, subscribe func(func(*config.Config)), mgr *config.Manager) error {
 	var client *posture.Client
 	var cs kubernetes.Interface
 	if cfg.Detection.Posture.Enabled {
@@ -563,6 +564,27 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	} else {
 		log.Info("aggregator: baseline engine disabled in config; skipping")
 	}
+
+	// Story 2.1: deterministic ThreatScore calculator (FR30). The
+	// calculator is stateless and reads cfg via mgr.Get() on every
+	// Score() invocation, so the wiring is purely construction +
+	// metric registration. Story 2.2 lands the FSM consumer that
+	// closes the discard below; until then the `_ =` keeps the
+	// construction live so an explicit consumer plug-in for Story
+	// 2.2 is a one-line patch rather than a re-discovery exercise.
+	scoreCalc, scoreErr := score.New(mgr, metricsReg)
+	if scoreErr != nil {
+		closeNATS()
+		return fmt.Errorf("aggregator: score: %w", scoreErr)
+	}
+	_ = scoreCalc
+	snap := scoreCalc.Snapshot()
+	log.Info("aggregator: score calculator wired",
+		"rule_weight", snap.RuleWeight,
+		"baseline_weight", snap.BaselineWeight,
+		"llm_weight", snap.LLMWeight,
+		"llm_cap", snap.LLMCap,
+		"sigma_normaliser", snap.SigmaNormaliser)
 
 	g.Go(func() error {
 		<-ctx.Done()

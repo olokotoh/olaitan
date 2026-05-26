@@ -30,8 +30,47 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/olokotoh/olaitan/internal/config"
 	"github.com/olokotoh/olaitan/internal/decision/rules/parser"
 )
+
+// extractEmbeddedConfigYAML pulls the literal olaitan.yaml content out
+// of the rendered olaitan-config ConfigMap. The chart embeds the file
+// under data.olaitan.yaml using the `|-` block-scalar shape; we trim
+// the leading 4-space indent each line carries inside the block-scalar
+// so the result is a stand-alone YAML document parsable by config.Load.
+func extractEmbeddedConfigYAML(t *testing.T, rendered string) string {
+	t.Helper()
+	marker := "olaitan.yaml: |-"
+	idx := strings.Index(rendered, marker)
+	if idx == -1 {
+		t.Fatalf("olaitan.yaml block not found in rendered ConfigMap")
+	}
+	body := rendered[idx+len(marker):]
+	// Stop at the next ConfigMap boundary (next `---` separator).
+	if end := strings.Index(body, "\n---\n"); end >= 0 {
+		body = body[:end]
+	}
+	var out strings.Builder
+	for _, line := range strings.Split(body, "\n") {
+		if len(line) >= 4 && line[:4] == "    " {
+			out.WriteString(line[4:])
+		} else {
+			out.WriteString(strings.TrimLeft(line, " "))
+		}
+		out.WriteString("\n")
+	}
+	return out.String()
+}
+
+// configLoad runs the production config.Load path against the supplied
+// file so the chart-side helm tests can round-trip the rendered
+// ConfigMap through the same validator the aggregator binary uses at
+// startup.
+func configLoad(t *testing.T, path string) (*config.Config, error) {
+	t.Helper()
+	return config.Load(path)
+}
 
 // chartDir resolves to <this-test-file>/../olaitan, independent of the
 // caller's working directory. `filepath.Abs("olaitan")` (the previous
@@ -2512,6 +2551,76 @@ func TestBaselinesEnabledFalseDisablesAggregatorBlock(t *testing.T) {
 	window := rendered[idx:end]
 	if !strings.Contains(window, "enabled: false") {
 		t.Errorf("baselines.enabled=false did not propagate; window:\n%s", window)
+	}
+}
+
+// --- Story 2.1: deterministic ThreatScore calculator helm wiring ----
+
+// TestScoreConfig_DefaultsRender pins AC2: the chart's default render
+// carries the FR30 defaults (rule_weight 0.4, baseline_weight 0.3,
+// llm_weight 0.3, llm_cap 35).
+func TestScoreConfig_DefaultsRender(t *testing.T) {
+	rendered := helmTemplate(t, nil)
+	block := evalConfigBlock(t, rendered)
+	for _, want := range []string{
+		"rule_weight: 0.4",
+		"baseline_weight: 0.3",
+		"llm_weight: 0.3",
+		"llm_cap: 35",
+	} {
+		if !strings.Contains(block, want) {
+			t.Errorf("score defaults render: missing %q in olaitan.yaml block", want)
+		}
+	}
+}
+
+// TestScoreConfig_OperatorOverride confirms the regex bridge in
+// configmap.yaml plumbs `--set score.*` overrides through to the
+// rendered detection.score.* keys.
+func TestScoreConfig_OperatorOverride(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"score.ruleWeight=0.5",
+		"score.baselineWeight=0.3",
+		"score.llmWeight=0.2",
+		"score.llmCap=40",
+	})
+	block := evalConfigBlock(t, rendered)
+	for _, want := range []string{
+		"rule_weight: 0.5",
+		"baseline_weight: 0.3",
+		"llm_weight: 0.2",
+		"llm_cap: 40",
+	} {
+		if !strings.Contains(block, want) {
+			t.Errorf("score operator override: missing %q in olaitan.yaml block; block snippet:\n%s",
+				want, snippet(block, "score:"))
+		}
+	}
+}
+
+// TestScoreConfig_FailsFast_OnInvalidSum renders the chart with score
+// weights summing to > 1.0, then round-trips the embedded olaitan.yaml
+// through config.Load to confirm the trust-bound validator rejects it.
+// Helm itself does not validate semantic invariants; the rejection
+// happens when the aggregator process loads the ConfigMap on startup.
+func TestScoreConfig_FailsFast_OnInvalidSum(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"score.ruleWeight=0.5",
+		"score.baselineWeight=0.5",
+		"score.llmWeight=0.5",
+	})
+	embedded := extractEmbeddedConfigYAML(t, rendered)
+
+	tmp := filepath.Join(t.TempDir(), "olaitan.yaml")
+	if err := os.WriteFile(tmp, []byte(embedded), 0o600); err != nil {
+		t.Fatalf("write tmp config: %v", err)
+	}
+	_, err := configLoad(t, tmp)
+	if err == nil {
+		t.Fatalf("expected config.Load to reject score weights summing > 1.0")
+	}
+	if !strings.Contains(err.Error(), "detection.score") {
+		t.Errorf("expected error to mention detection.score; got: %v", err)
 	}
 }
 

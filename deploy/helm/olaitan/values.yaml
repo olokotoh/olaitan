@@ -721,6 +721,43 @@ baselines:
   # explicitly to point at externally-managed Redis when redis.enabled=false.
   redisAddr: ""
 
+# Story 2.1: Deterministic ThreatScore calculator (FR30). The
+# calculator collapses an EvidencePackage's rule severity and baseline
+# deviation contributions into a single [0, 100] score using
+#
+#   total = rule_weight * max(rule_severity)
+#         + baseline_weight * normalised(max_sigma)
+#         + llm_weight * llm_capped_confidence
+#
+# where the LLM term is zero in Epic 2 (the calculator is wired ahead
+# of the Epic 3 analyst tier; epics.md:1589 will populate the term).
+# Defaults pin the trust-bound max(LLM-only) = 0.3 * 35 = 10.5 below
+# the SUSPICIOUS threshold 20 per prd.md:294.
+#
+# All four knobs are hot-reloadable via FR49. The calculator reads
+# config.Manager.Get() on every Score() call, so a
+# `helm upgrade --set score.ruleWeight=0.5` lands at the next package
+# without a controller restart.
+#
+# Story 1.19 evaluation-arm interaction: the F / RS / RSL / RSLT arms
+# (below) gate detection.rules.enabled, detection.baselines.enabled,
+# and analyst.provider. Score weights are NOT overridden by the
+# evaluation arm because the F arm disables the rules and baseline
+# engines entirely (their JetStream consumers are not created), so no
+# rule-match or baseline-deviation ever reaches the calculator in the
+# F arm. Documenting this here so a future operator does not "fix" a
+# non-bug.
+score:
+  # FR30 weights. The three weights must sum to <= 1.0; the validator
+  # rejects configurations that would break the algebraic trust-bound.
+  ruleWeight: 0.4
+  baselineWeight: 0.3
+  llmWeight: 0.3
+  # Per-provider LLM cap in [0, 100]. Default 35 mirrors the Claude
+  # Opus cap at prd.md:294; Epic 3 Stories will introduce per-provider
+  # caps via the analyst tier.
+  llmCap: 35
+
 # Story 1.19: Evaluation matrix configuration (FR53). One-flag switch
 # that places the chart into one of the canonical evaluation arms (F,
 # RS, RSL, RSLT-full). Empty default means "no override; individual
