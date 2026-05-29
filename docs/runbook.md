@@ -251,6 +251,48 @@ Wiring of the rate-limit counters above is in `cmd/olaitan/metrics.go:140-260` v
 - **Sample PromQL (aggregate):** `histogram_quantile(0.99, sum(rate(olaitan_decision_baseline_evaluation_seconds_bucket[5m])) by (le))`.
 - **Sample PromQL (alert):** `histogram_quantile(0.99, sum(rate(olaitan_decision_baseline_evaluation_seconds_bucket[5m])) by (le)) > 0.1` for 5 minutes.
 
+### 1.4a Score calculator ring (Story 2.1 NEW)
+
+#### `olaitan_decision_score_evaluations_total`
+
+- **Type:** counter
+- **Unit:** count
+- **Labels:** none
+- **Help:** Cumulative number of ThreatScore evaluations performed by the deterministic calculator (FR30). Increments once per `Score()` call; the calculator is stateless and pure, so this counter advances even when the input EvidencePackage has no rule matches and no baseline deviations (and the resulting Total is 0).
+- **Sample PromQL (aggregate):** `rate(olaitan_decision_score_evaluations_total[5m])`.
+- **Sample PromQL (alert):** `rate(olaitan_decision_score_evaluations_total[5m]) == 0 and on() olaitan_correlator_evidence_packages_total > 0` for 10 minutes (page if correlator is producing packages but the score ring stops evaluating; indicates a stuck consumer).
+
+#### `olaitan_decision_score_total`
+
+- **Type:** histogram_vec
+- **Unit:** ratio (0-100 contribution space)
+- **Labels:** `component_contribution` (one of `rules`, `baseline`, `llm`; cardinality 3), `result_bucket` (one of `low`, `medium`, `high`, `critical` per `severitybucket.Bucket`; cardinality 4). Cartesian envelope 3 x 4 = 12 series, bounded.
+- **Help:** Observation of each ThreatScore component contribution (rules, baseline, llm) labelled by the package's result_bucket. Buckets `[0, 25, 50, 75, 100]` cover the 0-100 contribution range; the `llm` component is identically zero in Epic 2 (the slot is wired for Epic 3 to populate).
+- **Sample PromQL (aggregate):** `sum(rate(olaitan_decision_score_total_count[5m])) by (component_contribution, result_bucket)`.
+- **Sample PromQL (alert):** `histogram_quantile(0.99, sum(rate(olaitan_decision_score_total_bucket{component_contribution="rules"}[5m])) by (le)) > 20` for 10 minutes (page when the p99 rule contribution sustains above the SUSPICIOUS threshold; suggests a noisy rule or a sustained attack).
+
+#### `olaitan_decision_score_evaluation_seconds`
+
+- **Type:** histogram
+- **Unit:** seconds
+- **Labels:** none (buckets via `prometheus.ExponentialBucketsRange(1e-6, 100e-3, 10)` aligned to NFR3 100 ms p99 ceiling)
+- **Help:** Wall-clock latency of the deterministic ThreatScore evaluation. The algorithm is `O(|RuleMatches| + |BaselineDeviations|)` with a single atomic `mgr.Get()` snapshot read per call and three label-keyed histogram observations; expected p99 well under 100 microseconds (3 orders of magnitude below NFR3).
+- **Sample PromQL (aggregate):** `histogram_quantile(0.99, sum(rate(olaitan_decision_score_evaluation_seconds_bucket[5m])) by (le))`.
+- **Sample PromQL (alert):** `histogram_quantile(0.99, sum(rate(olaitan_decision_score_evaluation_seconds_bucket[5m])) by (le)) > 0.1` for 5 minutes (page on NFR3 budget breach).
+
+#### Operator scenario: hot-reloading score weights
+
+The FR30 weights and LLM cap are Helm-tunable and hot-reloadable via FR49. To shift the rule-weight from the default 0.4 to 0.5 without a controller restart:
+
+```
+helm upgrade olaitan deploy/helm/olaitan --reuse-values \
+    --set score.ruleWeight=0.5 --set score.llmWeight=0.2
+```
+
+The chart's `templates/configmap.yaml` regex bridge overlays the chart values onto the ConfigMap's `detection.score.*` keys; `internal/config/watcher.go`'s fsnotify listener catches the K8s projected-volume `..data` symlink swap, the 50 ms debounce window expires, and `config.Manager.cur.Store(newCfg)` swaps the atomic pointer. The calculator reads `mgr.Get()` on every `Score()` invocation, so the next EvidencePackage that arrives at the score ring observes the new weights. No `kubectl rollout restart` is required.
+
+The weights validator rejects any operator change that pushes the three weights' sum above 1.0 + 1e-9 (the algebraic trust-bound `max(LLM-only) = LLMWeight × LLMCap` depends on this invariant); a rejected reload leaves the previous snapshot active and the rejection appears in the aggregator's slog output under `config: reload rejected`. Verify the active weights at any time via the startup log line `aggregator: score calculator wired` or by gathering `olaitan_decision_score_*` metrics on `:9090/metrics`.
+
 ### 1.5 Naming-convention reconciliation
 
 The Story 1.18 acceptance criteria text uses a mix of singular-ring and plural-ring metric names (e.g. AC2 says `olaitan_decision_rule_matches_total` singular; AC3 says `olaitan_decision_baseline_deviations_total{metric, sigma_bucket}` plural). The actual registrations follow `architecture.md:472-475` which mandates the `olaitan_<ring>_<metric>` pattern with the engine subfamily conventionally plural (`rules`, `baseline`) because the engine evaluates a corpus, not a single rule. The AC singular spellings are documentation aliases, not parallel families.

@@ -976,6 +976,129 @@ func TestRulesValidateRejectsRelativePath(t *testing.T) {
 	}
 }
 
+// scoreTrustBoundYAML is validYAML's minimal-config shape with a
+// parameterised score block, used by the trust-bound tests below. Only
+// llm_cap differs between the rejection and acceptance cases.
+const (
+	// llm_weight 0.3 * llm_cap 100 = 30 >= 20 SUSPICIOUS threshold. Each
+	// weight is individually in [0,1] and the three sum to exactly 1.0, so
+	// nothing but the explicit product check can reject this config.
+	scoreTrustBoundViolationYAML = `detection:
+  confidence_bands:
+    watch: 10
+    alert: 20
+    act: 60
+  baseline_window: "1h"
+  correlator:
+    window_duration: "60s"
+  posture:
+    enabled: false
+  rules:
+    enabled: false
+  baselines:
+    enabled: false
+  score:
+    rule_weight: 0.4
+    baseline_weight: 0.3
+    llm_weight: 0.3
+    llm_cap: 100
+metrics:
+  address: ":9090"
+rate_limit:
+  enabled: false
+response:
+  excluded_namespaces:
+    - kube-system
+analyst:
+  provider: none
+  timeout: 10s
+  score_cap: 35
+`
+	// llm_weight 0.3 * llm_cap 35 (the FR30 default) = 10.5 < 20.
+	scoreTrustBoundOKYAML = `detection:
+  confidence_bands:
+    watch: 10
+    alert: 20
+    act: 60
+  baseline_window: "1h"
+  correlator:
+    window_duration: "60s"
+  posture:
+    enabled: false
+  rules:
+    enabled: false
+  baselines:
+    enabled: false
+  score:
+    rule_weight: 0.4
+    baseline_weight: 0.3
+    llm_weight: 0.3
+    llm_cap: 35
+metrics:
+  address: ":9090"
+rate_limit:
+  enabled: false
+response:
+  excluded_namespaces:
+    - kube-system
+analyst:
+  provider: none
+  timeout: 10s
+  score_cap: 35
+`
+)
+
+// TestScoreValidateRejectsTrustBoundViolation pins the FR30 LLM-only
+// trust-bound (prd.md:294): a config whose llm_weight*llm_cap reaches the
+// SUSPICIOUS threshold (20) must be rejected even when every weight is
+// individually in [0,1] and the weights sum to <= 1.0. Regression guard
+// added per Story 2.1 code review (PR #29): the sum-<=1 check alone does
+// not constrain the weight*cap product.
+func TestScoreValidateRejectsTrustBoundViolation(t *testing.T) {
+	_, err := config.Load(writeConfig(t, scoreTrustBoundViolationYAML))
+	if err == nil {
+		t.Fatal("Load: got nil, want trust-bound rejection for llm_weight*llm_cap = 30")
+	}
+	if !strings.Contains(err.Error(), "llm_weight*llm_cap") {
+		t.Errorf("error does not mention the trust-bound product: %v", err)
+	}
+}
+
+// TestScoreValidateAcceptsDefaultCap is the positive companion: the FR30
+// default cap (35) yields 0.3*35 = 10.5 < 20 and must validate cleanly.
+func TestScoreValidateAcceptsDefaultCap(t *testing.T) {
+	if _, err := config.Load(writeConfig(t, scoreTrustBoundOKYAML)); err != nil {
+		t.Fatalf("Load: %v (default cap 35 must satisfy the trust-bound)", err)
+	}
+}
+
+// TestLoad_Score_DefaultsOnOmittedBlock asserts the Story 2.1 Task 5.4
+// default-on-omission behaviour: an operator who omits the
+// detection.score block inherits the FR30 production defaults after
+// Load substitution (rule_weight=0.4, baseline_weight=0.3,
+// llm_weight=0.3, llm_cap=35). Mirrors the Story 1.15 rules and Story
+// 1.17 baselines defaulting tests. validYAML carries no detection.score
+// block, so this exercises the pointer-nil substitution path in Load.
+func TestLoad_Score_DefaultsOnOmittedBlock(t *testing.T) {
+	path := writeConfig(t, validYAML)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Detection.Score.RuleWeightOrDefault(); got != 0.4 {
+		t.Errorf("RuleWeight: got %v, want 0.4 (default on omitted block)", got)
+	}
+	if got := cfg.Detection.Score.BaselineWeightOrDefault(); got != 0.3 {
+		t.Errorf("BaselineWeight: got %v, want 0.3 (default on omitted block)", got)
+	}
+	if got := cfg.Detection.Score.LLMWeightOrDefault(); got != 0.3 {
+		t.Errorf("LLMWeight: got %v, want 0.3 (default on omitted block)", got)
+	}
+	if got := cfg.Detection.Score.LLMCapOrDefault(); got != 35 {
+		t.Errorf("LLMCap: got %d, want 35 (default on omitted block)", got)
+	}
+}
+
 // TestRulesEnabledOrDefault verifies the nil-defaults-to-true
 // contract used by callers that do not go through Load (in-memory
 // Config construction in tests or hot-reload diff checks).

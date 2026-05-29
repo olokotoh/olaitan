@@ -121,6 +121,21 @@ detection:
     warmup_duration: "30m"
     sigma_multiplier: 3.0
     redis_addr: "redis:6379"
+  # Story 2.1: deterministic ThreatScore calculator (FR30). Collapses
+  # rule severity and baseline deviation contributions into a single
+  # 0-100 score using the formula
+  #   total = rule_weight * max(rule_severity)
+  #         + baseline_weight * normalised(max_sigma)
+  #         + llm_weight * llm_capped_confidence
+  # where llm_capped_confidence is zero in Epic 2 and populated by the
+  # Epic 3 analyst tier. Defaults pin the algebraic trust-bound
+  # max(LLM-only) = 0.3 * 35 = 10.5 < SUSPICIOUS-threshold 20 per
+  # prd.md:294. All four knobs are hot-reloadable via FR49.
+  score:
+    rule_weight: 0.4
+    baseline_weight: 0.3
+    llm_weight: 0.3
+    llm_cap: 35
 
 # Story 1.12: Prometheus metrics surface (FR8, FR50). Every Olaitan
 # process exposes Prometheus metrics on :9090/metrics from a dedicated

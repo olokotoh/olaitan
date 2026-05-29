@@ -225,6 +225,14 @@ type DetectionConfig struct {
 	// so the loader can distinguish operator omission from explicit
 	// zero/false.
 	Baselines BaselinesConfig `yaml:"baselines,omitempty"`
+	// Story 2.1: score sub-block configures the deterministic
+	// ThreatScore calculator (FR30). Pointer fields per the Story
+	// 1.14 D2 / 1.15 / 1.17 precedent so the loader distinguishes
+	// "operator omitted, substitute default" from "operator
+	// explicitly set 0". All four knobs are hot-reloadable via
+	// config.Manager.Get() on every Score() call -- no restart and
+	// no Subscribe callback required.
+	Score ScoreConfig `yaml:"score,omitempty"`
 }
 
 // CorrelatorConfig controls the Story 1.14 Ring-2 sliding-window
@@ -492,6 +500,138 @@ func (b BaselinesConfig) validate() error {
 	}
 	if b.RedisAddr == "" {
 		return errors.New("detection.baselines.redis_addr: required when baselines.enabled=true")
+	}
+	return nil
+}
+
+// ScoreConfig configures the Story 2.1 deterministic ThreatScore
+// calculator (FR30). The four knobs are pointer-tagged so the loader
+// distinguishes "operator omitted, substitute default" from "operator
+// explicitly set 0" (e.g. setting llm_weight to 0 in a sensing-only
+// deployment is a meaningful explicit choice and must not silently
+// revert to 0.3).
+//
+// All four knobs are hot-reloadable via config.Manager.Get() on every
+// Score() call. The calculator is stateless and reads the snapshot
+// on the hot path; no Subscribe callback is needed (the Story 1.13
+// limiter is the Subscribe precedent for stateful consumers).
+type ScoreConfig struct {
+	RuleWeight     *float64 `yaml:"rule_weight,omitempty"`
+	BaselineWeight *float64 `yaml:"baseline_weight,omitempty"`
+	LLMWeight      *float64 `yaml:"llm_weight,omitempty"`
+	LLMCap         *int     `yaml:"llm_cap,omitempty"`
+}
+
+// DefaultScore returns the FR30 production defaults: 0.4 rule weight,
+// 0.3 baseline weight, 0.3 LLM weight, LLM cap 35 (Claude Opus per
+// prd.md:294). The 0.3 * 35 = 10.5 trust-bound holds below the
+// SUSPICIOUS threshold 20.
+func DefaultScore() ScoreConfig {
+	rw := 0.4
+	bw := 0.3
+	lw := 0.3
+	cap := 35
+	return ScoreConfig{
+		RuleWeight:     &rw,
+		BaselineWeight: &bw,
+		LLMWeight:      &lw,
+		LLMCap:         &cap,
+	}
+}
+
+// RuleWeightOrDefault returns the effective rule weight, substituting
+// the FR30 default when omitted.
+func (s ScoreConfig) RuleWeightOrDefault() float64 {
+	if s.RuleWeight == nil {
+		return 0.4
+	}
+	return *s.RuleWeight
+}
+
+// BaselineWeightOrDefault returns the effective baseline weight,
+// substituting the FR30 default when omitted.
+func (s ScoreConfig) BaselineWeightOrDefault() float64 {
+	if s.BaselineWeight == nil {
+		return 0.3
+	}
+	return *s.BaselineWeight
+}
+
+// LLMWeightOrDefault returns the effective LLM weight, substituting
+// the FR30 default when omitted.
+func (s ScoreConfig) LLMWeightOrDefault() float64 {
+	if s.LLMWeight == nil {
+		return 0.3
+	}
+	return *s.LLMWeight
+}
+
+// LLMCapOrDefault returns the effective LLM cap, substituting the
+// Claude Opus default (35) when omitted.
+func (s ScoreConfig) LLMCapOrDefault() int {
+	if s.LLMCap == nil {
+		return 35
+	}
+	return *s.LLMCap
+}
+
+// SuspiciousThreshold is the ThreatScore at or above which a workload is
+// classed SUSPICIOUS (prd.md:294). The FR30 trust-bound requires that the
+// LLM tier alone can never reach it: max(LLM-only) = LLMWeight*LLMCap must
+// stay strictly below this value.
+const SuspiciousThreshold = 20.0
+
+// validate enforces ScoreConfig invariants. Each weight must lie in
+// [0.0, 1.0]; the three weights must sum to <= 1.0 (a 1e-9 tolerance
+// is allowed for float round-off when an operator sets e.g. 0.333 x 3);
+// LLMCap must lie in [0, 100]; and the LLM-only trust-bound
+// LLMWeight*LLMCap must stay below SuspiciousThreshold (prd.md:294).
+//
+// The sum-<=1 check alone does NOT pin that trust-bound: it constrains
+// each weight individually but says nothing about the weight*cap product.
+// A config such as llm_weight=0.3, llm_cap=100 (both individually valid,
+// weights summing to 1.0) would let the LLM tier alone drive Total to
+// 0.3*100 = 30 >= 20, escalating a workload to SUSPICIOUS on LLM input
+// only. The product is therefore enforced explicitly below. The LLM term
+// is hard-zeroed in Epic 2 (score.go), so this guards against an Epic 3
+// regression (epics.md:1589) rather than a live Epic 2 path. Added per
+// Story 2.1 code review (PR #29).
+//
+// A nil ScoreConfig (all four pointer fields nil) means the operator
+// did not declare the block; skip validation so in-memory test
+// fixtures can omit the sub-block. The Load path substitutes
+// DefaultScore before Validate, so production-deployed configs always
+// reach validate with non-nil pointers.
+func (s ScoreConfig) validate() error {
+	if s.RuleWeight == nil && s.BaselineWeight == nil && s.LLMWeight == nil && s.LLMCap == nil {
+		return nil
+	}
+	if s.RuleWeight != nil {
+		if *s.RuleWeight < 0 || *s.RuleWeight > 1 {
+			return fmt.Errorf("detection.score.rule_weight: must be in [0.0, 1.0] (got %v)", *s.RuleWeight)
+		}
+	}
+	if s.BaselineWeight != nil {
+		if *s.BaselineWeight < 0 || *s.BaselineWeight > 1 {
+			return fmt.Errorf("detection.score.baseline_weight: must be in [0.0, 1.0] (got %v)", *s.BaselineWeight)
+		}
+	}
+	if s.LLMWeight != nil {
+		if *s.LLMWeight < 0 || *s.LLMWeight > 1 {
+			return fmt.Errorf("detection.score.llm_weight: must be in [0.0, 1.0] (got %v)", *s.LLMWeight)
+		}
+	}
+	rw, bw, lw := s.RuleWeightOrDefault(), s.BaselineWeightOrDefault(), s.LLMWeightOrDefault()
+	if sum := rw + bw + lw; sum > 1.0+1e-9 {
+		return fmt.Errorf("detection.score: weights must sum to <= 1.0 (got %.6f from rule_weight=%v, baseline_weight=%v, llm_weight=%v; weights omitted from the config use the FR30 defaults 0.4/0.3/0.3)", sum, rw, bw, lw)
+	}
+	if s.LLMCap != nil {
+		if *s.LLMCap < 0 || *s.LLMCap > 100 {
+			return fmt.Errorf("detection.score.llm_cap: must be in [0, 100] (got %d)", *s.LLMCap)
+		}
+	}
+	if llmOnly := lw * float64(s.LLMCapOrDefault()); llmOnly >= SuspiciousThreshold {
+		return fmt.Errorf("detection.score: llm_weight*llm_cap = %.3f must be < %.0f (the SUSPICIOUS threshold, prd.md:294); the LLM tier alone must not escalate a workload (FR30 trust-bound)", llmOnly, SuspiciousThreshold)
 	}
 	return nil
 }
@@ -856,6 +996,26 @@ func Load(path string) (*Config, error) {
 		if cfg.Detection.Baselines.RedisAddr == "" {
 			cfg.Detection.Baselines.RedisAddr = defBaselines.RedisAddr
 		}
+
+		// Story 2.1: substitute score defaults before Validate so an
+		// operator who omits the detection.score block inherits the
+		// FR30 defaults 0.4 / 0.3 / 0.3 with LLMCap 35. The pointer-
+		// tagged fields let an explicit `llm_weight: 0` survive
+		// intact (e.g. sensing-only deployments that disable the LLM
+		// contribution explicitly).
+		defScore := DefaultScore()
+		if cfg.Detection.Score.RuleWeight == nil {
+			cfg.Detection.Score.RuleWeight = defScore.RuleWeight
+		}
+		if cfg.Detection.Score.BaselineWeight == nil {
+			cfg.Detection.Score.BaselineWeight = defScore.BaselineWeight
+		}
+		if cfg.Detection.Score.LLMWeight == nil {
+			cfg.Detection.Score.LLMWeight = defScore.LLMWeight
+		}
+		if cfg.Detection.Score.LLMCap == nil {
+			cfg.Detection.Score.LLMCap = defScore.LLMCap
+		}
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -965,6 +1125,9 @@ func (d DetectionConfig) validate() error {
 		return err
 	}
 	if err := d.Baselines.validate(); err != nil {
+		return err
+	}
+	if err := d.Score.validate(); err != nil {
 		return err
 	}
 	return nil

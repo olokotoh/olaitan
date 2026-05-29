@@ -392,6 +392,38 @@ data:
     {{- $cfg = regexReplaceAll $pBra $cfg (printf "${1}redis_addr: %q" $effectiveRedisAddr) }}
     {{- end }}
     {{- /*
+    Story 2.1 score block bridge. Mirrors the Story 1.15 / 1.17
+    pattern: each weight knob is anchor-guarded against the indent
+    structure inside `detection.score:`. The bridge runs BEFORE the
+    Story 1.19 evaluation overlay because Story 2.1 deliberately does
+    NOT participate in the F / RS / RSL / RSLT arm overlays -- score
+    weights are unchanged across arms (the F arm disables rules and
+    baselines entirely so no input ever reaches the calculator).
+    */ -}}
+    {{- if .Values.score }}
+    {{- $sc := .Values.score }}
+    {{- if hasKey $sc "ruleWeight" }}
+    {{- $pScRw := "(\\n  score:[[:space:]]*\\n    )rule_weight:[[:space:]]+[0-9.]+" -}}
+    {{- if not (mustRegexFind $pScRw $cfg) }}{{- fail (printf "helm bridge: detection.score.rule_weight anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pScRw) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pScRw $cfg (printf "${1}rule_weight: %v" $sc.ruleWeight) }}
+    {{- end }}
+    {{- if hasKey $sc "baselineWeight" }}
+    {{- $pScBw := "(?s)(\\n    rule_weight:[[:space:]]+[0-9.]+\\n    )baseline_weight:[[:space:]]+[0-9.]+" -}}
+    {{- if not (mustRegexFind $pScBw $cfg) }}{{- fail (printf "helm bridge: detection.score.baseline_weight anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pScBw) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pScBw $cfg (printf "${1}baseline_weight: %v" $sc.baselineWeight) }}
+    {{- end }}
+    {{- if hasKey $sc "llmWeight" }}
+    {{- $pScLw := "(?s)(\\n    baseline_weight:[[:space:]]+[0-9.]+\\n    )llm_weight:[[:space:]]+[0-9.]+" -}}
+    {{- if not (mustRegexFind $pScLw $cfg) }}{{- fail (printf "helm bridge: detection.score.llm_weight anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pScLw) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pScLw $cfg (printf "${1}llm_weight: %v" $sc.llmWeight) }}
+    {{- end }}
+    {{- if hasKey $sc "llmCap" }}
+    {{- $pScCap := "(?s)(\\n    llm_weight:[[:space:]]+[0-9.]+\\n    )llm_cap:[[:space:]]+[0-9]+" -}}
+    {{- if not (mustRegexFind $pScCap $cfg) }}{{- fail (printf "helm bridge: detection.score.llm_cap anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pScCap) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pScCap $cfg (printf "${1}llm_cap: %v" $sc.llmCap) }}
+    {{- end }}
+    {{- end }}
+    {{- /*
     Story 1.19: Evaluation-matrix overlay (FR53). Replace the file-side
     defaults for detection.rules.enabled, detection.baselines.enabled,
     and analyst.provider with the effective values computed by the
