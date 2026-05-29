@@ -108,6 +108,7 @@ type Calculator struct {
 // RegisterHistogramVec ownership contract.
 type calcMetrics struct {
 	evalCount       atomic.Int64
+	anomalyCount    atomic.Int64
 	scoreHist       *prometheus.HistogramVec
 	evalSecondsHist prometheus.Histogram
 }
@@ -156,6 +157,16 @@ func (c *Calculator) registerMetrics(r *metrics.Registry) error {
 		"Cumulative number of ThreatScore evaluations performed by the deterministic calculator (FR30).",
 		nil,
 		func() int64 { return c.metrics.evalCount.Load() },
+	); err != nil {
+		return err
+	}
+
+	if err := r.RegisterCounter(
+		"olaitan_decision_score_anomalies_total",
+		"",
+		"Cumulative number of malformed baseline deviations (NaN/Inf/negative sigma) skipped during scoring. A non-zero rate means a source is emitting structurally invalid sigma; the affected deviation is dropped and scoring continues on the remaining signals (Story 2.1 code review, PR #29).",
+		nil,
+		func() int64 { return c.metrics.anomalyCount.Load() },
 	); err != nil {
 		return err
 	}
@@ -235,7 +246,10 @@ func (c *Calculator) resolve() Config {
 //     TestScore_SeverityParseFallback locks this.
 //  3. baselineContribution: max sigma across pkg.BaselineDeviations,
 //     normalised against cfg.SigmaNormaliser and capped at 1.0, then
-//     scaled to the [0, 100] contribution space.
+//     scaled to the [0, 100] contribution space. A NaN/Inf/negative
+//     sigma is structurally invalid; the deviation is skipped (counted
+//     on olaitan_decision_score_anomalies_total) and scoring continues
+//     on the remaining signals.
 //  4. llmContribution: 0 in Story 2.1. Epic 3 follow-up at
 //     epics.md:1589 replaces this with llm_capped_confidence. There
 //     is no `if cfg.LLMEnabled` branch -- a dead branch would mask
@@ -248,10 +262,11 @@ func (c *Calculator) resolve() Config {
 // order of appearance and tracks running maxima; no time.Now(), no
 // map iteration, no goroutine scheduling.
 //
-// Error contract: returns an error only on structurally impossible
-// inputs (e.g. negative Sigma, which the schema permits at the type
-// level but the baseline engine never emits). Operator-misconfigured
-// weights are rejected upstream by ScoreConfig.validate().
+// Error contract: Score never returns a non-nil error in Epic 2 -- a nil
+// package is a no-op and malformed baseline deviations are skipped (see
+// step 3). The (ConfidenceScore, error) signature is retained for the
+// Epic 3 LLM tier, which may surface provider errors. Operator-
+// misconfigured weights are rejected upstream by ScoreConfig.validate().
 func (c *Calculator) Score(pkg *schema.EvidencePackage) (schema.ConfidenceScore, error) {
 	start := time.Now()
 	defer func() {
@@ -289,11 +304,21 @@ func (c *Calculator) Score(pkg *schema.EvidencePackage) (schema.ConfidenceScore,
 
 	maxSigma := 0.0
 	for _, bd := range pkg.BaselineDeviations {
-		if math.IsNaN(bd.Sigma) || math.IsInf(bd.Sigma, 0) {
-			return schema.ConfidenceScore{}, fmt.Errorf("score: NaN/Inf sigma on metric %q", bd.Metric)
-		}
-		if bd.Sigma < 0 {
-			return schema.ConfidenceScore{}, fmt.Errorf("score: negative sigma %v on metric %q", bd.Sigma, bd.Metric)
+		// A NaN/Inf/negative sigma is structurally invalid (the baseline
+		// engine never emits one; the schema permits it at the type
+		// level). Skip the malformed deviation and keep scoring the
+		// remaining signals rather than aborting the whole package.
+		// Aborting to a zero score would be fail-open for a detection
+		// system: a single poisoned sigma would suppress an otherwise
+		// escalating rule match, an evasion vector. The skip mirrors the
+		// severity-parse fallback above and is surfaced via the anomaly
+		// counter so malformed input stays visible (Story 2.1 code
+		// review, PR #29).
+		if math.IsNaN(bd.Sigma) || math.IsInf(bd.Sigma, 0) || bd.Sigma < 0 {
+			if c.metrics != nil {
+				c.metrics.anomalyCount.Add(1)
+			}
+			continue
 		}
 		if bd.Sigma > maxSigma {
 			maxSigma = bd.Sigma

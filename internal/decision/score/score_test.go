@@ -274,33 +274,50 @@ func TestScore_ConfigSnapshotChange(t *testing.T) {
 	}
 }
 
-// TestScore_NegativeSigmaIsStructuralError defends the Task 2.6 error
-// contract: a negative Sigma value should never reach the calculator
-// (the baseline engine never emits one), so receiving one is a
-// structural error not a silent zero.
-func TestScore_NegativeSigmaIsStructuralError(t *testing.T) {
+// TestScore_NegativeSigmaIsSkipped pins the Story 2.1 code-review (PR #29)
+// decision: a negative Sigma is structurally invalid (the baseline engine
+// never emits one) and is skipped rather than aborting the score.
+// Aborting to a zero score would let a single poisoned sigma suppress an
+// otherwise-escalating rule match (fail-open evasion), so a valid rule
+// match in the same package must still drive the score and the malformed
+// deviation must contribute 0.
+func TestScore_NegativeSigmaIsSkipped(t *testing.T) {
 	c := newCalcForTest(t, staticGetter(defaultScoreCfg()))
 
-	_, err := c.Score(&schema.EvidencePackage{
+	got, err := c.Score(&schema.EvidencePackage{
+		RuleMatches:        []schema.RuleMatch{{Severity: "100"}},
 		BaselineDeviations: []schema.BaselineDeviation{{Metric: "bad", Sigma: -1.0}},
 	})
-	if err == nil {
-		t.Fatalf("negative sigma: want error, got nil")
+	if err != nil {
+		t.Fatalf("negative sigma: want skip-and-continue, got error %v", err)
+	}
+	if got.Baseline != 0 {
+		t.Fatalf("malformed sigma must contribute 0 to baseline, got %v", got.Baseline)
+	}
+	if got.Rules <= 0 {
+		t.Fatalf("rule contribution lost: a skipped sigma must not zero the rule match (got Rules=%v)", got.Rules)
 	}
 }
 
-// TestScore_NaNInfSigmaIsStructuralError is the companion structural
-// check for NaN / Inf sigma values; the baseline engine guards
-// upstream but the calculator must not silently treat them as 0.
-func TestScore_NaNInfSigmaIsStructuralError(t *testing.T) {
+// TestScore_NaNInfSigmaIsSkipped is the companion for NaN / +Inf / -Inf:
+// each is skipped, scoring continues, and a co-located rule match still
+// produces its contribution.
+func TestScore_NaNInfSigmaIsSkipped(t *testing.T) {
 	c := newCalcForTest(t, staticGetter(defaultScoreCfg()))
 
 	for _, bad := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
-		_, err := c.Score(&schema.EvidencePackage{
+		got, err := c.Score(&schema.EvidencePackage{
+			RuleMatches:        []schema.RuleMatch{{Severity: "100"}},
 			BaselineDeviations: []schema.BaselineDeviation{{Metric: "bad", Sigma: bad}},
 		})
-		if err == nil {
-			t.Fatalf("Sigma=%v: want error, got nil", bad)
+		if err != nil {
+			t.Fatalf("Sigma=%v: want skip-and-continue, got error %v", bad, err)
+		}
+		if got.Baseline != 0 {
+			t.Fatalf("Sigma=%v: malformed sigma must contribute 0 to baseline, got %v", bad, got.Baseline)
+		}
+		if got.Rules <= 0 {
+			t.Fatalf("Sigma=%v: rule contribution lost (got Rules=%v)", bad, got.Rules)
 		}
 	}
 }

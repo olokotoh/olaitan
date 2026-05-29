@@ -575,13 +575,27 @@ func (s ScoreConfig) LLMCapOrDefault() int {
 	return *s.LLMCap
 }
 
+// SuspiciousThreshold is the ThreatScore at or above which a workload is
+// classed SUSPICIOUS (prd.md:294). The FR30 trust-bound requires that the
+// LLM tier alone can never reach it: max(LLM-only) = LLMWeight*LLMCap must
+// stay strictly below this value.
+const SuspiciousThreshold = 20.0
+
 // validate enforces ScoreConfig invariants. Each weight must lie in
 // [0.0, 1.0]; the three weights must sum to <= 1.0 (a 1e-9 tolerance
 // is allowed for float round-off when an operator sets e.g. 0.333 x 3);
-// LLMCap must lie in [0, 100]. The sum-<=1 invariant is what
-// mathematically pins the trust-bound max(LLM-only) <= LLMWeight * LLMCap;
-// rejecting weights that would break it stops the calculator from
-// emitting scores above the SUSPICIOUS threshold under LLM-only input.
+// LLMCap must lie in [0, 100]; and the LLM-only trust-bound
+// LLMWeight*LLMCap must stay below SuspiciousThreshold (prd.md:294).
+//
+// The sum-<=1 check alone does NOT pin that trust-bound: it constrains
+// each weight individually but says nothing about the weight*cap product.
+// A config such as llm_weight=0.3, llm_cap=100 (both individually valid,
+// weights summing to 1.0) would let the LLM tier alone drive Total to
+// 0.3*100 = 30 >= 20, escalating a workload to SUSPICIOUS on LLM input
+// only. The product is therefore enforced explicitly below. The LLM term
+// is hard-zeroed in Epic 2 (score.go), so this guards against an Epic 3
+// regression (epics.md:1589) rather than a live Epic 2 path. Added per
+// Story 2.1 code review (PR #29).
 //
 // A nil ScoreConfig (all four pointer fields nil) means the operator
 // did not declare the block; skip validation so in-memory test
@@ -607,14 +621,17 @@ func (s ScoreConfig) validate() error {
 			return fmt.Errorf("detection.score.llm_weight: must be in [0.0, 1.0] (got %v)", *s.LLMWeight)
 		}
 	}
-	sum := s.RuleWeightOrDefault() + s.BaselineWeightOrDefault() + s.LLMWeightOrDefault()
-	if sum > 1.0+1e-9 {
-		return fmt.Errorf("detection.score: weights must sum to <= 1.0 (got %.6f); breaking this invariant violates the FR30 trust-bound max(LLM-only) < SUSPICIOUS-threshold", sum)
+	rw, bw, lw := s.RuleWeightOrDefault(), s.BaselineWeightOrDefault(), s.LLMWeightOrDefault()
+	if sum := rw + bw + lw; sum > 1.0+1e-9 {
+		return fmt.Errorf("detection.score: weights must sum to <= 1.0 (got %.6f from rule_weight=%v, baseline_weight=%v, llm_weight=%v; weights omitted from the config use the FR30 defaults 0.4/0.3/0.3)", sum, rw, bw, lw)
 	}
 	if s.LLMCap != nil {
 		if *s.LLMCap < 0 || *s.LLMCap > 100 {
 			return fmt.Errorf("detection.score.llm_cap: must be in [0, 100] (got %d)", *s.LLMCap)
 		}
+	}
+	if llmOnly := lw * float64(s.LLMCapOrDefault()); llmOnly >= SuspiciousThreshold {
+		return fmt.Errorf("detection.score: llm_weight*llm_cap = %.3f must be < %.0f (the SUSPICIOUS threshold, prd.md:294); the LLM tier alone must not escalate a workload (FR30 trust-bound)", llmOnly, SuspiciousThreshold)
 	}
 	return nil
 }

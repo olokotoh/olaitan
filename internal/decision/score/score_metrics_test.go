@@ -1,6 +1,7 @@
 package score
 
 import (
+	"math"
 	"testing"
 
 	"github.com/olokotoh/olaitan/internal/metrics"
@@ -50,6 +51,7 @@ func TestNew_RegistersMetricFamilies(t *testing.T) {
 	}
 	want := map[string]bool{
 		"olaitan_decision_score_evaluations_total":  false,
+		"olaitan_decision_score_anomalies_total":    false,
 		"olaitan_decision_score_total":              false,
 		"olaitan_decision_score_evaluation_seconds": false,
 	}
@@ -83,6 +85,35 @@ func TestScore_IncrementsEvaluationsCounter(t *testing.T) {
 
 	if got := after - before; got != 1 {
 		t.Fatalf("evaluations_total delta: want 1, got %v", got)
+	}
+}
+
+// TestScore_SkippedSigmaIncrementsAnomalyCounter pins the Story 2.1
+// code-review (PR #29) observability fix: each malformed baseline
+// deviation skipped during scoring increments
+// olaitan_decision_score_anomalies_total, so a source emitting invalid
+// sigma stays visible instead of being silently swallowed.
+func TestScore_SkippedSigmaIncrementsAnomalyCounter(t *testing.T) {
+	reg := metrics.NewRegistry()
+	c, err := newWithGetter(staticGetter(defaultScoreCfg()), reg)
+	if err != nil {
+		t.Fatalf("newWithGetter: %v", err)
+	}
+
+	before := gatheredCounter(t, reg, "olaitan_decision_score_anomalies_total")
+	// Two malformed deviations (negative + NaN) in one package -> +2.
+	if _, err := c.Score(&schema.EvidencePackage{
+		BaselineDeviations: []schema.BaselineDeviation{
+			{Metric: "neg", Sigma: -1.0},
+			{Metric: "nan", Sigma: math.NaN()},
+		},
+	}); err != nil {
+		t.Fatalf("Score: %v", err)
+	}
+	after := gatheredCounter(t, reg, "olaitan_decision_score_anomalies_total")
+
+	if got := after - before; got != 2 {
+		t.Fatalf("anomalies_total delta: want 2, got %v", got)
 	}
 }
 

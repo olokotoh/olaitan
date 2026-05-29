@@ -67,22 +67,44 @@ func TestProperty_ScoreInRange(t *testing.T) {
 }
 
 // TestProperty_NoLLMOnlyEscalation is the algebraic trust-bound:
-// max(LLM-only) = LLMWeight * LLMCap = 0.3 * 35 = 10.5, comfortably
-// below the SUSPICIOUS threshold 20 per prd.md:294. Generator forces
-// empty RuleMatches and empty BaselineDeviations. The FR55 empirical
+// max(LLM-only) = LLMWeight * LLMCap must stay below the SUSPICIOUS
+// threshold (20, prd.md:294) so the LLM tier alone can never escalate a
+// workload.
+//
+// Epic 2 hard-zeroes the runtime LLM term (score.go: llm = LLMWeight*0),
+// so asserting on Score().Total alone is vacuous -- it is identically 0
+// for an LLM-only package regardless of the cap, and the original
+// assertion `Total < 20` therefore proved nothing (it passed even with
+// llm_cap=100). This rewrite pins the real ceiling two ways:
+//
+//  1. The algebraic ceiling LLMWeight*LLMCap of the resolved config is
+//     computed directly and asserted below the threshold -- this is the
+//     value the runtime term will reach once Epic 3 (epics.md:1589)
+//     populates it, so the test is non-vacuous and cap-sensitive.
+//  2. The runtime LLM-only Score().Total never exceeds that ceiling
+//     today (it is 0 <= ceiling), confirming the term is still zeroed.
+//
+// Enforcement of the ceiling across the whole operator-tunable config
+// space lives in ScoreConfig.validate (config package:
+// TestScoreValidateRejectsTrustBoundViolation). The FR55 empirical
 // counterpart is the Epic 5 adversarial-LLM experiment.
 func TestProperty_NoLLMOnlyEscalation(t *testing.T) {
 	c := newCalcForTest(t, staticGetter(scoreCfg(0.4, 0.3, 0.3, 35)))
 
+	snap := c.Snapshot()
+	ceiling := snap.LLMWeight * snap.LLMCap
+	if ceiling >= config.SuspiciousThreshold {
+		t.Fatalf("trust-bound: LLMWeight*LLMCap = %v, want < %v (SUSPICIOUS)", ceiling, config.SuspiciousThreshold)
+	}
+
 	props := gopter.NewProperties(pinnedParams())
-	props.Property("LLM-only path produces Total < 20 (SUSPICIOUS threshold)", prop.ForAll(
+	props.Property("runtime LLM-only Total stays within the algebraic ceiling and below SUSPICIOUS", prop.ForAll(
 		func(_ int) bool {
-			pkg := &schema.EvidencePackage{}
-			got, err := c.Score(pkg)
+			got, err := c.Score(&schema.EvidencePackage{})
 			if err != nil {
 				return false
 			}
-			return got.Total < 20
+			return got.Total <= ceiling && got.Total < config.SuspiciousThreshold
 		},
 		gen.IntRange(0, 1000),
 	))
