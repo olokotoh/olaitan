@@ -322,6 +322,35 @@ func TestScore_NaNInfSigmaIsSkipped(t *testing.T) {
 	}
 }
 
+// TestScore_SigmaNormaliserFallsBackToBaselines covers AC5's fallback
+// branch in resolve(): when the score block carries no sigma normaliser
+// of its own, the calculator's SigmaNormaliser is sourced from
+// detection.baselines.sigma_multiplier. The other score tests leave the
+// baselines block zero-valued, so they exercise only the
+// DefaultSigmaNormaliser (3.0) path; this test pins a non-default
+// multiplier of 5.0 and proves the normalisation denominator actually
+// uses it. With max sigma 4.0 the denominator-5.0 result (baseline =
+// 0.3 * min(4/5,1)*100 = 24) is distinct from the default-3.0 result
+// (baseline = 0.3 * min(4/3,1)*100 = 30), so a regression that ignored
+// the baselines multiplier would be caught.
+func TestScore_SigmaNormaliserFallsBackToBaselines(t *testing.T) {
+	cfg := defaultScoreCfg()
+	mult := 5.0
+	cfg.Detection.Baselines.SigmaMultiplier = &mult
+
+	c := newCalcForTest(t, staticGetter(cfg))
+
+	got, err := c.Score(&schema.EvidencePackage{
+		BaselineDeviations: []schema.BaselineDeviation{{Sigma: 4.0}},
+	})
+	if err != nil {
+		t.Fatalf("Score: %v", err)
+	}
+	if got.Baseline != 24 || got.Total != 24 {
+		t.Fatalf("baselines fallback: want Baseline=24 Total=24 (denominator 5.0), got Baseline=%v Total=%v", got.Baseline, got.Total)
+	}
+}
+
 // TestScore_TotalClamping defends step 6 of the algorithm: weights
 // summing > 1 cannot drive the total above 100. Configures degenerate
 // weights of (1.0, 1.0, 0.0) -- validate() would reject this in the
