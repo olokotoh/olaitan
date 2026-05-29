@@ -47,14 +47,6 @@ func (s *RecordingSink) Publish(st schema.StateTransition) {
 	s.transitions = append(s.transitions, st)
 }
 
-func (s *RecordingSink) all() []schema.StateTransition {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]schema.StateTransition, len(s.transitions))
-	copy(out, s.transitions)
-	return out
-}
-
 func (s *RecordingSink) count() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()

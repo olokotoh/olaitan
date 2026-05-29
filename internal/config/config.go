@@ -653,9 +653,9 @@ func (s ScoreConfig) validate() error {
 // "operator explicitly set 0" (a 0 s dwell on SUSPICIOUS is the default
 // and a meaningful explicit choice).
 //
-// All four are hot-reloadable via config.Manager.Subscribe: the FSM
-// holds per-workload state, so it follows the Story 1.13 limiter
-// Subscribe precedent rather than the Story 2.1 stateless-Get precedent.
+// All four are hot-reloadable: the FSM reads config.Manager.Get() once
+// per Evaluate call, following the Story 2.1 score precedent. No restart
+// and no Subscribe callback are required.
 type FSMConfig struct {
 	SuspiciousDwellSeconds      *int `yaml:"suspicious_dwell_seconds,omitempty"`
 	RestrictedDwellSeconds      *int `yaml:"restricted_dwell_seconds,omitempty"`

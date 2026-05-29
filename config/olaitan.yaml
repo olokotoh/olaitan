@@ -148,7 +148,8 @@ detection:
   # the score crosses the alert band; the RESTRICTED and QUARANTINED
   # dwells damp oscillation (AC2) and the cooldown gates de-escalation so
   # a single low sample does not de-escalate (AC3). All four are
-  # hot-reloadable via FR49 (config.Manager.Subscribe).
+  # hot-reloadable via FR49: the FSM reads config.Manager.Get() once per
+  # Evaluate call, following the Story 2.1 score precedent.
   fsm:
     suspicious_dwell_seconds: 0
     restricted_dwell_seconds: 120

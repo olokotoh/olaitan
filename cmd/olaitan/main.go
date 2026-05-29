@@ -595,8 +595,9 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	// into fsm.Evaluate, one state step at a time. A no-op TransitionSink
 	// is wired for now; Story 2.3 (Redis persistence) and Story 2.8 (NATS
 	// audit) replace it with real sinks. Dwell guards and the de-escalation
-	// cooldown read the config snapshot, so the Subscribe callback below
-	// keeps a hot config reload (FR49) flowing into the live machine.
+	// cooldown read config.Manager.Get() once per Evaluate call, following
+	// the Story 2.1 score precedent, so a hot config reload (FR49) flows
+	// into the live machine without a Subscribe callback.
 	stateMachine, fsmErr := fsm.New(mgr, metricsReg, fsm.NopSink{}, nil)
 	if fsmErr != nil {
 		closeNATS()
