@@ -215,6 +215,18 @@ func runRingCtx(ctx context.Context, ring string, args []string, stderr io.Write
 		}
 	case "aggregator":
 		if err := startAggregatorRing(gctx, g, log, mgr.Get(), mgr.Subscribe, mgr); err != nil {
+			// A cancelled context during startup is a clean shutdown, not
+			// a crash; mirror the g.Wait() path below and exit 0. The
+			// aggregator wiring makes context-dependent JetStream calls
+			// (wireFSMConsumer), so cancellation in the startup window can
+			// surface here as a wrapped context.Canceled.
+			if errors.Is(err, context.Canceled) {
+				log.Info(ring + ": shutting down")
+				ringCancel()
+				_ = g.Wait()
+				<-watcherDone
+				return 0
+			}
 			log.Error("startup: aggregator ring wiring", "err", err)
 			ringCancel()
 			_ = g.Wait()
