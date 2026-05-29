@@ -17,6 +17,7 @@ The Olaitan project follows semver for the on-the-wire schema:
 | Date | Story | Version | Change | Field(s) | Backwards compatible? |
 |---|---|---|---|---|---|
 | 2026-05-15 | 1.13 | MINOR | Added per-event sampling annotation for the per-source rate-limit circuit breaker. | `Event.Sampled` (`bool`, `json:"sampled,omitempty"`); `Event.SamplingRate` (`float64`, `json:"sampling_rate,omitempty"`) | Yes. `omitempty` keeps unsampled events bit-identical to the pre-1.13 wire form; the EVENTS.raw `MaxMsgSize` budget is unaffected. |
+| 2026-05-29 | 2.2 | MINOR | Extended `StateTransition` with the FSM provenance fields (BI-2). The on-wire shape is mirrored in `docs/schemas/state_transition.yaml` (`state_transition.v2`). | `StateTransition.WorkloadID` (`string`, `json:"workload_id,omitempty"`); `StateTransition.PackageID` (`string`, `json:"package_id,omitempty"`); `StateTransition.Reason` (`string`, `json:"reason,omitempty"`) | Yes. All three are `omitempty`, so the pre-2.2 wire form (the Story 1.x `schema.Incident.Transitions` slice) stays byte-identical for the zero value. No existing field was renamed or removed. |
 
 ## How to add a row
 

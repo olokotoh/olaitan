@@ -1,0 +1,85 @@
+# Canonical on-wire shape of schema.StateTransition.
+#
+# Source of truth: internal/schema/state.go (type StateTransition).
+# Version history: docs/schema-versioning.md.
+#
+# Story 2.2 (FSM) extended this schema to state_transition.v2 by adding
+# the three FSM provenance fields (workload_id, package_id, reason) per
+# binding interpretation BI-2. All three are omitempty, so the pre-2.2
+# wire form (the Story 1.x schema.Incident.Transitions slice) stays
+# byte-identical for the zero value. No existing field was renamed.
+schema: state_transition.v2
+description: >
+  A pod (or workload) moving between PodSecurityState values. Emitted by
+  the FSM (internal/response/fsm) on every actual state change and
+  consumed by Story 2.3 (Redis persistence) and Story 2.8 (NATS audit).
+fields:
+  timestamp:
+    type: string
+    format: date-time
+    required: true
+    description: When the transition occurred (FSM injected Clock).
+  pod:
+    type: object
+    required: true
+    description: PodRef (name, namespace, uid) the transition applies to.
+  from_state:
+    type: string
+    required: true
+    enum: [CLEAN, SUSPICIOUS, RESTRICTED, QUARANTINED, PRESERVED_KILLED]
+    description: AC4 before_state. The state the workload left.
+  to_state:
+    type: string
+    required: true
+    enum: [CLEAN, SUSPICIOUS, RESTRICTED, QUARANTINED, PRESERVED_KILLED]
+    description: AC4 after_state. The state the workload entered.
+  trigger_type:
+    type: string
+    required: true
+    enum: [automated, override]
+    description: >
+      "automated" for FSM-driven transitions (Story 2.2), "override" for
+      operator overrides (Story 2.7).
+  confidence:
+    type: number
+    required: true
+    description: >
+      AC4 triggering_threat_score. Carries ConfidenceScore.Total in
+      [0, 100], the score that drove this transition.
+  trigger_events:
+    type: array
+    items: {type: string}
+    required: false
+    description: Optional event IDs that contributed to the transition.
+  operator_id:
+    type: string
+    required: false
+    description: Operator who authored an override transition (Story 2.7).
+  workload_id:
+    type: string
+    required: false
+    added_in: state_transition.v2
+    description: >
+      AC4 workload_id. The schema.WorkloadIdentity canonical string
+      (namespace/owner-kind/owner-name, pod-name fallback) the FSM keyed
+      this transition on.
+  package_id:
+    type: string
+    required: false
+    added_in: state_transition.v2
+    description: >
+      AC4 package_id. The EvidencePackage that triggered the evaluation,
+      used as the FSM idempotency key (BI-5).
+  reason:
+    type: string
+    required: false
+    added_in: state_transition.v2
+    enum:
+      - escalation_threshold_crossed
+      - dwell_guard_elapsed
+      - de_escalation_cooldown_expired
+      - no_transition
+    description: >
+      AC4 reason. Why the FSM produced this transition. "no_transition"
+      is set on the record returned when state was unchanged and is not
+      emitted to a TransitionSink.

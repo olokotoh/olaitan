@@ -377,6 +377,30 @@ func (r *Registry) RegisterCounterVec(name, help string, labels []string) (*prom
 	return v, nil
 }
 
+// RegisterGaugeVec binds a labelled gauge to the Prometheus surface and
+// returns the *prometheus.GaugeVec handle. Use this for a directly-set
+// gauge family whose label set is not known up front (e.g. the Story 2.2
+// FSM active-workloads gauge keyed by state). The caller owns the handle
+// and is responsible for Set/Inc/Dec calls; the same ownership and
+// cardinality guidance as RegisterCounterVec applies.
+func (r *Registry) RegisterGaugeVec(name, help string, labels []string) (*prometheus.GaugeVec, error) {
+	if r == nil {
+		return nil, ErrNilRegistry
+	}
+	if name == "" {
+		return nil, errors.New("metrics: empty metric name")
+	}
+
+	v := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: name,
+		Help: help,
+	}, labels)
+	if err := r.reg.Register(v); err != nil {
+		return nil, fmt.Errorf("metrics: register %s: %w", name, err)
+	}
+	return v, nil
+}
+
 // RegisterHistogramVec binds a labelled histogram to the Prometheus
 // surface and returns the *prometheus.HistogramVec handle. Shares
 // the same ownership contract as RegisterCounterVec and the same

@@ -1111,3 +1111,150 @@ func TestRulesEnabledOrDefault(t *testing.T) {
 		t.Errorf("explicit disabled: EnabledOrDefault() = true, want false")
 	}
 }
+
+// TestLoad_FSM_DefaultsOnOmittedBlock asserts the Story 2.2 Task 2.2
+// default-on-omission behaviour: an operator who omits the detection.fsm
+// block inherits the AC2/AC3 defaults after Load substitution
+// (SUSPICIOUS dwell 0, RESTRICTED/QUARANTINED dwell 120, de-escalation
+// cooldown 600). validYAML carries no detection.fsm block, so this
+// exercises the pointer-nil substitution path in Load.
+func TestLoad_FSM_DefaultsOnOmittedBlock(t *testing.T) {
+	path := writeConfig(t, validYAML)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	f := cfg.Detection.FSM
+	if got := f.SuspiciousDwellSecondsOrDefault(); got != 0 {
+		t.Errorf("SuspiciousDwellSeconds: got %d, want 0", got)
+	}
+	if got := f.RestrictedDwellSecondsOrDefault(); got != 120 {
+		t.Errorf("RestrictedDwellSeconds: got %d, want 120", got)
+	}
+	if got := f.QuarantinedDwellSecondsOrDefault(); got != 120 {
+		t.Errorf("QuarantinedDwellSeconds: got %d, want 120", got)
+	}
+	if got := f.DeescalationCooldownSecondsOrDefault(); got != 600 {
+		t.Errorf("DeescalationCooldownSeconds: got %d, want 600", got)
+	}
+	// After Load substitution the pointers must be non-nil so a hot
+	// reload diff sees concrete values.
+	if f.SuspiciousDwellSeconds == nil || f.RestrictedDwellSeconds == nil ||
+		f.QuarantinedDwellSeconds == nil || f.DeescalationCooldownSeconds == nil {
+		t.Error("Load left an FSM pointer nil; defaults must be substituted before Validate")
+	}
+}
+
+// TestFSMConfig_ExplicitValuesHonoured pins that an explicitly-set FSM
+// block (including an explicit 0 dwell) survives Load intact and is not
+// overwritten by the default substitution.
+func TestFSMConfig_ExplicitValuesHonoured(t *testing.T) {
+	body := `
+detection:
+  confidence_bands:
+    watch: 20
+    alert: 40
+    act: 70
+  baseline_window: 24h
+  fsm:
+    suspicious_dwell_seconds: 0
+    restricted_dwell_seconds: 30
+    quarantined_dwell_seconds: 45
+    deescalation_cooldown_seconds: 90
+response:
+  excluded_namespaces: []
+analyst:
+  provider: api
+  score_cap: 35
+  timeout: 10s
+`
+	cfg, err := config.Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	f := cfg.Detection.FSM
+	if got := f.RestrictedDwellSecondsOrDefault(); got != 30 {
+		t.Errorf("RestrictedDwellSeconds: got %d, want 30", got)
+	}
+	if got := f.QuarantinedDwellSecondsOrDefault(); got != 45 {
+		t.Errorf("QuarantinedDwellSeconds: got %d, want 45", got)
+	}
+	if got := f.DeescalationCooldownSecondsOrDefault(); got != 90 {
+		t.Errorf("DeescalationCooldownSeconds: got %d, want 90", got)
+	}
+	if got := f.SuspiciousDwellSecondsOrDefault(); got != 0 {
+		t.Errorf("SuspiciousDwellSeconds: got %d, want explicit 0", got)
+	}
+}
+
+// TestFSMConfig_RejectsNegativeDuration pins the BI-4 non-negativity
+// invariant: a negative dwell or cooldown is rejected by Validate.
+func TestFSMConfig_RejectsNegativeDuration(t *testing.T) {
+	body := `
+detection:
+  confidence_bands:
+    watch: 20
+    alert: 40
+    act: 70
+  baseline_window: 24h
+  fsm:
+    restricted_dwell_seconds: -5
+response:
+  excluded_namespaces: []
+analyst:
+  provider: api
+  score_cap: 35
+  timeout: 10s
+`
+	_, err := config.Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("Load: got nil, want rejection for negative restricted_dwell_seconds")
+	}
+	if !strings.Contains(err.Error(), "restricted_dwell_seconds") {
+		t.Errorf("error does not mention the offending field: %v", err)
+	}
+}
+
+// TestConfidenceBands_MonotonicityRejected pins the BI-3 band ordering
+// invariant (watch < alert < act) the FSM thresholds depend on.
+func TestConfidenceBands_MonotonicityRejected(t *testing.T) {
+	body := `
+detection:
+  confidence_bands:
+    watch: 40
+    alert: 40
+    act: 70
+  baseline_window: 24h
+response:
+  excluded_namespaces: []
+analyst:
+  provider: api
+  score_cap: 35
+  timeout: 10s
+`
+	_, err := config.Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("Load: got nil, want rejection for watch == alert (must be strictly increasing)")
+	}
+	if !strings.Contains(err.Error(), "confidence_bands") {
+		t.Errorf("error does not mention confidence_bands: %v", err)
+	}
+}
+
+// TestFSMConfig_OrDefaultOnZeroValue verifies the nil-defaults contract
+// for callers that do not go through Load (in-memory construction).
+func TestFSMConfig_OrDefaultOnZeroValue(t *testing.T) {
+	var f config.FSMConfig
+	if got := f.SuspiciousDwellSecondsOrDefault(); got != 0 {
+		t.Errorf("SuspiciousDwellSecondsOrDefault zero-value: got %d, want 0", got)
+	}
+	if got := f.RestrictedDwellSecondsOrDefault(); got != 120 {
+		t.Errorf("RestrictedDwellSecondsOrDefault zero-value: got %d, want 120", got)
+	}
+	if got := f.QuarantinedDwellSecondsOrDefault(); got != 120 {
+		t.Errorf("QuarantinedDwellSecondsOrDefault zero-value: got %d, want 120", got)
+	}
+	if got := f.DeescalationCooldownSecondsOrDefault(); got != 600 {
+		t.Errorf("DeescalationCooldownSecondsOrDefault zero-value: got %d, want 600", got)
+	}
+}
