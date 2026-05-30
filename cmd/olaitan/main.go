@@ -17,6 +17,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -29,6 +30,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nats-io/nats.go/jetstream"
 	"golang.org/x/sync/errgroup"
 
 	"k8s.io/client-go/kubernetes"
@@ -52,8 +54,10 @@ import (
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
 	"github.com/olokotoh/olaitan/internal/ratelimit"
 	redisclient "github.com/olokotoh/olaitan/internal/redis"
+	"github.com/olokotoh/olaitan/internal/response/fsm"
 	"github.com/olokotoh/olaitan/internal/retry"
 	"github.com/olokotoh/olaitan/internal/schema"
+	"github.com/olokotoh/olaitan/internal/subjects"
 )
 
 var version = "dev"
@@ -211,6 +215,18 @@ func runRingCtx(ctx context.Context, ring string, args []string, stderr io.Write
 		}
 	case "aggregator":
 		if err := startAggregatorRing(gctx, g, log, mgr.Get(), mgr.Subscribe, mgr); err != nil {
+			// A cancelled context during startup is a clean shutdown, not
+			// a crash; mirror the g.Wait() path below and exit 0. The
+			// aggregator wiring makes context-dependent JetStream calls
+			// (wireFSMConsumer), so cancellation in the startup window can
+			// surface here as a wrapped context.Canceled.
+			if errors.Is(err, context.Canceled) {
+				log.Info(ring + ": shutting down")
+				ringCancel()
+				_ = g.Wait()
+				<-watcherDone
+				return 0
+			}
 			log.Error("startup: aggregator ring wiring", "err", err)
 			ringCancel()
 			_ = g.Wait()
@@ -577,7 +593,6 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		closeNATS()
 		return fmt.Errorf("aggregator: score: %w", scoreErr)
 	}
-	_ = scoreCalc
 	snap := scoreCalc.Snapshot()
 	log.Info("aggregator: score calculator wired",
 		"rule_weight", snap.RuleWeight,
@@ -585,6 +600,33 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		"llm_weight", snap.LLMWeight,
 		"llm_cap", snap.LLMCap,
 		"sigma_normaliser", snap.SigmaNormaliser)
+
+	// Story 2.2: response-ring FSM (FR31/FR32). The FSM is the Story
+	// 2.2 consumer that closes the previous `_ = scoreCalc` discard: it
+	// scores every inbound EvidencePackage and folds ConfidenceScore.Total
+	// into fsm.Evaluate, one state step at a time. A no-op TransitionSink
+	// is wired for now; Story 2.3 (Redis persistence) and Story 2.8 (NATS
+	// audit) replace it with real sinks. Dwell guards and the de-escalation
+	// cooldown read config.Manager.Get() once per Evaluate call, following
+	// the Story 2.1 score precedent, so a hot config reload (FR49) flows
+	// into the live machine without a Subscribe callback.
+	stateMachine, fsmErr := fsm.New(mgr, metricsReg, fsm.NopSink{}, nil)
+	if fsmErr != nil {
+		closeNATS()
+		return fmt.Errorf("aggregator: fsm: %w", fsmErr)
+	}
+	if err := wireFSMConsumer(ctx, g, log, nc, scoreCalc, stateMachine); err != nil {
+		closeNATS()
+		return fmt.Errorf("aggregator: fsm consumer: %w", err)
+	}
+	log.Info("aggregator: fsm wired",
+		"suspicious_threshold", cfg.Detection.ConfidenceBands.Watch,
+		"restricted_threshold", cfg.Detection.ConfidenceBands.Alert,
+		"quarantined_threshold", cfg.Detection.ConfidenceBands.Act,
+		"suspicious_dwell_seconds", cfg.Detection.FSM.SuspiciousDwellSecondsOrDefault(),
+		"restricted_dwell_seconds", cfg.Detection.FSM.RestrictedDwellSecondsOrDefault(),
+		"quarantined_dwell_seconds", cfg.Detection.FSM.QuarantinedDwellSecondsOrDefault(),
+		"deescalation_cooldown_seconds", cfg.Detection.FSM.DeescalationCooldownSecondsOrDefault())
 
 	g.Go(func() error {
 		<-ctx.Done()
@@ -659,6 +701,118 @@ func wireBaselineEngine(ctx context.Context, cfg *config.Config, nc *natsclient.
 	}
 	_ = ctx
 	return engine, closer, nil
+}
+
+// fsmConsumerMaxDeliver caps JetStream's per-message redelivery for the
+// FSM consumer so a poison package cannot loop forever. Mirrors the
+// rules-engine consumerMaxDeliver (Story 1.14 P18 closure).
+const fsmConsumerMaxDeliver = 5
+
+// fsmFetchBackoff is the bounded sleep between consumer.Next attempts
+// after a non-timeout error; the consumer honours context cancellation
+// immediately rather than completing the backoff. Mirrors the rules
+// engine.
+const fsmFetchBackoff = time.Second
+
+// wireFSMConsumer wires the Story 2.2 scoring + FSM evidence consumer.
+// It creates a durable JetStream consumer on subjects.EvidencePackages,
+// scores each inbound package via scoreCalc, and folds
+// ConfidenceScore.Total into stateMachine.Evaluate keyed by the
+// package's WorkloadID (AC1/AC4). It runs on its own errgroup goroutine
+// and returns nil on graceful ctx cancellation. The FSM is the documented
+// Story 2.2 consumer of the Story 2.1 calculator; see startAggregatorRing.
+func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, nc *natsclient.Client, scoreCalc *score.Calculator, stateMachine *fsm.Machine) error {
+	stream, err := nc.JetStream().Stream(ctx, "EVIDENCE")
+	if err != nil {
+		return fmt.Errorf("stream EVIDENCE: %w", err)
+	}
+	consumer, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+		Durable:       "olaitan-response-fsm",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		FilterSubject: subjects.EvidencePackages,
+		MaxDeliver:    fsmConsumerMaxDeliver,
+	})
+	if err != nil {
+		return fmt.Errorf("consumer: %w", err)
+	}
+
+	g.Go(func() error {
+		for {
+			if err := ctx.Err(); err != nil {
+				return nil
+			}
+			msg, err := consumer.Next(jetstream.FetchMaxWait(250 * time.Millisecond))
+			if err != nil {
+				if isFSMFetchTimeout(err) {
+					continue
+				}
+				log.Warn("aggregator: fsm consumer fetch failed", "err", err)
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(fsmFetchBackoff):
+				}
+				continue
+			}
+
+			var pkg schema.EvidencePackage
+			if jerr := json.Unmarshal(msg.Data(), &pkg); jerr != nil {
+				// A malformed package must not crash-loop the ring: drop
+				// and ack (mirrors the rules engine's drop-and-ack).
+				log.Warn("aggregator: fsm consumer decode failed; dropping", "err", jerr)
+				_ = msg.Ack()
+				continue
+			}
+
+			sc, serr := scoreCalc.Score(&pkg)
+			if serr != nil {
+				log.Warn("aggregator: fsm score failed; dropping", "err", serr, "package_id", pkg.PackageID)
+				_ = msg.Ack()
+				continue
+			}
+
+			// An empty WorkloadID would key every unattributed package into a
+			// single shared FSM state, so one orphan's score would drive the
+			// state reported for all orphans. Drop and ack instead.
+			if pkg.WorkloadID == "" {
+				log.Warn("aggregator: fsm consumer dropping package with empty workload_id", "package_id", pkg.PackageID)
+				_ = msg.Ack()
+				continue
+			}
+
+			st := stateMachine.Evaluate(pkg.WorkloadID, sc.Total, pkg.PackageID)
+			if st.FromState != st.ToState {
+				log.Info("aggregator: fsm transition",
+					"workload_id", st.WorkloadID,
+					"from_state", string(st.FromState),
+					"to_state", string(st.ToState),
+					"reason", st.Reason,
+					"score", st.Confidence,
+					"package_id", st.PackageID)
+			}
+			_ = msg.Ack()
+		}
+	})
+	return nil
+}
+
+// isFSMFetchTimeout reports whether err is an expected empty-fetch signal
+// from consumer.Next rather than a real consumer failure. Mirrors the
+// rules/baseline engines' isExpectedFetchTimeout.
+func isFSMFetchTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, jetstream.ErrNoMessages) {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if strings.Contains(err.Error(), "nats: no messages") {
+		return true
+	}
+	return false
 }
 
 // startCollectorRing wires the Ring 1 sensor adapters into the supplied

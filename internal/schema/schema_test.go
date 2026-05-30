@@ -2,6 +2,7 @@ package schema
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -172,6 +173,9 @@ func TestStateTransitionRoundTrip(t *testing.T) {
 		TriggerType:   "automated",
 		Confidence:    75.0,
 		TriggerEvents: []string{"evt-001", "evt-002"},
+		WorkloadID:    "default/Deployment/web",
+		PackageID:     "pkg-001",
+		Reason:        ReasonEscalationThresholdCrossed,
 	}
 
 	data, err := json.Marshal(original)
@@ -192,6 +196,40 @@ func TestStateTransitionRoundTrip(t *testing.T) {
 	}
 	if decoded.TriggerType != original.TriggerType {
 		t.Errorf("TriggerType: got %q, want %q", decoded.TriggerType, original.TriggerType)
+	}
+	if decoded.WorkloadID != original.WorkloadID {
+		t.Errorf("WorkloadID: got %q, want %q", decoded.WorkloadID, original.WorkloadID)
+	}
+	if decoded.PackageID != original.PackageID {
+		t.Errorf("PackageID: got %q, want %q", decoded.PackageID, original.PackageID)
+	}
+	if decoded.Reason != original.Reason {
+		t.Errorf("Reason: got %q, want %q", decoded.Reason, original.Reason)
+	}
+}
+
+// TestStateTransitionOmitsStory22FieldsAtZero pins the BI-2 backwards
+// compatibility guarantee: a StateTransition produced by a pre-Story-2.2
+// path (none of WorkloadID/PackageID/Reason set) marshals to the same
+// wire form it did before the extension, so the existing
+// schema.Incident.Transitions consumers stay byte-identical.
+func TestStateTransitionOmitsStory22FieldsAtZero(t *testing.T) {
+	st := StateTransition{
+		Timestamp:   time.Date(2026, 4, 8, 12, 0, 0, 0, time.UTC),
+		Pod:         PodRef{Name: "test", Namespace: "default", UID: "uid-1"},
+		FromState:   StateSuspicious,
+		ToState:     StateRestricted,
+		TriggerType: "automated",
+		Confidence:  75.0,
+	}
+	data, err := json.Marshal(st)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, key := range []string{"workload_id", "package_id", "reason"} {
+		if strings.Contains(string(data), key) {
+			t.Errorf("zero-valued StateTransition unexpectedly rendered %q: %s", key, data)
+		}
 	}
 }
 

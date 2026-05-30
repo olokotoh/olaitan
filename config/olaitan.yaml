@@ -4,10 +4,14 @@
 # strings ("24h", "10s").
 
 detection:
+  # confidence_bands are the FSM transition thresholds (BI-3): watch maps
+  # to SUSPICIOUS, alert to RESTRICTED, act to QUARANTINED. Story 2.2 pins
+  # the AC1 defaults 20/40/70 (epics.md:1012-1043). Must satisfy
+  # watch < alert < act, each in [0,100].
   confidence_bands:
-    watch: 40
-    alert: 70
-    act: 90
+    watch: 20
+    alert: 40
+    act: 70
   baseline_window: 24h
   # Story 1.14: Ring-2 sliding-window correlator and EvidencePackage
   # assembler. The window duration is hot-reloadable; max_package_bytes
@@ -136,6 +140,21 @@ detection:
     baseline_weight: 0.3
     llm_weight: 0.3
     llm_cap: 35
+  # Story 2.2: response-ring FSM dwell guards and de-escalation cooldown
+  # (FR31/FR32). The escalation thresholds are reused from
+  # confidence_bands above (BI-3); this block adds only the durations
+  # those bands do not cover (BI-4). suspicious_dwell_seconds defaults to
+  # 0 so a freshly-flagged workload can escalate to RESTRICTED as soon as
+  # the score crosses the alert band; the RESTRICTED and QUARANTINED
+  # dwells damp oscillation (AC2) and the cooldown gates de-escalation so
+  # a single low sample does not de-escalate (AC3). All four are
+  # hot-reloadable via FR49: the FSM reads config.Manager.Get() once per
+  # Evaluate call, following the Story 2.1 score precedent.
+  fsm:
+    suspicious_dwell_seconds: 0
+    restricted_dwell_seconds: 120
+    quarantined_dwell_seconds: 120
+    deescalation_cooldown_seconds: 600
 
 # Story 1.12: Prometheus metrics surface (FR8, FR50). Every Olaitan
 # process exposes Prometheus metrics on :9090/metrics from a dedicated

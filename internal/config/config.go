@@ -233,6 +233,15 @@ type DetectionConfig struct {
 	// config.Manager.Get() on every Score() call -- no restart and
 	// no Subscribe callback required.
 	Score ScoreConfig `yaml:"score,omitempty"`
+	// Story 2.2: fsm sub-block configures the per-state dwell guards
+	// and the de-escalation cooldown for the response-ring FSM
+	// (FR31/FR32). The escalation thresholds live in ConfidenceBands
+	// (BI-3); this block adds ONLY the durations ConfidenceBands does
+	// not cover (BI-4). Pointer fields mirror ScoreConfig so the
+	// loader distinguishes "operator omitted, substitute default"
+	// from "operator explicitly set 0" (a 0 s dwell is a meaningful
+	// choice, e.g. SUSPICIOUS defaults to 0).
+	FSM FSMConfig `yaml:"fsm,omitempty"`
 }
 
 // CorrelatorConfig controls the Story 1.14 Ring-2 sliding-window
@@ -581,6 +590,15 @@ func (s ScoreConfig) LLMCapOrDefault() int {
 // stay strictly below this value.
 const SuspiciousThreshold = 20.0
 
+// RestrictedThreshold and QuarantinedThreshold are the FSM band defaults
+// (AC1 source of truth: SUSPICIOUS 20, RESTRICTED 40, QUARANTINED 70).
+// They back the nil-config fall-through in internal/response/fsm so that
+// path cannot silently drift from the loaded ConfidenceBands defaults.
+const (
+	RestrictedThreshold  = 40.0
+	QuarantinedThreshold = 70.0
+)
+
 // validate enforces ScoreConfig invariants. Each weight must lie in
 // [0.0, 1.0]; the three weights must sum to <= 1.0 (a 1e-9 tolerance
 // is allowed for float round-off when an operator sets e.g. 0.333 x 3);
@@ -632,6 +650,113 @@ func (s ScoreConfig) validate() error {
 	}
 	if llmOnly := lw * float64(s.LLMCapOrDefault()); llmOnly >= SuspiciousThreshold {
 		return fmt.Errorf("detection.score: llm_weight*llm_cap = %.3f must be < %.0f (the SUSPICIOUS threshold, prd.md:294); the LLM tier alone must not escalate a workload (FR30 trust-bound)", llmOnly, SuspiciousThreshold)
+	}
+	return nil
+}
+
+// FSMConfig configures the Story 2.2 response-ring finite state machine
+// (FR31/FR32). It covers ONLY the per-state minimum dwell guards and the
+// de-escalation cooldown; the escalation thresholds are reused from
+// ConfidenceBands (BI-3, BI-4). The four knobs are pointer-tagged so the
+// loader distinguishes "operator omitted, substitute default" from
+// "operator explicitly set 0" (a 0 s dwell on SUSPICIOUS is the default
+// and a meaningful explicit choice).
+//
+// All four are hot-reloadable: the FSM reads config.Manager.Get() once
+// per Evaluate call, following the Story 2.1 score precedent. No restart
+// and no Subscribe callback are required.
+type FSMConfig struct {
+	SuspiciousDwellSeconds      *int `yaml:"suspicious_dwell_seconds,omitempty"`
+	RestrictedDwellSeconds      *int `yaml:"restricted_dwell_seconds,omitempty"`
+	QuarantinedDwellSeconds     *int `yaml:"quarantined_dwell_seconds,omitempty"`
+	DeescalationCooldownSeconds *int `yaml:"deescalation_cooldown_seconds,omitempty"`
+}
+
+// FSM default dwell guards (seconds) and de-escalation cooldown. The
+// SUSPICIOUS dwell is 0 so a freshly-flagged workload can escalate to
+// RESTRICTED immediately once the score crosses the alert band; the
+// RESTRICTED and QUARANTINED dwells are 120 s to damp oscillation
+// (AC2); the de-escalation cooldown is 600 s (AC3).
+const (
+	DefaultSuspiciousDwellSeconds      = 0
+	DefaultRestrictedDwellSeconds      = 120
+	DefaultQuarantinedDwellSeconds     = 120
+	DefaultDeescalationCooldownSeconds = 600
+)
+
+// DefaultFSM returns the Story 2.2 production defaults (AC2/AC3).
+func DefaultFSM() FSMConfig {
+	sd := DefaultSuspiciousDwellSeconds
+	rd := DefaultRestrictedDwellSeconds
+	qd := DefaultQuarantinedDwellSeconds
+	cd := DefaultDeescalationCooldownSeconds
+	return FSMConfig{
+		SuspiciousDwellSeconds:      &sd,
+		RestrictedDwellSeconds:      &rd,
+		QuarantinedDwellSeconds:     &qd,
+		DeescalationCooldownSeconds: &cd,
+	}
+}
+
+// SuspiciousDwellSecondsOrDefault returns the effective SUSPICIOUS dwell,
+// substituting the default when omitted.
+func (f FSMConfig) SuspiciousDwellSecondsOrDefault() int {
+	if f.SuspiciousDwellSeconds == nil {
+		return DefaultSuspiciousDwellSeconds
+	}
+	return *f.SuspiciousDwellSeconds
+}
+
+// RestrictedDwellSecondsOrDefault returns the effective RESTRICTED dwell,
+// substituting the default when omitted.
+func (f FSMConfig) RestrictedDwellSecondsOrDefault() int {
+	if f.RestrictedDwellSeconds == nil {
+		return DefaultRestrictedDwellSeconds
+	}
+	return *f.RestrictedDwellSeconds
+}
+
+// QuarantinedDwellSecondsOrDefault returns the effective QUARANTINED
+// dwell, substituting the default when omitted.
+func (f FSMConfig) QuarantinedDwellSecondsOrDefault() int {
+	if f.QuarantinedDwellSeconds == nil {
+		return DefaultQuarantinedDwellSeconds
+	}
+	return *f.QuarantinedDwellSeconds
+}
+
+// DeescalationCooldownSecondsOrDefault returns the effective
+// de-escalation cooldown, substituting the default when omitted.
+func (f FSMConfig) DeescalationCooldownSecondsOrDefault() int {
+	if f.DeescalationCooldownSeconds == nil {
+		return DefaultDeescalationCooldownSeconds
+	}
+	return *f.DeescalationCooldownSeconds
+}
+
+// validate enforces FSMConfig invariants: every duration must be
+// non-negative (BI-4). A fully-omitted block (all four pointers nil)
+// skips validation so in-memory test fixtures can leave it zero; the
+// Load path substitutes DefaultFSM before Validate so production configs
+// always reach validate with non-nil pointers.
+func (f FSMConfig) validate() error {
+	if f.SuspiciousDwellSeconds == nil && f.RestrictedDwellSeconds == nil &&
+		f.QuarantinedDwellSeconds == nil && f.DeescalationCooldownSeconds == nil {
+		return nil
+	}
+	checks := []struct {
+		name string
+		val  *int
+	}{
+		{"detection.fsm.suspicious_dwell_seconds", f.SuspiciousDwellSeconds},
+		{"detection.fsm.restricted_dwell_seconds", f.RestrictedDwellSeconds},
+		{"detection.fsm.quarantined_dwell_seconds", f.QuarantinedDwellSeconds},
+		{"detection.fsm.deescalation_cooldown_seconds", f.DeescalationCooldownSeconds},
+	}
+	for _, c := range checks {
+		if c.val != nil && *c.val < 0 {
+			return fmt.Errorf("%s: must be >= 0 (got %d)", c.name, *c.val)
+		}
 	}
 	return nil
 }
@@ -1016,6 +1141,26 @@ func Load(path string) (*Config, error) {
 		if cfg.Detection.Score.LLMCap == nil {
 			cfg.Detection.Score.LLMCap = defScore.LLMCap
 		}
+
+		// Story 2.2: substitute FSM dwell/cooldown defaults before
+		// Validate so an operator who omits the detection.fsm block
+		// inherits the AC2/AC3 defaults (RESTRICTED/QUARANTINED dwell
+		// 120 s, de-escalation cooldown 600 s, SUSPICIOUS dwell 0). The
+		// pointer-tagged fields let an explicit `suspicious_dwell_seconds:
+		// 0` survive intact.
+		defFSM := DefaultFSM()
+		if cfg.Detection.FSM.SuspiciousDwellSeconds == nil {
+			cfg.Detection.FSM.SuspiciousDwellSeconds = defFSM.SuspiciousDwellSeconds
+		}
+		if cfg.Detection.FSM.RestrictedDwellSeconds == nil {
+			cfg.Detection.FSM.RestrictedDwellSeconds = defFSM.RestrictedDwellSeconds
+		}
+		if cfg.Detection.FSM.QuarantinedDwellSeconds == nil {
+			cfg.Detection.FSM.QuarantinedDwellSeconds = defFSM.QuarantinedDwellSeconds
+		}
+		if cfg.Detection.FSM.DeescalationCooldownSeconds == nil {
+			cfg.Detection.FSM.DeescalationCooldownSeconds = defFSM.DeescalationCooldownSeconds
+		}
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -1128,6 +1273,9 @@ func (d DetectionConfig) validate() error {
 		return err
 	}
 	if err := d.Score.validate(); err != nil {
+		return err
+	}
+	if err := d.FSM.validate(); err != nil {
 		return err
 	}
 	return nil
