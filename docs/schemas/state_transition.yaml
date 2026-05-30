@@ -21,8 +21,12 @@ fields:
     description: When the transition occurred (FSM injected Clock).
   pod:
     type: object
-    required: true
-    description: PodRef (name, namespace, uid) the transition applies to.
+    required: false
+    description: >
+      PodRef (name, namespace, uid) the transition applies to. Optional in
+      state_transition.v2: the Story 2.2 FSM keys transitions by workload_id
+      and does not carry a PodRef, so it leaves pod at its zero value.
+      Stories 2.3/2.8 may enrich it when wiring the persistence/audit sinks.
   from_state:
     type: string
     required: true

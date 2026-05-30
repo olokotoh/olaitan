@@ -771,6 +771,15 @@ func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, n
 				continue
 			}
 
+			// An empty WorkloadID would key every unattributed package into a
+			// single shared FSM state, so one orphan's score would drive the
+			// state reported for all orphans. Drop and ack instead.
+			if pkg.WorkloadID == "" {
+				log.Warn("aggregator: fsm consumer dropping package with empty workload_id", "package_id", pkg.PackageID)
+				_ = msg.Ack()
+				continue
+			}
+
 			st := stateMachine.Evaluate(pkg.WorkloadID, sc.Total, pkg.PackageID)
 			if st.FromState != st.ToState {
 				log.Info("aggregator: fsm transition",

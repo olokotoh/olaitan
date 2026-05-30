@@ -36,6 +36,7 @@ package fsm
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -176,7 +177,7 @@ func newWithGetter(get func() *config.Config, registry *metrics.Registry, sink T
 func (m *Machine) registerMetrics(r *metrics.Registry) error {
 	tv, err := r.RegisterCounterVec(
 		"olaitan_response_fsm_transitions_total",
-		"Cumulative number of FSM evaluations labelled by from_state, to_state, and reason. no_transition evaluations are counted too (Story 2.2, FR31/FR32).",
+		"Cumulative number of actual FSM state changes labelled by from_state, to_state, and reason. no_transition evaluations are NOT counted (Story 2.2, FR31/FR32).",
 		[]string{"from_state", "to_state", "reason"},
 	)
 	if err != nil {
@@ -186,7 +187,7 @@ func (m *Machine) registerMetrics(r *metrics.Registry) error {
 
 	dv, err := r.RegisterHistogramVec(
 		"olaitan_response_fsm_dwell_seconds",
-		"Observed dwell time a workload spent in a state before the FSM left it on escalation, labelled by the state being left (Story 2.2, AC2).",
+		"Observed residence time a workload spent in a state before the FSM left it (recorded on any state change, escalation or de-escalation), labelled by the state being left (Story 2.2, AC2).",
 		[]string{"state"},
 		[]float64{1, 10, 30, 60, 120, 300, 600},
 	)
@@ -212,9 +213,9 @@ func (m *Machine) registerMetrics(r *metrics.Registry) error {
 // Story 2.1/2.2 defaults so the machine is always well-defined.
 func (m *Machine) resolve() thresholds {
 	t := thresholds{
-		suspicious:       float64(config.SuspiciousThreshold), // 20
-		restricted:       40,
-		quarantined:      70,
+		suspicious:       float64(config.SuspiciousThreshold),  // 20
+		restricted:       float64(config.RestrictedThreshold),  // 40
+		quarantined:      float64(config.QuarantinedThreshold), // 70
 		suspiciousDwell:  time.Duration(config.DefaultSuspiciousDwellSeconds) * time.Second,
 		restrictedDwell:  time.Duration(config.DefaultRestrictedDwellSeconds) * time.Second,
 		quarantinedDwell: time.Duration(config.DefaultQuarantinedDwellSeconds) * time.Second,
@@ -360,8 +361,8 @@ func nextDown(s PodState) PodState {
 //
 // The returned StateTransition always carries the reason; it is pushed to
 // the TransitionSink ONLY when From != To (an actual change, BI-5). The
-// transition counter is incremented on every call (including
-// no_transition) per Task 5.2.
+// transition counter is likewise incremented only on an actual change, so
+// it reflects state-change rate rather than evaluation volume (Task 5.2).
 func (m *Machine) Evaluate(workloadID string, score float64, packageID string) schema.StateTransition {
 	now := m.clock.Now()
 	t := m.resolve()
@@ -461,16 +462,24 @@ func (m *Machine) Evaluate(workloadID string, score float64, packageID string) s
 	return st
 }
 
-// recordMetrics updates the transition counter (every call) and refreshes
-// the active-workloads gauge. Called with m.mu held.
+// recordMetrics increments the transition counter on actual state changes
+// and refreshes the active-workloads gauge. Called with m.mu held.
 func (m *Machine) recordMetrics(st schema.StateTransition) {
 	if m.metrics == nil {
 		return
 	}
-	if m.metrics.transitions != nil {
+	// Count only actual state changes. A counter named ..._transitions_total
+	// must not tick on no_transition evaluations, or rate(transitions_total)
+	// would track inbound evidence volume on the hot path rather than the
+	// state-change rate the metric name promises.
+	if m.metrics.transitions != nil && st.FromState != st.ToState {
 		m.metrics.transitions.WithLabelValues(string(st.FromState), string(st.ToState), st.Reason).Inc()
 	}
-	if m.metrics.active != nil && st.FromState != st.ToState {
+	// Refresh the gauge on every evaluation, not only on transitions: a
+	// first-seen workload that stays CLEAN is inserted into m.states without
+	// a transition and must still be counted. Recompute is cheap (the map is
+	// small relative to the evaluation cadence).
+	if m.metrics.active != nil {
 		m.refreshActiveGaugeLocked()
 	}
 }
@@ -508,6 +517,12 @@ func (m *Machine) State(workloadID string) PodState {
 }
 
 func clamp(v, lo, hi float64) float64 {
+	// A NaN score (e.g. a 0/0 sigma normalisation upstream) compares false
+	// against every bound, so without this guard it would pass through
+	// unclamped and be classed as fully benign (CLEAN). Floor it to lo.
+	if math.IsNaN(v) {
+		return lo
+	}
 	if v < lo {
 		return lo
 	}

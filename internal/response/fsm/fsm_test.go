@@ -60,10 +60,21 @@ func testConfig(suspiciousDwell, restrictedDwell, quarantinedDwell, cooldown int
 	cfg := &config.Config{}
 	cfg.Detection.ConfidenceBands = config.ConfidenceBands{Watch: 20, Alert: 40, Act: 70}
 	fc := config.FSMConfig{}
-	fc.SuspiciousDwellSeconds = &suspiciousDwell
-	fc.RestrictedDwellSeconds = &restrictedDwell
-	fc.QuarantinedDwellSeconds = &quarantinedDwell
-	fc.DeescalationCooldownSeconds = &cooldown
+	// A negative value leaves the corresponding pointer nil so the
+	// FSMConfig OrDefault accessors apply, letting tests exercise the
+	// default path. Non-negative values are set explicitly.
+	if suspiciousDwell >= 0 {
+		fc.SuspiciousDwellSeconds = &suspiciousDwell
+	}
+	if restrictedDwell >= 0 {
+		fc.RestrictedDwellSeconds = &restrictedDwell
+	}
+	if quarantinedDwell >= 0 {
+		fc.QuarantinedDwellSeconds = &quarantinedDwell
+	}
+	if cooldown >= 0 {
+		fc.DeescalationCooldownSeconds = &cooldown
+	}
 	cfg.Detection.FSM = fc
 	return cfg
 }

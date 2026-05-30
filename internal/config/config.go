@@ -590,6 +590,15 @@ func (s ScoreConfig) LLMCapOrDefault() int {
 // stay strictly below this value.
 const SuspiciousThreshold = 20.0
 
+// RestrictedThreshold and QuarantinedThreshold are the FSM band defaults
+// (AC1 source of truth: SUSPICIOUS 20, RESTRICTED 40, QUARANTINED 70).
+// They back the nil-config fall-through in internal/response/fsm so that
+// path cannot silently drift from the loaded ConfidenceBands defaults.
+const (
+	RestrictedThreshold  = 40.0
+	QuarantinedThreshold = 70.0
+)
+
 // validate enforces ScoreConfig invariants. Each weight must lie in
 // [0.0, 1.0]; the three weights must sum to <= 1.0 (a 1e-9 tolerance
 // is allowed for float round-off when an operator sets e.g. 0.333 x 3);
