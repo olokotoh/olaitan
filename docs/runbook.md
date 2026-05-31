@@ -293,6 +293,25 @@ The chart's `templates/configmap.yaml` regex bridge overlays the chart values on
 
 The weights validator rejects any operator change that pushes the three weights' sum above 1.0 + 1e-9 (the algebraic trust-bound `max(LLM-only) = LLMWeight × LLMCap` depends on this invariant); a rejected reload leaves the previous snapshot active and the rejection appears in the aggregator's slog output under `config: reload rejected`. Verify the active weights at any time via the startup log line `aggregator: score calculator wired` or by gathering `olaitan_decision_score_*` metrics on `:9090/metrics`.
 
+### 1.4b Response FSM persistence ring (Story 2.3 NEW)
+
+#### `olaitan_response_fsm_state_recovered_total`
+
+- **Type:** counter
+- **Unit:** count
+- **Labels:** none (per-workload telemetry is forbidden as a Prometheus label per architecture.md:476; per-workload recovery is observable in the startup log line below and in the `fsm:{workload_id}:history` lists).
+- **Help:** Cumulative number of workloads whose FSM state was recovered from Redis on controller restart (FR37/NFR24). Incremented once per workload rehydrated by `Machine.Restore` before the FSM consumer starts.
+- **Sample PromQL (aggregate):** `olaitan_response_fsm_state_recovered_total`.
+- **Sample PromQL (alert):** `increase(olaitan_response_fsm_state_recovered_total[1h]) == 0 and on() olaitan_response_fsm_active_workloads > 0` is NOT an alert (a steady controller never re-recovers); instead watch `changes(process_start_time_seconds[15m]) > 2` for crash-looping, which would re-run recovery repeatedly.
+
+#### Operator scenario: restart recovery and persistence
+
+FSM state is persisted to the durable `fsm:{workload_id}` Redis hash (NO TTL) on every actual transition, with the transition appended to the `fsm:{workload_id}:history` list (capped at the last 1000 entries). On controller restart the aggregator rehydrates the in-memory FSM map from all `fsm:*` keys BEFORE the evidence consumer starts, so a restart never silently de-escalates a workload to CLEAN (NFR24, target within 60 s of pod readiness). Confirm recovery via the startup log line `aggregator: fsm state recovered from redis` (fields `recovered` and `skipped`) and the `olaitan_response_fsm_state_recovered_total` counter.
+
+A restart resets each recovered workload's de-escalation cooldown window (conservative: it can never de-escalate earlier than a fresh cooldown) while preserving dwell progress where the clock is monotonic. During a brief Redis outage, transitions are buffered in memory and replayed on reconnection (idempotent via the compare-and-swap write); a controller crash mid-outage loses only the unflushed buffer, and the prior committed state remains authoritative in Redis.
+
+To disable persistence (sensing-only or a Redis-less deployment), set `detection.fsm.persistence_enabled: false` in the aggregator ConfigMap and `kubectl rollout restart deploy/olaitan-aggregator` (this knob is restart-required: it rewires the FSM sink and the restore hook).
+
 ### 1.5 Naming-convention reconciliation
 
 The Story 1.18 acceptance criteria text uses a mix of singular-ring and plural-ring metric names (e.g. AC2 says `olaitan_decision_rule_matches_total` singular; AC3 says `olaitan_decision_baseline_deviations_total{metric, sigma_bucket}` plural). The actual registrations follow `architecture.md:472-475` which mandates the `olaitan_<ring>_<metric>` pattern with the engine subfamily conventionally plural (`rules`, `baseline`) because the engine evaluates a corpus, not a single rule. The AC singular spellings are documentation aliases, not parallel families.

@@ -670,6 +670,14 @@ type FSMConfig struct {
 	RestrictedDwellSeconds      *int `yaml:"restricted_dwell_seconds,omitempty"`
 	QuarantinedDwellSeconds     *int `yaml:"quarantined_dwell_seconds,omitempty"`
 	DeescalationCooldownSeconds *int `yaml:"deescalation_cooldown_seconds,omitempty"`
+
+	// Story 2.3: durable FSM-state persistence (FR37/NFR24). Unlike the
+	// dwell/cooldown knobs above (hot-reloadable), these are
+	// restart-required: toggling persistence or its Redis target rewires
+	// the aggregator's FSM sink and restore hook. PersistenceEnabled is
+	// pointer-tagged so an explicit `false` survives the loader.
+	PersistenceEnabled *bool  `yaml:"persistence_enabled,omitempty"`
+	RedisAddr          string `yaml:"redis_addr,omitempty"`
 }
 
 // FSM default dwell guards (seconds) and de-escalation cooldown. The
@@ -684,18 +692,40 @@ const (
 	DefaultDeescalationCooldownSeconds = 600
 )
 
-// DefaultFSM returns the Story 2.2 production defaults (AC2/AC3).
+// DefaultFSM returns the Story 2.2 production defaults (AC2/AC3) plus the
+// Story 2.3 persistence defaults (enabled, Redis at the canonical address).
 func DefaultFSM() FSMConfig {
 	sd := DefaultSuspiciousDwellSeconds
 	rd := DefaultRestrictedDwellSeconds
 	qd := DefaultQuarantinedDwellSeconds
 	cd := DefaultDeescalationCooldownSeconds
+	pe := true
 	return FSMConfig{
 		SuspiciousDwellSeconds:      &sd,
 		RestrictedDwellSeconds:      &rd,
 		QuarantinedDwellSeconds:     &qd,
 		DeescalationCooldownSeconds: &cd,
+		PersistenceEnabled:          &pe,
+		RedisAddr:                   "redis:6379",
 	}
+}
+
+// PersistenceEnabledOrDefault reports the effective FSM-persistence state,
+// treating a nil pointer as the default (true) per BaselinesConfig precedent.
+func (f FSMConfig) PersistenceEnabledOrDefault() bool {
+	if f.PersistenceEnabled == nil {
+		return true
+	}
+	return *f.PersistenceEnabled
+}
+
+// RedisAddrOrDefault returns the effective Redis address for FSM
+// persistence, substituting the canonical default when omitted.
+func (f FSMConfig) RedisAddrOrDefault() string {
+	if f.RedisAddr == "" {
+		return "redis:6379"
+	}
+	return f.RedisAddr
 }
 
 // SuspiciousDwellSecondsOrDefault returns the effective SUSPICIOUS dwell,
@@ -740,6 +770,12 @@ func (f FSMConfig) DeescalationCooldownSecondsOrDefault() int {
 // Load path substitutes DefaultFSM before Validate so production configs
 // always reach validate with non-nil pointers.
 func (f FSMConfig) validate() error {
+	// Story 2.3: when persistence is explicitly enabled, a Redis address
+	// is required. Checked before the dwell-only early return so a fixture
+	// that sets only the persistence knobs is still validated.
+	if f.PersistenceEnabled != nil && *f.PersistenceEnabled && f.RedisAddr == "" {
+		return errors.New("detection.fsm.redis_addr: required when fsm.persistence_enabled=true")
+	}
 	if f.SuspiciousDwellSeconds == nil && f.RestrictedDwellSeconds == nil &&
 		f.QuarantinedDwellSeconds == nil && f.DeescalationCooldownSeconds == nil {
 		return nil
@@ -1160,6 +1196,15 @@ func Load(path string) (*Config, error) {
 		}
 		if cfg.Detection.FSM.DeescalationCooldownSeconds == nil {
 			cfg.Detection.FSM.DeescalationCooldownSeconds = defFSM.DeescalationCooldownSeconds
+		}
+		// Story 2.3: substitute FSM-persistence defaults (enabled, Redis at
+		// redis:6379) before Validate. The pointer-tagged PersistenceEnabled
+		// lets an explicit `persistence_enabled: false` survive intact.
+		if cfg.Detection.FSM.PersistenceEnabled == nil {
+			cfg.Detection.FSM.PersistenceEnabled = defFSM.PersistenceEnabled
+		}
+		if cfg.Detection.FSM.RedisAddr == "" {
+			cfg.Detection.FSM.RedisAddr = defFSM.RedisAddr
 		}
 	}
 

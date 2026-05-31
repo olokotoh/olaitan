@@ -760,6 +760,14 @@ data:
         restricted_dwell_seconds: 120
         quarantined_dwell_seconds: 120
         deescalation_cooldown_seconds: 600
+        # Story 2.3: durable FSM-state persistence in Redis with restart
+        # recovery (FR37/NFR24). Unlike the dwell/cooldown knobs above
+        # (hot-reloadable), these are restart-required: toggling persistence
+        # or its Redis target rewires the aggregator's FSM sink and the
+        # restore-on-startup hook. The fsm: Redis family carries NO TTL so
+        # state survives an arbitrary restart gap.
+        persistence_enabled: true
+        redis_addr: "redis:6379"
     
     # Story 1.12: Prometheus metrics surface (FR8, FR50). Every Olaitan
     # process exposes Prometheus metrics on :9090/metrics from a dedicated

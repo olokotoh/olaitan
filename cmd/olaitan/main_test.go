@@ -38,6 +38,8 @@ func writeTestConfig(t *testing.T) string {
     enabled: false
   baselines:
     enabled: false
+  fsm:
+    persistence_enabled: false
 response:
   excluded_namespaces:
     - kube-system
@@ -349,6 +351,7 @@ func TestStartAggregator_BuildsPostureClientWhenEnabled(t *testing.T) {
 			Posture:   config.PostureConfig{Enabled: true},
 			Rules:     config.RulesConfig{Enabled: &rulesDisabled},
 			Baselines: config.BaselinesConfig{Enabled: &baselinesDisabled},
+			FSM:       config.FSMConfig{PersistenceEnabled: &baselinesDisabled},
 		},
 		// Story 1.12: startAggregatorRing now starts the Prometheus
 		// surface under the errgroup. ":0" lets the kernel pick a free
@@ -397,6 +400,7 @@ func TestStartAggregator_PostureDisabledLeavesClientNil(t *testing.T) {
 			Posture:   config.PostureConfig{Enabled: false},
 			Rules:     config.RulesConfig{Enabled: &rulesDisabled},
 			Baselines: config.BaselinesConfig{Enabled: &baselinesDisabled},
+			FSM:       config.FSMConfig{PersistenceEnabled: &baselinesDisabled},
 		},
 		Metrics: config.MetricsConfig{Address: "127.0.0.1:0"},
 	}
@@ -445,6 +449,7 @@ func TestStartAggregator_RulesEngineEnabledWiresGoroutines(t *testing.T) {
 			Posture:   postureDisabled,
 			Rules:     config.RulesConfig{Enabled: &rulesEnabled, Path: rulesDir},
 			Baselines: config.BaselinesConfig{Enabled: &baselinesDisabled},
+			FSM:       config.FSMConfig{PersistenceEnabled: &baselinesDisabled},
 		},
 		Metrics: config.MetricsConfig{Address: "127.0.0.1:0"},
 	}
@@ -490,6 +495,7 @@ func TestStartAggregator_RulesEngineDisabledSkipsWiring(t *testing.T) {
 			Posture:   config.PostureConfig{Enabled: false},
 			Rules:     config.RulesConfig{Enabled: &rulesDisabled, Path: "/nonexistent/path/that/would/break/loader"},
 			Baselines: config.BaselinesConfig{Enabled: &baselinesDisabled},
+			FSM:       config.FSMConfig{PersistenceEnabled: &baselinesDisabled},
 		},
 		Metrics: config.MetricsConfig{Address: "127.0.0.1:0"},
 	}
