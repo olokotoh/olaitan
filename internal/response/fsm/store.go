@@ -85,23 +85,23 @@ func (s *Store) Save(ctx context.Context, workloadID, expectedPrior string, st p
 		fieldCooldownAnchorNs: strconv.FormatInt(st.cooldownAnchorAt.UTC().UnixNano(), 10),
 		fieldUpdatedAtNs:      strconv.FormatInt(st.updatedAt.UTC().UnixNano(), 10),
 	}
-	swapped, err := s.client.SetFSMStateCAS(ctx, stateKey, fieldCurrentState, expectedPrior, fields)
-	if err != nil {
-		return false, fmt.Errorf("fsm: store save cas: %w", err)
-	}
-	if !swapped {
-		return false, nil
-	}
+	var histKey string
 	if len(historyEntry) > 0 {
-		histKey, herr := keys.FSMHistory(workloadID)
+		var herr error
+		histKey, herr = keys.FSMHistory(workloadID)
 		if herr != nil {
-			return true, fmt.Errorf("fsm: store history key: %w", herr)
-		}
-		if aerr := s.client.AppendFSMHistory(ctx, histKey, historyEntry, historyCap); aerr != nil {
-			return true, fmt.Errorf("fsm: store history append: %w", aerr)
+			return false, fmt.Errorf("fsm: store history key: %w", herr)
 		}
 	}
-	return true, nil
+	// State write and history append commit in one transaction so they can
+	// never diverge (round-3 review): a separate append could fail after
+	// the CAS landed, and the replay path would then skip it (the CAS now
+	// sees the target already persisted), permanently losing the row.
+	swapped, err := s.client.SetFSMStateCAS(ctx, stateKey, fieldCurrentState, expectedPrior, fields, histKey, historyEntry, historyCap)
+	if err != nil {
+		return false, fmt.Errorf("fsm: store save: %w", err)
+	}
+	return swapped, nil
 }
 
 // LoadAll scans every durable FSM-state key and parses it into a
@@ -118,10 +118,16 @@ func (s *Store) LoadAll(ctx context.Context) (recovered []restoredWorkload, skip
 	for _, k := range stateKeys {
 		h, gerr := s.client.GetFSMState(ctx, k)
 		if errors.Is(gerr, redisclient.ErrKeyMissing) {
+			// Key raced a deletion between SCAN and GET; nothing to recover.
 			continue
 		}
 		if gerr != nil {
-			return nil, skipped, fmt.Errorf("fsm: store loadall get %q: %w", k, gerr)
+			// A transient per-key read error must not abort recovery of the
+			// other workloads (NFR24 60s budget); skip and count it. A
+			// fundamentally unreachable Redis would already have failed the
+			// SCAN above.
+			skipped++
+			continue
 		}
 		ps, perr := parsePersisted(h)
 		if perr != nil {
@@ -154,10 +160,14 @@ func parsePersisted(h map[string]string) (persistedState, error) {
 	if err != nil {
 		return persistedState{}, fmt.Errorf("cooldown_anchor_ns: %w", err)
 	}
+	// updated_at_ns is optional on read (older rows without it are still
+	// valid); a parse failure leaves updatedAt zero.
+	updatedNs, _ := strconv.ParseInt(h[fieldUpdatedAtNs], 10, 64)
 	return persistedState{
 		current:          cur,
 		stateEnteredAt:   time.Unix(0, enteredNs).UTC(),
 		cooldownAnchorAt: time.Unix(0, anchorNs).UTC(),
+		updatedAt:        time.Unix(0, updatedNs).UTC(),
 	}, nil
 }
 

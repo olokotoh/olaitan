@@ -758,6 +758,31 @@ score:
   # caps via the analyst tier.
   llmCap: 35
 
+# Story 2.3: response-ring FSM state persistence in Redis with restart
+# recovery (FR37/NFR24). When enabled, the aggregator persists each FSM
+# transition to the durable `fsm:{workload_id}` Redis family (no TTL) and
+# rehydrates the in-memory FSM map on startup so a restart never silently
+# de-escalates a workload to CLEAN.
+#
+# Restart semantics: both knobs are restart-required (they rewire the FSM
+# transition sink and the restore-on-startup hook). Use `kubectl rollout
+# restart deploy/olaitan-aggregator` after `helm upgrade --set
+# fsm.persistenceEnabled=...`.
+fsm:
+  # Whether the FSM persists state to Redis and recovers it on restart.
+  # Setting to false keeps the in-memory-only no-op sink (Story 2.2
+  # behaviour) and skips the restore hook.
+  persistenceEnabled: true
+
+  # Redis address the FSM store dials for `fsm:{workload_id}` state.
+  # Empty (default) resolves to the bundled subchart's
+  # `<release>-redis-master:6379` Service via the olaitan.endpoints.redis
+  # helper (mirroring baselines.redisAddr); the file-side default of
+  # "redis:6379" in config/olaitan.yaml is a development-host shorthand
+  # that does not match the chart's Service naming. Operators with
+  # externally-managed Redis set this explicitly. Restart-required.
+  redisAddr: ""
+
 # Story 1.19: Evaluation matrix configuration (FR53). One-flag switch
 # that places the chart into one of the canonical evaluation arms (F,
 # RS, RSL, RSLT-full). Empty default means "no override; individual

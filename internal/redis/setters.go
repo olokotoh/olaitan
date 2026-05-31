@@ -198,9 +198,13 @@ func (c *Client) GetHealth(ctx context.Context, key string) (string, bool, error
 }
 
 // SetFSMStateCAS writes the durable FSM-state hash for a workload using a
-// compare-and-swap on casField (Story 2.3 AC1). The fsm: family carries
-// NO TTL: FSM state must survive an arbitrary restart gap (BI-2), so a
-// process crash must never let the state silently expire to absent.
+// compare-and-swap on casField AND, in the SAME transaction, appends
+// historyEntry to histKey (Story 2.3 AC1). Folding the state write and the
+// history append into one MULTI/EXEC means they commit together or not at
+// all, so the state hash and the :history list can never diverge (a
+// separate append could fail after the state landed, permanently losing
+// the history row; round-3 review finding). The fsm: family carries NO TTL
+// (BI-2): a process crash must never let the state silently expire.
 //
 // CAS semantics: the write lands when the persisted casField equals
 // expectedPrior, OR when the key is absent (the workload was never
@@ -208,10 +212,14 @@ func (c *Client) GetHealth(ctx context.Context, key string) (string, bool, error
 // write can never strand a workload at CLEAN on restart). A present key
 // whose casField differs from expectedPrior means a newer state already
 // won; the stale write is dropped and (false, nil) is returned. A
-// concurrent modification of the watched key also returns (false, nil)
-// so the caller may retry. This makes replays idempotent: re-applying a
-// transition whose target already landed is a no-op CAS (BI-7).
-func (c *Client) SetFSMStateCAS(ctx context.Context, key, casField, expectedPrior string, fields map[string]any) (bool, error) {
+// concurrent modification of the watched key also returns (false, nil) so
+// the caller may retry. This makes replays idempotent: re-applying a
+// transition whose target already landed is a no-op CAS, so neither the
+// state nor the history is double-written (BI-7).
+//
+// histKey/historyEntry may be empty to skip the append (histCap bounds the
+// list via LTRIM when > 0).
+func (c *Client) SetFSMStateCAS(ctx context.Context, key, casField, expectedPrior string, fields map[string]any, histKey string, historyEntry []byte, histCap int) (bool, error) {
 	rdb := c.conn()
 	if rdb == nil {
 		return false, ErrClientClosed
@@ -224,6 +232,9 @@ func (c *Client) SetFSMStateCAS(ctx context.Context, key, casField, expectedPrio
 	}
 	if len(fields) == 0 {
 		return false, fmt.Errorf("redis: set-fsm-state %q: fields is empty", key)
+	}
+	if histKey != "" && keys.FamilyOf(histKey) != keys.FamilyFSM {
+		return false, fmt.Errorf("redis: set-fsm-state %q: history key %q is not in fsm family", key, histKey)
 	}
 	swapped := false
 	txf := func(tx *goredis.Tx) error {
@@ -238,6 +249,12 @@ func (c *Client) SetFSMStateCAS(ctx context.Context, key, casField, expectedPrio
 		}
 		_, perr := tx.TxPipelined(ctx, func(pipe goredis.Pipeliner) error {
 			pipe.HSet(ctx, key, fields)
+			if histKey != "" && len(historyEntry) > 0 {
+				pipe.RPush(ctx, histKey, historyEntry)
+				if histCap > 0 {
+					pipe.LTrim(ctx, histKey, int64(-histCap), -1)
+				}
+			}
 			return nil
 		})
 		if perr != nil {

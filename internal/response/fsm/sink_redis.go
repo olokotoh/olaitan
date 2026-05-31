@@ -173,9 +173,34 @@ func (s *RedisSink) drain(ctx context.Context) {
 		s.bufMu.Lock()
 		s.buffer = append(remainder, s.buffer...)
 		if over := len(s.buffer) - s.bufCap; over > 0 {
+			// Drop from the TAIL (the newest transitions that arrived during
+			// the drain) so the older un-replayed remainder, which is needed
+			// to keep the per-workload CAS chain intact, is preserved.
 			s.dropped.Add(int64(over))
-			s.buffer = s.buffer[over:]
+			s.buffer = s.buffer[:len(s.buffer)-over]
 		}
+		s.bufMu.Unlock()
+	}
+}
+
+// drainOnce replays the buffered transitions with a single persist attempt
+// each (no retry/backoff), re-prepending any that still fail. Used on
+// shutdown so flushBestEffort cannot stall the errgroup past the
+// graceful-termination window when Redis is genuinely down.
+func (s *RedisSink) drainOnce(ctx context.Context) {
+	s.bufMu.Lock()
+	batch := s.buffer
+	s.buffer = make([]schema.StateTransition, 0, 64)
+	s.bufMu.Unlock()
+	i := 0
+	for ; i < len(batch); i++ {
+		if err := s.persist(ctx, batch[i]); err != nil {
+			break
+		}
+	}
+	if i < len(batch) {
+		s.bufMu.Lock()
+		s.buffer = append(batch[i:], s.buffer...)
 		s.bufMu.Unlock()
 	}
 }
@@ -185,7 +210,7 @@ func (s *RedisSink) drain(ctx context.Context) {
 func (s *RedisSink) flushBestEffort() {
 	ctx, cancel := context.WithTimeout(context.Background(), s.writeTimeout)
 	defer cancel()
-	s.drain(ctx)
+	s.drainOnce(ctx)
 	if d := s.dropped.Load(); d > 0 {
 		s.log.Warn("fsm redis sink: dropped buffered transitions over the buffer cap", "dropped", d)
 	}

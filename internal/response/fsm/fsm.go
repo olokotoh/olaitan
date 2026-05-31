@@ -123,6 +123,11 @@ type Machine struct {
 	// (Story 2.3 AC5). Read by the olaitan_response_fsm_state_recovered_total
 	// CounterFunc; written only by Restore.
 	recovered atomic.Int64
+
+	// restored guards Restore against being called more than once: it is a
+	// startup-only rehydration and a second call would clobber live
+	// in-memory state (dwell/cooldown timers) with stale Redis state.
+	restored atomic.Bool
 }
 
 // fsmMetrics owns the three Story 2.2 instruments.
@@ -546,6 +551,10 @@ func (m *Machine) State(workloadID string) PodState {
 func (m *Machine) Restore(ctx context.Context, store *Store) (recovered int, skipped int, err error) {
 	if store == nil {
 		return 0, 0, errors.New("fsm: restore with nil store")
+	}
+	if !m.restored.CompareAndSwap(false, true) {
+		// Restore is startup-only; a second call would clobber live state.
+		return 0, 0, errors.New("fsm: restore already performed")
 	}
 	loaded, skipped, err := store.LoadAll(ctx)
 	if err != nil {

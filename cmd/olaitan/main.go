@@ -625,13 +625,15 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		}
 		fsmSink = redisSink
 		fsmStore = store
+		// One goroutine owns both the replayer and the client close, in
+		// order: Run flushes the outage buffer best-effort on ctx.Done and
+		// only THEN do we close the Redis client. Two independent ctx.Done
+		// goroutines would race, and the closer could shut Redis before the
+		// final flush, losing a buffer Redis was healthy enough to accept.
 		g.Go(func() error {
-			<-ctx.Done()
+			err := redisSink.Run(ctx)
 			fsmCloser()
-			return nil
-		})
-		g.Go(func() error {
-			return redisSink.Run(ctx)
+			return err
 		})
 	}
 	stateMachine, fsmErr := fsm.New(mgr, metricsReg, fsmSink, nil)
