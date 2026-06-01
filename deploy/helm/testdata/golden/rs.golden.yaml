@@ -755,11 +755,25 @@ data:
       # a single low sample does not de-escalate (AC3). All four are
       # hot-reloadable via FR49: the FSM reads config.Manager.Get() once per
       # Evaluate call, following the Story 2.1 score precedent.
+      #
+      # Story 2.3: durable FSM-state persistence in Redis with restart recovery
+      # (FR37/NFR24). Unlike the dwell/cooldown knobs above (hot-reloadable),
+      # persistence_enabled and redis_addr are restart-required: toggling
+      # persistence or its Redis target rewires the aggregator's FSM sink and
+      # the restore-on-startup hook. The fsm: Redis family carries NO TTL so
+      # state survives an arbitrary restart gap. In a Helm install the chart
+      # overlays redis_addr with the resolved Redis Service address; the
+      # "redis:6379" literal here is the development-host default. The
+      # persistence_enabled and redis_addr keys MUST stay directly below
+      # deescalation_cooldown_seconds with no intervening comment so the
+      # configmap.yaml regex bridge anchors match.
       fsm:
         suspicious_dwell_seconds: 0
         restricted_dwell_seconds: 120
         quarantined_dwell_seconds: 120
         deescalation_cooldown_seconds: 600
+        persistence_enabled: true
+        redis_addr: "olaitan-redis-master:6379"
     
     # Story 1.12: Prometheus metrics surface (FR8, FR50). Every Olaitan
     # process exposes Prometheus metrics on :9090/metrics from a dedicated

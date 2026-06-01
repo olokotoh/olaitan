@@ -19,6 +19,14 @@ const (
 	StatePrefix      = "state:"
 	EvidencePrefix   = "evidence:"
 	HealthPrefix     = "health:"
+	// FSMStatePrefix is the Story 2.3 durable FSM-state family
+	// (fsm:{workload_id} and fsm:{workload_id}:history per
+	// architecture.md:455). It is distinct from StatePrefix: the state:
+	// family is a 1h-TTL per-pod cache keyed by (namespace, pod), whereas
+	// the fsm: family is keyed by the canonical three-segment workload_id
+	// and carries NO TTL (FSM state must survive an arbitrary restart gap;
+	// Story 2.3 BI-2).
+	FSMStatePrefix = "fsm:"
 )
 
 // Fixed checkpoint keys owned by Ring 3 (correlator).
@@ -37,6 +45,7 @@ const (
 	FamilyState
 	FamilyEvidence
 	FamilyHealth
+	FamilyFSM
 )
 
 // FamilyOf returns the Family a key belongs to by its prefix, or
@@ -53,6 +62,8 @@ func FamilyOf(key string) Family {
 		return FamilyEvidence
 	case strings.HasPrefix(key, HealthPrefix):
 		return FamilyHealth
+	case strings.HasPrefix(key, FSMStatePrefix):
+		return FamilyFSM
 	default:
 		return FamilyUnknown
 	}
@@ -151,4 +162,49 @@ func Health(ring string) (string, error) {
 		return "", fmt.Errorf("keys: health ring: %w", err)
 	}
 	return HealthPrefix + ring, nil
+}
+
+// validateWorkloadID accepts a canonical workload identifier produced by
+// WorkloadID or PodFallbackID ("<namespace>/<owner-kind>/<owner-name>")
+// and verifies it has exactly three slash-delimited segments, each a
+// valid token. This is the per-segment guard that lets the fsm: builders
+// embed the two architecture-specified "/" separators while still
+// rejecting Redis hierarchy separators, glob metacharacters, and
+// whitespace inside any segment.
+func validateWorkloadID(workloadID string) error {
+	if workloadID == "" {
+		return fmt.Errorf("empty workload-id")
+	}
+	segs := strings.Split(workloadID, "/")
+	if len(segs) != 3 {
+		return fmt.Errorf("workload-id %q must have exactly three segments (namespace/owner-kind/owner-name)", workloadID)
+	}
+	for _, s := range segs {
+		if err := validateToken(s); err != nil {
+			return fmt.Errorf("workload-id segment: %w", err)
+		}
+	}
+	return nil
+}
+
+// FSMState returns the Story 2.3 durable FSM-state key for a workload.
+// Layout: fsm:<workload_id> where workload_id is the canonical
+// "<namespace>/<owner-kind>/<owner-name>" form from WorkloadID. The key
+// carries NO TTL (FSM state must survive an arbitrary restart gap).
+func FSMState(workloadID string) (string, error) {
+	if err := validateWorkloadID(workloadID); err != nil {
+		return "", fmt.Errorf("keys: fsm-state: %w", err)
+	}
+	return FSMStatePrefix + workloadID, nil
+}
+
+// FSMHistory returns the Story 2.3 append-only transition-history key for
+// a workload. Layout: fsm:<workload_id>:history (a Redis list). Distinct
+// from the EvidenceTransitions stream and from the Story 2.8 NATS audit
+// subject; this list is operational state, bounded by an LTRIM cap.
+func FSMHistory(workloadID string) (string, error) {
+	if err := validateWorkloadID(workloadID); err != nil {
+		return "", fmt.Errorf("keys: fsm-history: %w", err)
+	}
+	return FSMStatePrefix + workloadID + ":history", nil
 }

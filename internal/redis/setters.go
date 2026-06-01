@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
@@ -194,4 +195,155 @@ func (c *Client) GetHealth(ctx context.Context, key string) (string, bool, error
 		return "", false, fmt.Errorf("redis: get-health %q: %w", key, err)
 	}
 	return val, true, nil
+}
+
+// SetFSMStateCAS writes the durable FSM-state hash for a workload using a
+// compare-and-swap on casField AND, in the SAME transaction, appends
+// historyEntry to histKey (Story 2.3 AC1). Folding the state write and the
+// history append into one MULTI/EXEC means they commit together or not at
+// all, so the state hash and the :history list can never diverge (a
+// separate append could fail after the state landed, permanently losing
+// the history row; round-3 review finding). The fsm: family carries NO TTL
+// (BI-2): a process crash must never let the state silently expire.
+//
+// CAS semantics: the write lands when the persisted casField equals
+// expectedPrior, OR when the key is absent (the workload was never
+// persisted, so the first transition can always land and a lost earlier
+// write can never strand a workload at CLEAN on restart). A present key
+// whose casField differs from expectedPrior means a newer state already
+// won; the stale write is dropped and (false, nil) is returned. A
+// concurrent modification of the watched key also returns (false, nil) so
+// the caller may retry. This makes replays idempotent: re-applying a
+// transition whose target already landed is a no-op CAS, so neither the
+// state nor the history is double-written (BI-7).
+//
+// histKey/historyEntry may be empty to skip the append (histCap bounds the
+// list via LTRIM when > 0).
+func (c *Client) SetFSMStateCAS(ctx context.Context, key, casField, expectedPrior string, fields map[string]any, histKey string, historyEntry []byte, histCap int) (bool, error) {
+	rdb := c.conn()
+	if rdb == nil {
+		return false, ErrClientClosed
+	}
+	if keys.FamilyOf(key) != keys.FamilyFSM {
+		return false, fmt.Errorf("redis: set-fsm-state %q: key is not in fsm family", key)
+	}
+	if casField == "" {
+		return false, fmt.Errorf("redis: set-fsm-state %q: cas field is empty", key)
+	}
+	if len(fields) == 0 {
+		return false, fmt.Errorf("redis: set-fsm-state %q: fields is empty", key)
+	}
+	if histKey != "" && keys.FamilyOf(histKey) != keys.FamilyFSM {
+		return false, fmt.Errorf("redis: set-fsm-state %q: history key %q is not in fsm family", key, histKey)
+	}
+	swapped := false
+	txf := func(tx *goredis.Tx) error {
+		prior, gerr := tx.HGet(ctx, key, casField).Result()
+		absent := errors.Is(gerr, goredis.Nil)
+		if gerr != nil && !absent {
+			return gerr
+		}
+		if !absent && prior != expectedPrior {
+			// A newer state already won; drop the stale/replayed write.
+			return nil
+		}
+		_, perr := tx.TxPipelined(ctx, func(pipe goredis.Pipeliner) error {
+			pipe.HSet(ctx, key, fields)
+			if histKey != "" && len(historyEntry) > 0 {
+				pipe.RPush(ctx, histKey, historyEntry)
+				if histCap > 0 {
+					pipe.LTrim(ctx, histKey, int64(-histCap), -1)
+				}
+			}
+			return nil
+		})
+		if perr != nil {
+			return perr
+		}
+		swapped = true
+		return nil
+	}
+	if err := rdb.Watch(ctx, txf, key); err != nil {
+		if errors.Is(err, goredis.TxFailedErr) {
+			// The watched key changed between WATCH and EXEC; not swapped.
+			return false, nil
+		}
+		return false, fmt.Errorf("redis: set-fsm-state %q: %w", key, err)
+	}
+	return swapped, nil
+}
+
+// GetFSMState returns the durable FSM-state hash for a workload, or
+// ErrKeyMissing when the key does not exist. Used on restart recovery.
+func (c *Client) GetFSMState(ctx context.Context, key string) (map[string]string, error) {
+	rdb := c.conn()
+	if rdb == nil {
+		return nil, ErrClientClosed
+	}
+	if keys.FamilyOf(key) != keys.FamilyFSM {
+		return nil, fmt.Errorf("redis: get-fsm-state %q: key is not in fsm family", key)
+	}
+	out, err := rdb.HGetAll(ctx, key).Result()
+	if err != nil {
+		return nil, fmt.Errorf("redis: get-fsm-state %q: %w", key, err)
+	}
+	if len(out) == 0 {
+		return nil, ErrKeyMissing
+	}
+	return out, nil
+}
+
+// AppendFSMHistory appends a marshalled transition record to the
+// workload's fsm:{workload_id}:history list and trims it to the last
+// capN entries in one pipelined round-trip (Story 2.3 AC1). When capN
+// is <= 0 the list is unbounded. No TTL is applied.
+func (c *Client) AppendFSMHistory(ctx context.Context, key string, entry []byte, capN int) error {
+	rdb := c.conn()
+	if rdb == nil {
+		return ErrClientClosed
+	}
+	if keys.FamilyOf(key) != keys.FamilyFSM {
+		return fmt.Errorf("redis: append-fsm-history %q: key is not in fsm family", key)
+	}
+	if len(entry) == 0 {
+		return fmt.Errorf("redis: append-fsm-history %q: entry is empty", key)
+	}
+	pipe := rdb.TxPipeline()
+	pipe.RPush(ctx, key, entry)
+	if capN > 0 {
+		pipe.LTrim(ctx, key, int64(-capN), -1)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("redis: append-fsm-history %q: %w", key, err)
+	}
+	return nil
+}
+
+// ScanFSMStateKeys returns every durable FSM-state key (fsm:{workload_id})
+// currently in Redis, excluding the fsm:{workload_id}:history lists. Used
+// on restart to rehydrate the in-memory FSM map (Story 2.3 AC2).
+func (c *Client) ScanFSMStateKeys(ctx context.Context) ([]string, error) {
+	rdb := c.conn()
+	if rdb == nil {
+		return nil, ErrClientClosed
+	}
+	var out []string
+	var cursor uint64
+	for {
+		batch, next, err := rdb.Scan(ctx, cursor, keys.FSMStatePrefix+"*", 256).Result()
+		if err != nil {
+			return nil, fmt.Errorf("redis: scan-fsm-state: %w", err)
+		}
+		for _, k := range batch {
+			if strings.HasSuffix(k, ":history") {
+				continue
+			}
+			out = append(out, k)
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return out, nil
 }

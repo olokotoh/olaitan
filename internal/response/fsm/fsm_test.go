@@ -398,19 +398,23 @@ func TestState_UnknownWorkloadIsCleanAndNotInserted(t *testing.T) {
 	}
 }
 
-// TestEncapsulation_EvaluateIsSoleMutator pins AC6: Evaluate is the only
-// exported method that mutates per-workload state. State is read-only;
-// there is no other exported mutator. This is an API-shape assertion.
+// TestEncapsulation_EvaluateIsSoleMutator pins AC6: at runtime Evaluate is
+// the only exported method that mutates per-workload state. State is
+// read-only. Story 2.3 adds Restore as the single sanctioned startup-only
+// rehydration mutator (it seeds the map from durable Redis before the
+// consumer starts and is in-package, so external code still cannot touch
+// workloadState directly). This is an API-shape assertion.
 func TestEncapsulation_EvaluateIsSoleMutator(t *testing.T) {
 	allowed := map[string]bool{
-		"Evaluate": true, // sole mutator (AC6)
+		"Evaluate": true, // sole runtime mutator (AC6)
 		"State":    true, // read-only query (BI-6)
+		"Restore":  true, // startup-only rehydration mutator (Story 2.3 BI-5)
 	}
 	mt := reflect.TypeOf(&Machine{})
 	for i := 0; i < mt.NumMethod(); i++ {
 		name := mt.Method(i).Name
 		if !allowed[name] {
-			t.Errorf("unexpected exported Machine method %q: only Evaluate (mutator) and State (read-only) may be exported (AC6)", name)
+			t.Errorf("unexpected exported Machine method %q: only Evaluate (runtime mutator), State (read-only), and Restore (startup rehydration) may be exported (AC6 + Story 2.3 BI-5)", name)
 		}
 	}
 }

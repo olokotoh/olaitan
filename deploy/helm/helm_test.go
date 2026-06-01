@@ -2488,6 +2488,56 @@ func TestRulesConfigMapKeysAreFlatNoDirectory(t *testing.T) {
 // baselines.warmupDuration and --set baselines.sigmaMultiplier
 // through the configmap.yaml bridge into the rendered olaitan.yaml.
 // Story 1.17 AC1/AC2.
+// TestFSMPersistenceConfigMapBridgedFromValues asserts the Story 2.3
+// fsm.persistenceEnabled / fsm.redisAddr Helm values reach the rendered
+// ConfigMap via the configmap.yaml bridge.
+func TestFSMPersistenceConfigMapBridgedFromValues(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"fsm.persistenceEnabled=false",
+		"fsm.redisAddr=custom-redis:6379",
+	})
+	if !strings.Contains(rendered, "persistence_enabled: false") {
+		t.Errorf("fsm.persistenceEnabled override did not propagate; snippet:\n%s", snippet(rendered, "fsm:"))
+	}
+	if !strings.Contains(rendered, `redis_addr: "custom-redis:6379"`) {
+		t.Errorf("fsm.redisAddr override did not propagate; snippet:\n%s", snippet(rendered, "fsm:"))
+	}
+}
+
+// TestFSMPersistenceRedisAddrResolvesEndpoint asserts the default empty
+// fsm.redisAddr resolves to the bundled subchart Service address rather
+// than leaving the dev-host "redis:6379" literal (the in-cluster
+// addressing correctness fix).
+func TestFSMPersistenceRedisAddrResolvesEndpoint(t *testing.T) {
+	rendered := helmTemplate(t, []string{})
+	if strings.Contains(rendered, `redis_addr: "redis:6379"`) {
+		t.Errorf("fsm redis_addr left at the dev-host literal; the bridge must resolve the Service address. snippet:\n%s", snippet(rendered, "fsm:"))
+	}
+	if !strings.Contains(rendered, "redis-master:6379") {
+		t.Errorf("fsm redis_addr did not resolve to the subchart Service; snippet:\n%s", snippet(rendered, "fsm:"))
+	}
+}
+
+// TestFSMPersistenceAnchorsPresentInOlaitanYAML guards the literal anchors
+// the configmap.yaml fsm-persistence bridge depends on. The persistence
+// keys MUST sit directly below deescalation_cooldown_seconds with no
+// intervening comment or the regex anchors break and --set values are
+// silently dropped.
+func TestFSMPersistenceAnchorsPresentInOlaitanYAML(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join(chartDir(t), "files", "olaitan.yaml"))
+	if err != nil {
+		t.Fatalf("read olaitan.yaml: %v", err)
+	}
+	for _, want := range []string{
+		"    deescalation_cooldown_seconds: 600\n    persistence_enabled: true",
+		"    persistence_enabled: true\n    redis_addr: \"redis:6379\"",
+	} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("fsm-block anchor missing/discontiguous in chart olaitan.yaml: %q", want)
+		}
+	}
+}
+
 func TestBaselinesConfigMapBridgedFromValues(t *testing.T) {
 	rendered := helmTemplate(t, []string{
 		"baselines.warmupDuration=15m",

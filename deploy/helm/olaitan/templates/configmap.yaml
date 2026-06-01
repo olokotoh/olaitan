@@ -424,6 +424,32 @@ data:
     {{- end }}
     {{- end }}
     {{- /*
+    Story 2.3 FSM-persistence bridge. persistence_enabled and redis_addr
+    are restart-required (they rewire the aggregator's FSM sink + restore
+    hook). redisAddr defaults to empty in values.yaml so the default
+    install resolves to the subchart's `<release>-redis-master:6379`
+    Service via the olaitan.endpoints.redis helper, exactly like
+    baselines.redisAddr; the file-side "redis:6379" in config/olaitan.yaml
+    is a dev-host shorthand that does not match the chart's Service naming.
+    */ -}}
+    {{- if .Values.fsm }}
+    {{- $fsm := .Values.fsm }}
+    {{- if hasKey $fsm "persistenceEnabled" }}
+    {{- $pFpe := "(?s)(\\n    deescalation_cooldown_seconds:[[:space:]]+[0-9]+\\n    )persistence_enabled:[[:space:]]+(?:true|false)" -}}
+    {{- if not (mustRegexFind $pFpe $cfg) }}{{- fail (printf "helm bridge: detection.fsm.persistence_enabled anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pFpe) }}{{- end }}
+    {{- $fpeVal := "false" }}
+    {{- if $fsm.persistenceEnabled }}{{- $fpeVal = "true" }}{{- end }}
+    {{- $cfg = regexReplaceAll $pFpe $cfg (printf "${1}persistence_enabled: %s" $fpeVal) }}
+    {{- end }}
+    {{- $fsmRedisAddr := $fsm.redisAddr }}
+    {{- if not $fsmRedisAddr }}
+    {{- $fsmRedisAddr = include "olaitan.endpoints.redis" . }}
+    {{- end }}
+    {{- $pFra := "(?s)(\\n    persistence_enabled:[[:space:]]+(?:true|false)\\n    )redis_addr:[[:space:]]+\"[^\"]*\"" -}}
+    {{- if not (mustRegexFind $pFra $cfg) }}{{- fail (printf "helm bridge: detection.fsm.redis_addr anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pFra) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pFra $cfg (printf "${1}redis_addr: %q" $fsmRedisAddr) }}
+    {{- end }}
+    {{- /*
     Story 1.19: Evaluation-matrix overlay (FR53). Replace the file-side
     defaults for detection.rules.enabled, detection.baselines.enabled,
     and analyst.provider with the effective values computed by the

@@ -610,10 +610,44 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	// cooldown read config.Manager.Get() once per Evaluate call, following
 	// the Story 2.1 score precedent, so a hot config reload (FR49) flows
 	// into the live machine without a Subscribe callback.
-	stateMachine, fsmErr := fsm.New(mgr, metricsReg, fsm.NopSink{}, nil)
+	// Story 2.3: durable FSM-state persistence (FR37/NFR24). When enabled,
+	// the FSM emits transitions through a Redis-backed sink and rehydrates
+	// its in-memory map from Redis BEFORE the consumer starts, so a restart
+	// never silently de-escalates a workload to CLEAN. When disabled, it
+	// keeps the Story 2.2 NopSink and skips restore.
+	var fsmSink fsm.TransitionSink = fsm.NopSink{}
+	var fsmStore *fsm.Store
+	if cfg.Detection.FSM.PersistenceEnabledOrDefault() {
+		redisSink, store, fsmCloser, perr := wireFSMPersistence(cfg, log)
+		if perr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: fsm persistence: %w", perr)
+		}
+		fsmSink = redisSink
+		fsmStore = store
+		// One goroutine owns both the replayer and the client close, in
+		// order: Run flushes the outage buffer best-effort on ctx.Done and
+		// only THEN do we close the Redis client. Two independent ctx.Done
+		// goroutines would race, and the closer could shut Redis before the
+		// final flush, losing a buffer Redis was healthy enough to accept.
+		g.Go(func() error {
+			err := redisSink.Run(ctx)
+			fsmCloser()
+			return err
+		})
+	}
+	stateMachine, fsmErr := fsm.New(mgr, metricsReg, fsmSink, nil)
 	if fsmErr != nil {
 		closeNATS()
 		return fmt.Errorf("aggregator: fsm: %w", fsmErr)
+	}
+	if fsmStore != nil {
+		recovered, skipped, rerr := stateMachine.Restore(ctx, fsmStore)
+		if rerr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: fsm restore: %w", rerr)
+		}
+		log.Info("aggregator: fsm state recovered from redis", "recovered", recovered, "skipped", skipped)
 	}
 	if err := wireFSMConsumer(ctx, g, log, nc, scoreCalc, stateMachine); err != nil {
 		closeNATS()
@@ -626,7 +660,8 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		"suspicious_dwell_seconds", cfg.Detection.FSM.SuspiciousDwellSecondsOrDefault(),
 		"restricted_dwell_seconds", cfg.Detection.FSM.RestrictedDwellSecondsOrDefault(),
 		"quarantined_dwell_seconds", cfg.Detection.FSM.QuarantinedDwellSecondsOrDefault(),
-		"deescalation_cooldown_seconds", cfg.Detection.FSM.DeescalationCooldownSecondsOrDefault())
+		"deescalation_cooldown_seconds", cfg.Detection.FSM.DeescalationCooldownSecondsOrDefault(),
+		"persistence_enabled", cfg.Detection.FSM.PersistenceEnabledOrDefault())
 
 	g.Go(func() error {
 		<-ctx.Done()
@@ -701,6 +736,46 @@ func wireBaselineEngine(ctx context.Context, cfg *config.Config, nc *natsclient.
 	}
 	_ = ctx
 	return engine, closer, nil
+}
+
+// wireFSMPersistence constructs the Story 2.3 Redis-backed FSM store and
+// transition sink. Returns the sink (whose Run is the background outage
+// replayer), the store (for the restore-on-startup hook), a closer to
+// defer for graceful shutdown, and any construction error. Mirrors
+// wireBaselineEngine, including the NFR8 mandatory REDIS_PASSWORD AUTH.
+func wireFSMPersistence(cfg *config.Config, log *slog.Logger) (*fsm.RedisSink, *fsm.Store, func(), error) {
+	rcfg := redisclient.DefaultConfig()
+	rcfg.Addr = cfg.Detection.FSM.RedisAddrOrDefault()
+	// NFR8: Redis AUTH is mandatory when FSM persistence is enabled. The
+	// password is surfaced as REDIS_PASSWORD via secretKeyRef; TrimRight
+	// guards the trailing-newline secretKeyRef pitfall (see wireBaselineEngine).
+	pwd := strings.TrimRight(os.Getenv("REDIS_PASSWORD"), "\r\n")
+	if pwd == "" {
+		return nil, nil, func() {}, fmt.Errorf("NFR8: REDIS_PASSWORD env var is required when detection.fsm.persistence_enabled=true (set --set secrets.redisPassword or wire a secretKeyRef)")
+	}
+	rcfg.Password = pwd
+	rc, err := redisclient.NewClient(rcfg)
+	if err != nil {
+		return nil, nil, func() {}, fmt.Errorf("aggregator: fsm redis: %w", err)
+	}
+	closer := func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if cerr := rc.Close(closeCtx); cerr != nil {
+			log.Warn("aggregator: fsm redis close", "err", cerr)
+		}
+	}
+	store, err := fsm.NewStore(rc)
+	if err != nil {
+		closer()
+		return nil, nil, func() {}, fmt.Errorf("aggregator: fsm store: %w", err)
+	}
+	sink, err := fsm.NewRedisSink(store, log, fsm.RedisSinkConfig{})
+	if err != nil {
+		closer()
+		return nil, nil, func() {}, fmt.Errorf("aggregator: fsm sink: %w", err)
+	}
+	return sink, store, closer, nil
 }
 
 // fsmConsumerMaxDeliver caps JetStream's per-message redelivery for the

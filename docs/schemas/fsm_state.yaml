@@ -1,0 +1,61 @@
+# Canonical shape of the durable FSM-state Redis hash (Story 2.3, FR37).
+#
+# Source of truth: internal/response/fsm/store.go (SchemaVersionFSMState
+# and the field constants). Version history: docs/schema-versioning.md.
+#
+# This is a Redis storage format, NOT an EVENTS.raw wire type. One hash
+# per workload at key fsm:{workload_id} (workload_id is the canonical
+# "<namespace>/<owner-kind>/<owner-name>" form from keys.WorkloadID). The
+# fsm: family carries NO TTL: FSM state must survive an arbitrary restart
+# gap so a controller restart never silently de-escalates a workload to
+# CLEAN. The append-only transition history lives in a separate Redis
+# list at fsm:{workload_id}:history (operational state; the 90-day SIEM
+# audit trail is the Story 2.8 NATS AUDIT.transitions subject).
+schema: fsm_state.v1
+description: >
+  The persisted projection of the in-memory FSM workloadState for one
+  workload. Written via compare-and-swap on current_state on each actual
+  transition and rehydrated into the in-memory map on controller restart.
+key: fsm:{workload_id}
+ttl: none
+fields:
+  schema_version:
+    type: string
+    required: true
+    description: Format tag (fsm_state.v1). An unknown value is skipped on load.
+  current_state:
+    type: string
+    required: true
+    enum: [CLEAN, SUSPICIOUS, RESTRICTED, QUARANTINED, PRESERVED_KILLED]
+    description: >
+      The workload's current PodSecurityState. This is the compare-and-swap
+      field: a write lands only when the persisted value equals the
+      caller's expected prior state (or the key is absent).
+  state_entered_at_ns:
+    type: string
+    required: true
+    description: >
+      Nanosecond Unix timestamp (int64 as decimal string) of when the
+      workload entered current_state. The escalation dwell guard measures
+      from here. On restore it is clamped so a future-dated value (a
+      backward clock step that lost the monotonic reading) yields zero, not
+      negative, elapsed.
+  cooldown_anchor_ns:
+    type: string
+    required: true
+    description: >
+      Nanosecond Unix timestamp (int64 as decimal string) of the most
+      recent time the score was at or above current_state's entry
+      threshold. The de-escalation cooldown measures from here. On restore
+      the in-memory anchor is reset to restore-time now (the cooldown
+      window restarts) so a stale persisted anchor cannot trigger a
+      premature de-escalation.
+  updated_at_ns:
+    type: string
+    required: true
+    description: Nanosecond Unix timestamp (int64 as decimal string) of the last write.
+history:
+  key: fsm:{workload_id}:history
+  type: list
+  bound: LTRIM to the last 1000 entries
+  element: marshalled schema.StateTransition JSON, one per applied transition

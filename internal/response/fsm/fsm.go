@@ -34,10 +34,12 @@
 package fsm
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -116,6 +118,16 @@ type Machine struct {
 	states map[string]*workloadState
 
 	metrics *fsmMetrics
+
+	// recovered counts workloads rehydrated from Redis on restart
+	// (Story 2.3 AC5). Read by the olaitan_response_fsm_state_recovered_total
+	// CounterFunc; written only by Restore.
+	recovered atomic.Int64
+
+	// restored guards Restore against being called more than once: it is a
+	// startup-only rehydration and a second call would clobber live
+	// in-memory state (dwell/cooldown timers) with stale Redis state.
+	restored atomic.Bool
 }
 
 // fsmMetrics owns the three Story 2.2 instruments.
@@ -205,6 +217,17 @@ func (m *Machine) registerMetrics(r *metrics.Registry) error {
 		return err
 	}
 	m.metrics.active = av
+
+	// Story 2.3 AC5: count workloads rehydrated from Redis on restart.
+	if err := r.RegisterCounter(
+		"olaitan_response_fsm_state_recovered_total",
+		"",
+		"Cumulative number of workloads whose FSM state was recovered from Redis on controller restart (Story 2.3, FR37/NFR24).",
+		nil,
+		func() int64 { return m.recovered.Load() },
+	); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -514,6 +537,54 @@ func (m *Machine) State(workloadID string) PodState {
 		return ws.current
 	}
 	return schema.StateClean
+}
+
+// Restore rehydrates the in-memory FSM map from durable Redis state on
+// controller startup (Story 2.3 AC2). It MUST run before the FSM consumer
+// begins so a recovered workload is never re-initialised to CLEAN by
+// Evaluate's first-seen path. For each recovered workload it seeds current
+// and stateEnteredAt (clamped so a future-dated persisted timestamp yields
+// zero, never negative, dwell elapsed; BI-6) and resets the de-escalation
+// cooldown anchor to now so a stale persisted anchor can never trigger a
+// premature de-escalation on restart. Returns the count recovered and the
+// count of malformed entries skipped. Safe to call once at startup.
+func (m *Machine) Restore(ctx context.Context, store *Store) (recovered int, skipped int, err error) {
+	if store == nil {
+		return 0, 0, errors.New("fsm: restore with nil store")
+	}
+	if !m.restored.CompareAndSwap(false, true) {
+		// Restore is startup-only; a second call would clobber live state.
+		return 0, 0, errors.New("fsm: restore already performed")
+	}
+	loaded, skipped, err := store.LoadAll(ctx)
+	if err != nil {
+		return 0, 0, fmt.Errorf("fsm: restore load: %w", err)
+	}
+	now := m.clock.Now()
+	m.mu.Lock()
+	for _, rw := range loaded {
+		entered := rw.state.stateEnteredAt
+		if now.Before(entered) {
+			// A backward clock step lost the monotonic reading; clamp the
+			// persisted timestamp to now so dwell elapsed is zero rather
+			// than negative (BI-6).
+			entered = now
+		}
+		m.states[rw.workloadID] = &workloadState{
+			current:                  rw.state.current,
+			stateEnteredAt:           entered,
+			lastAtOrAboveThresholdAt: now,
+		}
+	}
+	recovered = len(loaded)
+	if m.metrics != nil && m.metrics.active != nil {
+		m.refreshActiveGaugeLocked()
+	}
+	m.mu.Unlock()
+	if recovered > 0 {
+		m.recovered.Add(int64(recovered))
+	}
+	return recovered, skipped, nil
 }
 
 func clamp(v, lo, hi float64) float64 {
