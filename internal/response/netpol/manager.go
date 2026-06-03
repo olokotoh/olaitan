@@ -159,18 +159,27 @@ func (m *Manager) count(result string) {
 	}
 }
 
+// enforcedState reports whether a transition INTO state triggers a managed
+// NetworkPolicy (Story 2.5, BI-1). The manager acts on RESTRICTED (Story 2.4
+// egress allow-list) and QUARANTINED (Story 2.5 deny-all) and ignores every
+// other target state. De-escalation removal (QUARANTINED->RESTRICTED, ->CLEAN)
+// is Story 2.6 and is deliberately NOT triggered here.
+func enforcedState(s schema.PodSecurityState) bool {
+	return s == schema.StateRestricted || s == schema.StateQuarantined
+}
+
 // Publish is the fsm.TransitionSink seam (BI-3, BI-5). It acts only on a
-// transition INTO RESTRICTED and enqueues it for the async worker without
-// blocking the FSM goroutine; on a full queue it drops with a metric rather
-// than stalling the hot path (BI-4).
+// transition INTO an enforced state (RESTRICTED or QUARANTINED) and enqueues
+// it for the async worker without blocking the FSM goroutine; on a full queue
+// it drops with a metric rather than stalling the hot path (BI-4).
 func (m *Manager) Publish(st schema.StateTransition) {
-	if st.ToState != schema.StateRestricted {
+	if !enforcedState(st.ToState) {
 		return
 	}
 	select {
 	case m.queue <- st:
 	default:
-		m.log.Warn("netpol: apply queue full; dropping RESTRICTED transition", "workload_id", st.WorkloadID)
+		m.log.Warn("netpol: apply queue full; dropping transition", "workload_id", st.WorkloadID, "to_state", st.ToState)
 		m.count("dropped")
 	}
 }
@@ -244,12 +253,51 @@ func (m *Manager) handle(ctx context.Context, st schema.StateTransition) {
 	}
 	// NFR6 budget: record latency only on a successful apply/noop, never on
 	// the error path, so failed-apply durations do not skew the histogram.
+	// The QUARANTINED apply feeds the same histogram as RESTRICTED (AC3).
 	if m.applySeconds != nil && !st.Timestamp.IsZero() {
 		m.applySeconds.Observe(m.now().Sub(st.Timestamp).Seconds())
 	}
 	m.count(result)
-	m.log.Info("netpol: RESTRICTED policy applied",
-		"workload_id", st.WorkloadID, "policy", np.Name, "namespace", np.Namespace, "result", result)
+	m.log.Info("netpol: policy applied",
+		"workload_id", st.WorkloadID, "policy", np.Name, "namespace", np.Namespace, "to_state", st.ToState, "result", result)
+
+	// Atomic replacement (BI-5): ONLY after the QUARANTINED deny-all policy is
+	// confirmed applied do we best-effort delete the superseded RESTRICTED
+	// policy for the same workload. Apply-before-delete is the load-bearing
+	// invariant: during the brief overlap both policies select the pod and
+	// their union is strictly more blocked (the deny-all wins), so there is
+	// never a window with reduced or absent protection. A failed delete does
+	// NOT fail the QUARANTINED enforcement (the workload is already fully
+	// blocked; the stale restricted policy only ever ADDS egress the quarantine
+	// policy overrides, and is orphan-GC'd when its owner is deleted).
+	if st.ToState == schema.StateQuarantined {
+		m.deleteSupersededRestricted(ctx, ref, st.WorkloadID)
+	}
+}
+
+// deleteSupersededRestricted best-effort deletes the RESTRICTED policy a
+// QUARANTINED transition supersedes (BI-5 step 3). It MUST be called only
+// after the quarantine apply has returned success (apply-before-delete). A
+// NotFound is success (the workload may have skipped RESTRICTED, or the policy
+// was already GC'd). A real delete failure is logged at WARN and swallowed:
+// the workload is already fully blocked by the quarantine policy, so the
+// supersession delete is silent best-effort (BI-7, Open Assumption 4) and the
+// QUARANTINED enforcement does not fail.
+func (m *Manager) deleteSupersededRestricted(ctx context.Context, ref workloadRef, workloadID string) {
+	name := policyNameFor(schema.StateRestricted, workloadID)
+	err := m.cs.NetworkingV1().NetworkPolicies(ref.namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			m.log.Debug("netpol: no superseded RESTRICTED policy to delete",
+				"workload_id", workloadID, "policy", name, "namespace", ref.namespace)
+			return
+		}
+		m.log.Warn("netpol: failed to delete superseded RESTRICTED policy; quarantine still enforced",
+			"workload_id", workloadID, "policy", name, "namespace", ref.namespace, "err", err)
+		return
+	}
+	m.log.Info("netpol: deleted superseded RESTRICTED policy after quarantine apply",
+		"workload_id", workloadID, "policy", name, "namespace", ref.namespace)
 }
 
 // apply performs an idempotent get-then-create-or-update (BI-6). Re-applying

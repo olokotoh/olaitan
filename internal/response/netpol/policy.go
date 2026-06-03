@@ -28,6 +28,13 @@ const (
 	AnnWorkloadID = "olaitan.io/workload-id"
 
 	policyNamePrefix = "olaitan-restricted-"
+	// quarantinedNamePrefix is the distinct deterministic prefix for the
+	// QUARANTINED deny-all policy (Story 2.5, BI-3). It differs from the
+	// RESTRICTED prefix so the two states' objects are independently
+	// addressable during the apply-before-delete supersession (BI-5) and
+	// for Story 2.6 de-escalation, while both remain collectable by the
+	// single managed-by GC selector (BI-8).
+	quarantinedNamePrefix = "olaitan-quarantined-"
 )
 
 // managedBySelector is the label selector the GC reconcile lists with.
@@ -36,14 +43,38 @@ const managedBySelector = LabelManagedBy + "=" + ManagedByValue
 // rfc1918 are the private ranges always allowed for egress under RESTRICTED.
 var rfc1918 = []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
 
-// PolicyName returns the deterministic NetworkPolicy name for a workload:
-// "olaitan-restricted-" + the first 12 hex chars of sha256(workloadID). The
-// determinism makes apply idempotent (re-applying targets the same object,
-// BI-6) and lets the GC reconcile and the Story 2.5 QUARANTINED replacement
-// address the same object.
+// PolicyName returns the deterministic RESTRICTED NetworkPolicy name for a
+// workload: "olaitan-restricted-" + the first 12 hex chars of
+// sha256(workloadID). The determinism makes apply idempotent (re-applying
+// targets the same object, BI-6) and lets the GC reconcile and the Story 2.5
+// QUARANTINED supersession address the right object. It delegates to the
+// state-keyed policyNameFor so RESTRICTED has a single source of truth.
 func PolicyName(workloadID string) string {
+	return policyNameFor(schema.StateRestricted, workloadID)
+}
+
+// policyHashSuffix returns the first 12 hex chars of sha256(workloadID), the
+// shared deterministic suffix both per-state policy names carry (BI-3). The
+// same suffix means re-apply targets the same object (idempotent, BI-6) and
+// the RESTRICTED and QUARANTINED names for a workload differ only by prefix.
+func policyHashSuffix(workloadID string) string {
 	sum := sha256.Sum256([]byte(workloadID))
-	return policyNamePrefix + hex.EncodeToString(sum[:])[:12]
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+// policyNameFor returns the deterministic, state-keyed NetworkPolicy name for
+// a workload (Story 2.5, BI-3): the "olaitan-restricted-" prefix for
+// RESTRICTED and the "olaitan-quarantined-" prefix for QUARANTINED, each
+// followed by the shared 12-hex sha256 suffix. Any other state falls back to
+// the RESTRICTED prefix; handle never builds a policy for a non-enforced
+// state, so this default is unreachable in practice but keeps the helper
+// total.
+func policyNameFor(state schema.PodSecurityState, workloadID string) string {
+	prefix := policyNamePrefix
+	if state == schema.StateQuarantined {
+		prefix = quarantinedNamePrefix
+	}
+	return prefix + policyHashSuffix(workloadID)
 }
 
 // buildEgressRules precomputes the RESTRICTED egress allow-list (BI-8).
@@ -85,17 +116,22 @@ func managedLabels() map[string]string {
 	}
 }
 
-// buildPolicy constructs the typed RESTRICTED NetworkPolicy for a workload.
-// policyTypes is Egress only (RESTRICTED leaves ingress untouched; the full
-// ingress+egress block is the Story 2.5 QUARANTINED state). The egress rules
-// are the precomputed allow-list (BI-8).
+// buildPolicy constructs the typed NetworkPolicy for a workload, keyed by the
+// transition's target state (Story 2.5, BI-2). For RESTRICTED it renders the
+// egress allow-list policy (policyTypes Egress only; ingress untouched;
+// precomputed allow-list, BI-8), unchanged from Story 2.4. For QUARANTINED it
+// renders the deny-all-ingress-and-egress policy (policyTypes [Ingress,
+// Egress] with both rule slices left nil, BI-4). The name is state-keyed
+// (BI-3) and the AnnFSMState annotation carries the actual target state so
+// AC4's olaitan.io/fsm-state matches for both states from one code path. The
+// managed labels and the annotation block are reused verbatim.
 func (m *Manager) buildPolicy(ref workloadRef, sel *metav1.LabelSelector, st schema.StateTransition) *networkingv1.NetworkPolicy {
 	var podSelector metav1.LabelSelector
 	if sel != nil {
 		podSelector = *sel
 	}
 	annotations := map[string]string{
-		AnnFSMState:   string(schema.StateRestricted),
+		AnnFSMState:   string(st.ToState),
 		AnnWorkloadID: st.WorkloadID,
 	}
 	// Mirror the schema's omitempty intent: only carry the package-id
@@ -103,17 +139,26 @@ func (m *Manager) buildPolicy(ref workloadRef, sel *metav1.LabelSelector, st sch
 	if st.PackageID != "" {
 		annotations[AnnPackageID] = st.PackageID
 	}
+	spec := networkingv1.NetworkPolicySpec{PodSelector: podSelector}
+	if st.ToState == schema.StateQuarantined {
+		// Deny-all (BI-4): listing both policyTypes with NO rules of either
+		// type denies all ingress and all egress in additive
+		// networking.k8s.io/v1 semantics. Ingress and Egress are left nil; a
+		// stray empty rule struct ({}) would invert this to allow-all and MUST
+		// NOT be emitted. No DNS carve-out: a confirmed-malicious workload is
+		// cut off completely, name resolution included.
+		spec.PolicyTypes = []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress}
+	} else {
+		spec.PolicyTypes = []networkingv1.PolicyType{networkingv1.PolicyTypeEgress}
+		spec.Egress = m.egressRules
+	}
 	return &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        PolicyName(st.WorkloadID),
+			Name:        policyNameFor(st.ToState, st.WorkloadID),
 			Namespace:   ref.namespace,
 			Labels:      managedLabels(),
 			Annotations: annotations,
 		},
-		Spec: networkingv1.NetworkPolicySpec{
-			PodSelector: podSelector,
-			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
-			Egress:      m.egressRules,
-		},
+		Spec: spec,
 	}
 }

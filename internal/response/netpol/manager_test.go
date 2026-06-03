@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,9 +17,17 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/olokotoh/olaitan/internal/metrics"
 	"github.com/olokotoh/olaitan/internal/schema"
 )
+
+// testutilToFloat reads the current value of the apply_total{result} series.
+func testutilToFloat(t *testing.T, m *Manager, result string) float64 {
+	t.Helper()
+	return testutil.ToFloat64(m.applyTotal.WithLabelValues(result))
+}
 
 func metricsRegistryForTest(t *testing.T) *metrics.Registry {
 	t.Helper()
@@ -44,6 +53,16 @@ func restrictedTransition(workloadID, packageID string) schema.StateTransition {
 		Timestamp:  time.Now(),
 		FromState:  schema.StateSuspicious,
 		ToState:    schema.StateRestricted,
+		WorkloadID: workloadID,
+		PackageID:  packageID,
+	}
+}
+
+func quarantinedTransition(workloadID, packageID string) schema.StateTransition {
+	return schema.StateTransition{
+		Timestamp:  time.Now(),
+		FromState:  schema.StateRestricted,
+		ToState:    schema.StateQuarantined,
 		WorkloadID: workloadID,
 		PackageID:  packageID,
 	}
@@ -313,15 +332,259 @@ func TestHandle_SkipsExcludedNamespace(t *testing.T) {
 
 func TestPublish_FiltersAndEnqueues(t *testing.T) {
 	m := newTestManager(t, Config{ClusterCIDRs: []string{"10.96.0.0/12"}})
-	// Non-RESTRICTED transitions are ignored (not enqueued).
-	m.Publish(schema.StateTransition{ToState: schema.StateSuspicious, WorkloadID: "ns/Deployment/web"})
+	// Non-enforced transitions are ignored (not enqueued).
+	for _, to := range []schema.PodSecurityState{schema.StateClean, schema.StateSuspicious, schema.StatePreservedKilled} {
+		m.Publish(schema.StateTransition{ToState: to, WorkloadID: "ns/Deployment/web"})
+	}
 	if len(m.queue) != 0 {
-		t.Fatalf("non-RESTRICTED transition was enqueued: queue len %d", len(m.queue))
+		t.Fatalf("non-enforced transition was enqueued: queue len %d", len(m.queue))
 	}
 	// A RESTRICTED transition is enqueued.
 	m.Publish(restrictedTransition("ns/Deployment/web", "pkg-1"))
 	if len(m.queue) != 1 {
 		t.Fatalf("RESTRICTED transition not enqueued: queue len %d", len(m.queue))
+	}
+	// A QUARANTINED transition is also enqueued (Story 2.5, BI-1).
+	m.Publish(quarantinedTransition("ns/Deployment/web", "pkg-1"))
+	if len(m.queue) != 2 {
+		t.Fatalf("QUARANTINED transition not enqueued: queue len %d", len(m.queue))
+	}
+}
+
+func TestEnforcedState_AcceptSet(t *testing.T) {
+	accepted := map[schema.PodSecurityState]bool{
+		schema.StateRestricted:  true,
+		schema.StateQuarantined: true,
+	}
+	for _, s := range []schema.PodSecurityState{
+		schema.StateClean, schema.StateSuspicious, schema.StateRestricted,
+		schema.StateQuarantined, schema.StatePreservedKilled,
+	} {
+		if got := enforcedState(s); got != accepted[s] {
+			t.Fatalf("enforcedState(%q) = %v, want %v", s, got, accepted[s])
+		}
+	}
+}
+
+func TestPolicyNameFor_PerStatePrefixedSameSuffix(t *testing.T) {
+	const id = "ns/Deployment/web"
+	restricted := policyNameFor(schema.StateRestricted, id)
+	quarantined := policyNameFor(schema.StateQuarantined, id)
+
+	if restricted != PolicyName(id) {
+		t.Fatalf("policyNameFor(RESTRICTED) = %q != PolicyName(id) = %q", restricted, PolicyName(id))
+	}
+	if !strings.HasPrefix(restricted, policyNamePrefix) {
+		t.Fatalf("restricted name %q missing prefix %q", restricted, policyNamePrefix)
+	}
+	if !strings.HasPrefix(quarantined, quarantinedNamePrefix) {
+		t.Fatalf("quarantined name %q missing prefix %q", quarantined, quarantinedNamePrefix)
+	}
+	// Same 12-hex sha256 suffix; the two names differ only by prefix.
+	suffixR := strings.TrimPrefix(restricted, policyNamePrefix)
+	suffixQ := strings.TrimPrefix(quarantined, quarantinedNamePrefix)
+	if suffixR != suffixQ {
+		t.Fatalf("suffixes differ: restricted %q vs quarantined %q", suffixR, suffixQ)
+	}
+	if len(suffixQ) != 12 {
+		t.Fatalf("hash suffix %q has unexpected length %d", suffixQ, len(suffixQ))
+	}
+	// Deterministic.
+	if policyNameFor(schema.StateQuarantined, id) != quarantined {
+		t.Fatal("policyNameFor(QUARANTINED) is not deterministic")
+	}
+}
+
+func TestBuildPolicy_QuarantinedDenyAll(t *testing.T) {
+	m := newTestManager(t, Config{ClusterCIDRs: []string{"10.96.0.0/12"}})
+	st := quarantinedTransition("ns/Deployment/web", "pkg-9")
+	ref := workloadRef{namespace: "ns", ownerKind: "Deployment", ownerName: "web"}
+	sel := &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}}
+	np := m.buildPolicy(ref, sel, st)
+
+	if np.Name != policyNameFor(schema.StateQuarantined, st.WorkloadID) {
+		t.Fatalf("quarantine policy name %q != deterministic quarantine name", np.Name)
+	}
+	if !strings.HasPrefix(np.Name, quarantinedNamePrefix) {
+		t.Fatalf("quarantine policy name %q missing quarantine prefix", np.Name)
+	}
+	// policyTypes must be exactly [Ingress, Egress].
+	if len(np.Spec.PolicyTypes) != 2 {
+		t.Fatalf("policyTypes = %v, want [Ingress, Egress]", np.Spec.PolicyTypes)
+	}
+	haveIngress, haveEgress := false, false
+	for _, pt := range np.Spec.PolicyTypes {
+		switch pt {
+		case networkingv1.PolicyTypeIngress:
+			haveIngress = true
+		case networkingv1.PolicyTypeEgress:
+			haveEgress = true
+		}
+	}
+	if !haveIngress || !haveEgress {
+		t.Fatalf("policyTypes = %v, want both Ingress and Egress", np.Spec.PolicyTypes)
+	}
+	// Deny-all: both rule slices nil/empty, and crucially NOT a stray empty
+	// rule struct (which would invert to allow-all, BI-4).
+	if len(np.Spec.Ingress) != 0 {
+		t.Fatalf("quarantine Ingress = %v, want nil/empty (no allow-all rule)", np.Spec.Ingress)
+	}
+	if len(np.Spec.Egress) != 0 {
+		t.Fatalf("quarantine Egress = %v, want nil/empty (no allow-all rule)", np.Spec.Egress)
+	}
+	if np.Spec.Ingress != nil {
+		t.Fatal("quarantine Ingress is a non-nil empty slice; want nil to avoid any stray rule")
+	}
+	if np.Spec.Egress != nil {
+		t.Fatal("quarantine Egress is a non-nil empty slice; want nil to avoid any stray rule")
+	}
+	if np.Annotations[AnnFSMState] != string(schema.StateQuarantined) {
+		t.Fatalf("fsm-state annotation = %q, want QUARANTINED", np.Annotations[AnnFSMState])
+	}
+	if np.Annotations[AnnFSMState] != "QUARANTINED" {
+		t.Fatalf("fsm-state annotation literal = %q, want QUARANTINED", np.Annotations[AnnFSMState])
+	}
+	if np.Labels[LabelManagedBy] != ManagedByValue {
+		t.Fatalf("quarantine policy missing managed-by label: %v", np.Labels)
+	}
+	if np.Annotations[AnnWorkloadID] != st.WorkloadID {
+		t.Fatalf("workload-id annotation = %q", np.Annotations[AnnWorkloadID])
+	}
+	if np.Annotations[AnnPackageID] != "pkg-9" {
+		t.Fatalf("package-id annotation = %q", np.Annotations[AnnPackageID])
+	}
+	if np.Spec.PodSelector.MatchLabels["app"] != "web" {
+		t.Fatalf("podSelector = %v", np.Spec.PodSelector)
+	}
+}
+
+func TestBuildPolicy_RestrictedGoldenUnchangedAlongsideQuarantine(t *testing.T) {
+	// Assert the RESTRICTED rendering is unchanged when the builder is now
+	// state-keyed: egress allow-list present, policyTypes [Egress] only,
+	// AnnFSMState == RESTRICTED.
+	m := newTestManager(t, Config{ClusterCIDRs: []string{"10.96.0.0/12"}})
+	st := restrictedTransition("ns/Deployment/web", "pkg-1")
+	ref := workloadRef{namespace: "ns", ownerKind: "Deployment", ownerName: "web"}
+	np := m.buildPolicy(ref, &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}}, st)
+
+	if len(np.Spec.PolicyTypes) != 1 || np.Spec.PolicyTypes[0] != networkingv1.PolicyTypeEgress {
+		t.Fatalf("RESTRICTED policyTypes = %v, want [Egress]", np.Spec.PolicyTypes)
+	}
+	if len(np.Spec.Egress) == 0 {
+		t.Fatal("RESTRICTED egress allow-list missing")
+	}
+	if np.Spec.Ingress != nil {
+		t.Fatalf("RESTRICTED Ingress = %v, want nil", np.Spec.Ingress)
+	}
+	if np.Annotations[AnnFSMState] != string(schema.StateRestricted) {
+		t.Fatalf("RESTRICTED fsm-state annotation = %q", np.Annotations[AnnFSMState])
+	}
+	if !strings.HasPrefix(np.Name, policyNamePrefix) {
+		t.Fatalf("RESTRICTED policy name %q missing restricted prefix", np.Name)
+	}
+}
+
+func TestHandle_QuarantineAppliesAndDeletesRestricted(t *testing.T) {
+	sel := map[string]string{"app": "web"}
+	m := newTestManager(t, Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, deployment("ns", "web", sel))
+	ctx := context.Background()
+	workloadID := "ns/Deployment/web"
+
+	// Pre-existing RESTRICTED policy (the workload passed through RESTRICTED).
+	m.handle(ctx, restrictedTransition(workloadID, "pkg-1"))
+	restrictedName := policyNameFor(schema.StateRestricted, workloadID)
+	if _, err := m.cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, restrictedName, metav1.GetOptions{}); err != nil {
+		t.Fatalf("precondition: restricted policy not applied: %v", err)
+	}
+
+	// QUARANTINED transition: applies the quarantine policy, then deletes the
+	// restricted policy (apply-before-delete).
+	m.handle(ctx, quarantinedTransition(workloadID, "pkg-2"))
+
+	// Causal order in the assertions: quarantine present first ...
+	quarantineName := policyNameFor(schema.StateQuarantined, workloadID)
+	q, err := m.cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, quarantineName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("quarantine policy not applied: %v", err)
+	}
+	if q.Annotations[AnnFSMState] != "QUARANTINED" {
+		t.Fatalf("quarantine policy fsm-state = %q, want QUARANTINED", q.Annotations[AnnFSMState])
+	}
+	if len(q.Spec.PolicyTypes) != 2 {
+		t.Fatalf("quarantine policyTypes = %v, want [Ingress, Egress]", q.Spec.PolicyTypes)
+	}
+	// ... then the restricted policy is gone.
+	if _, err := m.cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, restrictedName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("restricted policy not superseded (deleted): err=%v", err)
+	}
+}
+
+func TestHandle_QuarantineWithoutPriorRestrictedIsNoOpDelete(t *testing.T) {
+	sel := map[string]string{"app": "web"}
+	m := newTestManager(t, Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, deployment("ns", "web", sel))
+	ctx := context.Background()
+	workloadID := "ns/Deployment/web"
+
+	// QUARANTINED with NO prior restricted policy: still applies quarantine,
+	// and the absent-restricted delete is a no-op (no error, no crash).
+	m.handle(ctx, quarantinedTransition(workloadID, "pkg-1"))
+
+	quarantineName := policyNameFor(schema.StateQuarantined, workloadID)
+	if _, err := m.cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, quarantineName, metav1.GetOptions{}); err != nil {
+		t.Fatalf("quarantine policy not applied: %v", err)
+	}
+	restrictedName := policyNameFor(schema.StateRestricted, workloadID)
+	if _, err := m.cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, restrictedName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("unexpected restricted policy present: err=%v", err)
+	}
+}
+
+func TestDeleteSupersededRestricted_NoOpWhenAbsent(t *testing.T) {
+	m := newTestManager(t, Config{ClusterCIDRs: []string{"10.96.0.0/12"}})
+	ctx := context.Background()
+	ref := workloadRef{namespace: "ns", ownerKind: "Deployment", ownerName: "web"}
+	// No restricted policy exists; the delete must be a silent no-op (NotFound
+	// treated as success, no panic, no error surfaced).
+	m.deleteSupersededRestricted(ctx, ref, "ns/Deployment/web")
+}
+
+func TestHandle_QuarantineIdempotentReapply(t *testing.T) {
+	sel := map[string]string{"app": "web"}
+	reg := metricsRegistryForTest(t)
+	cs := fake.NewSimpleClientset(runtime.Object(deployment("ns", "web", sel)))
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+	st := quarantinedTransition("ns/Deployment/web", "pkg-1")
+
+	m.handle(ctx, st)
+	if got := testutilToFloat(t, m, "applied"); got != 1 {
+		t.Fatalf("apply_total{applied} after first quarantine = %v, want 1", got)
+	}
+	// Re-emit the identical QUARANTINED transition: idempotent noop apply, and
+	// the (already-absent) restricted delete is a no-op.
+	m.handle(ctx, st)
+	if got := testutilToFloat(t, m, "noop"); got != 1 {
+		t.Fatalf("apply_total{noop} after re-quarantine = %v, want 1", got)
+	}
+}
+
+func TestHandle_QuarantineUnresolvableSkipped(t *testing.T) {
+	reg := metricsRegistryForTest(t)
+	cs := fake.NewSimpleClientset()
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// Valid id, owner does not exist -> resolve NotFound -> skipped, not error.
+	m.handle(context.Background(), quarantinedTransition("ns/Deployment/ghost", "pkg-1"))
+	if got := testutilToFloat(t, m, "skipped"); got != 1 {
+		t.Fatalf("apply_total{skipped} = %v, want 1 for unresolvable QUARANTINED", got)
+	}
+	if got := testutilToFloat(t, m, "error"); got != 0 {
+		t.Fatalf("apply_total{error} = %v, want 0", got)
 	}
 }
 
