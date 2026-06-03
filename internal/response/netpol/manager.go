@@ -343,12 +343,13 @@ func (m *Manager) reconcileGC(ctx context.Context) {
 	}
 	for i := range list.Items {
 		np := &list.Items[i]
-		// Apply/GC symmetry: handle skips excluded namespaces before applying,
-		// so GC must not touch policies that live in one (e.g. a hand-managed
-		// policy in kube-system that happens to carry our managed-by label).
-		if _, skip := m.excluded[np.Namespace]; skip {
-			continue
-		}
+		// GC operates only on policies carrying our managed-by label (the List
+		// selector guarantees this) and only deletes them once their owner is
+		// gone. The excluded-namespaces filter intentionally does NOT apply
+		// here: it stops us applying NEW policies in those namespaces, but a
+		// policy Olaitan already created there must still be collectable once
+		// orphaned. Skipping excluded namespaces would strand our own orphans
+		// permanently if a namespace were excluded after a policy was applied.
 		wid := np.Annotations[AnnWorkloadID]
 		if wid == "" {
 			continue

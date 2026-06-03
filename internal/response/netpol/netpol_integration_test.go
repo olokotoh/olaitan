@@ -31,6 +31,14 @@ var envtestState struct {
 }
 
 func TestMain(m *testing.M) {
+	// Explicit opt-out: skip the envtest-backed suite without even attempting
+	// to locate or start a kube-apiserver. Mirrors the documented contract in
+	// the env.Start() failure branch below.
+	if os.Getenv("NETPOL_INTEGRATION_SKIP") == "1" {
+		os.Stderr.WriteString("netpol integration: NETPOL_INTEGRATION_SKIP=1, skipping (exit 0)\n")
+		os.Exit(0)
+	}
+
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
 		if root, err := repoRoot(); err == nil {
 			candidates, _ := filepath.Glob(filepath.Join(root, "bin", "k8s", "k8s", "*-linux-amd64"))

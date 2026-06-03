@@ -372,18 +372,20 @@ func m_buildManagedPolicy(ns, name, workloadID string) *networkingv1.NetworkPoli
 	}
 }
 
-func TestReconcileGC_SkipsExcludedNamespace(t *testing.T) {
-	// A managed orphan policy in an excluded namespace must not be GC'd, for
-	// apply/GC symmetry: handle never applies in an excluded namespace, so GC
-	// must not delete there either.
+func TestReconcileGC_CollectsManagedOrphanEvenInExcludedNamespace(t *testing.T) {
+	// A managed orphan policy must be GC'd regardless of namespace exclusion.
+	// Excluding a namespace stops handle applying NEW policies there, but a
+	// policy Olaitan already created must still be collectable once its owner
+	// is gone, otherwise excluding a namespace after a policy was applied would
+	// strand our own orphan permanently.
 	orphan := m_buildManagedPolicy("kube-system", "orphan", "kube-system/Deployment/ghost")
 	m := newTestManager(t, Config{ClusterCIDRs: []string{"10.96.0.0/12"}, ExcludedNamespaces: []string{"kube-system"}}, orphan)
 	ctx := context.Background()
 
 	m.reconcileGC(ctx)
 
-	if _, err := m.cs.NetworkingV1().NetworkPolicies("kube-system").Get(ctx, "orphan", metav1.GetOptions{}); err != nil {
-		t.Fatalf("orphan policy in excluded namespace was deleted: %v", err)
+	if _, err := m.cs.NetworkingV1().NetworkPolicies("kube-system").Get(ctx, "orphan", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("managed orphan in excluded namespace was not GC'd: err=%v", err)
 	}
 }
 
