@@ -398,6 +398,32 @@ func TestState_UnknownWorkloadIsCleanAndNotInserted(t *testing.T) {
 	}
 }
 
+// TestCurrentState_TrackedFlag pins Story 2.6 BI-2c: CurrentState reports ok=true
+// only for a tracked workload and (CLEAN, false) for a never-seen one, without
+// inserting it. The netpol StateOracle keys the de-escalation reconcile on this.
+func TestCurrentState_TrackedFlag(t *testing.T) {
+	clock := newFakeClock()
+	m, _ := newMachineForTest(t, testConfig(0, 0, 0, 600), clock)
+
+	// Unknown workload: (CLEAN, false), not inserted.
+	if s, ok := m.CurrentState("never-seen"); ok || s != schema.StateClean {
+		t.Fatalf("CurrentState(unknown) = (%s, %v), want (CLEAN, false)", s, ok)
+	}
+	m.mu.RLock()
+	_, present := m.states["never-seen"]
+	m.mu.RUnlock()
+	if present {
+		t.Fatal("CurrentState inserted an entry for an unseen workload; it must be read-only")
+	}
+
+	// A tracked workload at RESTRICTED reports (RESTRICTED, true).
+	m.Evaluate("w", 50, "pkg-1") // CLEAN -> SUSPICIOUS (zero dwell)
+	m.Evaluate("w", 50, "pkg-2") // SUSPICIOUS -> RESTRICTED
+	if s, ok := m.CurrentState("w"); !ok || s != schema.StateRestricted {
+		t.Fatalf("CurrentState(w) = (%s, %v), want (RESTRICTED, true)", s, ok)
+	}
+}
+
 // TestEncapsulation_EvaluateIsSoleMutator pins AC6: at runtime Evaluate is
 // the only exported method that mutates per-workload state. State is
 // read-only. Story 2.3 adds Restore as the single sanctioned startup-only
@@ -406,9 +432,10 @@ func TestState_UnknownWorkloadIsCleanAndNotInserted(t *testing.T) {
 // workloadState directly). This is an API-shape assertion.
 func TestEncapsulation_EvaluateIsSoleMutator(t *testing.T) {
 	allowed := map[string]bool{
-		"Evaluate": true, // sole runtime mutator (AC6)
-		"State":    true, // read-only query (BI-6)
-		"Restore":  true, // startup-only rehydration mutator (Story 2.3 BI-5)
+		"Evaluate":     true, // sole runtime mutator (AC6)
+		"State":        true, // read-only query (BI-6)
+		"CurrentState": true, // read-only query with tracked flag (Story 2.6 BI-2c)
+		"Restore":      true, // startup-only rehydration mutator (Story 2.3 BI-5)
 	}
 	mt := reflect.TypeOf(&Machine{})
 	for i := 0; i < mt.NumMethod(); i++ {

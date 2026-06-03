@@ -304,3 +304,187 @@ func TestIntegration_RestrictedToQuarantineAtomicReplacement(t *testing.T) {
 		t.Fatalf("orphan quarantine policy not garbage-collected: err=%v", err)
 	}
 }
+
+// itOracle is an envtest-side fake StateOracle for the de-escalation-residue
+// reconcile assertions (Story 2.6, BI-2c).
+type itOracle struct {
+	states map[string]schema.PodSecurityState
+}
+
+func (o itOracle) CurrentState(workloadID string) (schema.PodSecurityState, bool) {
+	s, ok := o.states[workloadID]
+	return s, ok
+}
+
+func itCreateDeployment(t *testing.T, ns, name string, sel map[string]string) {
+	t.Helper()
+	if _, err := envtestState.cs.AppsV1().Deployments(ns).Create(context.Background(), &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: sel},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: sel},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "busybox"}}},
+			},
+		},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create deployment %q: %v", name, err)
+	}
+}
+
+// TestIntegration_DeescalationLifecycle exercises the full Story 2.6
+// de-escalation lifecycle QUARANTINED -> RESTRICTED -> SUSPICIOUS -> CLEAN
+// against a real kube-apiserver (AC4). It asserts the managed-policy set at each
+// step: QUARANTINED present alone (the Story 2.5 state), then RESTRICTED applied
+// and QUARANTINED removed (AC1 atomic relaxation, restricted asserted present
+// BEFORE quarantine absent), then both removed at SUSPICIOUS (AC2), then both
+// absent and the absence observable via a follow-up read at CLEAN (AC3).
+func TestIntegration_DeescalationLifecycle(t *testing.T) {
+	ns := freshNamespace(t)
+	cs := envtestState.cs
+	ctx := context.Background()
+	sel := map[string]string{"app": "web"}
+	itCreateDeployment(t, ns, "web", sel)
+
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, nil, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	workloadID := ns + "/Deployment/web"
+	restrictedName := PolicyName(workloadID)
+	quarantineName := policyNameFor(schema.StateQuarantined, workloadID)
+
+	// (1) QUARANTINED: deny-all present, restricted absent (Story 2.5 state).
+	m.handle(ctx, quarantinedTransition(workloadID, "pkg-q"))
+	q, err := cs.NetworkingV1().NetworkPolicies(ns).Get(ctx, quarantineName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("quarantine policy not applied: %v", err)
+	}
+	if len(q.Spec.PolicyTypes) != 2 {
+		t.Fatalf("quarantine policyTypes = %v, want [Ingress, Egress]", q.Spec.PolicyTypes)
+	}
+	if _, err := cs.NetworkingV1().NetworkPolicies(ns).Get(ctx, restrictedName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("restricted policy unexpectedly present at QUARANTINED: err=%v", err)
+	}
+
+	// (2) RESTRICTED (AC1 atomic relaxation): restricted applied, quarantine
+	// removed. Assert restricted present BEFORE asserting quarantine absent (the
+	// apply-before-delete causal order; no policy-less window).
+	m.handle(ctx, restrictedTransition(workloadID, "pkg-r"))
+	r, err := cs.NetworkingV1().NetworkPolicies(ns).Get(ctx, restrictedName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("restricted policy not applied on de-escalation: %v", err)
+	}
+	if len(r.Spec.PolicyTypes) != 1 || r.Spec.PolicyTypes[0] != networkingv1.PolicyTypeEgress {
+		t.Fatalf("restricted policyTypes = %v, want [Egress]", r.Spec.PolicyTypes)
+	}
+	if r.Annotations[AnnFSMState] != "RESTRICTED" {
+		t.Fatalf("restricted fsm-state annotation = %q, want RESTRICTED", r.Annotations[AnnFSMState])
+	}
+	if _, err := cs.NetworkingV1().NetworkPolicies(ns).Get(ctx, quarantineName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("quarantine policy not removed on de-escalation to RESTRICTED: err=%v", err)
+	}
+
+	// (3) SUSPICIOUS (AC2): both managed policies removed.
+	m.handle(ctx, suspiciousTransition(workloadID, "pkg-s"))
+	if _, err := cs.NetworkingV1().NetworkPolicies(ns).Get(ctx, restrictedName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("restricted policy not removed on SUSPICIOUS: err=%v", err)
+	}
+	if _, err := cs.NetworkingV1().NetworkPolicies(ns).Get(ctx, quarantineName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("quarantine policy not removed on SUSPICIOUS: err=%v", err)
+	}
+
+	// (4) CLEAN (AC3): both absent, absence observable via a follow-up read.
+	m.handle(ctx, cleanTransition(workloadID, "pkg-c"))
+	if _, err := cs.NetworkingV1().NetworkPolicies(ns).Get(ctx, restrictedName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("restricted policy present at CLEAN: err=%v", err)
+	}
+	if _, err := cs.NetworkingV1().NetworkPolicies(ns).Get(ctx, quarantineName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("quarantine policy present at CLEAN: err=%v", err)
+	}
+}
+
+// TestIntegration_DeescalationResidueReconcile exercises the FSM-target-aware
+// reconcile backstop (Story 2.6, BI-2c) against a real apiserver. With the
+// oracle reporting RESTRICTED, a co-existing quarantine deny-all (the failed
+// inline-delete residue) is removed and the freshly-applied restricted policy
+// survives. The mirror assertion (target QUARANTINED) guards the Story 2.5
+// escalation-residue regression.
+func TestIntegration_DeescalationResidueReconcile(t *testing.T) {
+	ns := freshNamespace(t)
+	cs := envtestState.cs
+	ctx := context.Background()
+	sel := map[string]string{"app": "web"}
+	itCreateDeployment(t, ns, "web", sel)
+	itCreateDeployment(t, ns, "api", sel)
+
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, nil, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	deWID := ns + "/Deployment/web" // de-escalation residue: target RESTRICTED
+	esWID := ns + "/Deployment/api" // escalation residue: target QUARANTINED
+	m.SetStateOracle(itOracle{states: map[string]schema.PodSecurityState{
+		deWID: schema.StateRestricted,
+		esWID: schema.StateQuarantined,
+	}})
+
+	// Seed BOTH policies for each workload (the overlap a failed inline delete
+	// leaves behind).
+	for _, wid := range []string{deWID, esWID} {
+		m.handle(ctx, restrictedTransition(wid, "pkg-r"))
+		// Apply the quarantine deny-all directly without the inline supersession
+		// removing the restricted policy, by building+applying it.
+		ref, _ := parseWorkloadID(wid)
+		np := m.buildPolicy(ref, &metav1.LabelSelector{MatchLabels: sel}, quarantinedTransition(wid, "pkg-q"))
+		if _, aerr := m.apply(ctx, np); aerr != nil {
+			t.Fatalf("seed quarantine for %q: %v", wid, aerr)
+		}
+	}
+
+	m.reconcileGC(ctx)
+
+	// De-escalation residue (target RESTRICTED): quarantine removed, restricted survives.
+	if _, err := cs.NetworkingV1().NetworkPolicies(ns).Get(ctx, policyNameFor(schema.StateQuarantined, deWID), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("de-escalation residue quarantine not removed: err=%v", err)
+	}
+	if _, err := cs.NetworkingV1().NetworkPolicies(ns).Get(ctx, PolicyName(deWID), metav1.GetOptions{}); err != nil {
+		t.Fatalf("restricted policy wrongly re-deleted on de-escalation: %v", err)
+	}
+
+	// Escalation residue (target QUARANTINED): restricted removed, quarantine survives.
+	if _, err := cs.NetworkingV1().NetworkPolicies(ns).Get(ctx, PolicyName(esWID), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("escalation residue restricted not removed: err=%v", err)
+	}
+	if _, err := cs.NetworkingV1().NetworkPolicies(ns).Get(ctx, policyNameFor(schema.StateQuarantined, esWID), metav1.GetOptions{}); err != nil {
+		t.Fatalf("quarantine policy wrongly removed for QUARANTINED target: %v", err)
+	}
+}
+
+// TestIntegration_CleanNoOpWithNothingPresent exercises the CLEAN no-op case
+// (Story 2.6, BI-5) against a real apiserver: a CLEAN de-escalation for a
+// workload with no managed policies succeeds, creates nothing, and the
+// verification read confirms absence.
+func TestIntegration_CleanNoOpWithNothingPresent(t *testing.T) {
+	ns := freshNamespace(t)
+	cs := envtestState.cs
+	ctx := context.Background()
+	sel := map[string]string{"app": "web"}
+	itCreateDeployment(t, ns, "web", sel)
+
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, nil, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	workloadID := ns + "/Deployment/web"
+
+	m.handle(ctx, cleanTransition(workloadID, "pkg-c"))
+
+	if _, err := cs.NetworkingV1().NetworkPolicies(ns).Get(ctx, PolicyName(workloadID), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("restricted policy created on no-op CLEAN: err=%v", err)
+	}
+	if _, err := cs.NetworkingV1().NetworkPolicies(ns).Get(ctx, policyNameFor(schema.StateQuarantined, workloadID), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("quarantine policy created on no-op CLEAN: err=%v", err)
+	}
+}
