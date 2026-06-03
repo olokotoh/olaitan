@@ -136,7 +136,7 @@ func (m *Manager) registerMetrics(r *metrics.Registry) error {
 
 	cv, err := r.RegisterCounterVec(
 		"olaitan_response_network_policy_apply_total",
-		"Cumulative NetworkPolicy enforcement actions labelled by result: applied, noop, error, skipped, dropped, gc_deleted (Story 2.4, FR33).",
+		"Cumulative NetworkPolicy enforcement actions labelled by result: applied, noop, error, skipped, dropped, gc_deleted, superseded (Story 2.4, FR33).",
 		[]string{"result"},
 	)
 	if err != nil {
@@ -146,7 +146,7 @@ func (m *Manager) registerMetrics(r *metrics.Registry) error {
 	// Pre-initialise every known result label to 0 so alert PromQL has a
 	// stable zero series from process startup, rather than a label series that
 	// only materialises on first occurrence.
-	for _, result := range []string{"applied", "noop", "error", "skipped", "dropped", "gc_deleted"} {
+	for _, result := range []string{"applied", "noop", "error", "skipped", "dropped", "gc_deleted", "superseded"} {
 		cv.WithLabelValues(result).Add(0)
 	}
 	return nil
@@ -264,12 +264,21 @@ func (m *Manager) handle(ctx context.Context, st schema.StateTransition) {
 	// Atomic replacement (BI-5): ONLY after the QUARANTINED deny-all policy is
 	// confirmed applied do we best-effort delete the superseded RESTRICTED
 	// policy for the same workload. Apply-before-delete is the load-bearing
-	// invariant: during the brief overlap both policies select the pod and
-	// their union is strictly more blocked (the deny-all wins), so there is
-	// never a window with reduced or absent protection. A failed delete does
-	// NOT fail the QUARANTINED enforcement (the workload is already fully
-	// blocked; the stale restricted policy only ever ADDS egress the quarantine
-	// policy overrides, and is orphan-GC'd when its owner is deleted).
+	// invariant because it is MONOTONICALLY TIGHTENING. Kubernetes
+	// NetworkPolicies are additive allow-lists: while both policies select the
+	// pod, ingress is denied immediately (only the QUARANTINED policy declares
+	// the Ingress policyType, with no allow rules), and egress remains the UNION
+	// of both policies' allows, i.e. still the RESTRICTED allow-list
+	// (RFC1918/cluster/DNS) - the deny-all does NOT subtract or override those
+	// allows. Egress only tightens to deny-all once the RESTRICTED policy is
+	// removed. There is therefore never a window LESS protected than RESTRICTED,
+	// and never a policy-less window. A failed inline delete does NOT fail the
+	// QUARANTINED enforcement: ingress is already denied, but a LINGERING
+	// RESTRICTED policy keeps egress at the allow-list level, so the workload is
+	// not yet fully isolated. The reconcile backstop (reconcileGC, FIX A) removes
+	// a restricted policy a failed inline delete left behind within one reconcile
+	// interval, converging egress to deny-all; orphan GC alone would NOT reap it
+	// while the owner still exists.
 	// Defense-in-depth gate (apply-before-delete made explicit): only supersede
 	// the restricted policy when the quarantine apply CONFIRMED the deny-all is
 	// present. "applied" = created/updated; "noop" = an idempotent re-apply that
@@ -287,10 +296,14 @@ func (m *Manager) handle(ctx context.Context, st schema.StateTransition) {
 // QUARANTINED transition supersedes (BI-5 step 3). It MUST be called only
 // after the quarantine apply has returned success (apply-before-delete). A
 // NotFound is success (the workload may have skipped RESTRICTED, or the policy
-// was already GC'd). A real delete failure is logged at WARN and swallowed:
-// the workload is already fully blocked by the quarantine policy, so the
-// supersession delete is silent best-effort (BI-7, Open Assumption 4) and the
-// QUARANTINED enforcement does not fail.
+// was already GC'd). A real delete failure is logged at WARN and swallowed so
+// the QUARANTINED enforcement does not fail. Note that until the RESTRICTED
+// policy is gone, egress remains at the RESTRICTED allow-list level: Kubernetes
+// NetworkPolicies are additive allow-lists, so the deny-all QUARANTINED policy
+// denies ingress immediately but does NOT subtract the RESTRICTED policy's
+// egress allows. The reconcile backstop (reconcileGC, FIX A) guarantees a
+// restricted policy this best-effort delete fails to remove is reaped within
+// one reconcile interval, converging egress to deny-all (BI-7, Open Assumption 4).
 func (m *Manager) deleteSupersededRestricted(ctx context.Context, ref workloadRef, workloadID string) {
 	name := policyNameFor(schema.StateRestricted, workloadID)
 	err := m.cs.NetworkingV1().NetworkPolicies(ref.namespace).Delete(ctx, name, metav1.DeleteOptions{})
@@ -387,29 +400,84 @@ func mapContains(super, sub map[string]string) bool {
 }
 
 // reconcileGC lists every Olaitan-managed NetworkPolicy cluster-wide and
-// deletes those whose workload owner no longer exists (AC4, BI-10). It
-// observes deletion through the API server (the authoritative source of
-// owner existence); a transient list/resolve error leaves the policy for a
-// later cycle rather than risking a wrong delete.
+// performs two independent housekeeping passes (AC4, BI-10):
+//
+//  1. Supersession backstop (Story 2.5, FIX A): any RESTRICTED policy whose
+//     workload also currently has a QUARANTINED policy is deleted as
+//     superseded, regardless of whether its owner still exists. A workload in
+//     QUARANTINED must not retain a RESTRICTED policy: while the RESTRICTED
+//     policy lingers its Egress allow-list still permits egress to the
+//     RFC1918/cluster/DNS CIDRs (Kubernetes NetworkPolicies are additive
+//     allow-lists, so the deny-all QUARANTINED policy does NOT subtract those
+//     allows), and orphan GC would never reap it while the owner exists. This
+//     pass makes the inline best-effort supersession (the fast path) eventually
+//     consistent: a failed inline delete self-heals within one reconcile
+//     interval (default 30s).
+//
+//  2. Orphan GC: a managed policy whose workload owner no longer exists is
+//     deleted (the original AC4 behaviour). Owner existence is observed through
+//     the API server (the authoritative source); a transient list/resolve error
+//     leaves the policy for a later cycle rather than risking a wrong delete.
+//
+// A RESTRICTED policy that is BOTH superseded AND orphaned is deleted (either
+// reason suffices); the superseded pass runs first so the deletion is logged
+// and counted as a supersession.
 func (m *Manager) reconcileGC(ctx context.Context) {
 	list, err := m.cs.NetworkingV1().NetworkPolicies("").List(ctx, metav1.ListOptions{LabelSelector: managedBySelector})
 	if err != nil {
 		m.log.Warn("netpol: gc list failed", "err", err)
 		return
 	}
+
+	// First, identify which workloads currently have a QUARANTINED policy. We
+	// key by workload_id read from the AnnWorkloadID annotation; the
+	// AnnFSMState == QUARANTINED annotation is the robust discriminator (the
+	// olaitan-quarantined- name prefix is an equivalent signal). The name of
+	// the superseding quarantine policy is retained for the supersession log.
+	quarantinedByWID := make(map[string]string)
+	for i := range list.Items {
+		np := &list.Items[i]
+		if np.Annotations[AnnFSMState] != string(schema.StateQuarantined) {
+			continue
+		}
+		if wid := np.Annotations[AnnWorkloadID]; wid != "" {
+			quarantinedByWID[wid] = np.Name
+		}
+	}
+
 	for i := range list.Items {
 		np := &list.Items[i]
 		// GC operates only on policies carrying our managed-by label (the List
-		// selector guarantees this) and only deletes them once their owner is
-		// gone. The excluded-namespaces filter intentionally does NOT apply
-		// here: it stops us applying NEW policies in those namespaces, but a
-		// policy Olaitan already created there must still be collectable once
-		// orphaned. Skipping excluded namespaces would strand our own orphans
-		// permanently if a namespace were excluded after a policy was applied.
+		// selector guarantees this). The excluded-namespaces filter intentionally
+		// does NOT apply here: it stops us applying NEW policies in those
+		// namespaces, but a policy Olaitan already created there must still be
+		// collectable once orphaned or superseded. Skipping excluded namespaces
+		// would strand our own policies permanently if a namespace were excluded
+		// after a policy was applied.
 		wid := np.Annotations[AnnWorkloadID]
 		if wid == "" {
 			continue
 		}
+
+		// Supersession backstop: a RESTRICTED policy for a workload that now has
+		// a QUARANTINED policy must be removed (independent of owner existence).
+		if np.Annotations[AnnFSMState] == string(schema.StateRestricted) {
+			if quarantineName, superseded := quarantinedByWID[wid]; superseded {
+				if derr := m.cs.NetworkingV1().NetworkPolicies(np.Namespace).Delete(ctx, np.Name, metav1.DeleteOptions{}); derr != nil {
+					if !apierrors.IsNotFound(derr) {
+						m.log.Warn("netpol: superseded restricted delete failed", "policy", np.Name, "namespace", np.Namespace, "err", derr)
+						continue
+					}
+				}
+				m.log.Info("netpol: reconcile removed superseded RESTRICTED policy",
+					"workload_id", wid, "namespace", np.Namespace,
+					"restricted_policy", np.Name, "quarantine_policy", quarantineName)
+				m.count("superseded")
+				continue
+			}
+		}
+
+		// Orphan GC: delete the policy once its owner no longer exists.
 		ref, err := parseWorkloadID(wid)
 		if err != nil {
 			continue

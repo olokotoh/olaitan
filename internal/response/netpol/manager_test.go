@@ -781,6 +781,77 @@ func TestReconcileGC_CollectsManagedOrphanEvenInExcludedNamespace(t *testing.T) 
 	}
 }
 
+// m_buildManagedQuarantinePolicy builds a managed QUARANTINED deny-all policy
+// carrying the workload-id and fsm-state=QUARANTINED annotations, mimicking one
+// the manager would have applied for a quarantined workload.
+func m_buildManagedQuarantinePolicy(ns, name, workloadID string) *networkingv1.NetworkPolicy {
+	return &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   ns,
+			Name:        name,
+			Labels:      managedLabels(),
+			Annotations: map[string]string{AnnWorkloadID: workloadID, AnnFSMState: string(schema.StateQuarantined)},
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
+		},
+	}
+}
+
+func TestReconcileGC_RemovesSupersededRestrictedKeepsQuarantine(t *testing.T) {
+	// Supersession backstop (FIX A): simulate a FAILED inline supersession where
+	// a workload in QUARANTINED still carries its RESTRICTED policy alongside the
+	// QUARANTINED policy. The owner Deployment still exists, so orphan GC alone
+	// would NOT reap the lingering restricted policy. The reconcile pass must
+	// delete the superseded RESTRICTED policy and keep the QUARANTINED policy.
+	//
+	// A separate workload (no quarantine policy) keeps only a RESTRICTED policy:
+	// it must be left untouched by this pass (only superseded policies are
+	// removed; its owner still exists, so orphan GC does not touch it either).
+	selSup := map[string]string{"app": "sup"}
+	selKeep := map[string]string{"app": "keep"}
+	supWID := "ns/Deployment/sup"
+	keepWID := "ns/Deployment/keep"
+
+	supRestricted := m_buildManagedPolicy("ns", policyNameFor(schema.StateRestricted, supWID), supWID)
+	supQuarantine := m_buildManagedQuarantinePolicy("ns", policyNameFor(schema.StateQuarantined, supWID), supWID)
+	keepRestricted := m_buildManagedPolicy("ns", policyNameFor(schema.StateRestricted, keepWID), keepWID)
+
+	reg := metricsRegistryForTest(t)
+	cs := fake.NewSimpleClientset(
+		runtime.Object(deployment("ns", "sup", selSup)),
+		runtime.Object(deployment("ns", "keep", selKeep)),
+		runtime.Object(supRestricted),
+		runtime.Object(supQuarantine),
+		runtime.Object(keepRestricted),
+	)
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+
+	m.reconcileGC(ctx)
+
+	// The superseded RESTRICTED policy is deleted.
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, supRestricted.Name, metav1.GetOptions{}); !apierrors.IsNotFound(gerr) {
+		t.Fatalf("superseded restricted policy was not removed by reconcile: err=%v", gerr)
+	}
+	// The QUARANTINED policy survives.
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, supQuarantine.Name, metav1.GetOptions{}); gerr != nil {
+		t.Fatalf("quarantine policy was incorrectly removed by reconcile: %v", gerr)
+	}
+	// The unrelated RESTRICTED policy (no quarantine for its workload) survives:
+	// it is not superseded, and its owner still exists so it is not an orphan.
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, keepRestricted.Name, metav1.GetOptions{}); gerr != nil {
+		t.Fatalf("non-superseded restricted policy was incorrectly removed by reconcile: %v", gerr)
+	}
+	// The supersession was counted exactly once.
+	if got := testutilToFloat(t, m, "superseded"); got != 1 {
+		t.Fatalf("apply_total{superseded} = %v, want 1", got)
+	}
+}
+
 func TestReconcileGC_IgnoresUnmanagedPolicies(t *testing.T) {
 	// An operator-owned policy without the managed-by label and without a
 	// workload-id annotation must never be touched by GC.

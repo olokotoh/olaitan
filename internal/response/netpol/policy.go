@@ -142,11 +142,19 @@ func (m *Manager) buildPolicy(ref workloadRef, sel *metav1.LabelSelector, st sch
 	spec := networkingv1.NetworkPolicySpec{PodSelector: podSelector}
 	if st.ToState == schema.StateQuarantined {
 		// Deny-all (BI-4): listing both policyTypes with NO rules of either
-		// type denies all ingress and all egress in additive
-		// networking.k8s.io/v1 semantics. Ingress and Egress are left nil; a
-		// stray empty rule struct ({}) would invert this to allow-all and MUST
-		// NOT be emitted. No DNS carve-out: a confirmed-malicious workload is
-		// cut off completely, name resolution included.
+		// type denies all ingress and all egress FOR TRAFFIC GOVERNED BY THIS
+		// POLICY. Kubernetes NetworkPolicies are additive allow-lists, so this
+		// denial is not absolute on its own: another policy selecting the same
+		// pod (notably the RESTRICTED egress allow-list during the
+		// apply-before-delete overlap) can still ALLOW traffic, because the
+		// allowed set is the UNION of all selecting policies' rules. Full egress
+		// denial for a quarantined workload therefore requires the superseded
+		// RESTRICTED policy to be removed, which the manager does inline and, if
+		// that fails, via the reconcile backstop (reconcileGC). Ingress and
+		// Egress are left nil; a stray empty rule struct ({}) would invert this
+		// to allow-all and MUST NOT be emitted. No DNS carve-out: a
+		// confirmed-malicious workload is cut off completely once the RESTRICTED
+		// policy is gone, name resolution included.
 		spec.PolicyTypes = []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress}
 	} else {
 		spec.PolicyTypes = []networkingv1.PolicyType{networkingv1.PolicyTypeEgress}
