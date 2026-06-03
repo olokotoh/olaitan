@@ -10,9 +10,11 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/olokotoh/olaitan/internal/metrics"
 	redisclient "github.com/olokotoh/olaitan/internal/redis"
@@ -64,27 +66,6 @@ func (p *fakePublisher) all() []OverrideApplied {
 	defer p.mu.Unlock()
 	out := make([]OverrideApplied, len(p.events))
 	copy(out, p.events)
-	return out
-}
-
-// recordingSink captures FSM transitions so a test can prove the pin routes
-// through the sink (BI-7) without depending on the netpol manager.
-type recordingSink struct {
-	mu sync.Mutex
-	t  []schema.StateTransition
-}
-
-func (s *recordingSink) Publish(st schema.StateTransition) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.t = append(s.t, st)
-}
-
-func (s *recordingSink) transitions() []schema.StateTransition {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]schema.StateTransition, len(s.t))
-	copy(out, s.t)
 	return out
 }
 
@@ -381,13 +362,16 @@ func TestReconcile_IdempotentReapply(t *testing.T) {
 	c.reconcile(ctx)
 	c.reconcile(ctx)
 
-	// Only ONE applied event despite three ticks (idempotent re-apply; BI-8).
+	// Only ONE applied event despite three ticks (unchanged signature; FIX 2
+	// edge-triggered: no re-emit and, crucially, no TTL refresh).
 	if n := len(pub.all()); n != 1 {
-		t.Fatalf("applied events after 3 idempotent ticks = %d, want 1", n)
+		t.Fatalf("applied events after 3 unchanged ticks = %d, want 1", n)
 	}
-	// The Redis key is still present (TTL refreshed each tick).
+	// The Redis key is still present at its ORIGINAL hard-deadline TTL (no
+	// FastForward, so the remaining TTL is unchanged at 30m; FIX 2 does NOT
+	// refresh it on an unchanged tick).
 	if ttl := mr.TTL("override:" + depWorkloadID); ttl != 30*time.Minute {
-		t.Errorf("TTL after re-apply = %s, want refreshed 30m", ttl)
+		t.Errorf("TTL after unchanged re-apply = %s, want unrefreshed 30m", ttl)
 	}
 }
 
@@ -728,7 +712,7 @@ func TestOwnerAnnotations_Variants(t *testing.T) {
 		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "db-0",
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "db", Controller: &trueVal}}}}
 		cs := fake.NewSimpleClientset(ss)
-		if got := ownerAnnotations(ctx, cs, pod); got[AnnotationState] != "RESTRICTED" {
+		if got, err := ownerAnnotations(ctx, cs, pod); err != nil || got[AnnotationState] != "RESTRICTED" {
 			t.Errorf("statefulset owner annotations = %v", got)
 		}
 	})
@@ -737,7 +721,7 @@ func TestOwnerAnnotations_Variants(t *testing.T) {
 		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "agent-x",
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: "agent", Controller: &trueVal}}}}
 		cs := fake.NewSimpleClientset(ds)
-		if got := ownerAnnotations(ctx, cs, pod); got[AnnotationState] != "RESTRICTED" {
+		if got, err := ownerAnnotations(ctx, cs, pod); err != nil || got[AnnotationState] != "RESTRICTED" {
 			t.Errorf("daemonset owner annotations = %v", got)
 		}
 	})
@@ -746,7 +730,7 @@ func TestOwnerAnnotations_Variants(t *testing.T) {
 		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "batch-x",
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: "batch/v1", Kind: "Job", Name: "batch", Controller: &trueVal}}}}
 		cs := fake.NewSimpleClientset(job)
-		if got := ownerAnnotations(ctx, cs, pod); got[AnnotationState] != "RESTRICTED" {
+		if got, err := ownerAnnotations(ctx, cs, pod); err != nil || got[AnnotationState] != "RESTRICTED" {
 			t.Errorf("job owner annotations = %v", got)
 		}
 	})
@@ -757,7 +741,7 @@ func TestOwnerAnnotations_Variants(t *testing.T) {
 		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "batch-x",
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: "batch/v1", Kind: "Job", Name: "batch", Controller: &trueVal}}}}
 		cs := fake.NewSimpleClientset(cj, job)
-		if got := ownerAnnotations(ctx, cs, pod); got[AnnotationState] != "RESTRICTED" {
+		if got, err := ownerAnnotations(ctx, cs, pod); err != nil || got[AnnotationState] != "RESTRICTED" {
 			t.Errorf("cronjob owner annotations = %v", got)
 		}
 	})
@@ -766,14 +750,14 @@ func TestOwnerAnnotations_Variants(t *testing.T) {
 		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "rs-x",
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "rs", Controller: &trueVal}}}}
 		cs := fake.NewSimpleClientset(rs)
-		if got := ownerAnnotations(ctx, cs, pod); got[AnnotationState] != "RESTRICTED" {
+		if got, err := ownerAnnotations(ctx, cs, pod); err != nil || got[AnnotationState] != "RESTRICTED" {
 			t.Errorf("rs owner annotations = %v", got)
 		}
 	})
 	t.Run("orphan pod has no owner annotations", func(t *testing.T) {
 		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "lonely"}}
 		cs := fake.NewSimpleClientset()
-		if got := ownerAnnotations(ctx, cs, pod); got != nil {
+		if got, err := ownerAnnotations(ctx, cs, pod); err != nil || got != nil {
 			t.Errorf("orphan owner annotations = %v, want nil", got)
 		}
 	})
@@ -799,5 +783,319 @@ func TestStore_ListActiveSkipsMalformed(t *testing.T) {
 	}
 	if _, ok := active["default/Deployment/bad"]; ok {
 		t.Error("malformed record must be skipped")
+	}
+}
+
+// --- FIX 1: indeterminate owner-read error must RETAIN the pin ---
+
+// TestReconcile_TransientOwnerErrorRetainsPin asserts that a non-NotFound K8s
+// API error while reading the owner annotation does NOT release a pinned
+// workload: the desired state is indeterminate this tick, so release detection
+// must skip it (FIX 1). The pod carries NO state annotation, so the owner read
+// is exercised; the injected reactor errors that owner GET.
+func TestReconcile_TransientOwnerErrorRetainsPin(t *testing.T) {
+	ctx := context.Background()
+	mr := startMiniredis(t)
+	store, _ := newRedisStore(t, mr)
+	machine := newMachine(t)
+	pub := &fakePublisher{}
+
+	// Tick 1: owner annotated RESTRICTED, pod NOT annotated, owner readable.
+	_, objs := deploymentPod("default", "web", nil)
+	for _, o := range objs {
+		if dep, ok := o.(*appsv1.Deployment); ok {
+			dep.Annotations = map[string]string{AnnotationState: "RESTRICTED", AnnotationTTL: "30m"}
+		}
+	}
+	cs := fake.NewSimpleClientset(objs...)
+	c, err := New(Config{PollInterval: time.Second, DefaultTTL: time.Hour}, cs, store, machine, pub, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	c.reconcile(ctx)
+	if s, pinned := machine.IsPinned(depWorkloadID); !pinned || s != schema.StateRestricted {
+		t.Fatalf("after tick 1 IsPinned = (%s, %v), want (RESTRICTED, true)", s, pinned)
+	}
+
+	// Tick 2: inject a transient (non-NotFound) error on the Deployment GET so
+	// the owner annotation read fails. The workload is indeterminate; the pin
+	// MUST be retained (never released on an unproven absence).
+	cs.PrependReactor("get", "deployments", func(_ k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewServiceUnavailable("transient api outage")
+	})
+	c.reconcile(ctx)
+
+	if s, pinned := machine.IsPinned(depWorkloadID); !pinned || s != schema.StateRestricted {
+		t.Fatalf("transient owner error must RETAIN the pin; IsPinned = (%s, %v), want (RESTRICTED, true)", s, pinned)
+	}
+	if _, ok, _ := store.Get(ctx, depWorkloadID); !ok {
+		t.Fatal("transient owner error must NOT delete the Redis key")
+	}
+}
+
+// TestReconcile_TransientResolveErrorRetainsPin asserts the same retention when
+// the workload_id RESOLVE itself errors transiently (the ReplicaSet GET in the
+// owner walk). The pod IS annotated, so resolveWorkloadID is the failing hop.
+func TestReconcile_TransientResolveErrorRetainsPin(t *testing.T) {
+	ctx := context.Background()
+	mr := startMiniredis(t)
+	store, _ := newRedisStore(t, mr)
+	machine := newMachine(t)
+	pub := &fakePublisher{}
+
+	_, objs := deploymentPod("default", "web", map[string]string{
+		AnnotationState: "QUARANTINED",
+		AnnotationTTL:   "30m",
+	})
+	cs := fake.NewSimpleClientset(objs...)
+	c, err := New(Config{PollInterval: time.Second, DefaultTTL: time.Hour}, cs, store, machine, pub, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	c.reconcile(ctx)
+	if _, pinned := machine.IsPinned(depWorkloadID); !pinned {
+		t.Fatal("expected pin after tick 1")
+	}
+
+	// Tick 2: a transient error on the ReplicaSet GET makes resolveWorkloadID
+	// fail with a non-NotFound error -> indeterminate -> pin retained.
+	cs.PrependReactor("get", "replicasets", func(_ k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewServiceUnavailable("transient api outage")
+	})
+	c.reconcile(ctx)
+
+	if _, pinned := machine.IsPinned(depWorkloadID); !pinned {
+		t.Fatal("transient resolve error must RETAIN the pin (indeterminate, FIX 1)")
+	}
+}
+
+// --- FIX 2: hard-deadline TTL expiry releases even with annotation present ---
+
+// TestReconcile_HardDeadlineReleasesWithAnnotationPresent asserts the override
+// auto-releases when the native TTL elapses EVEN THOUGH the annotation is still
+// present (AC2/FR39), and does NOT immediately re-pin (consumed set).
+func TestReconcile_HardDeadlineReleasesWithAnnotationPresent(t *testing.T) {
+	ctx := context.Background()
+	mr := startMiniredis(t)
+	store, _ := newRedisStore(t, mr)
+	machine := newMachine(t)
+	pub := &fakePublisher{}
+
+	// Annotation stays present for the whole test (same clientset, same controller).
+	_, objs := deploymentPod("default", "web", map[string]string{
+		AnnotationState: "RESTRICTED",
+		AnnotationTTL:   "30m",
+	})
+	c := newController(t, objs, store, machine, pub, nil)
+
+	// Tick 1: apply (writes key, lastActive empty this tick).
+	c.reconcile(ctx)
+	// Tick 2: key now in ListActive -> lastActive captures it; unchanged sig -> no refresh.
+	c.reconcile(ctx)
+	if _, pinned := machine.IsPinned(depWorkloadID); !pinned {
+		t.Fatal("expected pin to persist across unchanged ticks")
+	}
+	if n := len(pub.all()); n != 1 {
+		t.Fatalf("applied events after 2 unchanged ticks = %d, want 1 (no refresh, FIX 2)", n)
+	}
+
+	// Hard deadline elapses while the annotation remains present.
+	mr.FastForward(31 * time.Minute)
+	c.reconcile(ctx)
+
+	if _, pinned := machine.IsPinned(depWorkloadID); pinned {
+		t.Fatal("hard-deadline TTL expiry must release the pin even with the annotation present (AC2/FR39)")
+	}
+	// No immediate re-pin: a further tick with the still-present annotation must
+	// NOT re-pin (consumed set), and no new applied event.
+	beforeEvents := len(pub.all())
+	c.reconcile(ctx)
+	if _, pinned := machine.IsPinned(depWorkloadID); pinned {
+		t.Fatal("still-present annotation must NOT re-pin after hard-deadline release (consumed set)")
+	}
+	if n := len(pub.all()); n != beforeEvents {
+		t.Fatalf("re-pin oscillation: applied events grew from %d to %d after consumed release", beforeEvents, n)
+	}
+}
+
+// TestReconcile_EditedAnnotationRepinsWithFreshTTL asserts an operator EDIT of
+// the override state mid-flight re-pins with a fresh native TTL and emits a
+// DISTINCT applied event (fresh applied_at -> distinct msgID, FIX 2(b)/FIX 5).
+func TestReconcile_EditedAnnotationRepinsWithFreshTTL(t *testing.T) {
+	ctx := context.Background()
+	mr := startMiniredis(t)
+	store, _ := newRedisStore(t, mr)
+	machine := newMachine(t)
+	pub := &fakePublisher{}
+
+	tick := int64(0)
+	_, objs := deploymentPod("default", "web", map[string]string{
+		AnnotationState: "RESTRICTED",
+		AnnotationTTL:   "30m",
+	})
+	cs := fake.NewSimpleClientset(objs...)
+	c, err := New(Config{PollInterval: time.Second, DefaultTTL: time.Hour}, cs, store, machine, pub, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// Deterministic, monotonically increasing applied_at so the two events have
+	// distinct AppliedAtNs.
+	c.now = func() time.Time {
+		tick++
+		return time.Unix(tick, 0).UTC()
+	}
+	c.reconcile(ctx)
+	if s, _ := machine.IsPinned(depWorkloadID); s != schema.StateRestricted {
+		t.Fatalf("tick 1 pin = %s, want RESTRICTED", s)
+	}
+
+	// Operator edits the pod annotation RESTRICTED -> QUARANTINED with a new TTL.
+	pod, err := cs.CoreV1().Pods("default").Get(ctx, "web-abc", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get pod: %v", err)
+	}
+	pod.Annotations[AnnotationState] = "QUARANTINED"
+	pod.Annotations[AnnotationTTL] = "45m"
+	if _, err := cs.CoreV1().Pods("default").Update(ctx, pod, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update pod: %v", err)
+	}
+	c.reconcile(ctx)
+
+	if s, pinned := machine.IsPinned(depWorkloadID); !pinned || s != schema.StateQuarantined {
+		t.Fatalf("after edit IsPinned = (%s, %v), want (QUARANTINED, true)", s, pinned)
+	}
+	if ttl := mr.TTL("override:" + depWorkloadID); ttl != 45*time.Minute {
+		t.Errorf("edited override TTL = %s, want fresh 45m", ttl)
+	}
+	evts := pub.all()
+	if len(evts) != 2 {
+		t.Fatalf("applied events = %d, want 2 (initial + edit re-pin)", len(evts))
+	}
+	if evts[0].AppliedAtNs == evts[1].AppliedAtNs {
+		t.Fatalf("edit re-pin must carry a FRESH applied_at (distinct msgID, FIX 5); both = %d", evts[0].AppliedAtNs)
+	}
+	if evts[1].RequestedState != "QUARANTINED" {
+		t.Errorf("second event state = %s, want QUARANTINED", evts[1].RequestedState)
+	}
+}
+
+// TestReconcile_RemoveThenReaddRepins asserts that removing then re-adding the
+// SAME annotation re-pins (the consumed marker is cleared on manual removal),
+// so a re-applied override is honoured rather than suppressed (FIX 2(c)).
+func TestReconcile_RemoveThenReaddRepins(t *testing.T) {
+	ctx := context.Background()
+	mr := startMiniredis(t)
+	store, _ := newRedisStore(t, mr)
+	machine := newMachine(t)
+	pub := &fakePublisher{}
+
+	anns := map[string]string{AnnotationState: "RESTRICTED", AnnotationTTL: "30m"}
+	_, objs := deploymentPod("default", "web", anns)
+	cs := fake.NewSimpleClientset(objs...)
+	c, err := New(Config{PollInterval: time.Second, DefaultTTL: time.Hour}, cs, store, machine, pub, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	c.reconcile(ctx)
+	c.reconcile(ctx) // establish lastActive
+	if _, pinned := machine.IsPinned(depWorkloadID); !pinned {
+		t.Fatal("expected pin after initial ticks")
+	}
+
+	// Hard-deadline expiry with annotation present -> consumed.
+	mr.FastForward(31 * time.Minute)
+	c.reconcile(ctx)
+	if _, pinned := machine.IsPinned(depWorkloadID); pinned {
+		t.Fatal("expected hard-deadline release")
+	}
+
+	// Operator REMOVES the annotation (manual removal clears the consumed marker).
+	pod, _ := cs.CoreV1().Pods("default").Get(ctx, "web-abc", metav1.GetOptions{})
+	pod.Annotations = nil
+	if _, err := cs.CoreV1().Pods("default").Update(ctx, pod, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update (remove): %v", err)
+	}
+	c.reconcile(ctx)
+
+	// Operator RE-ADDS the same annotation -> must re-pin (consumed cleared).
+	pod, _ = cs.CoreV1().Pods("default").Get(ctx, "web-abc", metav1.GetOptions{})
+	pod.Annotations = map[string]string{AnnotationState: "RESTRICTED", AnnotationTTL: "30m"}
+	if _, err := cs.CoreV1().Pods("default").Update(ctx, pod, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update (re-add): %v", err)
+	}
+	c.reconcile(ctx)
+
+	if s, pinned := machine.IsPinned(depWorkloadID); !pinned || s != schema.StateRestricted {
+		t.Fatalf("re-added annotation must re-pin; IsPinned = (%s, %v), want (RESTRICTED, true)", s, pinned)
+	}
+	if ttl := mr.TTL("override:" + depWorkloadID); ttl != 30*time.Minute {
+		t.Errorf("re-added override TTL = %s, want fresh 30m", ttl)
+	}
+}
+
+// --- FIX 3: ListActive scan error skips the apply + release phases ---
+
+// TestReconcile_ScanErrorSkipsReleaseDetection asserts that when ListActive
+// errors (Redis scan failure), the controller does NOT release a pinned
+// workload (it skips the apply + release phases that tick, FIX 3).
+func TestReconcile_ScanErrorSkipsReleaseDetection(t *testing.T) {
+	ctx := context.Background()
+	mr := startMiniredis(t)
+	store, _ := newRedisStore(t, mr)
+	machine := newMachine(t)
+	pub := &fakePublisher{}
+
+	_, objs := deploymentPod("default", "web", map[string]string{
+		AnnotationState: "RESTRICTED",
+		AnnotationTTL:   "30m",
+	})
+	c := newController(t, objs, store, machine, pub, nil)
+	c.reconcile(ctx)
+	if _, pinned := machine.IsPinned(depWorkloadID); !pinned {
+		t.Fatal("expected pin after first reconcile")
+	}
+
+	// Make every Redis command (including the ListActive scan) error.
+	mr.SetError("forced scan failure")
+	c.reconcile(ctx)
+	mr.SetError("") // restore
+
+	if _, pinned := machine.IsPinned(depWorkloadID); !pinned {
+		t.Fatal("a ListActive scan error must SKIP release detection (pin retained, FIX 3)")
+	}
+	if _, ok, _ := store.Get(ctx, depWorkloadID); !ok {
+		t.Fatal("scan error must not delete the Redis key")
+	}
+}
+
+// --- FIX 4: operator_id flows through to the applied event ---
+
+// TestReconcile_OperatorIDFlowsThrough asserts the operator identity annotation
+// is read into the applied event, the Redis record, and the pin (FIX 4).
+func TestReconcile_OperatorIDFlowsThrough(t *testing.T) {
+	ctx := context.Background()
+	mr := startMiniredis(t)
+	store, _ := newRedisStore(t, mr)
+	machine := newMachine(t)
+	pub := &fakePublisher{}
+
+	_, objs := deploymentPod("default", "web", map[string]string{
+		AnnotationState:    "RESTRICTED",
+		AnnotationTTL:      "30m",
+		AnnotationOperator: "alice@corp",
+	})
+	c := newController(t, objs, store, machine, pub, nil)
+	c.reconcile(ctx)
+
+	evts := pub.all()
+	if len(evts) != 1 || evts[0].OperatorID != "alice@corp" {
+		t.Fatalf("events = %+v, want one applied event with operator_id=alice@corp", evts)
+	}
+	rec, ok, err := store.Get(ctx, depWorkloadID)
+	if err != nil || !ok {
+		t.Fatalf("store.Get = (%v, %v, %v)", rec, ok, err)
+	}
+	if rec.OperatorID != "alice@corp" {
+		t.Errorf("redis record operator_id = %q, want alice@corp", rec.OperatorID)
 	}
 }

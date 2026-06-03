@@ -10,8 +10,14 @@
 // against Redis and the FSM:
 //
 //   - annotation present + valid target  -> Machine.Pin + Redis SetOverride
-//     (native TTL); idempotent re-apply refreshes the TTL only (BI-8).
-//   - Redis key absent (native-TTL expiry) -> Machine.ReleasePin (BI-4).
+//     (native TTL). The reconcile is EDGE-TRIGGERED: the native TTL is a HARD
+//     DEADLINE measured from first application and is NEVER refreshed for an
+//     unchanged annotation (it counts down and auto-releases the override even
+//     while the annotation remains, honouring AC2/FR39). An operator EDIT of
+//     the annotation (state/ttl change) re-applies with a fresh native TTL.
+//   - Redis key gone while the annotation remains (hard-deadline expiry) ->
+//     Machine.ReleasePin and the workload+signature is marked "consumed" so
+//     the still-present annotation does not re-pin (FR39).
 //   - annotation gone, Redis key present (manual removal) -> ReleasePin +
 //     DeleteOverride (AC4).
 //   - target PRESERVED_KILLED -> reject with reason state_unavailable; an
@@ -93,9 +99,11 @@ func NewStore(client *redisclient.Client) (*Store, error) {
 	return &Store{client: client}, nil
 }
 
-// Put writes the override record for workloadID with a native Redis TTL.
-// Re-applying an unchanged override (the idempotent BI-8 path) refreshes the
-// TTL so the native expiry tracks the annotation's continued presence.
+// Put writes the override record for workloadID with a native Redis TTL. The
+// native TTL is a HARD DEADLINE: the controller writes the key only on a NEW
+// override or an operator EDIT (a signature change), never on an unchanged
+// re-apply, so the TTL counts down from first application and the override
+// auto-releases on expiry even while the annotation remains (AC2/FR39).
 func (s *Store) Put(ctx context.Context, workloadID string, rec OverrideRecord, ttl time.Duration) error {
 	key, err := keys.Override(workloadID)
 	if err != nil {
