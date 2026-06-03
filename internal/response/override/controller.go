@@ -54,11 +54,13 @@ type Controller struct {
 	// once (re-arm), which is acceptable (documented in docs/runbook.md).
 	consumed map[string]string
 
-	// lastActive tracks the workloads whose override key was present in Redis
-	// on the PREVIOUS tick. A workload that was active last tick, is still
-	// desired this tick, but whose key is now GONE is a native-TTL expiry
-	// (the hard-deadline release, FIX 2).
-	lastActive map[string]struct{}
+	// lastRejected records, per workload_id, the last REJECTED requested-state
+	// signature ("reason|requested") already emitted+counted (FIX 5, round 2).
+	// A standing invalid annotation is then counted ONCE rather than once per
+	// poll, keeping the rejected_total counter consistent with the deduped NATS
+	// event. The entry is cleared when the workload stops being rejected (it
+	// becomes valid, indeterminate-free desired, or disappears).
+	lastRejected map[string]string
 
 	// now is injectable for tests (defaults to time.Now).
 	now func() time.Time
@@ -126,17 +128,17 @@ func New(cfg Config, cs kubernetes.Interface, store *Store, machine *fsm.Machine
 		excluded[ns] = struct{}{}
 	}
 	c := &Controller{
-		cs:         cs,
-		store:      store,
-		machine:    machine,
-		publisher:  publisher,
-		log:        log,
-		poll:       poll,
-		defaultTTL: ttl,
-		excluded:   excluded,
-		consumed:   map[string]string{},
-		lastActive: map[string]struct{}{},
-		now:        time.Now,
+		cs:           cs,
+		store:        store,
+		machine:      machine,
+		publisher:    publisher,
+		log:          log,
+		poll:         poll,
+		defaultTTL:   ttl,
+		excluded:     excluded,
+		consumed:     map[string]string{},
+		lastRejected: map[string]string{},
+		now:          time.Now,
 	}
 	if registry != nil {
 		if err := c.registerMetrics(registry); err != nil {
@@ -192,31 +194,41 @@ func (c *Controller) Run(ctx context.Context) error {
 // positively determined this tick (a transient owner/resolve error, FIX 1) are
 // EXCLUDED from release candidates.
 func (c *Controller) reconcile(ctx context.Context) {
-	desiredSet, rejections, indeterminate, resolveIncomplete, err := c.computeDesired(ctx)
+	desiredSet, rejections, indeterminate, resolveFailed, err := c.computeDesired(ctx)
 	if err != nil {
 		c.log.Warn("override: list pods failed; skipping tick", "err", err)
 		return
 	}
 
-	// Emit rejections (no pin, no Redis write; BI-5).
+	// A workload that became VALID (now desired) clears any stale rejected
+	// marker, so a later regression to the same invalid value re-counts (FIX 5).
+	for wl := range desiredSet {
+		delete(c.lastRejected, wl)
+	}
+
+	// Emit rejections (no pin, no Redis write; BI-5). Counted/emitted only on a
+	// NEW or CHANGED rejection signature per workload (FIX 5) so a standing
+	// invalid annotation counts once, consistent with the deduped NATS event.
 	for _, rej := range rejections {
 		c.emitRejection(ctx, rej)
 	}
 
 	current, err := c.store.ListActive(ctx)
 	if err != nil {
-		// FIX 3: honour the log. On a scan error we cannot trust the active
-		// set, so we SKIP the apply phase (which depends on the active
-		// signature) AND the release-detection phase this tick. Both resume on
-		// the next successful scan. lastActive is left untouched so the next
-		// good tick's expiry detection is not corrupted by this gap.
+		// FIX 3: on a scan error we cannot trust the active set, so we SKIP the
+		// apply phase (which depends on the active signature) AND the
+		// release-detection phases this tick. Both resume on the next
+		// successful scan.
 		c.log.Warn("override: list active overrides failed; skipping apply + release detection this tick", "err", err)
 		return
 	}
 
-	// Phase 1: HARD-DEADLINE TTL expiry (FIX 2/FR39). Run BEFORE apply so a
+	// Phase 1: HARD-DEADLINE TTL expiry (FIX 1, round 2). Run BEFORE apply so a
 	// still-present annotation whose native TTL just elapsed is marked consumed
-	// and is NOT re-pinned by the apply phase this tick.
+	// and is NOT re-pinned by the apply phase this tick. Authoritative detection:
+	// the FSM pin set is the authority for "we believe this is pinned"; a
+	// currently-pinned, still-desired workload with NO active Redis key has
+	// reached its hard deadline (no dependence on a two-tick lastActive capture).
 	c.detectHardDeadlineExpiry(desiredSet, current, indeterminate)
 
 	// Phase 2: apply (edge-triggered): for each desired workload decide
@@ -226,23 +238,61 @@ func (c *Controller) reconcile(ctx context.Context) {
 	}
 
 	// Phase 3: MANUAL removal release (AC4): a pinned/active workload that is
-	// POSITIVELY not desired this tick. Skipped entirely when the resolve was
-	// incomplete (FIX 1): a transient resolve error means the desired set may
-	// be missing a workload we cannot key, so we must not treat any absence as
-	// a removal. The (safer) hard-deadline phase still ran above because it is
-	// gated on a positive Redis key disappearance, unaffected by resolve gaps.
-	if resolveIncomplete {
-		c.log.Warn("override: workload-id resolve incomplete this tick; skipping manual-removal release detection (pins retained)")
-	} else {
-		c.detectManualRemovals(ctx, desiredSet, current, indeterminate)
-	}
+	// not in the desired set this tick. Each candidate's removal is CONFIRMED by
+	// a direct owner read (FIX 2(b)) before release, so an owner scaled to zero
+	// (no live pods, empty pod list) but still annotated is NOT spuriously
+	// released. Per-workload indeterminate protection (FIX 2(a)) replaces the
+	// old tick-wide resolve veto: a positively-resolved, confirmed-absent
+	// workload is released even if some other pod errored this tick.
+	c.detectManualRemovals(ctx, desiredSet, current, indeterminate, resolveFailed)
 
-	// Record the active set for the next tick's hard-deadline expiry detection.
-	nextActive := make(map[string]struct{}, len(current))
-	for wl := range current {
-		nextActive[wl] = struct{}{}
+	// Phase 4: prune the in-memory consumed/last-rejected maps so a sustained
+	// outage cannot grow them unbounded (FIX 4 backstop).
+	c.pruneInMemory(desiredSet, current, rejections)
+}
+
+// pruneInMemory is the FIX 4 (round 2) defensive backstop: on each successful
+// tick it drops consumed/lastRejected entries for workloads that are no longer
+// relevant (neither desired, nor currently pinned, nor carrying an active Redis
+// key), so a sustained Redis/resolve outage that leaves stale entries cannot
+// grow the maps without bound. The normal release/apply paths already clear
+// entries on the happy path; this is purely a safety cap.
+func (c *Controller) pruneInMemory(desiredSet map[string]desired, current map[string]OverrideRecord, rejections []desired) {
+	relevant := func(wl string) bool {
+		if _, ok := desiredSet[wl]; ok {
+			return true
+		}
+		if _, ok := current[wl]; ok {
+			return true
+		}
+		if _, pinned := c.machine.IsPinned(wl); pinned {
+			return true
+		}
+		return false
 	}
-	c.lastActive = nextActive
+	for wl := range c.consumed {
+		if !relevant(wl) {
+			delete(c.consumed, wl)
+		}
+	}
+	// A lastRejected entry must SURVIVE while its workload is STILL being
+	// rejected this tick (that is the whole point of the dedup, FIX 5): a
+	// standing invalid annotation is neither desired, pinned, nor active, so the
+	// generic relevance test alone would wrongly prune it every tick and the
+	// counter would tick on every poll. Keep it for currently-rejected
+	// workloads; drop it only when the workload is neither rejected nor relevant.
+	stillRejected := make(map[string]struct{}, len(rejections))
+	for _, rej := range rejections {
+		stillRejected[rej.workloadID] = struct{}{}
+	}
+	for wl := range c.lastRejected {
+		if _, rej := stillRejected[wl]; rej {
+			continue
+		}
+		if !relevant(wl) {
+			delete(c.lastRejected, wl)
+		}
+	}
 }
 
 // computeDesired LISTs pods cluster-wide (honouring ExcludedNamespaces) and
@@ -254,7 +304,7 @@ func (c *Controller) reconcile(ctx context.Context) {
 // (a non-NotFound owner-read or workload-id-resolve error, FIX 1) is added to
 // the indeterminate set so the caller never releases it: only a POSITIVELY
 // confirmed absence (pod listed, annotation confirmed absent) is a release.
-func (c *Controller) computeDesired(ctx context.Context) (desiredSet map[string]desired, rejections []desired, indeterminate map[string]struct{}, resolveIncomplete bool, err error) {
+func (c *Controller) computeDesired(ctx context.Context) (desiredSet map[string]desired, rejections []desired, indeterminate map[string]struct{}, resolveFailed bool, err error) {
 	pods, lerr := c.cs.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
 	if lerr != nil {
 		return nil, nil, nil, false, fmt.Errorf("override: list pods: %w", lerr)
@@ -273,16 +323,19 @@ func (c *Controller) computeDesired(ctx context.Context) (desiredSet map[string]
 		// it.
 		workloadID, rerr := resolveWorkloadID(ctx, c.cs, pod)
 		if rerr != nil {
-			// FIX 1: a transient (non-NotFound) resolve error means we cannot
-			// even key this pod's workload (the owner walk failed), so we
-			// cannot precisely mark it indeterminate. Set the tick-wide
-			// resolveIncomplete flag so the manual-removal phase is SKIPPED
-			// entirely this tick (no workload is released on an unproven
-			// absence). The hard-deadline phase is unaffected (it keys on a
-			// positive Redis key disappearance, not on the desired set's
-			// completeness).
-			resolveIncomplete = true
-			c.log.Warn("override: resolve workload_id failed; tick resolve incomplete (will not treat absences as removals)", "namespace", pod.Namespace, "pod", pod.Name, "err", rerr)
+			// A transient (non-NotFound) resolve error means we cannot key this
+			// pod's workload (the owner walk failed), so we DROP it from the
+			// desired set this tick and raise resolveFailed. For an OWNER-sourced
+			// pin the per-workload owner-confirm GET in detectManualRemovals (FIX
+			// 2(b)) is the authoritative guard (the owner read there finds the
+			// annotation still present and skips the release). For a POD-sourced
+			// pin the owner object carries no annotation, so resolveFailed is
+			// what protects it: a pod-sourced candidate is treated as
+			// indeterminate while a resolve failed this tick (the pod exists but
+			// could not be keyed, an unproven absence). The hard-deadline phase
+			// is unaffected (it keys on the FSM pin set + a missing Redis key).
+			resolveFailed = true
+			c.log.Warn("override: resolve workload_id failed; dropping pod from desired set this tick (release guarded by owner-confirm + resolveFailed)", "namespace", pod.Namespace, "pod", pod.Name, "err", rerr)
 			continue
 		}
 		// Read the operative annotation: pod-level wins over owner-level (BI-9).
@@ -339,7 +392,7 @@ func (c *Controller) computeDesired(ctx context.Context) (desiredSet map[string]
 	for wl := range desiredSet {
 		delete(indeterminate, wl)
 	}
-	return desiredSet, rejections, indeterminate, resolveIncomplete, nil
+	return desiredSet, rejections, indeterminate, resolveFailed, nil
 }
 
 // operativeAnnotation returns the (state, ttl, operator, source) the override
@@ -472,37 +525,62 @@ func (c *Controller) applyDesired(ctx context.Context, workloadID string, d desi
 	}
 }
 
-// detectHardDeadlineExpiry handles the FR39 hard-deadline release (FIX 2): a
-// workload that is STILL desired (the annotation is present) but whose active
-// Redis key has GONE since the previous tick has reached its hard deadline.
-// ReleasePin and ADD the workload+signature to the in-memory consumed set so
-// the still-present annotation does NOT re-pin this tick or later. Run BEFORE
-// the apply phase so the consumed marker suppresses a same-tick re-pin.
-// Indeterminate workloads (FIX 1) are skipped.
+// detectHardDeadlineExpiry handles the FR39 hard-deadline release with
+// AUTHORITATIVE absolute-deadline detection (FIX 1, round 2). A workload has
+// reached its hard deadline when it is CURRENTLY PINNED in the FSM (the pin set
+// is the authority for "we believe this is pinned"), STILL desired this tick
+// (its annotation is present, i.e. in desiredSet), has NO active Redis key this
+// tick (the missing key IS the deadline signal, since the native TTL elapsed),
+// and is NOT indeterminate. On detection: ReleasePin + mark the
+// workload+signature consumed so the still-present annotation does NOT re-pin.
+// Run BEFORE the apply phase so the consumed marker suppresses a same-tick
+// re-pin.
+//
+// This removes the old two-tick lastActive dependence, which MISSED two cases:
+// (a) ttl < pollInterval (the key is written and expires within one poll gap,
+// so it is never captured in lastActive => an infinite re-pin loop), and (b) a
+// SCAN/GET race in ListActive that drops the key on the very tick it would have
+// been "last active" => a pin stranded forever. The FSM pin set plus the
+// absent Redis key are both authoritative and need no prior-tick capture.
 func (c *Controller) detectHardDeadlineExpiry(desiredSet map[string]desired, current map[string]OverrideRecord, indeterminate map[string]struct{}) {
 	for wl, d := range desiredSet {
 		if _, ind := indeterminate[wl]; ind {
 			continue
 		}
-		_, stillActive := current[wl]
-		_, wasActive := c.lastActive[wl]
-		if !stillActive && wasActive {
-			resumed, ok := c.machine.ReleasePin(wl)
-			c.consumed[wl] = d.signature()
-			c.log.Info("override: released (hard-deadline ttl expiry)", "workload_id", wl, "resumed_from", resumed, "was_pinned", ok)
+		if _, pinned := c.machine.IsPinned(wl); !pinned {
+			// Not (yet) pinned: this is a fresh apply, not a deadline expiry.
+			continue
 		}
+		if _, stillActive := current[wl]; stillActive {
+			// The key is still live: the hard deadline has not elapsed.
+			continue
+		}
+		resumed, ok := c.machine.ReleasePin(wl)
+		c.consumed[wl] = d.signature()
+		c.log.Info("override: released (hard-deadline ttl expiry)", "workload_id", wl, "resumed_from", resumed, "was_pinned", ok)
 	}
 }
 
 // detectManualRemovals handles the AC4 manual-removal release: a pinned/active
-// workload that is POSITIVELY not desired this tick (annotation confirmed
-// absent) with its key still present. ReleasePin + DeleteOverride + clear any
-// consumed marker. The candidate set is the union of the Redis-active set and
-// the FSM pin set. Indeterminate workloads (FIX 1) are skipped: their absence
-// is unproven, so a pinned QUARANTINED workload is never spuriously
-// un-isolated. The caller skips this phase entirely when the resolve was
-// incomplete this tick.
-func (c *Controller) detectManualRemovals(ctx context.Context, desiredSet map[string]desired, current map[string]OverrideRecord, indeterminate map[string]struct{}) {
+// workload that is not in the desired set this tick. The candidate set is the
+// union of the Redis-active set, the FSM pin set, and the consumed set (so a
+// hard-deadline-released workload's later annotation removal clears its stale
+// consumed marker). For each candidate not desired this tick:
+//
+//   - Indeterminate workloads (FIX 2(a)) are skipped: a per-workload owner-read
+//     error this tick leaves the desired state unproven. This is now PER
+//     WORKLOAD, not a tick-wide veto: a positively-resolved, confirmed-absent
+//     workload is still releasable even if some OTHER pod errored.
+//   - Before releasing, the removal is CONFIRMED by a direct owner read (FIX
+//     2(b)): parse the workload_id, GET the owner, and check it does NOT carry
+//     the override annotation. This fixes the owner-scaled-to-zero / rollout-
+//     churn false positive where a workload has zero live pods this tick (a
+//     successful-but-empty list) yet the owner still carries the annotation.
+//     Owner NotFound or owner-present-without-annotation => confirmed removal =>
+//     release. Owner-present-WITH-annotation => not a removal (pods merely
+//     absent) => skip. Owner GET error (non-NotFound) or unparseable id =>
+//     indeterminate => skip.
+func (c *Controller) detectManualRemovals(ctx context.Context, desiredSet map[string]desired, current map[string]OverrideRecord, indeterminate map[string]struct{}, resolveFailed bool) {
 	candidates := map[string]struct{}{}
 	for wl := range current {
 		candidates[wl] = struct{}{}
@@ -524,8 +602,31 @@ func (c *Controller) detectManualRemovals(ctx context.Context, desiredSet map[st
 		if _, ind := indeterminate[wl]; ind {
 			continue
 		}
+		// A POD-sourced override whose pod could not be resolved this tick is an
+		// unproven absence: the owner object carries no annotation (the
+		// annotation lived on the pod), so the owner-confirm below would falsely
+		// read "removed". Skip it while a resolve failed this tick (FIX 2(a)
+		// per-workload protection for the pod-sourced case).
+		if resolveFailed {
+			if rec, active := current[wl]; active && rec.Source == SourcePod {
+				c.log.Warn("override: pod-sourced pin unresolvable this tick (resolve error); retaining pin (indeterminate)", "workload_id", wl)
+				continue
+			}
+		}
+		// Confirm the annotation is GENUINELY gone via a direct owner read
+		// before treating the pod absence as a removal (FIX 2(b)).
+		switch confirmOwnerAnnotation(ctx, c.cs, wl) {
+		case ownerStillAnnotated:
+			c.log.Info("override: candidate has zero live pods but owner still annotated; retaining pin (not a removal)", "workload_id", wl)
+			continue
+		case ownerIndeterminate:
+			c.log.Warn("override: could not confirm owner annotation removal; retaining pin (indeterminate)", "workload_id", wl)
+			continue
+		case ownerRemovalConfirmed:
+			// fall through to release.
+		}
 		resumed, ok := c.machine.ReleasePin(wl)
-		// The annotation is positively gone; clear Redis (no-op if the key
+		// The annotation is confirmed gone; clear Redis (no-op if the key
 		// already expired) and drop any consumed marker so a future re-add
 		// re-pins.
 		if err := c.store.Delete(ctx, wl); err != nil {
@@ -536,9 +637,24 @@ func (c *Controller) detectManualRemovals(ctx context.Context, desiredSet map[st
 	}
 }
 
-// emitRejection publishes a rejected OVERRIDES.applied event and increments
-// the rejection counter (BI-5). It pins nothing and writes no Redis key.
+// emitRejection publishes a rejected OVERRIDES.applied event and increments the
+// rejection counter (BI-5), but only on a NEW or CHANGED rejection for that
+// workload (FIX 5, round 2). The NATS event is server-side deduped on
+// workload+reason+state, so a standing invalid annotation would otherwise emit
+// one event but increment the counter every poll. Tracking the last-rejected
+// signature per workload makes the counter consistent with the event: a
+// standing misconfiguration counts ONCE; a re-emit happens only when the
+// operator changes the (still-invalid) requested value. It pins nothing and
+// writes no Redis key.
 func (c *Controller) emitRejection(ctx context.Context, d desired) {
+	sig := d.rejectReason + "|" + d.requestedRaw
+	if prev, ok := c.lastRejected[d.workloadID]; ok && prev == sig {
+		// Already emitted+counted this exact standing rejection; do not
+		// re-count or re-emit (consistent with the deduped NATS event).
+		return
+	}
+	c.lastRejected[d.workloadID] = sig
+
 	if c.rejected != nil {
 		c.rejected.WithLabelValues(d.rejectReason).Inc()
 	}

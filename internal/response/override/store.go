@@ -202,14 +202,27 @@ func workloadIDFromKey(key string) (string, bool) {
 }
 
 // parseOverride decodes a persisted override hash, validating the schema
-// version and the requested-state enum.
+// version and the required numeric fields. A corrupt ttl_seconds is SURFACED
+// as an error (FIX 3, round 2) rather than silently coerced to 0: a ttl of 0
+// would make the record's signature never match the live annotation's
+// signature, causing a per-tick re-pin + TTL-refresh churn. ListActive skips a
+// key whose parse errors, so a malformed key reads as "no active key" and the
+// next tick performs a single clean re-apply (self-healing). The applied_at
+// field is likewise required so a corrupt timestamp does not silently surface
+// as the Unix epoch.
 func parseOverride(h map[string]string) (OverrideRecord, error) {
 	if v := h[fieldSchemaVersion]; v != SchemaVersionOverride {
 		return OverrideRecord{}, fmt.Errorf("unknown schema_version %q", v)
 	}
 	state := schema.PodSecurityState(h[fieldRequestedState])
-	ttl, _ := strconv.Atoi(h[fieldTTLSeconds])
-	appliedNs, _ := strconv.ParseInt(h[fieldAppliedAtNs], 10, 64)
+	ttl, err := strconv.Atoi(h[fieldTTLSeconds])
+	if err != nil {
+		return OverrideRecord{}, fmt.Errorf("parse ttl_seconds %q: %w", h[fieldTTLSeconds], err)
+	}
+	appliedNs, err := strconv.ParseInt(h[fieldAppliedAtNs], 10, 64)
+	if err != nil {
+		return OverrideRecord{}, fmt.Errorf("parse applied_at_ns %q: %w", h[fieldAppliedAtNs], err)
+	}
 	return OverrideRecord{
 		RequestedState: state,
 		TTLSeconds:     ttl,

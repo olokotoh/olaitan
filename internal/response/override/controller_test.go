@@ -1099,3 +1099,203 @@ func TestReconcile_OperatorIDFlowsThrough(t *testing.T) {
 		t.Errorf("redis record operator_id = %q, want alice@corp", rec.OperatorID)
 	}
 }
+
+// --- ROUND 2 FIX 1: authoritative absolute-deadline expiry ---
+
+// TestReconcile_TTLShorterThanPollExpiresOnce asserts the round-2 authoritative
+// expiry: when ttl < pollInterval (the key is written and expires WITHIN one
+// poll gap, so it is never captured by the old two-tick lastActive model), the
+// override pins exactly ONCE and then releases after the key expires, with NO
+// per-tick re-pin loop, even though the annotation stays present the whole time.
+func TestReconcile_TTLShorterThanPollExpiresOnce(t *testing.T) {
+	ctx := context.Background()
+	mr := startMiniredis(t)
+	store, _ := newRedisStore(t, mr)
+	machine := newMachine(t)
+	pub := &fakePublisher{}
+
+	// ttl 1s, far shorter than the (test) poll. Annotation stays present.
+	_, objs := deploymentPod("default", "web", map[string]string{
+		AnnotationState: "RESTRICTED",
+		AnnotationTTL:   "1s",
+	})
+	c := newController(t, objs, store, machine, pub, nil)
+
+	// Tick 1: apply (single pin, single applied event, key with 1s native TTL).
+	c.reconcile(ctx)
+	if _, pinned := machine.IsPinned(depWorkloadID); !pinned {
+		t.Fatal("tick 1 must pin")
+	}
+	if n := len(pub.all()); n != 1 {
+		t.Fatalf("tick 1 applied events = %d, want exactly 1", n)
+	}
+
+	// The native TTL elapses within the poll gap.
+	mr.FastForward(2 * time.Second)
+
+	// Tick 2: pinned + still-desired + NO active key => authoritative
+	// hard-deadline release. The consumed marker suppresses a same-tick re-pin.
+	c.reconcile(ctx)
+	if _, pinned := machine.IsPinned(depWorkloadID); pinned {
+		t.Fatal("tick 2 must release on authoritative hard-deadline expiry (ttl < poll)")
+	}
+
+	// Tick 3..5: the still-present annotation must NOT re-pin (no oscillation)
+	// and no new applied events (the old lastActive model would re-pin every
+	// tick here, an infinite loop).
+	for i := 0; i < 3; i++ {
+		c.reconcile(ctx)
+		if _, pinned := machine.IsPinned(depWorkloadID); pinned {
+			t.Fatalf("tick %d re-pinned: ttl<poll must NOT re-pin loop (consumed marker)", i+3)
+		}
+	}
+	if n := len(pub.all()); n != 1 {
+		t.Fatalf("total applied events = %d, want exactly 1 (no re-pin loop, FIX 1)", n)
+	}
+}
+
+// --- ROUND 2 FIX 2(b): owner-confirm before manual-removal release ---
+
+// TestReconcile_OwnerScaledToZeroNotReleased asserts that a pinned owner-level
+// override with ZERO live pods this tick (a successful-but-empty pod list) is
+// NOT released while the OWNER object still carries the annotation: the pods'
+// transient absence is not a manual removal (FIX 2(b)). When the owner
+// annotation is then removed, the override IS released on the next poll.
+func TestReconcile_OwnerScaledToZeroNotReleased(t *testing.T) {
+	ctx := context.Background()
+	mr := startMiniredis(t)
+	store, _ := newRedisStore(t, mr)
+	machine := newMachine(t)
+	pub := &fakePublisher{}
+
+	// Owner (Deployment) annotated; pod present at tick 1 so the override pins.
+	_, objs := deploymentPod("default", "web", nil)
+	for _, o := range objs {
+		if dep, ok := o.(*appsv1.Deployment); ok {
+			dep.Annotations = map[string]string{AnnotationState: "QUARANTINED", AnnotationTTL: "1h"}
+		}
+	}
+	cs := fake.NewSimpleClientset(objs...)
+	c, err := New(Config{PollInterval: time.Second, DefaultTTL: time.Hour}, cs, store, machine, pub, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	c.reconcile(ctx)
+	if _, pinned := machine.IsPinned(depWorkloadID); !pinned {
+		t.Fatal("tick 1 must pin from owner annotation")
+	}
+
+	// Scale to zero: delete the pod. The pod list is now successful-but-empty,
+	// so the workload is not in the desired set this tick. The owner Deployment
+	// is STILL annotated => NOT a manual removal.
+	if err := cs.CoreV1().Pods("default").Delete(ctx, "web-abc", metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("delete pod: %v", err)
+	}
+	c.reconcile(ctx)
+	if _, pinned := machine.IsPinned(depWorkloadID); !pinned {
+		t.Fatal("owner scaled to zero but still annotated must RETAIN the pin (FIX 2(b))")
+	}
+	if _, ok, _ := store.Get(ctx, depWorkloadID); !ok {
+		t.Fatal("owner scaled to zero must NOT delete the Redis key")
+	}
+
+	// Now remove the owner annotation: with zero pods AND the owner confirmed
+	// un-annotated, this IS a confirmed removal => release.
+	dep, err := cs.AppsV1().Deployments("default").Get(ctx, "web", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get deployment: %v", err)
+	}
+	dep.Annotations = nil
+	if _, err := cs.AppsV1().Deployments("default").Update(ctx, dep, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update deployment: %v", err)
+	}
+	c.reconcile(ctx)
+	if _, pinned := machine.IsPinned(depWorkloadID); pinned {
+		t.Fatal("owner annotation removed (confirmed) must release the pin (FIX 2(b))")
+	}
+	if _, ok, _ := store.Get(ctx, depWorkloadID); ok {
+		t.Fatal("confirmed removal must clear the Redis key (AC4)")
+	}
+}
+
+// --- ROUND 2 FIX 3: malformed ttl_seconds is SKIPPED by ListActive ---
+
+// TestStore_ListActiveSkipsMalformedTTL asserts a hash with a corrupt
+// ttl_seconds is skipped by ListActive (not surfaced as ttl=0), so the apply
+// path performs a clean single re-apply rather than a per-tick churn (FIX 3).
+func TestStore_ListActiveSkipsMalformedTTL(t *testing.T) {
+	ctx := context.Background()
+	mr := startMiniredis(t)
+	store, cli := newRedisStore(t, mr)
+
+	// A valid record and one with a NON-NUMERIC ttl_seconds.
+	if err := store.Put(ctx, depWorkloadID, OverrideRecord{RequestedState: schema.StateRestricted, AppliedAt: time.Now()}, time.Hour); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := cli.SetOverride(ctx, "override:default/Deployment/bad", map[string]any{
+		"schema_version":  SchemaVersionOverride,
+		"requested_state": "RESTRICTED",
+		"ttl_seconds":     "not-a-number",
+		"applied_at_ns":   "0",
+	}, time.Hour); err != nil {
+		t.Fatalf("seed malformed ttl: %v", err)
+	}
+
+	active, err := store.ListActive(ctx)
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if _, ok := active[depWorkloadID]; !ok {
+		t.Error("valid record missing")
+	}
+	if rec, ok := active["default/Deployment/bad"]; ok {
+		t.Errorf("malformed ttl_seconds must be SKIPPED, got %+v (would read as ttl=0)", rec)
+	}
+}
+
+// --- ROUND 2 FIX 5: standing rejection counts once ---
+
+// TestReconcile_StandingRejectionCountsOnce asserts a standing invalid
+// annotation increments the rejected counter ONCE across many polls (consistent
+// with the deduped NATS event), and re-counts when the (still-invalid) value
+// changes (FIX 5).
+func TestReconcile_StandingRejectionCountsOnce(t *testing.T) {
+	ctx := context.Background()
+	mr := startMiniredis(t)
+	store, _ := newRedisStore(t, mr)
+	machine := newMachine(t)
+	pub := &fakePublisher{}
+	reg := metrics.NewRegistry()
+
+	_, objs := deploymentPod("default", "web", map[string]string{
+		AnnotationState: "BOGUS",
+	})
+	cs := fake.NewSimpleClientset(objs...)
+	c, err := New(Config{PollInterval: time.Second, DefaultTTL: time.Hour}, cs, store, machine, pub, reg, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Five polls of the SAME standing invalid annotation.
+	for i := 0; i < 5; i++ {
+		c.reconcile(ctx)
+	}
+	if got := counterValue(t, reg, "olaitan_response_override_rejected_total", "invalid_state"); got != 1 {
+		t.Fatalf("standing rejection counter = %v, want 1 (counted once, FIX 5)", got)
+	}
+	if n := len(pub.all()); n != 1 {
+		t.Fatalf("standing rejection events = %d, want 1 (deduped)", n)
+	}
+
+	// Operator changes to a DIFFERENT still-invalid value => re-counts.
+	pod, _ := cs.CoreV1().Pods("default").Get(ctx, "web-abc", metav1.GetOptions{})
+	pod.Annotations[AnnotationState] = "ALSO_BOGUS"
+	if _, err := cs.CoreV1().Pods("default").Update(ctx, pod, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update pod: %v", err)
+	}
+	c.reconcile(ctx)
+	c.reconcile(ctx)
+	if got := counterValue(t, reg, "olaitan_response_override_rejected_total", "invalid_state"); got != 2 {
+		t.Fatalf("changed-but-still-invalid rejection counter = %v, want 2 (re-counted once, FIX 5)", got)
+	}
+}
