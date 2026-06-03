@@ -19,6 +19,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+
+	"github.com/olokotoh/olaitan/internal/schema"
 )
 
 // envtestState holds the package-shared envtest plumbing, started once in
@@ -198,5 +200,107 @@ func TestIntegration_ApplyIdempotentReapplyAndOrphanGC(t *testing.T) {
 	m.reconcileGC(ctx)
 	if _, err := cs.NetworkingV1().NetworkPolicies(ns).Get(ctx, name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("orphan policy not garbage-collected: err=%v", err)
+	}
+}
+
+// TestIntegration_RestrictedToQuarantineAtomicReplacement exercises the
+// Story 2.5 RESTRICTED->QUARANTINED transition against a real kube-apiserver
+// (AC5): the deny-all quarantine policy is applied with the correct
+// policyTypes/labels/annotation/selector, the previous RESTRICTED policy is
+// removed cleanly (apply-before-delete), the QUARANTINED re-apply is an
+// idempotent no-op, and the unchanged orphan GC collects the quarantine policy
+// once its owner is deleted (BI-8).
+func TestIntegration_RestrictedToQuarantineAtomicReplacement(t *testing.T) {
+	ns := freshNamespace(t)
+	cs := envtestState.cs
+	ctx := context.Background()
+	sel := map[string]string{"app": "web"}
+
+	if _, err := cs.AppsV1().Deployments(ns).Create(ctx, &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "web"},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: sel},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: sel},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "busybox"}}},
+			},
+		},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create deployment: %v", err)
+	}
+
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, nil, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	workloadID := ns + "/Deployment/web"
+	ref := workloadRef{namespace: ns, ownerKind: "Deployment", ownerName: "web"}
+	restrictedName := PolicyName(workloadID)
+	quarantineName := policyNameFor(schema.StateQuarantined, workloadID)
+
+	// (1) RESTRICTED first: the egress-only policy exists.
+	m.handle(ctx, restrictedTransition(workloadID, "pkg-1"))
+	r, err := cs.NetworkingV1().NetworkPolicies(ns).Get(ctx, restrictedName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("restricted policy not applied: %v", err)
+	}
+	if len(r.Spec.PolicyTypes) != 1 || r.Spec.PolicyTypes[0] != networkingv1.PolicyTypeEgress {
+		t.Fatalf("restricted policyTypes = %v, want [Egress]", r.Spec.PolicyTypes)
+	}
+
+	// (2) QUARANTINED: deny-all applied, restricted removed cleanly.
+	m.handle(ctx, quarantinedTransition(workloadID, "pkg-2"))
+
+	q, err := cs.NetworkingV1().NetworkPolicies(ns).Get(ctx, quarantineName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("quarantine policy not applied: %v", err)
+	}
+	if q.Labels[LabelManagedBy] != ManagedByValue {
+		t.Fatalf("quarantine policy missing managed-by label: %v", q.Labels)
+	}
+	if q.Annotations[AnnFSMState] != "QUARANTINED" {
+		t.Fatalf("quarantine fsm-state annotation = %q, want QUARANTINED", q.Annotations[AnnFSMState])
+	}
+	if len(q.Spec.PolicyTypes) != 2 {
+		t.Fatalf("quarantine policyTypes = %v, want [Ingress, Egress]", q.Spec.PolicyTypes)
+	}
+	if len(q.Spec.Ingress) != 0 || len(q.Spec.Egress) != 0 {
+		t.Fatalf("quarantine deny-all has rules: ingress=%v egress=%v", q.Spec.Ingress, q.Spec.Egress)
+	}
+	if q.Spec.PodSelector.MatchLabels["app"] != "web" {
+		t.Fatalf("quarantine podSelector = %v", q.Spec.PodSelector)
+	}
+	// Previous RESTRICTED policy is removed cleanly (AC2/AC5).
+	if _, err := cs.NetworkingV1().NetworkPolicies(ns).Get(ctx, restrictedName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("restricted policy not removed after quarantine: err=%v", err)
+	}
+	qrv := q.ResourceVersion
+
+	// (3) Idempotent QUARANTINED re-apply: a fresh identical desired state is a
+	// no-op and leaves the quarantine policy's resourceVersion unchanged.
+	np := m.buildPolicy(ref, &metav1.LabelSelector{MatchLabels: sel}, quarantinedTransition(workloadID, "pkg-2"))
+	result, err := m.apply(ctx, np)
+	if err != nil {
+		t.Fatalf("quarantine re-apply: %v", err)
+	}
+	if result != "noop" {
+		t.Fatalf("quarantine re-apply result = %q, want noop", result)
+	}
+	after, err := cs.NetworkingV1().NetworkPolicies(ns).Get(ctx, quarantineName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get after quarantine re-apply: %v", err)
+	}
+	if after.ResourceVersion != qrv {
+		t.Fatalf("idempotent quarantine re-apply mutated the object: rv %q -> %q", qrv, after.ResourceVersion)
+	}
+
+	// (4) Orphan GC (BI-8): delete the owner, reconcile, quarantine policy is
+	// collected by the unchanged managed-by GC selector.
+	if err := cs.AppsV1().Deployments(ns).Delete(ctx, "web", metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("delete deployment: %v", err)
+	}
+	m.reconcileGC(ctx)
+	if _, err := cs.NetworkingV1().NetworkPolicies(ns).Get(ctx, quarantineName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("orphan quarantine policy not garbage-collected: err=%v", err)
 	}
 }
