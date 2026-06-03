@@ -655,7 +655,8 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 			return fmt.Errorf("aggregator: netpol: %w", nerr)
 		}
 		sinks = append(sinks, npMgr)
-		g.Go(func() error { return npMgr.Run(ctx) })
+		// Run is launched below, AFTER SetStateOracle, so the reconcile
+		// goroutine never reads m.oracle concurrently with the setter write.
 	}
 	var fsmSink fsm.TransitionSink = fsm.NopSink{}
 	if len(sinks) > 0 {
@@ -674,6 +675,10 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	// once both exist. *fsm.Machine satisfies netpol.StateOracle via CurrentState.
 	if npMgr != nil {
 		npMgr.SetStateOracle(stateMachine)
+		// Launch the worker only now that the oracle is installed. Starting the
+		// goroutine here establishes a happens-before edge for the SetStateOracle
+		// write above, so the reconcile loop never races on m.oracle.
+		g.Go(func() error { return npMgr.Run(ctx) })
 	}
 	if fsmStore != nil {
 		recovered, skipped, rerr := stateMachine.Restore(ctx, fsmStore)
