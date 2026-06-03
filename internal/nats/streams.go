@@ -71,6 +71,21 @@ var streamConfigs = []jetstream.StreamConfig{
 		Storage:   jetstream.FileStorage,
 		Retention: jetstream.LimitsPolicy,
 	},
+	{
+		// OVERRIDES carries the Story 2.7 operator-override applied/rejected
+		// events (subjects.OverridesApplied). The architecture pins a 365-day
+		// retention (architecture.md:238 "OVERRIDES.applied | 365 days") so an
+		// operator can audit which workloads were manually pinned over the past
+		// year. LimitsPolicy + FileStorage like the other streams. The
+		// controller publishes with jetstream.WithMsgID so a poll re-emit is
+		// server-side deduplicated within the dedup window.
+		Name:       "OVERRIDES",
+		Subjects:   []string{subjects.OverridesApplied},
+		MaxAge:     365 * 24 * time.Hour,
+		Storage:    jetstream.FileStorage,
+		Retention:  jetstream.LimitsPolicy,
+		Duplicates: 2 * time.Minute,
+	},
 }
 
 // StreamConfigs returns a copy of the JetStream stream configurations.

@@ -368,6 +368,34 @@ When the FSM has no opinion on a workload (the oracle returns not-ok, e.g. trans
 
 Scope boundary: Story 2.6 handles ONLY automated, ThreatScore-driven de-escalation transitions. Operator-override state pins (`olaitan.io/state-override`, FR38/FR39) and their TTL release are Story 2.7; an override that drives the FSM into a lower state will flow through this same removal path once it lands, but the override controller, the annotation watch, and the `override_rejected` metric are not part of Story 2.6.
 
+#### Operator scenario: pinning a workload's state with an annotation (Story 2.7, FR38/FR39)
+
+When you have manually investigated an alert and want Olaitan to stand a workload down or escalate it for a fixed window, annotate the workload's pod OR its owner (Deployment/StatefulSet/DaemonSet/ReplicaSet/Job/CronJob) with the override pair and let the override controller pick it up. The controller is OFF by default; enable it with `response.override.enabled: true`.
+
+- `olaitan.io/state-override: <STATE>` where `<STATE>` is one of `CLEAN`, `SUSPICIOUS`, `RESTRICTED`, `QUARANTINED`. This pins the FSM to that state and DEFERS all subsequent ThreatScore-driven transitions until the override is released (FR38).
+- `olaitan.io/state-override-ttl: <duration>` (optional) is a Go duration such as `30m` or `2h`. When absent (or unparseable, or non-positive) the controller DEFAULTS to `1h` and logs a WARN; a bad TTL is NOT a rejection of the override.
+
+**Observation is a poll, not a watch.** The controller LISTs pods on a ticker (`response.override.poll_interval_seconds`, default 15 s) and reconciles. The aggregator deliberately holds no `watch` RBAC; observation is on-demand polling, so an override applied while the controller is briefly down is picked up on the next tick. **Release latency is therefore one poll interval**: the Redis key's TTL is exact, but the FSM's resumption is detected on the first poll AFTER the override ends (Open Assumption 1). Lower `poll_interval_seconds` for tighter release latency.
+
+**Native Redis TTL.** Each applied override writes `override:{workload_id}` (the canonical `namespace/owner-kind/owner-name` form) with a NATIVE Redis TTL equal to the requested duration. Inspect it with `redis-cli TTL override:default/Deployment/web`; the TTL should match the requested duration (AC3). This is the deliberate divergence from the no-TTL `fsm:` family: the override's lifetime is wall-clock, so it survives a controller restart and is reaped by Redis exactly on expiry. The pin's in-memory flag is NOT persisted in the `fsm:` hash; on restart the FSM rehydrates the pinned state from `fsm:` and the first post-restart poll re-establishes the in-memory pin from the surviving `override:` key (Open Assumption 3). If the controller is down longer than the TTL, Redis drops the key during the outage and the first post-restart poll sees no key and releases.
+
+**Release triggers (all detected by the same poll).** (1) Native-TTL expiry: Redis drops the key, the poll sees a pinned FSM with no `override:` key and calls `ReleasePin`. (2) Manual removal before expiry: you delete the annotation, the poll sees the key still present but the annotation gone, calls `ReleasePin` AND deletes the Redis key immediately (AC4). On release the FSM resumes score-driven control from the released state, re-evaluated against the CURRENT ThreatScore; the dwell/cooldown anchors are reset to a fresh window. The released workload reports the pinned state until its next ThreatScore arrives, then converges (Open Assumption 2): there is no synthetic re-score.
+
+**Enforcement reuses Stories 2.4-2.6 with no new code (BI-7).** A pin is a `StateTransition` routed through the same FSM sink the automated path uses. A pin to RESTRICTED/QUARANTINED therefore drives the Story 2.4/2.5 NetworkPolicy apply, and a pin to CLEAN/SUSPICIOUS drives the Story 2.6 removal. The override is a NEW WAY TO PRODUCE a transition, not a new enforcement path.
+
+**Precedence and conflicts (BI-9, Open Assumption 4).** A pod-level annotation wins over the same annotation on the owner; both key on the canonical owner-resolved `workload_id`, so an owner-level annotation pins the whole workload (the common "stand this Deployment down" case). Conflicting per-pod annotations of the SAME owner (pod A says RESTRICTED, pod B says QUARANTINED) resolve to the HIGHEST requested state (most-isolating wins, the safe security default) with a WARN log naming the conflict. Annotate the owner for a whole-workload override and avoid conflicting per-pod annotations.
+
+**Rejected overrides.** An override into `PRESERVED_KILLED` (Epic 4, not yet implemented) is REFUSED: no pin, no Redis key, an `OVERRIDES.applied` event with `rejected: true, reason: state_unavailable`, and the metric below increments with `reason="state_unavailable"`. A typo'd or non-enum state value is refused the same way with `reason="invalid_state"` so you can tell "you asked for a real-but-not-yet-implemented state" from "you mistyped the state".
+
+The `OVERRIDES.applied` NATS subject (365-day JetStream retention) carries one event per applied AND per rejected override; the append-only `AUDIT.overrides` SIEM mirror is Story 2.8 and is deliberately NOT produced here (Open Assumption 5).
+
+#### `olaitan_response_override_rejected_total` (Story 2.7, FR38/FR39)
+
+- **Type:** Counter vector, labelled `reason`.
+- **Labels:** `reason` is `state_unavailable` (a real-but-unimplemented target such as `PRESERVED_KILLED`) or `invalid_state` (an unknown/typo'd state value). Both label series are pre-initialised to 0 at startup so alert PromQL has a stable zero baseline.
+- **Meaning:** cumulative count of operator-override requests the controller refused. A non-zero `state_unavailable` is expected if operators try to pin `PRESERVED_KILLED` before Epic 4; a rising `invalid_state` indicates operators are mistyping the annotation value.
+- **No `workload_id` label** (forbidden as a Prometheus label per architecture.md:472-476); the rejected workload is in the `OVERRIDES.applied` event and the controller WARN log.
+
 ### 1.5 Naming-convention reconciliation
 
 The Story 1.18 acceptance criteria text uses a mix of singular-ring and plural-ring metric names (e.g. AC2 says `olaitan_decision_rule_matches_total` singular; AC3 says `olaitan_decision_baseline_deviations_total{metric, sigma_bucket}` plural). The actual registrations follow `architecture.md:472-475` which mandates the `olaitan_<ring>_<metric>` pattern with the engine subfamily conventionally plural (`rules`, `baseline`) because the engine evaluates a corpus, not a single rule. The AC singular spellings are documentation aliases, not parallel families.

@@ -27,6 +27,15 @@ const (
 	// and carries NO TTL (FSM state must survive an arbitrary restart gap;
 	// Story 2.3 BI-2).
 	FSMStatePrefix = "fsm:"
+	// OverridePrefix is the Story 2.7 operator-override family
+	// (override:{workload_id} per architecture.md:455). It is keyed by the
+	// canonical three-segment workload_id exactly like the fsm: family but,
+	// unlike fsm:, it carries a NATIVE Redis TTL equal to the override's
+	// requested duration (default 1h): the native TTL IS the FR39 release
+	// mechanism, so the override's lifetime is wall-clock-correct across a
+	// controller restart (Story 2.7 BI-3/BI-4). This is the deliberate
+	// divergence from the no-TTL fsm: family.
+	OverridePrefix = "override:"
 )
 
 // Fixed checkpoint keys owned by Ring 3 (correlator).
@@ -46,6 +55,7 @@ const (
 	FamilyEvidence
 	FamilyHealth
 	FamilyFSM
+	FamilyOverride
 )
 
 // FamilyOf returns the Family a key belongs to by its prefix, or
@@ -62,6 +72,8 @@ func FamilyOf(key string) Family {
 		return FamilyEvidence
 	case strings.HasPrefix(key, HealthPrefix):
 		return FamilyHealth
+	case strings.HasPrefix(key, OverridePrefix):
+		return FamilyOverride
 	case strings.HasPrefix(key, FSMStatePrefix):
 		return FamilyFSM
 	default:
@@ -196,6 +208,19 @@ func FSMState(workloadID string) (string, error) {
 		return "", fmt.Errorf("keys: fsm-state: %w", err)
 	}
 	return FSMStatePrefix + workloadID, nil
+}
+
+// Override returns the Story 2.7 operator-override key for a workload.
+// Layout: override:<workload_id> where workload_id is the canonical
+// "<namespace>/<owner-kind>/<owner-name>" form from WorkloadID. Unlike
+// the no-TTL fsm: family, this key is written with a NATIVE Redis TTL
+// equal to the override's requested duration: the native TTL is the FR39
+// release mechanism (BI-3/BI-4).
+func Override(workloadID string) (string, error) {
+	if err := validateWorkloadID(workloadID); err != nil {
+		return "", fmt.Errorf("keys: override: %w", err)
+	}
+	return OverridePrefix + workloadID, nil
 }
 
 // FSMHistory returns the Story 2.3 append-only transition-history key for

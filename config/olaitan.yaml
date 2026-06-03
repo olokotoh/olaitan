@@ -218,6 +218,27 @@ response:
     extra_allowed_cidrs: []
     reconcile_interval_seconds: 30
 
+  # Story 2.7: operator-override controller (FR38/FR39). When enabled, a
+  # controller polls (LISTs) pods on poll_interval_seconds for the
+  # olaitan.io/state-override annotation (with an optional
+  # olaitan.io/state-override-ttl), pins the workload's FSM state, and records
+  # an override:{workload_id} Redis key with a native TTL equal to the
+  # requested duration (default 1h when the TTL annotation is absent). The pin
+  # transition routes through the existing FSM sink, so a pinned RESTRICTED/
+  # QUARANTINED drives the Story 2.4/2.5 NetworkPolicy enforcement and a pinned
+  # CLEAN drives the Story 2.6 removal with no new enforcement code. Release is
+  # detected by the poll: native-TTL expiry (Redis key gone) or manual
+  # annotation removal both release the pin within one poll interval. An
+  # override to PRESERVED_KILLED (Epic 4, not implemented) is rejected with an
+  # OVERRIDES.applied {rejected:true, reason:state_unavailable} event and the
+  # olaitan_response_override_rejected_total{reason} metric. Disabled by
+  # default; observation is poll, never watch (no new RBAC). Full values.yaml
+  # mode-surfacing is deferred to Story 2.10 (the Story 2.4 precedent).
+  override:
+    enabled: false
+    poll_interval_seconds: 15
+    default_ttl_seconds: 3600
+
 analyst:
   provider: api
   api:

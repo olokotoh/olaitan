@@ -250,9 +250,10 @@ func TestEnsureStreams(t *testing.T) {
 	}
 
 	want := map[string][]string{
-		"EVENTS":   {subjects.Normalised},
-		"THREATS":  {subjects.ThreatsPrefix + ">"},
-		"EVIDENCE": {subjects.EvidencePrefix + ">"},
+		"EVENTS":    {subjects.Normalised},
+		"THREATS":   {subjects.ThreatsPrefix + ">"},
+		"EVIDENCE":  {subjects.EvidencePrefix + ">"},
+		"OVERRIDES": {subjects.OverridesApplied},
 	}
 
 	js := c.JetStream()
@@ -630,6 +631,32 @@ func TestStreamConfigsCoversNetworkFlowSubject(t *testing.T) {
 		subjects.RawNetwork)
 }
 
+// TestStreamConfigsCoversOverridesApplied pins Story 2.7 BI-10: the
+// OVERRIDES stream covers subjects.OverridesApplied with the architecture's
+// 365-day retention (architecture.md:238) so operator overrides are auditable
+// for a year, and a >= 2m dedup window so a poll re-emit (WithMsgID) is
+// server-side deduplicated.
+func TestStreamConfigsCoversOverridesApplied(t *testing.T) {
+	configs := natsclient.StreamConfigs()
+	for _, cfg := range configs {
+		for _, subj := range cfg.Subjects {
+			if subj == subjects.OverridesApplied {
+				if cfg.Name != "OVERRIDES" {
+					t.Errorf("subjects.OverridesApplied covered by stream %q, want OVERRIDES", cfg.Name)
+				}
+				if want := 365 * 24 * time.Hour; cfg.MaxAge != want {
+					t.Errorf("OVERRIDES MaxAge = %s, want %s (365-day audit retention)", cfg.MaxAge, want)
+				}
+				if cfg.Duplicates < 2*time.Minute {
+					t.Errorf("OVERRIDES Duplicates window: got %s, want >= 2m for at-least-once dedup", cfg.Duplicates)
+				}
+				return
+			}
+		}
+	}
+	t.Fatalf("StreamConfigs: no stream covers subjects.OverridesApplied (%q)", subjects.OverridesApplied)
+}
+
 func TestStreamConfigsDeepCopy(t *testing.T) {
 	a := natsclient.StreamConfigs()
 	b := natsclient.StreamConfigs()
@@ -688,6 +715,15 @@ func testStreamConfigs() []jetstream.StreamConfig {
 			MaxBytes:  1 * 1024 * 1024,
 			Storage:   jetstream.MemoryStorage,
 			Retention: jetstream.LimitsPolicy,
+		},
+		{
+			Name:       "OVERRIDES",
+			Subjects:   []string{subjects.OverridesApplied},
+			MaxAge:     365 * 24 * time.Hour,
+			MaxBytes:   1 * 1024 * 1024,
+			Storage:    jetstream.MemoryStorage,
+			Retention:  jetstream.LimitsPolicy,
+			Duplicates: 2 * time.Minute,
 		},
 	}
 }

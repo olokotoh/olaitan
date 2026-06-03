@@ -319,6 +319,98 @@ func (c *Client) AppendFSMHistory(ctx context.Context, key string, entry []byte,
 	return nil
 }
 
+// SetOverride writes an operator-override hash for a workload with a
+// NATIVE Redis TTL equal to the caller-supplied override duration (Story
+// 2.7 BI-3). Unlike SetState (a fixed 1h family constant), the override
+// family's TTL IS the requested override duration, so the native TTL is
+// the FR39 release mechanism: when Redis drops the key the controller's
+// poll detects the absence and releases the FSM pin (BI-4). The write is
+// the same pipelined HSET+EXPIRE idiom as SetState so a ctx cancel
+// between the two commands cannot leave an untimed override key. Key must
+// be in the override family (keys.Override output), never a raw string.
+func (c *Client) SetOverride(ctx context.Context, key string, fields map[string]any, ttl time.Duration) error {
+	rdb := c.conn()
+	if rdb == nil {
+		return ErrClientClosed
+	}
+	if keys.FamilyOf(key) != keys.FamilyOverride {
+		return fmt.Errorf("redis: set-override %q: key is not in override family", key)
+	}
+	if len(fields) == 0 {
+		return fmt.Errorf("redis: set-override %q: fields is empty", key)
+	}
+	if ttl <= 0 {
+		return fmt.Errorf("redis: set-override %q: ttl must be positive (got %s)", key, ttl)
+	}
+	return c.setHashWithTTL(ctx, rdb, "set-override", key, fields, ttl)
+}
+
+// GetOverride returns the override hash for a workload, or ErrKeyMissing
+// when the key does not exist or its native TTL expired. A single HGETALL
+// is atomic, so there is no TOCTOU gap against TTL expiry; an empty result
+// means the key is absent (relies on SetOverride rejecting empty writes).
+func (c *Client) GetOverride(ctx context.Context, key string) (map[string]string, error) {
+	rdb := c.conn()
+	if rdb == nil {
+		return nil, ErrClientClosed
+	}
+	if keys.FamilyOf(key) != keys.FamilyOverride {
+		return nil, fmt.Errorf("redis: get-override %q: key is not in override family", key)
+	}
+	out, err := rdb.HGetAll(ctx, key).Result()
+	if err != nil {
+		return nil, fmt.Errorf("redis: get-override %q: %w", key, err)
+	}
+	if len(out) == 0 {
+		return nil, ErrKeyMissing
+	}
+	return out, nil
+}
+
+// DeleteOverride removes a workload's override key (the AC4 manual-removal
+// path: the annotation was withdrawn before the native TTL elapsed, so the
+// controller clears Redis immediately). Deleting an absent key is a no-op
+// and not an error.
+func (c *Client) DeleteOverride(ctx context.Context, key string) error {
+	rdb := c.conn()
+	if rdb == nil {
+		return ErrClientClosed
+	}
+	if keys.FamilyOf(key) != keys.FamilyOverride {
+		return fmt.Errorf("redis: delete-override %q: key is not in override family", key)
+	}
+	if err := rdb.Del(ctx, key).Err(); err != nil {
+		return fmt.Errorf("redis: delete-override %q: %w", key, err)
+	}
+	return nil
+}
+
+// ScanOverrideKeys returns every active operator-override key
+// (override:{workload_id}) currently in Redis. Used by the controller's
+// reconcile loop to compute the CURRENT override set against the DESIRED
+// set from live annotations and detect releases (Story 2.7 BI-4). Mirrors
+// ScanFSMStateKeys.
+func (c *Client) ScanOverrideKeys(ctx context.Context) ([]string, error) {
+	rdb := c.conn()
+	if rdb == nil {
+		return nil, ErrClientClosed
+	}
+	var out []string
+	var cursor uint64
+	for {
+		batch, next, err := rdb.Scan(ctx, cursor, keys.OverridePrefix+"*", 256).Result()
+		if err != nil {
+			return nil, fmt.Errorf("redis: scan-override: %w", err)
+		}
+		out = append(out, batch...)
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return out, nil
+}
+
 // ScanFSMStateKeys returns every durable FSM-state key (fsm:{workload_id})
 // currently in Redis, excluding the fsm:{workload_id}:history lists. Used
 // on restart to rehydrate the in-memory FSM map (Story 2.3 AC2).

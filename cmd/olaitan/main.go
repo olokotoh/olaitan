@@ -56,6 +56,7 @@ import (
 	redisclient "github.com/olokotoh/olaitan/internal/redis"
 	"github.com/olokotoh/olaitan/internal/response/fsm"
 	"github.com/olokotoh/olaitan/internal/response/netpol"
+	"github.com/olokotoh/olaitan/internal/response/override"
 	"github.com/olokotoh/olaitan/internal/retry"
 	"github.com/olokotoh/olaitan/internal/schema"
 	"github.com/olokotoh/olaitan/internal/subjects"
@@ -688,6 +689,24 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		}
 		log.Info("aggregator: fsm state recovered from redis", "recovered", recovered, "skipped", skipped)
 	}
+	// Story 2.7: operator-override controller (FR38/FR39). Gated by
+	// response.override.enabled (off by default). Constructed AFTER the FSM
+	// Machine exists (it calls Pin/ReleasePin on it) and runs on the errgroup;
+	// its dedicated Redis client (own NFR8 AUTH'd connection + closer) is shut
+	// after Run returns, mirroring the FSM sink ordering.
+	overrideEnabled := cfg.Response.Override.EnabledOrDefault()
+	if overrideEnabled {
+		ovrController, ovrCloser, oerr := wireOverrideController(cfg, cs, nc, stateMachine, metricsReg, log)
+		if oerr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: override controller: %w", oerr)
+		}
+		g.Go(func() error {
+			err := ovrController.Run(ctx)
+			ovrCloser()
+			return err
+		})
+	}
 	if err := wireFSMConsumer(ctx, g, log, nc, scoreCalc, stateMachine); err != nil {
 		closeNATS()
 		return fmt.Errorf("aggregator: fsm consumer: %w", err)
@@ -701,7 +720,8 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		"quarantined_dwell_seconds", cfg.Detection.FSM.QuarantinedDwellSecondsOrDefault(),
 		"deescalation_cooldown_seconds", cfg.Detection.FSM.DeescalationCooldownSecondsOrDefault(),
 		"persistence_enabled", cfg.Detection.FSM.PersistenceEnabledOrDefault(),
-		"netpol_enabled", netpolEnabled)
+		"netpol_enabled", netpolEnabled,
+		"override_enabled", overrideEnabled)
 
 	g.Go(func() error {
 		<-ctx.Done()
@@ -842,6 +862,69 @@ func wireNetworkPolicyManager(cfg *config.Config, cs kubernetes.Interface, log *
 		ExcludedNamespaces: cfg.Response.ExcludedNamespaces,
 		ReconcileInterval:  time.Duration(np.ReconcileIntervalSecondsOrDefault()) * time.Second,
 	}, cs, metricsReg, log)
+}
+
+// wireOverrideController constructs the Story 2.7 operator-override controller
+// (FR38/FR39). It reuses the clientset already built for the posture/netpol
+// path when present (cs != nil), or acquires its own via kubeClientFactory. It
+// owns a DEDICATED Redis client with the NFR8 mandatory REDIS_PASSWORD AUTH
+// (mirroring wireFSMPersistence; NOT shared with the FSM sink's connection
+// ownership) and its closer, a NATS publisher on subjects.OverridesApplied,
+// and the FSM Machine (for Pin/ReleasePin). No new RBAC: the existing
+// pods/owner get,list cover the poll (no watch, BI-1). Returns the controller,
+// a closer to defer after Run returns, and any construction error.
+func wireOverrideController(cfg *config.Config, cs kubernetes.Interface, nc *natsclient.Client, machine *fsm.Machine, metricsReg *metrics.Registry, log *slog.Logger) (*override.Controller, func(), error) {
+	if cs == nil {
+		var err error
+		cs, err = kubeClientFactory(log)
+		if err != nil {
+			return nil, func() {}, fmt.Errorf("kube client: %w", err)
+		}
+	}
+
+	// NFR8: Redis AUTH is mandatory when the override controller is enabled.
+	// TrimRight guards the trailing-newline secretKeyRef pitfall (see
+	// wireBaselineEngine / wireFSMPersistence).
+	pwd := strings.TrimRight(os.Getenv("REDIS_PASSWORD"), "\r\n")
+	if pwd == "" {
+		return nil, func() {}, fmt.Errorf("NFR8: REDIS_PASSWORD env var is required when response.override.enabled=true (set --set secrets.redisPassword or wire a secretKeyRef)")
+	}
+	rcfg := redisclient.DefaultConfig()
+	rcfg.Addr = cfg.Detection.FSM.RedisAddrOrDefault()
+	rcfg.Password = pwd
+	rc, err := redisclient.NewClient(rcfg)
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("aggregator: override redis: %w", err)
+	}
+	closer := func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if cerr := rc.Close(closeCtx); cerr != nil {
+			log.Warn("aggregator: override redis close", "err", cerr)
+		}
+	}
+
+	store, err := override.NewStore(rc)
+	if err != nil {
+		closer()
+		return nil, func() {}, fmt.Errorf("aggregator: override store: %w", err)
+	}
+	publisher, err := override.NewNATSPublisher(nc)
+	if err != nil {
+		closer()
+		return nil, func() {}, fmt.Errorf("aggregator: override publisher: %w", err)
+	}
+	ovr := cfg.Response.Override
+	ctrl, err := override.New(override.Config{
+		PollInterval:       time.Duration(ovr.PollIntervalSecondsOrDefault()) * time.Second,
+		DefaultTTL:         time.Duration(ovr.DefaultTTLSecondsOrDefault()) * time.Second,
+		ExcludedNamespaces: cfg.Response.ExcludedNamespaces,
+	}, cs, store, machine, publisher, metricsReg, log)
+	if err != nil {
+		closer()
+		return nil, func() {}, fmt.Errorf("aggregator: override controller: %w", err)
+	}
+	return ctrl, closer, nil
 }
 
 // fsmConsumerMaxDeliver caps JetStream's per-message redelivery for the
