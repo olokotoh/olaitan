@@ -143,6 +143,12 @@ func (m *Manager) registerMetrics(r *metrics.Registry) error {
 		return err
 	}
 	m.applyTotal = cv
+	// Pre-initialise every known result label to 0 so alert PromQL has a
+	// stable zero series from process startup, rather than a label series that
+	// only materialises on first occurrence.
+	for _, result := range []string{"applied", "noop", "error", "skipped", "dropped", "gc_deleted"} {
+		cv.WithLabelValues(result).Add(0)
+	}
 	return nil
 }
 
@@ -209,6 +215,20 @@ func (m *Manager) handle(ctx context.Context, st schema.StateTransition) {
 			m.count("skipped")
 			return
 		}
+		if isNonEnforceable(err) {
+			// Non-transient, non-enforceable outcomes: an unsupported owner
+			// kind (including CronJob, which has no spec.selector), an
+			// unlabelled orphan pod, or an owner that resolves to an empty
+			// selector (which would block the whole namespace). None of these
+			// are failures to enforce a policy we could have applied; count
+			// them as skipped and log at debug, not error level.
+			m.log.Debug("netpol: workload not enforceable; skipping apply",
+				"workload_id", st.WorkloadID, "owner_kind", ref.ownerKind, "err", err)
+			m.count("skipped")
+			return
+		}
+		// A genuine transient API error (timeout, 5xx, conflict): count as
+		// error so the alert fires and the FSM re-emit retries.
 		m.log.Warn("netpol: cannot resolve pod selector; skipping apply",
 			"workload_id", st.WorkloadID, "owner_kind", ref.ownerKind, "err", err)
 		m.count("error")
@@ -217,13 +237,15 @@ func (m *Manager) handle(ctx context.Context, st schema.StateTransition) {
 
 	np := m.buildPolicy(ref, sel, st)
 	result, err := m.apply(ctx, np)
-	if m.applySeconds != nil && !st.Timestamp.IsZero() {
-		m.applySeconds.Observe(m.now().Sub(st.Timestamp).Seconds())
-	}
 	if err != nil {
 		m.log.Warn("netpol: apply failed", "workload_id", st.WorkloadID, "policy", np.Name, "err", err)
 		m.count("error")
 		return
+	}
+	// NFR6 budget: record latency only on a successful apply/noop, never on
+	// the error path, so failed-apply durations do not skew the histogram.
+	if m.applySeconds != nil && !st.Timestamp.IsZero() {
+		m.applySeconds.Observe(m.now().Sub(st.Timestamp).Seconds())
 	}
 	m.count(result)
 	m.log.Info("netpol: RESTRICTED policy applied",
@@ -321,6 +343,12 @@ func (m *Manager) reconcileGC(ctx context.Context) {
 	}
 	for i := range list.Items {
 		np := &list.Items[i]
+		// Apply/GC symmetry: handle skips excluded namespaces before applying,
+		// so GC must not touch policies that live in one (e.g. a hand-managed
+		// policy in kube-system that happens to carry our managed-by label).
+		if _, skip := m.excluded[np.Namespace]; skip {
+			continue
+		}
 		wid := np.Annotations[AnnWorkloadID]
 		if wid == "" {
 			continue

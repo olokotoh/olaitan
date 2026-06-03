@@ -208,6 +208,32 @@ func TestBuildPolicy_LabelsAnnotationsAndEgress(t *testing.T) {
 	}
 }
 
+func TestBuildPolicy_OmitsEmptyPackageIDAnnotation(t *testing.T) {
+	m := newTestManager(t, Config{ClusterCIDRs: []string{"10.96.0.0/12"}})
+	ref := workloadRef{namespace: "ns", ownerKind: "Deployment", ownerName: "web"}
+	sel := &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}}
+
+	// Present case: a non-empty package id is carried.
+	withPkg := m.buildPolicy(ref, sel, restrictedTransition("ns/Deployment/web", "pkg-7"))
+	if withPkg.Annotations[AnnPackageID] != "pkg-7" {
+		t.Fatalf("package-id annotation = %q, want pkg-7", withPkg.Annotations[AnnPackageID])
+	}
+
+	// Absent case: an empty package id must omit the annotation key entirely
+	// (mirrors the schema omitempty intent).
+	noPkg := m.buildPolicy(ref, sel, restrictedTransition("ns/Deployment/web", ""))
+	if _, ok := noPkg.Annotations[AnnPackageID]; ok {
+		t.Fatalf("package-id annotation present for empty PackageID: %v", noPkg.Annotations)
+	}
+	// The other annotations must still be set.
+	if noPkg.Annotations[AnnFSMState] != string(schema.StateRestricted) {
+		t.Fatalf("fsm-state annotation missing when package id empty")
+	}
+	if noPkg.Annotations[AnnWorkloadID] != "ns/Deployment/web" {
+		t.Fatalf("workload-id annotation missing when package id empty")
+	}
+}
+
 func TestApply_CreateThenIdempotentReapply(t *testing.T) {
 	sel := map[string]string{"app": "web"}
 	m := newTestManager(t, Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, deployment("ns", "web", sel))
@@ -343,6 +369,21 @@ func m_buildManagedPolicy(ns, name, workloadID string) *networkingv1.NetworkPoli
 		Spec: networkingv1.NetworkPolicySpec{
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
 		},
+	}
+}
+
+func TestReconcileGC_SkipsExcludedNamespace(t *testing.T) {
+	// A managed orphan policy in an excluded namespace must not be GC'd, for
+	// apply/GC symmetry: handle never applies in an excluded namespace, so GC
+	// must not delete there either.
+	orphan := m_buildManagedPolicy("kube-system", "orphan", "kube-system/Deployment/ghost")
+	m := newTestManager(t, Config{ClusterCIDRs: []string{"10.96.0.0/12"}, ExcludedNamespaces: []string{"kube-system"}}, orphan)
+	ctx := context.Background()
+
+	m.reconcileGC(ctx)
+
+	if _, err := m.cs.NetworkingV1().NetworkPolicies("kube-system").Get(ctx, "orphan", metav1.GetOptions{}); err != nil {
+		t.Fatalf("orphan policy in excluded namespace was deleted: %v", err)
 	}
 }
 

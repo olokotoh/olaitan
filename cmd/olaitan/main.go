@@ -821,7 +821,7 @@ func wireNetworkPolicyManager(cfg *config.Config, cs kubernetes.Interface, log *
 	}
 	np := cfg.Response.NetworkPolicy
 	return netpol.New(netpol.Config{
-		ClusterCIDRs:       np.ClusterCIDRs,
+		ClusterCIDRs:       np.ClusterCIDRsOrDefault(),
 		ExtraAllowedCIDRs:  np.ExtraAllowedCIDRs,
 		ExcludedNamespaces: cfg.Response.ExcludedNamespaces,
 		ReconcileInterval:  time.Duration(np.ReconcileIntervalSecondsOrDefault()) * time.Second,

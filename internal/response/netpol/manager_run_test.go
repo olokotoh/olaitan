@@ -6,6 +6,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -104,6 +105,86 @@ func TestHandle_MissingWorkloadSkipped(t *testing.T) {
 	m.handle(context.Background(), restrictedTransition("ns/Deployment/ghost", "pkg-1"))
 	if got := testutil.ToFloat64(m.applyTotal.WithLabelValues("skipped")); got != 1 {
 		t.Fatalf("apply_total{skipped} = %v, want 1", got)
+	}
+}
+
+func TestHandle_EmptySelectorSkippedNotApplied(t *testing.T) {
+	// A Deployment with a nil selector resolves to an empty podSelector, which
+	// would block ALL pods in the namespace. The manager must skip it (no
+	// apply) and count "skipped", never "error".
+	reg := metricsRegistryForTest(t)
+	owner := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "noselector"},
+		Spec:       appsv1.DeploymentSpec{Selector: nil},
+	}
+	cs := fake.NewSimpleClientset(runtime.Object(owner))
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	st := restrictedTransition("ns/Deployment/noselector", "pkg-1")
+	m.handle(context.Background(), st)
+
+	if got := testutil.ToFloat64(m.applyTotal.WithLabelValues("skipped")); got != 1 {
+		t.Fatalf("apply_total{skipped} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.applyTotal.WithLabelValues("error")); got != 0 {
+		t.Fatalf("apply_total{error} = %v, want 0 (empty selector is not an error)", got)
+	}
+	if _, gerr := m.cs.NetworkingV1().NetworkPolicies("ns").Get(context.Background(), PolicyName(st.WorkloadID), metav1.GetOptions{}); gerr == nil {
+		t.Fatal("a policy was created for an empty selector; want none")
+	}
+}
+
+func TestHandle_UnsupportedKindSkippedNotError(t *testing.T) {
+	// A CronJob owner has no spec.selector; resolveSelector falls through to
+	// the unsupported-kind branch. The manager must classify it as a skip.
+	reg := metricsRegistryForTest(t)
+	cs := fake.NewSimpleClientset()
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	m.handle(context.Background(), restrictedTransition("ns/CronJob/nightly", "pkg-1"))
+
+	if got := testutil.ToFloat64(m.applyTotal.WithLabelValues("skipped")); got != 1 {
+		t.Fatalf("apply_total{skipped} = %v, want 1 (CronJob is an unsupported, skipped kind)", got)
+	}
+	if got := testutil.ToFloat64(m.applyTotal.WithLabelValues("error")); got != 0 {
+		t.Fatalf("apply_total{error} = %v, want 0", got)
+	}
+}
+
+func TestHandle_UnlabelledOrphanPodSkippedNotError(t *testing.T) {
+	// An unlabelled orphan pod cannot produce a podSelector; skip, not error.
+	reg := metricsRegistryForTest(t)
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "lonely"}}
+	cs := fake.NewSimpleClientset(runtime.Object(pod))
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	m.handle(context.Background(), restrictedTransition("ns/Pod/lonely", "pkg-1"))
+
+	if got := testutil.ToFloat64(m.applyTotal.WithLabelValues("skipped")); got != 1 {
+		t.Fatalf("apply_total{skipped} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.applyTotal.WithLabelValues("error")); got != 0 {
+		t.Fatalf("apply_total{error} = %v, want 0", got)
+	}
+}
+
+func TestRegisterMetrics_PreInitialisesResultSeries(t *testing.T) {
+	reg := metricsRegistryForTest(t)
+	cs := fake.NewSimpleClientset()
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	for _, result := range []string{"applied", "noop", "error", "skipped", "dropped", "gc_deleted"} {
+		if got := testutil.ToFloat64(m.applyTotal.WithLabelValues(result)); got != 0 {
+			t.Fatalf("apply_total{%s} = %v, want a pre-initialised 0 series", result, got)
+		}
 	}
 }
 

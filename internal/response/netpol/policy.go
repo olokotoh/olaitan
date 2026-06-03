@@ -94,16 +94,21 @@ func (m *Manager) buildPolicy(ref workloadRef, sel *metav1.LabelSelector, st sch
 	if sel != nil {
 		podSelector = *sel
 	}
+	annotations := map[string]string{
+		AnnFSMState:   string(schema.StateRestricted),
+		AnnWorkloadID: st.WorkloadID,
+	}
+	// Mirror the schema's omitempty intent: only carry the package-id
+	// annotation when a triggering package id is present.
+	if st.PackageID != "" {
+		annotations[AnnPackageID] = st.PackageID
+	}
 	return &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      PolicyName(st.WorkloadID),
-			Namespace: ref.namespace,
-			Labels:    managedLabels(),
-			Annotations: map[string]string{
-				AnnFSMState:   string(schema.StateRestricted),
-				AnnPackageID:  st.PackageID,
-				AnnWorkloadID: st.WorkloadID,
-			},
+			Name:        PolicyName(st.WorkloadID),
+			Namespace:   ref.namespace,
+			Labels:      managedLabels(),
+			Annotations: annotations,
 		},
 		Spec: networkingv1.NetworkPolicySpec{
 			PodSelector: podSelector,
