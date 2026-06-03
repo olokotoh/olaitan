@@ -334,12 +334,12 @@ func TestHandle_SkipsExcludedNamespace(t *testing.T) {
 
 func TestPublish_FiltersAndEnqueues(t *testing.T) {
 	m := newTestManager(t, Config{ClusterCIDRs: []string{"10.96.0.0/12"}})
-	// Non-enforced transitions are ignored (not enqueued).
-	for _, to := range []schema.PodSecurityState{schema.StateClean, schema.StateSuspicious, schema.StatePreservedKilled} {
-		m.Publish(schema.StateTransition{ToState: to, WorkloadID: "ns/Deployment/web"})
-	}
+	// Only PRESERVED_KILLED has no managed-policy desired set and is dropped
+	// (Story 2.6, BI-1): CLEAN and SUSPICIOUS are now removal states and ARE
+	// enqueued (see TestPublish_EnqueuesRemovalStates).
+	m.Publish(schema.StateTransition{ToState: schema.StatePreservedKilled, WorkloadID: "ns/Deployment/web"})
 	if len(m.queue) != 0 {
-		t.Fatalf("non-enforced transition was enqueued: queue len %d", len(m.queue))
+		t.Fatalf("PRESERVED_KILLED transition was enqueued: queue len %d", len(m.queue))
 	}
 	// A RESTRICTED transition is enqueued.
 	m.Publish(restrictedTransition("ns/Deployment/web", "pkg-1"))
@@ -873,5 +873,509 @@ func TestRegisterMetrics_NoError(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	if _, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, reg, discardLog()); err != nil {
 		t.Fatalf("New with metrics registry: %v", err)
+	}
+}
+
+// ---- Story 2.6: de-escalation policy removal (FR35) ----
+
+// suspiciousTransition / cleanTransition mirror restrictedTransition /
+// quarantinedTransition for the Story 2.6 removal states.
+func suspiciousTransition(workloadID, packageID string) schema.StateTransition {
+	return schema.StateTransition{
+		Timestamp:  time.Now(),
+		FromState:  schema.StateRestricted,
+		ToState:    schema.StateSuspicious,
+		WorkloadID: workloadID,
+		PackageID:  packageID,
+	}
+}
+
+func cleanTransition(workloadID, packageID string) schema.StateTransition {
+	return schema.StateTransition{
+		Timestamp:  time.Now(),
+		FromState:  schema.StateSuspicious,
+		ToState:    schema.StateClean,
+		WorkloadID: workloadID,
+		PackageID:  packageID,
+	}
+}
+
+// fakeOracle is an injectable netpol.StateOracle for the FSM-target-aware
+// reconcile tests. states maps a workload id to its current FSM target; an
+// absent key reports not-ok (the FSM has no opinion).
+type fakeOracle struct {
+	states map[string]schema.PodSecurityState
+}
+
+func (f fakeOracle) CurrentState(workloadID string) (schema.PodSecurityState, bool) {
+	s, ok := f.states[workloadID]
+	return s, ok
+}
+
+func TestRemovalState_Predicate(t *testing.T) {
+	removal := map[schema.PodSecurityState]bool{
+		schema.StateSuspicious: true,
+		schema.StateClean:      true,
+	}
+	for _, s := range []schema.PodSecurityState{
+		schema.StateClean, schema.StateSuspicious, schema.StateRestricted,
+		schema.StateQuarantined, schema.StatePreservedKilled,
+	} {
+		if got := removalState(s); got != removal[s] {
+			t.Fatalf("removalState(%q) = %v, want %v", s, got, removal[s])
+		}
+	}
+}
+
+func TestPublish_EnqueuesRemovalStates(t *testing.T) {
+	m := newTestManager(t, Config{ClusterCIDRs: []string{"10.96.0.0/12"}})
+	// SUSPICIOUS and CLEAN are now enqueued (Story 2.6, BI-1).
+	m.Publish(suspiciousTransition("ns/Deployment/web", "pkg-1"))
+	m.Publish(cleanTransition("ns/Deployment/web", "pkg-2"))
+	if len(m.queue) != 2 {
+		t.Fatalf("removal transitions not enqueued: queue len %d, want 2", len(m.queue))
+	}
+	// PRESERVED_KILLED is still dropped (neither enforced nor removal).
+	m.Publish(schema.StateTransition{ToState: schema.StatePreservedKilled, WorkloadID: "ns/Deployment/web"})
+	if len(m.queue) != 2 {
+		t.Fatalf("PRESERVED_KILLED was enqueued: queue len %d, want 2", len(m.queue))
+	}
+}
+
+func TestHandle_RestrictedDeletesSupersededQuarantine(t *testing.T) {
+	// QUARANTINED->RESTRICTED de-escalation (AC1): the restricted policy is
+	// applied AND the pre-existing quarantine deny-all is removed, in causal
+	// order (restricted present before quarantine absent).
+	sel := map[string]string{"app": "web"}
+	workloadID := "ns/Deployment/web"
+	quarantine := m_buildManagedQuarantinePolicy("ns", policyNameFor(schema.StateQuarantined, workloadID), workloadID)
+	m := newTestManager(t, Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, deployment("ns", "web", sel), quarantine)
+	ctx := context.Background()
+	restrictedName := policyNameFor(schema.StateRestricted, workloadID)
+	quarantineName := policyNameFor(schema.StateQuarantined, workloadID)
+
+	m.handle(ctx, restrictedTransition(workloadID, "pkg-1"))
+
+	// Restricted present first ...
+	r, err := m.cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, restrictedName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("restricted policy not applied on de-escalation: %v", err)
+	}
+	if r.Annotations[AnnFSMState] != string(schema.StateRestricted) {
+		t.Fatalf("restricted fsm-state annotation = %q, want RESTRICTED", r.Annotations[AnnFSMState])
+	}
+	if len(r.Spec.PolicyTypes) != 1 || r.Spec.PolicyTypes[0] != networkingv1.PolicyTypeEgress {
+		t.Fatalf("restricted policyTypes = %v, want [Egress]", r.Spec.PolicyTypes)
+	}
+	// ... then the superseded quarantine deny-all is gone.
+	if _, err := m.cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, quarantineName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("superseded quarantine policy not removed on de-escalation: err=%v", err)
+	}
+}
+
+func TestHandle_RestrictedWithoutPriorQuarantineIsNoOpDelete(t *testing.T) {
+	sel := map[string]string{"app": "web"}
+	m := newTestManager(t, Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, deployment("ns", "web", sel))
+	ctx := context.Background()
+	workloadID := "ns/Deployment/web"
+
+	// RESTRICTED with NO prior quarantine policy: still applies restricted, and
+	// the absent-quarantine delete is a no-op.
+	m.handle(ctx, restrictedTransition(workloadID, "pkg-1"))
+
+	restrictedName := policyNameFor(schema.StateRestricted, workloadID)
+	if _, err := m.cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, restrictedName, metav1.GetOptions{}); err != nil {
+		t.Fatalf("restricted policy not applied: %v", err)
+	}
+	quarantineName := policyNameFor(schema.StateQuarantined, workloadID)
+	if _, err := m.cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, quarantineName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("unexpected quarantine policy present: err=%v", err)
+	}
+}
+
+func TestDeleteSupersededQuarantine_NoOpWhenAbsent(t *testing.T) {
+	m := newTestManager(t, Config{ClusterCIDRs: []string{"10.96.0.0/12"}})
+	ctx := context.Background()
+	ref := workloadRef{namespace: "ns", ownerKind: "Deployment", ownerName: "web"}
+	// No quarantine policy exists; the delete must be a silent no-op.
+	m.deleteSupersededQuarantine(ctx, ref, "ns/Deployment/web")
+}
+
+func TestHandle_SuspiciousRemovesBothPolicies(t *testing.T) {
+	// SUSPICIOUS removal (AC2): both managed policies for the workload are
+	// removed, counted "removed".
+	workloadID := "ns/Deployment/web"
+	restricted := m_buildManagedPolicy("ns", policyNameFor(schema.StateRestricted, workloadID), workloadID)
+	quarantine := m_buildManagedQuarantinePolicy("ns", policyNameFor(schema.StateQuarantined, workloadID), workloadID)
+	reg := metricsRegistryForTest(t)
+	cs := fake.NewSimpleClientset(runtime.Object(restricted), runtime.Object(quarantine))
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+
+	m.handle(ctx, suspiciousTransition(workloadID, "pkg-1"))
+
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, restricted.Name, metav1.GetOptions{}); !apierrors.IsNotFound(gerr) {
+		t.Fatalf("restricted policy not removed on SUSPICIOUS: err=%v", gerr)
+	}
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, quarantine.Name, metav1.GetOptions{}); !apierrors.IsNotFound(gerr) {
+		t.Fatalf("quarantine policy not removed on SUSPICIOUS: err=%v", gerr)
+	}
+	if got := testutilToFloat(t, m, "removed"); got != 1 {
+		t.Fatalf("apply_total{removed} = %v, want 1", got)
+	}
+	if got := testutilToFloat(t, m, "error"); got != 0 {
+		t.Fatalf("apply_total{error} = %v, want 0", got)
+	}
+}
+
+func TestHandle_CleanRemovesBothAndVerifiesAbsence(t *testing.T) {
+	// CLEAN removal (AC3): both managed policies removed, absence verified, no
+	// resolveSelector needed (no owner created), counted "removed".
+	workloadID := "ns/Deployment/web"
+	restricted := m_buildManagedPolicy("ns", policyNameFor(schema.StateRestricted, workloadID), workloadID)
+	quarantine := m_buildManagedQuarantinePolicy("ns", policyNameFor(schema.StateQuarantined, workloadID), workloadID)
+	reg := metricsRegistryForTest(t)
+	cs := fake.NewSimpleClientset(runtime.Object(restricted), runtime.Object(quarantine))
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+
+	m.handle(ctx, cleanTransition(workloadID, "pkg-1"))
+
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, restricted.Name, metav1.GetOptions{}); !apierrors.IsNotFound(gerr) {
+		t.Fatalf("restricted policy not removed on CLEAN: err=%v", gerr)
+	}
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, quarantine.Name, metav1.GetOptions{}); !apierrors.IsNotFound(gerr) {
+		t.Fatalf("quarantine policy not removed on CLEAN: err=%v", gerr)
+	}
+	if got := testutilToFloat(t, m, "removed"); got != 1 {
+		t.Fatalf("apply_total{removed} = %v, want 1", got)
+	}
+	if got := testutilToFloat(t, m, "error"); got != 0 {
+		t.Fatalf("apply_total{error} = %v, want 0", got)
+	}
+}
+
+func TestHandle_CleanWithNothingPresentIsCleanNoOp(t *testing.T) {
+	// A CLEAN de-escalation for a workload that was never isolated: both deletes
+	// are NotFound no-ops, both verification reads confirm absence, the result is
+	// a successful "removed", NEVER "error" (BI-5, Open Assumption 3).
+	reg := metricsRegistryForTest(t)
+	cs := fake.NewSimpleClientset()
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+	workloadID := "ns/Deployment/web"
+
+	m.handle(ctx, cleanTransition(workloadID, "pkg-1"))
+
+	if got := testutilToFloat(t, m, "removed"); got != 1 {
+		t.Fatalf("apply_total{removed} = %v, want 1 for a no-op CLEAN", got)
+	}
+	if got := testutilToFloat(t, m, "error"); got != 0 {
+		t.Fatalf("apply_total{error} = %v, want 0 for a no-op CLEAN", got)
+	}
+	// No policy was created.
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, policyNameFor(schema.StateRestricted, workloadID), metav1.GetOptions{}); !apierrors.IsNotFound(gerr) {
+		t.Fatalf("unexpected restricted policy present after no-op CLEAN: err=%v", gerr)
+	}
+}
+
+func TestHandle_RemovalSkipsExcludedNamespace(t *testing.T) {
+	// A SUSPICIOUS/CLEAN removal into an excluded namespace is skipped (mirrors
+	// the apply path); a pre-existing managed policy there is NOT touched by the
+	// inline path (the reconcile/orphan-GC remains the safety net).
+	workloadID := "kube-system/Deployment/x"
+	restricted := m_buildManagedPolicy("kube-system", policyNameFor(schema.StateRestricted, workloadID), workloadID)
+	reg := metricsRegistryForTest(t)
+	cs := fake.NewSimpleClientset(runtime.Object(restricted))
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}, ExcludedNamespaces: []string{"kube-system"}}, cs, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+
+	m.handle(ctx, suspiciousTransition(workloadID, "pkg-1"))
+
+	if got := testutilToFloat(t, m, "skipped"); got != 1 {
+		t.Fatalf("apply_total{skipped} = %v, want 1 for excluded-namespace removal", got)
+	}
+	if got := testutilToFloat(t, m, "removed"); got != 0 {
+		t.Fatalf("apply_total{removed} = %v, want 0 for a skipped removal", got)
+	}
+	// The pre-existing policy survives (inline path did not touch it).
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("kube-system").Get(ctx, restricted.Name, metav1.GetOptions{}); gerr != nil {
+		t.Fatalf("policy in excluded namespace was deleted by a skipped removal: %v", gerr)
+	}
+}
+
+func TestHandle_RemovalMalformedWorkloadIDIsError(t *testing.T) {
+	reg := metricsRegistryForTest(t)
+	cs := fake.NewSimpleClientset()
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// Malformed id (2 segments): parseWorkloadID fails on the removal path too,
+	// counted "error" (mirrors the apply path).
+	m.handle(context.Background(), cleanTransition("ns/web", "pkg-1"))
+	if got := testutilToFloat(t, m, "error"); got != 1 {
+		t.Fatalf("apply_total{error} = %v, want 1 for a malformed-id removal", got)
+	}
+}
+
+func TestHandle_CleanReDeletesStraySurvivor(t *testing.T) {
+	// CLEAN verification re-delete branch (BI-5): a delete returns success but a
+	// follow-up Get still finds the policy (a stale object). The manager
+	// re-deletes once; the second delete then succeeds, so the result is
+	// "removed", not "error". We simulate "delete reports success but object
+	// lingers" by intercepting only the FIRST delete with a no-op success
+	// reactor that leaves the object in place.
+	workloadID := "ns/Deployment/web"
+	restricted := m_buildManagedPolicy("ns", policyNameFor(schema.StateRestricted, workloadID), workloadID)
+	reg := metricsRegistryForTest(t)
+	cs := fake.NewSimpleClientset(runtime.Object(restricted))
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+	restrictedName := restricted.Name
+
+	var deleteCalls int
+	cs.PrependReactor("delete", "networkpolicies", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		da := action.(k8stesting.DeleteAction)
+		if da.GetName() == restrictedName {
+			deleteCalls++
+			if deleteCalls == 1 {
+				// Report success WITHOUT removing the object: simulate a delete
+				// that returned ok but did not take effect.
+				return true, nil, nil
+			}
+		}
+		// Subsequent calls fall through to the default tracker (real delete).
+		return false, nil, nil
+	})
+
+	m.handle(ctx, cleanTransition(workloadID, "pkg-1"))
+
+	// The stray survivor was re-deleted and is now gone.
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, restrictedName, metav1.GetOptions{}); !apierrors.IsNotFound(gerr) {
+		t.Fatalf("stray restricted policy not re-deleted on CLEAN: err=%v", gerr)
+	}
+	if deleteCalls < 2 {
+		t.Fatalf("expected a re-delete on the stray survivor; delete calls = %d", deleteCalls)
+	}
+	if got := testutilToFloat(t, m, "removed"); got != 1 {
+		t.Fatalf("apply_total{removed} = %v, want 1 after a successful re-delete", got)
+	}
+	if got := testutilToFloat(t, m, "error"); got != 0 {
+		t.Fatalf("apply_total{error} = %v, want 0 after a successful re-delete", got)
+	}
+}
+
+func TestReconcileGC_TargetRestrictedDeletesStaleQuarantine(t *testing.T) {
+	// FSM-target-aware reconcile (BI-2c): with the oracle reporting the workload
+	// as RESTRICTED, a co-existing QUARANTINED deny-all (the de-escalation
+	// residue of a failed inline delete) is removed, and the freshly-applied
+	// RESTRICTED policy SURVIVES (the backstop does not re-delete it).
+	sel := map[string]string{"app": "web"}
+	workloadID := "ns/Deployment/web"
+	restricted := m_buildManagedPolicy("ns", policyNameFor(schema.StateRestricted, workloadID), workloadID)
+	quarantine := m_buildManagedQuarantinePolicy("ns", policyNameFor(schema.StateQuarantined, workloadID), workloadID)
+	reg := metricsRegistryForTest(t)
+	cs := fake.NewSimpleClientset(
+		runtime.Object(deployment("ns", "web", sel)),
+		runtime.Object(restricted),
+		runtime.Object(quarantine),
+	)
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	m.SetStateOracle(fakeOracle{states: map[string]schema.PodSecurityState{workloadID: schema.StateRestricted}})
+	ctx := context.Background()
+
+	m.reconcileGC(ctx)
+
+	// The stale QUARANTINED deny-all is removed.
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, quarantine.Name, metav1.GetOptions{}); !apierrors.IsNotFound(gerr) {
+		t.Fatalf("stale quarantine policy not removed for RESTRICTED target: err=%v", gerr)
+	}
+	// The RESTRICTED policy survives (NOT re-deleted).
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, restricted.Name, metav1.GetOptions{}); gerr != nil {
+		t.Fatalf("RESTRICTED policy was wrongly re-deleted on de-escalation: %v", gerr)
+	}
+	if got := testutilToFloat(t, m, "removed"); got != 1 {
+		t.Fatalf("apply_total{removed} = %v, want 1", got)
+	}
+}
+
+func TestReconcileGC_TargetQuarantinedDeletesStaleRestricted(t *testing.T) {
+	// FSM-target-aware reconcile (BI-2c) Story 2.5 regression: with the oracle
+	// reporting QUARANTINED, a lingering RESTRICTED policy (escalation residue)
+	// is removed and the QUARANTINED deny-all survives.
+	sel := map[string]string{"app": "web"}
+	workloadID := "ns/Deployment/web"
+	restricted := m_buildManagedPolicy("ns", policyNameFor(schema.StateRestricted, workloadID), workloadID)
+	quarantine := m_buildManagedQuarantinePolicy("ns", policyNameFor(schema.StateQuarantined, workloadID), workloadID)
+	reg := metricsRegistryForTest(t)
+	cs := fake.NewSimpleClientset(
+		runtime.Object(deployment("ns", "web", sel)),
+		runtime.Object(restricted),
+		runtime.Object(quarantine),
+	)
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	m.SetStateOracle(fakeOracle{states: map[string]schema.PodSecurityState{workloadID: schema.StateQuarantined}})
+	ctx := context.Background()
+
+	m.reconcileGC(ctx)
+
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, restricted.Name, metav1.GetOptions{}); !apierrors.IsNotFound(gerr) {
+		t.Fatalf("escalation-residue restricted policy not removed for QUARANTINED target: err=%v", gerr)
+	}
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, quarantine.Name, metav1.GetOptions{}); gerr != nil {
+		t.Fatalf("quarantine policy wrongly removed for QUARANTINED target: %v", gerr)
+	}
+	if got := testutilToFloat(t, m, "superseded"); got != 1 {
+		t.Fatalf("apply_total{superseded} = %v, want 1", got)
+	}
+}
+
+func TestReconcileGC_TargetSuspiciousDeletesBothWhenOwnerExists(t *testing.T) {
+	// FSM-target-aware reconcile (BI-2c/BI-6): with the oracle reporting
+	// SUSPICIOUS and the owner still present, BOTH managed policies are removed
+	// (a failed inline removal self-heals).
+	sel := map[string]string{"app": "web"}
+	workloadID := "ns/Deployment/web"
+	restricted := m_buildManagedPolicy("ns", policyNameFor(schema.StateRestricted, workloadID), workloadID)
+	quarantine := m_buildManagedQuarantinePolicy("ns", policyNameFor(schema.StateQuarantined, workloadID), workloadID)
+	reg := metricsRegistryForTest(t)
+	cs := fake.NewSimpleClientset(
+		runtime.Object(deployment("ns", "web", sel)),
+		runtime.Object(restricted),
+		runtime.Object(quarantine),
+	)
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	m.SetStateOracle(fakeOracle{states: map[string]schema.PodSecurityState{workloadID: schema.StateSuspicious}})
+	ctx := context.Background()
+
+	m.reconcileGC(ctx)
+
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, restricted.Name, metav1.GetOptions{}); !apierrors.IsNotFound(gerr) {
+		t.Fatalf("restricted policy not removed for SUSPICIOUS target: err=%v", gerr)
+	}
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, quarantine.Name, metav1.GetOptions{}); !apierrors.IsNotFound(gerr) {
+		t.Fatalf("quarantine policy not removed for SUSPICIOUS target: err=%v", gerr)
+	}
+	if got := testutilToFloat(t, m, "removed"); got != 2 {
+		t.Fatalf("apply_total{removed} = %v, want 2 (both policies)", got)
+	}
+}
+
+func TestReconcileGC_NotOkLeavesPolicyWhenOwnerExists(t *testing.T) {
+	// BI-2c not-ok rule: the FSM has NO entry for the workload (oracle not-ok)
+	// but a managed policy lingers and the owner still EXISTS. The desired-state
+	// backstop must NOT delete it (avoid stripping protection from a workload the
+	// FSM merely lost track of, e.g. after an unrestored restart); the orphan-GC
+	// pass leaves it too because the owner exists. The policy SURVIVES.
+	sel := map[string]string{"app": "web"}
+	workloadID := "ns/Deployment/web"
+	restricted := m_buildManagedPolicy("ns", policyNameFor(schema.StateRestricted, workloadID), workloadID)
+	reg := metricsRegistryForTest(t)
+	cs := fake.NewSimpleClientset(
+		runtime.Object(deployment("ns", "web", sel)),
+		runtime.Object(restricted),
+	)
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// Oracle knows nothing about this workload (empty map -> not-ok).
+	m.SetStateOracle(fakeOracle{states: map[string]schema.PodSecurityState{}})
+	ctx := context.Background()
+
+	m.reconcileGC(ctx)
+
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, restricted.Name, metav1.GetOptions{}); gerr != nil {
+		t.Fatalf("policy for a not-ok workload with a live owner was wrongly deleted: %v", gerr)
+	}
+	if got := testutilToFloat(t, m, "removed"); got != 0 {
+		t.Fatalf("apply_total{removed} = %v, want 0 for a not-ok live workload", got)
+	}
+	if got := testutilToFloat(t, m, "superseded"); got != 0 {
+		t.Fatalf("apply_total{superseded} = %v, want 0 for a not-ok live workload", got)
+	}
+}
+
+func TestReconcileGC_NotOkOrphanStillCollected(t *testing.T) {
+	// BI-2c not-ok rule + orphan-GC authority: the FSM has no entry (not-ok) AND
+	// the owner is gone. The orphan-GC pass (the sole authority for not-ok) reaps
+	// the policy as gc_deleted.
+	workloadID := "ns/Deployment/ghost"
+	orphan := m_buildManagedPolicy("ns", policyNameFor(schema.StateRestricted, workloadID), workloadID)
+	reg := metricsRegistryForTest(t)
+	cs := fake.NewSimpleClientset(runtime.Object(orphan)) // no Deployment -> owner gone
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	m.SetStateOracle(fakeOracle{states: map[string]schema.PodSecurityState{}})
+	ctx := context.Background()
+
+	m.reconcileGC(ctx)
+
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, orphan.Name, metav1.GetOptions{}); !apierrors.IsNotFound(gerr) {
+		t.Fatalf("not-ok orphan policy not collected by orphan GC: err=%v", gerr)
+	}
+	if got := testutilToFloat(t, m, "gc_deleted"); got != 1 {
+		t.Fatalf("apply_total{gc_deleted} = %v, want 1", got)
+	}
+}
+
+func TestReconcileGC_NilOraclePreservesShippedBehaviour(t *testing.T) {
+	// With oracle == nil, the reconcile retains the shipped Story 2.5
+	// "quarantine object wins" supersession: a RESTRICTED policy co-existing with
+	// a QUARANTINED policy object is deleted as superseded, regardless of FSM.
+	sel := map[string]string{"app": "web"}
+	workloadID := "ns/Deployment/web"
+	restricted := m_buildManagedPolicy("ns", policyNameFor(schema.StateRestricted, workloadID), workloadID)
+	quarantine := m_buildManagedQuarantinePolicy("ns", policyNameFor(schema.StateQuarantined, workloadID), workloadID)
+	reg := metricsRegistryForTest(t)
+	cs := fake.NewSimpleClientset(
+		runtime.Object(deployment("ns", "web", sel)),
+		runtime.Object(restricted),
+		runtime.Object(quarantine),
+	)
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// No oracle set: nil-oracle fallback path.
+	ctx := context.Background()
+
+	m.reconcileGC(ctx)
+
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, restricted.Name, metav1.GetOptions{}); !apierrors.IsNotFound(gerr) {
+		t.Fatalf("nil-oracle: superseded restricted not removed: err=%v", gerr)
+	}
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, quarantine.Name, metav1.GetOptions{}); gerr != nil {
+		t.Fatalf("nil-oracle: quarantine wrongly removed: %v", gerr)
+	}
+	if got := testutilToFloat(t, m, "superseded"); got != 1 {
+		t.Fatalf("nil-oracle apply_total{superseded} = %v, want 1", got)
 	}
 }

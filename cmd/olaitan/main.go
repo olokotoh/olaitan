@@ -646,14 +646,17 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	// It acquires its own clientset when posture (which builds cs above) is
 	// disabled.
 	netpolEnabled := cfg.Response.NetworkPolicy.EnabledOrDefault()
+	var npMgr *netpol.Manager
 	if netpolEnabled {
-		npMgr, nerr := wireNetworkPolicyManager(cfg, cs, log, metricsReg)
+		var nerr error
+		npMgr, nerr = wireNetworkPolicyManager(cfg, cs, log, metricsReg)
 		if nerr != nil {
 			closeNATS()
 			return fmt.Errorf("aggregator: netpol: %w", nerr)
 		}
 		sinks = append(sinks, npMgr)
-		g.Go(func() error { return npMgr.Run(ctx) })
+		// Run is launched below, AFTER SetStateOracle, so the reconcile
+		// goroutine never reads m.oracle concurrently with the setter write.
 	}
 	var fsmSink fsm.TransitionSink = fsm.NopSink{}
 	if len(sinks) > 0 {
@@ -663,6 +666,19 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	if fsmErr != nil {
 		closeNATS()
 		return fmt.Errorf("aggregator: fsm: %w", fsmErr)
+	}
+	// Story 2.6 (BI-2c): thread the FSM Machine into the NetworkPolicyManager as
+	// its StateOracle so the reconcile backstop is FSM-target-aware (it deletes a
+	// de-escalation residue without re-deleting the freshly-applied restricted
+	// policy). The Machine is constructed AFTER the manager (the manager is a sink
+	// fanned into this very Machine), so the oracle is installed here via a setter
+	// once both exist. *fsm.Machine satisfies netpol.StateOracle via CurrentState.
+	if npMgr != nil {
+		npMgr.SetStateOracle(stateMachine)
+		// Launch the worker only now that the oracle is installed. Starting the
+		// goroutine here establishes a happens-before edge for the SetStateOracle
+		// write above, so the reconcile loop never races on m.oracle.
+		g.Go(func() error { return npMgr.Run(ctx) })
 	}
 	if fsmStore != nil {
 		recovered, skipped, rerr := stateMachine.Restore(ctx, fsmStore)

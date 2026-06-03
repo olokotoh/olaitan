@@ -539,6 +539,25 @@ func (m *Machine) State(workloadID string) PodState {
 	return schema.StateClean
 }
 
+// CurrentState returns the current FSM state for workloadID together with a
+// flag reporting whether the workload is actually tracked. Unlike State, it
+// distinguishes "tracked and currently CLEAN" from "never seen": ok is false
+// only when the workload has no entry in the in-memory map. The Story 2.6
+// NetworkPolicyManager consumes this through its one-method netpol.StateOracle
+// seam so the reconcile backstop can converge each workload's managed policies
+// to the FSM's current desired-set membership (de-escalation residue removal,
+// BI-2c). The read is taken under the same RWMutex Evaluate mutates the map
+// with, so it observes a consistent snapshot; it is NOT a mutator (an unseen
+// workload is reported (StateClean, false) without being inserted).
+func (m *Machine) CurrentState(workloadID string) (PodState, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if ws, ok := m.states[workloadID]; ok {
+		return ws.current, true
+	}
+	return schema.StateClean, false
+}
+
 // Restore rehydrates the in-memory FSM map from durable Redis state on
 // controller startup (Story 2.3 AC2). It MUST run before the FSM consumer
 // begins so a recovered workload is never re-initialised to CLEAN by

@@ -46,6 +46,24 @@ const (
 // errNilClientset is returned by New when cs is nil.
 var errNilClientset = errors.New("netpol: nil clientset")
 
+// StateOracle is the one-method seam the reconcile backstop uses to learn a
+// workload's CURRENT FSM target so it can converge the workload's managed
+// NetworkPolicies to that target's desired-set membership (Story 2.6, BI-2c).
+// It is defined HERE (in netpol) rather than imported from internal/response/fsm
+// so the Manager depends on a structural one-method interface, not the whole
+// fsm.Machine: the package body stays Ring-clean and unit tests can inject a
+// fake oracle without constructing an FSM. *fsm.Machine satisfies it via its
+// exported CurrentState method, wired at the cmd/olaitan call site.
+//
+// CurrentState returns the workload's current state and ok=true when the FSM
+// is actively tracking the workload, or (StateClean, false) when the FSM has
+// no opinion (never-seen workload, or a workload not restored after an FSM
+// restart). A nil oracle falls back to the shipped Story 2.5 reconcile
+// behaviour (BI-2c), so the seam is optional.
+type StateOracle interface {
+	CurrentState(workloadID string) (schema.PodSecurityState, bool)
+}
+
 // Config configures a Manager.
 type Config struct {
 	// ClusterCIDRs are the cluster pod/service CIDRs allowed for egress.
@@ -70,6 +88,14 @@ type Manager struct {
 	excluded    map[string]struct{}
 	reconcile   time.Duration
 	queue       chan schema.StateTransition
+
+	// oracle is the optional FSM-target query seam (Story 2.6, BI-2c). When
+	// non-nil, the reconcile backstop converges each workload's managed
+	// policies to the desired set of the workload's CURRENT FSM target. When
+	// nil, the backstop retains the shipped Story 2.5 "quarantine object wins"
+	// supersession behaviour so the change is backward-compatible. Set once at
+	// wiring time via SetStateOracle; never mutated after Run starts.
+	oracle StateOracle
 
 	applySeconds prometheus.Histogram
 	applyTotal   *prometheus.CounterVec
@@ -121,6 +147,17 @@ func New(cfg Config, cs kubernetes.Interface, registry *metrics.Registry, log *s
 	return m, nil
 }
 
+// SetStateOracle installs the optional FSM-target query seam (Story 2.6,
+// BI-2c). It is a setter rather than a New parameter because the FSM Machine
+// is constructed AFTER the Manager in cmd/olaitan (the Manager is a sink fanned
+// into the very Machine that would be the oracle), so wiring at construction
+// would be a chicken-and-egg. Call it once, before Run starts, while the
+// Manager is still single-threaded; the field is then read-only for the worker.
+// A nil oracle leaves the shipped Story 2.5 reconcile behaviour in place.
+func (m *Manager) SetStateOracle(o StateOracle) {
+	m.oracle = o
+}
+
 func (m *Manager) registerMetrics(r *metrics.Registry) error {
 	h, err := r.RegisterHistogram(
 		"olaitan_response_network_policy_apply_seconds",
@@ -136,7 +173,7 @@ func (m *Manager) registerMetrics(r *metrics.Registry) error {
 
 	cv, err := r.RegisterCounterVec(
 		"olaitan_response_network_policy_apply_total",
-		"Cumulative NetworkPolicy enforcement actions labelled by result: applied, noop, error, skipped, dropped, gc_deleted, superseded (Story 2.4, FR33).",
+		"Cumulative NetworkPolicy enforcement actions labelled by result: applied, noop, error, skipped, dropped, gc_deleted, superseded, removed (Story 2.4/2.6, FR33/FR35). removed counts a de-escalation removal of a workload's managed policies (SUSPICIOUS/CLEAN inline path, or a reconcile delete driven by the workload's FSM target dropping below the policy's state).",
 		[]string{"result"},
 	)
 	if err != nil {
@@ -145,8 +182,9 @@ func (m *Manager) registerMetrics(r *metrics.Registry) error {
 	m.applyTotal = cv
 	// Pre-initialise every known result label to 0 so alert PromQL has a
 	// stable zero series from process startup, rather than a label series that
-	// only materialises on first occurrence.
-	for _, result := range []string{"applied", "noop", "error", "skipped", "dropped", "gc_deleted", "superseded"} {
+	// only materialises on first occurrence. "removed" is the Story 2.6
+	// de-escalation removal label (BI-7).
+	for _, result := range []string{"applied", "noop", "error", "skipped", "dropped", "gc_deleted", "superseded", "removed"} {
 		cv.WithLabelValues(result).Add(0)
 	}
 	return nil
@@ -159,21 +197,41 @@ func (m *Manager) count(result string) {
 	}
 }
 
-// enforcedState reports whether a transition INTO state triggers a managed
-// NetworkPolicy (Story 2.5, BI-1). The manager acts on RESTRICTED (Story 2.4
-// egress allow-list) and QUARANTINED (Story 2.5 deny-all) and ignores every
-// other target state. De-escalation removal (QUARANTINED->RESTRICTED, ->CLEAN)
-// is Story 2.6 and is deliberately NOT triggered here.
+// enforcedState reports whether a transition INTO state has a managed-policy
+// desired set the manager converges to by APPLYING a policy (Story 2.5/2.6,
+// BI-1). It is true for RESTRICTED (Story 2.4 egress allow-list) and
+// QUARANTINED (Story 2.5 deny-all). The sibling removalState (below) covers the
+// states whose desired set is EMPTY (SUSPICIOUS/CLEAN), which the manager
+// converges to by REMOVING policies. Under the Story 2.6 desired-state-per-target
+// model each enforced target DEFINES the managed set: entering RESTRICTED also
+// removes any quarantine policy (deleteSupersededQuarantine), and entering
+// QUARANTINED removes any restricted policy (deleteSupersededRestricted), so the
+// two enforced states own a one-policy desired set and the two removal states
+// own the empty set. Publish enqueues a transition when EITHER predicate holds;
+// every other ToState (only PRESERVED_KILLED remains, which Evaluate never
+// produces) is dropped.
 func enforcedState(s schema.PodSecurityState) bool {
 	return s == schema.StateRestricted || s == schema.StateQuarantined
 }
 
-// Publish is the fsm.TransitionSink seam (BI-3, BI-5). It acts only on a
-// transition INTO an enforced state (RESTRICTED or QUARANTINED) and enqueues
-// it for the async worker without blocking the FSM goroutine; on a full queue
-// it drops with a metric rather than stalling the hot path (BI-4).
+// removalState reports whether a transition INTO state has an EMPTY managed-policy
+// desired set (Story 2.6, BI-1/BI-4): SUSPICIOUS is a sensing-only state with no
+// NetworkPolicy isolation, and CLEAN is fully recovered, so for both the manager
+// REMOVES every Olaitan-managed policy for the workload (CLEAN additionally
+// verifies absence, BI-5). It is the sibling of enforcedState in the
+// desired-state-per-target model.
+func removalState(s schema.PodSecurityState) bool {
+	return s == schema.StateSuspicious || s == schema.StateClean
+}
+
+// Publish is the fsm.TransitionSink seam (BI-3, BI-5). It acts on a transition
+// INTO any state with a defined managed-policy desired set: the enforced states
+// (RESTRICTED/QUARANTINED) that APPLY a policy, and the removal states
+// (SUSPICIOUS/CLEAN) that REMOVE all managed policies (Story 2.6, BI-1). It
+// enqueues for the async worker without blocking the FSM goroutine; on a full
+// queue it drops with a metric rather than stalling the hot path (BI-4).
 func (m *Manager) Publish(st schema.StateTransition) {
-	if !enforcedState(st.ToState) {
+	if !enforcedState(st.ToState) && !removalState(st.ToState) {
 		return
 	}
 	select {
@@ -214,6 +272,18 @@ func (m *Manager) handle(ctx context.Context, st schema.StateTransition) {
 	}
 	if _, skip := m.excluded[ref.namespace]; skip {
 		m.count("skipped")
+		return
+	}
+
+	// De-escalation removal (Story 2.6, BI-4/BI-5): SUSPICIOUS and CLEAN have an
+	// EMPTY managed-policy desired set, so the manager REMOVES both managed
+	// policies for the workload rather than applying one. This branch runs
+	// BEFORE resolveSelector: removal needs no podSelector, and a de-escalating
+	// workload whose owner is being torn down could fail selector resolution,
+	// yet its policies must still be cleared. CLEAN additionally verifies absence
+	// via a follow-up read (BI-5).
+	if removalState(st.ToState) {
+		m.removeManaged(ctx, ref, st.WorkloadID, st.ToState == schema.StateClean)
 		return
 	}
 
@@ -290,6 +360,25 @@ func (m *Manager) handle(ctx context.Context, st schema.StateTransition) {
 	if st.ToState == schema.StateQuarantined && (result == "applied" || result == "noop") {
 		m.deleteSupersededRestricted(ctx, ref, st.WorkloadID)
 	}
+
+	// De-escalation relaxation (Story 2.6, BI-2/BI-2a/BI-3): the EXACT MIRROR of
+	// the escalation supersession above. On entering RESTRICTED, ONLY after the
+	// restricted egress-only policy is CONFIRMED applied do we best-effort delete
+	// the superseded QUARANTINED deny-all for the same workload. Apply-before-delete
+	// is load-bearing here for the OPPOSITE reason: deleting the deny-all before
+	// the restricted apply would momentarily revert the workload to NO Olaitan
+	// egress restriction (fully open egress). During the brief overlap the
+	// workload is selected by both policies: egress is already at the relaxed
+	// restricted allow-list (the deny-all contributes no egress allows), and
+	// ingress stays denied until the deny-all is gone, so the overlap is, if
+	// anything, STRICTER than the final RESTRICTED state and never policy-less.
+	// The same applied/noop gate as the QUARANTINED branch guarantees a failed
+	// restricted apply early-returns above and never deletes the deny-all, so a
+	// workload is never left with neither policy. A failed inline quarantine
+	// delete self-heals via the FSM-target-aware reconcile backstop (BI-2c).
+	if st.ToState == schema.StateRestricted && (result == "applied" || result == "noop") {
+		m.deleteSupersededQuarantine(ctx, ref, st.WorkloadID)
+	}
 }
 
 // deleteSupersededRestricted best-effort deletes the RESTRICTED policy a
@@ -319,6 +408,116 @@ func (m *Manager) deleteSupersededRestricted(ctx context.Context, ref workloadRe
 	}
 	m.log.Info("netpol: deleted superseded RESTRICTED policy after quarantine apply",
 		"workload_id", workloadID, "policy", name, "namespace", ref.namespace)
+}
+
+// deleteSupersededQuarantine best-effort deletes the QUARANTINED deny-all
+// policy a RESTRICTED de-escalation supersedes (Story 2.6, BI-2/BI-2a/BI-3): the
+// EXACT MIRROR of deleteSupersededRestricted. It MUST be called only after the
+// restricted apply has returned success (apply-before-delete). A NotFound is
+// success (the workload may never have been quarantined, or the deny-all was
+// already removed). A real delete failure is logged at WARN and swallowed so the
+// RESTRICTED enforcement does not fail; until the deny-all is gone the workload
+// stays slightly STRICTER than RESTRICTED (ingress denied), never less protected,
+// and the FSM-target-aware reconcile backstop reaps the lingering deny-all within
+// one reconcile interval (BI-2c, BI-6). The inline delete is silent best-effort
+// accounting-wise (mirror of the escalation path): the meaningful action is the
+// restricted apply, already counted (BI-7).
+func (m *Manager) deleteSupersededQuarantine(ctx context.Context, ref workloadRef, workloadID string) {
+	name := policyNameFor(schema.StateQuarantined, workloadID)
+	err := m.cs.NetworkingV1().NetworkPolicies(ref.namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			m.log.Debug("netpol: no superseded QUARANTINED policy to delete",
+				"workload_id", workloadID, "policy", name, "namespace", ref.namespace)
+			return
+		}
+		m.log.Warn("netpol: failed to delete superseded QUARANTINED policy; restricted still enforced",
+			"workload_id", workloadID, "policy", name, "namespace", ref.namespace, "err", err)
+		return
+	}
+	m.log.Info("netpol: deleted superseded QUARANTINED policy after restricted apply",
+		"workload_id", workloadID, "policy", name, "namespace", ref.namespace)
+}
+
+// removeManaged converges a workload's managed-policy set to EMPTY on a
+// SUSPICIOUS/CLEAN de-escalation (Story 2.6, BI-4/BI-5). It deletes BOTH the
+// RESTRICTED and QUARANTINED policies for the workload, treating IsNotFound on
+// each as success (a workload that was never isolated, or one a prior step
+// already cleared, is a successful no-op, never an error - BI-5). It does NOT
+// resolve a podSelector (removal must proceed even when the owner is being torn
+// down, BI-4); the excluded-namespace skip is applied by the caller. When verify
+// is true (CLEAN, AC3) it follows each delete with a Get to confirm absence and,
+// on a stray surviving policy, re-deletes once and re-Gets; a policy that still
+// survives counts error and is left for the reconcile backstop (BI-6). A
+// transient delete error counts error and logs WARN; the workload self-heals at
+// the next reconcile. On full convergence it counts removed.
+func (m *Manager) removeManaged(ctx context.Context, ref workloadRef, workloadID string, verify bool) {
+	names := []string{
+		policyNameFor(schema.StateRestricted, workloadID),
+		policyNameFor(schema.StateQuarantined, workloadID),
+	}
+	api := m.cs.NetworkingV1().NetworkPolicies(ref.namespace)
+	failed := false
+	deleted := 0
+	for _, name := range names {
+		err := api.Delete(ctx, name, metav1.DeleteOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			m.log.Warn("netpol: de-escalation removal delete failed",
+				"workload_id", workloadID, "policy", name, "namespace", ref.namespace, "err", err)
+			failed = true
+			continue
+		}
+		deleted++
+	}
+
+	if verify {
+		// CLEAN absence verification (BI-5): confirm each managed policy is gone
+		// via a follow-up Get. A survivor (a delete that returned success but did
+		// not take effect, or a pre-existing object a NotFound delete missed) is
+		// re-deleted once and re-checked; if it persists, it is left for the
+		// reconcile backstop and counted as a failure.
+		for _, name := range names {
+			if _, gerr := api.Get(ctx, name, metav1.GetOptions{}); apierrors.IsNotFound(gerr) {
+				continue
+			} else if gerr != nil {
+				// A transient read error: cannot confirm absence this cycle; let
+				// the reconcile backstop reap and re-verify.
+				m.log.Warn("netpol: de-escalation removal verification read failed",
+					"workload_id", workloadID, "policy", name, "namespace", ref.namespace, "err", gerr)
+				failed = true
+				continue
+			}
+			// Still present: re-delete once.
+			m.log.Warn("netpol: managed policy survived CLEAN removal; re-deleting",
+				"workload_id", workloadID, "policy", name, "namespace", ref.namespace)
+			if derr := api.Delete(ctx, name, metav1.DeleteOptions{}); derr != nil && !apierrors.IsNotFound(derr) {
+				m.log.Warn("netpol: CLEAN removal re-delete failed",
+					"workload_id", workloadID, "policy", name, "namespace", ref.namespace, "err", derr)
+				failed = true
+				continue
+			}
+			if _, gerr := api.Get(ctx, name, metav1.GetOptions{}); !apierrors.IsNotFound(gerr) {
+				m.log.Warn("netpol: managed policy still present after CLEAN re-delete; reconcile will reap",
+					"workload_id", workloadID, "policy", name, "namespace", ref.namespace, "err", gerr)
+				failed = true
+			}
+		}
+	}
+
+	if failed {
+		m.count("error")
+		return
+	}
+	// Both policies confirmed absent (whether we deleted them or they were
+	// already gone). A removal-with-nothing-to-remove is a successful no-op
+	// counted removed, never error (BI-5, Open Assumption 3).
+	m.count("removed")
+	m.log.Info("netpol: de-escalation removed managed policies",
+		"workload_id", workloadID, "namespace", ref.namespace,
+		"deleted", deleted, "verified", verify)
 }
 
 // apply performs an idempotent get-then-create-or-update (BI-6). Re-applying
@@ -402,26 +601,48 @@ func mapContains(super, sub map[string]string) bool {
 // reconcileGC lists every Olaitan-managed NetworkPolicy cluster-wide and
 // performs two independent housekeeping passes (AC4, BI-10):
 //
-//  1. Supersession backstop (Story 2.5, FIX A): any RESTRICTED policy whose
-//     workload also currently has a QUARANTINED policy is deleted as
-//     superseded, regardless of whether its owner still exists. A workload in
-//     QUARANTINED must not retain a RESTRICTED policy: while the RESTRICTED
-//     policy lingers its Egress allow-list still permits egress to the
-//     RFC1918/cluster/DNS CIDRs (Kubernetes NetworkPolicies are additive
-//     allow-lists, so the deny-all QUARANTINED policy does NOT subtract those
-//     allows), and orphan GC would never reap it while the owner exists. This
-//     pass makes the inline best-effort supersession (the fast path) eventually
-//     consistent: a failed inline delete self-heals within one reconcile
-//     interval (default 30s).
+//  1. Desired-state backstop (Story 2.6, BI-2c, the FSM-target-aware rework of
+//     the Story 2.5 supersession pass). For each managed policy, the reconciler
+//     asks the FSM oracle for the workload's CURRENT target and deletes any
+//     policy that is NOT part of that target's managed-policy desired set:
+//     - target QUARANTINED  => desired set is {quarantine present, restricted
+//     absent}; a lingering RESTRICTED policy is the escalation residue and
+//     is deleted (count superseded). This is exactly the shipped Story 2.5
+//     backstop.
+//     - target RESTRICTED   => desired set is {restricted present, quarantine
+//     absent}; a lingering QUARANTINED deny-all is the DE-ESCALATION residue
+//     and is deleted (count removed). This is the NEW direction: it converges
+//     the QUARANTINED->RESTRICTED overlap WITHOUT re-deleting the
+//     freshly-applied restricted policy, which the old "quarantine object
+//     wins" heuristic would have done backwards.
+//     - target SUSPICIOUS/CLEAN => desired set is empty; BOTH the restricted
+//     and quarantine policies are stale and, while the owner still EXISTS,
+//     are deleted (count removed) so a failed inline removal self-heals
+//     (BI-6). If the owner is gone the orphan pass below reaps them as
+//     gc_deleted instead.
+//     Not-ok (the oracle has NO entry for the workload) rule: the backstop does
+//     NOT delete the policy. A managed policy can exist transiently before the
+//     FSM map is populated, and after an FSM restart that did not restore a
+//     workload the oracle returns not-ok though a live, still-running workload's
+//     policy lingers; aggressively deleting on a missing FSM entry would strip
+//     protection from a workload the FSM simply lost track of. We therefore leave
+//     the orphan-GC pass (owner NotFound) as the SOLE authority for not-ok
+//     workloads: if the owner is truly gone the policy is reaped as gc_deleted;
+//     if the owner still exists the policy is retained until the FSM next
+//     evaluates the workload and the backstop gains an opinion.
+//     When oracle == nil the reconciler falls back to the shipped Story 2.5
+//     behaviour (a RESTRICTED policy whose workload also has a live QUARANTINED
+//     policy OBJECT is superseded), so the change is backward-compatible.
 //
 //  2. Orphan GC: a managed policy whose workload owner no longer exists is
 //     deleted (the original AC4 behaviour). Owner existence is observed through
 //     the API server (the authoritative source); a transient list/resolve error
 //     leaves the policy for a later cycle rather than risking a wrong delete.
+//     This pass is UNCHANGED and is the authority for not-ok workloads.
 //
-// A RESTRICTED policy that is BOTH superseded AND orphaned is deleted (either
-// reason suffices); the superseded pass runs first so the deletion is logged
-// and counted as a supersession.
+// A policy that is BOTH stale-by-desired-state AND orphaned is deleted (either
+// reason suffices); the desired-state pass runs first so the deletion is logged
+// and counted under its specific result.
 func (m *Manager) reconcileGC(ctx context.Context) {
 	list, err := m.cs.NetworkingV1().NetworkPolicies("").List(ctx, metav1.ListOptions{LabelSelector: managedBySelector})
 	if err != nil {
@@ -429,19 +650,20 @@ func (m *Manager) reconcileGC(ctx context.Context) {
 		return
 	}
 
-	// First, identify which workloads currently have a QUARANTINED policy. We
-	// key by workload_id read from the AnnWorkloadID annotation; the
-	// AnnFSMState == QUARANTINED annotation is the robust discriminator (the
-	// olaitan-quarantined- name prefix is an equivalent signal). The name of
-	// the superseding quarantine policy is retained for the supersession log.
-	quarantinedByWID := make(map[string]string)
-	for i := range list.Items {
-		np := &list.Items[i]
-		if np.Annotations[AnnFSMState] != string(schema.StateQuarantined) {
-			continue
-		}
-		if wid := np.Annotations[AnnWorkloadID]; wid != "" {
-			quarantinedByWID[wid] = np.Name
+	// Fallback discriminator for the nil-oracle path (shipped Story 2.5
+	// behaviour): which workloads currently have a live QUARANTINED policy
+	// object. Only built and consulted when oracle == nil.
+	var quarantinedByWID map[string]string
+	if m.oracle == nil {
+		quarantinedByWID = make(map[string]string)
+		for i := range list.Items {
+			np := &list.Items[i]
+			if np.Annotations[AnnFSMState] != string(schema.StateQuarantined) {
+				continue
+			}
+			if wid := np.Annotations[AnnWorkloadID]; wid != "" {
+				quarantinedByWID[wid] = np.Name
+			}
 		}
 	}
 
@@ -451,33 +673,23 @@ func (m *Manager) reconcileGC(ctx context.Context) {
 		// selector guarantees this). The excluded-namespaces filter intentionally
 		// does NOT apply here: it stops us applying NEW policies in those
 		// namespaces, but a policy Olaitan already created there must still be
-		// collectable once orphaned or superseded. Skipping excluded namespaces
-		// would strand our own policies permanently if a namespace were excluded
-		// after a policy was applied.
+		// collectable once orphaned or stale. Skipping excluded namespaces would
+		// strand our own policies permanently if a namespace were excluded after a
+		// policy was applied.
 		wid := np.Annotations[AnnWorkloadID]
 		if wid == "" {
 			continue
 		}
 
-		// Supersession backstop: a RESTRICTED policy for a workload that now has
-		// a QUARANTINED policy must be removed (independent of owner existence).
-		if np.Annotations[AnnFSMState] == string(schema.StateRestricted) {
-			if quarantineName, superseded := quarantinedByWID[wid]; superseded {
-				if derr := m.cs.NetworkingV1().NetworkPolicies(np.Namespace).Delete(ctx, np.Name, metav1.DeleteOptions{}); derr != nil {
-					if !apierrors.IsNotFound(derr) {
-						m.log.Warn("netpol: superseded restricted delete failed", "policy", np.Name, "namespace", np.Namespace, "err", derr)
-						continue
-					}
-				}
-				m.log.Info("netpol: reconcile removed superseded RESTRICTED policy",
-					"workload_id", wid, "namespace", np.Namespace,
-					"restricted_policy", np.Name, "quarantine_policy", quarantineName)
-				m.count("superseded")
-				continue
-			}
+		// Desired-state backstop. When stale-by-desired-state deletes the policy,
+		// continue to the next policy; when it leaves the policy, fall through to
+		// the orphan-GC pass.
+		if m.reconcileDesiredState(ctx, np, wid, quarantinedByWID) {
+			continue
 		}
 
-		// Orphan GC: delete the policy once its owner no longer exists.
+		// Orphan GC: delete the policy once its owner no longer exists. This is
+		// the sole authority for not-ok workloads (BI-2c not-ok rule).
 		ref, err := parseWorkloadID(wid)
 		if err != nil {
 			continue
@@ -500,4 +712,108 @@ func (m *Manager) reconcileGC(ctx context.Context) {
 			"policy", np.Name, "namespace", np.Namespace, "workload_id", wid)
 		m.count("gc_deleted")
 	}
+}
+
+// reconcileDesiredState applies the FSM-target-aware desired-state backstop to a
+// single managed policy (Story 2.6, BI-2c). It returns true when it DELETED the
+// policy (the caller skips the orphan pass) and false when it left the policy in
+// place (the caller falls through to orphan GC). See reconcileGC's doc for the
+// per-target dispositions and the not-ok rule.
+func (m *Manager) reconcileDesiredState(ctx context.Context, np *networkingv1.NetworkPolicy, wid string, quarantinedByWID map[string]string) bool {
+	policyState := np.Annotations[AnnFSMState]
+
+	// Nil-oracle fallback: shipped Story 2.5 "quarantine object wins"
+	// supersession. A RESTRICTED policy whose workload also has a live
+	// QUARANTINED policy object is superseded.
+	if m.oracle == nil {
+		if policyState != string(schema.StateRestricted) {
+			return false
+		}
+		quarantineName, superseded := quarantinedByWID[wid]
+		if !superseded {
+			return false
+		}
+		if !m.reconcileDelete(ctx, np) {
+			return false
+		}
+		m.log.Info("netpol: reconcile removed superseded RESTRICTED policy",
+			"workload_id", wid, "namespace", np.Namespace,
+			"restricted_policy", np.Name, "quarantine_policy", quarantineName)
+		m.count("superseded")
+		return true
+	}
+
+	target, ok := m.oracle.CurrentState(wid)
+	if !ok {
+		// FSM has no opinion: leave the policy to the orphan-GC authority
+		// (BI-2c not-ok rule) rather than stripping protection from a workload
+		// the FSM merely lost track of.
+		return false
+	}
+
+	switch target {
+	case schema.StateQuarantined:
+		// Escalation residue: a lingering RESTRICTED policy is not in the
+		// QUARANTINED desired set.
+		if policyState != string(schema.StateRestricted) {
+			return false
+		}
+		if !m.reconcileDelete(ctx, np) {
+			return false
+		}
+		m.log.Info("netpol: reconcile removed superseded RESTRICTED policy (target QUARANTINED)",
+			"workload_id", wid, "namespace", np.Namespace, "policy", np.Name)
+		m.count("superseded")
+		return true
+	case schema.StateRestricted:
+		// De-escalation residue: a lingering QUARANTINED deny-all is not in the
+		// RESTRICTED desired set. Crucially the restricted policy itself is NOT
+		// deleted, so a reconcile tick during the QUARANTINED->RESTRICTED overlap
+		// cannot undo the freshly-applied restricted policy (BI-2b).
+		if policyState != string(schema.StateQuarantined) {
+			return false
+		}
+		if !m.reconcileDelete(ctx, np) {
+			return false
+		}
+		m.log.Info("netpol: reconcile removed stale QUARANTINED policy on de-escalation (target RESTRICTED)",
+			"workload_id", wid, "namespace", np.Namespace, "policy", np.Name)
+		m.count("removed")
+		return true
+	default:
+		// target SUSPICIOUS/CLEAN: empty desired set. Both managed policies are
+		// stale. While the owner still exists, delete them here (count removed) so
+		// a failed inline removal self-heals (BI-6); if the owner is gone, leave
+		// the policy for the orphan pass to reap as gc_deleted.
+		ref, err := parseWorkloadID(wid)
+		if err != nil {
+			return false
+		}
+		exists, err := m.ownerExists(ctx, ref)
+		if err != nil || !exists {
+			// Transient error, or owner gone: defer to the orphan-GC pass.
+			return false
+		}
+		if !m.reconcileDelete(ctx, np) {
+			return false
+		}
+		m.log.Info("netpol: reconcile removed stale managed policy on de-escalation (target below RESTRICTED)",
+			"workload_id", wid, "namespace", np.Namespace, "policy", np.Name, "target", string(target))
+		m.count("removed")
+		return true
+	}
+}
+
+// reconcileDelete best-effort deletes a managed policy during a reconcile pass.
+// It returns true when the policy is gone (deleted now or already absent) and
+// false on a real (non-NotFound) delete error, which is logged at WARN and left
+// for the next reconcile tick.
+func (m *Manager) reconcileDelete(ctx context.Context, np *networkingv1.NetworkPolicy) bool {
+	if derr := m.cs.NetworkingV1().NetworkPolicies(np.Namespace).Delete(ctx, np.Name, metav1.DeleteOptions{}); derr != nil {
+		if !apierrors.IsNotFound(derr) {
+			m.log.Warn("netpol: reconcile desired-state delete failed", "policy", np.Name, "namespace", np.Namespace, "err", derr)
+			return false
+		}
+	}
+	return true
 }
