@@ -55,6 +55,7 @@ import (
 	"github.com/olokotoh/olaitan/internal/ratelimit"
 	redisclient "github.com/olokotoh/olaitan/internal/redis"
 	"github.com/olokotoh/olaitan/internal/response/fsm"
+	"github.com/olokotoh/olaitan/internal/response/netpol"
 	"github.com/olokotoh/olaitan/internal/retry"
 	"github.com/olokotoh/olaitan/internal/schema"
 	"github.com/olokotoh/olaitan/internal/subjects"
@@ -615,7 +616,11 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	// its in-memory map from Redis BEFORE the consumer starts, so a restart
 	// never silently de-escalates a workload to CLEAN. When disabled, it
 	// keeps the Story 2.2 NopSink and skips restore.
-	var fsmSink fsm.TransitionSink = fsm.NopSink{}
+	// Story 2.2/2.3/2.4: the FSM emits each transition to a MultiSink that
+	// fans out to every enabled consumer (BI-3). Story 2.3 adds the Redis
+	// persistence sink; Story 2.4 adds the NetworkPolicy enforcement
+	// manager. When neither is enabled the machine keeps a NopSink.
+	var sinks fsm.MultiSink
 	var fsmStore *fsm.Store
 	if cfg.Detection.FSM.PersistenceEnabledOrDefault() {
 		redisSink, store, fsmCloser, perr := wireFSMPersistence(cfg, log)
@@ -623,7 +628,7 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 			closeNATS()
 			return fmt.Errorf("aggregator: fsm persistence: %w", perr)
 		}
-		fsmSink = redisSink
+		sinks = append(sinks, redisSink)
 		fsmStore = store
 		// One goroutine owns both the replayer and the client close, in
 		// order: Run flushes the outage buffer best-effort on ctx.Done and
@@ -635,6 +640,24 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 			fsmCloser()
 			return err
 		})
+	}
+	// Story 2.4: RESTRICTED-state NetworkPolicy enforcement (FR33/NFR6). The
+	// manager is a second TransitionSink fanned out alongside the Redis sink.
+	// It acquires its own clientset when posture (which builds cs above) is
+	// disabled.
+	netpolEnabled := cfg.Response.NetworkPolicy.EnabledOrDefault()
+	if netpolEnabled {
+		npMgr, nerr := wireNetworkPolicyManager(cfg, cs, log, metricsReg)
+		if nerr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: netpol: %w", nerr)
+		}
+		sinks = append(sinks, npMgr)
+		g.Go(func() error { return npMgr.Run(ctx) })
+	}
+	var fsmSink fsm.TransitionSink = fsm.NopSink{}
+	if len(sinks) > 0 {
+		fsmSink = sinks
 	}
 	stateMachine, fsmErr := fsm.New(mgr, metricsReg, fsmSink, nil)
 	if fsmErr != nil {
@@ -661,7 +684,8 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		"restricted_dwell_seconds", cfg.Detection.FSM.RestrictedDwellSecondsOrDefault(),
 		"quarantined_dwell_seconds", cfg.Detection.FSM.QuarantinedDwellSecondsOrDefault(),
 		"deescalation_cooldown_seconds", cfg.Detection.FSM.DeescalationCooldownSecondsOrDefault(),
-		"persistence_enabled", cfg.Detection.FSM.PersistenceEnabledOrDefault())
+		"persistence_enabled", cfg.Detection.FSM.PersistenceEnabledOrDefault(),
+		"netpol_enabled", netpolEnabled)
 
 	g.Go(func() error {
 		<-ctx.Done()
@@ -776,6 +800,32 @@ func wireFSMPersistence(cfg *config.Config, log *slog.Logger) (*fsm.RedisSink, *
 		return nil, nil, func() {}, fmt.Errorf("aggregator: fsm sink: %w", err)
 	}
 	return sink, store, closer, nil
+}
+
+// wireNetworkPolicyManager constructs the Story 2.4 RESTRICTED-state
+// NetworkPolicy enforcement manager (FR33/NFR6). It reuses the clientset
+// already built for the posture client when present (cs != nil), or
+// acquires its own via kubeClientFactory when posture is disabled. The
+// returned manager is a fsm.TransitionSink whose Run is the async apply +
+// orphan-GC worker, wired into the errgroup by the caller. No new RBAC is
+// required: the aggregator ClusterRole already grants networkpolicies
+// create/update/delete/get/list plus apps/batch get/list for owner
+// resolution (deploy/helm/olaitan/templates/rbac.yaml).
+func wireNetworkPolicyManager(cfg *config.Config, cs kubernetes.Interface, log *slog.Logger, metricsReg *metrics.Registry) (*netpol.Manager, error) {
+	if cs == nil {
+		var err error
+		cs, err = kubeClientFactory(log)
+		if err != nil {
+			return nil, fmt.Errorf("kube client: %w", err)
+		}
+	}
+	np := cfg.Response.NetworkPolicy
+	return netpol.New(netpol.Config{
+		ClusterCIDRs:       np.ClusterCIDRsOrDefault(),
+		ExtraAllowedCIDRs:  np.ExtraAllowedCIDRs,
+		ExcludedNamespaces: cfg.Response.ExcludedNamespaces,
+		ReconcileInterval:  time.Duration(np.ReconcileIntervalSecondsOrDefault()) * time.Second,
+	}, cs, metricsReg, log)
 }
 
 // fsmConsumerMaxDeliver caps JetStream's per-message redelivery for the

@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -976,6 +977,114 @@ type ConfidenceBands struct {
 // the agent from self-isolating or hard-killing cluster infrastructure.
 type ResponseConfig struct {
 	ExcludedNamespaces []string `yaml:"excluded_namespaces"`
+	// Story 2.4: network_policy sub-block configures the RESTRICTED-state
+	// NetworkPolicyManager (FR33/NFR6). Enabled is pointer-tagged so an
+	// explicit `false` survives the loader (Story 2.3 PersistenceEnabled
+	// precedent); the manager is opt-in and defaults off until Story 2.10
+	// wires the graduated-isolation mode.
+	NetworkPolicy NetworkPolicyConfig `yaml:"network_policy,omitempty"`
+}
+
+// NetworkPolicyConfig configures the Story 2.4 RESTRICTED-state
+// NetworkPolicy enforcement (FR33). The RESTRICTED policy allows egress
+// only to the RFC 1918 private ranges (always allowed), the cluster's pod
+// and service CIDRs (ClusterCIDRs), and any operator-supplied extra CIDRs,
+// and blocks all other (external) egress.
+//
+// Enabled is pointer-tagged so an explicit `false` survives the loader;
+// the default is OFF (the manager is opt-in; Story 2.10 turns it on per
+// graduated-isolation mode). ReconcileIntervalSeconds is pointer-tagged so
+// an explicit small value survives; it sets the orphan-GC reconcile
+// cadence and must stay well inside the 60 s AC4 budget.
+type NetworkPolicyConfig struct {
+	Enabled                  *bool    `yaml:"enabled,omitempty"`
+	ClusterCIDRs             []string `yaml:"cluster_cidrs,omitempty"`
+	ExtraAllowedCIDRs        []string `yaml:"extra_allowed_cidrs,omitempty"`
+	ReconcileIntervalSeconds *int     `yaml:"reconcile_interval_seconds,omitempty"`
+}
+
+// DefaultNetworkPolicyReconcileSeconds is the orphan-GC reconcile cadence;
+// 30 s is comfortably inside the 60 s AC4 garbage-collection budget.
+const DefaultNetworkPolicyReconcileSeconds = 30
+
+// DefaultNetworkPolicyClusterCIDRs are the pod and service CIDRs allowed
+// for egress by default. They match the kind/Calico evaluation cluster
+// (pod CIDR 10.244.0.0/16, service CIDR 10.96.0.0/12). Operators on other
+// clusters MUST override these to their own pod and service CIDRs so that
+// in-cluster traffic (including DNS to the service-CIDR-resident CoreDNS)
+// survives the RESTRICTED egress block.
+var DefaultNetworkPolicyClusterCIDRs = []string{"10.244.0.0/16", "10.96.0.0/12"}
+
+// DefaultNetworkPolicy returns the Story 2.4 defaults: disabled, the
+// kind/Calico cluster CIDRs, and a 30 s reconcile cadence.
+func DefaultNetworkPolicy() NetworkPolicyConfig {
+	enabled := false
+	ri := DefaultNetworkPolicyReconcileSeconds
+	cidrs := make([]string, len(DefaultNetworkPolicyClusterCIDRs))
+	copy(cidrs, DefaultNetworkPolicyClusterCIDRs)
+	return NetworkPolicyConfig{
+		Enabled:                  &enabled,
+		ClusterCIDRs:             cidrs,
+		ReconcileIntervalSeconds: &ri,
+	}
+}
+
+// EnabledOrDefault reports whether the NetworkPolicy manager is enabled,
+// treating a nil pointer as the default (false).
+func (n NetworkPolicyConfig) EnabledOrDefault() bool {
+	if n.Enabled == nil {
+		return false
+	}
+	return *n.Enabled
+}
+
+// ReconcileIntervalSecondsOrDefault returns the effective orphan-GC
+// reconcile cadence, substituting the default when omitted.
+func (n NetworkPolicyConfig) ReconcileIntervalSecondsOrDefault() int {
+	if n.ReconcileIntervalSeconds == nil {
+		return DefaultNetworkPolicyReconcileSeconds
+	}
+	return *n.ReconcileIntervalSeconds
+}
+
+// ClusterCIDRsOrDefault returns the effective cluster CIDRs, substituting
+// the kind/Calico defaults when omitted.
+func (n NetworkPolicyConfig) ClusterCIDRsOrDefault() []string {
+	if len(n.ClusterCIDRs) == 0 {
+		out := make([]string, len(DefaultNetworkPolicyClusterCIDRs))
+		copy(out, DefaultNetworkPolicyClusterCIDRs)
+		return out
+	}
+	return n.ClusterCIDRs
+}
+
+// validate enforces NetworkPolicyConfig invariants: every CIDR must parse,
+// and the reconcile interval (when set) must be in [1, 60] so orphan GC
+// always meets the AC4 60 s budget. A fully-omitted block skips validation
+// so in-memory test fixtures can leave it zero; the Load path substitutes
+// DefaultNetworkPolicy before Validate when the manager is enabled.
+func (n NetworkPolicyConfig) validate() error {
+	for i, c := range n.ClusterCIDRs {
+		if _, _, err := net.ParseCIDR(c); err != nil {
+			return fmt.Errorf("response.network_policy.cluster_cidrs[%d]: invalid CIDR %q: %w", i, c, err)
+		}
+	}
+	for i, c := range n.ExtraAllowedCIDRs {
+		if _, _, err := net.ParseCIDR(c); err != nil {
+			return fmt.Errorf("response.network_policy.extra_allowed_cidrs[%d]: invalid CIDR %q: %w", i, c, err)
+		}
+	}
+	if n.ReconcileIntervalSeconds != nil {
+		if v := *n.ReconcileIntervalSeconds; v < 1 || v > 60 {
+			return fmt.Errorf("response.network_policy.reconcile_interval_seconds: must be in [1, 60] to meet the 60 s orphan-GC budget (got %d)", v)
+		}
+	}
+	// When the manager is explicitly enabled, at least one cluster CIDR is
+	// required so in-cluster traffic and DNS are not blocked.
+	if n.Enabled != nil && *n.Enabled && len(n.ClusterCIDRs) == 0 {
+		return errors.New("response.network_policy.cluster_cidrs: at least one cluster CIDR (pod and/or service CIDR) is required when network_policy.enabled=true")
+	}
+	return nil
 }
 
 // AnalystConfig -- see architecture.md:806-835 (LLM analyst settings).
@@ -1206,6 +1315,23 @@ func Load(path string) (*Config, error) {
 		if cfg.Detection.FSM.RedisAddr == "" {
 			cfg.Detection.FSM.RedisAddr = defFSM.RedisAddr
 		}
+
+		// Story 2.4: substitute NetworkPolicy defaults before Validate. The
+		// pointer-tagged Enabled lets an explicit `enabled: false` survive;
+		// ClusterCIDRs and the reconcile interval inherit the kind/Calico
+		// defaults when omitted so an operator who enables the manager
+		// without listing CIDRs still gets a working (if cluster-specific)
+		// egress allow-list rather than a hard rejection.
+		defNP := DefaultNetworkPolicy()
+		if cfg.Response.NetworkPolicy.Enabled == nil {
+			cfg.Response.NetworkPolicy.Enabled = defNP.Enabled
+		}
+		if len(cfg.Response.NetworkPolicy.ClusterCIDRs) == 0 {
+			cfg.Response.NetworkPolicy.ClusterCIDRs = defNP.ClusterCIDRs
+		}
+		if cfg.Response.NetworkPolicy.ReconcileIntervalSeconds == nil {
+			cfg.Response.NetworkPolicy.ReconcileIntervalSeconds = defNP.ReconcileIntervalSeconds
+		}
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -1396,6 +1522,9 @@ func (r ResponseConfig) validate() error {
 		if strings.TrimSpace(ns) != ns {
 			return fmt.Errorf("response.excluded_namespaces[%d]: leading/trailing whitespace in %q", i, ns)
 		}
+	}
+	if err := r.NetworkPolicy.validate(); err != nil {
+		return err
 	}
 	return nil
 }
