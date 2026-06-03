@@ -2,6 +2,7 @@ package netpol
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
@@ -546,6 +548,133 @@ func TestDeleteSupersededRestricted_NoOpWhenAbsent(t *testing.T) {
 	// No restricted policy exists; the delete must be a silent no-op (NotFound
 	// treated as success, no panic, no error surfaced).
 	m.deleteSupersededRestricted(ctx, ref, "ns/Deployment/web")
+}
+
+// syntheticAPIError is a non-NotFound, non-AlreadyExists server error the
+// reactor tests inject to simulate a transient apiserver failure. apierrors
+// helpers classify it as a generic error (not NotFound), so handle takes the
+// genuine-error path and counts "error".
+var syntheticAPIError = apierrors.NewInternalError(errors.New("synthetic apiserver failure"))
+
+func TestHandle_FailedQuarantineApplyPreservesRestricted(t *testing.T) {
+	// Safety invariant (apply-before-delete): a FAILED quarantine apply must
+	// NEVER delete the restricted policy. Pre-create the restricted policy, then
+	// fail every networkpolicies create/update so the quarantine apply errors;
+	// the restricted policy MUST survive and the manager MUST count an error.
+	sel := map[string]string{"app": "web"}
+	reg := metricsRegistryForTest(t)
+	cs := fake.NewSimpleClientset(runtime.Object(deployment("ns", "web", sel)))
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+	workloadID := "ns/Deployment/web"
+	restrictedName := policyNameFor(schema.StateRestricted, workloadID)
+
+	// Pre-create the RESTRICTED policy (the workload passed through RESTRICTED).
+	m.handle(ctx, restrictedTransition(workloadID, "pkg-1"))
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, restrictedName, metav1.GetOptions{}); gerr != nil {
+		t.Fatalf("precondition: restricted policy not applied: %v", gerr)
+	}
+
+	// Now fail all networkpolicies create AND update with a synthetic
+	// non-NotFound error so the quarantine apply fails.
+	cs.PrependReactor("create", "networkpolicies", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, syntheticAPIError
+	})
+	cs.PrependReactor("update", "networkpolicies", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, syntheticAPIError
+	})
+
+	m.handle(ctx, quarantinedTransition(workloadID, "pkg-2"))
+
+	// (a) The failed quarantine apply was counted as an error.
+	if got := testutilToFloat(t, m, "error"); got != 1 {
+		t.Fatalf("apply_total{error} = %v, want 1 for a failed quarantine apply", got)
+	}
+	// (b) The RESTRICTED policy is STILL present: the failed apply did NOT
+	// trigger the supersession delete (the load-bearing safety invariant).
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, restrictedName, metav1.GetOptions{}); gerr != nil {
+		t.Fatalf("restricted policy was deleted after a FAILED quarantine apply (safety invariant violated): %v", gerr)
+	}
+	// And no quarantine policy was created.
+	quarantineName := policyNameFor(schema.StateQuarantined, workloadID)
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, quarantineName, metav1.GetOptions{}); !apierrors.IsNotFound(gerr) {
+		t.Fatalf("quarantine policy unexpectedly present after failed apply: err=%v", gerr)
+	}
+}
+
+func TestHandle_QuarantineSucceedsButRestrictedDeleteFailsIsSwallowed(t *testing.T) {
+	// WARN-branch coverage: the quarantine apply SUCCEEDS but the best-effort
+	// supersession delete of the restricted policy returns a non-NotFound error.
+	// handle must NOT fail (no panic, returns normally), the quarantine policy
+	// must be present, and the restricted policy is still present (the delete
+	// failed but was swallowed as best-effort WARN).
+	sel := map[string]string{"app": "web"}
+	m := newTestManager(t, Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, deployment("ns", "web", sel))
+	cs := m.cs.(*fake.Clientset)
+	ctx := context.Background()
+	workloadID := "ns/Deployment/web"
+	restrictedName := policyNameFor(schema.StateRestricted, workloadID)
+	quarantineName := policyNameFor(schema.StateQuarantined, workloadID)
+
+	// Pre-create the RESTRICTED policy.
+	m.handle(ctx, restrictedTransition(workloadID, "pkg-1"))
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, restrictedName, metav1.GetOptions{}); gerr != nil {
+		t.Fatalf("precondition: restricted policy not applied: %v", gerr)
+	}
+
+	// Fail every networkpolicies delete (the quarantine create/update path is
+	// left untouched, so the apply still succeeds).
+	cs.PrependReactor("delete", "networkpolicies", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, syntheticAPIError
+	})
+
+	// Must not panic and must return normally.
+	m.handle(ctx, quarantinedTransition(workloadID, "pkg-2"))
+
+	// The quarantine policy IS present (apply succeeded).
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, quarantineName, metav1.GetOptions{}); gerr != nil {
+		t.Fatalf("quarantine policy not applied: %v", gerr)
+	}
+	// The restricted policy is still present: the delete failed and was
+	// swallowed as best-effort WARN, not surfaced as a handle failure.
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, restrictedName, metav1.GetOptions{}); gerr != nil {
+		t.Fatalf("restricted policy missing; the failed best-effort delete should have left it in place: %v", gerr)
+	}
+}
+
+func TestHandle_QuarantineSkipsExcludedNamespace(t *testing.T) {
+	// Mirror of TestHandle_SkipsExcludedNamespace for QUARANTINED: a QUARANTINED
+	// transition into an excluded namespace must NOT apply a quarantine policy
+	// AND must NOT delete a pre-existing restricted policy there. Count "skipped".
+	sel := map[string]string{"app": "x"}
+	reg := metricsRegistryForTest(t)
+	restricted := m_buildManagedPolicy("kube-system", policyNameFor(schema.StateRestricted, "kube-system/Deployment/x"), "kube-system/Deployment/x")
+	cs := fake.NewSimpleClientset(runtime.Object(deployment("kube-system", "x", sel)), runtime.Object(restricted))
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}, ExcludedNamespaces: []string{"kube-system"}}, cs, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+	workloadID := "kube-system/Deployment/x"
+
+	m.handle(ctx, quarantinedTransition(workloadID, "pkg-1"))
+
+	if got := testutilToFloat(t, m, "skipped"); got != 1 {
+		t.Fatalf("apply_total{skipped} = %v, want 1 for excluded-namespace QUARANTINED", got)
+	}
+	// No quarantine policy was created.
+	quarantineName := policyNameFor(schema.StateQuarantined, workloadID)
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("kube-system").Get(ctx, quarantineName, metav1.GetOptions{}); !apierrors.IsNotFound(gerr) {
+		t.Fatalf("quarantine policy created in excluded namespace: err=%v", gerr)
+	}
+	// The pre-existing restricted policy survives (no supersession delete ran).
+	restrictedName := policyNameFor(schema.StateRestricted, workloadID)
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("kube-system").Get(ctx, restrictedName, metav1.GetOptions{}); gerr != nil {
+		t.Fatalf("restricted policy in excluded namespace was deleted by a skipped QUARANTINED: %v", gerr)
+	}
 }
 
 func TestHandle_QuarantineIdempotentReapply(t *testing.T) {

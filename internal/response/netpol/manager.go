@@ -125,7 +125,7 @@ func (m *Manager) registerMetrics(r *metrics.Registry) error {
 	h, err := r.RegisterHistogram(
 		"olaitan_response_network_policy_apply_seconds",
 		"",
-		"End-to-end latency from the FSM RESTRICTED transition timestamp to NetworkPolicy apply completion (Story 2.4, NFR6 p99 <= 1s).",
+		"End-to-end latency from the FSM RESTRICTED/QUARANTINED transition timestamp to NetworkPolicy apply completion (Story 2.4, NFR6 p99 <= 1s).",
 		nil,
 		[]float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5},
 	)
@@ -184,7 +184,7 @@ func (m *Manager) Publish(st schema.StateTransition) {
 	}
 }
 
-// Run is the background worker (BI-4). It applies queued RESTRICTED
+// Run is the background worker (BI-4). It applies queued RESTRICTED/QUARANTINED
 // transitions and runs the orphan-GC reconcile on a ticker. Wire it into
 // the errgroup. It returns nil on graceful context cancellation.
 func (m *Manager) Run(ctx context.Context) error {
@@ -202,7 +202,7 @@ func (m *Manager) Run(ctx context.Context) error {
 	}
 }
 
-// handle resolves the workload's pod selector and applies the RESTRICTED
+// handle resolves the workload's pod selector and applies the RESTRICTED/QUARANTINED
 // policy idempotently, recording the apply latency against the transition
 // timestamp for the NFR6 budget (AC2).
 func (m *Manager) handle(ctx context.Context, st schema.StateTransition) {
@@ -270,7 +270,15 @@ func (m *Manager) handle(ctx context.Context, st schema.StateTransition) {
 	// NOT fail the QUARANTINED enforcement (the workload is already fully
 	// blocked; the stale restricted policy only ever ADDS egress the quarantine
 	// policy overrides, and is orphan-GC'd when its owner is deleted).
-	if st.ToState == schema.StateQuarantined {
+	// Defense-in-depth gate (apply-before-delete made explicit): only supersede
+	// the restricted policy when the quarantine apply CONFIRMED the deny-all is
+	// present. "applied" = created/updated; "noop" = an idempotent re-apply that
+	// matched the live deny-all (so it is confirmed present). Any other result
+	// (or an error path, which early-returns above) MUST NOT delete the
+	// restricted policy: deleting it after a failed/absent quarantine apply would
+	// leave a malicious workload unprotected. The upstream error early-returns
+	// already guarantee this, but the gate states the invariant at the call site.
+	if st.ToState == schema.StateQuarantined && (result == "applied" || result == "noop") {
 		m.deleteSupersededRestricted(ctx, ref, st.WorkloadID)
 	}
 }
