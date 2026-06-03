@@ -51,6 +51,14 @@ const StatePrefix = "olaitan.state."
 // Use Evidence(kind) to build a subject.
 const EvidencePrefix = "olaitan.evidence."
 
+// OverridesApplied is the Story 2.7 published subject on which the operator-
+// override controller emits one event per applied AND per rejected override
+// (FR38/FR39, architecture.md:225/447). It follows the architecture's
+// literal dotted UPPER published-contract naming (distinct from the lower
+// olaitan.* per-pod subjects above). The append-only AUDIT.overrides SIEM
+// subject (FR40) is Story 2.8 and is NOT defined here.
+const OverridesApplied = "OVERRIDES.applied"
+
 // EvidencePackages is the Ring-2 EvidencePackage subject.
 const EvidencePackages = EvidencePrefix + "packages"
 

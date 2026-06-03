@@ -21,11 +21,19 @@
 // audit) wire later. Re-evaluating the same (workload, state, score,
 // time) yields the same StateTransition.
 //
-// Encapsulation (AC6, BI-6): Evaluate is the SOLE exported mutator. All
-// per-workload state lives in an in-memory map guarded by a sync.RWMutex
-// (Redis persistence and restart recovery are Story 2.3, not here). The
-// only other exported surface is the read-only State query and the
-// TransitionSink seam.
+// Encapsulation (AC6, BI-6): Evaluate is the sole AUTOMATED (score-driven)
+// mutator. All per-workload state lives in an in-memory map guarded by a
+// sync.RWMutex (Redis persistence and restart recovery are Story 2.3, not
+// here). Story 2.7 (FR38/FR39) adds two explicit operator-driven mutators,
+// Pin and ReleasePin, so the state-mutating exported surface is now THREE
+// methods (Evaluate, Pin, ReleasePin), all mutex-guarded and all routed
+// through the same lock-release-then-Publish path so a pin transition
+// flows to the netpol/Redis sinks exactly like an automated one (BI-2/BI-7).
+// While a workload is pinned, Evaluate early-returns a no_transition without
+// advancing dwell/cooldown timers (the FR38 defer), so Evaluate remains the
+// sole mutator of the AUTOMATED path. The remaining exported surface is the
+// read-only State/CurrentState queries, Restore (startup rehydration), and
+// the TransitionSink seam.
 //
 // Dependency-ring direction (BI-1): this package is Ring 4
 // (response/isolation) and imports only substrate: internal/schema,
@@ -101,6 +109,17 @@ type workloadState struct {
 	// cooldown measures the continuous sub-threshold window from here so
 	// a single low sample does not de-escalate (AC3).
 	lastAtOrAboveThresholdAt time.Time
+	// overridden is the Story 2.7 operator-override pin flag (FR38). While
+	// true, Evaluate early-returns a no_transition without advancing the
+	// dwell/cooldown timers, freezing the workload at overrideState. It is
+	// in-memory only; the durable record of the pin is the override:{wl}
+	// Redis key with its native TTL (BI-2/BI-7), NOT the fsm: hash.
+	overridden bool
+	// overrideState is the state the workload is pinned at while overridden
+	// is true (equal to current; kept explicit so a future re-pin or audit
+	// can distinguish the operator's requested target from a score-driven
+	// current value).
+	overrideState PodState
 }
 
 // PodState aliases schema.PodSecurityState so callers can reference the
@@ -141,6 +160,14 @@ type fsmMetrics struct {
 // an explicit sink (NopSink{} in Epic 2) so the emission seam is never
 // silently dropped.
 var ErrNilSink = errors.New("fsm: nil transition sink")
+
+// ErrInvalidOverrideState is returned by Pin when the requested override
+// target is not one of the four reachable Epic-2 states
+// (CLEAN/SUSPICIOUS/RESTRICTED/QUARANTINED). PRESERVED_KILLED (Epic 4, not
+// yet implemented) and any unknown value are rejected (Story 2.7 BI-5); the
+// override controller maps this sentinel to the state_unavailable /
+// invalid_state rejection event + metric.
+var ErrInvalidOverrideState = errors.New("fsm: invalid override target state")
 
 // New constructs a Machine bound to the supplied config manager, metrics
 // registry, and sink, mirroring score.New ergonomics. A nil mgr degrades
@@ -402,6 +429,29 @@ func (m *Machine) Evaluate(workloadID string, score float64, packageID string) s
 		m.states[workloadID] = ws
 	}
 
+	// FR38 defer (Story 2.7 BI-2): while the workload is pinned by an
+	// operator override, skip the escalation/de-escalation computation
+	// entirely and return a no_transition with from==to==current. The
+	// dwell/cooldown anchors are deliberately NOT advanced (the pin freezes
+	// the workload), and because from==to the sink is not fired and the
+	// transition counter does not tick. Evaluate thus remains the sole
+	// AUTOMATED mutator: it makes no change here, Pin/ReleasePin own the
+	// override mutations.
+	if ws.overridden {
+		pinned := ws.current
+		m.mu.Unlock()
+		return schema.StateTransition{
+			Timestamp:   now,
+			FromState:   pinned,
+			ToState:     pinned,
+			TriggerType: "override",
+			Confidence:  score,
+			WorkloadID:  workloadID,
+			PackageID:   packageID,
+			Reason:      schema.ReasonNoTransition,
+		}
+	}
+
 	from := ws.current
 
 	// Refresh the rolling cooldown anchor: as long as the score is at or
@@ -483,6 +533,152 @@ func (m *Machine) Evaluate(workloadID string, score float64, packageID string) s
 		m.sink.Publish(st)
 	}
 	return st
+}
+
+// validOverrideTarget reports whether s is one of the four reachable Epic-2
+// states an operator may pin a workload to (Story 2.7 BI-5). PRESERVED_KILLED
+// (Epic 4) and any unknown value are rejected.
+func validOverrideTarget(s PodState) bool {
+	switch s {
+	case schema.StateClean, schema.StateSuspicious, schema.StateRestricted, schema.StateQuarantined:
+		return true
+	default:
+		return false
+	}
+}
+
+// Pin is the Story 2.7 operator-override entry (FR38). It pins workloadID's
+// FSM state to the requested target and marks the workload overridden so the
+// next Evaluate early-returns (the FR38 defer) without advancing timers.
+//
+// Validation: state MUST be a reachable Epic-2 target
+// (CLEAN/SUSPICIOUS/RESTRICTED/QUARANTINED); PRESERVED_KILLED and any unknown
+// value return ErrInvalidOverrideState and mutate nothing (BI-5). A pin on a
+// never-seen workload is legitimate (the entry is created at the target).
+//
+// Idempotency (BI-8): a pin to the SAME state the workload is already at
+// emits NO transition (the operator re-applied an unchanged annotation), but
+// the overridden flag is (re-)set so the defer stays active. A pin to a
+// DIFFERENT state advances ws.current, resets the dwell/cooldown anchors to
+// now, and emits a StateTransition with TriggerType "override" and Reason
+// operator_override through the SAME lock-release-then-Publish path Evaluate
+// uses, so the netpol manager applies (RESTRICTED/QUARANTINED) or removes
+// (CLEAN/SUSPICIOUS) the managed policies with NO new enforcement code (BI-7),
+// and the Redis FSM sink persists the pinned current state.
+//
+// operatorID, when non-empty, is stamped on the emitted transition's
+// OperatorID for the audit trail.
+func (m *Machine) Pin(workloadID string, state PodState, operatorID string) error {
+	if !validOverrideTarget(state) {
+		return fmt.Errorf("%w: %q", ErrInvalidOverrideState, state)
+	}
+	now := m.clock.Now()
+
+	m.mu.Lock()
+	ws, known := m.states[workloadID]
+	if !known {
+		ws = &workloadState{
+			current:                  schema.StateClean,
+			stateEnteredAt:           now,
+			lastAtOrAboveThresholdAt: now,
+		}
+		m.states[workloadID] = ws
+	}
+	from := ws.current
+	changed := state != ws.current
+	var st schema.StateTransition
+	if changed {
+		// Validate against the transition table for defence in depth; an
+		// override may legitimately jump more than one step (an operator may
+		// pin CLEAN straight to QUARANTINED), which ValidTransition permits on
+		// escalation only one step. Override is an operator-authorised set, so
+		// we do NOT gate it on the one-step escalation rule; we record the
+		// dwell of the state being left and apply the pin directly.
+		if m.metrics != nil && m.metrics.dwell != nil {
+			m.metrics.dwell.WithLabelValues(string(from)).Observe(now.Sub(ws.stateEnteredAt).Seconds())
+		}
+		ws.current = state
+		ws.stateEnteredAt = now
+		ws.lastAtOrAboveThresholdAt = now
+		st = schema.StateTransition{
+			Timestamp:   now,
+			FromState:   from,
+			ToState:     state,
+			TriggerType: "override",
+			OperatorID:  operatorID,
+			WorkloadID:  workloadID,
+			Reason:      schema.ReasonOperatorOverride,
+		}
+		m.recordMetrics(st)
+	}
+	ws.overridden = true
+	ws.overrideState = state
+	m.mu.Unlock()
+
+	if changed {
+		m.sink.Publish(st)
+	}
+	return nil
+}
+
+// ReleasePin is the Story 2.7 override release (FR39). It clears the
+// overridden flag so the NEXT Evaluate resumes score-driven control from the
+// released state, and resets the dwell/cooldown anchors to now so the first
+// post-release score is judged on a fresh window rather than the frozen one
+// (BI-6). It deliberately does NOT change ws.current: re-evaluation is
+// genuinely score-driven (the next inbound ThreatScore converges the state),
+// not a controller guess.
+//
+// Returns the state the workload was pinned at (so the controller can log the
+// resumed-from state) and ok=true when the workload existed; ok=false when the
+// workload is unknown (nothing to release). Releasing a known-but-not-pinned
+// workload returns its current state with ok=true and is a no-op on the flag.
+func (m *Machine) ReleasePin(workloadID string) (resumedFrom PodState, ok bool) {
+	now := m.clock.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ws, known := m.states[workloadID]
+	if !known {
+		return schema.StateClean, false
+	}
+	resumedFrom = ws.current
+	ws.overridden = false
+	ws.overrideState = ""
+	ws.stateEnteredAt = now
+	ws.lastAtOrAboveThresholdAt = now
+	return resumedFrom, true
+}
+
+// IsPinned reports whether workloadID is currently held by an operator
+// override. The override controller consults it to decide whether a pin must
+// be (re-)applied or is already in place (idempotent re-apply, BI-8). The read
+// is taken under the same RWMutex Pin/ReleasePin mutate the flag with.
+func (m *Machine) IsPinned(workloadID string) (state PodState, pinned bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if ws, ok := m.states[workloadID]; ok && ws.overridden {
+		return ws.overrideState, true
+	}
+	return schema.StateClean, false
+}
+
+// PinnedWorkloads returns the set of workload_ids currently held by an
+// operator override, keyed for set membership. The override controller's
+// release-detection reconcile unions this with the Redis-recorded set to find
+// workloads whose pin must be released (native-TTL expiry leaves a pinned FSM
+// with no Redis key, BI-4). The read is taken under the same RWMutex
+// Pin/ReleasePin mutate the flag with; the returned map is a fresh copy the
+// caller owns.
+func (m *Machine) PinnedWorkloads() map[string]PodState {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make(map[string]PodState)
+	for wl, ws := range m.states {
+		if ws.overridden {
+			out[wl] = ws.overrideState
+		}
+	}
+	return out
 }
 
 // recordMetrics increments the transition counter on actual state changes

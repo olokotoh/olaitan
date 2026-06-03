@@ -1,6 +1,7 @@
 package fsm
 
 import (
+	"errors"
 	"reflect"
 	"sync"
 	"testing"
@@ -432,10 +433,14 @@ func TestCurrentState_TrackedFlag(t *testing.T) {
 // workloadState directly). This is an API-shape assertion.
 func TestEncapsulation_EvaluateIsSoleMutator(t *testing.T) {
 	allowed := map[string]bool{
-		"Evaluate":     true, // sole runtime mutator (AC6)
-		"State":        true, // read-only query (BI-6)
-		"CurrentState": true, // read-only query with tracked flag (Story 2.6 BI-2c)
-		"Restore":      true, // startup-only rehydration mutator (Story 2.3 BI-5)
+		"Evaluate":        true, // sole AUTOMATED (score-driven) mutator (AC6)
+		"State":           true, // read-only query (BI-6)
+		"CurrentState":    true, // read-only query with tracked flag (Story 2.6 BI-2c)
+		"Restore":         true, // startup-only rehydration mutator (Story 2.3 BI-5)
+		"Pin":             true, // operator-override mutator (Story 2.7 BI-2)
+		"ReleasePin":      true, // operator-override release mutator (Story 2.7 BI-2)
+		"IsPinned":        true, // read-only override-pin query (Story 2.7 BI-8)
+		"PinnedWorkloads": true, // read-only override-pin set query (Story 2.7 BI-4)
 	}
 	mt := reflect.TypeOf(&Machine{})
 	for i := 0; i < mt.NumMethod(); i++ {
@@ -502,5 +507,162 @@ func TestNew_RealClockDefault(t *testing.T) {
 	// A real-clock Evaluate must still work end-to-end.
 	if st := m.Evaluate("w", 50, "p"); st.ToState != schema.StateSuspicious {
 		t.Fatalf("real clock evaluate: state = %s, want SUSPICIOUS", st.ToState)
+	}
+}
+
+// --- Story 2.7 operator override (Pin/ReleasePin/Evaluate defer) ---
+
+// TestPin_EmitsOverrideTransition pins Task 2.5: a Pin to a different state
+// emits exactly one transition through the sink with TriggerType "override"
+// and Reason operator_override (BI-7, the override's authoritative entry).
+func TestPin_EmitsOverrideTransition(t *testing.T) {
+	clock := newFakeClock()
+	m, sink := newMachineForTest(t, testConfig(0, 0, 0, 600), clock)
+
+	if err := m.Pin("w", schema.StateRestricted, "alice"); err != nil {
+		t.Fatalf("Pin: %v", err)
+	}
+	if sink.count() != 1 {
+		t.Fatalf("Pin emitted %d transitions, want exactly 1", sink.count())
+	}
+	st := sink.transitions[0]
+	if st.ToState != schema.StateRestricted || st.FromState != schema.StateClean {
+		t.Errorf("pin transition = %s->%s, want CLEAN->RESTRICTED", st.FromState, st.ToState)
+	}
+	if st.TriggerType != "override" {
+		t.Errorf("pin TriggerType = %q, want override", st.TriggerType)
+	}
+	if st.Reason != schema.ReasonOperatorOverride {
+		t.Errorf("pin Reason = %q, want operator_override", st.Reason)
+	}
+	if st.OperatorID != "alice" {
+		t.Errorf("pin OperatorID = %q, want alice", st.OperatorID)
+	}
+	if s, pinned := m.IsPinned("w"); !pinned || s != schema.StateRestricted {
+		t.Errorf("IsPinned(w) = (%s, %v), want (RESTRICTED, true)", s, pinned)
+	}
+}
+
+// TestPin_RejectsInvalidTarget pins BI-5: a pin to PRESERVED_KILLED or an
+// unknown state returns ErrInvalidOverrideState and mutates nothing.
+func TestPin_RejectsInvalidTarget(t *testing.T) {
+	clock := newFakeClock()
+	m, sink := newMachineForTest(t, testConfig(0, 0, 0, 600), clock)
+
+	for _, bad := range []schema.PodSecurityState{schema.StatePreservedKilled, "BOGUS"} {
+		if err := m.Pin("w", bad, ""); !errors.Is(err, ErrInvalidOverrideState) {
+			t.Errorf("Pin(%q) = %v, want ErrInvalidOverrideState", bad, err)
+		}
+	}
+	if sink.count() != 0 {
+		t.Fatalf("invalid pin emitted %d transitions, want 0", sink.count())
+	}
+	if _, pinned := m.IsPinned("w"); pinned {
+		t.Error("invalid pin left the workload pinned")
+	}
+}
+
+// TestPin_IdempotentSameState pins BI-8: re-pinning to the SAME state emits
+// no further transition but keeps the workload pinned.
+func TestPin_IdempotentSameState(t *testing.T) {
+	clock := newFakeClock()
+	m, sink := newMachineForTest(t, testConfig(0, 0, 0, 600), clock)
+
+	if err := m.Pin("w", schema.StateRestricted, ""); err != nil {
+		t.Fatalf("first Pin: %v", err)
+	}
+	if err := m.Pin("w", schema.StateRestricted, ""); err != nil {
+		t.Fatalf("second Pin: %v", err)
+	}
+	if sink.count() != 1 {
+		t.Fatalf("idempotent re-pin emitted %d transitions, want 1 (only the first)", sink.count())
+	}
+	if _, pinned := m.IsPinned("w"); !pinned {
+		t.Error("re-pin cleared the pin flag")
+	}
+}
+
+// TestEvaluate_NoOpWhilePinned pins the FR38 defer (BI-2): a pinned workload
+// returns no_transition for ANY score and never escalates/de-escalates, and
+// the dwell/cooldown timers are not advanced.
+func TestEvaluate_NoOpWhilePinned(t *testing.T) {
+	clock := newFakeClock()
+	m, sink := newMachineForTest(t, testConfig(0, 0, 0, 600), clock)
+
+	if err := m.Pin("w", schema.StateSuspicious, ""); err != nil {
+		t.Fatalf("Pin: %v", err)
+	}
+	sinkBefore := sink.count()
+
+	// A maximal score would normally drive escalation; while pinned it must not.
+	for i := 0; i < 5; i++ {
+		clock.advance(time.Hour)
+		st := m.Evaluate("w", 100, "p")
+		if st.FromState != schema.StateSuspicious || st.ToState != schema.StateSuspicious {
+			t.Fatalf("pinned Evaluate = %s->%s, want SUSPICIOUS->SUSPICIOUS", st.FromState, st.ToState)
+		}
+		if st.Reason != schema.ReasonNoTransition {
+			t.Errorf("pinned Evaluate Reason = %q, want no_transition", st.Reason)
+		}
+	}
+	if sink.count() != sinkBefore {
+		t.Errorf("pinned Evaluate fired the sink %d extra times, want 0", sink.count()-sinkBefore)
+	}
+	if m.State("w") != schema.StateSuspicious {
+		t.Errorf("pinned workload drifted to %s, want SUSPICIOUS", m.State("w"))
+	}
+}
+
+// TestReleasePin_ResumesScoreDrivenControl pins BI-6: after release the next
+// Evaluate runs the normal escalation logic from the released state.
+func TestReleasePin_ResumesScoreDrivenControl(t *testing.T) {
+	clock := newFakeClock()
+	m, _ := newMachineForTest(t, testConfig(0, 0, 0, 600), clock)
+
+	if err := m.Pin("w", schema.StateSuspicious, ""); err != nil {
+		t.Fatalf("Pin: %v", err)
+	}
+	resumed, ok := m.ReleasePin("w")
+	if !ok || resumed != schema.StateSuspicious {
+		t.Fatalf("ReleasePin = (%s, %v), want (SUSPICIOUS, true)", resumed, ok)
+	}
+	if _, pinned := m.IsPinned("w"); pinned {
+		t.Fatal("ReleasePin did not clear the pin flag")
+	}
+	// A high score now escalates one step from the released SUSPICIOUS state.
+	st := m.Evaluate("w", 100, "p")
+	if st.FromState != schema.StateSuspicious || st.ToState != schema.StateRestricted {
+		t.Fatalf("post-release Evaluate = %s->%s, want SUSPICIOUS->RESTRICTED (score-driven re-evaluation)", st.FromState, st.ToState)
+	}
+}
+
+// TestReleasePin_UnknownWorkload pins the ok=false branch.
+func TestReleasePin_UnknownWorkload(t *testing.T) {
+	clock := newFakeClock()
+	m, _ := newMachineForTest(t, testConfig(0, 0, 0, 600), clock)
+	if _, ok := m.ReleasePin("never-seen"); ok {
+		t.Error("ReleasePin(unknown) ok = true, want false")
+	}
+}
+
+// TestPin_CleanRoutesRemoval pins BI-7: a pin to CLEAN from a higher state
+// emits a transition INTO CLEAN (which the netpol manager treats as a removal
+// of all managed policies). We assert the sink sees the CLEAN transition.
+func TestPin_CleanRoutesRemoval(t *testing.T) {
+	clock := newFakeClock()
+	m, sink := newMachineForTest(t, testConfig(0, 0, 0, 600), clock)
+
+	if err := m.Pin("w", schema.StateQuarantined, ""); err != nil {
+		t.Fatalf("Pin QUARANTINED: %v", err)
+	}
+	if err := m.Pin("w", schema.StateClean, ""); err != nil {
+		t.Fatalf("Pin CLEAN: %v", err)
+	}
+	last := sink.transitions[len(sink.transitions)-1]
+	if last.ToState != schema.StateClean || last.FromState != schema.StateQuarantined {
+		t.Errorf("re-pin transition = %s->%s, want QUARANTINED->CLEAN (removal path)", last.FromState, last.ToState)
+	}
+	if last.TriggerType != "override" {
+		t.Errorf("re-pin TriggerType = %q, want override", last.TriggerType)
 	}
 }

@@ -983,6 +983,10 @@ type ResponseConfig struct {
 	// precedent); the manager is opt-in and defaults off until Story 2.10
 	// wires the graduated-isolation mode.
 	NetworkPolicy NetworkPolicyConfig `yaml:"network_policy,omitempty"`
+	// Story 2.7: override sub-block configures the operator-override
+	// controller (FR38/FR39). Enabled is pointer-tagged so an explicit
+	// `false` survives the loader; the controller is opt-in and defaults off.
+	Override OverrideConfig `yaml:"override,omitempty"`
 }
 
 // NetworkPolicyConfig configures the Story 2.4 RESTRICTED-state
@@ -1083,6 +1087,86 @@ func (n NetworkPolicyConfig) validate() error {
 	// required so in-cluster traffic and DNS are not blocked.
 	if n.Enabled != nil && *n.Enabled && len(n.ClusterCIDRs) == 0 {
 		return errors.New("response.network_policy.cluster_cidrs: at least one cluster CIDR (pod and/or service CIDR) is required when network_policy.enabled=true")
+	}
+	return nil
+}
+
+// OverrideConfig configures the Story 2.7 operator-override controller
+// (FR38/FR39). The controller polls (LISTs) pods for the
+// olaitan.io/state-override annotation, pins the FSM, and records an
+// override:{workload_id} Redis key with a native TTL.
+//
+// Enabled is pointer-tagged so an explicit `false` survives the loader (the
+// NetworkPolicyConfig.Enabled precedent); the default is OFF (opt-in).
+// PollIntervalSeconds is the reconcile cadence (default 15) and bounds the
+// release-detection latency to one tick (BI-4 / Open Assumption 1).
+// DefaultTTLSeconds is the override duration applied when the
+// olaitan.io/state-override-ttl annotation is absent or unparseable (default
+// 3600 = 1h, AC2 / BI-8).
+type OverrideConfig struct {
+	Enabled             *bool `yaml:"enabled,omitempty"`
+	PollIntervalSeconds *int  `yaml:"poll_interval_seconds,omitempty"`
+	DefaultTTLSeconds   *int  `yaml:"default_ttl_seconds,omitempty"`
+}
+
+// DefaultOverridePollSeconds is the override poll/reconcile cadence; 15 s is
+// well inside any operator-meaningful manual-override latency (BI-1).
+const DefaultOverridePollSeconds = 15
+
+// DefaultOverrideTTLSeconds is the override duration applied when the TTL
+// annotation is absent or unparseable (AC2 "default 1 hour if absent").
+const DefaultOverrideTTLSeconds = 3600
+
+// DefaultOverride returns the Story 2.7 defaults: disabled, a 15 s poll, and
+// a 1 h default TTL.
+func DefaultOverride() OverrideConfig {
+	enabled := false
+	poll := DefaultOverridePollSeconds
+	ttl := DefaultOverrideTTLSeconds
+	return OverrideConfig{
+		Enabled:             &enabled,
+		PollIntervalSeconds: &poll,
+		DefaultTTLSeconds:   &ttl,
+	}
+}
+
+// EnabledOrDefault reports whether the override controller is enabled,
+// treating a nil pointer as the default (false).
+func (o OverrideConfig) EnabledOrDefault() bool {
+	if o.Enabled == nil {
+		return false
+	}
+	return *o.Enabled
+}
+
+// PollIntervalSecondsOrDefault returns the effective poll cadence,
+// substituting the default when omitted.
+func (o OverrideConfig) PollIntervalSecondsOrDefault() int {
+	if o.PollIntervalSeconds == nil {
+		return DefaultOverridePollSeconds
+	}
+	return *o.PollIntervalSeconds
+}
+
+// DefaultTTLSecondsOrDefault returns the effective default override TTL,
+// substituting the 1 h default when omitted.
+func (o OverrideConfig) DefaultTTLSecondsOrDefault() int {
+	if o.DefaultTTLSeconds == nil {
+		return DefaultOverrideTTLSeconds
+	}
+	return *o.DefaultTTLSeconds
+}
+
+// validate enforces OverrideConfig invariants: a set poll interval and
+// default TTL must be positive. A fully-omitted block skips validation so
+// in-memory fixtures can leave it zero; Load substitutes DefaultOverride
+// before Validate.
+func (o OverrideConfig) validate() error {
+	if o.PollIntervalSeconds != nil && *o.PollIntervalSeconds < 1 {
+		return fmt.Errorf("response.override.poll_interval_seconds: must be >= 1 (got %d)", *o.PollIntervalSeconds)
+	}
+	if o.DefaultTTLSeconds != nil && *o.DefaultTTLSeconds < 1 {
+		return fmt.Errorf("response.override.default_ttl_seconds: must be >= 1 (got %d)", *o.DefaultTTLSeconds)
 	}
 	return nil
 }
@@ -1332,6 +1416,21 @@ func Load(path string) (*Config, error) {
 		if cfg.Response.NetworkPolicy.ReconcileIntervalSeconds == nil {
 			cfg.Response.NetworkPolicy.ReconcileIntervalSeconds = defNP.ReconcileIntervalSeconds
 		}
+
+		// Story 2.7: substitute Override defaults before Validate. The
+		// pointer-tagged Enabled lets an explicit `enabled: false` survive;
+		// the poll interval and default TTL inherit the 15 s / 1 h defaults
+		// when omitted.
+		defOvr := DefaultOverride()
+		if cfg.Response.Override.Enabled == nil {
+			cfg.Response.Override.Enabled = defOvr.Enabled
+		}
+		if cfg.Response.Override.PollIntervalSeconds == nil {
+			cfg.Response.Override.PollIntervalSeconds = defOvr.PollIntervalSeconds
+		}
+		if cfg.Response.Override.DefaultTTLSeconds == nil {
+			cfg.Response.Override.DefaultTTLSeconds = defOvr.DefaultTTLSeconds
+		}
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -1524,6 +1623,9 @@ func (r ResponseConfig) validate() error {
 		}
 	}
 	if err := r.NetworkPolicy.validate(); err != nil {
+		return err
+	}
+	if err := r.Override.validate(); err != nil {
 		return err
 	}
 	return nil
