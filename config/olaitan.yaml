@@ -198,6 +198,26 @@ response:
     - kube-system
     - olaitan
 
+  # Story 2.4: RESTRICTED-state NetworkPolicy enforcement (FR33/NFR6). When
+  # enabled, a workload entering the RESTRICTED FSM state is given a
+  # NetworkPolicy that allows egress only to the RFC 1918 private ranges
+  # (always allowed), the cluster pod/service CIDRs (cluster_cidrs), and any
+  # extra_allowed_cidrs, and blocks all other (external) egress so a suspect
+  # workload cannot exfiltrate to the internet while internal traffic keeps
+  # flowing. Disabled by default; the per-mode (RS/RSL/RSLT) graduated-
+  # isolation wiring is Story 2.10. Operators MUST set cluster_cidrs to
+  # their own pod and service CIDRs (the defaults below match the kind/
+  # Calico evaluation cluster) so in-cluster traffic and DNS (CoreDNS in the
+  # service CIDR) survive the egress block. reconcile_interval_seconds is
+  # the orphan-GC cadence and must stay within the 60 s budget.
+  network_policy:
+    enabled: false
+    cluster_cidrs:
+      - "10.244.0.0/16"
+      - "10.96.0.0/12"
+    extra_allowed_cidrs: []
+    reconcile_interval_seconds: 30
+
 analyst:
   provider: api
   api:

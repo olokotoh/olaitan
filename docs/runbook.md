@@ -312,6 +312,36 @@ A restart resets each recovered workload's de-escalation cooldown window (conser
 
 To disable persistence (sensing-only or a Redis-less deployment), set `detection.fsm.persistence_enabled: false` in the aggregator ConfigMap and `kubectl rollout restart deploy/olaitan-aggregator` (this knob is restart-required: it rewires the FSM sink and the restore hook).
 
+### 1.4c Response NetworkPolicy enforcement ring (Story 2.4 NEW)
+
+#### `olaitan_response_network_policy_apply_seconds`
+
+- **Type:** histogram
+- **Unit:** seconds
+- **Labels:** none.
+- **Help:** End-to-end latency from the FSM RESTRICTED transition timestamp to NetworkPolicy apply completion (NFR6, p99 within 1 s). Observed once per applied/no-op transition.
+- **Sample PromQL (p99):** `histogram_quantile(0.99, sum(rate(olaitan_response_network_policy_apply_seconds_bucket[5m])) by (le))`.
+- **Sample PromQL (alert):** `histogram_quantile(0.99, sum(rate(olaitan_response_network_policy_apply_seconds_bucket[5m])) by (le)) > 1` breaches the NFR6 budget.
+
+#### `olaitan_response_network_policy_apply_total`
+
+- **Type:** counter
+- **Unit:** count
+- **Labels:** `result` (one of `applied`, `noop`, `error`, `skipped`, `dropped`, `gc_deleted`).
+- **Help:** Cumulative NetworkPolicy enforcement actions by result (FR33). `applied` = a policy created or updated; `noop` = an idempotent re-apply that matched the live object; `skipped` = a workload in an excluded namespace or already deleted; `dropped` = a transition dropped because the apply queue was full; `gc_deleted` = an orphan policy garbage-collected after its workload was removed.
+- **Sample PromQL (error rate):** `sum(rate(olaitan_response_network_policy_apply_total{result="error"}[5m]))`.
+- **Sample PromQL (drops):** `increase(olaitan_response_network_policy_apply_total{result="dropped"}[15m]) > 0` indicates the FSM is producing RESTRICTED transitions faster than the worker can apply them; investigate API-server latency.
+
+#### Operator scenario: graduated isolation (RESTRICTED enforcement)
+
+When a workload's ThreatScore crosses the RESTRICTED band (default 40), the FSM transitions it to RESTRICTED and the NetworkPolicyManager applies a NetworkPolicy named `olaitan-restricted-<hash>` in the workload's namespace. The policy allows egress only to the RFC 1918 private ranges, the configured cluster pod/service CIDRs, and any `extra_allowed_cidrs`, plus an explicit DNS (UDP/TCP 53) rule, and blocks all other (external) egress; ingress is left untouched (the full ingress+egress block is the QUARANTINED state, Story 2.5). Confirm with `kubectl get networkpolicy -n <namespace> -l app.kubernetes.io/managed-by=olaitan` and inspect the `olaitan.io/fsm-state` and `olaitan.io/package-id` annotations to trace the policy back to the triggering evidence package.
+
+Enforcement is OFF by default. To enable it, set `response.network_policy.enabled: true` in the aggregator ConfigMap and, critically, set `response.network_policy.cluster_cidrs` to your cluster's own pod and service CIDRs (the defaults `10.244.0.0/16` and `10.96.0.0/12` match the kind/Calico evaluation cluster). If the service CIDR is omitted, in-cluster DNS resolution to CoreDNS can break under RESTRICTED. Then `kubectl rollout restart deploy/olaitan-aggregator`.
+
+Two real-world limitations apply. First, enforcement depends on a NetworkPolicy-compliant CNI (Calico, Cilium, Antrea); under a CNI that does not enforce NetworkPolicy (for example Flannel) the policy object is created but has no effect. Second, Kubernetes NetworkPolicies are additive: if a pre-existing permissive egress policy also selects the workload's pods, it unions with the Olaitan RESTRICTED policy and the egress block is not fully effective. The RESTRICTED egress block is fully effective only where no conflicting allow-policy selects the workload.
+
+Orphan policies (a workload deleted while RESTRICTED) are garbage-collected within 60 s by a periodic reconcile (default 30 s, tunable via `response.network_policy.reconcile_interval_seconds`) that deletes managed policies whose owner no longer exists.
+
 ### 1.5 Naming-convention reconciliation
 
 The Story 1.18 acceptance criteria text uses a mix of singular-ring and plural-ring metric names (e.g. AC2 says `olaitan_decision_rule_matches_total` singular; AC3 says `olaitan_decision_baseline_deviations_total{metric, sigma_bucket}` plural). The actual registrations follow `architecture.md:472-475` which mandates the `olaitan_<ring>_<metric>` pattern with the engine subfamily conventionally plural (`rules`, `baseline`) because the engine evaluates a corpus, not a single rule. The AC singular spellings are documentation aliases, not parallel families.
