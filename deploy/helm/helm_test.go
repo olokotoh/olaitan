@@ -3174,6 +3174,21 @@ func TestGraduatedIsolationBridgesFromValues(t *testing.T) {
 			t.Errorf("Story 2.10 bridge did not propagate %q; snippet:\n%s", want, snippet(rendered, "response:"))
 		}
 	}
+	// Boolean enable-flag propagation + the audit-vs-detection-audit
+	// disambiguation (the riskiest anchor): the response.* blocks must flip to
+	// enabled: true. The audit regex pins the trailing retention key, which
+	// exists ONLY under response.audit, so it proves the response block flipped
+	// and NOT detection.sources.audit. Indentation-tolerant (the config is
+	// embedded as an indented block scalar in the ConfigMap).
+	for name, re := range map[string]string{
+		"response.networkPolicy.enabled": `(?m)^\s+network_policy:\n\s+enabled: true`,
+		"response.override.enabled":      `(?m)^\s+override:\n\s+enabled: true`,
+		"response.audit.enabled":         `(?m)^\s+audit:\n\s+enabled: true\n\s+retention_transitions_days:`,
+	} {
+		if !regexp.MustCompile(re).MatchString(rendered) {
+			t.Errorf("%s did not flip the right block (pattern %q); snippet:\n%s", name, re, snippet(rendered, "response:"))
+		}
+	}
 }
 
 // TestGraduatedIsolationDefaultsAreNoOp (Story 2.10, BI-3/BI-4): with no
