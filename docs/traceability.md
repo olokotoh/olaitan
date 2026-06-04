@@ -442,6 +442,14 @@ NFR42 while the auditable chain is preserved row-for-row. New PRs from Story
 - **eval_run_ids rationale:** response-ring SIEM audit substrate, not an Epic-5 evaluation-bearing claim.
 - **Bundled CI fix.** A latent e2e `InvalidImageName` failure (surfaced while clearing the staging-tip red, operator-directed) was root-caused and fixed: `helm --set image.tag=<all-numeric-short-sha>` type-infers an int64, so the chart's `printf "%s:%s"` rendered `olaitan:%!s(int64=...)`. Fixed with `toString` in the `olaitan.image` helper (`deploy/helm/olaitan/templates/_helpers.tpl`) plus `--set-string` in `.github/workflows/ci.yml` and the `e2e-local` Makefile target. Deterministic for the ~3% of commits whose short SHA is all-digits, which is why the all-numeric staging-tip commit failed while its hex-containing parent passed.
 
+### `c3.7.x-observability`
+
+- **Story:** 2.9 (graduated-isolation observability surface, NFR32).
+- **Merge SHA:** `bb6972c` (PR [#37](https://github.com/olokotoh/olaitan/pull/37), squash-merged to the `epic-2-staging` integration branch 2026-06-04; pending review before `main`). Two bmad-code-review rounds (round 1 clean, no HIGH/MED; round-1 follow-up closed a LOW test-coverage gap - the audit drop-counter pull-pattern + an override no-double-count assertion + a netpol quarantined-zero assertion; round 2 regression-clean, race x2) plus Copilot (no comments).
+- **FRs/NFRs:** NFR32 (satisfied; every Epic 2 metric documented with type/unit/labels + sample PromQL in the runbook). The FSM surface shipped in Story 2.2; this added override `applied_total{state}`/`active{state}`, netpol `network_policy_active{state}`, and the two audit drop pull-counters.
+- **ADRs:** none. **eval_run_ids rationale:** response-ring observability substrate, not an Epic-5 evaluation-bearing claim.
+- **BI-2 metric-name reconciliation:** kept the shipped `olaitan_response_network_policy_*` family (the AC's `networkpolicy_apply_duration_seconds` spelling would break Story 2.4 tests + dashboards); documented in `docs/runbook.md` §1.
+
 ## Conventions
 
 - **`claim_id` grammar.** `c<chapter>.<section>[.<sub>]-<short-slug>`. The slug
