@@ -1,0 +1,63 @@
+# Human-readable mirror of the AUDIT.overrides wire event.
+#
+# AUTHORITATIVE validation source: docs/schemas/audit/overrides.json
+# (draft 2020-12). This YAML is the documentation mirror; the .json is what
+# the integration tests validate against (BI-6). Source of truth for the Go
+# shape: internal/response/override/audit.go (type AuditOverride).
+#
+# Story 2.8 (FR40). The append-only SIEM copy of an operator override
+# application or rejection, published to AUDIT.overrides (365 d LimitsPolicy
+# retention). Mirrors the operational OverrideApplied (OVERRIDES.applied)
+# shape with an independent schema_version. A rejected override emits this
+# event but NO AUDIT.transitions event (a rejection changes no state, BI-10).
+schema: audit.overrides.v1
+subject: AUDIT.overrides
+fields:
+  schema_version:
+    type: string
+    required: true
+    description: Always "audit.overrides.v1".
+  workload_id:
+    type: string
+    required: true
+    description: The WorkloadIdentity canonical string.
+  requested_state:
+    type: string
+    required: true
+    description: >
+      The operator-requested target. NOT state-enum-constrained: a rejection
+      carries the RAW (possibly invalid) requested annotation value.
+  before_state:
+    type: string
+    required: true
+    description: The FSM state the workload was in before the override.
+  ttl_seconds:
+    type: integer
+    required: true
+    description: FR40 override duration in seconds.
+  operator_id:
+    type: string
+    required: false
+    description: User attribution, FR40 (omitempty).
+  source:
+    type: string
+    required: true
+    description: Annotation source (pod / owner).
+  rejected:
+    type: boolean
+    required: true
+    description: true for a rejected override, false for an applied one.
+  reason:
+    type: string
+    required: false
+    enum: [state_unavailable, invalid_state]
+    description: Rejection reason (omitempty; set only when rejected=true).
+  published_at:
+    type: string
+    format: date-time
+    required: true
+    description: When the audit event was emitted onto NATS.
+  applied_at_ns:
+    type: integer
+    required: true
+    description: Applied-at nanosecond timestamp; the dedup msgID key (0 on rejection).

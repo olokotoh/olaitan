@@ -36,7 +36,14 @@ type Controller struct {
 	store     *Store
 	machine   *fsm.Machine
 	publisher OverridePublisher
-	log       *slog.Logger
+	// auditPublisher is the optional Story 2.8 SIEM audit seam (BI-2). When
+	// non-nil, each operational OVERRIDES.applied publish is mirrored to an
+	// append-only AUDIT.overrides event built from the SAME in-memory
+	// OverrideApplied. nil = no audit (off-by-default, BI-8). Set once at wiring
+	// time via SetAuditPublisher, before Run, while the controller is still
+	// single-threaded; read-only for the poll loop thereafter.
+	auditPublisher AuditOverridePublisher
+	log            *slog.Logger
 
 	poll       time.Duration
 	defaultTTL time.Duration
@@ -146,6 +153,31 @@ func New(cfg Config, cs kubernetes.Interface, store *Store, machine *fsm.Machine
 		}
 	}
 	return c, nil
+}
+
+// SetAuditPublisher installs the optional Story 2.8 SIEM audit seam (BI-2).
+// Like the netpol SetPolicyAuditPublisher / SetStateOracle precedent, it is a
+// setter rather than a New parameter so the existing call sites and tests are
+// unchanged and the audit adapter (wired at cmd/olaitan after the controller
+// exists) is fully optional: a nil publisher leaves auditing off. It MUST be
+// called once before Run starts, while the controller is still single-threaded;
+// the field is then read-only for the poll loop.
+func (c *Controller) SetAuditPublisher(p AuditOverridePublisher) {
+	c.auditPublisher = p
+}
+
+// auditOverride mirrors an operational OverrideApplied event to the append-only
+// AUDIT.overrides subject when the audit seam is installed (BI-2). It is a
+// guarded no-op when c.auditPublisher == nil. A publish failure is logged and
+// swallowed (BI-5.2): an audit-emission gap must never abort a poll tick or
+// strand a pin.
+func (c *Controller) auditOverride(ctx context.Context, evt OverrideApplied) {
+	if c.auditPublisher == nil {
+		return
+	}
+	if err := c.auditPublisher.PublishAuditOverride(ctx, auditOverrideFromApplied(evt)); err != nil {
+		c.log.Warn("override: publish audit override failed", "workload_id", evt.WorkloadID, "rejected", evt.Rejected, "err", err)
+	}
 }
 
 func (c *Controller) registerMetrics(r *metrics.Registry) error {
@@ -523,6 +555,10 @@ func (c *Controller) applyDesired(ctx context.Context, workloadID string, d desi
 	if err := c.publisher.PublishOverride(ctx, evt); err != nil {
 		c.log.Warn("override: publish applied failed", "workload_id", workloadID, "err", err)
 	}
+	// Story 2.8 (BI-2): mirror the SAME applied event to the append-only
+	// AUDIT.overrides SIEM subject. Built from the same evt so the SIEM copy
+	// cannot drift; best-effort (BI-5.2).
+	c.auditOverride(ctx, evt)
 }
 
 // detectHardDeadlineExpiry handles the FR39 hard-deadline release with
@@ -670,5 +706,10 @@ func (c *Controller) emitRejection(ctx context.Context, d desired) {
 	if err := c.publisher.PublishOverride(ctx, evt); err != nil {
 		c.log.Warn("override: publish rejection failed", "workload_id", d.workloadID, "err", err)
 	}
+	// Story 2.8 (BI-2/BI-2.4): mirror the rejection to AUDIT.overrides. This
+	// publish lives AFTER the lastRejected dedup gate above, so a standing
+	// invalid annotation yields exactly ONE AUDIT.overrides rejection line, not
+	// one per poll. Best-effort (BI-5.2).
+	c.auditOverride(ctx, evt)
 	c.log.Warn("override: rejected", "workload_id", d.workloadID, "requested_state", d.requestedRaw, "reason", d.rejectReason)
 }

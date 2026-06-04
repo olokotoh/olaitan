@@ -547,7 +547,7 @@ func TestDeleteSupersededRestricted_NoOpWhenAbsent(t *testing.T) {
 	ref := workloadRef{namespace: "ns", ownerKind: "Deployment", ownerName: "web"}
 	// No restricted policy exists; the delete must be a silent no-op (NotFound
 	// treated as success, no panic, no error surfaced).
-	m.deleteSupersededRestricted(ctx, ref, "ns/Deployment/web")
+	m.deleteSupersededRestricted(ctx, ref, "ns/Deployment/web", "")
 }
 
 // syntheticAPIError is a non-NotFound, non-AlreadyExists server error the
@@ -998,7 +998,7 @@ func TestDeleteSupersededQuarantine_NoOpWhenAbsent(t *testing.T) {
 	ctx := context.Background()
 	ref := workloadRef{namespace: "ns", ownerKind: "Deployment", ownerName: "web"}
 	// No quarantine policy exists; the delete must be a silent no-op.
-	m.deleteSupersededQuarantine(ctx, ref, "ns/Deployment/web")
+	m.deleteSupersededQuarantine(ctx, ref, "ns/Deployment/web", "")
 }
 
 func TestHandle_SuspiciousRemovesBothPolicies(t *testing.T) {

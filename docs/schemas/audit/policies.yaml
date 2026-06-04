@@ -1,0 +1,66 @@
+# Human-readable mirror of the AUDIT.policies wire event.
+#
+# AUTHORITATIVE validation source: docs/schemas/audit/policies.json
+# (draft 2020-12). This YAML is the documentation mirror; the .json is what
+# the integration tests validate against (BI-6). Source of truth for the Go
+# shape: internal/response/audit/events.go (type AuditPolicy).
+#
+# Story 2.8 (FR40). The append-only SIEM projection of a single NetworkPolicy
+# mutation, published to AUDIT.policies (365 d LimitsPolicy retention).
+# Records MUTATIONS only (BI-9): an idempotent noop / NotFound delete / skipped
+# / errored apply produces NO event. spec_summary is a compact closed enum,
+# NOT a full-object diff (BI-11). policy_name/policy_kind are omitted on a
+# deescalation_remove (a managed-SET removal has no single object).
+schema: audit.policies.v1
+subject: AUDIT.policies
+fields:
+  schema_version:
+    type: string
+    required: true
+    description: Always "audit.policies.v1".
+  action:
+    type: string
+    required: true
+    enum: [apply, supersede_delete, deescalation_remove, gc_delete]
+    description: Which kind of real cluster mutation this records (BI-9).
+  workload_id:
+    type: string
+    required: true
+    description: The WorkloadIdentity canonical string.
+  namespace:
+    type: string
+    required: true
+    description: The namespace of the mutated policy.
+  policy_name:
+    type: string
+    required: false
+    description: The mutated policy's name (omitted on a deescalation_remove set removal).
+  policy_kind:
+    type: string
+    required: false
+    enum: [restricted, quarantined]
+    description: The policy family (omitted on a deescalation_remove set removal).
+  fsm_state:
+    type: string
+    required: true
+    enum: [CLEAN, SUSPICIOUS, RESTRICTED, QUARANTINED, PRESERVED_KILLED]
+    description: The FSM state at the time of mutation (BI-3.4).
+  result:
+    type: string
+    required: true
+    enum: [applied, superseded, removed, gc_deleted]
+    description: The apply-result string the metric counts (BI-9).
+  spec_summary:
+    type: string
+    required: true
+    enum: [egress_allowlist, deny_all, removed]
+    description: Compact policy-shape enum (BI-4.3/BI-11), NOT a full diff.
+  package_id:
+    type: string
+    required: false
+    description: The triggering EvidencePackage id when present (omitempty).
+  published_at:
+    type: string
+    format: date-time
+    required: true
+    description: When the audit event was emitted onto NATS.

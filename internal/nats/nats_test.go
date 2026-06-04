@@ -657,6 +657,89 @@ func TestStreamConfigsCoversOverridesApplied(t *testing.T) {
 	t.Fatalf("StreamConfigs: no stream covers subjects.OverridesApplied (%q)", subjects.OverridesApplied)
 }
 
+// findStream returns the stream config covering subj, or fails.
+func findStreamFor(t *testing.T, configs []jetstream.StreamConfig, subj string) jetstream.StreamConfig {
+	t.Helper()
+	for _, cfg := range configs {
+		for _, s := range cfg.Subjects {
+			if s == subj {
+				return cfg
+			}
+		}
+	}
+	t.Fatalf("no stream covers subject %q", subj)
+	return jetstream.StreamConfig{}
+}
+
+// TestStreamConfigsCoversAuditSubjects pins Story 2.8 (BI-7): each of the three
+// AUDIT subjects is covered by a dedicated stream with the AC4 default
+// retention and a >= 2m dedup window.
+func TestStreamConfigsCoversAuditSubjects(t *testing.T) {
+	configs := natsclient.StreamConfigs()
+	cases := []struct {
+		subject string
+		stream  string
+		maxAge  time.Duration
+	}{
+		{subjects.AuditTransitions, "AUDIT_TRANSITIONS", 90 * 24 * time.Hour},
+		{subjects.AuditOverrides, "AUDIT_OVERRIDES", 365 * 24 * time.Hour},
+		{subjects.AuditPolicies, "AUDIT_POLICIES", 365 * 24 * time.Hour},
+	}
+	for _, c := range cases {
+		cfg := findStreamFor(t, configs, c.subject)
+		if cfg.Name != c.stream {
+			t.Errorf("%s covered by %q, want %q", c.subject, cfg.Name, c.stream)
+		}
+		if cfg.MaxAge != c.maxAge {
+			t.Errorf("%s MaxAge = %s, want %s", c.stream, cfg.MaxAge, c.maxAge)
+		}
+		if cfg.Duplicates < 2*time.Minute {
+			t.Errorf("%s Duplicates = %s, want >= 2m", c.stream, cfg.Duplicates)
+		}
+	}
+}
+
+// TestAuditStreamsAreLimitsPolicy is the NFR16 guard (BI-7): every AUDIT_*
+// stream MUST be LimitsPolicy (append-only by retention), NOT
+// Interest/WorkQueue (which delete on consumer ack and would let a consumer
+// effectively delete audit events). A future regression here fails CI.
+func TestAuditStreamsAreLimitsPolicy(t *testing.T) {
+	for _, subj := range []string{subjects.AuditTransitions, subjects.AuditOverrides, subjects.AuditPolicies} {
+		cfg := findStreamFor(t, natsclient.StreamConfigs(), subj)
+		if cfg.Retention != jetstream.LimitsPolicy {
+			t.Errorf("%s: Retention = %v, want LimitsPolicy (NFR16 append-only)", cfg.Name, cfg.Retention)
+		}
+		if cfg.Storage != jetstream.FileStorage {
+			t.Errorf("%s: Storage = %v, want FileStorage", cfg.Name, cfg.Storage)
+		}
+	}
+}
+
+// TestStreamConfigsWithAuditOverridesMaxAge pins BI-8: an operator-tuned
+// AuditRetention overrides the baked-in MaxAge (positive values only), so AC4's
+// Helm-tunability is real; a zero leaves the default.
+func TestStreamConfigsWithAuditOverridesMaxAge(t *testing.T) {
+	ar := natsclient.AuditRetention{
+		Transitions: 7 * 24 * time.Hour,
+		// Overrides left zero -> keep default 365 d.
+		Policies: 30 * 24 * time.Hour,
+	}
+	configs := natsclient.StreamConfigsWithAudit(ar)
+	if got := findStreamFor(t, configs, subjects.AuditTransitions).MaxAge; got != 7*24*time.Hour {
+		t.Errorf("transitions MaxAge = %s, want 7d (operator override)", got)
+	}
+	if got := findStreamFor(t, configs, subjects.AuditOverrides).MaxAge; got != 365*24*time.Hour {
+		t.Errorf("overrides MaxAge = %s, want 365d (zero override keeps default)", got)
+	}
+	if got := findStreamFor(t, configs, subjects.AuditPolicies).MaxAge; got != 30*24*time.Hour {
+		t.Errorf("policies MaxAge = %s, want 30d (operator override)", got)
+	}
+	// A non-audit stream is untouched by the override.
+	if got := findStreamFor(t, configs, subjects.OverridesApplied).MaxAge; got != 365*24*time.Hour {
+		t.Errorf("OVERRIDES MaxAge unexpectedly changed: %s", got)
+	}
+}
+
 func TestStreamConfigsDeepCopy(t *testing.T) {
 	a := natsclient.StreamConfigs()
 	b := natsclient.StreamConfigs()
