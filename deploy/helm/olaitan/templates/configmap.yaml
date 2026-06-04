@@ -448,6 +448,114 @@ data:
     {{- $pFra := "(?s)(\\n    persistence_enabled:[[:space:]]+(?:true|false)\\n    )redis_addr:[[:space:]]+\"[^\"]*\"" -}}
     {{- if not (mustRegexFind $pFra $cfg) }}{{- fail (printf "helm bridge: detection.fsm.redis_addr anchor not found in config/olaitan.yaml (pattern %q). Bridge broken; --set values would be silently dropped." $pFra) }}{{- end }}
     {{- $cfg = regexReplaceAll $pFra $cfg (printf "${1}redis_addr: %q" $fsmRedisAddr) }}
+    {{- /*
+    Story 2.10: FSM ThreatScore thresholds overlay (FR47/FR49). Maps
+    fsm.thresholds.{suspicious,restricted,quarantined} onto
+    detection.confidence_bands.{watch,alert,act}. Each anchor is chained on
+    the preceding confidence_bands line so it cannot match a stray scalar
+    elsewhere; each carries a mustRegexFind guard.
+    */ -}}
+    {{- $th := $fsm.thresholds | default dict }}
+    {{- if hasKey $th "suspicious" }}
+    {{- $p := "(?s)(\\n  confidence_bands:\\n    watch: )[0-9]+" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: confidence_bands.watch anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $th.suspicious) }}
+    {{- end }}
+    {{- if hasKey $th "restricted" }}
+    {{- $p := "(?s)(\\n    watch: [0-9]+\\n    alert: )[0-9]+" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: confidence_bands.alert anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $th.restricted) }}
+    {{- end }}
+    {{- if hasKey $th "quarantined" }}
+    {{- $p := "(?s)(\\n    alert: [0-9]+\\n    act: )[0-9]+" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: confidence_bands.act anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $th.quarantined) }}
+    {{- end }}
+    {{- /*
+    Story 2.10: FSM dwell guards + de-escalation cooldown overlay (FR49). The
+    keys are unique strings under detection.fsm so simple anchors are safe.
+    */ -}}
+    {{- $dw := $fsm.dwellSeconds | default dict }}
+    {{- range $k, $cfgKey := dict "suspicious" "suspicious_dwell_seconds" "restricted" "restricted_dwell_seconds" "quarantined" "quarantined_dwell_seconds" }}
+    {{- if hasKey $dw $k }}
+    {{- $p := printf "(\\n    %s: )[0-9]+" $cfgKey -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: detection.fsm.%s anchor not found (pattern %q)" $cfgKey $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" (index $dw $k)) }}
+    {{- end }}
+    {{- end }}
+    {{- if not (kindIs "invalid" $fsm.deescalationCooldownSeconds) }}
+    {{- $p := "(\\n    deescalation_cooldown_seconds: )[0-9]+" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: detection.fsm.deescalation_cooldown_seconds anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $fsm.deescalationCooldownSeconds) }}
+    {{- end }}
+    {{- end }}
+    {{- /*
+    Story 2.10: response-ring graduated-isolation overlay (FR47/FR49). Bridges
+    response.{networkPolicy,override,audit} values onto the config/olaitan.yaml
+    response block. Enable-flag anchors are disambiguated by their parent block
+    (network_policy / override / audit under response:) since all three default
+    to `enabled: false`; the audit enable anchor additionally pins the trailing
+    retention key so it cannot match the detection.sources.audit block. CIDR
+    lists are addressed below.
+    */ -}}
+    {{- if .Values.response }}
+    {{- $rsp := .Values.response }}
+    {{- $np := $rsp.networkPolicy | default dict }}
+    {{- if hasKey $np "enabled" }}
+    {{- $p := "(\\n  network_policy:\\n    enabled: )(?:true|false)" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.network_policy.enabled anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $np.enabled) }}
+    {{- end }}
+    {{- if hasKey $np "reconcileIntervalSeconds" }}
+    {{- $p := "(\\n    reconcile_interval_seconds: )[0-9]+" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.network_policy.reconcile_interval_seconds anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $np.reconcileIntervalSeconds) }}
+    {{- end }}
+    {{- if $np.clusterCidrs }}
+    {{- $items := "" }}
+    {{- range $c := $np.clusterCidrs }}{{- $items = printf "%s      - %s\n" $items $c }}{{- end }}
+    {{- $p := "(?s)(\\n    cluster_cidrs:\\n)(?:      - [^\\n]*\\n)+(    extra_allowed_cidrs:)" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.network_policy.cluster_cidrs anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%s${2}" $items) }}
+    {{- end }}
+    {{- if $np.extraAllowedCidrs }}
+    {{- $items := "" }}
+    {{- range $c := $np.extraAllowedCidrs }}{{- $items = printf "%s      - %s\n" $items $c }}{{- end }}
+    {{- /* the default config carries `extra_allowed_cidrs: []`; replace the
+           empty-list scalar with a rendered block list when the operator sets it. */ -}}
+    {{- $p := "(\\n    extra_allowed_cidrs:) \\[\\]" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.network_policy.extra_allowed_cidrs anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}\n%s" $items) }}
+    {{- end }}
+    {{- $ov := $rsp.override | default dict }}
+    {{- if hasKey $ov "enabled" }}
+    {{- $p := "(\\n  override:\\n    enabled: )(?:true|false)" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.override.enabled anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $ov.enabled) }}
+    {{- end }}
+    {{- if hasKey $ov "pollIntervalSeconds" }}
+    {{- $p := "(\\n    poll_interval_seconds: )[0-9]+" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.override.poll_interval_seconds anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $ov.pollIntervalSeconds) }}
+    {{- end }}
+    {{- if hasKey $ov "defaultTtlSeconds" }}
+    {{- $p := "(\\n    default_ttl_seconds: )[0-9]+" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.override.default_ttl_seconds anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $ov.defaultTtlSeconds) }}
+    {{- end }}
+    {{- $au := $rsp.audit | default dict }}
+    {{- if hasKey $au "enabled" }}
+    {{- $p := "(\\n  audit:\\n    enabled: )(?:true|false)(\\n    retention_transitions_days:)" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.audit.enabled anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v${2}" $au.enabled) }}
+    {{- end }}
+    {{- range $k, $cfgKey := dict "retentionTransitionsDays" "retention_transitions_days" "retentionOverridesDays" "retention_overrides_days" "retentionPoliciesDays" "retention_policies_days" }}
+    {{- if hasKey $au $k }}
+    {{- $p := printf "(\\n    %s: )[0-9]+" $cfgKey -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.audit.%s anchor not found (pattern %q)" $cfgKey $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" (index $au $k)) }}
+    {{- end }}
+    {{- end }}
     {{- end }}
     {{- /*
     Story 1.19: Evaluation-matrix overlay (FR53). Replace the file-side

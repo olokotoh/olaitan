@@ -452,6 +452,31 @@ Sample PromQL (scaffolding; finalised in Epic 6):
 - Apply latency SLO (NFR6): `histogram_quantile(0.99, sum by (le) (rate(olaitan_response_network_policy_apply_seconds_bucket[5m])))`
 - Audit loss: `increase(olaitan_response_audit_transitions_dropped_total[5m]) > 0`
 
+#### Enabling graduated isolation via Helm (Story 2.10, FR47/FR49)
+
+`helm upgrade olaitan deploy/helm/olaitan/` from an Epic 1 sensing-only
+deployment adds the Epic 2 surface without disrupting in-flight evidence
+packages (AC1). Isolation defaults OFF; enable it explicitly (it is NOT
+auto-enabled by the RS evaluation arm). All knobs are surfaced in values.yaml
+and overlaid onto the running config via the ConfigMap watcher (hot-reloadable
+except where a per-knob comment marks it restart-required):
+
+```
+--set response.networkPolicy.enabled=true \
+--set response.networkPolicy.clusterCidrs='{10.244.0.0/16,10.96.0.0/12}' \
+--set response.override.enabled=true \
+--set response.audit.enabled=true \
+--set fsm.thresholds.suspicious=20 --set fsm.thresholds.restricted=40 --set fsm.thresholds.quarantined=70 \
+--set fsm.dwellSeconds.restricted=120 --set fsm.deescalationCooldownSeconds=600 \
+--set response.audit.retentionTransitionsDays=90
+```
+
+Operators MUST set `response.networkPolicy.clusterCidrs` to their cluster's
+real pod/service CIDRs so in-cluster traffic and DNS survive the RESTRICTED
+egress block. A values key left at its default leaves the baked
+config/olaitan.yaml default untouched (the overlay only fires when the value is
+set), so the chart and config defaults cannot diverge.
+
 ### 1.5 Naming-convention reconciliation
 
 The Story 1.18 acceptance criteria text uses a mix of singular-ring and plural-ring metric names (e.g. AC2 says `olaitan_decision_rule_matches_total` singular; AC3 says `olaitan_decision_baseline_deviations_total{metric, sigma_bucket}` plural). The actual registrations follow `architecture.md:472-475` which mandates the `olaitan_<ring>_<metric>` pattern with the engine subfamily conventionally plural (`rules`, `baseline`) because the engine evaluates a corpus, not a single rule. The AC singular spellings are documentation aliases, not parallel families.
