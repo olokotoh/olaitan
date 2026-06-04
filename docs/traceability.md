@@ -451,6 +451,13 @@ NFR42 while the auditable chain is preserved row-for-row. New PRs from Story
 - **ADRs:** none. **eval_run_ids rationale:** response-ring observability substrate, not an Epic-5 evaluation-bearing claim.
 - **BI-2 metric-name reconciliation:** kept the shipped `olaitan_response_network_policy_*` family (the AC's `networkpolicy_apply_duration_seconds` spelling would break Story 2.4 tests + dashboards); documented in `docs/runbook.md` §1.
 
+### `c3.8.x-helm-graduated-isolation`
+
+- **Story:** 2.10 (Helm chart wiring for graduated-isolation mode, FR47/FR49). Epic 2 closure.
+- **Merge SHA:** `0f55025` (PR [#38](https://github.com/olokotoh/olaitan/pull/38), squash-merged to the `epic-2-staging` integration branch 2026-06-04; pending review before `main`). Two bmad-code-review rounds (round 1 clean - all 18 bridge anchors verified unique, CIDR YAML valid, no golden drift; round-1 follow-up regression-locked the audit-vs-detection-audit disambiguation; round 2 regression-clean, 115 helm tests, lint clean) plus Copilot (no comments).
+- **FRs/NFRs:** FR47/FR49 (satisfied; every Epic 2 knob is values-surfaced and overlaid onto the running config via the ConfigMap watcher, with mustRegexFind fail-fast guards). NFR31 (helm lint clean, goldens regenerated/unchanged). The values-bridge + golden + lint are the binding gate; AC4/AC5's full S5 e2e chain is covered by the shipped kind RS smoke + the Story 2.4/2.7/2.8 suites (BI-5).
+- **ADRs:** none. **eval_run_ids rationale:** chart-wiring substrate, not an Epic-5 evaluation-bearing claim.
+
 ## Conventions
 
 - **`claim_id` grammar.** `c<chapter>.<section>[.<sub>]-<short-slug>`. The slug
