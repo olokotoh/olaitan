@@ -1207,9 +1207,20 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 
 	// Provision JetStream streams once at startup. EnsureStreams is
 	// idempotent so a re-run on a pre-existing stream is a no-op.
+	// Story 2.8: use the same audit retention as the aggregator so that
+	// whichever ring wins the startup race provisions the AUDIT_* streams with
+	// identical MaxAge (no transient default-retention window if an operator has
+	// tuned response.audit.retention_*_days). The aggregator remains the
+	// retention authority; this just keeps the collector's create-or-update
+	// consistent with it.
 	streamsCtx, streamsCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer streamsCancel()
-	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigs()); err != nil {
+	auditRetention := natsclient.AuditRetention{
+		Transitions: time.Duration(cfg.Response.Audit.RetentionTransitionsDaysOrDefault()) * 24 * time.Hour,
+		Overrides:   time.Duration(cfg.Response.Audit.RetentionOverridesDaysOrDefault()) * 24 * time.Hour,
+		Policies:    time.Duration(cfg.Response.Audit.RetentionPoliciesDaysOrDefault()) * 24 * time.Hour,
+	}
+	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigsWithAudit(auditRetention)); err != nil {
 		closeNATS()
 		return fmt.Errorf("collector: ensure streams: %w", err)
 	}
