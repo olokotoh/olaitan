@@ -671,6 +671,29 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 			closeNATS()
 			return fmt.Errorf("aggregator: audit override publisher: %w", oerr)
 		}
+		// Story 2.9 (BI-5): surface the buffered audit sinks' overflow-drop
+		// counters as pull-based Prometheus counters (deferred from Story 2.8).
+		// Distinct names per subject avoid a labelled-vec duplicate registration.
+		if metricsReg != nil {
+			ts := auditTransitionSink
+			ps := auditPolicySink
+			if rerr := metricsReg.RegisterCounter(
+				"olaitan_response_audit_transitions_dropped_total", "",
+				"Cumulative AUDIT.transitions audit events dropped due to buffer overflow during a NATS outage (Story 2.9 / 2.8 BI-5).",
+				nil, func() int64 { return ts.Dropped() },
+			); rerr != nil {
+				closeNATS()
+				return fmt.Errorf("aggregator: audit transitions dropped counter: %w", rerr)
+			}
+			if rerr := metricsReg.RegisterCounter(
+				"olaitan_response_audit_policies_dropped_total", "",
+				"Cumulative AUDIT.policies audit events dropped due to buffer overflow during a NATS outage (Story 2.9 / 2.8 BI-5).",
+				nil, func() int64 { return ps.Dropped() },
+			); rerr != nil {
+				closeNATS()
+				return fmt.Errorf("aggregator: audit policies dropped counter: %w", rerr)
+			}
+		}
 	}
 
 	var sinks fsm.MultiSink

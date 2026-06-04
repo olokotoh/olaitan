@@ -177,6 +177,10 @@ type Manager struct {
 
 	applySeconds prometheus.Histogram
 	applyTotal   *prometheus.CounterVec
+	// active is the Story 2.9 gauge of currently-managed NetworkPolicies per
+	// kind (restricted/quarantined), set each reconcile pass from the managed
+	// policy list (BI-4). nil-guarded.
+	active *prometheus.GaugeVec
 }
 
 // New constructs a Manager. cs must be non-nil. registry may be nil to skip
@@ -355,7 +359,45 @@ func (m *Manager) registerMetrics(r *metrics.Registry) error {
 	for _, result := range []string{"applied", "noop", "error", "skipped", "dropped", "gc_deleted", "superseded", "removed"} {
 		cv.WithLabelValues(result).Add(0)
 	}
+
+	// Story 2.9 (AC3, BI-2/BI-4): gauge of currently-managed NetworkPolicies per
+	// kind. The name keeps the shipped network_policy_* family prefix (the AC's
+	// "networkpolicy" spelling is reconciled to the shipped family). Set each
+	// reconcile pass from the managed-policy list; pre-init both kinds to 0.
+	gv, err := r.RegisterGaugeVec(
+		"olaitan_response_network_policy_active",
+		"Current number of Olaitan-managed NetworkPolicies per kind (restricted/quarantined), refreshed each reconcile pass from the managed-by=olaitan policy list (Story 2.9, AC3).",
+		[]string{"state"},
+	)
+	if err != nil {
+		return err
+	}
+	for _, kind := range []string{AuditPolicyKindRestricted, AuditPolicyKindQuarantined} {
+		gv.WithLabelValues(kind).Set(0)
+	}
+	m.active = gv
 	return nil
+}
+
+// updateActiveGauge sets olaitan_response_network_policy_active{state} from a
+// managed-policy list (Story 2.9, BI-4). It resets to zero for both kinds first
+// so a kind that drops to zero managed policies is reflected, then counts each
+// policy by its AnnFSMState kind. A nil gauge (registry-less fixture) is a
+// no-op. policyKindFor maps any state to restricted/quarantined.
+func (m *Manager) updateActiveGauge(items []networkingv1.NetworkPolicy) {
+	if m.active == nil {
+		return
+	}
+	restricted, quarantined := 0, 0
+	for i := range items {
+		if items[i].Annotations[AnnFSMState] == string(schema.StateQuarantined) {
+			quarantined++
+		} else {
+			restricted++
+		}
+	}
+	m.active.WithLabelValues(AuditPolicyKindRestricted).Set(float64(restricted))
+	m.active.WithLabelValues(AuditPolicyKindQuarantined).Set(float64(quarantined))
 }
 
 // count increments the apply-result counter when metrics are registered.
@@ -888,6 +930,11 @@ func (m *Manager) reconcileGC(ctx context.Context) {
 		m.log.Warn("netpol: gc list failed", "err", err)
 		return
 	}
+
+	// Story 2.9 (AC3, BI-4): refresh the active-policy gauge from this pass's
+	// managed-policy list (the count at reconcile-list time; converges to ground
+	// truth every interval). Counts by the policy's own AnnFSMState kind.
+	m.updateActiveGauge(list.Items)
 
 	// Fallback discriminator for the nil-oracle path (shipped Story 2.5
 	// behaviour): which workloads currently have a live QUARANTINED policy
