@@ -987,6 +987,12 @@ type ResponseConfig struct {
 	// controller (FR38/FR39). Enabled is pointer-tagged so an explicit
 	// `false` survives the loader; the controller is opt-in and defaults off.
 	Override OverrideConfig `yaml:"override,omitempty"`
+	// Story 2.8: audit sub-block gates the three append-only SIEM audit
+	// subjects (AUDIT.transitions/overrides/policies, FR40/NFR16). Enabled is
+	// pointer-tagged so an explicit `false` survives the loader; auditing is
+	// opt-in and defaults off. The per-subject retention days drive the
+	// AUDIT_* JetStream stream MaxAge (AC4 Helm-tunability).
+	Audit AuditConfig `yaml:"audit,omitempty"`
 }
 
 // NetworkPolicyConfig configures the Story 2.4 RESTRICTED-state
@@ -1167,6 +1173,104 @@ func (o OverrideConfig) validate() error {
 	}
 	if o.DefaultTTLSeconds != nil && *o.DefaultTTLSeconds < 1 {
 		return fmt.Errorf("response.override.default_ttl_seconds: must be >= 1 (got %d)", *o.DefaultTTLSeconds)
+	}
+	return nil
+}
+
+// AuditConfig configures the Story 2.8 append-only SIEM audit subjects
+// (FR40/NFR16). A single Enabled flag gates all three seams together (the
+// transitions sink, the override second-publish, and the netpol policy
+// publisher, BI-8 / Open Assumption 1). The three retention-days fields set the
+// MaxAge of the corresponding AUDIT_* JetStream streams (BI-7), so an operator
+// tunes each subject's append-only retention independently; the defaults are
+// 90/365/365 days (AC4, reconciling the architecture's generalised "AUDIT.* 365
+// d" with the AC's specific 90 d transitions retention).
+//
+// Enabled is pointer-tagged so an explicit `false` survives the loader (the
+// OverrideConfig.Enabled precedent); the default is OFF (opt-in). The retention
+// fields are pointer-tagged so an explicit value survives and a zero is
+// distinguishable from omitted.
+type AuditConfig struct {
+	Enabled                  *bool `yaml:"enabled,omitempty"`
+	RetentionTransitionsDays *int  `yaml:"retention_transitions_days,omitempty"`
+	RetentionOverridesDays   *int  `yaml:"retention_overrides_days,omitempty"`
+	RetentionPoliciesDays    *int  `yaml:"retention_policies_days,omitempty"`
+}
+
+// Default audit retention days (AC4). Transitions default to 90 d (matching the
+// STATE_TRANSITIONS.applied operational audit-trail retention); overrides and
+// policies default to 365 d.
+const (
+	DefaultAuditRetentionTransitionsDays = 90
+	DefaultAuditRetentionOverridesDays   = 365
+	DefaultAuditRetentionPoliciesDays    = 365
+)
+
+// DefaultAudit returns the Story 2.8 defaults: disabled, with 90/365/365 d
+// retention.
+func DefaultAudit() AuditConfig {
+	enabled := false
+	t := DefaultAuditRetentionTransitionsDays
+	o := DefaultAuditRetentionOverridesDays
+	p := DefaultAuditRetentionPoliciesDays
+	return AuditConfig{
+		Enabled:                  &enabled,
+		RetentionTransitionsDays: &t,
+		RetentionOverridesDays:   &o,
+		RetentionPoliciesDays:    &p,
+	}
+}
+
+// EnabledOrDefault reports whether the audit subjects are enabled, treating a
+// nil pointer as the default (false).
+func (a AuditConfig) EnabledOrDefault() bool {
+	if a.Enabled == nil {
+		return false
+	}
+	return *a.Enabled
+}
+
+// RetentionTransitionsDaysOrDefault returns the effective transitions retention
+// in days, substituting the 90 d default when omitted.
+func (a AuditConfig) RetentionTransitionsDaysOrDefault() int {
+	if a.RetentionTransitionsDays == nil {
+		return DefaultAuditRetentionTransitionsDays
+	}
+	return *a.RetentionTransitionsDays
+}
+
+// RetentionOverridesDaysOrDefault returns the effective overrides retention in
+// days, substituting the 365 d default when omitted.
+func (a AuditConfig) RetentionOverridesDaysOrDefault() int {
+	if a.RetentionOverridesDays == nil {
+		return DefaultAuditRetentionOverridesDays
+	}
+	return *a.RetentionOverridesDays
+}
+
+// RetentionPoliciesDaysOrDefault returns the effective policies retention in
+// days, substituting the 365 d default when omitted.
+func (a AuditConfig) RetentionPoliciesDaysOrDefault() int {
+	if a.RetentionPoliciesDays == nil {
+		return DefaultAuditRetentionPoliciesDays
+	}
+	return *a.RetentionPoliciesDays
+}
+
+// validate enforces AuditConfig invariants: every set retention must be
+// positive (a non-positive MaxAge would mean "never expire" on some JetStream
+// versions and is never an operator intent for an append-only audit window). A
+// fully-omitted block skips validation so in-memory fixtures can leave it zero;
+// Load substitutes DefaultAudit before Validate when auditing is enabled.
+func (a AuditConfig) validate() error {
+	if a.RetentionTransitionsDays != nil && *a.RetentionTransitionsDays < 1 {
+		return fmt.Errorf("response.audit.retention_transitions_days: must be >= 1 (got %d)", *a.RetentionTransitionsDays)
+	}
+	if a.RetentionOverridesDays != nil && *a.RetentionOverridesDays < 1 {
+		return fmt.Errorf("response.audit.retention_overrides_days: must be >= 1 (got %d)", *a.RetentionOverridesDays)
+	}
+	if a.RetentionPoliciesDays != nil && *a.RetentionPoliciesDays < 1 {
+		return fmt.Errorf("response.audit.retention_policies_days: must be >= 1 (got %d)", *a.RetentionPoliciesDays)
 	}
 	return nil
 }
@@ -1433,6 +1537,25 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
+	// Story 2.8: substitute the audit defaults so an enabled audit block with
+	// omitted retentions inherits the 90/365/365 d defaults, and an omitted
+	// Enabled stays off.
+	{
+		defAudit := DefaultAudit()
+		if cfg.Response.Audit.Enabled == nil {
+			cfg.Response.Audit.Enabled = defAudit.Enabled
+		}
+		if cfg.Response.Audit.RetentionTransitionsDays == nil {
+			cfg.Response.Audit.RetentionTransitionsDays = defAudit.RetentionTransitionsDays
+		}
+		if cfg.Response.Audit.RetentionOverridesDays == nil {
+			cfg.Response.Audit.RetentionOverridesDays = defAudit.RetentionOverridesDays
+		}
+		if cfg.Response.Audit.RetentionPoliciesDays == nil {
+			cfg.Response.Audit.RetentionPoliciesDays = defAudit.RetentionPoliciesDays
+		}
+	}
+
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("config: validate %q: %w", path, err)
 	}
@@ -1626,6 +1749,9 @@ func (r ResponseConfig) validate() error {
 		return err
 	}
 	if err := r.Override.validate(); err != nil {
+		return err
+	}
+	if err := r.Audit.validate(); err != nil {
 		return err
 	}
 	return nil

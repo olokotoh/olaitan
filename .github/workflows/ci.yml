@@ -186,7 +186,7 @@ jobs:
           # the rest of the pipeline runs).
           helm install olaitan ./deploy/helm/olaitan \
             --set image.repository=olaitan \
-            --set image.tag="$tag" \
+            --set-string image.tag="$tag" \
             --set image.pullPolicy=Never \
             --set evaluation.config=RS \
             --set baselines.warmupDuration=5s \

@@ -64,6 +64,76 @@ type StateOracle interface {
 	CurrentState(workloadID string) (schema.PodSecurityState, bool)
 }
 
+// Story 2.8 audit action values (BI-9). These label which kind of cluster
+// mutation an AUDIT.policies event records. They are defined HERE (in netpol)
+// so the manager emits them at its real mutation points without importing the
+// audit/subjects packages; the audit adapter maps them onto the wire event.
+const (
+	// AuditActionApply is a real NetworkPolicy create or update (result
+	// applied), NOT an idempotent noop (BI-9).
+	AuditActionApply = "apply"
+	// AuditActionSupersedeDelete is an inline or reconcile delete of a policy
+	// superseded by a tighter/looser target (escalation/de-escalation residue).
+	AuditActionSupersedeDelete = "supersede_delete"
+	// AuditActionDeescalationRemove is a de-escalation removal of a workload's
+	// managed policies (SUSPICIOUS/CLEAN, or the reconcile de-escalation
+	// residue), emitted once per converged removal (BI-9).
+	AuditActionDeescalationRemove = "deescalation_remove"
+	// AuditActionGCDelete is an orphan-GC delete of a policy whose owner is gone.
+	AuditActionGCDelete = "gc_delete"
+)
+
+// Story 2.8 policy_kind and spec_summary closed enums (BI-4.3/BI-11). policy_kind
+// reflects which deterministic-name family the policy belongs to; spec_summary is
+// a compact rendering of the policy shape, NOT a full-object diff.
+const (
+	AuditPolicyKindRestricted  = "restricted"
+	AuditPolicyKindQuarantined = "quarantined"
+
+	AuditSpecEgressAllowlist = "egress_allowlist"
+	AuditSpecDenyAll         = "deny_all"
+	AuditSpecRemoved         = "removed"
+)
+
+// PolicyAuditEvent carries the facts the manager already knows at each real
+// mutation point so the audit adapter can project them onto the AUDIT.policies
+// wire event (Story 2.8, BI-3.1). It is a netpol-package struct so the manager
+// builds it without importing internal/nats or internal/subjects.
+type PolicyAuditEvent struct {
+	// Action is one of the AuditAction* constants (BI-9).
+	Action string
+	// WorkloadID, Namespace, PolicyName identify the mutated policy.
+	WorkloadID string
+	Namespace  string
+	PolicyName string
+	// PolicyKind is restricted/quarantined (BI-4.3), derived from the policy
+	// name family.
+	PolicyKind string
+	// FSMState is the FSM state that caused this mutation (BI-3.4).
+	FSMState string
+	// Result is the apply-result string (applied/superseded/removed/gc_deleted)
+	// mirroring the metric the mutation counts (BI-9).
+	Result string
+	// SpecSummary is the compact policy-shape enum (BI-4.3/BI-11):
+	// egress_allowlist / deny_all / removed.
+	SpecSummary string
+	// PackageID is the triggering package id when present.
+	PackageID string
+}
+
+// PolicyAuditPublisher is the Story 2.8 one-method audit seam (BI-3). The
+// manager calls PublishPolicyAudit at each real mutation point so a NATS-backed
+// adapter (wired at cmd/olaitan, living in internal/response/audit) can publish
+// an append-only AUDIT.policies event. It is defined HERE rather than imported
+// so netpol gains NO internal/nats or internal/subjects import and stays
+// Ring-clean, exactly like the StateOracle precedent above. PublishPolicyAudit
+// MUST be NON-blocking (fire-and-forget): a NATS stall must never wedge the
+// apply worker and delay an NFR6-critical NetworkPolicy apply (BI-5.3). A nil
+// publisher means no audit (off-by-default, the nil-oracle precedent).
+type PolicyAuditPublisher interface {
+	PublishPolicyAudit(evt PolicyAuditEvent)
+}
+
 // Config configures a Manager.
 type Config struct {
 	// ClusterCIDRs are the cluster pod/service CIDRs allowed for egress.
@@ -96,6 +166,14 @@ type Manager struct {
 	// supersession behaviour so the change is backward-compatible. Set once at
 	// wiring time via SetStateOracle; never mutated after Run starts.
 	oracle StateOracle
+
+	// audit is the optional Story 2.8 audit seam (BI-3). When non-nil, the
+	// manager fires a non-blocking PublishPolicyAudit at each real mutation
+	// point (apply/supersede/de-escalation/gc) so the mutation is recorded on
+	// the append-only AUDIT.policies subject. nil = no audit (off-by-default,
+	// the nil-oracle precedent). Set once at wiring time via
+	// SetPolicyAuditPublisher, before Run; read-only for the worker thereafter.
+	audit PolicyAuditPublisher
 
 	applySeconds prometheus.Histogram
 	applyTotal   *prometheus.CounterVec
@@ -156,6 +234,96 @@ func New(cfg Config, cs kubernetes.Interface, registry *metrics.Registry, log *s
 // A nil oracle leaves the shipped Story 2.5 reconcile behaviour in place.
 func (m *Manager) SetStateOracle(o StateOracle) {
 	m.oracle = o
+}
+
+// SetPolicyAuditPublisher installs the optional Story 2.8 audit seam (BI-3).
+// Like SetStateOracle, it is a setter rather than a New parameter because the
+// audit adapter is wired at cmd/olaitan after the manager exists, and is
+// installed once before Run starts while the Manager is still single-threaded;
+// the field is then read-only for the worker. A nil publisher leaves auditing
+// off (the nil-oracle precedent), so the seam is fully optional and Ring-clean.
+func (m *Manager) SetPolicyAuditPublisher(p PolicyAuditPublisher) {
+	m.audit = p
+}
+
+// auditPolicy fires a non-blocking audit event when a publisher is installed
+// (BI-3/BI-5.3). It is a guarded no-op when m.audit == nil. It is called only
+// at real mutation success/converge points (BI-9), AFTER the mutation succeeds
+// and AFTER m.count(result), so the audit mirrors exactly what the metric
+// counts and never claims a mutation that did not happen.
+func (m *Manager) auditPolicy(evt PolicyAuditEvent) {
+	if m.audit == nil {
+		return
+	}
+	m.audit.PublishPolicyAudit(evt)
+}
+
+// policyKindFor reports the audit policy_kind enum (BI-4.3) for the FSM state
+// whose desired set the policy belongs to. RESTRICTED renders the egress
+// allow-list (restricted); QUARANTINED renders the deny-all (quarantined).
+func policyKindFor(state schema.PodSecurityState) string {
+	if state == schema.StateQuarantined {
+		return AuditPolicyKindQuarantined
+	}
+	return AuditPolicyKindRestricted
+}
+
+// specSummaryFor reports the audit spec_summary enum (BI-4.3/BI-11) for an
+// applied policy of the given state: deny_all for QUARANTINED, egress_allowlist
+// for RESTRICTED.
+func specSummaryFor(state schema.PodSecurityState) string {
+	if state == schema.StateQuarantined {
+		return AuditSpecDenyAll
+	}
+	return AuditSpecEgressAllowlist
+}
+
+// auditReconcileDelete emits a Story 2.8 AUDIT.policies event for a reconcile-
+// driven delete (BI-9). The mutation facts come from the live policy object:
+// fsm_state is the policy's own AnnFSMState annotation (the FSM state that
+// caused the policy to exist, BI-3.4), policy_kind is derived from it, and the
+// spec_summary is "removed" because this records a delete. No package_id is
+// available on the reconcile path (no triggering EvidencePackage). Called only
+// after the delete succeeds and after m.count(result) (BI-9), so the audit
+// mirrors exactly what the metric counts and never records a phantom mutation.
+func (m *Manager) auditReconcileDelete(np *networkingv1.NetworkPolicy, action, result string) {
+	// fsm_state comes from the live policy's AnnFSMState annotation (BI-3.4).
+	// The GC loop only requires AnnWorkloadID, so a managed policy whose
+	// AnnFSMState was stripped/tampered/written by another version could carry
+	// an empty or non-enum value. Emitting that would publish an
+	// AUDIT.policies event the committed schema rejects (fsm_state is a closed
+	// enum), breaking the AC6 "every payload validates" guarantee. Skip the
+	// audit emit in that case (the mutation is still counted by m.count); a
+	// misleading/invalid audit line is worse than a missing one for an
+	// append-only SIEM trail.
+	state := np.Annotations[AnnFSMState]
+	if !isAuditableFSMState(state) {
+		m.log.Warn("netpol: skipping AUDIT.policies emit for policy with missing/invalid fsm-state annotation",
+			"policy", np.Name, "namespace", np.Namespace, "fsm_state", state, "action", action)
+		return
+	}
+	m.auditPolicy(PolicyAuditEvent{
+		Action:      action,
+		WorkloadID:  np.Annotations[AnnWorkloadID],
+		Namespace:   np.Namespace,
+		PolicyName:  np.Name,
+		PolicyKind:  policyKindFor(schema.PodSecurityState(state)),
+		FSMState:    state,
+		Result:      result,
+		SpecSummary: AuditSpecRemoved,
+	})
+}
+
+// isAuditableFSMState reports whether s is one of the closed-enum FSM states the
+// AUDIT.policies schema accepts for fsm_state. Used to suppress an audit emit
+// for a managed policy whose AnnFSMState annotation is absent or corrupt.
+func isAuditableFSMState(s string) bool {
+	switch schema.PodSecurityState(s) {
+	case schema.StateClean, schema.StateSuspicious, schema.StateRestricted, schema.StateQuarantined, schema.StatePreservedKilled:
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *Manager) registerMetrics(r *metrics.Registry) error {
@@ -283,7 +451,7 @@ func (m *Manager) handle(ctx context.Context, st schema.StateTransition) {
 	// yet its policies must still be cleared. CLEAN additionally verifies absence
 	// via a follow-up read (BI-5).
 	if removalState(st.ToState) {
-		m.removeManaged(ctx, ref, st.WorkloadID, st.ToState == schema.StateClean)
+		m.removeManaged(ctx, ref, st.WorkloadID, st.PackageID, st.ToState == schema.StateClean)
 		return
 	}
 
@@ -331,6 +499,26 @@ func (m *Manager) handle(ctx context.Context, st schema.StateTransition) {
 	m.log.Info("netpol: policy applied",
 		"workload_id", st.WorkloadID, "policy", np.Name, "namespace", np.Namespace, "to_state", st.ToState, "result", result)
 
+	// Story 2.8 audit (BI-9): emit AUDIT.policies on a REAL apply (applied =
+	// create/update) only, NOT a noop (an idempotent re-apply that changed
+	// nothing in the cluster is not a mutation and would flood the stream on
+	// every reconcile of an unchanged policy). fsm_state is st.ToState, the
+	// transition that drove the apply (BI-3.4). Emitted after m.count so the
+	// audit mirrors the metric.
+	if result == "applied" {
+		m.auditPolicy(PolicyAuditEvent{
+			Action:      AuditActionApply,
+			WorkloadID:  st.WorkloadID,
+			Namespace:   np.Namespace,
+			PolicyName:  np.Name,
+			PolicyKind:  policyKindFor(st.ToState),
+			FSMState:    string(st.ToState),
+			Result:      result,
+			SpecSummary: specSummaryFor(st.ToState),
+			PackageID:   st.PackageID,
+		})
+	}
+
 	// Atomic replacement (BI-5): ONLY after the QUARANTINED deny-all policy is
 	// confirmed applied do we best-effort delete the superseded RESTRICTED
 	// policy for the same workload. Apply-before-delete is the load-bearing
@@ -358,7 +546,7 @@ func (m *Manager) handle(ctx context.Context, st schema.StateTransition) {
 	// leave a malicious workload unprotected. The upstream error early-returns
 	// already guarantee this, but the gate states the invariant at the call site.
 	if st.ToState == schema.StateQuarantined && (result == "applied" || result == "noop") {
-		m.deleteSupersededRestricted(ctx, ref, st.WorkloadID)
+		m.deleteSupersededRestricted(ctx, ref, st.WorkloadID, st.PackageID)
 	}
 
 	// De-escalation relaxation (Story 2.6, BI-2/BI-2a/BI-3): the EXACT MIRROR of
@@ -377,7 +565,7 @@ func (m *Manager) handle(ctx context.Context, st schema.StateTransition) {
 	// workload is never left with neither policy. A failed inline quarantine
 	// delete self-heals via the FSM-target-aware reconcile backstop (BI-2c).
 	if st.ToState == schema.StateRestricted && (result == "applied" || result == "noop") {
-		m.deleteSupersededQuarantine(ctx, ref, st.WorkloadID)
+		m.deleteSupersededQuarantine(ctx, ref, st.WorkloadID, st.PackageID)
 	}
 }
 
@@ -393,7 +581,7 @@ func (m *Manager) handle(ctx context.Context, st schema.StateTransition) {
 // egress allows. The reconcile backstop (reconcileGC, FIX A) guarantees a
 // restricted policy this best-effort delete fails to remove is reaped within
 // one reconcile interval, converging egress to deny-all (BI-7, Open Assumption 4).
-func (m *Manager) deleteSupersededRestricted(ctx context.Context, ref workloadRef, workloadID string) {
+func (m *Manager) deleteSupersededRestricted(ctx context.Context, ref workloadRef, workloadID, packageID string) {
 	name := policyNameFor(schema.StateRestricted, workloadID)
 	err := m.cs.NetworkingV1().NetworkPolicies(ref.namespace).Delete(ctx, name, metav1.DeleteOptions{})
 	if err != nil {
@@ -408,6 +596,23 @@ func (m *Manager) deleteSupersededRestricted(ctx context.Context, ref workloadRe
 	}
 	m.log.Info("netpol: deleted superseded RESTRICTED policy after quarantine apply",
 		"workload_id", workloadID, "policy", name, "namespace", ref.namespace)
+	// Story 2.8 audit (BI-9): a real RESTRICTED-policy delete superseded by the
+	// QUARANTINED escalation. fsm_state is the NEW target that triggered the
+	// supersession (QUARANTINED, BI-3.4); the deleted object is the restricted
+	// policy. Emitted only on a successful delete (a NotFound early-returns
+	// above), never on a failed one, so the audit never claims a phantom
+	// mutation (BI-9).
+	m.auditPolicy(PolicyAuditEvent{
+		Action:      AuditActionSupersedeDelete,
+		WorkloadID:  workloadID,
+		Namespace:   ref.namespace,
+		PolicyName:  name,
+		PolicyKind:  AuditPolicyKindRestricted,
+		FSMState:    string(schema.StateQuarantined),
+		Result:      "superseded",
+		SpecSummary: AuditSpecRemoved,
+		PackageID:   packageID,
+	})
 }
 
 // deleteSupersededQuarantine best-effort deletes the QUARANTINED deny-all
@@ -422,7 +627,7 @@ func (m *Manager) deleteSupersededRestricted(ctx context.Context, ref workloadRe
 // one reconcile interval (BI-2c, BI-6). The inline delete is silent best-effort
 // accounting-wise (mirror of the escalation path): the meaningful action is the
 // restricted apply, already counted (BI-7).
-func (m *Manager) deleteSupersededQuarantine(ctx context.Context, ref workloadRef, workloadID string) {
+func (m *Manager) deleteSupersededQuarantine(ctx context.Context, ref workloadRef, workloadID, packageID string) {
 	name := policyNameFor(schema.StateQuarantined, workloadID)
 	err := m.cs.NetworkingV1().NetworkPolicies(ref.namespace).Delete(ctx, name, metav1.DeleteOptions{})
 	if err != nil {
@@ -437,6 +642,21 @@ func (m *Manager) deleteSupersededQuarantine(ctx context.Context, ref workloadRe
 	}
 	m.log.Info("netpol: deleted superseded QUARANTINED policy after restricted apply",
 		"workload_id", workloadID, "policy", name, "namespace", ref.namespace)
+	// Story 2.8 audit (BI-9): the EXACT MIRROR of deleteSupersededRestricted for
+	// the RESTRICTED de-escalation. fsm_state is the NEW target that triggered
+	// the supersession (RESTRICTED, BI-3.4); the deleted object is the
+	// quarantined deny-all. Emitted only on a successful delete.
+	m.auditPolicy(PolicyAuditEvent{
+		Action:      AuditActionSupersedeDelete,
+		WorkloadID:  workloadID,
+		Namespace:   ref.namespace,
+		PolicyName:  name,
+		PolicyKind:  AuditPolicyKindQuarantined,
+		FSMState:    string(schema.StateRestricted),
+		Result:      "superseded",
+		SpecSummary: AuditSpecRemoved,
+		PackageID:   packageID,
+	})
 }
 
 // removeManaged converges a workload's managed-policy set to EMPTY on a
@@ -451,7 +671,7 @@ func (m *Manager) deleteSupersededQuarantine(ctx context.Context, ref workloadRe
 // survives counts error and is left for the reconcile backstop (BI-6). A
 // transient delete error counts error and logs WARN; the workload self-heals at
 // the next reconcile. On full convergence it counts removed.
-func (m *Manager) removeManaged(ctx context.Context, ref workloadRef, workloadID string, verify bool) {
+func (m *Manager) removeManaged(ctx context.Context, ref workloadRef, workloadID, packageID string, verify bool) {
 	names := []string{
 		policyNameFor(schema.StateRestricted, workloadID),
 		policyNameFor(schema.StateQuarantined, workloadID),
@@ -518,6 +738,25 @@ func (m *Manager) removeManaged(ctx context.Context, ref workloadRef, workloadID
 	m.log.Info("netpol: de-escalation removed managed policies",
 		"workload_id", workloadID, "namespace", ref.namespace,
 		"deleted", deleted, "verified", verify)
+	// Story 2.8 audit (BI-9): ONE deescalation_remove line per converged
+	// removal of a workload's managed SET (not one per individual policy
+	// delete), emitted only on the removed-converge path, never on the
+	// failed/error path above. fsm_state is the de-escalation target
+	// (CLEAN when verify, else SUSPICIOUS, BI-3.4); policy_name/policy_kind
+	// are left empty because this records a set removal, not a single object.
+	target := schema.StateSuspicious
+	if verify {
+		target = schema.StateClean
+	}
+	m.auditPolicy(PolicyAuditEvent{
+		Action:      AuditActionDeescalationRemove,
+		WorkloadID:  workloadID,
+		Namespace:   ref.namespace,
+		FSMState:    string(target),
+		Result:      "removed",
+		SpecSummary: AuditSpecRemoved,
+		PackageID:   packageID,
+	})
 }
 
 // apply performs an idempotent get-then-create-or-update (BI-6). Re-applying
@@ -711,6 +950,7 @@ func (m *Manager) reconcileGC(ctx context.Context) {
 		m.log.Info("netpol: garbage-collected orphan policy",
 			"policy", np.Name, "namespace", np.Namespace, "workload_id", wid)
 		m.count("gc_deleted")
+		m.auditReconcileDelete(np, AuditActionGCDelete, "gc_deleted")
 	}
 }
 
@@ -740,6 +980,7 @@ func (m *Manager) reconcileDesiredState(ctx context.Context, np *networkingv1.Ne
 			"workload_id", wid, "namespace", np.Namespace,
 			"restricted_policy", np.Name, "quarantine_policy", quarantineName)
 		m.count("superseded")
+		m.auditReconcileDelete(np, AuditActionSupersedeDelete, "superseded")
 		return true
 	}
 
@@ -764,6 +1005,7 @@ func (m *Manager) reconcileDesiredState(ctx context.Context, np *networkingv1.Ne
 		m.log.Info("netpol: reconcile removed superseded RESTRICTED policy (target QUARANTINED)",
 			"workload_id", wid, "namespace", np.Namespace, "policy", np.Name)
 		m.count("superseded")
+		m.auditReconcileDelete(np, AuditActionSupersedeDelete, "superseded")
 		return true
 	case schema.StateRestricted:
 		// De-escalation residue: a lingering QUARANTINED deny-all is not in the
@@ -779,6 +1021,7 @@ func (m *Manager) reconcileDesiredState(ctx context.Context, np *networkingv1.Ne
 		m.log.Info("netpol: reconcile removed stale QUARANTINED policy on de-escalation (target RESTRICTED)",
 			"workload_id", wid, "namespace", np.Namespace, "policy", np.Name)
 		m.count("removed")
+		m.auditReconcileDelete(np, AuditActionDeescalationRemove, "removed")
 		return true
 	default:
 		// target SUSPICIOUS/CLEAN: empty desired set. Both managed policies are
@@ -800,6 +1043,7 @@ func (m *Manager) reconcileDesiredState(ctx context.Context, np *networkingv1.Ne
 		m.log.Info("netpol: reconcile removed stale managed policy on de-escalation (target below RESTRICTED)",
 			"workload_id", wid, "namespace", np.Namespace, "policy", np.Name, "target", string(target))
 		m.count("removed")
+		m.auditReconcileDelete(np, AuditActionDeescalationRemove, "removed")
 		return true
 	}
 }

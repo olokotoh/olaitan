@@ -56,8 +56,21 @@ const EvidencePrefix = "olaitan.evidence."
 // (FR38/FR39, architecture.md:225/447). It follows the architecture's
 // literal dotted UPPER published-contract naming (distinct from the lower
 // olaitan.* per-pod subjects above). The append-only AUDIT.overrides SIEM
-// subject (FR40) is Story 2.8 and is NOT defined here.
+// subject (FR40) is Story 2.8 (AuditOverrides below).
 const OverridesApplied = "OVERRIDES.applied"
+
+// Story 2.8: the three append-only SIEM audit subjects (FR40/NFR16,
+// architecture.md:380/447/613). Each carries a committed JSON-Schema
+// (docs/schemas/audit/) and rides a dedicated LimitsPolicy JetStream stream
+// (append-only by retention: transitions 90d, overrides/policies 365d). They
+// follow the architecture's literal dotted UPPER published-contract naming,
+// matching the OverridesApplied precedent above. The two sibling SIEM subjects
+// AUDIT.assessments and AUDIT.redactions (Epic 3) are NOT defined here.
+const (
+	AuditTransitions = "AUDIT.transitions"
+	AuditOverrides   = "AUDIT.overrides"
+	AuditPolicies    = "AUDIT.policies"
+)
 
 // EvidencePackages is the Ring-2 EvidencePackage subject.
 const EvidencePackages = EvidencePrefix + "packages"

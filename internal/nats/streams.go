@@ -86,6 +86,79 @@ var streamConfigs = []jetstream.StreamConfig{
 		Retention:  jetstream.LimitsPolicy,
 		Duplicates: 2 * time.Minute,
 	},
+	{
+		// AUDIT_TRANSITIONS carries the Story 2.8 append-only SIEM audit copy of
+		// every FSM state change (subjects.AuditTransitions, FR40). Retention
+		// defaults to 90 days (AC4): this reconciles the architecture's
+		// generalised "AUDIT.* 365 d" table (architecture.md:239) with the AC's
+		// specific 90 d, which matches the STATE_TRANSITIONS.applied operational
+		// audit-trail row. Retention is Helm-tunable via StreamConfigsWithAudit.
+		// Retention is LimitsPolicy NOT Interest/WorkQueue: NFR16 requires the
+		// audit subjects be append-only (consumers cannot delete events), and
+		// only LimitsPolicy keeps messages until MaxAge regardless of consumer
+		// ack. The transitions sink publishes with jetstream.WithMsgID so a
+		// drainer re-publish is server-side deduplicated within the window.
+		Name:       "AUDIT_TRANSITIONS",
+		Subjects:   []string{subjects.AuditTransitions},
+		MaxAge:     defaultAuditTransitionsMaxAge,
+		Storage:    jetstream.FileStorage,
+		Retention:  jetstream.LimitsPolicy,
+		Duplicates: 2 * time.Minute,
+	},
+	{
+		// AUDIT_OVERRIDES carries the Story 2.8 append-only SIEM audit copy of
+		// every operator override application/rejection (subjects.AuditOverrides,
+		// FR40), the SIEM sibling of OVERRIDES.applied. 365 d retention (AC4),
+		// LimitsPolicy (NFR16 append-only), Helm-tunable. The override controller
+		// publishes with the same WithMsgID derivation as the operational subject
+		// so a poll re-emit is deduplicated.
+		Name:       "AUDIT_OVERRIDES",
+		Subjects:   []string{subjects.AuditOverrides},
+		MaxAge:     defaultAuditOverridesMaxAge,
+		Storage:    jetstream.FileStorage,
+		Retention:  jetstream.LimitsPolicy,
+		Duplicates: 2 * time.Minute,
+	},
+	{
+		// AUDIT_POLICIES carries the Story 2.8 append-only SIEM audit copy of
+		// every NetworkPolicy mutation (subjects.AuditPolicies, FR40). 365 d
+		// retention (AC4), LimitsPolicy (NFR16 append-only), Helm-tunable.
+		Name:       "AUDIT_POLICIES",
+		Subjects:   []string{subjects.AuditPolicies},
+		MaxAge:     defaultAuditPoliciesMaxAge,
+		Storage:    jetstream.FileStorage,
+		Retention:  jetstream.LimitsPolicy,
+		Duplicates: 2 * time.Minute,
+	},
+}
+
+// defaultAudit*MaxAge are the Story 2.8 AC4 retention defaults baked into
+// streamConfigs. They are the DEFAULTS; an operator tunes each independently
+// via StreamConfigsWithAudit (driven from response.audit.retention.* config,
+// BI-7/BI-8) so AC4's Helm-tunability is real rather than cosmetic.
+const (
+	defaultAuditTransitionsMaxAge = 90 * 24 * time.Hour
+	defaultAuditOverridesMaxAge   = 365 * 24 * time.Hour
+	defaultAuditPoliciesMaxAge    = 365 * 24 * time.Hour
+)
+
+// AuditRetention carries the operator-tuned per-subject MaxAge for the three
+// Story 2.8 AUDIT_* streams (BI-7). A non-positive field means "leave the
+// baked-in default"; StreamConfigsWithAudit substitutes only positive values,
+// so a zero-valued AuditRetention is equivalent to StreamConfigs().
+type AuditRetention struct {
+	Transitions time.Duration
+	Overrides   time.Duration
+	Policies    time.Duration
+}
+
+// auditStreamNames maps each AUDIT_* stream name to the AuditRetention field
+// that drives its MaxAge. Used by StreamConfigsWithAudit so the override is
+// keyed on the stream contract, not a positional index.
+var auditStreamNames = map[string]func(AuditRetention) time.Duration{
+	"AUDIT_TRANSITIONS": func(a AuditRetention) time.Duration { return a.Transitions },
+	"AUDIT_OVERRIDES":   func(a AuditRetention) time.Duration { return a.Overrides },
+	"AUDIT_POLICIES":    func(a AuditRetention) time.Duration { return a.Policies },
 }
 
 // StreamConfigs returns a copy of the JetStream stream configurations.
@@ -106,6 +179,20 @@ var streamConfigs = []jetstream.StreamConfig{
 // fileStore.maxSize. Production deployments leave the env var unset
 // and size the NATS PVC to accommodate the configured sum.
 func StreamConfigs() []jetstream.StreamConfig {
+	return streamConfigsWith(AuditRetention{})
+}
+
+// StreamConfigsWithAudit returns StreamConfigs() with the three Story 2.8
+// AUDIT_* streams' MaxAge overridden by the operator-tuned ar (BI-7/BI-8). A
+// non-positive ar field leaves that stream's baked-in default (90/365/365 d).
+// The aggregator threads its response.audit.retention.* config in here so
+// AC4's Helm-tunability drives the real stream MaxAge; callers that want the
+// pure architecture defaults use StreamConfigs() (a zero AuditRetention).
+func StreamConfigsWithAudit(ar AuditRetention) []jetstream.StreamConfig {
+	return streamConfigsWith(ar)
+}
+
+func streamConfigsWith(ar AuditRetention) []jetstream.StreamConfig {
 	override := streamMaxBytesOverride()
 	out := make([]jetstream.StreamConfig, len(streamConfigs))
 	for i, cfg := range streamConfigs {
@@ -115,6 +202,11 @@ func StreamConfigs() []jetstream.StreamConfig {
 		}
 		if override > 0 && (c.MaxBytes == 0 || c.MaxBytes > override) {
 			c.MaxBytes = override
+		}
+		if field, isAudit := auditStreamNames[c.Name]; isAudit {
+			if d := field(ar); d > 0 {
+				c.MaxAge = d
+			}
 		}
 		out[i] = c
 	}

@@ -54,6 +54,7 @@ import (
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
 	"github.com/olokotoh/olaitan/internal/ratelimit"
 	redisclient "github.com/olokotoh/olaitan/internal/redis"
+	responseaudit "github.com/olokotoh/olaitan/internal/response/audit"
 	"github.com/olokotoh/olaitan/internal/response/fsm"
 	"github.com/olokotoh/olaitan/internal/response/netpol"
 	"github.com/olokotoh/olaitan/internal/response/override"
@@ -418,7 +419,17 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 
 	streamsCtx, streamsCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer streamsCancel()
-	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigs()); err != nil {
+	// Story 2.8 (BI-7/BI-8): the three AUDIT_* streams' MaxAge derives from the
+	// response.audit.retention_*_days config so AC4's Helm-tunability drives the
+	// real append-only retention. The retentions are defaulted in Load even when
+	// auditing is disabled, so this is safe to apply unconditionally; EnsureStreams
+	// is create-or-update, so it reconciles the MaxAge on an existing stream.
+	auditRetention := natsclient.AuditRetention{
+		Transitions: time.Duration(cfg.Response.Audit.RetentionTransitionsDaysOrDefault()) * 24 * time.Hour,
+		Overrides:   time.Duration(cfg.Response.Audit.RetentionOverridesDaysOrDefault()) * 24 * time.Hour,
+		Policies:    time.Duration(cfg.Response.Audit.RetentionPoliciesDaysOrDefault()) * 24 * time.Hour,
+	}
+	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigsWithAudit(auditRetention)); err != nil {
 		closeNATS()
 		if ctx.Err() != nil {
 			return nil
@@ -621,6 +632,47 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	// fans out to every enabled consumer (BI-3). Story 2.3 adds the Redis
 	// persistence sink; Story 2.4 adds the NetworkPolicy enforcement
 	// manager. When neither is enabled the machine keeps a NopSink.
+	// Story 2.8: append-only SIEM audit (FR40/NFR16). One flag
+	// (response.audit.enabled, off by default) gates THREE seams built up-front
+	// here and wired at their three call sites below: a transitions sink (a new
+	// MultiSink member, appended before fsm.New), a second publish off the
+	// override controller, and a netpol PolicyAuditPublisher. All publish
+	// best-effort to NATS via the shared nc; the two buffered drainers run on the
+	// errgroup. A NATS outage drops audit events, never stalling enforcement
+	// (BI-5/BI-8).
+	auditEnabled := cfg.Response.Audit.EnabledOrDefault()
+	var auditTransitionSink *responseaudit.TransitionAuditSink
+	var auditPolicySink *responseaudit.PolicyAuditSink
+	var auditOverridePub override.AuditOverridePublisher
+	if auditEnabled {
+		tp, terr := responseaudit.NewNATSTransitionPublisher(nc)
+		if terr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: audit transition publisher: %w", terr)
+		}
+		auditTransitionSink, terr = responseaudit.NewTransitionAuditSink(tp, log, responseaudit.TransitionAuditSinkConfig{})
+		if terr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: audit transition sink: %w", terr)
+		}
+		pp, perr := responseaudit.NewNATSPolicyPublisher(nc)
+		if perr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: audit policy publisher: %w", perr)
+		}
+		auditPolicySink, perr = responseaudit.NewPolicyAuditSink(pp, log, responseaudit.PolicyAuditSinkConfig{})
+		if perr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: audit policy sink: %w", perr)
+		}
+		oerr := error(nil)
+		auditOverridePub, oerr = override.NewNATSAuditPublisher(nc)
+		if oerr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: audit override publisher: %w", oerr)
+		}
+	}
+
 	var sinks fsm.MultiSink
 	var fsmStore *fsm.Store
 	if cfg.Detection.FSM.PersistenceEnabledOrDefault() {
@@ -659,6 +711,14 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		// Run is launched below, AFTER SetStateOracle, so the reconcile
 		// goroutine never reads m.oracle concurrently with the setter write.
 	}
+	// Story 2.8 (BI-1/BI-8): the transitions audit sink is a THIRD MultiSink
+	// member, appended BEFORE fsm.New so the FSM fans every actual transition
+	// (including operator pins) out to it like the Redis/netpol sinks. Its
+	// buffered drainer runs on the errgroup, off the FSM hot path.
+	if auditTransitionSink != nil {
+		sinks = append(sinks, auditTransitionSink)
+		g.Go(func() error { return auditTransitionSink.Run(ctx) })
+	}
 	var fsmSink fsm.TransitionSink = fsm.NopSink{}
 	if len(sinks) > 0 {
 		fsmSink = sinks
@@ -676,9 +736,18 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	// once both exist. *fsm.Machine satisfies netpol.StateOracle via CurrentState.
 	if npMgr != nil {
 		npMgr.SetStateOracle(stateMachine)
-		// Launch the worker only now that the oracle is installed. Starting the
-		// goroutine here establishes a happens-before edge for the SetStateOracle
-		// write above, so the reconcile loop never races on m.oracle.
+		// Story 2.8 (BI-3/BI-8): install the policy audit publisher BEFORE
+		// npMgr.Run so the worker reads m.audit only after the single-threaded
+		// setter write, and launch the policy adapter's buffered drainer on the
+		// errgroup. Only wired when netpol is enabled (no mutations to audit
+		// otherwise); the SetStateOracle ordering precedent.
+		if auditPolicySink != nil {
+			npMgr.SetPolicyAuditPublisher(auditPolicySink)
+			g.Go(func() error { return auditPolicySink.Run(ctx) })
+		}
+		// Launch the worker only now that the oracle (and audit seam) are
+		// installed. Starting the goroutine here establishes a happens-before edge
+		// for the setter writes above, so the reconcile loop never races on them.
 		g.Go(func() error { return npMgr.Run(ctx) })
 	}
 	if fsmStore != nil {
@@ -701,6 +770,11 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 			closeNATS()
 			return fmt.Errorf("aggregator: override controller: %w", oerr)
 		}
+		// Story 2.8 (BI-2/BI-8): install the SIEM audit second-publish before
+		// Run, while the controller is still single-threaded.
+		if auditOverridePub != nil {
+			ovrController.SetAuditPublisher(auditOverridePub)
+		}
 		g.Go(func() error {
 			err := ovrController.Run(ctx)
 			ovrCloser()
@@ -721,7 +795,8 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		"deescalation_cooldown_seconds", cfg.Detection.FSM.DeescalationCooldownSecondsOrDefault(),
 		"persistence_enabled", cfg.Detection.FSM.PersistenceEnabledOrDefault(),
 		"netpol_enabled", netpolEnabled,
-		"override_enabled", overrideEnabled)
+		"override_enabled", overrideEnabled,
+		"audit_enabled", auditEnabled)
 
 	g.Go(func() error {
 		<-ctx.Done()
@@ -1132,9 +1207,20 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 
 	// Provision JetStream streams once at startup. EnsureStreams is
 	// idempotent so a re-run on a pre-existing stream is a no-op.
+	// Story 2.8: use the same audit retention as the aggregator so that
+	// whichever ring wins the startup race provisions the AUDIT_* streams with
+	// identical MaxAge (no transient default-retention window if an operator has
+	// tuned response.audit.retention_*_days). The aggregator remains the
+	// retention authority; this just keeps the collector's create-or-update
+	// consistent with it.
 	streamsCtx, streamsCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer streamsCancel()
-	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigs()); err != nil {
+	auditRetention := natsclient.AuditRetention{
+		Transitions: time.Duration(cfg.Response.Audit.RetentionTransitionsDaysOrDefault()) * 24 * time.Hour,
+		Overrides:   time.Duration(cfg.Response.Audit.RetentionOverridesDaysOrDefault()) * 24 * time.Hour,
+		Policies:    time.Duration(cfg.Response.Audit.RetentionPoliciesDaysOrDefault()) * 24 * time.Hour,
+	}
+	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigsWithAudit(auditRetention)); err != nil {
 		closeNATS()
 		return fmt.Errorf("collector: ensure streams: %w", err)
 	}

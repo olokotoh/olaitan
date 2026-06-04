@@ -240,7 +240,7 @@ Wiring of the rate-limit counters above is in `cmd/olaitan/metrics.go:140-260` v
 - **Labels:** none (per BI-2 of Story 1.18; `architecture.md:476` forbids the `{workload}` label suggested by AC3's literal text because workload-keyed labels have unbounded cardinality)
 - **Help:** Count of workloads currently within an active warm-up window (FR18). Sampled from the Warmup controller cache; cardinality bounded by the workload set under the controller's reach.
 - **Sample PromQL (aggregate):** `olaitan_decision_baseline_warmup_active`.
-- **Per-workload telemetry:** the per-workload warm-up detail (which specific workloads are in warm-up at any given moment) is surfaced through the `AUDIT.transitions` subject documented in `architecture.md:380`, not through Prometheus. SIEM-side consumers subscribe to the audit subjects when they need pod-level granularity.
+- **Per-workload telemetry:** the per-workload warm-up detail (which specific workloads are in warm-up at any given moment) is surfaced through the `AUDIT.transitions` subject (shipped in Story 2.8; see "Append-only SIEM audit subjects" below), not through Prometheus. SIEM-side consumers subscribe to the audit subjects when they need pod-level granularity.
 
 #### `olaitan_decision_baseline_evaluation_seconds`
 
@@ -394,7 +394,25 @@ When you have manually investigated an alert and want Olaitan to stand a workloa
 
 **Rejected overrides.** An override into `PRESERVED_KILLED` (Epic 4, not yet implemented) is REFUSED: no pin, no Redis key, an `OVERRIDES.applied` event with `rejected: true, reason: state_unavailable`, and the metric below increments with `reason="state_unavailable"`. A typo'd or non-enum state value is refused the same way with `reason="invalid_state"` so you can tell "you asked for a real-but-not-yet-implemented state" from "you mistyped the state".
 
-The `OVERRIDES.applied` NATS subject (365-day JetStream retention) carries one event per applied AND per rejected override; the append-only `AUDIT.overrides` SIEM mirror is Story 2.8 and is deliberately NOT produced here (Open Assumption 5).
+The `OVERRIDES.applied` NATS subject (365-day JetStream retention) carries one event per applied AND per rejected override; its append-only `AUDIT.overrides` SIEM mirror ships in Story 2.8 (see "Append-only SIEM audit subjects" below).
+
+### Append-only SIEM audit subjects (Story 2.8, FR40/NFR16)
+
+When `response.audit.enabled=true` (off by default; one flag gates all three), the agent publishes three append-only NATS audit subjects for SIEM consumption (Splunk / Elastic / Datadog). Each rides a dedicated `LimitsPolicy` JetStream stream (append-only by retention: NFR16 means consumers cannot delete events) with Helm-tunable per-subject retention:
+
+| Subject | Stream | Default retention | Records |
+|---|---|---|---|
+| `AUDIT.transitions` | `AUDIT_TRANSITIONS` | 90 d (`response.audit.retention_transitions_days`) | every actual FSM state change (`before_state`/`after_state`/`triggering_threat_score`/...), automated AND operator-pin |
+| `AUDIT.overrides` | `AUDIT_OVERRIDES` | 365 d (`response.audit.retention_overrides_days`) | every override application AND rejection, with full FR40 attribution |
+| `AUDIT.policies` | `AUDIT_POLICIES` | 365 d (`response.audit.retention_policies_days`) | every real NetworkPolicy mutation (apply/supersede_delete/deescalation_remove/gc_delete) |
+
+Inspect with `nats sub AUDIT.transitions --raw` (or `.overrides` / `.policies`): each is structured JSON with documented field names (no NL parsing). Committed schemas live at `docs/schemas/audit/*.json` (authoritative) with `*.yaml` documentation mirrors.
+
+Operational notes:
+- **Two events per applied override, by design (BI-10):** an applied operator override emits one `AUDIT.transitions` (the state change, `trigger_type=override`) AND one `AUDIT.overrides` (the application, with TTL/source/attribution); a rejected override emits only `AUDIT.overrides`. They are complementary, correlated on `workload_id` + time. Do NOT "deduplicate" them.
+- **Mutations only, not heartbeats (BI-9, Open Assumption 2):** an idempotent NetworkPolicy noop, a NotFound delete, and a no-op FSM evaluation produce NO audit event. Audit-stream volume tracks real activity, not reconcile cadence. For reconcile-cadence telemetry use the Story 2.9 Prometheus metrics.
+- **Transitions retention is 90 d (BI-7):** this reconciles architecture.md:239's generalised "AUDIT.* 365 d" with the AC's specific 90 d for transitions (matching `STATE_TRANSITIONS.applied`); overrides/policies stay 365 d.
+- **Best-effort, never blocks enforcement (BI-5):** a NATS outage drops audit events (with a warn + a dropped counter on the buffered transitions/policy paths) rather than stalling the FSM goroutine, the override poll, or the netpol apply worker. A missed audit line is an observability gap, not a control-plane failure.
 
 #### `olaitan_response_override_rejected_total` (Story 2.7, FR38/FR39)
 

@@ -1,0 +1,66 @@
+# Human-readable mirror of the AUDIT.transitions wire event.
+#
+# AUTHORITATIVE validation source: docs/schemas/audit/transitions.json
+# (draft 2020-12). This YAML is the documentation mirror in the
+# docs/schemas/state_transition.yaml style; the .json is what the
+# integration tests validate against (BI-6). Source of truth for the Go
+# shape: internal/response/audit/events.go (type AuditTransition).
+#
+# Story 2.8 (FR40/NFR16). The SIEM projection of schema.StateTransition,
+# published append-only to AUDIT.transitions (90 d LimitsPolicy retention).
+# An override-driven transition arrives here like any automated one with
+# trigger_type=override and operator_id set (BI-1.1/BI-10); it is NOT
+# special-cased and is complementary to the AUDIT.overrides event.
+schema: audit.transitions.v1
+subject: AUDIT.transitions
+fields:
+  schema_version:
+    type: string
+    required: true
+    description: Always "audit.transitions.v1".
+  before_state:
+    type: string
+    required: true
+    enum: [CLEAN, SUSPICIOUS, RESTRICTED, QUARANTINED, PRESERVED_KILLED]
+    description: AC1 before_state. StateTransition.FromState.
+  after_state:
+    type: string
+    required: true
+    enum: [CLEAN, SUSPICIOUS, RESTRICTED, QUARANTINED, PRESERVED_KILLED]
+    description: AC1 after_state. StateTransition.ToState.
+  triggering_threat_score:
+    type: number
+    required: true
+    description: AC1 triggering_threat_score. StateTransition.Confidence in [0,100].
+  package_id:
+    type: string
+    required: true
+    description: The EvidencePackage that triggered the evaluation (may be empty).
+  workload_id:
+    type: string
+    required: true
+    description: The WorkloadIdentity canonical string.
+  trigger_type:
+    type: string
+    required: true
+    enum: [automated, override]
+    description: automated for FSM-driven transitions, override for operator pins.
+  reason:
+    type: string
+    required: true
+    enum: [escalation_threshold_crossed, dwell_guard_elapsed, de_escalation_cooldown_expired, no_transition, operator_override]
+    description: Closed enum of schema.Reason* constants plus operator_override.
+  operator_id:
+    type: string
+    required: false
+    description: Populated on override transitions only (omitempty).
+  decided_at:
+    type: string
+    format: date-time
+    required: true
+    description: FSM injected-clock decision time (StateTransition.Timestamp). Distinct from published_at (BI-1.3).
+  published_at:
+    type: string
+    format: date-time
+    required: true
+    description: When the audit event was emitted onto NATS.

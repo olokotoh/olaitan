@@ -238,6 +238,15 @@ response:
     enabled: false
     poll_interval_seconds: 15
     default_ttl_seconds: 3600
+  # Story 2.8: append-only SIEM audit subjects (FR40/NFR16). One flag gates
+  # the three subjects (AUDIT.transitions/overrides/policies); off by default
+  # (Story 2.10 surfaces it in the graduated-isolation mode). The retention
+  # days drive the AUDIT_* JetStream stream MaxAge (90/365/365 d, AC4).
+  audit:
+    enabled: false
+    retention_transitions_days: 90
+    retention_overrides_days: 365
+    retention_policies_days: 365
 
 analyst:
   provider: api

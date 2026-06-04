@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/olokotoh/olaitan/docs/schemas/audit/overrides.json",
+  "title": "AUDIT.overrides (audit.overrides.v1)",
+  "description": "Story 2.8 append-only SIEM copy of an operator override application/rejection (FR40). AUTHORITATIVE validation source for AUDIT.overrides; overrides.yaml is the human-readable mirror. Mirrors the operational OverrideApplied shape with an independent schema_version. requested_state is NOT state-enum-constrained because a rejection carries the RAW (possibly invalid) requested value.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "workload_id",
+    "requested_state",
+    "before_state",
+    "ttl_seconds",
+    "source",
+    "rejected",
+    "published_at",
+    "applied_at_ns"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "audit.overrides.v1"},
+    "workload_id": {"type": "string"},
+    "requested_state": {"type": "string"},
+    "before_state": {"type": "string"},
+    "ttl_seconds": {"type": "integer"},
+    "operator_id": {"type": "string"},
+    "source": {"type": "string"},
+    "rejected": {"type": "boolean"},
+    "reason": {"type": "string", "enum": ["state_unavailable", "invalid_state"]},
+    "published_at": {"type": "string", "format": "date-time"},
+    "applied_at_ns": {"type": "integer"}
+  }
+}
