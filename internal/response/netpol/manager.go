@@ -287,16 +287,43 @@ func specSummaryFor(state schema.PodSecurityState) string {
 // after the delete succeeds and after m.count(result) (BI-9), so the audit
 // mirrors exactly what the metric counts and never records a phantom mutation.
 func (m *Manager) auditReconcileDelete(np *networkingv1.NetworkPolicy, action, result string) {
+	// fsm_state comes from the live policy's AnnFSMState annotation (BI-3.4).
+	// The GC loop only requires AnnWorkloadID, so a managed policy whose
+	// AnnFSMState was stripped/tampered/written by another version could carry
+	// an empty or non-enum value. Emitting that would publish an
+	// AUDIT.policies event the committed schema rejects (fsm_state is a closed
+	// enum), breaking the AC6 "every payload validates" guarantee. Skip the
+	// audit emit in that case (the mutation is still counted by m.count); a
+	// misleading/invalid audit line is worse than a missing one for an
+	// append-only SIEM trail.
+	state := np.Annotations[AnnFSMState]
+	if !isAuditableFSMState(state) {
+		m.log.Warn("netpol: skipping AUDIT.policies emit for policy with missing/invalid fsm-state annotation",
+			"policy", np.Name, "namespace", np.Namespace, "fsm_state", state, "action", action)
+		return
+	}
 	m.auditPolicy(PolicyAuditEvent{
 		Action:      action,
 		WorkloadID:  np.Annotations[AnnWorkloadID],
 		Namespace:   np.Namespace,
 		PolicyName:  np.Name,
-		PolicyKind:  policyKindFor(schema.PodSecurityState(np.Annotations[AnnFSMState])),
-		FSMState:    np.Annotations[AnnFSMState],
+		PolicyKind:  policyKindFor(schema.PodSecurityState(state)),
+		FSMState:    state,
 		Result:      result,
 		SpecSummary: AuditSpecRemoved,
 	})
+}
+
+// isAuditableFSMState reports whether s is one of the closed-enum FSM states the
+// AUDIT.policies schema accepts for fsm_state. Used to suppress an audit emit
+// for a managed policy whose AnnFSMState annotation is absent or corrupt.
+func isAuditableFSMState(s string) bool {
+	switch schema.PodSecurityState(s) {
+	case schema.StateClean, schema.StateSuspicious, schema.StateRestricted, schema.StateQuarantined, schema.StatePreservedKilled:
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *Manager) registerMetrics(r *metrics.Registry) error {

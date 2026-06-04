@@ -4,6 +4,9 @@ import (
 	"context"
 	"sync"
 	"testing"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // capturePolicyAudit is a capturing PolicyAuditPublisher for the Story 2.8
@@ -108,4 +111,48 @@ func TestAudit_NilPublisherNoPanic(t *testing.T) {
 	m := newTestManager(t, Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, deployment("ns", "web", sel))
 	// No SetPolicyAuditPublisher: m.audit is nil; handle must not panic.
 	m.handle(context.Background(), restrictedTransition("ns/Deployment/web", "pkg-1"))
+}
+
+// TestAudit_GCEmitsValidEventForWellFormedPolicy confirms a normal orphan GC
+// emits a gc_delete audit event with the policy's own fsm_state.
+func TestAudit_GCEmitsValidEventForWellFormedPolicy(t *testing.T) {
+	orphan := m_buildManagedPolicy("ns", "orphan", "ns/Deployment/ghost") // owner absent -> orphan
+	m := newTestManager(t, Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, orphan)
+	cap := &capturePolicyAudit{}
+	m.SetPolicyAuditPublisher(cap)
+
+	m.reconcileGC(context.Background())
+
+	gc := cap.byAction(AuditActionGCDelete)
+	if len(gc) != 1 {
+		t.Fatalf("want 1 gc_delete audit, got %d", len(gc))
+	}
+	if gc[0].FSMState != "RESTRICTED" || gc[0].PolicyName != "orphan" {
+		t.Errorf("unexpected gc_delete audit: %+v", gc[0])
+	}
+}
+
+// TestAudit_GCSkipsEmitForMissingFSMState pins the round-1 fix: a managed
+// policy whose AnnFSMState annotation is absent/corrupt is still GC'd (mutation
+// happens) but produces NO AUDIT.policies event, because an empty fsm_state
+// would violate the committed schema's closed enum (AC6 "every payload
+// validates"). The GC loop only requires AnnWorkloadID, so this is reachable.
+func TestAudit_GCSkipsEmitForMissingFSMState(t *testing.T) {
+	orphan := m_buildManagedPolicy("ns", "orphan", "ns/Deployment/ghost")
+	delete(orphan.Annotations, AnnFSMState) // strip the fsm-state annotation
+	m := newTestManager(t, Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, orphan)
+	cap := &capturePolicyAudit{}
+	m.SetPolicyAuditPublisher(cap)
+	ctx := context.Background()
+
+	m.reconcileGC(ctx)
+
+	// The mutation still happened: the orphan is gone.
+	if _, err := m.cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, "orphan", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("orphan should still be GC'd, err=%v", err)
+	}
+	// But NO audit event, since fsm_state would be empty/invalid.
+	if got := len(cap.events()); got != 0 {
+		t.Fatalf("want 0 audit events for missing fsm-state policy, got %d: %+v", got, cap.events())
+	}
 }
