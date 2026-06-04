@@ -48,4 +48,7 @@ func TestActiveGauge_ResetsToZeroWhenEmpty(t *testing.T) {
 	if got := testutil.ToFloat64(m.active.WithLabelValues(AuditPolicyKindRestricted)); got != 0 {
 		t.Errorf("active{restricted} = %v, want 0", got)
 	}
+	if got := testutil.ToFloat64(m.active.WithLabelValues(AuditPolicyKindQuarantined)); got != 0 {
+		t.Errorf("active{quarantined} = %v, want 0", got)
+	}
 }

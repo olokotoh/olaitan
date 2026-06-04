@@ -37,4 +37,15 @@ func TestOverrideMetrics_AppliedAndActive(t *testing.T) {
 	if got := testutil.ToFloat64(c.active.WithLabelValues("QUARANTINED")); got != 0 {
 		t.Errorf("active{QUARANTINED} = %v, want 0", got)
 	}
+
+	// Steady-state tick: an UNCHANGED override must NOT re-count applied (the
+	// counter tracks genuine apply events, not poll cadence) and the active
+	// gauge stays at 1 (still pinned).
+	c.reconcile(ctx)
+	if got := testutil.ToFloat64(c.applied.WithLabelValues("RESTRICTED")); got != 1 {
+		t.Errorf("applied_total{RESTRICTED} after a steady tick = %v, want 1 (no re-count)", got)
+	}
+	if got := testutil.ToFloat64(c.active.WithLabelValues("RESTRICTED")); got != 1 {
+		t.Errorf("active{RESTRICTED} after a steady tick = %v, want 1", got)
+	}
 }
