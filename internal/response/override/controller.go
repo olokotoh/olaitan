@@ -50,6 +50,11 @@ type Controller struct {
 	excluded   map[string]struct{}
 
 	rejected *prometheus.CounterVec
+	// Story 2.9 observability: applied counts applied overrides per requested
+	// state; active is a gauge of currently-pinned workloads per state, set each
+	// reconcile tick from the authoritative FSM pin set. Both nil-guarded.
+	applied *prometheus.CounterVec
+	active  *prometheus.GaugeVec
 
 	// consumed records, per workload_id, the override SIGNATURE whose native
 	// Redis TTL has already elapsed (the hard-deadline release, FIX 2/FR39).
@@ -195,7 +200,48 @@ func (c *Controller) registerMetrics(r *metrics.Registry) error {
 		cv.WithLabelValues(reason).Add(0)
 	}
 	c.rejected = cv
+
+	// Story 2.9 AC2: applied-override counter labelled by requested state.
+	ac, err := r.RegisterCounterVec(
+		"olaitan_response_override_applied_total",
+		"Cumulative number of operator overrides APPLIED, labelled by the requested target state (Story 2.9, AC2). The sibling rejected counter is olaitan_response_override_rejected_total.",
+		[]string{"state"},
+	)
+	if err != nil {
+		return err
+	}
+	c.applied = ac
+
+	// Story 2.9 AC2: gauge of currently-pinned workloads per state, set each
+	// reconcile tick from the FSM pin set (self-correcting on release).
+	gv, err := r.RegisterGaugeVec(
+		"olaitan_response_override_active",
+		"Current number of workloads with an ACTIVE operator override (FSM pin), labelled by the pinned state (Story 2.9, AC2).",
+		[]string{"state"},
+	)
+	if err != nil {
+		return err
+	}
+	c.active = gv
 	return nil
+}
+
+// updateActiveGauge sets olaitan_response_override_active{state} from the
+// authoritative FSM pin set (BI-3). It resets the vec first so a state that
+// drops to zero pinned workloads is reflected as 0 rather than a stale value.
+// A nil gauge (registry-less fixture) is a no-op.
+func (c *Controller) updateActiveGauge() {
+	if c.active == nil {
+		return
+	}
+	counts := map[schema.PodSecurityState]int{}
+	for _, st := range c.machine.PinnedWorkloads() {
+		counts[st]++
+	}
+	c.active.Reset()
+	for st, n := range counts {
+		c.active.WithLabelValues(string(st)).Set(float64(n))
+	}
 }
 
 // Run is the poll/reconcile loop (BI-1). It LISTs annotated pods on a ticker,
@@ -281,6 +327,10 @@ func (c *Controller) reconcile(ctx context.Context) {
 	// Phase 4: prune the in-memory consumed/last-rejected maps so a sustained
 	// outage cannot grow them unbounded (FIX 4 backstop).
 	c.pruneInMemory(desiredSet, current, rejections)
+
+	// Story 2.9 (AC2): refresh the active-pins gauge from the authoritative FSM
+	// pin set at the end of every successful tick.
+	c.updateActiveGauge()
 }
 
 // pruneInMemory is the FIX 4 (round 2) defensive backstop: on each successful
@@ -559,6 +609,10 @@ func (c *Controller) applyDesired(ctx context.Context, workloadID string, d desi
 	// AUDIT.overrides SIEM subject. Built from the same evt so the SIEM copy
 	// cannot drift; best-effort (BI-5.2).
 	c.auditOverride(ctx, evt)
+	// Story 2.9 (AC2): count the applied override by requested state.
+	if c.applied != nil {
+		c.applied.WithLabelValues(string(d.state)).Inc()
+	}
 }
 
 // detectHardDeadlineExpiry handles the FR39 hard-deadline release with

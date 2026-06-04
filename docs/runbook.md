@@ -422,6 +422,36 @@ Operational notes:
 - **Counting semantics (one per DISTINCT rejection, not per poll).** A standing invalid annotation is counted ONCE, not once per poll. The controller tracks the last-rejected signature (`reason|requested-value`) per workload and increments the counter (and emits the `OVERRIDES.applied` rejection event) only on a NEW or CHANGED rejection for that workload, so the counter stays consistent with the server-side-deduped NATS event (one event, one increment). If the operator edits the annotation to a DIFFERENT still-invalid value the counter ticks once more (a new distinct rejection); when the workload stops being rejected (the value is corrected, or the annotation is removed) the marker is cleared, so a later regression to the same bad value re-counts. Read a flat `invalid_state` as "one standing misconfiguration", and a STEP increase as "a new or changed bad annotation", rather than as a per-scrape rate.
 - **No `workload_id` label** (forbidden as a Prometheus label per architecture.md:472-476); the rejected workload is in the `OVERRIDES.applied` event and the controller WARN log.
 
+#### Graduated-isolation observability surface (Story 2.9, NFR32)
+
+Story 2.9 completes the Epic 2 Prometheus surface. The FSM metrics
+(`olaitan_response_fsm_transitions_total{from_state,to_state,reason}`,
+`olaitan_response_fsm_dwell_seconds{state}`,
+`olaitan_response_fsm_active_workloads{state}`) shipped in Story 2.2. Story 2.9
+adds:
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `olaitan_response_override_applied_total` | counter | `state` | applied operator overrides per requested target state |
+| `olaitan_response_override_active` | gauge | `state` | workloads with an ACTIVE operator pin, by state (refreshed each reconcile from the FSM pin set) |
+| `olaitan_response_network_policy_active` | gauge | `state` | Olaitan-managed NetworkPolicies per kind (`restricted`/`quarantined`), refreshed each reconcile from the managed-policy list |
+| `olaitan_response_audit_transitions_dropped_total` | counter | (none) | AUDIT.transitions events dropped on buffer overflow during a NATS outage |
+| `olaitan_response_audit_policies_dropped_total` | counter | (none) | AUDIT.policies events dropped on buffer overflow |
+
+**Metric-name reconciliation (Story 2.9 BI-2).** epics.md Story 2.9 spells the
+NetworkPolicy metrics `olaitan_response_networkpolicy_apply_duration_seconds`
+etc.; the SHIPPED family (Story 2.4) is `olaitan_response_network_policy_apply_seconds`
+and `_apply_total{result}`. The shipped `network_policy` names are authoritative
+(renaming would break Story 2.4 tests + operator dashboards for a cosmetic
+spelling); the new `network_policy_active` gauge follows that shipped family.
+
+Sample PromQL (scaffolding; finalised in Epic 6):
+- Runaway escalation: `sum(rate(olaitan_response_fsm_transitions_total{to_state="QUARANTINED"}[5m]))`
+- Override misuse: `sum(rate(olaitan_response_override_applied_total[1h]))` and `olaitan_response_override_active`
+- Stale policies: `olaitan_response_network_policy_active` vs `olaitan_response_fsm_active_workloads{state=~"RESTRICTED|QUARANTINED"}`
+- Apply latency SLO (NFR6): `histogram_quantile(0.99, sum by (le) (rate(olaitan_response_network_policy_apply_seconds_bucket[5m])))`
+- Audit loss: `increase(olaitan_response_audit_transitions_dropped_total[5m]) > 0`
+
 ### 1.5 Naming-convention reconciliation
 
 The Story 1.18 acceptance criteria text uses a mix of singular-ring and plural-ring metric names (e.g. AC2 says `olaitan_decision_rule_matches_total` singular; AC3 says `olaitan_decision_baseline_deviations_total{metric, sigma_bucket}` plural). The actual registrations follow `architecture.md:472-475` which mandates the `olaitan_<ring>_<metric>` pattern with the engine subfamily conventionally plural (`rules`, `baseline`) because the engine evaluates a corpus, not a single rule. The AC singular spellings are documentation aliases, not parallel families.
