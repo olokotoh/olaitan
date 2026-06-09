@@ -37,6 +37,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
+	claudeprovider "github.com/olokotoh/olaitan/internal/agent/provider/claude"
 	"github.com/olokotoh/olaitan/internal/collector/audit"
 	"github.com/olokotoh/olaitan/internal/collector/cni"
 	"github.com/olokotoh/olaitan/internal/collector/cri"
@@ -727,10 +728,52 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		}
 		g.Go(func() error { return redactionAuditSink.Run(ctx) })
 	}
-	// redactionAuditSink is wired for the Epic 3 LLM call sites (Stories
-	// 3.2/3.5-3.7), which do not exist yet (BI-8). Reference it so the wiring is
-	// live and the build does not flag it unused until those stories land.
-	_ = redactionAuditSink
+	// Story 3.2 (BI-6.3): the Claude LLM provider is constructed only when
+	// the operator selected the API provider path AND the projected Secret
+	// env var carries a key. analyst.api.api_key_secret NAMES the env var
+	// the Kubernetes Secret is projected into; the config loader never
+	// reads the value (config.go:1367-1369), this composition root does,
+	// once, at startup, and passes it into the constructor so the provider
+	// stays testable and the env name lives in one place. An empty name or
+	// value degrades cleanly to rules-only (RS) mode: no crash, no blocked
+	// startup, the deterministic ThreatScore path is unaffected (NFR27
+	// alignment; the fallback POLICY itself is Story 3.10 scope). The
+	// off-by-default redaction audit sink wired above is threaded in so
+	// every Analyse call routes reportredact.RedactAndAudit through the
+	// same sink (nil unless report.redact.audit_enabled).
+	var claudeProvider *claudeprovider.Provider
+	switch prov := cfg.Analyst.Provider; prov {
+	case "api", "claude":
+		keyEnv := cfg.Analyst.API.APIKeySecret
+		apiKey := ""
+		if keyEnv != "" {
+			apiKey = os.Getenv(keyEnv)
+		}
+		if apiKey == "" {
+			// NFR18: log the BOOLEAN presence flag and the env NAME,
+			// never a key value.
+			log.Info("aggregator: claude provider not wired; running rules-only",
+				"provider", "claude", "api_key_set", false, "api_key_env", keyEnv)
+			break
+		}
+		cp, perr := claudeprovider.New(claudeprovider.Config{
+			Model:    cfg.Analyst.API.Model,
+			BaseURL:  cfg.Analyst.API.Endpoint,
+			ScoreCap: cfg.Analyst.ScoreCap,
+		}, apiKey, metricsReg, redactionAuditSink, log)
+		if perr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: claude provider: %w", perr)
+		}
+		claudeProvider = cp
+	default:
+		log.Info("aggregator: analyst provider is not the API path; claude provider not wired",
+			"analyst_provider", prov)
+	}
+	// claudeProvider is consumed by the Story 3.5-3.7 orchestrator, which
+	// does not exist yet (BI-8). Reference it so the wiring is live and the
+	// build does not flag it unused until those stories land.
+	_ = claudeProvider
 
 	var sinks fsm.MultiSink
 	var fsmStore *fsm.Store
