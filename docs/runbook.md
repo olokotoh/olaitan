@@ -570,6 +570,20 @@ only, never a date suffix). Evidence is redacted via the Story 3.1 pipeline
 BEFORE the wire payload is built; the captured-request-body integration test
 is the proof.
 
+**Known limitations (tracked, not blocking).**
+(a) An explicit `analyst.score_cap: 0` is currently indistinguishable from
+an omitted field (Go zero value) and is coerced to the default 35; an
+operator intending "LLM contributes nothing" should use
+`analyst.provider: none` until Story 3.11 (which owns cap enforcement)
+introduces the unset-vs-zero distinction.
+(b) The provider's `max_tokens` ceiling is programmatically tunable
+(`claude.Config.MaxTokens`) but has no `analyst.*` config field yet; the
+operator-facing knob lands with the Story 3.16 Helm wiring. Until then the
+default 4096 applies.
+(c) A well-formed 200 reply with an empty message object yields
+`Response.Raw == ""` recorded as `success`; callers (Stories 3.5-3.7) must
+treat an empty `Raw` as a failed verdict.
+
 ### 1.5 Naming-convention reconciliation
 
 The Story 1.18 acceptance criteria text uses a mix of singular-ring and plural-ring metric names (e.g. AC2 says `olaitan_decision_rule_matches_total` singular; AC3 says `olaitan_decision_baseline_deviations_total{metric, sigma_bucket}` plural). The actual registrations follow `architecture.md:472-475` which mandates the `olaitan_<ring>_<metric>` pattern with the engine subfamily conventionally plural (`rules`, `baseline`) because the engine evaluates a corpus, not a single rule. The AC singular spellings are documentation aliases, not parallel families.

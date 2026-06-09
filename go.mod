@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	github.com/alicebob/miniredis/v2 v2.37.0
+	github.com/anthropics/anthropic-sdk-go v1.50.0
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/leanovate/gopter v0.2.11
 	github.com/nats-io/nats-server/v2 v2.11.15
@@ -25,7 +26,6 @@ require (
 )
 
 require (
-	github.com/anthropics/anthropic-sdk-go v1.50.0 // indirect
 	github.com/antithesishq/antithesis-sdk-go v0.6.0-default-no-op // indirect
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect

@@ -742,33 +742,29 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	// every Analyse call routes reportredact.RedactAndAudit through the
 	// same sink (nil unless report.redact.audit_enabled).
 	var claudeProvider *claudeprovider.Provider
-	switch prov := cfg.Analyst.Provider; prov {
-	case "api", "claude":
+	if analystSelectsAPIProvider(cfg.Analyst.Provider) {
 		keyEnv := cfg.Analyst.API.APIKeySecret
-		apiKey := ""
-		if keyEnv != "" {
-			apiKey = os.Getenv(keyEnv)
-		}
+		apiKey := analystAPIKeyFromEnv(keyEnv)
 		if apiKey == "" {
 			// NFR18: log the BOOLEAN presence flag and the env NAME,
 			// never a key value.
 			log.Info("aggregator: claude provider not wired; running rules-only",
 				"provider", "claude", "api_key_set", false, "api_key_env", keyEnv)
-			break
+		} else {
+			cp, perr := claudeprovider.New(claudeprovider.Config{
+				Model:    cfg.Analyst.API.Model,
+				BaseURL:  cfg.Analyst.API.Endpoint,
+				ScoreCap: cfg.Analyst.ScoreCap,
+			}, apiKey, metricsReg, redactionAuditSink, log)
+			if perr != nil {
+				closeNATS()
+				return fmt.Errorf("aggregator: claude provider: %w", perr)
+			}
+			claudeProvider = cp
 		}
-		cp, perr := claudeprovider.New(claudeprovider.Config{
-			Model:    cfg.Analyst.API.Model,
-			BaseURL:  cfg.Analyst.API.Endpoint,
-			ScoreCap: cfg.Analyst.ScoreCap,
-		}, apiKey, metricsReg, redactionAuditSink, log)
-		if perr != nil {
-			closeNATS()
-			return fmt.Errorf("aggregator: claude provider: %w", perr)
-		}
-		claudeProvider = cp
-	default:
+	} else {
 		log.Info("aggregator: analyst provider is not the API path; claude provider not wired",
-			"analyst_provider", prov)
+			"analyst_provider", cfg.Analyst.Provider)
 	}
 	// claudeProvider is consumed by the Story 3.5-3.7 orchestrator, which
 	// does not exist yet (BI-8). Reference it so the wiring is live and the
@@ -1607,4 +1603,29 @@ Flags (collector, aggregator):
 
 Olaitan -- LLM-powered autonomous runtime security agent for Kubernetes.
 `)
+}
+
+// analystSelectsAPIProvider reports whether analyst.provider selects the
+// external-API (Claude) path. The comparison is case-insensitive to match
+// the config validator, which lowercases before checking its allow-set
+// [api local none]; a case-sensitive match here silently disabled the
+// whole LLM tier on a config the loader had declared valid (Story 3.2
+// round-1 review HIGH). No "claude" spelling exists: the validator
+// rejects it at load time, so it can never reach this wiring.
+func analystSelectsAPIProvider(provider string) bool {
+	return strings.EqualFold(provider, "api")
+}
+
+// analystAPIKeyFromEnv reads the projected analyst API key from the env
+// var named by analyst.api.api_key_secret. The value is whitespace-trimmed
+// (kubectl-created Secrets routinely carry a trailing newline, and an
+// untrimmed key fails every call client-side with "invalid header field
+// value"); a whitespace-only value collapses to the clean rules-only skip
+// path rather than wiring a garbage key (Story 3.2 round-1 review MED).
+// An empty envName means no Secret is configured: skip.
+func analystAPIKeyFromEnv(envName string) string {
+	if envName == "" {
+		return ""
+	}
+	return strings.TrimSpace(os.Getenv(envName))
 }

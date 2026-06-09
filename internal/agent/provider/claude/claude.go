@@ -288,6 +288,14 @@ func (p *Provider) Analyse(ctx context.Context, req provider.Request) (provider.
 	var msg *anthropic.Message
 	op := func(opCtx context.Context) error {
 		m, callErr := p.client.Messages.New(opCtx, params)
+		if callErr == nil && m == nil {
+			// A 200 with a JSON `null` body decodes into a nil *Message
+			// with no error. The endpoint is operator-configurable
+			// (gateways, proxies), so a misbehaving upstream must degrade
+			// to a retryable transport error, never a nil dereference and
+			// never a falsified success outcome (round-1 review HIGH).
+			return errors.New("claude: empty message in 200 response")
+		}
 		if callErr != nil {
 			if isPermanent(callErr) {
 				// Permanent classes (BI-3 table) short-circuit Strategy.Do
@@ -328,7 +336,7 @@ func (p *Provider) Health(ctx context.Context) error {
 	hctx, cancel := context.WithTimeout(ctx, healthTimeout)
 	defer cancel()
 
-	_, err := p.client.Messages.New(hctx, anthropic.MessageNewParams{
+	msg, err := p.client.Messages.New(hctx, anthropic.MessageNewParams{
 		Model:     anthropic.Model(p.model),
 		MaxTokens: 1,
 		Messages:  []anthropic.MessageParam{anthropic.NewUserMessage(anthropic.NewTextBlock("ping"))},
@@ -336,6 +344,11 @@ func (p *Provider) Health(ctx context.Context) error {
 	})
 	if err != nil {
 		return fmt.Errorf("claude: health: %w", err)
+	}
+	if msg == nil {
+		// Same nil-on-200-null decode hazard as in Analyse: a probe that
+		// produced no message is not a healthy endpoint.
+		return errors.New("claude: health: empty message in 200 response")
 	}
 	return nil
 }
@@ -428,6 +441,11 @@ func isPermanent(err error) bool {
 // adaptive thinking stays off in 3.2. Story 3.7 may promote the Senior
 // role to adaptive thinking via a per-role option without changing this
 // default.
+//
+// Model constraint: explicit {type: disabled} is accepted on the Opus
+// 4.x family but rejected (HTTP 400) by Fable-class models, which require
+// the thinking field to be omitted instead. If a future analyst.api.model
+// pin targets such a model, this construction must become model-aware.
 func disabledThinking() anthropic.ThinkingConfigParamUnion {
 	return anthropic.ThinkingConfigParamUnion{
 		OfDisabled: &anthropic.ThinkingConfigDisabledParam{},

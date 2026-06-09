@@ -80,6 +80,14 @@ func (r Role) Valid() bool {
 // (Stories 3.5-3.7). The provider only transports it; it never composes
 // analyst instructions itself.
 //
+// REDACTION CONTRACT (AC3 boundary): the provider redacts Request.Package
+// before any byte leaves the process, but Prompt text and PriorAssessment
+// cross the wire VERBATIM. Callers must therefore never interpolate raw
+// event excerpts or any other un-redacted evidence into the prompt;
+// evidence travels exclusively on Request.Package, where Story 3.1's
+// pipeline guards it. A PriorAssessment derived from previously redacted
+// evidence is clean by construction.
+//
 // Callers that surface model output to operators should include a
 // final-answer-only instruction in System: with thinking disabled
 // (the Story 3.2 default) Opus 4.8 may otherwise write reasoning
@@ -114,7 +122,10 @@ type Request struct {
 // returns the structured payload; it does not parse it into
 // schema.ThreatAssessment (that is the orchestrator's job).
 type Response struct {
-	// Raw is the concatenated text content of the model reply.
+	// Raw is the concatenated text content of the model reply. It may be
+	// empty on a degenerate-but-well-formed reply (e.g. an upstream proxy
+	// returning an empty message object); callers must treat an empty Raw
+	// as a failed verdict, not parse it optimistically.
 	Raw string
 	// StopReason is the provider's stop reason (e.g. "end_turn",
 	// "max_tokens") for caller-side truncation handling.

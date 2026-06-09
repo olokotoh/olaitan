@@ -471,6 +471,45 @@ func TestAnalyseAPIKeyNeverInErrorOrLogs(t *testing.T) {
 	}
 }
 
+// Story 3.2 round-1 review HIGH: a 200 response whose body is JSON `null`
+// decodes into a nil *Message with no error in the SDK. That must degrade
+// to a retryable transport error and a transient_failure outcome, never a
+// nil-pointer panic recorded as success.
+func TestAnalyseNullResponseBodyIsTransientNotPanic(t *testing.T) {
+	h := &capturingHandler{script: []scriptedResponse{{200, "null"}}}
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	p, reg := newTestProvider(t, ts.URL, nil)
+	_, err := p.Analyse(context.Background(), analyseRequest(provider.RoleL1))
+	if err == nil {
+		t.Fatal("Analyse on 200 null body: err = nil, want transport error")
+	}
+	if !strings.Contains(err.Error(), "empty message") {
+		t.Errorf("err = %v, want empty-message transport error", err)
+	}
+	if got := h.attempts.Load(); got != 3 {
+		t.Errorf("attempts = %d, want 3 (transient, retried)", got)
+	}
+	if v, _ := counterValue(t, reg, "claude", "l1", statusTransient); v != 1 {
+		t.Errorf("metric {claude,l1,transient_failure} = %v, want 1", v)
+	}
+	if v, _ := counterValue(t, reg, "claude", "l1", statusSuccess); v != 0 {
+		t.Errorf("metric {claude,l1,success} = %v, want 0 (a null body is not a success)", v)
+	}
+}
+
+func TestHealthNullResponseBodyReturnsError(t *testing.T) {
+	h := &capturingHandler{script: []scriptedResponse{{200, "null"}}}
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	p, _ := newTestProvider(t, ts.URL, nil)
+	if err := p.Health(context.Background()); err == nil {
+		t.Fatal("Health on 200 null body: err = nil, want unhealthy")
+	}
+}
+
 func TestHealthSuccessAndFailure(t *testing.T) {
 	h := &capturingHandler{script: []scriptedResponse{{200, successBody}}}
 	ts := httptest.NewServer(h)
