@@ -221,7 +221,7 @@ func TestRedactAndAudit_EnqueuesNoSecretValue(t *testing.T) {
 	go func() { done <- sink.Run(ctx) }()
 
 	secret := "sk-top-secret-value"
-	b64 := base64.StdEncoding.EncodeToString([]byte("rawbytes"))
+	b64 := base64.StdEncoding.EncodeToString([]byte{0x00, 0x01, 0x02, 0xff, 0xfe, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e})
 	pkg := schema.EvidencePackage{
 		PackageID:  "pkg-1",
 		WorkloadID: "w",

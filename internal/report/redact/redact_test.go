@@ -115,7 +115,9 @@ func TestRedact_JWTInSummary(t *testing.T) {
 }
 
 func TestRedact_RawPayloadHashed(t *testing.T) {
-	payloadBytes := []byte{0x01, 0x02, 0x03, 0x04, 0x05}
+	// A genuine binary blob (>= minBlobLen bytes, high non-printable ratio) so
+	// the ROUND-1 fix #8 heuristic recognises it as a raw payload.
+	payloadBytes := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x00, 0xff, 0xfe, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b}
 	b64 := base64.StdEncoding.EncodeToString(payloadBytes)
 	pkg := pkgWithRaw(t, map[string]any{"payload": b64})
 	out, events := Redact(pkg)

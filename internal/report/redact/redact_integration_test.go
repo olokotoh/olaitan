@@ -51,7 +51,7 @@ func validateAgainstSchema(t *testing.T, schemaPath string, payload []byte) erro
 func TestRedactions_RealRedactValidatesAgainstSchema(t *testing.T) {
 	schemaPath := filepath.Join(schemaDir, "redactions.json")
 	jwt := validJWT(t)
-	b64 := base64.StdEncoding.EncodeToString([]byte("rawbytes"))
+	b64 := base64.StdEncoding.EncodeToString([]byte{0x00, 0x01, 0x02, 0xff, 0xfe, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e})
 	pkg := schema.EvidencePackage{
 		PackageID:  "pkg-int-1",
 		WorkloadID: "ns/Deployment/web",

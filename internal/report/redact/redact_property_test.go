@@ -76,6 +76,12 @@ func pinnedParams() *gopter.TestParameters {
 
 // genSecretBearingPackage produces an EvidencePackage whose Event.Raw trees are
 // seeded with known secret-bearing fields and records the ground-truth secrets.
+//
+// ROUND-1 fix #9: the generator now injects AND ground-truth-tracks ALL of: a
+// secret-keyed string value, a secret in the K8s {name,value} env shape, a JWT
+// embedded inside a LARGER Raw string, a secret in Event.Tags, a raw-payload
+// byte blob (tracking the DECODED bytes too), a nested-object secret value under
+// a secret key, and a file-ref with secret contents.
 func genSecretBearingPackage() gopter.Gen {
 	// A non-empty bounded slice of seed strings drives one event per seed; the
 	// map function caps the count so packages stay small and fast.
@@ -89,26 +95,43 @@ func genSecretBearingPackage() gopter.Gen {
 		var secrets []string
 		events := make([]schema.Event, len(seeds))
 		for i, seed := range seeds {
-			secretVal := "sk-" + sanitise(seed) + strconv.Itoa(i) + "-secret"
-			jwt := genJWT(seed + strconv.Itoa(i))
-			fileContents := "file-secret-" + sanitise(seed) + strconv.Itoa(i)
-			rawBytes := []byte("payload-" + sanitise(seed) + strconv.Itoa(i))
-			secrets = append(secrets, secretVal, jwt, fileContents, secretVal+"-deep")
+			s := sanitise(seed) + strconv.Itoa(i)
+			secretVal := "sk-" + s + "-secret"
+			envSecret := "envsecret-" + s      // K8s {name,value} env shape
+			tagSecret := genJWT("tag" + s)     // JWT inside a tag
+			jwt := genJWT(s)                   // JWT in a larger string
+			fileContents := "file-secret-" + s // file-ref contents
+			deepSecret := secretVal + "-deep"  // nested secret value
+			// A genuine binary blob so the fix #8 heuristic reduces it; track
+			// BOTH the encoded form AND the decoded bytes as ground truth.
+			rawBytes := []byte{0x00, 0x01, 0xff, 0xfe, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x10 ^ byte(i), 0x11, 0x12, 0x13}
+			rawB64 := base64.StdEncoding.EncodeToString(rawBytes)
+			secrets = append(secrets,
+				secretVal, envSecret, tagSecret, jwt, fileContents, deepSecret,
+				rawB64, string(rawBytes),
+			)
 
 			raw := map[string]any{
 				"api_key":       secretVal,
-				"authorization": jwt,
-				"payload":       base64.StdEncoding.EncodeToString(rawBytes),
+				"authorization": "Bearer " + jwt, // JWT embedded in a LARGER string (fix #2)
+				"payload":       rawB64,          // raw byte blob (fix #8)
 				"file":          map[string]any{"path": "/etc/app/x", "contents": fileContents},
+				"containers": []any{ // K8s {name,value} env shape (fix #1)
+					map[string]any{"env": []any{
+						map[string]any{"name": "DB_PASSWORD", "value": envSecret},
+						map[string]any{"name": "LOG_LEVEL", "value": "debug"},
+					}},
+				},
 				"nested": map[string]any{
-					"deep": map[string]any{"password": secretVal + "-deep"},
-					"safe": "kept-value",
+					"credentials": map[string]any{"deep": deepSecret},
+					"safe":        "kept-value",
 				},
 			}
 			rb, _ := json.Marshal(raw)
 			events[i] = schema.Event{
 				ID:      "e" + strconv.Itoa(i),
 				Summary: "saw token " + jwt + " on the wire",
+				Tags:    []string{"benign", "auth=" + tagSecret},
 				Raw:     rb,
 			}
 		}
@@ -147,7 +170,9 @@ func sanitise(s string) string {
 
 // TestProperty_NoSecretReachesProvider is the NFR15 core (AC3): for every
 // generated package and every role, the redacted payload the provider mock
-// receives contains NO injected secret value.
+// receives contains NO injected secret value. The assertion is over the WHOLE
+// marshalled EvidencePackage (ROUND-1 fix #9/#10), so a leak through ANY field
+// (including a future root field) is caught.
 func TestProperty_NoSecretReachesProvider(t *testing.T) {
 	props := gopter.NewProperties(pinnedParams())
 	props.Property("no injected secret survives Redact for any role", prop.ForAll(
@@ -170,12 +195,84 @@ func TestProperty_NoSecretReachesProvider(t *testing.T) {
 				if !strings.Contains(payload, jsonEscape(redactedToken)) || !strings.Contains(payload, jsonEscape(redactedJWTToken)) {
 					return false
 				}
+				// Benign values must SURVIVE (no over-redaction, ROUND-1
+				// balance): the LOG_LEVEL=debug env value and kept-value.
+				if !strings.Contains(payload, "debug") || !strings.Contains(payload, "kept-value") {
+					return false
+				}
+				// Structural assertions (Task 6.2/BI-9.2): raw payloads carry
+				// ONLY sha256+len; file refs carry ONLY path+size+sha256.
+				if !structuralShapesOK(redacted) {
+					return false
+				}
 			}
 			return true
 		},
 		genSecretBearingPackage(),
 	))
 	props.TestingRun(t)
+}
+
+// structuralShapesOK walks each redacted Event.Raw and asserts that every
+// raw_payload placeholder carries exactly {redacted,sha256,len} and every
+// file-ref reduction carries exactly {path,size,sha256} (BI-9.2). The generator
+// produces file refs with no extra sibling keys, so the file-ref form is the
+// minimal three-key shape.
+func structuralShapesOK(pkg schema.EvidencePackage) bool {
+	for _, ev := range pkg.Events {
+		if len(ev.Raw) == 0 {
+			continue
+		}
+		var tree any
+		if json.Unmarshal(ev.Raw, &tree) != nil {
+			return false
+		}
+		if !shapeWalk(tree) {
+			return false
+		}
+	}
+	return true
+}
+
+func shapeWalk(v any) bool {
+	switch t := v.(type) {
+	case map[string]any:
+		if red, ok := t["redacted"].(string); ok && red == ReasonRawPayload {
+			// raw payload placeholder: exactly redacted+sha256+len.
+			if len(t) != 3 {
+				return false
+			}
+			_, hasSha := t["sha256"]
+			_, hasLen := t["len"]
+			return hasSha && hasLen
+		}
+		if _, hasSha := t["sha256"]; hasSha {
+			if _, hasPath := t["path"]; hasPath {
+				// file-ref reduction: exactly path+size+sha256 (the generator
+				// adds no sibling keys).
+				if len(t) != 3 {
+					return false
+				}
+				_, hasSize := t["size"]
+				return hasSize
+			}
+		}
+		for _, e := range t {
+			if !shapeWalk(e) {
+				return false
+			}
+		}
+		return true
+	case []any:
+		for _, e := range t {
+			if !shapeWalk(e) {
+				return false
+			}
+		}
+		return true
+	default:
+		return true
+	}
 }
 
 // TestProperty_Determinism (AC3, BI-9.3): Redact() twice yields byte-identical
