@@ -85,4 +85,10 @@ const (
 	ReasonDwellGuardElapsed           = "dwell_guard_elapsed"
 	ReasonDeescalationCooldownExpired = "de_escalation_cooldown_expired"
 	ReasonNoTransition                = "no_transition"
+	// ReasonOperatorOverride labels a transition produced by the Story 2.7
+	// operator-override controller pinning the FSM via Machine.Pin (FR38).
+	// It carries TriggerType "override" rather than "automated" so audit and
+	// enforcement consumers can distinguish an operator-driven pin from a
+	// ThreatScore-driven transition.
+	ReasonOperatorOverride = "operator_override"
 )

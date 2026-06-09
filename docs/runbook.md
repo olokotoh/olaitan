@@ -240,7 +240,7 @@ Wiring of the rate-limit counters above is in `cmd/olaitan/metrics.go:140-260` v
 - **Labels:** none (per BI-2 of Story 1.18; `architecture.md:476` forbids the `{workload}` label suggested by AC3's literal text because workload-keyed labels have unbounded cardinality)
 - **Help:** Count of workloads currently within an active warm-up window (FR18). Sampled from the Warmup controller cache; cardinality bounded by the workload set under the controller's reach.
 - **Sample PromQL (aggregate):** `olaitan_decision_baseline_warmup_active`.
-- **Per-workload telemetry:** the per-workload warm-up detail (which specific workloads are in warm-up at any given moment) is surfaced through the `AUDIT.transitions` subject documented in `architecture.md:380`, not through Prometheus. SIEM-side consumers subscribe to the audit subjects when they need pod-level granularity.
+- **Per-workload telemetry:** the per-workload warm-up detail (which specific workloads are in warm-up at any given moment) is surfaced through the `AUDIT.transitions` subject (shipped in Story 2.8; see "Append-only SIEM audit subjects" below), not through Prometheus. SIEM-side consumers subscribe to the audit subjects when they need pod-level granularity.
 
 #### `olaitan_decision_baseline_evaluation_seconds`
 
@@ -311,6 +311,171 @@ FSM state is persisted to the durable `fsm:{workload_id}` Redis hash (NO TTL) on
 A restart resets each recovered workload's de-escalation cooldown window (conservative: it can never de-escalate earlier than a fresh cooldown) while preserving dwell progress where the clock is monotonic. During a brief Redis outage, transitions are buffered in memory and replayed on reconnection (idempotent via the compare-and-swap write); a controller crash mid-outage loses only the unflushed buffer, and the prior committed state remains authoritative in Redis.
 
 To disable persistence (sensing-only or a Redis-less deployment), set `detection.fsm.persistence_enabled: false` in the aggregator ConfigMap and `kubectl rollout restart deploy/olaitan-aggregator` (this knob is restart-required: it rewires the FSM sink and the restore hook).
+
+### 1.4c Response NetworkPolicy enforcement ring (Story 2.4 NEW)
+
+#### `olaitan_response_network_policy_apply_seconds`
+
+- **Type:** histogram
+- **Unit:** seconds
+- **Labels:** none.
+- **Help:** End-to-end latency from the FSM RESTRICTED transition timestamp to NetworkPolicy apply completion (NFR6, p99 within 1 s). Observed once per applied/no-op transition.
+- **Sample PromQL (p99):** `histogram_quantile(0.99, sum(rate(olaitan_response_network_policy_apply_seconds_bucket[5m])) by (le))`.
+- **Sample PromQL (alert):** `histogram_quantile(0.99, sum(rate(olaitan_response_network_policy_apply_seconds_bucket[5m])) by (le)) > 1` breaches the NFR6 budget.
+
+#### `olaitan_response_network_policy_apply_total`
+
+- **Type:** counter
+- **Unit:** count
+- **Labels:** `result` (one of `applied`, `noop`, `error`, `skipped`, `dropped`, `gc_deleted`, `superseded`, `removed`).
+- **Help:** Cumulative NetworkPolicy enforcement actions by result (FR33/FR35). `applied` = a policy created or updated; `noop` = an idempotent re-apply that matched the live object; `skipped` = a workload in an excluded namespace or already deleted; `dropped` = a transition dropped because the apply queue was full; `gc_deleted` = an orphan policy garbage-collected after its workload was removed; `superseded` = an escalation-residue policy removed by the reconcile backstop (a RESTRICTED policy for a workload the FSM now targets at QUARANTINED); `removed` = a de-escalation removal of a workload's managed policies (the SUSPICIOUS/CLEAN inline path, or a reconcile delete driven by the workload's FSM target dropping below the policy's state, Story 2.6). Note the `removed` granularity differs by path: the inline SUSPICIOUS/CLEAN removal counts `removed` once per workload (one handled transition), whereas the reconcile backstop counts `removed` once per policy object deleted, so a workload whose two policies are both reaped by the reconciler increments `removed` twice. Sum `removed` for action volume, not workload count.
+- **Sample PromQL (error rate):** `sum(rate(olaitan_response_network_policy_apply_total{result="error"}[5m]))`.
+- **Sample PromQL (drops):** `increase(olaitan_response_network_policy_apply_total{result="dropped"}[15m]) > 0` indicates the FSM is producing RESTRICTED transitions faster than the worker can apply them; investigate API-server latency.
+
+#### Operator scenario: graduated isolation (RESTRICTED enforcement)
+
+When a workload's ThreatScore crosses the RESTRICTED band (default 40), the FSM transitions it to RESTRICTED and the NetworkPolicyManager applies a NetworkPolicy named `olaitan-restricted-<hash>` in the workload's namespace. The policy allows egress only to the RFC 1918 private ranges, the configured cluster pod/service CIDRs, and any `extra_allowed_cidrs`, plus an explicit DNS (UDP/TCP 53) rule, and blocks all other (external) egress; ingress is left untouched (the full ingress+egress block is the QUARANTINED state, Story 2.5). Confirm with `kubectl get networkpolicy -n <namespace> -l app.kubernetes.io/managed-by=olaitan` and inspect the `olaitan.io/fsm-state` and `olaitan.io/package-id` annotations to trace the policy back to the triggering evidence package.
+
+Enforcement is OFF by default. To enable it, set `response.network_policy.enabled: true` in the aggregator ConfigMap and, critically, set `response.network_policy.cluster_cidrs` to your cluster's own pod and service CIDRs (the defaults `10.244.0.0/16` and `10.96.0.0/12` match the kind/Calico evaluation cluster). If the service CIDR is omitted, in-cluster DNS resolution to CoreDNS can break under RESTRICTED. Then `kubectl rollout restart deploy/olaitan-aggregator`.
+
+Two real-world limitations apply. First, enforcement depends on a NetworkPolicy-compliant CNI (Calico, Cilium, Antrea); under a CNI that does not enforce NetworkPolicy (for example Flannel) the policy object is created but has no effect. Second, Kubernetes NetworkPolicies are additive: if a pre-existing permissive egress policy also selects the workload's pods, it unions with the Olaitan RESTRICTED policy and the egress block is not fully effective. The RESTRICTED egress block is fully effective only where no conflicting allow-policy selects the workload.
+
+Orphan policies (a workload deleted while RESTRICTED) are garbage-collected within 60 s by a periodic reconcile (default 30 s, tunable via `response.network_policy.reconcile_interval_seconds`) that deletes managed policies whose owner no longer exists.
+
+A RESTRICTED transition is enforced per emission, not per desired state. If a transition is dropped because the apply queue was full (`result="dropped"`) or its owner-selector resolution hit a transient API error (`result="error"`), that specific RESTRICTED transition is not enforced until the FSM re-emits it for the same workload; the manager does not retry the dropped or errored transition on its own. There is no continuous desired-state re-reconciliation that would re-apply a missing RESTRICTED policy independently of a fresh FSM emission, so a sustained `result="dropped"` or `result="error"` rate means some workloads may sit in RESTRICTED without an enforcing policy until the next transition. Full desired-state re-reconciliation is deferred (see Open Assumption 5 in the Story 2.4 specification). Treat a non-zero `dropped`/`error` rate as an enforcement-coverage gap, not merely a latency blip.
+
+#### Operator scenario: full isolation (QUARANTINED enforcement, Story 2.5)
+
+When a workload's ThreatScore crosses the QUARANTINED band, the FSM transitions it from RESTRICTED to QUARANTINED and the NetworkPolicyManager applies a deny-all NetworkPolicy named `olaitan-quarantined-<hash>` in the workload's namespace. Unlike the RESTRICTED egress allow-list, the quarantine policy blocks ALL ingress and ALL egress for the workload's pods: it carries `policyTypes: [Ingress, Egress]` with no ingress and no egress rules at all (in additive `networking.k8s.io/v1` semantics, a selected pod with a policy type but no rules of that type is fully denied for that direction). There is deliberately NO DNS carve-out under QUARANTINED, so in-pod name resolution is also cut off; this is intentional total isolation of a confirmed-malicious workload (the DFIR agent does not rely on in-pod DNS). Confirm with `kubectl get networkpolicy -n <namespace> -l app.kubernetes.io/managed-by=olaitan` and inspect the `olaitan.io/fsm-state: QUARANTINED` annotation. The quarantine policy carries the same management labels as the RESTRICTED policy.
+
+The replacement of the RESTRICTED policy by the QUARANTINED policy is monotonically tightening from the workload's perspective: there is never a window with no policy at all, and never a window less protected than RESTRICTED. The manager uses apply-before-delete with distinct deterministic names. It FIRST applies the `olaitan-quarantined-<hash>` deny-all policy (via the same idempotent get-then-create-or-update path RESTRICTED uses) and, ONLY after that apply returns success, best-effort deletes the `olaitan-restricted-<hash>` policy for the same workload. Kubernetes NetworkPolicies are additive allow-lists: while both policies select the pod, ingress is denied immediately (only the quarantine policy declares the Ingress policyType, with no allow rules), and egress remains the UNION of both policies' allows, which is still the RESTRICTED allow-list (RFC 1918, cluster CIDRs, DNS). The deny-all does NOT subtract or override those egress allows; egress only tightens to deny-all once the restricted policy is removed. The manager never deletes the old policy before the new one is confirmed, so protection only ever increases.
+
+The supersession delete of the RESTRICTED policy is best-effort inline. A failed inline delete does NOT fail the QUARANTINED enforcement, but it does leave the workload not yet fully isolated: ingress is already denied, yet a lingering RESTRICTED policy keeps egress at the allow-list level (RFC 1918 + cluster + DNS), so egress is not yet deny-all. A transient inline delete failure is logged at WARN and is then reconciled by the periodic reconcile backstop (see below). The same two real-world limitations as RESTRICTED apply: enforcement depends on a NetworkPolicy-compliant CNI, and a pre-existing permissive third-party policy selecting the same pod can union to permit traffic the quarantine intends to block.
+
+If the inline supersession delete fails (or a controller shutdown is timed precisely between a successful quarantine apply and the supersession delete), the superseded `olaitan-restricted-<hash>` policy is removed by the periodic reconcile, which is the supersession backstop. Each reconcile cycle (default 30 s) lists managed policies, identifies workloads that currently have a QUARANTINED policy (by the `olaitan.io/fsm-state: QUARANTINED` annotation), and deletes any RESTRICTED policy for those workloads regardless of whether the owner still exists. This converges egress to deny-all within one reconcile interval and is counted under `result="superseded"`. Note that orphan GC alone would NOT remove the lingering restricted policy while the owner still exists (it only deletes on owner deletion); the supersession backstop is what makes the eventual full isolation guarantee hold. No operator action is required beyond awaiting the reconcile cycle.
+
+#### Operator scenario: de-escalation policy removal (Story 2.6, FR35)
+
+When a workload's threat indicators decay, the FSM de-escalates it one step at a time (QUARANTINED -> RESTRICTED -> SUSPICIOUS -> CLEAN), each step cooldown-gated. The NetworkPolicyManager removes or relaxes the managed policies in lock-step so a workload that is no longer suspect recovers normal connectivity automatically, without a stale deny-all or egress-block stranding it. Each FSM target DEFINES the workload's desired managed-policy set, and both the inline path and the reconcile backstop converge to it:
+
+- **QUARANTINED -> RESTRICTED (relaxation, the mirror of escalation):** the manager FIRST applies the `olaitan-restricted-<hash>` egress-only policy, then best-effort deletes the superseded `olaitan-quarantined-<hash>` deny-all. Apply-before-delete is load-bearing here for the opposite reason to escalation: deleting the deny-all before the restricted apply would momentarily revert the workload to fully open egress (no Olaitan restriction at all). During the brief overlap the workload is selected by both policies, so egress is already at the relaxed allow-list (the deny-all contributes no egress allows) while ingress stays denied until the deny-all is gone; the overlap is therefore, if anything, STRICTER than the final RESTRICTED state and never policy-less. The restricted apply counts `applied`/`noop`; the inline quarantine delete is silent best-effort. Confirm with `kubectl get networkpolicy -n <namespace> -l app.kubernetes.io/managed-by=olaitan`: you should see the `olaitan-restricted-<hash>` policy (annotation `olaitan.io/fsm-state: RESTRICTED`) and NO `olaitan-quarantined-<hash>`.
+
+- **RESTRICTED -> SUSPICIOUS and -> CLEAN (full removal):** SUSPICIOUS is a sensing-only state with no NetworkPolicy isolation and CLEAN is fully recovered, so both have an EMPTY desired set: the manager deletes BOTH `olaitan-restricted-<hash>` and `olaitan-quarantined-<hash>` for the workload (`IsNotFound` on either is success). Removal runs WITHOUT resolving a podSelector, so a de-escalating workload whose owner is being torn down still has its policies cleared. CLEAN additionally VERIFIES absence via a follow-up read of each name and re-deletes a stray survivor once. A successful removal counts `removed`; a removal-with-nothing-to-remove (a workload that was never isolated, or whose policies an intermediate step already cleared) is a successful no-op also counted `removed`, NEVER `error`. Do not read a `removed` with no policies present as a fault.
+
+The reconcile backstop is now FSM-target-aware (Story 2.6). Each reconcile cycle (default 30 s) the manager queries the FSM for each managed policy's workload and converges the policy set to the workload's CURRENT target's desired set: target QUARANTINED deletes a stale RESTRICTED policy (`result="superseded"`, the escalation residue, unchanged from Story 2.5); target RESTRICTED deletes a stale QUARANTINED policy (`result="removed"`, the de-escalation residue) WITHOUT touching the freshly-applied restricted policy; target SUSPICIOUS/CLEAN with the owner still present deletes BOTH (`result="removed"`). This is what guarantees a failed inline relaxation or removal self-heals within one reconcile interval, and what prevents a reconcile tick during the QUARANTINED->RESTRICTED overlap from re-deleting the freshly-applied restricted policy (the old "quarantine object wins" heuristic would have resolved that overlap backwards). The FSM target is read through a one-method `StateOracle` seam wired from the in-process `fsm.Machine`.
+
+When the FSM has no opinion on a workload (the oracle returns not-ok, e.g. transiently before the FSM map is populated, or after an FSM restart that did not restore the workload), the desired-state backstop deliberately does NOT delete the policy: the orphan-GC pass (owner NotFound -> `gc_deleted`) is the sole authority for such workloads. This is conservative by design, so an FSM state loss never strips protection from a still-running workload; the policy is reaped only if its owner is genuinely gone, otherwise it is retained until the FSM next evaluates the workload and the backstop regains an opinion. The orphan-GC behaviour is unchanged for all policies.
+
+Scope boundary: Story 2.6 handles ONLY automated, ThreatScore-driven de-escalation transitions. Operator-override state pins (`olaitan.io/state-override`, FR38/FR39) and their TTL release are Story 2.7; an override that drives the FSM into a lower state will flow through this same removal path once it lands, but the override controller, the annotation watch, and the `override_rejected` metric are not part of Story 2.6.
+
+#### Operator scenario: pinning a workload's state with an annotation (Story 2.7, FR38/FR39)
+
+When you have manually investigated an alert and want Olaitan to stand a workload down or escalate it for a fixed window, annotate the workload's pod OR its owner (Deployment/StatefulSet/DaemonSet/ReplicaSet/Job/CronJob) with the override pair and let the override controller pick it up. The controller is OFF by default; enable it with `response.override.enabled: true`.
+
+- `olaitan.io/state-override: <STATE>` where `<STATE>` is one of `CLEAN`, `SUSPICIOUS`, `RESTRICTED`, `QUARANTINED`. This pins the FSM to that state and DEFERS all subsequent ThreatScore-driven transitions until the override is released (FR38).
+- `olaitan.io/state-override-ttl: <duration>` (optional) is a Go duration such as `30m` or `2h`. When absent (or unparseable, or non-positive) the controller DEFAULTS to `1h` and logs a WARN; a bad TTL is NOT a rejection of the override.
+- `olaitan.io/state-override-by: <operator-id>` (optional) records who applied the override. When present it is carried on the `OVERRIDES.applied` event, the `override:{workload_id}` Redis record, and the FSM pin transition's `operator_id` for the audit trail. When absent the operator id is empty (acceptable). An operator-id change ALONE does NOT re-pin or re-arm the TTL (the TTL hard deadline is keyed on state + duration only).
+
+**Observation is a poll, not a watch.** The controller LISTs pods on a ticker (`response.override.poll_interval_seconds`, default 15 s) and reconciles. The aggregator deliberately holds no `watch` RBAC; observation is on-demand polling, so an override applied while the controller is briefly down is picked up on the next tick. **Release latency is therefore one poll interval**: the Redis key's TTL is exact, but the FSM's resumption is detected on the first poll AFTER the override ends (Open Assumption 1). Lower `poll_interval_seconds` for tighter release latency.
+
+**Native Redis TTL is a HARD DEADLINE, not a refreshing lease.** Each applied override writes `override:{workload_id}` (the canonical `namespace/owner-kind/owner-name` form) with a NATIVE Redis TTL equal to the requested duration. Inspect it with `redis-cli TTL override:default/Deployment/web`; the TTL should match the requested duration when the override was first applied (AC3). The reconcile is EDGE-TRIGGERED: the TTL is measured from FIRST application and is NEVER refreshed while the annotation merely remains present, so the override AUTO-RELEASES when the TTL elapses EVEN IF the annotation is still on the pod or owner (this honours AC2/FR39: "when the TTL elapses, the override is released, the FSM resumes"). To extend or change an override, the operator must CHANGE the annotation (a different state or a different `-ttl`) or REMOVE and RE-APPLY it; an unchanged annotation does not re-arm the deadline. This is the deliberate divergence from the no-TTL `fsm:` family: the override's lifetime is wall-clock, so it is reaped by Redis exactly on expiry. The pin's in-memory flag is NOT persisted in the `fsm:` hash; on restart the FSM rehydrates the pinned state from `fsm:` and the first post-restart poll re-establishes the in-memory pin from the surviving `override:` key (Open Assumption 3). If the controller is down longer than the TTL, Redis drops the key during the outage and the first post-restart poll sees no key and releases.
+
+**Restart re-arm caveat (hard-deadline model).** The "already-expired" suppression that stops a still-present annotation from re-pinning after its hard deadline is held IN MEMORY on the controller (a per-workload consumed-signature set). After a controller restart, that in-memory set is empty, so a still-present annotation whose hard deadline already elapsed RE-PINS ONCE (re-arm) with a fresh native TTL on the first post-restart poll. This is acceptable: the operator who wanted the override gone should remove the annotation, and the durable `override:` key drives correctness across the restart for the common case.
+
+**Release triggers (all detected by the same poll).** (1) Hard-deadline TTL expiry: the native Redis TTL elapses, Redis drops the `override:` key, and the poll detects the expiry AUTHORITATIVELY: a workload that is CURRENTLY PINNED in the FSM, is STILL desired (its annotation is present), and has NO active `override:` key this tick has reached its hard deadline (the missing key IS the deadline signal; the FSM pin set is the authority for "we believe this is pinned"). It calls `ReleasePin` and marks the workload "consumed" so the still-present annotation does NOT immediately re-pin. This absolute-deadline detection does NOT depend on observing the key present on a previous tick, so it is correct even when the TTL is SHORTER than the poll interval (the key is written and expires inside one poll gap) and when a SCAN/GET race transiently drops the key from one poll's active set. (2) Manual removal before expiry: you delete the annotation, the poll sees the workload no longer in the desired set (with the key possibly still present), CONFIRMS the annotation is genuinely gone with a direct read of the owner object (see below), then calls `ReleasePin` AND deletes the Redis key immediately (AC4), and clears the consumed marker so a later re-add re-pins. On release the FSM resumes score-driven control from the released state, re-evaluated against the CURRENT ThreatScore; the dwell/cooldown anchors are reset to a fresh window. The released workload reports the pinned state until its next ThreatScore arrives, then converges (Open Assumption 2): there is no synthetic re-score.
+
+**Manual-removal confirmation by a direct owner read.** Before a pinned/active workload that is not in this tick's desired set is released as a "manual removal", the controller CONFIRMS the annotation is genuinely gone by reading the workload's owner object directly (parse the `workload_id` into `namespace/Kind/name`, GET that owner via the typed client, and check it does NOT carry `olaitan.io/state-override`). This closes the owner-scaled-to-zero / rollout-churn false positive: a workload whose owner annotation pins it but which has ZERO live pods this tick produces a successful-but-EMPTY pod list, which is NOT a removal. Outcomes: owner NotFound (genuinely gone) => confirmed removal => release; owner present WITHOUT the annotation => confirmed removal => release; owner present WITH the annotation => the pods are merely absent (e.g. scaled to zero, mid-rollout) => NOT a removal => the pin is RETAINED; owner GET errors (non-NotFound) => indeterminate => retained. A pod-sourced override whose pod could not be resolved this tick (a transient owner-walk error) is likewise retained, since the owner object carries no pod-level annotation to confirm against.
+
+**Transient-error safety.** A pinned workload is NEVER released on an UNPROVEN absence. If a transient (non-NotFound) Kubernetes API error prevents the poll from positively determining a workload's desired state this tick (an owner-annotation read error, or a workload-id resolve error), the controller marks THAT SPECIFIC workload INDETERMINATE and SKIPS releasing it; a positively-resolved, confirmed-absent workload elsewhere is still releasable the same tick (the protection is per-workload, not a tick-wide veto). The override is retained until a clean poll positively confirms the annotation is gone. This prevents a transient API blip from spuriously un-isolating a pinned QUARANTINED workload.
+
+**Enforcement reuses Stories 2.4-2.6 with no new code (BI-7).** A pin is a `StateTransition` routed through the same FSM sink the automated path uses. A pin to RESTRICTED/QUARANTINED therefore drives the Story 2.4/2.5 NetworkPolicy apply, and a pin to CLEAN/SUSPICIOUS drives the Story 2.6 removal. The override is a NEW WAY TO PRODUCE a transition, not a new enforcement path.
+
+**Precedence and conflicts (BI-9, Open Assumption 4).** A pod-level annotation wins over the same annotation on the owner; both key on the canonical owner-resolved `workload_id`, so an owner-level annotation pins the whole workload (the common "stand this Deployment down" case). Conflicting per-pod annotations of the SAME owner (pod A says RESTRICTED, pod B says QUARANTINED) resolve to the HIGHEST requested state (most-isolating wins, the safe security default) with a WARN log naming the conflict. Annotate the owner for a whole-workload override and avoid conflicting per-pod annotations.
+
+**Rejected overrides.** An override into `PRESERVED_KILLED` (Epic 4, not yet implemented) is REFUSED: no pin, no Redis key, an `OVERRIDES.applied` event with `rejected: true, reason: state_unavailable`, and the metric below increments with `reason="state_unavailable"`. A typo'd or non-enum state value is refused the same way with `reason="invalid_state"` so you can tell "you asked for a real-but-not-yet-implemented state" from "you mistyped the state".
+
+The `OVERRIDES.applied` NATS subject (365-day JetStream retention) carries one event per applied AND per rejected override; its append-only `AUDIT.overrides` SIEM mirror ships in Story 2.8 (see "Append-only SIEM audit subjects" below).
+
+### Append-only SIEM audit subjects (Story 2.8, FR40/NFR16)
+
+When `response.audit.enabled=true` (off by default; one flag gates all three), the agent publishes three append-only NATS audit subjects for SIEM consumption (Splunk / Elastic / Datadog). Each rides a dedicated `LimitsPolicy` JetStream stream (append-only by retention: NFR16 means consumers cannot delete events) with Helm-tunable per-subject retention:
+
+| Subject | Stream | Default retention | Records |
+|---|---|---|---|
+| `AUDIT.transitions` | `AUDIT_TRANSITIONS` | 90 d (`response.audit.retention_transitions_days`) | every actual FSM state change (`before_state`/`after_state`/`triggering_threat_score`/...), automated AND operator-pin |
+| `AUDIT.overrides` | `AUDIT_OVERRIDES` | 365 d (`response.audit.retention_overrides_days`) | every override application AND rejection, with full FR40 attribution |
+| `AUDIT.policies` | `AUDIT_POLICIES` | 365 d (`response.audit.retention_policies_days`) | every real NetworkPolicy mutation (apply/supersede_delete/deescalation_remove/gc_delete) |
+
+Inspect with `nats sub AUDIT.transitions --raw` (or `.overrides` / `.policies`): each is structured JSON with documented field names (no NL parsing). Committed schemas live at `docs/schemas/audit/*.json` (authoritative) with `*.yaml` documentation mirrors.
+
+Operational notes:
+- **Two events per applied override, by design (BI-10):** an applied operator override emits one `AUDIT.transitions` (the state change, `trigger_type=override`) AND one `AUDIT.overrides` (the application, with TTL/source/attribution); a rejected override emits only `AUDIT.overrides`. They are complementary, correlated on `workload_id` + time. Do NOT "deduplicate" them.
+- **Mutations only, not heartbeats (BI-9, Open Assumption 2):** an idempotent NetworkPolicy noop, a NotFound delete, and a no-op FSM evaluation produce NO audit event. Audit-stream volume tracks real activity, not reconcile cadence. For reconcile-cadence telemetry use the Story 2.9 Prometheus metrics.
+- **Transitions retention is 90 d (BI-7):** this reconciles architecture.md:239's generalised "AUDIT.* 365 d" with the AC's specific 90 d for transitions (matching `STATE_TRANSITIONS.applied`); overrides/policies stay 365 d.
+- **Best-effort, never blocks enforcement (BI-5):** a NATS outage drops audit events (with a warn + a dropped counter on the buffered transitions/policy paths) rather than stalling the FSM goroutine, the override poll, or the netpol apply worker. A missed audit line is an observability gap, not a control-plane failure.
+
+#### `olaitan_response_override_rejected_total` (Story 2.7, FR38/FR39)
+
+- **Type:** Counter vector, labelled `reason`.
+- **Labels:** `reason` is `state_unavailable` (a real-but-unimplemented target such as `PRESERVED_KILLED`) or `invalid_state` (an unknown/typo'd state value). Both label series are pre-initialised to 0 at startup so alert PromQL has a stable zero baseline.
+- **Meaning:** cumulative count of operator-override requests the controller refused. A non-zero `state_unavailable` is expected if operators try to pin `PRESERVED_KILLED` before Epic 4; a rising `invalid_state` indicates operators are mistyping the annotation value.
+- **Counting semantics (one per DISTINCT rejection, not per poll).** A standing invalid annotation is counted ONCE, not once per poll. The controller tracks the last-rejected signature (`reason|requested-value`) per workload and increments the counter (and emits the `OVERRIDES.applied` rejection event) only on a NEW or CHANGED rejection for that workload, so the counter stays consistent with the server-side-deduped NATS event (one event, one increment). If the operator edits the annotation to a DIFFERENT still-invalid value the counter ticks once more (a new distinct rejection); when the workload stops being rejected (the value is corrected, or the annotation is removed) the marker is cleared, so a later regression to the same bad value re-counts. Read a flat `invalid_state` as "one standing misconfiguration", and a STEP increase as "a new or changed bad annotation", rather than as a per-scrape rate.
+- **No `workload_id` label** (forbidden as a Prometheus label per architecture.md:472-476); the rejected workload is in the `OVERRIDES.applied` event and the controller WARN log.
+
+#### Graduated-isolation observability surface (Story 2.9, NFR32)
+
+Story 2.9 completes the Epic 2 Prometheus surface. The FSM metrics
+(`olaitan_response_fsm_transitions_total{from_state,to_state,reason}`,
+`olaitan_response_fsm_dwell_seconds{state}`,
+`olaitan_response_fsm_active_workloads{state}`) shipped in Story 2.2. Story 2.9
+adds:
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `olaitan_response_override_applied_total` | counter | `state` | applied operator overrides per requested target state |
+| `olaitan_response_override_active` | gauge | `state` | workloads with an ACTIVE operator pin, by state (refreshed each reconcile from the FSM pin set) |
+| `olaitan_response_network_policy_active` | gauge | `state` | Olaitan-managed NetworkPolicies per kind (`restricted`/`quarantined`), refreshed each reconcile from the managed-policy list |
+| `olaitan_response_audit_transitions_dropped_total` | counter | (none) | AUDIT.transitions events dropped on buffer overflow during a NATS outage |
+| `olaitan_response_audit_policies_dropped_total` | counter | (none) | AUDIT.policies events dropped on buffer overflow |
+
+**Metric-name reconciliation (Story 2.9 BI-2).** epics.md Story 2.9 spells the
+NetworkPolicy metrics `olaitan_response_networkpolicy_apply_duration_seconds`
+etc.; the SHIPPED family (Story 2.4) is `olaitan_response_network_policy_apply_seconds`
+and `_apply_total{result}`. The shipped `network_policy` names are authoritative
+(renaming would break Story 2.4 tests + operator dashboards for a cosmetic
+spelling); the new `network_policy_active` gauge follows that shipped family.
+
+Sample PromQL (scaffolding; finalised in Epic 6):
+- Runaway escalation: `sum(rate(olaitan_response_fsm_transitions_total{to_state="QUARANTINED"}[5m]))`
+- Override misuse: `sum(rate(olaitan_response_override_applied_total[1h]))` and `olaitan_response_override_active`
+- Stale policies: `olaitan_response_network_policy_active` vs `olaitan_response_fsm_active_workloads{state=~"RESTRICTED|QUARANTINED"}`
+- Apply latency SLO (NFR6): `histogram_quantile(0.99, sum by (le) (rate(olaitan_response_network_policy_apply_seconds_bucket[5m])))`
+- Audit loss: `increase(olaitan_response_audit_transitions_dropped_total[5m]) > 0`
+
+#### Enabling graduated isolation via Helm (Story 2.10, FR47/FR49)
+
+`helm upgrade olaitan deploy/helm/olaitan/` from an Epic 1 sensing-only
+deployment adds the Epic 2 surface without disrupting in-flight evidence
+packages (AC1). Isolation defaults OFF; enable it explicitly (it is NOT
+auto-enabled by the RS evaluation arm). All knobs are surfaced in values.yaml
+and overlaid onto the running config via the ConfigMap watcher (hot-reloadable
+except where a per-knob comment marks it restart-required):
+
+```
+--set response.networkPolicy.enabled=true \
+--set response.networkPolicy.clusterCidrs='{10.244.0.0/16,10.96.0.0/12}' \
+--set response.override.enabled=true \
+--set response.audit.enabled=true \
+--set fsm.thresholds.suspicious=20 --set fsm.thresholds.restricted=40 --set fsm.thresholds.quarantined=70 \
+--set fsm.dwellSeconds.restricted=120 --set fsm.deescalationCooldownSeconds=600 \
+--set response.audit.retentionTransitionsDays=90
+```
+
+Operators MUST set `response.networkPolicy.clusterCidrs` to their cluster's
+real pod/service CIDRs so in-cluster traffic and DNS survive the RESTRICTED
+egress block. A values key left at its default leaves the baked
+config/olaitan.yaml default untouched (the overlay only fires when the value is
+set), so the chart and config defaults cannot diverge.
 
 ### 1.5 Naming-convention reconciliation
 

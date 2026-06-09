@@ -10,7 +10,8 @@
 # gap so a controller restart never silently de-escalates a workload to
 # CLEAN. The append-only transition history lives in a separate Redis
 # list at fsm:{workload_id}:history (operational state; the 90-day SIEM
-# audit trail is the Story 2.8 NATS AUDIT.transitions subject).
+# audit trail is the NATS AUDIT.transitions subject, shipped in Story 2.8,
+# schema docs/schemas/audit/transitions.json).
 schema: fsm_state.v1
 description: >
   The persisted projection of the in-memory FSM workloadState for one

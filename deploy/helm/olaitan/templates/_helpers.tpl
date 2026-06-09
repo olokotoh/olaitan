@@ -88,10 +88,17 @@ value, because rbac.yaml bindings reference it by string.
 {{/*
 Image reference. Splits image.tag → .Chart.AppVersion fallback out of
 every template so `--set image.tag=<sha>` works consistently.
+
+toString coerces the tag before formatting: a purely-numeric short git SHA
+(e.g. 3574411) passed via `--set image.tag=<sha>` is type-inferred by Helm as
+an int64, and "%s" on an int64 renders the literal "%!s(int64=3574411)" - a
+malformed image ref that the kubelet rejects with InvalidImageName. toString
+forces the string form so a numeric-looking tag is always a valid ref,
+regardless of whether callers use --set or --set-string.
 */}}
 {{- define "olaitan.image" -}}
 {{- $tag := default .Chart.AppVersion .Values.image.tag -}}
-{{- printf "%s:%s" .Values.image.repository $tag -}}
+{{- printf "%s:%s" .Values.image.repository (toString $tag) -}}
 {{- end -}}
 
 {{/*

@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -976,6 +977,302 @@ type ConfidenceBands struct {
 // the agent from self-isolating or hard-killing cluster infrastructure.
 type ResponseConfig struct {
 	ExcludedNamespaces []string `yaml:"excluded_namespaces"`
+	// Story 2.4: network_policy sub-block configures the RESTRICTED-state
+	// NetworkPolicyManager (FR33/NFR6). Enabled is pointer-tagged so an
+	// explicit `false` survives the loader (Story 2.3 PersistenceEnabled
+	// precedent); the manager is opt-in and defaults off until Story 2.10
+	// wires the graduated-isolation mode.
+	NetworkPolicy NetworkPolicyConfig `yaml:"network_policy,omitempty"`
+	// Story 2.7: override sub-block configures the operator-override
+	// controller (FR38/FR39). Enabled is pointer-tagged so an explicit
+	// `false` survives the loader; the controller is opt-in and defaults off.
+	Override OverrideConfig `yaml:"override,omitempty"`
+	// Story 2.8: audit sub-block gates the three append-only SIEM audit
+	// subjects (AUDIT.transitions/overrides/policies, FR40/NFR16). Enabled is
+	// pointer-tagged so an explicit `false` survives the loader; auditing is
+	// opt-in and defaults off. The per-subject retention days drive the
+	// AUDIT_* JetStream stream MaxAge (AC4 Helm-tunability).
+	Audit AuditConfig `yaml:"audit,omitempty"`
+}
+
+// NetworkPolicyConfig configures the Story 2.4 RESTRICTED-state
+// NetworkPolicy enforcement (FR33). The RESTRICTED policy allows egress
+// only to the RFC 1918 private ranges (always allowed), the cluster's pod
+// and service CIDRs (ClusterCIDRs), and any operator-supplied extra CIDRs,
+// and blocks all other (external) egress.
+//
+// Enabled is pointer-tagged so an explicit `false` survives the loader;
+// the default is OFF (the manager is opt-in; Story 2.10 turns it on per
+// graduated-isolation mode). ReconcileIntervalSeconds is pointer-tagged so
+// an explicit small value survives; it sets the orphan-GC reconcile
+// cadence and must stay well inside the 60 s AC4 budget.
+type NetworkPolicyConfig struct {
+	Enabled                  *bool    `yaml:"enabled,omitempty"`
+	ClusterCIDRs             []string `yaml:"cluster_cidrs,omitempty"`
+	ExtraAllowedCIDRs        []string `yaml:"extra_allowed_cidrs,omitempty"`
+	ReconcileIntervalSeconds *int     `yaml:"reconcile_interval_seconds,omitempty"`
+}
+
+// DefaultNetworkPolicyReconcileSeconds is the orphan-GC reconcile cadence;
+// 30 s is comfortably inside the 60 s AC4 garbage-collection budget.
+const DefaultNetworkPolicyReconcileSeconds = 30
+
+// DefaultNetworkPolicyClusterCIDRs are the pod and service CIDRs allowed
+// for egress by default. They match the kind/Calico evaluation cluster
+// (pod CIDR 10.244.0.0/16, service CIDR 10.96.0.0/12). Operators on other
+// clusters MUST override these to their own pod and service CIDRs so that
+// in-cluster traffic (including DNS to the service-CIDR-resident CoreDNS)
+// survives the RESTRICTED egress block.
+var DefaultNetworkPolicyClusterCIDRs = []string{"10.244.0.0/16", "10.96.0.0/12"}
+
+// DefaultNetworkPolicy returns the Story 2.4 defaults: disabled, the
+// kind/Calico cluster CIDRs, and a 30 s reconcile cadence.
+func DefaultNetworkPolicy() NetworkPolicyConfig {
+	enabled := false
+	ri := DefaultNetworkPolicyReconcileSeconds
+	cidrs := make([]string, len(DefaultNetworkPolicyClusterCIDRs))
+	copy(cidrs, DefaultNetworkPolicyClusterCIDRs)
+	return NetworkPolicyConfig{
+		Enabled:                  &enabled,
+		ClusterCIDRs:             cidrs,
+		ReconcileIntervalSeconds: &ri,
+	}
+}
+
+// EnabledOrDefault reports whether the NetworkPolicy manager is enabled,
+// treating a nil pointer as the default (false).
+func (n NetworkPolicyConfig) EnabledOrDefault() bool {
+	if n.Enabled == nil {
+		return false
+	}
+	return *n.Enabled
+}
+
+// ReconcileIntervalSecondsOrDefault returns the effective orphan-GC
+// reconcile cadence, substituting the default when omitted.
+func (n NetworkPolicyConfig) ReconcileIntervalSecondsOrDefault() int {
+	if n.ReconcileIntervalSeconds == nil {
+		return DefaultNetworkPolicyReconcileSeconds
+	}
+	return *n.ReconcileIntervalSeconds
+}
+
+// ClusterCIDRsOrDefault returns the effective cluster CIDRs, substituting
+// the kind/Calico defaults when omitted.
+func (n NetworkPolicyConfig) ClusterCIDRsOrDefault() []string {
+	if len(n.ClusterCIDRs) == 0 {
+		out := make([]string, len(DefaultNetworkPolicyClusterCIDRs))
+		copy(out, DefaultNetworkPolicyClusterCIDRs)
+		return out
+	}
+	return n.ClusterCIDRs
+}
+
+// validate enforces NetworkPolicyConfig invariants: every CIDR must parse,
+// and the reconcile interval (when set) must be in [1, 60] so orphan GC
+// always meets the AC4 60 s budget. A fully-omitted block skips validation
+// so in-memory test fixtures can leave it zero; the Load path substitutes
+// DefaultNetworkPolicy before Validate when the manager is enabled.
+func (n NetworkPolicyConfig) validate() error {
+	for i, c := range n.ClusterCIDRs {
+		if _, _, err := net.ParseCIDR(c); err != nil {
+			return fmt.Errorf("response.network_policy.cluster_cidrs[%d]: invalid CIDR %q: %w", i, c, err)
+		}
+	}
+	for i, c := range n.ExtraAllowedCIDRs {
+		if _, _, err := net.ParseCIDR(c); err != nil {
+			return fmt.Errorf("response.network_policy.extra_allowed_cidrs[%d]: invalid CIDR %q: %w", i, c, err)
+		}
+	}
+	if n.ReconcileIntervalSeconds != nil {
+		if v := *n.ReconcileIntervalSeconds; v < 1 || v > 60 {
+			return fmt.Errorf("response.network_policy.reconcile_interval_seconds: must be in [1, 60] to meet the 60 s orphan-GC budget (got %d)", v)
+		}
+	}
+	// When the manager is explicitly enabled, at least one cluster CIDR is
+	// required so in-cluster traffic and DNS are not blocked.
+	if n.Enabled != nil && *n.Enabled && len(n.ClusterCIDRs) == 0 {
+		return errors.New("response.network_policy.cluster_cidrs: at least one cluster CIDR (pod and/or service CIDR) is required when network_policy.enabled=true")
+	}
+	return nil
+}
+
+// OverrideConfig configures the Story 2.7 operator-override controller
+// (FR38/FR39). The controller polls (LISTs) pods for the
+// olaitan.io/state-override annotation, pins the FSM, and records an
+// override:{workload_id} Redis key with a native TTL.
+//
+// Enabled is pointer-tagged so an explicit `false` survives the loader (the
+// NetworkPolicyConfig.Enabled precedent); the default is OFF (opt-in).
+// PollIntervalSeconds is the reconcile cadence (default 15) and bounds the
+// release-detection latency to one tick (BI-4 / Open Assumption 1).
+// DefaultTTLSeconds is the override duration applied when the
+// olaitan.io/state-override-ttl annotation is absent or unparseable (default
+// 3600 = 1h, AC2 / BI-8).
+type OverrideConfig struct {
+	Enabled             *bool `yaml:"enabled,omitempty"`
+	PollIntervalSeconds *int  `yaml:"poll_interval_seconds,omitempty"`
+	DefaultTTLSeconds   *int  `yaml:"default_ttl_seconds,omitempty"`
+}
+
+// DefaultOverridePollSeconds is the override poll/reconcile cadence; 15 s is
+// well inside any operator-meaningful manual-override latency (BI-1).
+const DefaultOverridePollSeconds = 15
+
+// DefaultOverrideTTLSeconds is the override duration applied when the TTL
+// annotation is absent or unparseable (AC2 "default 1 hour if absent").
+const DefaultOverrideTTLSeconds = 3600
+
+// DefaultOverride returns the Story 2.7 defaults: disabled, a 15 s poll, and
+// a 1 h default TTL.
+func DefaultOverride() OverrideConfig {
+	enabled := false
+	poll := DefaultOverridePollSeconds
+	ttl := DefaultOverrideTTLSeconds
+	return OverrideConfig{
+		Enabled:             &enabled,
+		PollIntervalSeconds: &poll,
+		DefaultTTLSeconds:   &ttl,
+	}
+}
+
+// EnabledOrDefault reports whether the override controller is enabled,
+// treating a nil pointer as the default (false).
+func (o OverrideConfig) EnabledOrDefault() bool {
+	if o.Enabled == nil {
+		return false
+	}
+	return *o.Enabled
+}
+
+// PollIntervalSecondsOrDefault returns the effective poll cadence,
+// substituting the default when omitted.
+func (o OverrideConfig) PollIntervalSecondsOrDefault() int {
+	if o.PollIntervalSeconds == nil {
+		return DefaultOverridePollSeconds
+	}
+	return *o.PollIntervalSeconds
+}
+
+// DefaultTTLSecondsOrDefault returns the effective default override TTL,
+// substituting the 1 h default when omitted.
+func (o OverrideConfig) DefaultTTLSecondsOrDefault() int {
+	if o.DefaultTTLSeconds == nil {
+		return DefaultOverrideTTLSeconds
+	}
+	return *o.DefaultTTLSeconds
+}
+
+// validate enforces OverrideConfig invariants: a set poll interval and
+// default TTL must be positive. A fully-omitted block skips validation so
+// in-memory fixtures can leave it zero; Load substitutes DefaultOverride
+// before Validate.
+func (o OverrideConfig) validate() error {
+	if o.PollIntervalSeconds != nil && *o.PollIntervalSeconds < 1 {
+		return fmt.Errorf("response.override.poll_interval_seconds: must be >= 1 (got %d)", *o.PollIntervalSeconds)
+	}
+	if o.DefaultTTLSeconds != nil && *o.DefaultTTLSeconds < 1 {
+		return fmt.Errorf("response.override.default_ttl_seconds: must be >= 1 (got %d)", *o.DefaultTTLSeconds)
+	}
+	return nil
+}
+
+// AuditConfig configures the Story 2.8 append-only SIEM audit subjects
+// (FR40/NFR16). A single Enabled flag gates all three seams together (the
+// transitions sink, the override second-publish, and the netpol policy
+// publisher, BI-8 / Open Assumption 1). The three retention-days fields set the
+// MaxAge of the corresponding AUDIT_* JetStream streams (BI-7), so an operator
+// tunes each subject's append-only retention independently; the defaults are
+// 90/365/365 days (AC4, reconciling the architecture's generalised "AUDIT.* 365
+// d" with the AC's specific 90 d transitions retention).
+//
+// Enabled is pointer-tagged so an explicit `false` survives the loader (the
+// OverrideConfig.Enabled precedent); the default is OFF (opt-in). The retention
+// fields are pointer-tagged so an explicit value survives and a zero is
+// distinguishable from omitted.
+type AuditConfig struct {
+	Enabled                  *bool `yaml:"enabled,omitempty"`
+	RetentionTransitionsDays *int  `yaml:"retention_transitions_days,omitempty"`
+	RetentionOverridesDays   *int  `yaml:"retention_overrides_days,omitempty"`
+	RetentionPoliciesDays    *int  `yaml:"retention_policies_days,omitempty"`
+}
+
+// Default audit retention days (AC4). Transitions default to 90 d (matching the
+// STATE_TRANSITIONS.applied operational audit-trail retention); overrides and
+// policies default to 365 d.
+const (
+	DefaultAuditRetentionTransitionsDays = 90
+	DefaultAuditRetentionOverridesDays   = 365
+	DefaultAuditRetentionPoliciesDays    = 365
+)
+
+// DefaultAudit returns the Story 2.8 defaults: disabled, with 90/365/365 d
+// retention.
+func DefaultAudit() AuditConfig {
+	enabled := false
+	t := DefaultAuditRetentionTransitionsDays
+	o := DefaultAuditRetentionOverridesDays
+	p := DefaultAuditRetentionPoliciesDays
+	return AuditConfig{
+		Enabled:                  &enabled,
+		RetentionTransitionsDays: &t,
+		RetentionOverridesDays:   &o,
+		RetentionPoliciesDays:    &p,
+	}
+}
+
+// EnabledOrDefault reports whether the audit subjects are enabled, treating a
+// nil pointer as the default (false).
+func (a AuditConfig) EnabledOrDefault() bool {
+	if a.Enabled == nil {
+		return false
+	}
+	return *a.Enabled
+}
+
+// RetentionTransitionsDaysOrDefault returns the effective transitions retention
+// in days, substituting the 90 d default when omitted.
+func (a AuditConfig) RetentionTransitionsDaysOrDefault() int {
+	if a.RetentionTransitionsDays == nil {
+		return DefaultAuditRetentionTransitionsDays
+	}
+	return *a.RetentionTransitionsDays
+}
+
+// RetentionOverridesDaysOrDefault returns the effective overrides retention in
+// days, substituting the 365 d default when omitted.
+func (a AuditConfig) RetentionOverridesDaysOrDefault() int {
+	if a.RetentionOverridesDays == nil {
+		return DefaultAuditRetentionOverridesDays
+	}
+	return *a.RetentionOverridesDays
+}
+
+// RetentionPoliciesDaysOrDefault returns the effective policies retention in
+// days, substituting the 365 d default when omitted.
+func (a AuditConfig) RetentionPoliciesDaysOrDefault() int {
+	if a.RetentionPoliciesDays == nil {
+		return DefaultAuditRetentionPoliciesDays
+	}
+	return *a.RetentionPoliciesDays
+}
+
+// validate enforces AuditConfig invariants: every set retention must be
+// positive (a non-positive MaxAge would mean "never expire" on some JetStream
+// versions and is never an operator intent for an append-only audit window). A
+// fully-omitted block skips validation so in-memory fixtures can leave it zero;
+// Load substitutes DefaultAudit before Validate when auditing is enabled.
+func (a AuditConfig) validate() error {
+	if a.RetentionTransitionsDays != nil && *a.RetentionTransitionsDays < 1 {
+		return fmt.Errorf("response.audit.retention_transitions_days: must be >= 1 (got %d)", *a.RetentionTransitionsDays)
+	}
+	if a.RetentionOverridesDays != nil && *a.RetentionOverridesDays < 1 {
+		return fmt.Errorf("response.audit.retention_overrides_days: must be >= 1 (got %d)", *a.RetentionOverridesDays)
+	}
+	if a.RetentionPoliciesDays != nil && *a.RetentionPoliciesDays < 1 {
+		return fmt.Errorf("response.audit.retention_policies_days: must be >= 1 (got %d)", *a.RetentionPoliciesDays)
+	}
+	return nil
 }
 
 // AnalystConfig -- see architecture.md:806-835 (LLM analyst settings).
@@ -1206,6 +1503,57 @@ func Load(path string) (*Config, error) {
 		if cfg.Detection.FSM.RedisAddr == "" {
 			cfg.Detection.FSM.RedisAddr = defFSM.RedisAddr
 		}
+
+		// Story 2.4: substitute NetworkPolicy defaults before Validate. The
+		// pointer-tagged Enabled lets an explicit `enabled: false` survive;
+		// ClusterCIDRs and the reconcile interval inherit the kind/Calico
+		// defaults when omitted so an operator who enables the manager
+		// without listing CIDRs still gets a working (if cluster-specific)
+		// egress allow-list rather than a hard rejection.
+		defNP := DefaultNetworkPolicy()
+		if cfg.Response.NetworkPolicy.Enabled == nil {
+			cfg.Response.NetworkPolicy.Enabled = defNP.Enabled
+		}
+		if len(cfg.Response.NetworkPolicy.ClusterCIDRs) == 0 {
+			cfg.Response.NetworkPolicy.ClusterCIDRs = defNP.ClusterCIDRs
+		}
+		if cfg.Response.NetworkPolicy.ReconcileIntervalSeconds == nil {
+			cfg.Response.NetworkPolicy.ReconcileIntervalSeconds = defNP.ReconcileIntervalSeconds
+		}
+
+		// Story 2.7: substitute Override defaults before Validate. The
+		// pointer-tagged Enabled lets an explicit `enabled: false` survive;
+		// the poll interval and default TTL inherit the 15 s / 1 h defaults
+		// when omitted.
+		defOvr := DefaultOverride()
+		if cfg.Response.Override.Enabled == nil {
+			cfg.Response.Override.Enabled = defOvr.Enabled
+		}
+		if cfg.Response.Override.PollIntervalSeconds == nil {
+			cfg.Response.Override.PollIntervalSeconds = defOvr.PollIntervalSeconds
+		}
+		if cfg.Response.Override.DefaultTTLSeconds == nil {
+			cfg.Response.Override.DefaultTTLSeconds = defOvr.DefaultTTLSeconds
+		}
+	}
+
+	// Story 2.8: substitute the audit defaults so an enabled audit block with
+	// omitted retentions inherits the 90/365/365 d defaults, and an omitted
+	// Enabled stays off.
+	{
+		defAudit := DefaultAudit()
+		if cfg.Response.Audit.Enabled == nil {
+			cfg.Response.Audit.Enabled = defAudit.Enabled
+		}
+		if cfg.Response.Audit.RetentionTransitionsDays == nil {
+			cfg.Response.Audit.RetentionTransitionsDays = defAudit.RetentionTransitionsDays
+		}
+		if cfg.Response.Audit.RetentionOverridesDays == nil {
+			cfg.Response.Audit.RetentionOverridesDays = defAudit.RetentionOverridesDays
+		}
+		if cfg.Response.Audit.RetentionPoliciesDays == nil {
+			cfg.Response.Audit.RetentionPoliciesDays = defAudit.RetentionPoliciesDays
+		}
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -1396,6 +1744,15 @@ func (r ResponseConfig) validate() error {
 		if strings.TrimSpace(ns) != ns {
 			return fmt.Errorf("response.excluded_namespaces[%d]: leading/trailing whitespace in %q", i, ns)
 		}
+	}
+	if err := r.NetworkPolicy.validate(); err != nil {
+		return err
+	}
+	if err := r.Override.validate(); err != nil {
+		return err
+	}
+	if err := r.Audit.validate(); err != nil {
+		return err
 	}
 	return nil
 }

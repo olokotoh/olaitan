@@ -11,6 +11,9 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/olokotoh/olaitan/internal/config"
+	"github.com/olokotoh/olaitan/internal/metrics"
+	responseaudit "github.com/olokotoh/olaitan/internal/response/audit"
+	"github.com/olokotoh/olaitan/internal/schema"
 	"github.com/olokotoh/olaitan/internal/sourcehealth"
 )
 
@@ -213,4 +216,53 @@ func TestStartMetricsServer_PropagatesRegistrationError(t *testing.T) {
 	// path (no goroutines to wait on).
 	cancel()
 	_ = g.Wait()
+}
+
+// TestAuditDroppedCounterSurfacesSinkDrops pins Story 2.9 BI-5: the pull-based
+// audit drop counters wired in startAggregatorRing surface the buffered sinks'
+// Dropped() count. It exercises the exact RegisterCounter+getter pattern used
+// in main.go against a real TransitionAuditSink driven into overflow.
+func TestAuditDroppedCounterSurfacesSinkDrops(t *testing.T) {
+	sink, err := responseaudit.NewTransitionAuditSink(
+		&nopTransitionPublisher{}, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		responseaudit.TransitionAuditSinkConfig{BufferCap: 1},
+	)
+	if err != nil {
+		t.Fatalf("NewTransitionAuditSink: %v", err)
+	}
+	// Overflow the cap-1 buffer to force drops.
+	for i := 0; i < 4; i++ {
+		sink.Publish(schema.StateTransition{FromState: schema.StateClean, ToState: schema.StateRestricted, WorkloadID: "w"})
+	}
+	if sink.Dropped() == 0 {
+		t.Fatal("expected the sink to have dropped events")
+	}
+
+	reg := metrics.NewRegistry()
+	if err := reg.RegisterCounter(
+		"olaitan_response_audit_transitions_dropped_total", "", "test",
+		nil, func() int64 { return sink.Dropped() },
+	); err != nil {
+		t.Fatalf("RegisterCounter: %v", err)
+	}
+	// The registered pull-counter must reflect the sink's drop count on scrape.
+	mfs, err := reg.Gatherer().Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	var got float64 = -1
+	for _, mf := range mfs {
+		if mf.GetName() == "olaitan_response_audit_transitions_dropped_total" {
+			got = mf.GetMetric()[0].GetCounter().GetValue()
+		}
+	}
+	if int64(got) != sink.Dropped() {
+		t.Errorf("scraped dropped counter = %v, want %d (the sink's Dropped())", got, sink.Dropped())
+	}
+}
+
+type nopTransitionPublisher struct{}
+
+func (nopTransitionPublisher) PublishAuditTransition(context.Context, responseaudit.AuditTransition) error {
+	return nil
 }

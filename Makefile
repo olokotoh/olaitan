@@ -154,7 +154,7 @@ e2e-local: helm-prepare helm-deps docker-build
 	# well under the kind node's PVC backing.
 	helm install olaitan $(CHART_DIR) \
 		--set image.repository=$(IMAGE) \
-		--set image.tag=$(TAG) \
+		--set-string image.tag=$(TAG) \
 		--set image.pullPolicy=Never \
 		--set evaluation.config=RS \
 		--set baselines.warmupDuration=5s \

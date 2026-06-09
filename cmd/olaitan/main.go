@@ -54,7 +54,10 @@ import (
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
 	"github.com/olokotoh/olaitan/internal/ratelimit"
 	redisclient "github.com/olokotoh/olaitan/internal/redis"
+	responseaudit "github.com/olokotoh/olaitan/internal/response/audit"
 	"github.com/olokotoh/olaitan/internal/response/fsm"
+	"github.com/olokotoh/olaitan/internal/response/netpol"
+	"github.com/olokotoh/olaitan/internal/response/override"
 	"github.com/olokotoh/olaitan/internal/retry"
 	"github.com/olokotoh/olaitan/internal/schema"
 	"github.com/olokotoh/olaitan/internal/subjects"
@@ -416,7 +419,17 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 
 	streamsCtx, streamsCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer streamsCancel()
-	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigs()); err != nil {
+	// Story 2.8 (BI-7/BI-8): the three AUDIT_* streams' MaxAge derives from the
+	// response.audit.retention_*_days config so AC4's Helm-tunability drives the
+	// real append-only retention. The retentions are defaulted in Load even when
+	// auditing is disabled, so this is safe to apply unconditionally; EnsureStreams
+	// is create-or-update, so it reconciles the MaxAge on an existing stream.
+	auditRetention := natsclient.AuditRetention{
+		Transitions: time.Duration(cfg.Response.Audit.RetentionTransitionsDaysOrDefault()) * 24 * time.Hour,
+		Overrides:   time.Duration(cfg.Response.Audit.RetentionOverridesDaysOrDefault()) * 24 * time.Hour,
+		Policies:    time.Duration(cfg.Response.Audit.RetentionPoliciesDaysOrDefault()) * 24 * time.Hour,
+	}
+	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigsWithAudit(auditRetention)); err != nil {
 		closeNATS()
 		if ctx.Err() != nil {
 			return nil
@@ -615,7 +628,75 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	// its in-memory map from Redis BEFORE the consumer starts, so a restart
 	// never silently de-escalates a workload to CLEAN. When disabled, it
 	// keeps the Story 2.2 NopSink and skips restore.
-	var fsmSink fsm.TransitionSink = fsm.NopSink{}
+	// Story 2.2/2.3/2.4: the FSM emits each transition to a MultiSink that
+	// fans out to every enabled consumer (BI-3). Story 2.3 adds the Redis
+	// persistence sink; Story 2.4 adds the NetworkPolicy enforcement
+	// manager. When neither is enabled the machine keeps a NopSink.
+	// Story 2.8: append-only SIEM audit (FR40/NFR16). One flag
+	// (response.audit.enabled, off by default) gates THREE seams built up-front
+	// here and wired at their three call sites below: a transitions sink (a new
+	// MultiSink member, appended before fsm.New), a second publish off the
+	// override controller, and a netpol PolicyAuditPublisher. All publish
+	// best-effort to NATS via the shared nc; the two buffered drainers run on the
+	// errgroup. A NATS outage drops audit events, never stalling enforcement
+	// (BI-5/BI-8).
+	auditEnabled := cfg.Response.Audit.EnabledOrDefault()
+	var auditTransitionSink *responseaudit.TransitionAuditSink
+	var auditPolicySink *responseaudit.PolicyAuditSink
+	var auditOverridePub override.AuditOverridePublisher
+	if auditEnabled {
+		tp, terr := responseaudit.NewNATSTransitionPublisher(nc)
+		if terr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: audit transition publisher: %w", terr)
+		}
+		auditTransitionSink, terr = responseaudit.NewTransitionAuditSink(tp, log, responseaudit.TransitionAuditSinkConfig{})
+		if terr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: audit transition sink: %w", terr)
+		}
+		pp, perr := responseaudit.NewNATSPolicyPublisher(nc)
+		if perr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: audit policy publisher: %w", perr)
+		}
+		auditPolicySink, perr = responseaudit.NewPolicyAuditSink(pp, log, responseaudit.PolicyAuditSinkConfig{})
+		if perr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: audit policy sink: %w", perr)
+		}
+		oerr := error(nil)
+		auditOverridePub, oerr = override.NewNATSAuditPublisher(nc)
+		if oerr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: audit override publisher: %w", oerr)
+		}
+		// Story 2.9 (BI-5): surface the buffered audit sinks' overflow-drop
+		// counters as pull-based Prometheus counters (deferred from Story 2.8).
+		// Distinct names per subject avoid a labelled-vec duplicate registration.
+		if metricsReg != nil {
+			ts := auditTransitionSink
+			ps := auditPolicySink
+			if rerr := metricsReg.RegisterCounter(
+				"olaitan_response_audit_transitions_dropped_total", "",
+				"Cumulative AUDIT.transitions audit events dropped due to buffer overflow during a NATS outage (Story 2.9 / 2.8 BI-5).",
+				nil, func() int64 { return ts.Dropped() },
+			); rerr != nil {
+				closeNATS()
+				return fmt.Errorf("aggregator: audit transitions dropped counter: %w", rerr)
+			}
+			if rerr := metricsReg.RegisterCounter(
+				"olaitan_response_audit_policies_dropped_total", "",
+				"Cumulative AUDIT.policies audit events dropped due to buffer overflow during a NATS outage (Story 2.9 / 2.8 BI-5).",
+				nil, func() int64 { return ps.Dropped() },
+			); rerr != nil {
+				closeNATS()
+				return fmt.Errorf("aggregator: audit policies dropped counter: %w", rerr)
+			}
+		}
+	}
+
+	var sinks fsm.MultiSink
 	var fsmStore *fsm.Store
 	if cfg.Detection.FSM.PersistenceEnabledOrDefault() {
 		redisSink, store, fsmCloser, perr := wireFSMPersistence(cfg, log)
@@ -623,7 +704,7 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 			closeNATS()
 			return fmt.Errorf("aggregator: fsm persistence: %w", perr)
 		}
-		fsmSink = redisSink
+		sinks = append(sinks, redisSink)
 		fsmStore = store
 		// One goroutine owns both the replayer and the client close, in
 		// order: Run flushes the outage buffer best-effort on ctx.Done and
@@ -636,10 +717,61 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 			return err
 		})
 	}
+	// Story 2.4: RESTRICTED-state NetworkPolicy enforcement (FR33/NFR6). The
+	// manager is a second TransitionSink fanned out alongside the Redis sink.
+	// It acquires its own clientset when posture (which builds cs above) is
+	// disabled.
+	netpolEnabled := cfg.Response.NetworkPolicy.EnabledOrDefault()
+	var npMgr *netpol.Manager
+	if netpolEnabled {
+		var nerr error
+		npMgr, nerr = wireNetworkPolicyManager(cfg, cs, log, metricsReg)
+		if nerr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: netpol: %w", nerr)
+		}
+		sinks = append(sinks, npMgr)
+		// Run is launched below, AFTER SetStateOracle, so the reconcile
+		// goroutine never reads m.oracle concurrently with the setter write.
+	}
+	// Story 2.8 (BI-1/BI-8): the transitions audit sink is a THIRD MultiSink
+	// member, appended BEFORE fsm.New so the FSM fans every actual transition
+	// (including operator pins) out to it like the Redis/netpol sinks. Its
+	// buffered drainer runs on the errgroup, off the FSM hot path.
+	if auditTransitionSink != nil {
+		sinks = append(sinks, auditTransitionSink)
+		g.Go(func() error { return auditTransitionSink.Run(ctx) })
+	}
+	var fsmSink fsm.TransitionSink = fsm.NopSink{}
+	if len(sinks) > 0 {
+		fsmSink = sinks
+	}
 	stateMachine, fsmErr := fsm.New(mgr, metricsReg, fsmSink, nil)
 	if fsmErr != nil {
 		closeNATS()
 		return fmt.Errorf("aggregator: fsm: %w", fsmErr)
+	}
+	// Story 2.6 (BI-2c): thread the FSM Machine into the NetworkPolicyManager as
+	// its StateOracle so the reconcile backstop is FSM-target-aware (it deletes a
+	// de-escalation residue without re-deleting the freshly-applied restricted
+	// policy). The Machine is constructed AFTER the manager (the manager is a sink
+	// fanned into this very Machine), so the oracle is installed here via a setter
+	// once both exist. *fsm.Machine satisfies netpol.StateOracle via CurrentState.
+	if npMgr != nil {
+		npMgr.SetStateOracle(stateMachine)
+		// Story 2.8 (BI-3/BI-8): install the policy audit publisher BEFORE
+		// npMgr.Run so the worker reads m.audit only after the single-threaded
+		// setter write, and launch the policy adapter's buffered drainer on the
+		// errgroup. Only wired when netpol is enabled (no mutations to audit
+		// otherwise); the SetStateOracle ordering precedent.
+		if auditPolicySink != nil {
+			npMgr.SetPolicyAuditPublisher(auditPolicySink)
+			g.Go(func() error { return auditPolicySink.Run(ctx) })
+		}
+		// Launch the worker only now that the oracle (and audit seam) are
+		// installed. Starting the goroutine here establishes a happens-before edge
+		// for the setter writes above, so the reconcile loop never races on them.
+		g.Go(func() error { return npMgr.Run(ctx) })
 	}
 	if fsmStore != nil {
 		recovered, skipped, rerr := stateMachine.Restore(ctx, fsmStore)
@@ -648,6 +780,29 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 			return fmt.Errorf("aggregator: fsm restore: %w", rerr)
 		}
 		log.Info("aggregator: fsm state recovered from redis", "recovered", recovered, "skipped", skipped)
+	}
+	// Story 2.7: operator-override controller (FR38/FR39). Gated by
+	// response.override.enabled (off by default). Constructed AFTER the FSM
+	// Machine exists (it calls Pin/ReleasePin on it) and runs on the errgroup;
+	// its dedicated Redis client (own NFR8 AUTH'd connection + closer) is shut
+	// after Run returns, mirroring the FSM sink ordering.
+	overrideEnabled := cfg.Response.Override.EnabledOrDefault()
+	if overrideEnabled {
+		ovrController, ovrCloser, oerr := wireOverrideController(cfg, cs, nc, stateMachine, metricsReg, log)
+		if oerr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: override controller: %w", oerr)
+		}
+		// Story 2.8 (BI-2/BI-8): install the SIEM audit second-publish before
+		// Run, while the controller is still single-threaded.
+		if auditOverridePub != nil {
+			ovrController.SetAuditPublisher(auditOverridePub)
+		}
+		g.Go(func() error {
+			err := ovrController.Run(ctx)
+			ovrCloser()
+			return err
+		})
 	}
 	if err := wireFSMConsumer(ctx, g, log, nc, scoreCalc, stateMachine); err != nil {
 		closeNATS()
@@ -661,7 +816,10 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		"restricted_dwell_seconds", cfg.Detection.FSM.RestrictedDwellSecondsOrDefault(),
 		"quarantined_dwell_seconds", cfg.Detection.FSM.QuarantinedDwellSecondsOrDefault(),
 		"deescalation_cooldown_seconds", cfg.Detection.FSM.DeescalationCooldownSecondsOrDefault(),
-		"persistence_enabled", cfg.Detection.FSM.PersistenceEnabledOrDefault())
+		"persistence_enabled", cfg.Detection.FSM.PersistenceEnabledOrDefault(),
+		"netpol_enabled", netpolEnabled,
+		"override_enabled", overrideEnabled,
+		"audit_enabled", auditEnabled)
 
 	g.Go(func() error {
 		<-ctx.Done()
@@ -776,6 +934,95 @@ func wireFSMPersistence(cfg *config.Config, log *slog.Logger) (*fsm.RedisSink, *
 		return nil, nil, func() {}, fmt.Errorf("aggregator: fsm sink: %w", err)
 	}
 	return sink, store, closer, nil
+}
+
+// wireNetworkPolicyManager constructs the Story 2.4 RESTRICTED-state
+// NetworkPolicy enforcement manager (FR33/NFR6). It reuses the clientset
+// already built for the posture client when present (cs != nil), or
+// acquires its own via kubeClientFactory when posture is disabled. The
+// returned manager is a fsm.TransitionSink whose Run is the async apply +
+// orphan-GC worker, wired into the errgroup by the caller. No new RBAC is
+// required: the aggregator ClusterRole already grants networkpolicies
+// create/update/delete/get/list plus apps/batch get/list for owner
+// resolution (deploy/helm/olaitan/templates/rbac.yaml).
+func wireNetworkPolicyManager(cfg *config.Config, cs kubernetes.Interface, log *slog.Logger, metricsReg *metrics.Registry) (*netpol.Manager, error) {
+	if cs == nil {
+		var err error
+		cs, err = kubeClientFactory(log)
+		if err != nil {
+			return nil, fmt.Errorf("kube client: %w", err)
+		}
+	}
+	np := cfg.Response.NetworkPolicy
+	return netpol.New(netpol.Config{
+		ClusterCIDRs:       np.ClusterCIDRsOrDefault(),
+		ExtraAllowedCIDRs:  np.ExtraAllowedCIDRs,
+		ExcludedNamespaces: cfg.Response.ExcludedNamespaces,
+		ReconcileInterval:  time.Duration(np.ReconcileIntervalSecondsOrDefault()) * time.Second,
+	}, cs, metricsReg, log)
+}
+
+// wireOverrideController constructs the Story 2.7 operator-override controller
+// (FR38/FR39). It reuses the clientset already built for the posture/netpol
+// path when present (cs != nil), or acquires its own via kubeClientFactory. It
+// owns a DEDICATED Redis client with the NFR8 mandatory REDIS_PASSWORD AUTH
+// (mirroring wireFSMPersistence; NOT shared with the FSM sink's connection
+// ownership) and its closer, a NATS publisher on subjects.OverridesApplied,
+// and the FSM Machine (for Pin/ReleasePin). No new RBAC: the existing
+// pods/owner get,list cover the poll (no watch, BI-1). Returns the controller,
+// a closer to defer after Run returns, and any construction error.
+func wireOverrideController(cfg *config.Config, cs kubernetes.Interface, nc *natsclient.Client, machine *fsm.Machine, metricsReg *metrics.Registry, log *slog.Logger) (*override.Controller, func(), error) {
+	if cs == nil {
+		var err error
+		cs, err = kubeClientFactory(log)
+		if err != nil {
+			return nil, func() {}, fmt.Errorf("kube client: %w", err)
+		}
+	}
+
+	// NFR8: Redis AUTH is mandatory when the override controller is enabled.
+	// TrimRight guards the trailing-newline secretKeyRef pitfall (see
+	// wireBaselineEngine / wireFSMPersistence).
+	pwd := strings.TrimRight(os.Getenv("REDIS_PASSWORD"), "\r\n")
+	if pwd == "" {
+		return nil, func() {}, fmt.Errorf("NFR8: REDIS_PASSWORD env var is required when response.override.enabled=true (set --set secrets.redisPassword or wire a secretKeyRef)")
+	}
+	rcfg := redisclient.DefaultConfig()
+	rcfg.Addr = cfg.Detection.FSM.RedisAddrOrDefault()
+	rcfg.Password = pwd
+	rc, err := redisclient.NewClient(rcfg)
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("aggregator: override redis: %w", err)
+	}
+	closer := func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if cerr := rc.Close(closeCtx); cerr != nil {
+			log.Warn("aggregator: override redis close", "err", cerr)
+		}
+	}
+
+	store, err := override.NewStore(rc)
+	if err != nil {
+		closer()
+		return nil, func() {}, fmt.Errorf("aggregator: override store: %w", err)
+	}
+	publisher, err := override.NewNATSPublisher(nc)
+	if err != nil {
+		closer()
+		return nil, func() {}, fmt.Errorf("aggregator: override publisher: %w", err)
+	}
+	ovr := cfg.Response.Override
+	ctrl, err := override.New(override.Config{
+		PollInterval:       time.Duration(ovr.PollIntervalSecondsOrDefault()) * time.Second,
+		DefaultTTL:         time.Duration(ovr.DefaultTTLSecondsOrDefault()) * time.Second,
+		ExcludedNamespaces: cfg.Response.ExcludedNamespaces,
+	}, cs, store, machine, publisher, metricsReg, log)
+	if err != nil {
+		closer()
+		return nil, func() {}, fmt.Errorf("aggregator: override controller: %w", err)
+	}
+	return ctrl, closer, nil
 }
 
 // fsmConsumerMaxDeliver caps JetStream's per-message redelivery for the
@@ -983,9 +1230,20 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 
 	// Provision JetStream streams once at startup. EnsureStreams is
 	// idempotent so a re-run on a pre-existing stream is a no-op.
+	// Story 2.8: use the same audit retention as the aggregator so that
+	// whichever ring wins the startup race provisions the AUDIT_* streams with
+	// identical MaxAge (no transient default-retention window if an operator has
+	// tuned response.audit.retention_*_days). The aggregator remains the
+	// retention authority; this just keeps the collector's create-or-update
+	// consistent with it.
 	streamsCtx, streamsCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer streamsCancel()
-	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigs()); err != nil {
+	auditRetention := natsclient.AuditRetention{
+		Transitions: time.Duration(cfg.Response.Audit.RetentionTransitionsDaysOrDefault()) * 24 * time.Hour,
+		Overrides:   time.Duration(cfg.Response.Audit.RetentionOverridesDaysOrDefault()) * 24 * time.Hour,
+		Policies:    time.Duration(cfg.Response.Audit.RetentionPoliciesDaysOrDefault()) * 24 * time.Hour,
+	}
+	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigsWithAudit(auditRetention)); err != nil {
 		closeNATS()
 		return fmt.Errorf("collector: ensure streams: %w", err)
 	}

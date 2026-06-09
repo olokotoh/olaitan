@@ -783,6 +783,56 @@ fsm:
   # externally-managed Redis set this explicitly. Restart-required.
   redisAddr: ""
 
+  # Story 2.10: FSM ThreatScore thresholds (the detection.confidence_bands
+  # watch/alert/act) that drive SUSPICIOUS/RESTRICTED/QUARANTINED escalation.
+  # Empty (commented-out / null) leaves the config/olaitan.yaml defaults
+  # (20/40/70). Hot-reloadable via the ConfigMap watcher (FR49). Values are
+  # ThreatScore points in [0,100]; watch < alert < act is enforced by the
+  # config validator.
+  thresholds: {}
+    # suspicious: 20   # detection.confidence_bands.watch
+    # restricted: 40   # detection.confidence_bands.alert
+    # quarantined: 70  # detection.confidence_bands.act
+
+  # Story 2.10: per-state dwell guards (seconds) - minimum residence before the
+  # FSM may leave a state. Empty leaves the config defaults (0/120/120).
+  # Hot-reloadable (FR49).
+  dwellSeconds: {}
+    # suspicious: 0
+    # restricted: 120
+    # quarantined: 120
+
+  # Story 2.10: de-escalation cooldown (seconds) before the FSM relaxes a
+  # workload to a lower state. Empty leaves the config default (600).
+  # Hot-reloadable (FR49). null sentinel so an explicit 0 is distinguishable.
+  deescalationCooldownSeconds: null
+
+# Story 2.10: response-ring graduated-isolation controllers (Epic 2). All OFF
+# by default; an operator running RS-with-isolation enables them explicitly.
+# A block left empty leaves the config/olaitan.yaml defaults untouched.
+response:
+  # Story 2.4-2.6: RESTRICTED/QUARANTINED NetworkPolicy enforcement (FR33/NFR6).
+  networkPolicy:
+    enabled: false
+    # Cluster pod/service CIDRs allowed for egress under RESTRICTED. Operators
+    # MUST set these to their cluster's real CIDRs so in-cluster traffic + DNS
+    # survive the egress block. Empty leaves the config kind/Calico defaults.
+    clusterCidrs: []
+    extraAllowedCidrs: []
+    reconcileIntervalSeconds: 30
+  # Story 2.7: operator-override controller (FR38/FR39).
+  override:
+    enabled: false
+    pollIntervalSeconds: 15
+    defaultTtlSeconds: 3600
+  # Story 2.8: append-only SIEM audit subjects (FR40/NFR16). One flag gates the
+  # three subjects; retention days drive the AUDIT_* JetStream stream MaxAge.
+  audit:
+    enabled: false
+    retentionTransitionsDays: 90
+    retentionOverridesDays: 365
+    retentionPoliciesDays: 365
+
 # Story 1.19: Evaluation matrix configuration (FR53). One-flag switch
 # that places the chart into one of the canonical evaluation arms (F,
 # RS, RSL, RSLT-full). Empty default means "no override; individual

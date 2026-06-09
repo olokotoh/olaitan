@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/olokotoh/olaitan/docs/schemas/audit/policies.json",
+  "title": "AUDIT.policies (audit.policies.v1)",
+  "description": "Story 2.8 append-only SIEM projection of a single NetworkPolicy mutation (FR40). AUTHORITATIVE validation source for AUDIT.policies; policies.yaml is the human-readable mirror. spec_summary is a compact closed enum (NOT a full-object diff). policy_name/policy_kind are omitted on a deescalation_remove, which records a workload's managed-SET removal rather than a single object (BI-9).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "action",
+    "workload_id",
+    "namespace",
+    "fsm_state",
+    "result",
+    "spec_summary",
+    "published_at"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "audit.policies.v1"},
+    "action": {"type": "string", "enum": ["apply", "supersede_delete", "deescalation_remove", "gc_delete"]},
+    "workload_id": {"type": "string"},
+    "namespace": {"type": "string"},
+    "policy_name": {"type": "string"},
+    "policy_kind": {"type": "string", "enum": ["restricted", "quarantined"]},
+    "fsm_state": {"type": "string", "enum": ["CLEAN", "SUSPICIOUS", "RESTRICTED", "QUARANTINED", "PRESERVED_KILLED"]},
+    "result": {"type": "string", "enum": ["applied", "superseded", "removed", "gc_deleted"]},
+    "spec_summary": {"type": "string", "enum": ["egress_allowlist", "deny_all", "removed"]},
+    "package_id": {"type": "string"},
+    "published_at": {"type": "string", "format": "date-time"}
+  }
+}

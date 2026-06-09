@@ -3140,3 +3140,91 @@ func TestGoldenFile_RS(t *testing.T) {
 func TestGoldenFile_F(t *testing.T) {
 	runGolden(t, "f", []string{"evaluation.config=F"})
 }
+
+// TestGraduatedIsolationBridgesFromValues (Story 2.10, AC2): the fsm
+// threshold/dwell/cooldown and response.{networkPolicy,override,audit} values
+// are overlaid onto the rendered config by the configmap bridges.
+func TestGraduatedIsolationBridgesFromValues(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"secrets.redisPassword=ci",
+		"fsm.thresholds.suspicious=25",
+		"fsm.thresholds.restricted=45",
+		"fsm.thresholds.quarantined=80",
+		"fsm.dwellSeconds.restricted=90",
+		"fsm.deescalationCooldownSeconds=300",
+		"response.networkPolicy.enabled=true",
+		"response.networkPolicy.reconcileIntervalSeconds=20",
+		"response.networkPolicy.clusterCidrs={10.0.0.0/8,172.16.0.0/12}",
+		"response.networkPolicy.extraAllowedCidrs={8.8.8.8/32}",
+		"response.override.enabled=true",
+		"response.override.defaultTtlSeconds=60",
+		"response.audit.enabled=true",
+		"response.audit.retentionTransitionsDays=30",
+	})
+	for _, want := range []string{
+		"watch: 25", "alert: 45", "act: 80",
+		"restricted_dwell_seconds: 90",
+		"deescalation_cooldown_seconds: 300",
+		"reconcile_interval_seconds: 20",
+		"- 10.0.0.0/8", "- 172.16.0.0/12", "- 8.8.8.8/32",
+		"default_ttl_seconds: 60",
+		"retention_transitions_days: 30",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("Story 2.10 bridge did not propagate %q; snippet:\n%s", want, snippet(rendered, "response:"))
+		}
+	}
+	// Boolean enable-flag propagation + the audit-vs-detection-audit
+	// disambiguation (the riskiest anchor): the response.* blocks must flip to
+	// enabled: true. The audit regex pins the trailing retention key, which
+	// exists ONLY under response.audit, so it proves the response block flipped
+	// and NOT detection.sources.audit. Indentation-tolerant (the config is
+	// embedded as an indented block scalar in the ConfigMap).
+	for name, re := range map[string]string{
+		"response.networkPolicy.enabled": `(?m)^\s+network_policy:\n\s+enabled: true`,
+		"response.override.enabled":      `(?m)^\s+override:\n\s+enabled: true`,
+		"response.audit.enabled":         `(?m)^\s+audit:\n\s+enabled: true\n\s+retention_transitions_days:`,
+	} {
+		if !regexp.MustCompile(re).MatchString(rendered) {
+			t.Errorf("%s did not flip the right block (pattern %q); snippet:\n%s", name, re, snippet(rendered, "response:"))
+		}
+	}
+}
+
+// TestGraduatedIsolationDefaultsAreNoOp (Story 2.10, BI-3/BI-4): with no
+// overrides, the bridges leave the config defaults untouched (off by default,
+// 90/365/365 retention, 20/40/70 thresholds).
+func TestGraduatedIsolationDefaultsAreNoOp(t *testing.T) {
+	rendered := helmTemplate(t, []string{"secrets.redisPassword=ci"})
+	for _, want := range []string{
+		"watch: 20", "alert: 40", "act: 70",
+		"retention_transitions_days: 90",
+		"retention_overrides_days: 365",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("default render lost %q; snippet:\n%s", want, snippet(rendered, "confidence_bands:"))
+		}
+	}
+}
+
+// TestGraduatedIsolationAnchorsPresentInOlaitanYAML guards the literal anchors
+// the Story 2.10 configmap bridges depend on; a config-shape drift that moves
+// these would otherwise silently drop --set values (the bridges fail-fast at
+// render, but this catches the drift at the unit-test layer too).
+func TestGraduatedIsolationAnchorsPresentInOlaitanYAML(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join(chartDir(t), "files", "olaitan.yaml"))
+	if err != nil {
+		t.Fatalf("read olaitan.yaml: %v", err)
+	}
+	for _, want := range []string{
+		"  confidence_bands:\n    watch: 20",
+		"  network_policy:\n    enabled: false",
+		"  override:\n    enabled: false",
+		"  audit:\n    enabled: false\n    retention_transitions_days:",
+		"    extra_allowed_cidrs: []",
+	} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("Story 2.10 bridge anchor missing/discontiguous in chart olaitan.yaml: %q", want)
+		}
+	}
+}

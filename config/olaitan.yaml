@@ -198,6 +198,56 @@ response:
     - kube-system
     - olaitan
 
+  # Story 2.4: RESTRICTED-state NetworkPolicy enforcement (FR33/NFR6). When
+  # enabled, a workload entering the RESTRICTED FSM state is given a
+  # NetworkPolicy that allows egress only to the RFC 1918 private ranges
+  # (always allowed), the cluster pod/service CIDRs (cluster_cidrs), and any
+  # extra_allowed_cidrs, and blocks all other (external) egress so a suspect
+  # workload cannot exfiltrate to the internet while internal traffic keeps
+  # flowing. Disabled by default; the per-mode (RS/RSL/RSLT) graduated-
+  # isolation wiring is Story 2.10. Operators MUST set cluster_cidrs to
+  # their own pod and service CIDRs (the defaults below match the kind/
+  # Calico evaluation cluster) so in-cluster traffic and DNS (CoreDNS in the
+  # service CIDR) survive the egress block. reconcile_interval_seconds is
+  # the orphan-GC cadence and must stay within the 60 s budget.
+  network_policy:
+    enabled: false
+    cluster_cidrs:
+      - "10.244.0.0/16"
+      - "10.96.0.0/12"
+    extra_allowed_cidrs: []
+    reconcile_interval_seconds: 30
+
+  # Story 2.7: operator-override controller (FR38/FR39). When enabled, a
+  # controller polls (LISTs) pods on poll_interval_seconds for the
+  # olaitan.io/state-override annotation (with an optional
+  # olaitan.io/state-override-ttl), pins the workload's FSM state, and records
+  # an override:{workload_id} Redis key with a native TTL equal to the
+  # requested duration (default 1h when the TTL annotation is absent). The pin
+  # transition routes through the existing FSM sink, so a pinned RESTRICTED/
+  # QUARANTINED drives the Story 2.4/2.5 NetworkPolicy enforcement and a pinned
+  # CLEAN drives the Story 2.6 removal with no new enforcement code. Release is
+  # detected by the poll: native-TTL expiry (Redis key gone) or manual
+  # annotation removal both release the pin within one poll interval. An
+  # override to PRESERVED_KILLED (Epic 4, not implemented) is rejected with an
+  # OVERRIDES.applied {rejected:true, reason:state_unavailable} event and the
+  # olaitan_response_override_rejected_total{reason} metric. Disabled by
+  # default; observation is poll, never watch (no new RBAC). Full values.yaml
+  # mode-surfacing is deferred to Story 2.10 (the Story 2.4 precedent).
+  override:
+    enabled: false
+    poll_interval_seconds: 15
+    default_ttl_seconds: 3600
+  # Story 2.8: append-only SIEM audit subjects (FR40/NFR16). One flag gates
+  # the three subjects (AUDIT.transitions/overrides/policies); off by default
+  # (Story 2.10 surfaces it in the graduated-isolation mode). The retention
+  # days drive the AUDIT_* JetStream stream MaxAge (90/365/365 d, AC4).
+  audit:
+    enabled: false
+    retention_transitions_days: 90
+    retention_overrides_days: 365
+    retention_policies_days: 365
+
 analyst:
   provider: api
   api:
