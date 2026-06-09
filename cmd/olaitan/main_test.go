@@ -555,3 +555,44 @@ func TestStartAggregator_KubeClientFailureWrapsError(t *testing.T) {
 		t.Errorf("postureClient: got non-nil, want nil on failure path")
 	}
 }
+
+// Story 3.2 round-1 review HIGH: the provider match must be
+// case-insensitive, mirroring the config validator's ToLower allow-set.
+func TestAnalystSelectsAPIProvider(t *testing.T) {
+	for _, p := range []string{"api", "API", "Api", "aPi"} {
+		if !analystSelectsAPIProvider(p) {
+			t.Errorf("analystSelectsAPIProvider(%q) = false, want true", p)
+		}
+	}
+	for _, p := range []string{"", "local", "none", "claude", "api ", "apix"} {
+		if analystSelectsAPIProvider(p) {
+			t.Errorf("analystSelectsAPIProvider(%q) = true, want false", p)
+		}
+	}
+}
+
+// Story 3.2 round-1 review MED: projected Secret values routinely carry a
+// trailing newline; the key must be trimmed and whitespace-only values
+// must collapse to the rules-only skip path.
+func TestAnalystAPIKeyFromEnv(t *testing.T) {
+	const env = "OLAITAN_TEST_ANALYST_KEY"
+
+	t.Setenv(env, "sk-test-value\n")
+	if got := analystAPIKeyFromEnv(env); got != "sk-test-value" {
+		t.Errorf("trailing newline not trimmed: got %q", got)
+	}
+
+	t.Setenv(env, "  \t\n")
+	if got := analystAPIKeyFromEnv(env); got != "" {
+		t.Errorf("whitespace-only value should collapse to empty, got %q", got)
+	}
+
+	t.Setenv(env, "")
+	if got := analystAPIKeyFromEnv(env); got != "" {
+		t.Errorf("empty env should be empty, got %q", got)
+	}
+
+	if got := analystAPIKeyFromEnv(""); got != "" {
+		t.Errorf("empty env NAME should be empty, got %q", got)
+	}
+}

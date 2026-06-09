@@ -491,6 +491,99 @@ egress block. A values key left at its default leaves the baked
 config/olaitan.yaml default untouched (the overlay only fires when the value is
 set), so the chart and config defaults cannot diverge.
 
+### LLM transport tier (Story 3.2, NFR4/NFR5/NFR18/NFR23/NFR27)
+
+Story 3.2 lands the shared LLM provider interface (`internal/agent/provider/`)
+and the Claude implementation (`internal/agent/provider/claude/`) over the
+official `anthropic-sdk-go`. This resolves the architecture.md:308 deferral
+(official SDK chosen over a raw HTTPS client: stable, typed error classes for
+the retry predicate, custom base URL for the integration boundary, structured
+output support). The package layout follows architecture.md:292 --
+`internal/agent/provider/`, NOT the empty `internal/decision/analyst/`
+placeholder, which is reserved for the Story 3.5-3.7 agent code.
+
+**Metric: `olaitan_llm_calls_total`** (counter, unitless).
+Labels: `{provider, role, status}`; `provider` is `claude` (Stories 3.3/3.4
+add `openai`/`ollama`), `role` in `{l1, l2, senior, dfir}`, `status` in
+`{success, transient_failure, permanent_failure, timeout}`. Bounded 16-series
+family today (1 provider x 4 x 4); no per-workload label, per the
+metrics.go:357-362 cardinality rule. Help: "LLM transport calls by provider,
+analyst role and final outcome (success, transient_failure,
+permanent_failure, timeout). One increment per Analyse call; bounded
+16-series label set (Story 3.2 BI-4)." The status is the FINAL outcome of the
+whole retried call, incremented exactly once per `Analyse` invocation:
+
+| status | Meaning |
+|---|---|
+| `success` | The call returned a decoded response (possibly after retries). |
+| `transient_failure` | Retries exhausted on 429/500/529/transport errors, or the parent context was cancelled (process shutdown). |
+| `permanent_failure` | A non-retryable client error (400/401/403/404/413) aborted the call on the first attempt. |
+| `timeout` | The per-role deadline itself expired (parent context still live). |
+
+Sample PromQL -- dashboard rate:
+`sum by (role, status) (rate(olaitan_llm_calls_total[5m]))`;
+alerting predicate (sustained transport failure):
+`sum(rate(olaitan_llm_calls_total{status=~"transient_failure|timeout"}[10m])) > 0.1`.
+
+**Per-role timeout table (total budget across ALL retry attempts):**
+
+| role | budget |
+|---|---|
+| `l1` | 30s |
+| `l2` | 30s |
+| `senior` | 60s |
+| `dfir` (reserved, Epic 4) | 120s |
+
+The role timeout is the TOTAL budget for the attempt loop including backoff
+(worst case 1s+4s of sleep across 3 attempts), not per-attempt. Story 3.8
+makes these config-routable.
+
+**Retry ownership.** The SDK's built-in auto-retry is DISABLED
+(`option.WithMaxRetries(0)`); `internal/retry` owns all retries with
+`Strategy{Min:1s, Max:16s, Multiplier:4, Jitter:1, MaxAttempts:3}` so the
+attempt count and backoff stay observable and single-source-of-truth, and the
+metric above cannot be corrupted by hidden SDK attempts. Error classification
+is by the SDK's typed `*anthropic.Error` status code, never substring
+matching: 400/401/403/404/413 abort immediately; 429/500/529 and transport
+errors retry.
+
+**API key wiring and the NFR18 guarantee.** `analyst.api.api_key_secret`
+NAMES the environment variable the Kubernetes Secret is projected into (the
+config loader never reads the value); `cmd/olaitan` reads that env var once
+at startup and passes the value into the provider constructor. The key is
+never logged, never a metric or audit label, and never embedded in an error;
+the construction log records the BOOLEAN `api_key_set` only. The Helm wiring
+that projects the Secret lands in Story 3.16.
+
+**Clean degradation (no key).** When `analyst.provider` is not the API path
+or the projected env var is empty, the Claude provider is simply not
+constructed: the controller starts normally and runs rules-only (RS mode);
+the deterministic ThreatScore path is unaffected. The rules-only fallback
+POLICY for mid-flight LLM failures is Story 3.10 scope.
+
+**Request surface (Opus 4.8).** Analyst calls are non-streaming with
+thinking explicitly disabled and a bounded `max_tokens` (default 4096); no
+sampling parameter (`temperature`/`top_p`/`top_k`) and no `budget_tokens` is
+ever sent (removed on Opus 4.8; they return HTTP 400). Default model
+`claude-opus-4-8`, operator-pinnable via `analyst.api.model` (exact model ids
+only, never a date suffix). Evidence is redacted via the Story 3.1 pipeline
+BEFORE the wire payload is built; the captured-request-body integration test
+is the proof.
+
+**Known limitations (tracked, not blocking).**
+(a) An explicit `analyst.score_cap: 0` is currently indistinguishable from
+an omitted field (Go zero value) and is coerced to the default 35; an
+operator intending "LLM contributes nothing" should use
+`analyst.provider: none` until Story 3.11 (which owns cap enforcement)
+introduces the unset-vs-zero distinction.
+(b) The provider's `max_tokens` ceiling is programmatically tunable
+(`claude.Config.MaxTokens`) but has no `analyst.*` config field yet; the
+operator-facing knob lands with the Story 3.16 Helm wiring. Until then the
+default 4096 applies.
+(c) A well-formed 200 reply with an empty message object yields
+`Response.Raw == ""` recorded as `success`; callers (Stories 3.5-3.7) must
+treat an empty `Raw` as a failed verdict.
+
 ### 1.5 Naming-convention reconciliation
 
 The Story 1.18 acceptance criteria text uses a mix of singular-ring and plural-ring metric names (e.g. AC2 says `olaitan_decision_rule_matches_total` singular; AC3 says `olaitan_decision_baseline_deviations_total{metric, sigma_bucket}` plural). The actual registrations follow `architecture.md:472-475` which mandates the `olaitan_<ring>_<metric>` pattern with the engine subfamily conventionally plural (`rules`, `baseline`) because the engine evaluates a corpus, not a single rule. The AC singular spellings are documentation aliases, not parallel families.
