@@ -59,6 +59,42 @@
 //     a plain human-readable string under `data` is left intact (and still
 //     gets JWT/secret scanning as an ordinary string value).
 //
+// ROUND-2 REVIEW AMENDMENTS (PR #40): round-2 adversarial review found that the
+// round-1 OVER-redaction fixes opened two UNDER-redaction secret leaks plus a
+// Tags gap. All three are closed here (each with a failing-then-passing
+// regression test) WITHOUT reintroducing over-redaction of benign data:
+//
+//   - Dotted/slashed secret keys leaked (fix #1). isSecretKey segmented only on
+//     `_`/`-`/camelCase, so `db.password`, `app.secret`, `auth.token` and the
+//     annotation form `app.kubernetes.io/secret` were a single non-matching
+//     segment and forwarded their value. `.`, `/` and ` ` are now in the
+//     FieldsFunc delimiter set, so dotted/slashed keys segment correctly and
+//     expose their secret segment. Benign dotted/slashed keys
+//     (`app.kubernetes.io/name`, `region.code`) still do NOT match.
+//   - base64/printable-ASCII secrets under data/payload/bytes leaked (fix #2).
+//     The round-1 looksLikeBinaryBlob only reduced a value whose DECODED bytes
+//     were non-printable, so the canonical K8s Secret `{"data":"<base64>"}`
+//     (base64 of a printable password / AWS key id / GitHub token) was
+//     forwarded verbatim. looksLikeEncodedPayload now reduces a value under a
+//     raw-payload key when it is valid base64/hex of meaningful DECODED length
+//     REGARDLESS of decoded printability. A plain human-readable sentence under
+//     `data` is not valid base64/hex (spaces/punctuation) and still survives for
+//     the ordinary string scan.
+//   - Event.Tags / Event.Summary key=value secrets leaked (fix #3). Round-1
+//     gave tags only a JWT scan, so a plaintext `password=hunter2plaintext` tag
+//     forwarded verbatim despite the round-1 doc claiming tags were scanned.
+//     keyValueSecretScan now splits each tag (and Summary) on the first `=`,
+//     applies isSecretKey to the left side and redacts the right side to
+//     <REDACTED> (secret_pattern). The JWT scan is kept. A tag with no `=`, or a
+//     benign `env=prod`, is left intact.
+//
+// NOTED, NOT BROADENED (round-2 decision): concatenated-glued keys such as
+// `xapikey` and `apikeyv2` are deliberately NOT matched. They are non-standard
+// glued forms; matching them would require substring matching, which is exactly
+// the round-2 over-redaction class (it would reshred `monkey`/`tokenizer`). The
+// segment-anchored match is kept; glued keys are accepted as a known, defensible
+// non-match.
+//
 // PACKAGE-ROOT SCOPE DECISION (fix #10): the EvidencePackage root string fields
 // (WorkloadIdentity {namespace, owner kind/name}, RuleMatches[].RuleName,
 // Trigger, BaselineDeviation metrics, WorkloadPosture) are analyst-derived /
@@ -145,10 +181,16 @@ func isSecretKey(key string) bool {
 	if publicKeyKeyRe.MatchString(lower) {
 		return false
 	}
-	// Split on camelCase first, then on the separators.
+	// Split on camelCase first, then on the separators. The separator set
+	// includes `.` and `/` (and space) so dotted/slashed keys segment correctly
+	// (ROUND-2 fix #1): `db.password` -> [`db`,`password`], `auth.token` ->
+	// [`auth`,`token`], and the annotation form `app.kubernetes.io/secret` ->
+	// [...,`secret`] all expose a secret segment. Without `.`/`/` the whole
+	// dotted/slashed key was a single segment that never matched, leaking the
+	// value verbatim.
 	spaced := camelBoundaryRe.ReplaceAllString(key, "$1 $2")
 	segs := strings.FieldsFunc(spaced, func(r rune) bool {
-		return r == '_' || r == '-' || r == ' '
+		return r == '_' || r == '-' || r == ' ' || r == '.' || r == '/'
 	})
 	for i, seg := range segs {
 		s := strings.ToLower(seg)
@@ -234,10 +276,21 @@ func Redact(pkg schema.EvidencePackage) (schema.EvidencePackage, []RedactionEven
 		ev := &out.Events[i]
 		base := "events[" + strconv.Itoa(i) + "]"
 
-		// Scan the free-form Summary text for an embedded JWT (BI-4.2). The
+		// Scan the free-form Summary text for an embedded JWT (BI-4.2) and for a
+		// key=value secret (ROUND-2 fix #3, for consistency with Tags). The JWT
 		// scan emits one jwt_body event per JWT occurrence (ROUND-1 minor:
-		// per-occurrence audit, not one collapsed event).
+		// per-occurrence audit, not one collapsed event); the key=value scan
+		// emits one secret_pattern event when it redacts a right-hand side.
 		if ev.Summary != "" {
+			if redacted, ok := keyValueSecretScan(ev.Summary); ok {
+				ev.Summary = redacted
+				events = append(events, RedactionEvent{
+					FieldPath:  base + ".summary",
+					Reason:     ReasonSecretPattern,
+					WorkloadID: pkg.WorkloadID,
+					RedactedAt: now,
+				})
+			}
 			redacted, n := jwtScan(ev.Summary)
 			if n > 0 {
 				ev.Summary = redacted
@@ -252,20 +305,34 @@ func Redact(pkg schema.EvidencePackage) (schema.EvidencePackage, []RedactionEven
 			}
 		}
 
-		// Scan each Tag with the shared JWT scan (ROUND-1 fix #3). Tags
-		// previously bypassed redaction entirely. The Tags slice is cloned so
-		// the redacted copy never shares backing storage with the caller
-		// (BI-4.1 no-mutation), even when no tag is redacted.
+		// Scan each Tag with the key=value secret scan (ROUND-2 fix #3) AND the
+		// shared JWT scan (ROUND-1 fix #3). Round-1 applied only the JWT scan,
+		// so a key=value secret such as `password=hunter2plaintext` forwarded
+		// verbatim. The key=value scan redacts the right-hand side to <REDACTED>
+		// (secret_pattern); the JWT scan still runs so a JWT-bearing tag is also
+		// caught. A tag with no `=`, or a benign `env=prod`, is left intact. The
+		// Tags slice is cloned so the redacted copy never shares backing storage
+		// with the caller (BI-4.1 no-mutation), even when no tag is redacted.
 		if len(ev.Tags) > 0 {
 			tags := make([]string, len(ev.Tags))
 			copy(tags, ev.Tags)
 			for j := range tags {
+				fieldPath := base + ".tags[" + strconv.Itoa(j) + "]"
+				if redacted, ok := keyValueSecretScan(tags[j]); ok {
+					tags[j] = redacted
+					events = append(events, RedactionEvent{
+						FieldPath:  fieldPath,
+						Reason:     ReasonSecretPattern,
+						WorkloadID: pkg.WorkloadID,
+						RedactedAt: now,
+					})
+				}
 				redacted, n := jwtScan(tags[j])
 				if n > 0 {
 					tags[j] = redacted
 					for k := 0; k < n; k++ {
 						events = append(events, RedactionEvent{
-							FieldPath:  base + ".tags[" + strconv.Itoa(j) + "]",
+							FieldPath:  fieldPath,
 							Reason:     ReasonJWTBody,
 							WorkloadID: pkg.WorkloadID,
 							RedactedAt: now,
@@ -459,6 +526,28 @@ func (w *walker) record(path, reason string) {
 	})
 }
 
+// keyValueSecretScan applies a key=value secret scan to a free-text string
+// (ROUND-2 fix #3): it splits on the FIRST `=`, applies isSecretKey to the
+// left-hand side and, if it matches, replaces the right-hand side with the
+// literal <REDACTED> token. It returns the rewritten string and true when a
+// redaction occurred. A string with no `=`, or whose left side is a benign key
+// (e.g. `env=prod`), is returned unchanged with false (no over-redaction).
+//
+// This closes the Event.Tags / Event.Summary leak where a secret rode a tag
+// such as `password=hunter2plaintext`: such tags previously received only a JWT
+// scan (which does not match a plaintext password) and forwarded the value.
+func keyValueSecretScan(s string) (string, bool) {
+	i := strings.IndexByte(s, '=')
+	if i <= 0 {
+		return s, false
+	}
+	left := strings.TrimSpace(s[:i])
+	if !isSecretKey(left) {
+		return s, false
+	}
+	return s[:i+1] + redactedToken, true
+}
+
 // jwtScan is the SINGLE shared JWT search-and-replace scan (ROUND-1 fix #2/#3).
 // It finds every JWT-looking candidate inside s, replaces each structurally
 // valid JWT with the literal JWT token, and returns the rewritten string plus
@@ -554,10 +643,18 @@ func splitDot(s string) []string {
 // ROUND-1 fix #8 (over-redaction): a plain human-readable string under
 // data/payload/bytes (e.g. {"data":"hello world ..."}) is NOT a byte blob and
 // must be left intact (it still gets JWT/secret scanning as an ordinary string
-// value). The reduction is therefore gated behind a binary/encoding heuristic:
-// the value must be a string that decodes as base64/hex of meaningful length OR
-// has a high non-printable ratio. A non-string value under one of these keys
-// is left to the normal recursive walk.
+// value). A non-string value under one of these keys is left to the normal
+// recursive walk.
+//
+// ROUND-2 fix #2 (under-redaction): the reduction now fires when the value is a
+// valid base64/hex blob of meaningful DECODED length REGARDLESS of decoded
+// printability, OR when the raw string has a high non-printable ratio. The
+// round-1 heuristic only reduced values whose DECODED bytes were non-printable,
+// so the canonical K8s Secret shape `{"kind":"Secret","data":"<base64>"}` (and
+// `payload`/`bytes` blobs that are base64 of an ASCII secret like an AWS key id
+// or a GitHub token) decoded to printable text and was forwarded verbatim. A
+// plain human-readable sentence under `data` is NOT valid base64/hex (it carries
+// spaces/punctuation), so it still survives for the normal string scan.
 func isRawPayloadKey(k string, val any) bool {
 	if _, ok := rawPayloadKeys[k]; !ok {
 		return false
@@ -566,18 +663,28 @@ func isRawPayloadKey(k string, val any) bool {
 	if !isStr {
 		return false
 	}
-	return looksLikeBinaryBlob(s)
+	return looksLikeEncodedPayload(s)
 }
 
 // minBlobLen is the smallest string length we treat as a candidate byte blob.
 // Below this a base64/hex "match" is far more likely to be a short benign word.
 const minBlobLen = 16
 
-// looksLikeBinaryBlob reports whether s looks like an encoded byte blob (the
-// ROUND-1 fix #8 heuristic). True when s decodes as base64 or hex to a
-// meaningful length, or when the raw string has a high non-printable ratio.
-// A plain human-readable ASCII string returns false.
-func looksLikeBinaryBlob(s string) bool {
+// looksLikeEncodedPayload reports whether a string under a raw-payload key
+// (data/payload/bytes) should be reduced to a {sha256,len} placeholder
+// (ROUND-2 fix #2). It is true when:
+//   - the raw string has a high non-printable ratio (a literal byte blob); OR
+//   - s is valid base64 (std or raw-url) decoding to >= minBlobLen bytes,
+//     REGARDLESS of decoded printability; OR
+//   - s is a valid hex string of >= minBlobLen decoded bytes.
+//
+// The printability of the DECODED bytes is deliberately NOT a gate here: the
+// canonical K8s Secret carries a base64 of a printable ASCII secret (a
+// password, an AWS key id, a GitHub token), so requiring non-printable decoded
+// bytes (the round-1 behaviour) leaked those verbatim. A plain human-readable
+// sentence is not valid base64/hex (spaces/punctuation), so it is NOT reduced
+// here and survives for the ordinary string scan.
+func looksLikeEncodedPayload(s string) bool {
 	if len(s) < minBlobLen {
 		return false
 	}
@@ -585,16 +692,10 @@ func looksLikeBinaryBlob(s string) bool {
 		return true
 	}
 	if b, err := base64.StdEncoding.DecodeString(s); err == nil && len(b) >= minBlobLen {
-		// Base64 of plain ASCII text decodes back to printable text; only treat
-		// it as a blob when the decoded bytes are themselves non-printable.
-		if nonPrintableRatio(string(b)) > 0.15 {
-			return true
-		}
+		return true
 	}
 	if b, err := base64.RawURLEncoding.DecodeString(s); err == nil && len(b) >= minBlobLen {
-		if nonPrintableRatio(string(b)) > 0.15 {
-			return true
-		}
+		return true
 	}
 	if isHexString(s) && len(s) >= 2*minBlobLen {
 		return true

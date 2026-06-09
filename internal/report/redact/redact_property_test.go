@@ -102,20 +102,33 @@ func genSecretBearingPackage() gopter.Gen {
 			jwt := genJWT(s)                   // JWT in a larger string
 			fileContents := "file-secret-" + s // file-ref contents
 			deepSecret := secretVal + "-deep"  // nested secret value
-			// A genuine binary blob so the fix #8 heuristic reduces it; track
-			// BOTH the encoded form AND the decoded bytes as ground truth.
+			dottedSecret := "dotleak-" + s     // value under a DOTTED secret key (round-2 fix #1)
+			tagKVSecret := "kvsecret-" + s     // key=value secret in a Tag (round-2 fix #3)
+			// A genuine binary blob so the heuristic reduces it; track BOTH the
+			// encoded form AND the decoded bytes as ground truth.
 			rawBytes := []byte{0x00, 0x01, 0xff, 0xfe, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x10 ^ byte(i), 0x11, 0x12, 0x13}
 			rawB64 := base64.StdEncoding.EncodeToString(rawBytes)
+			// A base64 of a PRINTABLE ASCII secret under `data` (round-2 fix #2):
+			// the canonical K8s Secret shape. Track BOTH the encoded form AND the
+			// decoded secret string as ground truth.
+			dataDecoded := "printable-secret-" + s
+			dataB64 := base64.StdEncoding.EncodeToString([]byte(dataDecoded))
 			secrets = append(secrets,
 				secretVal, envSecret, tagSecret, jwt, fileContents, deepSecret,
-				rawB64, string(rawBytes),
+				rawB64, string(rawBytes), dottedSecret, tagKVSecret,
+				dataB64, dataDecoded,
 			)
 
 			raw := map[string]any{
 				"api_key":       secretVal,
+				"db.password":   dottedSecret,    // DOTTED secret key (round-2 fix #1)
 				"authorization": "Bearer " + jwt, // JWT embedded in a LARGER string (fix #2)
 				"payload":       rawB64,          // raw byte blob (fix #8)
-				"file":          map[string]any{"path": "/etc/app/x", "contents": fileContents},
+				// Canonical K8s Secret shape (round-2 fix #2): a base64 of a
+				// PRINTABLE secret under `data`, with no path-like sibling so it
+				// routes through the raw-payload reduction (not the file-ref one).
+				"secretObj": map[string]any{"kind": "Secret", "data": dataB64},
+				"file":      map[string]any{"path": "/etc/app/x", "contents": fileContents},
 				"containers": []any{ // K8s {name,value} env shape (fix #1)
 					map[string]any{"env": []any{
 						map[string]any{"name": "DB_PASSWORD", "value": envSecret},
@@ -131,7 +144,7 @@ func genSecretBearingPackage() gopter.Gen {
 			events[i] = schema.Event{
 				ID:      "e" + strconv.Itoa(i),
 				Summary: "saw token " + jwt + " on the wire",
-				Tags:    []string{"benign", "auth=" + tagSecret},
+				Tags:    []string{"benign", "auth=" + tagSecret, "password=" + tagKVSecret, "env=prod"},
 				Raw:     rb,
 			}
 		}
