@@ -853,6 +853,19 @@ data:
         retention_overrides_days: 365
         retention_policies_days: 365
     
+    # Story 3.1: the Ring-5 report layer. The redact sub-block gates the
+    # AUDIT.redactions SIEM emission (FR41); redaction itself is ALWAYS applied at
+    # every LLM/persistence boundary regardless of config (turning it off would
+    # violate NFR15 and is forbidden, BI-7). audit_enabled is off by default: an
+    # operator without a SIEM pays no NATS-publish cost while still getting full
+    # redaction. retention_redactions_days drives the AUDIT_REDACTIONS JetStream
+    # stream MaxAge (365 d, append-only via LimitsPolicy, NFR16). The audit event
+    # carries field_path + reason + package_id but NEVER the secret value (NFR18).
+    report:
+      redact:
+        audit_enabled: false
+        retention_redactions_days: 365
+    
     analyst:
       provider: none
       api:

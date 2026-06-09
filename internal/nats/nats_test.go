@@ -684,6 +684,8 @@ func TestStreamConfigsCoversAuditSubjects(t *testing.T) {
 		{subjects.AuditTransitions, "AUDIT_TRANSITIONS", 90 * 24 * time.Hour},
 		{subjects.AuditOverrides, "AUDIT_OVERRIDES", 365 * 24 * time.Hour},
 		{subjects.AuditPolicies, "AUDIT_POLICIES", 365 * 24 * time.Hour},
+		// Story 3.1: the fifth SIEM audit subject, 365 d default (BI-3.2).
+		{subjects.AuditRedactions, "AUDIT_REDACTIONS", 365 * 24 * time.Hour},
 	}
 	for _, c := range cases {
 		cfg := findStreamFor(t, configs, c.subject)
@@ -704,7 +706,7 @@ func TestStreamConfigsCoversAuditSubjects(t *testing.T) {
 // Interest/WorkQueue (which delete on consumer ack and would let a consumer
 // effectively delete audit events). A future regression here fails CI.
 func TestAuditStreamsAreLimitsPolicy(t *testing.T) {
-	for _, subj := range []string{subjects.AuditTransitions, subjects.AuditOverrides, subjects.AuditPolicies} {
+	for _, subj := range []string{subjects.AuditTransitions, subjects.AuditOverrides, subjects.AuditPolicies, subjects.AuditRedactions} {
 		cfg := findStreamFor(t, natsclient.StreamConfigs(), subj)
 		if cfg.Retention != jetstream.LimitsPolicy {
 			t.Errorf("%s: Retention = %v, want LimitsPolicy (NFR16 append-only)", cfg.Name, cfg.Retention)
@@ -722,7 +724,8 @@ func TestStreamConfigsWithAuditOverridesMaxAge(t *testing.T) {
 	ar := natsclient.AuditRetention{
 		Transitions: 7 * 24 * time.Hour,
 		// Overrides left zero -> keep default 365 d.
-		Policies: 30 * 24 * time.Hour,
+		Policies:   30 * 24 * time.Hour,
+		Redactions: 14 * 24 * time.Hour,
 	}
 	configs := natsclient.StreamConfigsWithAudit(ar)
 	if got := findStreamFor(t, configs, subjects.AuditTransitions).MaxAge; got != 7*24*time.Hour {
@@ -733,6 +736,9 @@ func TestStreamConfigsWithAuditOverridesMaxAge(t *testing.T) {
 	}
 	if got := findStreamFor(t, configs, subjects.AuditPolicies).MaxAge; got != 30*24*time.Hour {
 		t.Errorf("policies MaxAge = %s, want 30d (operator override)", got)
+	}
+	if got := findStreamFor(t, configs, subjects.AuditRedactions).MaxAge; got != 14*24*time.Hour {
+		t.Errorf("redactions MaxAge = %s, want 14d (operator override)", got)
 	}
 	// A non-audit stream is untouched by the override.
 	if got := findStreamFor(t, configs, subjects.OverridesApplied).MaxAge; got != 365*24*time.Hour {

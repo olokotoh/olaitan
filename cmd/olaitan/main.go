@@ -54,6 +54,7 @@ import (
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
 	"github.com/olokotoh/olaitan/internal/ratelimit"
 	redisclient "github.com/olokotoh/olaitan/internal/redis"
+	reportredact "github.com/olokotoh/olaitan/internal/report/redact"
 	responseaudit "github.com/olokotoh/olaitan/internal/response/audit"
 	"github.com/olokotoh/olaitan/internal/response/fsm"
 	"github.com/olokotoh/olaitan/internal/response/netpol"
@@ -428,6 +429,12 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		Transitions: time.Duration(cfg.Response.Audit.RetentionTransitionsDaysOrDefault()) * 24 * time.Hour,
 		Overrides:   time.Duration(cfg.Response.Audit.RetentionOverridesDaysOrDefault()) * 24 * time.Hour,
 		Policies:    time.Duration(cfg.Response.Audit.RetentionPoliciesDaysOrDefault()) * 24 * time.Hour,
+		// Story 3.1 (BI-7.3): the AUDIT_REDACTIONS stream's MaxAge derives from
+		// report.redact.retention_redactions_days (365 d default). Defaulted in
+		// Load even when the redact audit is disabled, so this is safe to apply
+		// unconditionally; the stream is provisioned alongside the others so
+		// startup order does not matter (the Story 2.8 round-2 amendment).
+		Redactions: time.Duration(cfg.Report.Redact.RetentionRedactionsDaysOrDefault()) * 24 * time.Hour,
 	}
 	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigsWithAudit(auditRetention)); err != nil {
 		closeNATS()
@@ -696,6 +703,35 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		}
 	}
 
+	// Story 3.1 (BI-7.3): the AUDIT.redactions emission is gated by
+	// report.redact.audit_enabled (off by default). Redaction itself is ALWAYS
+	// applied at every LLM/persistence boundary regardless of config (BI-7.2);
+	// only the SIEM publish is gated. The sink + NATS-backed publisher are
+	// constructed only when enabled and the buffered drainer runs on the
+	// errgroup; the sink reference is threaded to the future Story 3.2/3.5-3.7
+	// LLM call sites via reportredact.RedactAndAudit(pkg, redactionAuditSink)
+	// (nil sink = no emission, the off-by-default path). A redaction-audit
+	// failure NEVER blocks or fails the redaction (BI-6.2).
+	redactAuditEnabled := cfg.Report.Redact.AuditEnabledOrDefault()
+	var redactionAuditSink *reportredact.RedactionAuditSink
+	if redactAuditEnabled {
+		rp, rerr := reportredact.NewNATSRedactionPublisher(nc)
+		if rerr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: redaction audit publisher: %w", rerr)
+		}
+		redactionAuditSink, rerr = reportredact.NewRedactionAuditSink(rp, log, reportredact.RedactionAuditSinkConfig{})
+		if rerr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: redaction audit sink: %w", rerr)
+		}
+		g.Go(func() error { return redactionAuditSink.Run(ctx) })
+	}
+	// redactionAuditSink is wired for the Epic 3 LLM call sites (Stories
+	// 3.2/3.5-3.7), which do not exist yet (BI-8). Reference it so the wiring is
+	// live and the build does not flag it unused until those stories land.
+	_ = redactionAuditSink
+
 	var sinks fsm.MultiSink
 	var fsmStore *fsm.Store
 	if cfg.Detection.FSM.PersistenceEnabledOrDefault() {
@@ -819,7 +855,8 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		"persistence_enabled", cfg.Detection.FSM.PersistenceEnabledOrDefault(),
 		"netpol_enabled", netpolEnabled,
 		"override_enabled", overrideEnabled,
-		"audit_enabled", auditEnabled)
+		"audit_enabled", auditEnabled,
+		"redactions_audit_enabled", redactAuditEnabled)
 
 	g.Go(func() error {
 		<-ctx.Done()
@@ -1242,6 +1279,10 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 		Transitions: time.Duration(cfg.Response.Audit.RetentionTransitionsDaysOrDefault()) * 24 * time.Hour,
 		Overrides:   time.Duration(cfg.Response.Audit.RetentionOverridesDaysOrDefault()) * 24 * time.Hour,
 		Policies:    time.Duration(cfg.Response.Audit.RetentionPoliciesDaysOrDefault()) * 24 * time.Hour,
+		// Story 3.1: keep the AUDIT_REDACTIONS retention consistent with the
+		// aggregator so whichever ring wins the startup race provisions the
+		// stream with the same MaxAge.
+		Redactions: time.Duration(cfg.Report.Redact.RetentionRedactionsDaysOrDefault()) * 24 * time.Hour,
 	}
 	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigsWithAudit(auditRetention)); err != nil {
 		closeNATS()

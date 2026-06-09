@@ -130,6 +130,24 @@ var streamConfigs = []jetstream.StreamConfig{
 		Retention:  jetstream.LimitsPolicy,
 		Duplicates: 2 * time.Minute,
 	},
+	{
+		// AUDIT_REDACTIONS carries the Story 3.1 append-only SIEM audit copy of
+		// every redacted field (subjects.AuditRedactions, FR41), the fifth and
+		// final SIEM audit subject (architecture.md:131/380/447). Retention
+		// defaults to 365 d: unlike transitions (90 d), no AC carves out a
+		// shorter redactions retention, so it takes the architecture's
+		// generalised "AUDIT.* 365 d" default (architecture.md:239). LimitsPolicy
+		// NOT Interest/WorkQueue (NFR16 append-only: consumers cannot delete
+		// audit events). Helm-tunable via StreamConfigsWithAudit. The redaction
+		// sink publishes with jetstream.WithMsgID so a drainer re-publish of the
+		// same redaction is server-side deduplicated within the window.
+		Name:       "AUDIT_REDACTIONS",
+		Subjects:   []string{subjects.AuditRedactions},
+		MaxAge:     defaultAuditRedactionsMaxAge,
+		Storage:    jetstream.FileStorage,
+		Retention:  jetstream.LimitsPolicy,
+		Duplicates: 2 * time.Minute,
+	},
 }
 
 // defaultAudit*MaxAge are the Story 2.8 AC4 retention defaults baked into
@@ -140,16 +158,22 @@ const (
 	defaultAuditTransitionsMaxAge = 90 * 24 * time.Hour
 	defaultAuditOverridesMaxAge   = 365 * 24 * time.Hour
 	defaultAuditPoliciesMaxAge    = 365 * 24 * time.Hour
+	// defaultAuditRedactionsMaxAge is the Story 3.1 redactions retention default.
+	// No AC carves out a shorter window (unlike transitions' 90 d), so it takes
+	// the architecture's generalised "AUDIT.* 365 d" default (BI-3.2).
+	defaultAuditRedactionsMaxAge = 365 * 24 * time.Hour
 )
 
-// AuditRetention carries the operator-tuned per-subject MaxAge for the three
-// Story 2.8 AUDIT_* streams (BI-7). A non-positive field means "leave the
+// AuditRetention carries the operator-tuned per-subject MaxAge for the
+// AUDIT_* streams (the three Story 2.8 streams plus the Story 3.1
+// AUDIT_REDACTIONS stream, BI-7/BI-3). A non-positive field means "leave the
 // baked-in default"; StreamConfigsWithAudit substitutes only positive values,
 // so a zero-valued AuditRetention is equivalent to StreamConfigs().
 type AuditRetention struct {
 	Transitions time.Duration
 	Overrides   time.Duration
 	Policies    time.Duration
+	Redactions  time.Duration
 }
 
 // auditStreamNames maps each AUDIT_* stream name to the AuditRetention field
@@ -159,6 +183,7 @@ var auditStreamNames = map[string]func(AuditRetention) time.Duration{
 	"AUDIT_TRANSITIONS": func(a AuditRetention) time.Duration { return a.Transitions },
 	"AUDIT_OVERRIDES":   func(a AuditRetention) time.Duration { return a.Overrides },
 	"AUDIT_POLICIES":    func(a AuditRetention) time.Duration { return a.Policies },
+	"AUDIT_REDACTIONS":  func(a AuditRetention) time.Duration { return a.Redactions },
 }
 
 // StreamConfigs returns a copy of the JetStream stream configurations.

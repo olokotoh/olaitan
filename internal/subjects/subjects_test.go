@@ -112,6 +112,10 @@ func TestConstants(t *testing.T) {
 		"ThreatsIsolate":   "olaitan.threats.isolate",
 		"EvidencePackages": "olaitan.evidence.packages",
 		"HealthHeartbeat":  "olaitan.health.heartbeat",
+		"AuditTransitions": "AUDIT.transitions",
+		"AuditOverrides":   "AUDIT.overrides",
+		"AuditPolicies":    "AUDIT.policies",
+		"AuditRedactions":  "AUDIT.redactions",
 	}
 	got := map[string]string{
 		"RawFalco":         subjects.RawFalco,
@@ -126,6 +130,10 @@ func TestConstants(t *testing.T) {
 		"ThreatsIsolate":   subjects.ThreatsIsolate,
 		"EvidencePackages": subjects.EvidencePackages,
 		"HealthHeartbeat":  subjects.HealthHeartbeat,
+		"AuditTransitions": subjects.AuditTransitions,
+		"AuditOverrides":   subjects.AuditOverrides,
+		"AuditPolicies":    subjects.AuditPolicies,
+		"AuditRedactions":  subjects.AuditRedactions,
 	}
 	for k, v := range want {
 		if got[k] != v {
