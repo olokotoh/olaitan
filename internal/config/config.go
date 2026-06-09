@@ -54,6 +54,11 @@ type Config struct {
 	// rate) so a chart deploy that has not yet adopted the block
 	// inherits production behaviour.
 	RateLimit RateLimitConfig `yaml:"rate_limit,omitempty"`
+	// Report configures the Ring-5 report layer (Story 3.1 onward). Today it
+	// carries only the redact sub-block, which gates the AUDIT.redactions SIEM
+	// emission (redaction itself is always on, BI-7). Omission of the block
+	// leaves the redact defaults (audit off, 365 d retention).
+	Report ReportConfig `yaml:"report,omitempty"`
 }
 
 // MetricsConfig configures the Story 1.12 Prometheus surface bound at
@@ -1275,6 +1280,78 @@ func (a AuditConfig) validate() error {
 	return nil
 }
 
+// ReportConfig configures the Ring-5 report layer. Story 3.1 adds the redact
+// sub-block; Epic 4 extends this block with the S3/forensic-persistence knobs.
+type ReportConfig struct {
+	// Redact gates the Story 3.1 AUDIT.redactions SIEM emission (FR41). The
+	// redaction itself is ALWAYS applied at every LLM/persistence boundary
+	// regardless of config (turning it off would violate NFR15 and is
+	// forbidden); only the SIEM publish is config-gated, off by default (the
+	// Story 2.8 response.audit.enabled precedent, BI-7).
+	Redact RedactConfig `yaml:"redact,omitempty"`
+}
+
+// RedactConfig configures the Story 3.1 AUDIT.redactions emission (BI-7.1). A
+// single AuditEnabled flag gates the SIEM publish; RetentionRedactionsDays sets
+// the MaxAge of the AUDIT_REDACTIONS JetStream stream (365 d default, BI-3.2).
+//
+// AuditEnabled is pointer-tagged so an explicit `false` survives the loader (the
+// AuditConfig.Enabled precedent); the default is OFF (opt-in). The retention
+// field is pointer-tagged so an explicit value survives and a zero is
+// distinguishable from omitted.
+//
+// Open Assumption 3 / BI-7.2: there is NO flag to disable redaction. An
+// operator without a SIEM leaves audit_enabled false and pays no NATS-publish
+// cost while STILL getting full redaction at every boundary.
+type RedactConfig struct {
+	AuditEnabled            *bool `yaml:"audit_enabled,omitempty"`
+	RetentionRedactionsDays *int  `yaml:"retention_redactions_days,omitempty"`
+}
+
+// DefaultRedactionsRetentionDays is the Story 3.1 redactions retention default
+// (BI-3.2): 365 d, the architecture's generalised "AUDIT.* 365 d".
+const DefaultRedactionsRetentionDays = 365
+
+// DefaultRedact returns the Story 3.1 defaults: audit emission disabled, 365 d
+// retention.
+func DefaultRedact() RedactConfig {
+	enabled := false
+	r := DefaultRedactionsRetentionDays
+	return RedactConfig{
+		AuditEnabled:            &enabled,
+		RetentionRedactionsDays: &r,
+	}
+}
+
+// AuditEnabledOrDefault reports whether the AUDIT.redactions emission is
+// enabled, treating a nil pointer as the default (false).
+func (r RedactConfig) AuditEnabledOrDefault() bool {
+	if r.AuditEnabled == nil {
+		return false
+	}
+	return *r.AuditEnabled
+}
+
+// RetentionRedactionsDaysOrDefault returns the effective redactions retention in
+// days, substituting the 365 d default when omitted.
+func (r RedactConfig) RetentionRedactionsDaysOrDefault() int {
+	if r.RetentionRedactionsDays == nil {
+		return DefaultRedactionsRetentionDays
+	}
+	return *r.RetentionRedactionsDays
+}
+
+// validate enforces RedactConfig invariants: a set retention must be positive
+// (a non-positive MaxAge is never an operator intent for an append-only audit
+// window). A fully-omitted block skips validation; Load substitutes
+// DefaultRedact before Validate.
+func (r RedactConfig) validate() error {
+	if r.RetentionRedactionsDays != nil && *r.RetentionRedactionsDays < 1 {
+		return fmt.Errorf("report.redact.retention_redactions_days: must be >= 1 (got %d)", *r.RetentionRedactionsDays)
+	}
+	return nil
+}
+
 // AnalystConfig -- see architecture.md:806-835 (LLM analyst settings).
 // Covers MVP single-analyst and Target multi-agent chain/subtasks.
 type AnalystConfig struct {
@@ -1556,6 +1633,19 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
+	// Story 3.1: substitute the redact defaults so an enabled redact block with
+	// an omitted retention inherits the 365 d default, and an omitted
+	// AuditEnabled stays off (redaction itself is always on, BI-7).
+	{
+		defRedact := DefaultRedact()
+		if cfg.Report.Redact.AuditEnabled == nil {
+			cfg.Report.Redact.AuditEnabled = defRedact.AuditEnabled
+		}
+		if cfg.Report.Redact.RetentionRedactionsDays == nil {
+			cfg.Report.Redact.RetentionRedactionsDays = defRedact.RetentionRedactionsDays
+		}
+	}
+
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("config: validate %q: %w", path, err)
 	}
@@ -1604,6 +1694,9 @@ func (c *Config) Validate() error {
 		return err
 	}
 	if err := c.RateLimit.validate(); err != nil {
+		return err
+	}
+	if err := c.Report.Redact.validate(); err != nil {
 		return err
 	}
 	return nil

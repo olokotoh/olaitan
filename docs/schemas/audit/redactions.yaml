@@ -1,0 +1,48 @@
+# Human-readable mirror of the AUDIT.redactions wire event.
+#
+# AUTHORITATIVE validation source: docs/schemas/audit/redactions.json
+# (draft 2020-12). This YAML is the documentation mirror; the .json is what
+# the integration tests validate against (BI-3.4). Source of truth for the Go
+# shape: internal/report/redact/audit.go (type AuditRedaction).
+#
+# Story 3.1 (FR41/FR44). The fifth and final append-only SIEM audit subject,
+# one event per redacted field, published to AUDIT.redactions (365 d
+# LimitsPolicy retention, NFR16 append-only). CRITICAL: the event carries the
+# field PATH + reason but NEVER the secret VALUE (NFR18, BI-5.3): there is no
+# value/before field, so the audit trail is safe to ship to a SIEM. redacted_at
+# (the redaction decision time) is distinct from published_at (the
+# audit-emission time, BI-3.4).
+schema: audit.redactions.v1
+subject: AUDIT.redactions
+fields:
+  schema_version:
+    type: string
+    required: true
+    description: Always "audit.redactions.v1".
+  package_id:
+    type: string
+    required: true
+    description: The EvidencePackage.PackageID, threaded onto every event in the redaction batch (AC4).
+  field_path:
+    type: string
+    required: true
+    description: The dotted/indexed path to the redacted field, e.g. events[3].raw.spec.containers[0].env.API_KEY (BI-4.4).
+  reason:
+    type: string
+    required: true
+    enum: [secret_pattern, jwt_body, raw_payload, file_contents]
+    description: Why the field was redacted; one closed value per AC1/AC2 rule (BI-4.3).
+  workload_id:
+    type: string
+    required: false
+    description: The WorkloadIdentity canonical string, carried for SIEM correlation when known (omitempty).
+  redacted_at:
+    type: string
+    format: date-time
+    required: true
+    description: When the redaction decision was made (BI-3.4).
+  published_at:
+    type: string
+    format: date-time
+    required: true
+    description: When the audit event was emitted onto NATS (BI-3.4).

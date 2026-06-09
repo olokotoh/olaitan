@@ -408,6 +408,20 @@ When `response.audit.enabled=true` (off by default; one flag gates all three), t
 
 Inspect with `nats sub AUDIT.transitions --raw` (or `.overrides` / `.policies`): each is structured JSON with documented field names (no NL parsing). Committed schemas live at `docs/schemas/audit/*.json` (authoritative) with `*.yaml` documentation mirrors.
 
+### AUDIT.redactions, the fifth SIEM audit subject (Story 3.1, FR41/FR44/NFR15/NFR18)
+
+`AUDIT.redactions` is the fifth and final SIEM audit subject, completing the architecture's five-subject surface. It joins the other four above and is inspected the same way: `nats sub AUDIT.redactions --raw`. It carries one structured-JSON event per redacted field, validated against `docs/schemas/audit/redactions.json` (authoritative, with the `redactions.yaml` mirror).
+
+| Subject | Stream | Default retention | Records |
+|---|---|---|---|
+| `AUDIT.redactions` | `AUDIT_REDACTIONS` | 365 d (`report.redact.retention_redactions_days`) | one event per redacted field: `field_path` + `reason` (`secret_pattern`/`jwt_body`/`raw_payload`/`file_contents`) + `package_id` |
+
+Operational notes:
+- **Redaction is ALWAYS on; only the SIEM emission is config-gated, off by default (BI-7).** The `Redact()` pipeline strips secrets/JWTs/raw-payloads/file-contents at EVERY LLM and persistence boundary regardless of config (turning it off would violate NFR15 and is forbidden). The `report.redact.audit_enabled` flag (default `false`) gates ONLY whether the `AUDIT.redactions` SIEM events are published. An operator without a SIEM leaves it `false` and pays no NATS-publish cost while STILL getting full redaction.
+- **No secret value on the wire (NFR18, BI-5.3).** The event records WHERE (`field_path`) and WHY (`reason`) a redaction happened, NEVER the secret that was redacted: there is no value/before field. `nats sub AUDIT.redactions --raw` is therefore safe to ship to a SIEM. `redacted_at` (the redaction decision time) is distinct from `published_at` (the audit-emit time).
+- **Append-only via LimitsPolicy (NFR16), 365 d default.** The `AUDIT_REDACTIONS` stream is `LimitsPolicy` (consumers cannot delete events), Helm-tunable via `report.redact.retention_redactions_days`. Unlike transitions' 90 d, no AC carves out a shorter window for redactions, so it takes the architecture's generalised "AUDIT.* 365 d" default.
+- **Best-effort, never blocks or fails the redaction (BI-6.2).** A NATS outage drops redaction-audit events (with a warn + a dropped counter on the buffered sink) rather than adding latency to or failing the redaction / LLM call. The redaction is the security guarantee; the audit line is observability.
+
 Operational notes:
 - **Two events per applied override, by design (BI-10):** an applied operator override emits one `AUDIT.transitions` (the state change, `trigger_type=override`) AND one `AUDIT.overrides` (the application, with TTL/source/attribution); a rejected override emits only `AUDIT.overrides`. They are complementary, correlated on `workload_id` + time. Do NOT "deduplicate" them.
 - **Mutations only, not heartbeats (BI-9, Open Assumption 2):** an idempotent NetworkPolicy noop, a NotFound delete, and a no-op FSM evaluation produce NO audit event. Audit-stream volume tracks real activity, not reconcile cadence. For reconcile-cadence telemetry use the Story 2.9 Prometheus metrics.

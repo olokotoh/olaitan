@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/olokotoh/olaitan/docs/schemas/audit/redactions.json",
+  "title": "AUDIT.redactions (audit.redactions.v1)",
+  "description": "Story 3.1 append-only SIEM projection of a single redacted field (FR41/FR44). AUTHORITATIVE validation source for AUDIT.redactions; redactions.yaml is the human-readable mirror. Records that a field at field_path was redacted for reason, NEVER the secret value that was redacted (NFR18). redacted_at (the redaction decision time) is distinct from published_at (the audit-emission time).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "package_id",
+    "field_path",
+    "reason",
+    "redacted_at",
+    "published_at"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "audit.redactions.v1"},
+    "package_id": {"type": "string"},
+    "field_path": {"type": "string"},
+    "reason": {"type": "string", "enum": ["secret_pattern", "jwt_body", "raw_payload", "file_contents"]},
+    "workload_id": {"type": "string"},
+    "redacted_at": {"type": "string", "format": "date-time"},
+    "published_at": {"type": "string", "format": "date-time"}
+  }
+}
