@@ -503,15 +503,16 @@ output support). The package layout follows architecture.md:292 --
 placeholder, which is reserved for the Story 3.5-3.7 agent code.
 
 **Metric: `olaitan_llm_calls_total`** (counter, unitless).
-Labels: `{provider, role, status}`; `provider` is `claude` (Stories 3.3/3.4
-add `openai`/`ollama`), `role` in `{l1, l2, senior, dfir}`, `status` in
-`{success, transient_failure, permanent_failure, timeout}`. Bounded 16-series
-family today (1 provider x 4 x 4); no per-workload label, per the
-metrics.go:357-362 cardinality rule. Help: "LLM transport calls by provider,
-analyst role and final outcome (success, transient_failure,
-permanent_failure, timeout). One increment per Analyse call; bounded
-16-series label set (Story 3.2 BI-4)." The status is the FINAL outcome of the
-whole retried call, incremented exactly once per `Analyse` invocation:
+Labels: `{provider, role, status}`; `provider` in `{claude, openai}` (Story
+3.3; Story 3.4 adds `ollama`), `role` in `{l1, l2, senior, dfir}`, `status`
+in `{success, transient_failure, permanent_failure, timeout}`. Bounded
+32-series family today (2 providers x 4 x 4); no per-workload label, per
+the metrics.go:357-362 cardinality rule. Registration is SHARED and
+idempotent (`provider.RegisterCallsMetric`, Story 3.3): every provider
+increments the same family, so a dual-provider process (the Story 3.8
+routing future) cannot hit a duplicate-registration error. The status is
+the FINAL outcome of the whole retried call, incremented exactly once per
+`Analyse` invocation:
 
 | status | Meaning |
 |---|---|
@@ -570,6 +571,36 @@ only, never a date suffix). Evidence is redacted via the Story 3.1 pipeline
 BEFORE the wire payload is built; the captured-request-body integration test
 is the proof.
 
+**OpenAI-compatible provider (Story 3.3).** A second `Provider`
+implementation at `internal/agent/provider/openai_compat/` speaks the
+lowest-common-denominator Chat Completions shape over a hand-rolled stdlib
+client (no SDK dependency): `POST {base}/chat/completions`, `max_tokens`
+(never `max_completion_tokens`), `Authorization: Bearer`, no sampling
+params, `stream: false`. `Name()` is `openai` -- the family identity for
+the metric label and the Story 3.8 routing key; the BaseURL selects the
+vendor (default `https://api.openai.com/v1`; Together
+`https://api.together.xyz/v1`; Groq `https://api.groq.com/openai/v1`; any
+LiteLLM/vLLM proxy). The BaseURL must be an absolute http(s) URL without
+userinfo credentials; anything else fails construction with
+`ErrBadBaseURL` (fail-fast: a bad endpoint would otherwise retry forever
+as transient, and userinfo would leak into the construction log). The
+model id is REQUIRED (no cross-vendor default
+exists; the constructor returns `ErrNoModel`), and the context window is
+the `MaxContextTokens` config knob (default 128000) because compatible
+vendors are unenumerable. The client never follows redirects: a 3xx from
+a misconfigured endpoint surfaces as a typed transient error instead of
+converting the POST to a GET and re-sending the bearer token to the
+redirect target. Upstream error bodies are bounded (4 KiB read, 256 B
+kept) and laundered (key scrub, control-character flattening) before any
+error string or log line is built, because some vendors echo key material
+in 401 bodies. Retry, per-role timeouts, redaction-before-send,
+key hygiene, the outcome metric, and the degenerate-200 guards (null body,
+empty choices) behave identically to the Claude provider; the shared
+helpers in `internal/agent/provider/` enforce the parity. The provider is
+NOT yet wired in cmd/olaitan: no config discriminator exists between the
+Claude and OpenAI paths under `analyst.provider: api`; Story 3.8 owns the
+per-role routing that makes it reachable.
+
 **Known limitations (tracked, not blocking).**
 (a) An explicit `analyst.score_cap: 0` is currently indistinguishable from
 an omitted field (Go zero value) and is coerced to the default 35; an
@@ -577,10 +608,11 @@ operator intending "LLM contributes nothing" should use
 `analyst.provider: none` until Story 3.11 (which owns cap enforcement)
 introduces the unset-vs-zero distinction.
 (b) The provider's `max_tokens` ceiling is programmatically tunable
-(`claude.Config.MaxTokens`) but has no `analyst.*` config field yet; the
-operator-facing knob lands with the Story 3.16 Helm wiring. Until then the
-default 4096 applies.
-(c) A well-formed 200 reply with an empty message object yields
+(`claude.Config.MaxTokens` / `openaicompat.Config.MaxTokens`) but has no
+`analyst.*` config field yet; the operator-facing knob lands with the
+Story 3.16 Helm wiring. Until then the default 4096 applies.
+(c) A well-formed 200 reply with an empty message object (Claude) or an
+empty `choices[0].message.content` (OpenAI-compatible) yields
 `Response.Raw == ""` recorded as `success`; callers (Stories 3.5-3.7) must
 treat an empty `Raw` as a failed verdict.
 

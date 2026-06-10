@@ -42,7 +42,6 @@ package claude
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -87,28 +86,25 @@ const (
 	// the intended cadence.
 	healthTimeout = 10 * time.Second
 
-	metricName = "olaitan_llm_calls_total"
-	metricHelp = "LLM transport calls by provider, analyst role and final outcome " +
-		"(success, transient_failure, permanent_failure, timeout). One increment " +
-		"per Analyse call; bounded 16-series label set (Story 3.2 BI-4)."
+	// metricName aliases the shared family registered via
+	// provider.RegisterCallsMetric (Story 3.3 BI-3 hoist). Consumed by the
+	// Story 3.2 integration suite, which stays unchanged by design.
+	metricName = provider.CallsMetricName
 )
 
-// Metric status label values (the bounded outcome enum).
+// Metric status label values: aliases of the shared bounded outcome enum
+// (Story 3.3 BI-5 hoist; values unchanged from Story 3.2).
 const (
-	statusSuccess   = "success"
-	statusTransient = "transient_failure"
-	statusPermanent = "permanent_failure"
-	statusTimeout   = "timeout"
+	statusSuccess   = provider.StatusSuccess
+	statusTransient = provider.StatusTransient
+	statusPermanent = provider.StatusPermanent
+	statusTimeout   = provider.StatusTimeout
 )
 
-// roleTimeouts is the AC2-mandated per-role total retry budget. Story 3.8
-// makes these config-routable; for Story 3.2 the constants are the contract.
-var roleTimeouts = map[provider.Role]time.Duration{
-	provider.RoleL1:     30 * time.Second,
-	provider.RoleL2:     30 * time.Second,
-	provider.RoleSenior: 60 * time.Second,
-	provider.RoleDFIR:   120 * time.Second,
-}
+// roleTimeouts is the AC2-mandated per-role total retry budget, shared
+// across providers (Story 3.3 BI-5 hoist). Story 3.8 makes these
+// config-routable; for Epic 3 the constants are the contract.
+var roleTimeouts = provider.DefaultRoleTimeouts()
 
 // contextWindows maps the supported model ids to their context window for
 // MaxContextTokens(). Unknown ids fall back to the conservative 200K so a
@@ -183,9 +179,9 @@ func New(cfg Config, apiKey string, reg *metrics.Registry, sink *redact.Redactio
 		scoreCap = DefaultScoreCap
 	}
 
-	calls, err := reg.RegisterCounterVec(metricName, metricHelp, []string{"provider", "role", "status"})
+	calls, err := provider.RegisterCallsMetric(reg)
 	if err != nil {
-		return nil, fmt.Errorf("claude: register %s: %w", metricName, err)
+		return nil, fmt.Errorf("claude: %w", err)
 	}
 
 	// WithoutEnvironmentDefaults keeps construction deterministic: a stray
@@ -362,34 +358,15 @@ func (p *Provider) Health(ctx context.Context) error {
 // removed on Opus 4.8 and return HTTP 400 (BI-2.4); thinking is the
 // explicit disabled union (BI-9).
 func (p *Provider) buildParams(redacted schema.EvidencePackage, req provider.Request) (anthropic.MessageNewParams, error) {
-	evidence, err := marshalEvidence(redacted)
+	content, err := provider.BuildAnalystContent(redacted, req)
 	if err != nil {
-		return anthropic.MessageNewParams{}, err
-	}
-
-	var sb strings.Builder
-	sb.WriteString(req.Prompt.User)
-	sb.WriteString("\n\n<evidence_package>\n")
-	sb.Write(evidence)
-	sb.WriteString("\n</evidence_package>")
-	if req.PriorAssessment != nil {
-		prior, perr := json.Marshal(req.PriorAssessment)
-		if perr != nil {
-			return anthropic.MessageNewParams{}, fmt.Errorf("claude: marshal prior assessment: %w", perr)
-		}
-		sb.WriteString("\n\n<prior_assessment>\n")
-		sb.Write(prior)
-		sb.WriteString("\n</prior_assessment>")
-	}
-	if len(req.Schema) > 0 {
-		sb.WriteString("\n\nRespond with a single JSON document conforming to this JSON Schema and nothing else:\n")
-		sb.Write(req.Schema)
+		return anthropic.MessageNewParams{}, fmt.Errorf("claude: %w", err)
 	}
 
 	params := anthropic.MessageNewParams{
 		Model:     anthropic.Model(p.model),
 		MaxTokens: p.maxTokens,
-		Messages:  []anthropic.MessageParam{anthropic.NewUserMessage(anthropic.NewTextBlock(sb.String()))},
+		Messages:  []anthropic.MessageParam{anthropic.NewUserMessage(anthropic.NewTextBlock(content))},
 		Thinking:  disabledThinking(),
 	}
 	if req.Prompt.System != "" {
@@ -399,23 +376,10 @@ func (p *Provider) buildParams(redacted schema.EvidencePackage, req provider.Req
 }
 
 // resolveStatus maps the final Strategy.Do outcome onto the bounded metric
-// status enum (BI-3.2): success when err is nil; timeout when the per-role
-// deadline itself fired (parent context still alive, so a process shutdown
-// is never misreported as a role timeout); permanent_failure when a BI-3
-// permanent class aborted the attempt loop; transient_failure otherwise
-// (exhausted retries, transport errors, parent-context cancellation).
+// status enum via the shared provider.ResolveStatus (Story 3.3 BI-5
+// hoist; semantics unchanged from Story 3.2 BI-3.2/BI-5.2).
 func (p *Provider) resolveStatus(err error, callCtx, parentCtx context.Context) string {
-	switch {
-	case err == nil:
-		return statusSuccess
-	case errors.Is(err, context.DeadlineExceeded) &&
-		callCtx.Err() != nil && parentCtx.Err() == nil:
-		return statusTimeout
-	case isPermanent(err):
-		return statusPermanent
-	default:
-		return statusTransient
-	}
+	return provider.ResolveStatus(err, isPermanent, callCtx, parentCtx)
 }
 
 // isPermanent classifies err against the BI-3 table using the SDK's typed
@@ -469,14 +433,4 @@ func toResponse(msg *anthropic.Message) provider.Response {
 		InputTokens:  msg.Usage.InputTokens,
 		OutputTokens: msg.Usage.OutputTokens,
 	}
-}
-
-// marshalEvidence renders the redacted package as the canonical JSON the
-// model receives. A marshal failure is a permanent (caller-data) error.
-func marshalEvidence(v any) ([]byte, error) {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return nil, fmt.Errorf("claude: marshal redacted evidence: %w", err)
-	}
-	return b, nil
 }
