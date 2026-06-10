@@ -580,10 +580,20 @@ params, `stream: false`. `Name()` is `openai` -- the family identity for
 the metric label and the Story 3.8 routing key; the BaseURL selects the
 vendor (default `https://api.openai.com/v1`; Together
 `https://api.together.xyz/v1`; Groq `https://api.groq.com/openai/v1`; any
-LiteLLM/vLLM proxy). The model id is REQUIRED (no cross-vendor default
+LiteLLM/vLLM proxy). The BaseURL must be an absolute http(s) URL without
+userinfo credentials; anything else fails construction with
+`ErrBadBaseURL` (fail-fast: a bad endpoint would otherwise retry forever
+as transient, and userinfo would leak into the construction log). The
+model id is REQUIRED (no cross-vendor default
 exists; the constructor returns `ErrNoModel`), and the context window is
 the `MaxContextTokens` config knob (default 128000) because compatible
-vendors are unenumerable. Retry, per-role timeouts, redaction-before-send,
+vendors are unenumerable. The client never follows redirects: a 3xx from
+a misconfigured endpoint surfaces as a typed transient error instead of
+converting the POST to a GET and re-sending the bearer token to the
+redirect target. Upstream error bodies are bounded (4 KiB read, 256 B
+kept) and laundered (key scrub, control-character flattening) before any
+error string or log line is built, because some vendors echo key material
+in 401 bodies. Retry, per-role timeouts, redaction-before-send,
 key hygiene, the outcome metric, and the degenerate-200 guards (null body,
 empty choices) behave identically to the Claude provider; the shared
 helpers in `internal/agent/provider/` enforce the parity. The provider is

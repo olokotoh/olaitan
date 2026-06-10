@@ -45,8 +45,10 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -66,6 +68,14 @@ var ErrNoAPIKey = errors.New("openai: no API key configured")
 // a generic compatible endpoint, so the operator must pin one (Story 3.3
 // BI-4.1, the one documented divergence from claude.New).
 var ErrNoModel = errors.New("openai: no model configured")
+
+// ErrBadBaseURL is returned by New when a non-empty cfg.BaseURL is not an
+// absolute http(s) URL or carries userinfo credentials. Failing fast here
+// turns a permanent misconfiguration into a construction error instead of
+// an endlessly retried transient, and keeps credentials out of the
+// construction log and url.Error strings. The error deliberately does not
+// echo the offending value.
+var ErrBadBaseURL = errors.New("openai: base URL must be an absolute http(s) URL without userinfo")
 
 const (
 	providerName = "openai"
@@ -94,9 +104,15 @@ const (
 	healthTimeout = 10 * time.Second
 
 	// maxErrorBodyBytes bounds how much of an upstream error body is
-	// carried on the typed error (diagnostics only; the API key never
-	// appears in response bodies).
+	// carried on the typed error (diagnostics only; the body is laundered
+	// by sanitizeSnippet before it can reach an error string or log).
 	maxErrorBodyBytes = 256
+
+	// errorBodyReadBytes bounds how much of a non-200 body is read off the
+	// wire at all. Error bodies are upstream-controlled; only a snippet is
+	// kept, so reading the 200-path ceiling would be wasted exposure. Kept
+	// larger than maxErrorBodyBytes so the key scrub sees past the cut.
+	errorBodyReadBytes = 4 << 10
 
 	// maxResponseBodyBytes bounds how much of a 200 body is read; analyst
 	// verdicts are KB-scale, so 10 MiB is generous headroom against a
@@ -167,6 +183,13 @@ func New(cfg Config, apiKey string, reg *metrics.Registry, sink *redact.Redactio
 		baseURL = DefaultBaseURL
 	}
 	baseURL = strings.TrimRight(baseURL, "/")
+	// Round-1 review: validate the endpoint at construction. A relative or
+	// scheme-less URL would fail on every attempt as a retried transient,
+	// masking a permanent misconfiguration; userinfo would leak into the
+	// construction log below and into url.Error strings.
+	if u, err := url.Parse(baseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+		return nil, ErrBadBaseURL
+	}
 
 	maxTokens := cfg.MaxTokens
 	if maxTokens <= 0 {
@@ -189,8 +212,16 @@ func New(cfg Config, apiKey string, reg *metrics.Registry, sink *redact.Redactio
 	p := &Provider{
 		// No client-level timeout: the per-role context is the sole,
 		// sufficient bound (mirrors the Claude provider, where the SDK
-		// adds no timeout of its own).
-		httpc:     &http.Client{},
+		// adds no timeout of its own). Redirects are never followed: no
+		// compatible endpoint legitimately redirects /chat/completions,
+		// and following one would convert the POST to a GET (301/302/303)
+		// and re-send the bearer token to the redirect target. The 3xx
+		// surfaces as a typed *apiError instead (transient class).
+		httpc: &http.Client{
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 		baseURL:   baseURL,
 		key:       apiKey,
 		model:     cfg.Model,
@@ -211,6 +242,10 @@ func New(cfg Config, apiKey string, reg *metrics.Registry, sink *redact.Redactio
 	}
 
 	// NFR18: the BOOLEAN presence flag only, never the key value.
+	// base_url is a documented addition to the Story 3.2 construction-log
+	// field set (BI-4 amendment, round-1 review): the endpoint is the one
+	// knob that distinguishes compat vendors, and the validation above
+	// guarantees it carries no userinfo credentials.
 	log.Info("openai-compatible provider constructed",
 		"provider", providerName,
 		"model", cfg.Model,
@@ -405,17 +440,18 @@ func (p *Provider) post(ctx context.Context, path string, body []byte) (provider
 	}
 	defer func() { _ = httpResp.Body.Close() }()
 
+	if httpResp.StatusCode != http.StatusOK {
+		// Error bodies are upstream-controlled: read only a bounded
+		// prefix (round-1 review; the 200-path ceiling would be wasted
+		// exposure) and tolerate a mid-read failure, since the status
+		// code alone carries the classification.
+		raw, _ := io.ReadAll(io.LimitReader(httpResp.Body, errorBodyReadBytes))
+		return provider.Response{}, &apiError{StatusCode: httpResp.StatusCode, Snippet: p.sanitizeSnippet(raw)}
+	}
+
 	raw, err := io.ReadAll(io.LimitReader(httpResp.Body, maxResponseBodyBytes))
 	if err != nil {
 		return provider.Response{}, fmt.Errorf("openai: read response: %w", err)
-	}
-
-	if httpResp.StatusCode != http.StatusOK {
-		snippet := string(raw)
-		if len(snippet) > maxErrorBodyBytes {
-			snippet = snippet[:maxErrorBodyBytes]
-		}
-		return provider.Response{}, &apiError{StatusCode: httpResp.StatusCode, Snippet: snippet}
 	}
 
 	var decoded chatResponse
@@ -437,6 +473,26 @@ func (p *Provider) post(ctx context.Context, path string, body []byte) (provider
 		InputTokens:  decoded.Usage.PromptTokens,
 		OutputTokens: decoded.Usage.CompletionTokens,
 	}, nil
+}
+
+// sanitizeSnippet launders an upstream error body before it can reach an
+// error string or a log line (round-1 review). Response bodies SHOULD
+// never carry the API key, but OpenAI itself echoes key material in 401
+// bodies and arbitrary compatible proxies may echo the Authorization
+// value, so the key is scrubbed defensively; control characters are
+// flattened (log-injection); and the length cut lands on a rune boundary.
+func (p *Provider) sanitizeSnippet(raw []byte) string {
+	s := strings.ReplaceAll(string(raw), p.key, "<redacted>")
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s)
+	if len(s) > maxErrorBodyBytes {
+		s = s[:maxErrorBodyBytes]
+	}
+	return strings.ToValidUTF8(s, "")
 }
 
 // isPermanent classifies err against the shared BI-2.4 table using the

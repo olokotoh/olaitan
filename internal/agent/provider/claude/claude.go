@@ -87,7 +87,8 @@ const (
 	healthTimeout = 10 * time.Second
 
 	// metricName aliases the shared family registered via
-	// provider.RegisterCallsMetric (Story 3.3 BI-3 hoist).
+	// provider.RegisterCallsMetric (Story 3.3 BI-3 hoist). Consumed by the
+	// Story 3.2 integration suite, which stays unchanged by design.
 	metricName = provider.CallsMetricName
 )
 

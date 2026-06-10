@@ -374,9 +374,9 @@ func TestAnalyseParentCancellationIsNotTimeout(t *testing.T) {
 }
 
 // TestAnalyseRedactsEvidenceBeforeSend: the Story 3.1/3.2 boundary proof
-// on the Chat Completions wire shape — decode the transported evidence
+// on the Chat Completions wire shape (decode the transported evidence
 // exactly as the model would and assert the secret-keyed value IS the
-// redaction placeholder.
+// redaction placeholder).
 func TestAnalyseRedactsEvidenceBeforeSend(t *testing.T) {
 	const rawSecret = "raw-secret-value-qP7xT"
 	h := &capturingHandler{script: []scriptedResponse{{200, successBody}}}
@@ -461,6 +461,103 @@ func TestAnalyseAPIKeyNeverInErrorOrLogs(t *testing.T) {
 	}
 }
 
+// TestAnalyseKeyEchoedInErrorBodyIsScrubbed: round-1 review finding.
+// OpenAI itself echoes key material in 401 bodies ("Incorrect API key
+// provided: sk-...") and arbitrary compatible proxies may echo the
+// Authorization value; the snippet scrub must keep an echoed key out of
+// error strings and logs (NFR18).
+func TestAnalyseKeyEchoedInErrorBodyIsScrubbed(t *testing.T) {
+	const sentinel = "SENTINEL-KEY-ZWNoby1pbi1ib2R5"
+	h := &capturingHandler{script: []scriptedResponse{{401, apiErrorBody("invalid_api_key", "Incorrect API key provided: "+sentinel)}}}
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	var logBuf bytes.Buffer
+	reg := metrics.NewRegistry()
+	p, err := New(Config{Model: "test-model", BaseURL: ts.URL}, sentinel, reg, nil, slog.New(slog.NewJSONHandler(&logBuf, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p.strategy.Min = time.Millisecond
+	p.strategy.Max = 4 * time.Millisecond
+
+	_, err = p.Analyse(context.Background(), analyseRequest(provider.RoleL1))
+	if err == nil {
+		t.Fatal("Analyse: err = nil, want 401")
+	}
+	if strings.Contains(err.Error(), sentinel) {
+		t.Error("error string contains the API key echoed by the upstream error body (NFR18 violation)")
+	}
+	if !strings.Contains(err.Error(), "<redacted>") {
+		t.Errorf("err = %v, want the echoed key replaced with <redacted>", err)
+	}
+	if strings.Contains(logBuf.String(), sentinel) {
+		t.Error("log output contains the echoed API key (NFR18 violation)")
+	}
+}
+
+// TestAnalyseDoesNotFollowRedirects: round-1 review finding. A 3xx from
+// a misconfigured endpoint must surface as a typed transient apiError;
+// following it would convert the POST to a GET (301/302/303) and re-send
+// the bearer token to the redirect target.
+func TestAnalyseDoesNotFollowRedirects(t *testing.T) {
+	target := &capturingHandler{script: []scriptedResponse{{200, successBody}}}
+	tsTarget := httptest.NewServer(target)
+	defer tsTarget.Close()
+
+	var redirects atomic.Int64
+	tsRedir := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirects.Add(1)
+		http.Redirect(w, r, tsTarget.URL+"/chat/completions", http.StatusMovedPermanently)
+	}))
+	defer tsRedir.Close()
+
+	p, reg := newTestProvider(t, tsRedir.URL, nil)
+	_, err := p.Analyse(context.Background(), analyseRequest(provider.RoleL1))
+	if err == nil {
+		t.Fatal("Analyse via 301: err = nil, want typed apiError")
+	}
+	var apiErr *apiError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusMovedPermanently {
+		t.Errorf("err = %v, want typed apiError with status 301", err)
+	}
+	if got := redirects.Load(); got != 3 {
+		t.Errorf("redirecting endpoint attempts = %d, want 3 (transient, retried)", got)
+	}
+	if got := target.attempts.Load(); got != 0 {
+		t.Errorf("redirect target received %d requests, want 0 (no follow, no key forward)", got)
+	}
+	if v, _ := counterValue(t, reg, "openai", "l1", provider.StatusTransient); v != 1 {
+		t.Errorf("metric {openai,l1,transient_failure} = %v, want 1", v)
+	}
+}
+
+// TestAnalyseEmptyContentIn200IsSuccess pins the documented contract
+// (runbook limitation c): a well-formed 200 whose first choice carries an
+// empty content string is SUCCESS with Raw == ""; treating an empty
+// verdict as failed is the Story 3.5-3.7 caller's contract, not the
+// transport's (round-1 review: previously documented but unpinned).
+func TestAnalyseEmptyContentIn200IsSuccess(t *testing.T) {
+	h := &capturingHandler{script: []scriptedResponse{{200, `{"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":0}}`}}}
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	p, reg := newTestProvider(t, ts.URL, nil)
+	resp, err := p.Analyse(context.Background(), analyseRequest(provider.RoleL1))
+	if err != nil {
+		t.Fatalf("Analyse: %v", err)
+	}
+	if resp.Raw != "" {
+		t.Errorf("Raw = %q, want empty string", resp.Raw)
+	}
+	if got := h.attempts.Load(); got != 1 {
+		t.Errorf("attempts = %d, want 1 (empty content is not retryable)", got)
+	}
+	if v, _ := counterValue(t, reg, "openai", "l1", provider.StatusSuccess); v != 1 {
+		t.Errorf("metric {openai,l1,success} = %v, want 1", v)
+	}
+}
+
 // The Story 3.2 round-1 lesson, binding here per BI-4: degenerate 200
 // bodies must degrade to retryable transport errors, never a panic or a
 // falsified success.
@@ -514,7 +611,7 @@ func TestHealthSuccessFailureAndGuards(t *testing.T) {
 	hFail := &capturingHandler{script: []scriptedResponse{{503, apiErrorBody("service_unavailable", "down")}}}
 	tsFail := httptest.NewServer(hFail)
 	defer tsFail.Close()
-	pFail, _ := newTestProvider(t, tsFail.URL, nil)
+	pFail, regFail := newTestProvider(t, tsFail.URL, nil)
 	if err := pFail.Health(context.Background()); err == nil {
 		t.Fatal("Health against 503: err = nil, want error")
 	}
@@ -525,19 +622,23 @@ func TestHealthSuccessFailureAndGuards(t *testing.T) {
 	hNull := &capturingHandler{script: []scriptedResponse{{200, "null"}}}
 	tsNull := httptest.NewServer(hNull)
 	defer tsNull.Close()
-	pNull, _ := newTestProvider(t, tsNull.URL, nil)
+	pNull, regNull := newTestProvider(t, tsNull.URL, nil)
 	if err := pNull.Health(context.Background()); err == nil {
 		t.Fatal("Health on 200 null body: err = nil, want unhealthy")
 	}
 
-	// The metric is Analyse-scoped; Health must not touch it.
-	mfs, err := reg.Gatherer().Gather()
-	if err != nil {
-		t.Fatalf("gather: %v", err)
-	}
-	for _, mf := range mfs {
-		if mf.GetName() == provider.CallsMetricName && len(mf.GetMetric()) != 0 {
-			t.Error("Health incremented olaitan_llm_calls_total; the metric is Analyse-scoped")
+	// The metric is Analyse-scoped; Health must not touch it on the
+	// success path NOR the failure paths (round-1 review: the failure
+	// paths are the ones most likely to share code with Analyse).
+	for name, r := range map[string]*metrics.Registry{"success": reg, "fail-503": regFail, "null-body": regNull} {
+		mfs, err := r.Gatherer().Gather()
+		if err != nil {
+			t.Fatalf("gather %s: %v", name, err)
+		}
+		for _, mf := range mfs {
+			if mf.GetName() == provider.CallsMetricName && len(mf.GetMetric()) != 0 {
+				t.Errorf("Health (%s path) incremented olaitan_llm_calls_total; the metric is Analyse-scoped", name)
+			}
 		}
 	}
 }
@@ -594,7 +695,9 @@ func TestBaseURLForms(t *testing.T) {
 // TestDualProviderSharedRegistry is the BI-3 coexistence proof: the
 // Claude and OpenAI-compatible providers construct against the SAME
 // registry (no duplicate-registration error) and increment side-by-side
-// series of the one shared family — the Story 3.8 routing prerequisite.
+// series of the one shared family (the Story 3.8 routing prerequisite).
+// Both providers drive a REAL Analyse increment (round-1 review: the
+// BI-7 clause demands increment, not just registration).
 func TestDualProviderSharedRegistry(t *testing.T) {
 	reg := metrics.NewRegistry()
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
@@ -607,17 +710,37 @@ func TestDualProviderSharedRegistry(t *testing.T) {
 		t.Fatalf("openai New: %v", err)
 	}
 
-	cl, err := claude.New(claude.Config{}, testAPIKey, reg, nil, log)
+	// A minimal Anthropic Messages success body so the claude provider can
+	// complete a real call against its own httptest endpoint.
+	const claudeSuccessBody = `{
+	  "id": "msg_01DualProvider",
+	  "type": "message",
+	  "role": "assistant",
+	  "model": "claude-opus-4-8",
+	  "content": [{"type": "text", "text": "{\"verdict\":\"benign\"}"}],
+	  "stop_reason": "end_turn",
+	  "stop_sequence": null,
+	  "usage": {"input_tokens": 1, "output_tokens": 1}
+	}`
+	hCL := &capturingHandler{script: []scriptedResponse{{200, claudeSuccessBody}}}
+	tsCL := httptest.NewServer(hCL)
+	defer tsCL.Close()
+	cl, err := claude.New(claude.Config{BaseURL: tsCL.URL}, testAPIKey, reg, nil, log)
 	if err != nil {
 		t.Fatalf("claude.New on the same registry: %v (BI-3 idempotent registration broken)", err)
 	}
-	_ = cl // construction on the shared registry is the registration proof
 
 	if _, err := oa.Analyse(context.Background(), analyseRequest(provider.RoleL1)); err != nil {
 		t.Fatalf("openai Analyse: %v", err)
 	}
+	if _, err := cl.Analyse(context.Background(), analyseRequest(provider.RoleL1)); err != nil {
+		t.Fatalf("claude Analyse: %v", err)
+	}
 
 	if v, _ := counterValue(t, reg, "openai", "l1", provider.StatusSuccess); v != 1 {
 		t.Errorf("metric {openai,l1,success} = %v, want 1", v)
+	}
+	if v, series := counterValue(t, reg, "claude", "l1", provider.StatusSuccess); v != 1 || series != 2 {
+		t.Errorf("metric {claude,l1,success} = %v (family series = %d), want 1 with 2 side-by-side series", v, series)
 	}
 }

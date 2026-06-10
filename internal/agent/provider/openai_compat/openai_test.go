@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/olokotoh/olaitan/internal/agent/provider"
 	"github.com/olokotoh/olaitan/internal/metrics"
@@ -33,6 +34,61 @@ func TestNewValidation(t *testing.T) {
 	var nilReg *metrics.Registry
 	if _, err := New(validConfig(), "test-key", nilReg, nil, discardLogger()); err == nil {
 		t.Error("nil registry: err = nil, want metric-registration error")
+	}
+}
+
+// TestNewRejectsBadBaseURL: round-1 review finding. A relative,
+// scheme-less, non-http(s), or userinfo-bearing BaseURL must fail at
+// construction (fail-fast posture, ErrNoAPIKey/ErrNoModel parity) and
+// the error must never echo the offending value (it can carry
+// credentials).
+func TestNewRejectsBadBaseURL(t *testing.T) {
+	cases := []struct{ name, baseURL string }{
+		{"scheme-less", "api.openai.com/v1"},
+		{"relative path", "/v1"},
+		{"unparseable", "://nope"},
+		{"non-http scheme", "ftp://host/v1"},
+		{"userinfo credentials", "https://user:secret-cred@host/v1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := New(Config{Model: "test-model", BaseURL: tc.baseURL}, "test-key", metrics.NewRegistry(), nil, discardLogger())
+			if !errors.Is(err, ErrBadBaseURL) {
+				t.Fatalf("New(BaseURL=%q): err = %v, want ErrBadBaseURL", tc.baseURL, err)
+			}
+			if strings.Contains(err.Error(), "secret-cred") {
+				t.Error("constructor error echoes the BaseURL userinfo credential")
+			}
+		})
+	}
+}
+
+// TestSanitizeSnippet: round-1 review finding. The upstream error-body
+// snippet is laundered before it can reach an error string or log: the
+// key is scrubbed, control characters are flattened (log injection), the
+// length cut is bounded, and the result is valid UTF-8 even when the cut
+// would land mid-rune.
+func TestSanitizeSnippet(t *testing.T) {
+	p := &Provider{key: "sk-sentinel-key"}
+
+	got := p.sanitizeSnippet([]byte("line1\r\nline2\x00 key=sk-sentinel-key tail"))
+	if strings.Contains(got, "sk-sentinel-key") {
+		t.Error("snippet contains the API key after scrub")
+	}
+	if !strings.Contains(got, "<redacted>") {
+		t.Errorf("snippet = %q, want the key replaced with <redacted>", got)
+	}
+	if strings.ContainsAny(got, "\r\n\x00") {
+		t.Errorf("snippet = %q, want control characters flattened", got)
+	}
+
+	long := strings.Repeat("é", maxErrorBodyBytes) // 2 bytes per rune: the cut lands mid-rune
+	got = p.sanitizeSnippet([]byte(long))
+	if len(got) > maxErrorBodyBytes {
+		t.Errorf("snippet length = %d, want <= %d", len(got), maxErrorBodyBytes)
+	}
+	if !utf8.ValidString(got) {
+		t.Error("snippet is not valid UTF-8 after the length cut")
 	}
 }
 
