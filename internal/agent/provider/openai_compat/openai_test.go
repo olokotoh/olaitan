@@ -82,7 +82,10 @@ func TestSanitizeSnippet(t *testing.T) {
 		t.Errorf("snippet = %q, want control characters flattened", got)
 	}
 
-	long := strings.Repeat("é", maxErrorBodyBytes) // 2 bytes per rune: the cut lands mid-rune
+	// The odd-length prefix forces the 256-byte cut mid-rune (each é is 2
+	// bytes); without it the cut lands on a boundary and the UTF-8 guard
+	// would be unpinned (round-2 review).
+	long := "x" + strings.Repeat("é", maxErrorBodyBytes)
 	got = p.sanitizeSnippet([]byte(long))
 	if len(got) > maxErrorBodyBytes {
 		t.Errorf("snippet length = %d, want <= %d", len(got), maxErrorBodyBytes)

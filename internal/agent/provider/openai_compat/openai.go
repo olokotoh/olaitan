@@ -443,9 +443,14 @@ func (p *Provider) post(ctx context.Context, path string, body []byte) (provider
 	if httpResp.StatusCode != http.StatusOK {
 		// Error bodies are upstream-controlled: read only a bounded
 		// prefix (round-1 review; the 200-path ceiling would be wasted
-		// exposure) and tolerate a mid-read failure, since the status
-		// code alone carries the classification.
-		raw, _ := io.ReadAll(io.LimitReader(httpResp.Body, errorBodyReadBytes))
+		// exposure). A partial body from a mid-read failure could end
+		// inside an echoed key and defeat the exact-match scrub, so the
+		// snippet is dropped entirely on a read error; the status code
+		// alone carries the classification (round-2 review).
+		raw, err := io.ReadAll(io.LimitReader(httpResp.Body, errorBodyReadBytes))
+		if err != nil {
+			raw = nil
+		}
 		return provider.Response{}, &apiError{StatusCode: httpResp.StatusCode, Snippet: p.sanitizeSnippet(raw)}
 	}
 
