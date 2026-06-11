@@ -890,6 +890,41 @@ evaluation:
 analyst:
   provider: "none"
 
+  # Story 3.4 (FR48): the local (Ollama) provider's endpoint and model.
+  # Empty values keep the file-side defaults from config/olaitan.yaml
+  # (endpoint http://ollama:11434, model gemma:2b); non-empty values are
+  # bridged into the rendered olaitan.yaml by configmap.yaml (the same
+  # C11-pattern overlay analyst.provider uses, so a Helm-set value is
+  # never a silent no-op). Only consulted when provider is "local".
+  # The model must be one the operator actually provisioned in the
+  # Ollama instance -- there is no cross-model default.
+  local:
+    endpoint: ""
+    model: ""
+
+# Story 3.4 (FR48): optional in-cluster Ollama for air-gapped /
+# data-residency-restricted deployments. Default OFF: the default
+# render is unchanged unless an operator opts in. See
+# values-airgapped.yaml for the documented air-gapped reference
+# overlay, and docs/runbook.md (air-gapped section) for model
+# provisioning, warm-up, and num_ctx pairing guidance. Story 3.16
+# wires this surface into the evaluation modes.
+ollama:
+  enabled: false
+  image:
+    repository: ollama/ollama
+    # Pinned tag, never latest: air-gapped clusters mirror images by
+    # digest/tag and a floating tag breaks reproducibility (NFR31).
+    tag: "0.9.0"
+    pullPolicy: IfNotPresent
+  resources: {}
+  # Model volume (mounted at /root/.ollama). The chart does NOT create
+  # the claim: provision it with the pre-pulled model and reference it
+  # here (model provisioning is operator-owned).
+  persistence:
+    enabled: false
+    existingClaim: ""
+
 # --- Subchart overrides ------------------------------------------------
 # Only opinions we impose on the downstream charts live here -- upstream
 # defaults are otherwise preserved. To see every available knob, consult

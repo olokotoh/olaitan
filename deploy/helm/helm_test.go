@@ -3228,3 +3228,149 @@ func TestGraduatedIsolationAnchorsPresentInOlaitanYAML(t *testing.T) {
 		}
 	}
 }
+
+// --- Story 3.4: optional in-cluster Ollama (FR48) ---
+
+// TestOllamaGate_AllResourcesGated asserts the ollama Deployment,
+// Service, and NetworkPolicy are absent by default and present when
+// ollama.enabled=true. All gated resources come and go together (a
+// partial render is a chart-rot signal), and the default render stays
+// byte-identical to the pre-3.4 chart.
+func TestOllamaGate_AllResourcesGated(t *testing.T) {
+	defaultRender := helmTemplate(t, []string{
+		"falco.enabled=false", "nats.enabled=false", "redis.enabled=false",
+	})
+	for _, m := range parseManifests(t, defaultRender) {
+		if strings.HasSuffix(m.Metadata.Name, "-ollama") {
+			t.Errorf("%s %s rendered with ollama.enabled=false (default)", m.Kind, m.Metadata.Name)
+		}
+	}
+
+	enabledRender := helmTemplate(t, []string{
+		"falco.enabled=false", "nats.enabled=false", "redis.enabled=false",
+		"ollama.enabled=true",
+	})
+	enabledMs := parseManifests(t, enabledRender)
+	want := map[string]bool{"Deployment": false, "Service": false, "NetworkPolicy": false}
+	for _, m := range enabledMs {
+		if strings.HasSuffix(m.Metadata.Name, "-ollama") {
+			if _, ok := want[m.Kind]; ok {
+				want[m.Kind] = true
+			}
+		}
+	}
+	for kind, found := range want {
+		if !found {
+			t.Errorf("ollama %s not rendered with ollama.enabled=true", kind)
+		}
+	}
+}
+
+// TestOllamaNetworkPolicyRestrictsToAggregator: Story 3.4 AC3 - the
+// ollama pod accepts ingress ONLY from the aggregator (controller) pod
+// selector on 11434, and its egress is declared and EMPTY (the air-gap
+// statement; architecture.md:263 - the policy IS the auth boundary, no
+// credential exists).
+func TestOllamaNetworkPolicyRestrictsToAggregator(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"falco.enabled=false", "nats.enabled=false", "redis.enabled=false",
+		"ollama.enabled=true",
+	})
+	docs := strings.Split(rendered, "\n---\n")
+	var npDoc string
+	for _, d := range docs {
+		if strings.Contains(d, "kind: NetworkPolicy") && strings.Contains(d, "name: olaitan-ollama") {
+			npDoc = d
+		}
+	}
+	if npDoc == "" {
+		t.Fatal("olaitan-ollama NetworkPolicy not found in enabled render")
+	}
+	assertContains(t, npDoc, "app.kubernetes.io/component: aggregator",
+		"ollama NetworkPolicy must allow ingress from the aggregator pod selector only (AC3)")
+	assertContains(t, npDoc, "port: 11434",
+		"ollama NetworkPolicy must scope ingress to the Ollama port")
+	assertContains(t, npDoc, "egress: []",
+		"ollama NetworkPolicy must declare an EMPTY egress list (the air-gap statement)")
+	if strings.Contains(npDoc, "namespaceSelector") {
+		t.Error("ollama NetworkPolicy must not allow cross-namespace peers")
+	}
+}
+
+// TestAnalystLocalBridge: Story 3.4 BI-7.5 - Helm-set
+// analyst.local.{endpoint,model} land in the rendered olaitan.yaml
+// (never a silent no-op), unset values keep the file-side defaults,
+// and the bridged config round-trips through the production
+// config.Load validator.
+func TestAnalystLocalBridge(t *testing.T) {
+	overridden := helmTemplate(t, []string{
+		"analyst.provider=local",
+		"analyst.local.endpoint=http://my-ollama:11434",
+		"analyst.local.model=llama3.1:70b",
+	})
+	embedded := extractEmbeddedConfigYAML(t, overridden)
+	assertContains(t, embedded, `endpoint: "http://my-ollama:11434"`,
+		"analyst.local.endpoint bridge must rewrite the rendered config")
+	assertContains(t, embedded, `model: "llama3.1:70b"`,
+		"analyst.local.model bridge must rewrite the rendered config")
+	assertContains(t, embedded, "provider: local",
+		"analyst.provider bridge must carry the local selector")
+
+	tmp := filepath.Join(t.TempDir(), "olaitan.yaml")
+	if err := os.WriteFile(tmp, []byte(embedded), 0o600); err != nil {
+		t.Fatalf("write tmp config: %v", err)
+	}
+	cfg, err := configLoad(t, tmp)
+	if err != nil {
+		t.Fatalf("bridged config rejected by config.Load: %v", err)
+	}
+	if cfg.Analyst.Local.Endpoint != "http://my-ollama:11434" || cfg.Analyst.Local.Model != "llama3.1:70b" {
+		t.Errorf("loaded analyst.local = %+v, want the bridged values", cfg.Analyst.Local)
+	}
+
+	defaults := helmTemplate(t, nil)
+	embeddedDefaults := extractEmbeddedConfigYAML(t, defaults)
+	assertContains(t, embeddedDefaults, `endpoint: "http://ollama:11434"`,
+		"unset analyst.local.endpoint must keep the file-side default")
+	assertContains(t, embeddedDefaults, `model: "gemma:2b"`,
+		"unset analyst.local.model must keep the file-side default")
+}
+
+// TestValuesAirgappedOverlay renders with the FR48 reference overlay
+// and asserts the complete air-gapped posture: ollama surface present,
+// provider local with the overlay's endpoint/model bridged, and no
+// extra egress CIDRs.
+func TestValuesAirgappedOverlay(t *testing.T) {
+	args := []string{
+		"template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+		"-f", filepath.Join(chartDir(t), "values-airgapped.yaml"),
+	}
+	cmd := exec.Command("helm", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("helm template with values-airgapped.yaml failed: %v\nstderr:\n%s", err, stderr.String())
+	}
+	rendered := stdout.String()
+
+	ms := parseManifests(t, rendered)
+	ollamaFound := false
+	for _, m := range ms {
+		if m.Kind == "Deployment" && strings.HasSuffix(m.Metadata.Name, "-ollama") {
+			ollamaFound = true
+		}
+	}
+	if !ollamaFound {
+		t.Error("values-airgapped.yaml must enable the in-cluster ollama Deployment")
+	}
+
+	embedded := extractEmbeddedConfigYAML(t, rendered)
+	assertContains(t, embedded, "provider: local",
+		"air-gapped overlay must select the local provider")
+	assertContains(t, embedded, `model: "llama3.1:70b"`,
+		"air-gapped overlay model must be bridged into the rendered config")
+	assertContains(t, embedded, "olaitan-ollama.olaitan.svc.cluster.local:11434",
+		"air-gapped overlay endpoint must be bridged into the rendered config")
+}

@@ -1,0 +1,59 @@
+# values-airgapped.yaml -- the FR48 air-gapped / data-residency
+# reference overlay (Story 3.4; architecture.md:963).
+#
+#   helm upgrade --install olaitan deploy/helm/olaitan \
+#     -f deploy/helm/olaitan/values-airgapped.yaml
+#
+# WHY: when analyst.provider is "api", evidence packages cross the
+# cluster boundary into a third-party LLM provider's infrastructure.
+# Operators under data-residency constraints (GDPR, financial-services
+# localisation) run the LLM tier fully in-cluster instead: the local
+# (Ollama) provider makes no external call at all (prd.md:241). The
+# trade-off is a lower trust cap: the Ollama tier contributes at most
+# analyst.score_cap=25 of 100 to the ThreatScore (versus 35 for the
+# Claude tier), enforcement landing with Story 3.7.
+#
+# RESTART-REQUIRED: the analyst ring is constructed at startup; after
+# switching provider run
+#   kubectl rollout restart deploy/olaitan-aggregator
+#
+# MODEL PROVISIONING IS OPERATOR-OWNED: the chart deploys the Ollama
+# server only. Bake the model into the image or pre-populate a volume
+# (ollama.persistence.existingClaim) -- in a true air-gapped cluster
+# `ollama pull` has nowhere to pull from. analyst.local.model MUST name
+# a model that is actually present; the provider fails construction on
+# an empty model and a wrong name surfaces as a permanent 404 (see
+# docs/runbook.md, air-gapped section, for the full checklist including
+# Health warm-up and the num_ctx <-> MaxContextTokens pairing).
+
+# The in-cluster Ollama surface (Deployment + Service + NetworkPolicy
+# restricting ingress to the olaitan controller, egress declared empty).
+ollama:
+  enabled: true
+  # resources: size for the model you provisioned; a 70b-class model
+  # wants tens of GiB of memory. Left unset here deliberately -- sizing
+  # is cluster-specific.
+  # persistence:
+  #   enabled: true
+  #   existingClaim: ollama-models
+
+analyst:
+  # "local" is the config-side selector for the in-cluster Ollama path
+  # (the PRD-level name "analyst.provider: ollama" arrives as a Helm
+  # alias with Story 3.16's evaluation-mode wiring).
+  provider: "local"
+  local:
+    # The RENDERED Service DNS for a chart-managed Ollama is
+    # <release>-olaitan-ollama.<namespace>.svc.cluster.local (the
+    # provider's built-in default, ollama.olaitan.svc.cluster.local,
+    # assumes a Service literally named "ollama" in namespace
+    # "olaitan"). Adjust release/namespace to your install:
+    endpoint: "http://olaitan-ollama.olaitan.svc.cluster.local:11434"
+    # PRD Journey 3 reference model; replace with what you provisioned.
+    model: "llama3.1:70b"
+
+# No external LLM egress: networkPolicy.extraEgress stays EMPTY -- that
+# is the point of this overlay. (The release NetworkPolicy's
+# intra-namespace egress already covers aggregator -> ollama.)
+networkPolicy:
+  extraEgress: []

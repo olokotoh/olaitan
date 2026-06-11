@@ -601,6 +601,30 @@ data:
     {{- $pEvAnalyst := "(\\nanalyst:[[:space:]]*\\n  )provider:[[:space:]]+[a-z0-9_-]+" -}}
     {{- if not (mustRegexFind $pEvAnalyst $cfg) }}{{- fail (printf "helm bridge: evaluation overlay anchor for analyst.provider not found (pattern %q)" $pEvAnalyst) }}{{- end }}
     {{- $cfg = regexReplaceAll $pEvAnalyst $cfg (printf "${1}provider: %s" $analystProvider) }}
+    {{- /*
+    Story 3.4 (FR48): bridge analyst.local.{endpoint,model} from Helm
+    values into the rendered config -- the same C11-pattern overlay as
+    analyst.provider above, so a Helm-set value is never a silent no-op
+    while empty values keep the file-side defaults. Anchors: `  local:`
+    is the unique 2-space child of the column-0 `analyst:` block in
+    config/olaitan.yaml (the chain.l1/l2 endpoint/model lines are
+    nested deeper and cannot match); the model pattern rides on the
+    adjacent endpoint line so the api block's identical field names
+    cannot match either. fail-fast on a missing anchor, like every
+    bridge above.
+    */ -}}
+    {{- $analystVals := default (dict) .Values.analyst -}}
+    {{- $localVals := default (dict) $analystVals.local -}}
+    {{- with $localVals.endpoint }}
+    {{- $pLocalEndpoint := "(\\n  local:[[:space:]]*\\n    )endpoint:[^\\n]*" -}}
+    {{- if not (mustRegexFind $pLocalEndpoint $cfg) }}{{- fail (printf "helm bridge: overlay anchor for analyst.local.endpoint not found (pattern %q)" $pLocalEndpoint) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pLocalEndpoint $cfg (printf "${1}endpoint: %q" .) }}
+    {{- end }}
+    {{- with $localVals.model }}
+    {{- $pLocalModel := "(\\n  local:[[:space:]]*\\n    endpoint:[^\\n]*\\n    )model:[^\\n]*" -}}
+    {{- if not (mustRegexFind $pLocalModel $cfg) }}{{- fail (printf "helm bridge: overlay anchor for analyst.local.model not found (pattern %q)" $pLocalModel) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pLocalModel $cfg (printf "${1}model: %q" .) }}
+    {{- end }}
     {{- /* AC2: under evaluation.config=F the rendered config must keep
            only the Falco sensor adapter active. Disable audit /
            containerd / calico source adapters and the posture

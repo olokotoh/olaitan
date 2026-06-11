@@ -571,6 +571,24 @@ func TestAnalystSelectsAPIProvider(t *testing.T) {
 	}
 }
 
+// Story 3.4 BI-6: the local-provider gate must be case-insensitive,
+// mirroring the config validator's ToLower allow-set (the same Story 3.2
+// round-1 lesson the api gate encodes). "ollama" is deliberately NOT a
+// config value: the PRD-level spelling maps onto "local" at the Helm
+// layer in Story 3.16.
+func TestAnalystSelectsLocalProvider(t *testing.T) {
+	for _, p := range []string{"local", "LOCAL", "Local", "lOcAl"} {
+		if !analystSelectsLocalProvider(p) {
+			t.Errorf("analystSelectsLocalProvider(%q) = false, want true", p)
+		}
+	}
+	for _, p := range []string{"", "api", "none", "ollama", "local ", "localx"} {
+		if analystSelectsLocalProvider(p) {
+			t.Errorf("analystSelectsLocalProvider(%q) = true, want false", p)
+		}
+	}
+}
+
 // Story 3.2 round-1 review MED: projected Secret values routinely carry a
 // trailing newline; the key must be trimmed and whitespace-only values
 // must collapse to the rules-only skip path.
