@@ -1,0 +1,9 @@
+{
+  "schema_version": "threat_assessment.v1",
+  "threat_type": "crypto_miner",
+  "reasoning": "Challenged L1's miner hypothesis against L2's refutation; the binary hash evidence outweighs the startup-path explanation.",
+  "mitre_techniques": ["T1496", "T1059.004"],
+  "noted_disagreements": ["L2 refuted L1's reading of evt-1; the Senior sides with L1 on the hash evidence"],
+  "kill_chain_stage": "execution",
+  "confidence": 85
+}

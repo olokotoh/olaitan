@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/olokotoh/olaitan/docs/schemas/threat_assessment.json",
+  "title": "ThreatAssessment senior verdict (threat_assessment.v1)",
+  "description": "Story 3.7 structured Senior verdict (FR24). AUTHORITATIVE validation source for the Senior sub-agent response contract; threat_assessment.yaml is the human-readable mirror and internal/decision/analyst/threat_assessment_schema.json is the byte-identical embedded runtime copy. This is the MODEL-facing verdict schema: the persisted schema.ThreatAssessment struct additionally carries the orchestrator-computed raw_confidence/llm_capped_confidence pair, agents_available, and the Story 3.11 ConfidenceScore fold. schema_version is optional (or null) on the model side: the runner force-stamps threat_assessment.v1 after validation. Whitespace-only threat_type, reasoning and noted_disagreements entries are rejected programmatically by the runner. confidence is the RAW model confidence; capping at the per-provider score cap is orchestrator-side (AC2). Size bounds follow the Story 3.5 round-1 convention.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "threat_type",
+    "reasoning",
+    "confidence"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 64,
+      "description": "Stamped to threat_assessment.v1 by the runner; optional (or null) from the model."
+    },
+    "threat_type": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Short classification of the assessed activity (e.g. crypto_miner, benign_operations)."
+    },
+    "reasoning": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000,
+      "description": "The Senior's challenge-driven reasoning over the evidence, L1 hypothesis and L2 verification."
+    },
+    "mitre_techniques": {
+      "type": "array",
+      "maxItems": 20,
+      "description": "ATT&CK technique annotations (FR24); optional because a benign verdict may carry none.",
+      "items": {
+        "type": "string",
+        "pattern": "^T[0-9]{4}(\\.[0-9]{3})?$"
+      }
+    },
+    "noted_disagreements": {
+      "type": "array",
+      "maxItems": 20,
+      "description": "Explicit disagreements between L1 and L2 the Senior records (FR24); preserved for audit.",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 500
+      }
+    },
+    "kill_chain_stage": {
+      "type": "string",
+      "maxLength": 64,
+      "description": "Optional kill-chain stage annotation."
+    },
+    "confidence": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "RAW Senior confidence in [0,100]; the orchestrator caps it at the per-provider score cap."
+    }
+  }
+}

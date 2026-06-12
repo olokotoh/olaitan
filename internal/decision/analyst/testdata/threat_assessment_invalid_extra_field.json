@@ -1,0 +1,6 @@
+{
+  "threat_type": "crypto_miner",
+  "reasoning": "Smuggling a state recommendation.",
+  "recommended_state": "QUARANTINED",
+  "confidence": 50
+}

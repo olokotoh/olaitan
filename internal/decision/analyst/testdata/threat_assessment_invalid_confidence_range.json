@@ -1,0 +1,5 @@
+{
+  "threat_type": "crypto_miner",
+  "reasoning": "Overconfident.",
+  "confidence": 101
+}
