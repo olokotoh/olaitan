@@ -1,0 +1,13 @@
+{
+  "schema_version": "l1_hypothesis.v1",
+  "hypothesis": "A cryptominer was launched inside the web pod after a successful exploit of the upload endpoint.",
+  "cited_evidence": [
+    {"event_id": "evt-1", "note": "execve of xmrig from /tmp"},
+    {"event_id": "evt-2", "note": "ServiceAccount token read shortly before"}
+  ],
+  "follow_up_probes": [
+    "list outbound connections from pod web-0",
+    "fetch process ancestry for pid 4242"
+  ],
+  "confidence": 78
+}

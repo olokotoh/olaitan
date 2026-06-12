@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/olokotoh/olaitan/docs/schemas/l1_hypothesis.json",
+  "title": "L1Hypothesis (l1_hypothesis.v1)",
+  "description": "Story 3.5 structured first-pass analyst verdict (FR21). AUTHORITATIVE validation source for the L1 sub-agent response contract; l1_hypothesis.yaml is the human-readable mirror and internal/decision/analyst/l1_hypothesis_schema.json is the byte-identical embedded runtime copy. schema_version is optional on the model side: the L1 runner force-stamps l1_hypothesis.v1 after validation. The referential rule that every cited event_id must exist in the input EvidencePackage is enforced programmatically by the runner (AC3); JSON Schema cannot express cross-document membership.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["hypothesis", "cited_evidence", "confidence"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "description": "Stamped to l1_hypothesis.v1 by the runner; optional from the model."
+    },
+    "hypothesis": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The single most plausible hypothesis about the observed activity."
+    },
+    "cited_evidence": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Events from the input package the hypothesis rests on.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["event_id"],
+        "properties": {
+          "event_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Event.ID of a cited event; must exist in the input package (AC3, runner-enforced)."
+          },
+          "note": {
+            "type": "string",
+            "description": "One-line relevance note for the citation."
+          }
+        }
+      }
+    },
+    "follow_up_probes": {
+      "type": "array",
+      "description": "Free-text follow-up probes the L1 analyst requests; consumed by later chain stages.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "confidence": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "Structured confidence in [0,100] (FR21)."
+    }
+  }
+}

@@ -1,0 +1,41 @@
+# Canonical on-wire shape of schema.L1Hypothesis.
+#
+# AUTHORITATIVE validation source: docs/schemas/l1_hypothesis.json
+# (draft 2020-12). This YAML is the documentation mirror in the
+# docs/schemas/state_transition.yaml style; the .json is what the
+# Story 3.5 L1 runner validates model responses against, via the
+# byte-identical embedded copy at
+# internal/decision/analyst/l1_hypothesis_schema.json. Source of truth
+# for the Go shape: internal/schema/hypothesis.go (type L1Hypothesis).
+#
+# Story 3.5 (FR21). The structured first-pass verdict of the L1 triage
+# analyst. schema_version is optional on the model side and force-stamped
+# to l1_hypothesis.v1 by the runner after validation. The AC3 referential
+# rule (every cited event_id must exist in the input EvidencePackage) is
+# enforced programmatically by the runner; JSON Schema cannot express
+# cross-document membership.
+schema: l1_hypothesis.v1
+fields:
+  schema_version:
+    type: string
+    required: false
+    description: Stamped to "l1_hypothesis.v1" by the runner; optional from the model.
+  hypothesis:
+    type: string
+    required: true
+    description: The single most plausible hypothesis about the observed activity. Non-empty.
+  cited_evidence:
+    type: array
+    required: true
+    description: >
+      Events from the input package the hypothesis rests on. At least one
+      entry. Each entry carries event_id (required, must exist in the input
+      EvidencePackage per AC3) and an optional one-line relevance note.
+  follow_up_probes:
+    type: array
+    required: false
+    description: Free-text follow-up probes the L1 analyst requests; consumed by later chain stages.
+  confidence:
+    type: integer
+    required: true
+    description: Structured confidence in [0,100] (FR21).
