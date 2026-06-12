@@ -101,7 +101,7 @@ const (
 	// caller-context cancellation), or the reply was truncated by the
 	// output-token ceiling before it could carry a complete verdict.
 	StatusUnavailable = "unavailable"
-	// StatusSchemaViolation: the response failed the L1Hypothesis
+	// StatusSchemaViolation: the response failed its role schema
 	// contract (see ErrSchemaViolation).
 	StatusSchemaViolation = "schema_violation"
 	// StatusSuccessLowConfidence is RESERVED for the Story 3.7 Senior

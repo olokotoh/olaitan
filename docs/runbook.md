@@ -537,9 +537,10 @@ response validation, complementing the transport-level
 `olaitan_llm_calls_total` (one `Run` maps to exactly one `Analyse` call,
 which may itself have retried internally). Bounded envelope 3 providers
 x 3 roles x 4 statuses = 36 series. The l1 (Story 3.5) and l2 (Story
-3.6) runners increment the family; series MATERIALIZE once the Story
-3.7/3.8 orchestrator wires the runners into the chain (before that the
-family is registered but empty). `senior` lands with Story 3.7. Registration is SHARED and idempotent
+3.6) runners increment the family; registration happens in the runner
+constructors, so before the Story 3.7/3.8 orchestrator wires the
+runners into the chain the family is neither registered nor populated
+in the production binary. `senior` lands with Story 3.7. Registration is SHARED and idempotent
 (`analyst.RegisterDecisionCallsMetric`), so the Story 3.6/3.7 runners
 join the same family.
 

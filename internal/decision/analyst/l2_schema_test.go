@@ -77,10 +77,11 @@ func TestL2SchemaJSONYAMLAgreement(t *testing.T) {
 // JSON-Schema keyword (or message fragment) its violation must be
 // reported under.
 var invalidL2ExemplarKeyword = map[string]string{
-	"l2_verification_invalid_bad_verdict.json":      "value must be one of",
-	"l2_verification_invalid_missing_finding.json":  "missing property",
-	"l2_verification_invalid_empty_verified.json":   "minItems",
-	"l2_verification_invalid_confidence_range.json": "maximum",
+	"l2_verification_invalid_bad_verdict.json":         "value must be one of",
+	"l2_verification_invalid_missing_finding.json":     "missing property",
+	"l2_verification_invalid_empty_verified.json":      "minItems",
+	"l2_verification_invalid_confidence_range.json":    "maximum",
+	"l2_verification_invalid_empty_contradictory.json": "minLength",
 }
 
 // TestL2VerificationExemplars validates every committed L2 exemplar

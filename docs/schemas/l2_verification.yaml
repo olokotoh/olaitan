@@ -36,7 +36,9 @@ fields:
     required: true
     description: >
       Evidence-by-evidence verification narrative. 1 to 50 entries,
-      uniqueItems. Each entry carries event_id (required, maxLength 256,
+      uniqueItems, and one entry per event_id (the per-id rule is
+      runner-enforced; uniqueItems only rejects whole-object
+      duplicates). Each entry carries event_id (required, maxLength 256,
       must exist in the input EvidencePackage) and finding (required,
       non-whitespace, maxLength 500).
   contradictory_findings:
@@ -45,10 +47,9 @@ fields:
     description: >
       Findings that contradict the L1 hypothesis; preserved verbatim for
       the Senior's challenge (AC3). Up to 20 entries, each minLength 1
-      and maxLength 500; whitespace-only entries and null arrays are
-      rejected (minLength schema-side, the rest runner-enforced). One
-      narrative entry per event_id across verified_evidence
-      (runner-enforced).
+      and maxLength 500. Empty entries and null arrays are rejected
+      schema-side (minLength and type: array); whitespace-only entries
+      are rejected by the runner.
   confidence:
     type: integer
     required: true

@@ -48,12 +48,18 @@ const L2SkipReasonL1Unavailable = "l1_unavailable"
 // ShouldSkipL2 is the AC4 chain gate, exported for the Story 3.7
 // orchestrator: L2 is skipped if and only if L1 failed with provider
 // unavailability (the Story 3.10 three-strike policy routes its
-// post-retry llm_unavailable exhaustion through the same sentinel). A
+// post-retry llm_unavailable exhaustion through the same sentinel). The
+// sentinel inherits the full unavailable classification, so transport
+// failures, exhausted retries, the per-role timeout, output-token
+// truncation and caller-context cancellation all skip under the same
+// l1_unavailable label (Story 3.10 may split the reason set). A
 // schema violation does NOT skip L2 at this level: before Story 3.10 a
 // single violation is not yet llm_unavailable, and 3.10 owns that
 // escalation. ErrNoCitableEvents is a chain-level concern (no L1 ran at
 // all) owned by Story 3.8. The returned reason is the bounded metric
-// label value for olaitan_decision_llm_l2_skipped_total.
+// label value for olaitan_decision_llm_l2_skipped_total; on the
+// no-skip path it is "" and must never be recorded (RecordL2Skip
+// refuses it).
 func ShouldSkipL2(l1Err error) (bool, string) {
 	if errors.Is(l1Err, ErrProviderUnavailable) {
 		return true, L2SkipReasonL1Unavailable
