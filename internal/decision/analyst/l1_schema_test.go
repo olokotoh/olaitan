@@ -61,11 +61,51 @@ func TestL1SchemaJSONYAMLAgreement(t *testing.T) {
 			t.Errorf("yaml field %q missing from json schema", k)
 		}
 	}
+
+	// Required-ness must agree too (round-1 review: a names-only check
+	// lets the mirror silently flip a field's required flag).
+	var jreq struct {
+		Required []string `json:"required"`
+	}
+	if err := json.Unmarshal(jb, &jreq); err != nil {
+		t.Fatalf("unmarshal json required: %v", err)
+	}
+	jrequired := map[string]bool{}
+	for _, k := range jreq.Required {
+		jrequired[k] = true
+	}
+	var yreq struct {
+		Fields map[string]struct {
+			Required bool `yaml:"required"`
+		} `yaml:"fields"`
+	}
+	if err := yaml.Unmarshal(yb, &yreq); err != nil {
+		t.Fatalf("unmarshal yaml required flags: %v", err)
+	}
+	for k, f := range yreq.Fields {
+		if f.Required != jrequired[k] {
+			t.Errorf("required-ness disagrees for %q: yaml=%v json=%v", k, f.Required, jrequired[k])
+		}
+	}
+}
+
+// invalidExemplarKeyword maps each invalid exemplar to the JSON-Schema
+// keyword (or message fragment) its violation must be reported under
+// (round-1 review: a mis-authored exemplar failing for the WRONG reason
+// must not pass silently).
+var invalidExemplarKeyword = map[string]string{
+	"l1_hypothesis_invalid_missing_hypothesis.json": "hypothesis",
+	"l1_hypothesis_invalid_confidence_range.json":   "maximum",
+	"l1_hypothesis_invalid_empty_citations.json":    "minItems",
+	"l1_hypothesis_invalid_extra_field.json":        "additional properties",
 }
 
 // TestL1HypothesisExemplars validates every committed exemplar in
-// testdata/ against the embedded schema (AC5): files named *_valid*
-// must pass, files named *_invalid_* must fail.
+// testdata/ against the embedded schema (AC5): files named
+// l1_hypothesis_valid_* must pass, files named l1_hypothesis_invalid_*
+// must fail for the expected reason; any other name is an error
+// (round-1 review: a stray file must not silently join the
+// must-validate set).
 func TestL1HypothesisExemplars(t *testing.T) {
 	sch, err := compiledL1Schema()
 	if err != nil {
@@ -78,7 +118,8 @@ func TestL1HypothesisExemplars(t *testing.T) {
 	var valid, invalid int
 	for _, p := range paths {
 		p := p
-		t.Run(filepath.Base(p), func(t *testing.T) {
+		base := filepath.Base(p)
+		t.Run(base, func(t *testing.T) {
 			b, err := os.ReadFile(p)
 			if err != nil {
 				t.Fatalf("read exemplar: %v", err)
@@ -89,16 +130,25 @@ func TestL1HypothesisExemplars(t *testing.T) {
 			}
 			verr := sch.Validate(inst)
 			switch {
-			case strings.Contains(p, "_invalid_"):
+			case strings.HasPrefix(base, "l1_hypothesis_invalid_"):
 				invalid++
 				if verr == nil {
-					t.Errorf("invalid exemplar %s passed schema validation", p)
+					t.Fatalf("invalid exemplar %s passed schema validation", p)
 				}
-			default:
+				keyword, known := invalidExemplarKeyword[base]
+				if !known {
+					t.Fatalf("invalid exemplar %s has no expected-keyword entry; add it to invalidExemplarKeyword", base)
+				}
+				if !strings.Contains(verr.Error(), keyword) {
+					t.Errorf("exemplar %s failed for the wrong reason: want %q in error, got: %v", base, keyword, verr)
+				}
+			case strings.HasPrefix(base, "l1_hypothesis_valid_"):
 				valid++
 				if verr != nil {
 					t.Errorf("valid exemplar %s failed schema validation: %v", p, verr)
 				}
+			default:
+				t.Fatalf("exemplar %s matches neither l1_hypothesis_valid_* nor l1_hypothesis_invalid_*; rename it", base)
 			}
 		})
 	}

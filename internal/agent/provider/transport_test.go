@@ -140,6 +140,37 @@ func TestBuildAnalystContent(t *testing.T) {
 // escape processing.
 var jsonAngleEscape = string([]byte{0x5c}) + "u003c"
 
+// TestEscapeAngleBrackets pins the hardening layer itself, independent
+// of encoding/json's own HTML-escaping defaults (which already escape
+// '<' on the std-marshal path, making end-to-end tests unable to detect
+// removal of this function; round-1 review). This is the committed
+// mutant-killer for DW3.3-1: delete the ReplaceAll and these cases fail.
+func TestEscapeAngleBrackets(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"single bracket", "<", jsonAngleEscape},
+		{"closing tag in payload", `{"cmd":"</evidence_package>"}`, `{"cmd":"` + jsonAngleEscape + `/evidence_package>"}`},
+		{"multiple brackets", "a<b<c", "a" + jsonAngleEscape + "b" + jsonAngleEscape + "c"},
+		{"no brackets unchanged", `{"k":"v"}`, `{"k":"v"}`},
+		{"already escaped sequence untouched", `{"k":"` + jsonAngleEscape + `"}`, `{"k":"` + jsonAngleEscape + `"}`},
+		{"empty", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := string(escapeAngleBrackets([]byte(tc.in)))
+			if got != tc.want {
+				t.Errorf("escapeAngleBrackets(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+			if strings.ContainsRune(got, '<') {
+				t.Errorf("output retains a '<': %q", got)
+			}
+		})
+	}
+}
+
 // TestBuildAnalystContentEscapesPayloadAngleBrackets is the DW3.3-1 /
 // Story 3.5 BI-7 injection regression: schema.Event.Raw is
 // json.RawMessage, so redacted payload bytes used to flow into the

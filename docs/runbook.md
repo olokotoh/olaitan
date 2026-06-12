@@ -530,7 +530,9 @@ alerting predicate (sustained transport failure):
 Labels: `{provider, role, status}`; `role` in `{l1, l2, senior}` (the
 emitting chain roles; the DFIR agent reports through the transport family
 only), `status` is the architecture B7 `llm_status` enum. One increment
-per runner `Run` (Story 3.5): this is the DECISION-level outcome after
+per PROVIDER-REACHING runner `Run` (Story 3.5; a package with no citable
+event ids fails fast with ErrNoCitableEvents before the provider call and
+records nothing): this is the DECISION-level outcome after
 response validation, complementing the transport-level
 `olaitan_llm_calls_total` (one `Run` maps to exactly one `Analyse` call,
 which may itself have retried internally). Bounded envelope 3 providers
@@ -542,8 +544,8 @@ join the same family.
 | status | Meaning |
 |---|---|
 | `success` | The reply parsed, validated against `l1_hypothesis.v1` and passed the referential checks. |
-| `unavailable` | `Provider.Analyse` failed (transport failure, exhausted retries, or the per-role timeout). |
-| `schema_violation` | The reply failed the role schema contract: empty body, undecodable JSON, JSON-Schema failure, or a cited `event_id` absent from the input package. |
+| `unavailable` | `Provider.Analyse` failed (transport failure, exhausted retries, the per-role timeout, or caller-context cancellation), or the reply was truncated by the output-token ceiling (stop reason `max_tokens`/`length`). |
+| `schema_violation` | The reply failed the role schema contract: empty body, undecodable JSON, JSON-Schema failure (incl. the size bounds), a whitespace-only hypothesis, or a cited `event_id` absent from the input package. |
 | `success_low_confidence` | RESERVED for the Story 3.7 Senior (validated assessment below the acting threshold); never emitted before then. |
 
 Sample PromQL -- schema-violation rate per provider (feeds the Story
