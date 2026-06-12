@@ -634,14 +634,22 @@ client (no SDK, no external egress).
   header, and no `api_key_set` construction-log field for this
   provider: the chart-rendered NetworkPolicy is the auth boundary
   (ingress to the Ollama pod only from the aggregator pod selector on
-  11434; egress declared and EMPTY). The endpoint must be an absolute
-  http(s) URL without userinfo; anything else fails construction with
-  `ErrBadEndpoint`.
+  11434; egress declared and EMPTY; the release policy excludes the
+  ollama component so the NetworkPolicy union cannot re-grant what the
+  ollama policy denies). PRECONDITION: NetworkPolicy isolation requires
+  an enforcing CNI (the project's Calico deployment enforces; a
+  non-enforcing CNI such as bare flannel leaves the credential-free
+  Ollama pod reachable cluster-wide). The endpoint must be an absolute
+  http(s) URL without userinfo, query, or fragment; anything else
+  fails construction with `ErrBadEndpoint`.
 - **Trust cap ladder.** The Ollama tier contributes at most
   `score_cap` 25 of 100 to the ThreatScore (versus 35 Claude-tier, 30
   OpenAI-class) -- a smaller local model earns less algebraic trust.
-  The 25 default ships in the package; enforcement on assessments is
-  Story 3.7 scope.
+  The 25 default ships in the package; the FILE-SIDE config default is
+  the Claude-tier 35, so set `analyst.score_cap: 25` (Helm-bridged;
+  values-airgapped.yaml does this) for the local tier -- the aggregator
+  logs a loud warning at startup when the configured cap exceeds 25 on
+  the local path. Enforcement on assessments is Story 3.7 scope.
 - **Model provisioning is operator-owned.** The chart deploys the
   server only (`ollama.enabled: true` renders the Deployment, Service,
   and NetworkPolicy; default false). Bake the model into the image or
@@ -655,9 +663,10 @@ client (no SDK, no external egress).
   `options.num_ctx`; the EFFECTIVE context window is the server-side
   `num_ctx` (small by default regardless of model capability). The
   provider's `MaxContextTokens` knob defaults to a conservative 4096 to
-  match; an operator who raises `num_ctx` (Modelfile or
-  `OLLAMA_CONTEXT_LENGTH`) should raise the knob to the same value so
-  the Story 3.5-3.7 prompt budgeter neither lies nor starves.
+  match; an operator who raises `num_ctx` (Modelfile, or
+  `OLLAMA_CONTEXT_LENGTH` via the chart's `ollama.extraEnv`) should
+  raise the knob to the same value so the Story 3.5-3.7 prompt
+  budgeter neither lies nor starves.
 - **Cold-load and Health.** First use loads the model into memory; a
   cold 70b-class load takes minutes, during which the provider's
   1-token Health probe honestly reports unhealthy. Warm the model after
@@ -665,11 +674,14 @@ client (no SDK, no external egress).
   policy) before relying on Health-gated automation.
 - **Reference overlay.** `deploy/helm/olaitan/values-airgapped.yaml`
   is the documented FR48 reference: in-cluster Ollama enabled,
-  `analyst.provider: local` with the rendered Service DNS and a pinned
-  model, and `networkPolicy.extraEgress` left empty (the point). The
-  `analyst.local.*` values are bridged into the rendered olaitan.yaml
-  by the chart (the same overlay mechanism as `analyst.provider`), so
-  a Helm-set value is never a silent no-op.
+  `analyst.provider: local` with a pinned model and `score_cap: 25`,
+  and `networkPolicy.extraEgress` left empty (the point). The
+  `analyst.local.*` and `analyst.score_cap` values are bridged into
+  the rendered olaitan.yaml by the chart (the same overlay mechanism
+  as `analyst.provider`), so a Helm-set value is never a silent no-op;
+  when `ollama.enabled` is on and no endpoint is set, the chart
+  DERIVES the rendered Service DNS for the actual release and
+  namespace, so the overlay works under any install name.
 
 ### 1.5 Naming-convention reconciliation
 

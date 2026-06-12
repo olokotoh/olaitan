@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -19,6 +20,7 @@ import (
 	kubefake "k8s.io/client-go/kubernetes/fake"
 
 	"github.com/olokotoh/olaitan/internal/config"
+	"github.com/olokotoh/olaitan/internal/metrics"
 )
 
 // writeTestConfig drops a minimal valid olaitan.yaml into t.TempDir()
@@ -587,6 +589,78 @@ func TestAnalystSelectsLocalProvider(t *testing.T) {
 			t.Errorf("analystSelectsLocalProvider(%q) = true, want false", p)
 		}
 	}
+}
+
+// Story 3.4 Task 3.2 (round-1 review: the construction branch itself
+// must be exercised, not just the string gate): model set -> provider
+// constructed with the NFR18 log fields and no api_key_set key; empty
+// model -> rules-only degrade log, no error; malformed endpoint ->
+// startup error; ladder-exceeding score_cap -> loud warn.
+func TestWireOllamaProvider(t *testing.T) {
+	baseCfg := func() *config.Config {
+		cfg := &config.Config{}
+		cfg.Analyst.Provider = "local"
+		cfg.Analyst.Local.Endpoint = "http://ollama-test:11434"
+		cfg.Analyst.Local.Model = "test-model"
+		cfg.Analyst.ScoreCap = 25
+		return cfg
+	}
+
+	t.Run("model set constructs with NFR18 log fields", func(t *testing.T) {
+		var buf bytes.Buffer
+		p, err := wireOllamaProvider(baseCfg(), metrics.NewRegistry(), nil, slog.New(slog.NewJSONHandler(&buf, nil)))
+		if err != nil {
+			t.Fatalf("wireOllamaProvider: %v", err)
+		}
+		if p == nil {
+			t.Fatal("provider = nil, want constructed")
+		}
+		logs := buf.String()
+		for _, want := range []string{`"provider":"ollama"`, `"model":"test-model"`, `"endpoint":"http://ollama-test:11434"`, `"audit_sink_wired":false`} {
+			if !strings.Contains(logs, want) {
+				t.Errorf("construction log missing %s\nlogs: %s", want, logs)
+			}
+		}
+		if strings.Contains(logs, "api_key_set") {
+			t.Error("construction log carries api_key_set; no credential exists for this provider")
+		}
+	})
+
+	t.Run("empty model degrades rules-only without error", func(t *testing.T) {
+		var buf bytes.Buffer
+		cfg := baseCfg()
+		cfg.Analyst.Local.Model = ""
+		p, err := wireOllamaProvider(cfg, metrics.NewRegistry(), nil, slog.New(slog.NewJSONHandler(&buf, nil)))
+		if err != nil {
+			t.Fatalf("empty model must not error (rules-only degrade): %v", err)
+		}
+		if p != nil {
+			t.Error("provider constructed despite empty model")
+		}
+		if !strings.Contains(buf.String(), `"model_set":false`) {
+			t.Errorf("degrade log missing model_set=false: %s", buf.String())
+		}
+	})
+
+	t.Run("malformed endpoint is a startup error", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.Analyst.Local.Endpoint = "http://user:cred@host:11434"
+		if _, err := wireOllamaProvider(cfg, metrics.NewRegistry(), nil, slog.New(slog.NewJSONHandler(io.Discard, nil))); err == nil {
+			t.Fatal("malformed endpoint: err = nil, want fail-fast construction error")
+		}
+	})
+
+	t.Run("ladder-exceeding score_cap warns loudly", func(t *testing.T) {
+		var buf bytes.Buffer
+		cfg := baseCfg()
+		cfg.Analyst.ScoreCap = 35
+		if _, err := wireOllamaProvider(cfg, metrics.NewRegistry(), nil, slog.New(slog.NewJSONHandler(&buf, nil))); err != nil {
+			t.Fatalf("wireOllamaProvider: %v", err)
+		}
+		if !strings.Contains(buf.String(), "exceeds the Ollama-tier trust ladder") {
+			t.Errorf("expected trust-ladder warning at score_cap=35: %s", buf.String())
+		}
+	})
 }
 
 // Story 3.2 round-1 review MED: projected Secret values routinely carry a

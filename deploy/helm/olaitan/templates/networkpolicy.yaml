@@ -37,6 +37,22 @@ spec:
   podSelector:
     matchLabels:
       {{- include "olaitan.selectorLabels" . | nindent 6 }}
+    {{- /*
+    Story 3.4 round-1 review (documented BI-8 amendment): the optional
+    ollama pod carries the shared name/instance labels, and
+    NetworkPolicies UNION -- without this exclusion the release
+    policy's ingress (from every olaitan pod, any port) and egress
+    (DNS, apiserver, intra-namespace, extraEgress) would also apply to
+    the ollama pod, nullifying ollama-networkpolicy.yaml's
+    aggregator-only-11434 ingress and declared-empty egress. Gated so
+    the default render is byte-identical when ollama is disabled.
+    */}}
+    {{- if (default (dict) .Values.ollama).enabled }}
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: NotIn
+        values: ["ollama"]
+    {{- end }}
   policyTypes:
     - Ingress
     - Egress

@@ -913,11 +913,17 @@ ollama:
   enabled: false
   image:
     repository: ollama/ollama
-    # Pinned tag, never latest: air-gapped clusters mirror images by
-    # digest/tag and a floating tag breaks reproducibility (NFR31).
+    # Pinned tag, never latest (reproducibility hygiene, NFR31); mirror
+    # by digest in production registries for tamper-proofing.
     tag: "0.9.0"
     pullPolicy: IfNotPresent
   resources: {}
+  # Extra environment for the Ollama server, e.g. OLLAMA_CONTEXT_LENGTH
+  # (pair with the provider's MaxContextTokens knob per the runbook's
+  # air-gapped section) or OLLAMA_KEEP_ALIVE for warm-model policy.
+  extraEnv: []
+  nodeSelector: {}
+  tolerations: []
   # Model volume (mounted at /root/.ollama). The chart does NOT create
   # the claim: provision it with the pre-pulled model and reference it
   # here (model provisioning is operator-owned).

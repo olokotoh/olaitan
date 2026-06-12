@@ -192,7 +192,12 @@ func New(cfg Config, reg *metrics.Registry, sink *redact.RedactionAuditSink, log
 		endpoint = DefaultEndpoint
 	}
 	endpoint = strings.TrimRight(endpoint, "/")
-	if u, err := url.Parse(endpoint); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+	// Round-1 review: query strings and fragments are rejected too, not
+	// just userinfo/bad schemes; "/api/chat" appended after a "?" or "#"
+	// would land inside the query/fragment and every call would 404.
+	if u, err := url.Parse(endpoint); err != nil ||
+		(u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil ||
+		u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 		return nil, ErrBadEndpoint
 	}
 
@@ -475,6 +480,14 @@ func (p *Provider) post(ctx context.Context, body []byte) (provider.Response, er
 		// round-1 lesson, binding per Story 3.4 BI-2.2).
 		return provider.Response{}, errors.New("ollama: missing message in 200 response")
 	}
+	if !decoded.Done {
+		// With stream:false the server sends ONE complete object with
+		// done:true; a single object carrying done:false is a severed
+		// or proxy-mangled partial generation and must degrade to a
+		// retryable transport error, never a truncated-but-successful
+		// verdict (round-1 review).
+		return provider.Response{}, errors.New("ollama: incomplete (done=false) 200 response")
+	}
 
 	return provider.Response{
 		Raw:          decoded.Message.Content,
@@ -487,9 +500,10 @@ func (p *Provider) post(ctx context.Context, body []byte) (provider.Response, er
 
 // sanitizeSnippet launders an upstream error body before it can reach an
 // error string or a log line: control characters are flattened
-// (log-injection) and the length cut lands on a rune boundary. There is
-// no API key to scrub for this provider (BI-3); the laundering itself is
-// the Story 3.3 round-1 lesson and stays.
+// (log-injection), the length cut is made byte-wise, and ToValidUTF8
+// drops any dangling partial rune the cut left behind. There is no API
+// key to scrub for this provider (BI-3); the laundering itself is the
+// Story 3.3 round-1 lesson and stays.
 func sanitizeSnippet(raw []byte) string {
 	s := strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) {

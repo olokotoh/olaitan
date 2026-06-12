@@ -42,13 +42,18 @@ analyst:
   # (the PRD-level name "analyst.provider: ollama" arrives as a Helm
   # alias with Story 3.16's evaluation-mode wiring).
   provider: "local"
+  # The Ollama-tier trust cap (PRD ladder: 35 Claude / 30 OpenAI-class
+  # / 25 local Ollama). The file-side default targets the Claude tier;
+  # this overlay pins the local-tier value. Story 3.7 owns enforcement;
+  # the aggregator logs a loud warning if this exceeds 25.
+  score_cap: 25
   local:
-    # The RENDERED Service DNS for a chart-managed Ollama is
-    # <release>-olaitan-ollama.<namespace>.svc.cluster.local (the
-    # provider's built-in default, ollama.olaitan.svc.cluster.local,
-    # assumes a Service literally named "ollama" in namespace
-    # "olaitan"). Adjust release/namespace to your install:
-    endpoint: "http://olaitan-ollama.olaitan.svc.cluster.local:11434"
+    # endpoint is deliberately UNSET: with ollama.enabled the chart
+    # derives the rendered Service DNS
+    # (<release>-olaitan-ollama.<namespace>.svc.cluster.local) for any
+    # release name and namespace. Set it only for an EXTERNAL,
+    # user-managed Ollama.
+    endpoint: ""
     # PRD Journey 3 reference model; replace with what you provisioned.
     model: "llama3.1:70b"
 

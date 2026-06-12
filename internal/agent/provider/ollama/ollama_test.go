@@ -45,6 +45,9 @@ func TestNewRejectsBadEndpoint(t *testing.T) {
 		{"unparseable", "://nope"},
 		{"non-http scheme", "grpc://host:11434"},
 		{"userinfo credentials", "http://user:secret-cred@host:11434"},
+		{"query string", "http://host:11434?keep_alive=5m"},
+		{"bare query", "http://host:11434?"},
+		{"fragment", "http://host:11434#frag"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

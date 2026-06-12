@@ -12,12 +12,23 @@ volume mounted at /root/.ollama through ollama.persistence. The
 analyst model id itself lives in analyst.local.model, not here -- the
 provider pins what the operator provisioned (ErrNoModel otherwise).
 
-First use loads the model into memory; a cold 70b load takes minutes,
-during which the provider's Health probe honestly reports unhealthy
-(docs/runbook.md air-gapped section documents warm-up guidance).
+First use loads the model into memory; a cold 70b load takes minutes.
+The readiness probe gates Service routing on the server listening; it
+deliberately does NOT prove the model is warm (that is the provider
+Health probe's job, and docs/runbook.md documents warm-up guidance).
+ollama.extraEnv exists so operators can set OLLAMA_CONTEXT_LENGTH /
+OLLAMA_KEEP_ALIVE per the runbook's num_ctx pairing note.
+
+Round-1 review hardening: the pod mounts no ServiceAccount token (it
+talks to nobody and nothing in the cluster API), privilege escalation
+is off, and the image tag is required (an empty tag would render
+"ollama/ollama:" and ImagePullBackOff silently). The official image
+runs as root (writes /root/.ollama), so runAsNonRoot is not imposed;
+mirror the image by digest in production registries (the pinned tag is
+reproducibility hygiene, not tamper-proofing).
 [Source: architecture.md:263, :963 -- FR48 air-gapped Ollama mode]
 */}}
-{{- if .Values.ollama.enabled -}}
+{{- if (default (dict) .Values.ollama).enabled -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -41,14 +52,35 @@ spec:
       labels:
         {{- include "olaitan.ollama.selectorLabels" . | nindent 8 }}
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: ollama
-          image: "{{ .Values.ollama.image.repository }}:{{ .Values.ollama.image.tag }}"
+          image: "{{ .Values.ollama.image.repository }}:{{ required "ollama.image.tag is required (an empty tag renders a broken image reference)" .Values.ollama.image.tag }}"
           imagePullPolicy: {{ .Values.ollama.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
           ports:
             - name: http
               containerPort: 11434
               protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          {{- with .Values.ollama.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           {{- with .Values.ollama.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
@@ -58,6 +90,14 @@ spec:
             - name: models
               mountPath: /root/.ollama
           {{- end }}
+      {{- with .Values.ollama.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.ollama.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- if .Values.ollama.persistence.enabled }}
       volumes:
         - name: models

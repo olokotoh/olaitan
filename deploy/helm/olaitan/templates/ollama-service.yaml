@@ -4,12 +4,14 @@ Ollama. NAMING RECONCILIATION: the epic's default endpoint constant
 (http://ollama.olaitan.svc.cluster.local:11434, baked into the
 provider's DefaultEndpoint) assumes a Service literally named `ollama`
 in namespace `olaitan`; the chart renders the fullname-prefixed
-`<release>-olaitan-ollama` per chart idiom instead. values-airgapped.yaml
-therefore sets analyst.local.endpoint to the RENDERED Service DNS
-explicitly -- the provider default is the convention, the overlay is
-the truth for a chart-managed Ollama.
+`<release>-ollama` per chart idiom instead. When ollama.enabled and no
+operator endpoint is set, the configmap bridge DERIVES the rendered
+Service DNS for the analyst config (round-1 review: a hardcoded or
+defaulted endpoint pointing at a Service this chart never creates
+would dial nothing forever) -- the provider constant is the
+convention, the derivation is the truth for a chart-managed Ollama.
 */}}
-{{- if .Values.ollama.enabled -}}
+{{- if (default (dict) .Values.ollama).enabled -}}
 apiVersion: v1
 kind: Service
 metadata:

@@ -456,6 +456,33 @@ func TestAnalyseNullBodyAndMissingMessageAreTransient(t *testing.T) {
 	}
 }
 
+// TestAnalyseDoneFalseIsTransient: round-1 review finding. With
+// stream:false the server sends ONE complete object with done:true; a
+// single object carrying done:false is a severed or proxy-mangled
+// partial generation and must degrade transient, never a truncated
+// verdict recorded as success.
+func TestAnalyseDoneFalseIsTransient(t *testing.T) {
+	partial := `{"model":"test-model","message":{"role":"assistant","content":"par"},"done":false}`
+	h := &capturingHandler{script: []scriptedResponse{{200, partial}}}
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	p, reg := newTestProvider(t, ts.URL, nil)
+	_, err := p.Analyse(context.Background(), analyseRequest(provider.RoleL1))
+	if err == nil {
+		t.Fatal("Analyse on done:false 200: err = nil, want incomplete-response error")
+	}
+	if !strings.Contains(err.Error(), "incomplete") {
+		t.Errorf("err = %v, want incomplete (done=false) transport error", err)
+	}
+	if got := h.attempts.Load(); got != 3 {
+		t.Errorf("attempts = %d, want 3 (transient, retried)", got)
+	}
+	if v, _ := counterValue(t, reg, "ollama", "l1", provider.StatusSuccess); v != 0 {
+		t.Errorf("a done:false partial must never record success")
+	}
+}
+
 // TestAnalyseNDJSONLeakIsTransient: a server that ignores stream:false
 // returns NDJSON chunks; the single-object decode fails and the call
 // degrades to a retryable transport error, never a partial verdict.
@@ -715,18 +742,22 @@ func TestTriProviderSharedRegistry(t *testing.T) {
 	}
 }
 
-// TestAnalyseLogsNeverCarryEvidence: the laundered error snippet and the
-// transport errors must not leak the redacted-evidence payload into logs
-// (bounded diagnostics only).
+// TestAnalyseErrorSnippetIsBoundedAndLaundered: the laundered error
+// snippet must be bounded and control-character-free, and the provider
+// logs must never carry the upstream error body or the evidence payload
+// (round-1 review: the control characters sit INSIDE the first 256
+// bytes so the launder assertion actually bites, and logBuf is
+// inspected, not just wired).
 func TestAnalyseErrorSnippetIsBoundedAndLaundered(t *testing.T) {
-	long := strings.Repeat("A", 8000) + "\r\n\x00ctrl"
+	long := "leading\r\n\x00ctrl " + strings.Repeat("A", 8000) + " UNREAD-TAIL-MARKER"
 	h := &capturingHandler{script: []scriptedResponse{{500, long}}}
 	ts := httptest.NewServer(h)
 	defer ts.Close()
 
 	var logBuf bytes.Buffer
 	p, _ := newTestProvider(t, ts.URL, &logBuf)
-	_, err := p.Analyse(context.Background(), analyseRequest(provider.RoleL1))
+	req := analyseRequest(provider.RoleL1)
+	_, err := p.Analyse(context.Background(), req)
 	if err == nil {
 		t.Fatal("Analyse: err = nil, want 500 exhaustion")
 	}
@@ -739,5 +770,12 @@ func TestAnalyseErrorSnippetIsBoundedAndLaundered(t *testing.T) {
 	}
 	if strings.ContainsAny(apiErr.Snippet, "\r\n\x00") {
 		t.Errorf("snippet carries control characters: %q", apiErr.Snippet)
+	}
+	if strings.Contains(apiErr.Snippet, "UNREAD-TAIL-MARKER") {
+		t.Error("snippet carries bytes beyond the bounded error read")
+	}
+	logs := logBuf.String()
+	if strings.Contains(logs, "UNREAD-TAIL-MARKER") || strings.Contains(logs, "evidence_package") || strings.Contains(logs, req.Prompt.User) {
+		t.Errorf("provider logs leaked upstream body or analyst payload:\n%s", logs)
 	}
 }
