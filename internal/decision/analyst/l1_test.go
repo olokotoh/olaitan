@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/olokotoh/olaitan/internal/agent/provider"
 	"github.com/olokotoh/olaitan/internal/metrics"
@@ -315,9 +317,10 @@ func TestL1RunSchemaVersionOverwritten(t *testing.T) {
 	}
 }
 
-// manyCitations builds n distinct citation objects (ids evt-gen-0..n-1)
-// for schema-stage maxItems checks (the schema runs before the
-// referential check, so the unknown ids never reach it).
+// manyCitations builds n distinct citation objects (ids of the form
+// evt-gen-<letter><x-run>, letter cycling a-z with the x-run length
+// growing every 26) for schema-stage maxItems checks (the schema runs
+// before the referential check, so the unknown ids never reach it).
 func manyCitations(n int) string {
 	parts := make([]string, n)
 	for i := range parts {
@@ -464,6 +467,116 @@ func TestRedactionPreservesEventIDs(t *testing.T) {
 	}
 	if redacted.Trigger.EventID != pkg.Trigger.EventID {
 		t.Errorf("redaction rewrote Trigger.EventID: %q -> %q", pkg.Trigger.EventID, redacted.Trigger.EventID)
+	}
+}
+
+// TestL1RunSchemaNotAliased pins the bytes.Clone defensive copy
+// (round-2 review F1): a provider mutating req.Schema in place must
+// not corrupt the embedded schema for later runs.
+func TestL1RunSchemaNotAliased(t *testing.T) {
+	fp := &fakeProvider{name: "fake", model: "fake-model", resp: provider.Response{Raw: validVerdict}}
+	l1, _ := newRunner(t, fp)
+	if _, err := l1.Run(context.Background(), testPackage()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(fp.got.Schema) == 0 {
+		t.Fatal("no schema captured")
+	}
+	original := l1SchemaJSON[0]
+	fp.got.Schema[0] = '!'
+	if l1SchemaJSON[0] != original {
+		t.Error("mutating the request schema corrupted the embedded schema; Request.Schema aliases l1SchemaJSON")
+	}
+}
+
+// TestL1RecordLogLevels pins the Warn-on-failure escalation (round-2
+// review F2).
+func TestL1RecordLogLevels(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	reg := metrics.NewRegistry()
+	fp := &fakeProvider{name: "fake", model: "fake-model", err: errors.New("boom")}
+	l1, err := NewL1(fp, PromptSpec{System: "s", Version: "v"}, reg, logger)
+	if err != nil {
+		t.Fatalf("NewL1: %v", err)
+	}
+	_, _ = l1.Run(context.Background(), testPackage())
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("failure outcome not logged at Warn: %s", buf.String())
+	}
+
+	buf.Reset()
+	fp.err = nil
+	fp.resp = provider.Response{Raw: validVerdict}
+	if _, err := l1.Run(context.Background(), testPackage()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(buf.String(), "level=INFO") {
+		t.Errorf("success outcome not logged at Info: %s", buf.String())
+	}
+}
+
+// TestBoundForLog pins the 64-byte cap and the UTF-8 laundering of the
+// cut (round-2 review F3 + the provider sanitizer standard).
+func TestBoundForLog(t *testing.T) {
+	short := "evt-1"
+	if got := boundForLog(short); got != short {
+		t.Errorf("short string altered: %q", got)
+	}
+	long := strings.Repeat("a", 100)
+	got := boundForLog(long)
+	if got != strings.Repeat("a", 64)+"..." {
+		t.Errorf("long string not capped at 64 bytes: %q (len %d)", got, len(got))
+	}
+	// 62 ASCII bytes then a 3-byte rune straddling the 64-byte cut.
+	multibyte := strings.Repeat("a", 62) + "世界"
+	got = boundForLog(multibyte)
+	if !utf8.ValidString(got) {
+		t.Errorf("cut produced invalid UTF-8: %q", got)
+	}
+	if !strings.HasSuffix(got, "...") {
+		t.Errorf("capped string missing ellipsis: %q", got)
+	}
+}
+
+// TestL1RunOversizedEventIDInErrorBounded asserts the violation error
+// carries the bounded form of a model-controlled event_id.
+func TestL1RunOversizedEventIDInErrorBounded(t *testing.T) {
+	longID := strings.Repeat("z", 100)
+	raw := `{"hypothesis":"x","cited_evidence":[{"event_id":"` + longID + `"}],"confidence":50}`
+	fp := &fakeProvider{name: "fake", model: "fake-model", resp: provider.Response{Raw: raw}}
+	l1, _ := newRunner(t, fp)
+	_, err := l1.Run(context.Background(), testPackage())
+	if !errors.Is(err, ErrSchemaViolation) {
+		t.Fatalf("err = %v, want ErrSchemaViolation", err)
+	}
+	if strings.Contains(err.Error(), longID) {
+		t.Error("error carries the full 100-byte event_id; boundForLog not applied")
+	}
+	if !strings.Contains(err.Error(), strings.Repeat("z", 64)+"...") {
+		t.Errorf("error does not carry the bounded id form: %v", err)
+	}
+}
+
+// TestL1RunEmptyEventIDNotCitable pins the round-2 guard refinement:
+// an empty Events[].ID cannot satisfy the schema (minLength 1), so it
+// must not count as citable.
+func TestL1RunEmptyEventIDNotCitable(t *testing.T) {
+	fp := &fakeProvider{name: "fake", model: "fake-model", resp: provider.Response{Raw: validVerdict}}
+	l1, reg := newRunner(t, fp)
+	pkg := schema.EvidencePackage{
+		PackageID: "pkg-empty-ids",
+		Events:    []schema.Event{{ID: "", Source: schema.SourceFalco, Category: schema.CategorySyscall, Summary: "id-less"}},
+	}
+	_, err := l1.Run(context.Background(), pkg)
+	if !errors.Is(err, ErrNoCitableEvents) {
+		t.Fatalf("err = %v, want ErrNoCitableEvents", err)
+	}
+	if fp.calls != 0 {
+		t.Errorf("provider called %d times despite an unsatisfiable package", fp.calls)
+	}
+	if got := familyTotal(t, reg); got != 0 {
+		t.Errorf("family total = %v, want 0", got)
 	}
 }
 

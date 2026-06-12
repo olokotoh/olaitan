@@ -298,14 +298,19 @@ func isTruncated(stopReason string) bool {
 	return strings.EqualFold(stopReason, "max_tokens") || strings.EqualFold(stopReason, "length")
 }
 
-// citableEventIDs builds the AC3 referential set: every Events[].ID
-// plus a non-empty Trigger.EventID (the trigger event may have been
-// dropped by the Story 1.14 overflow cap, so trigger membership avoids
-// a false violation; BI-6.5).
+// citableEventIDs builds the AC3 referential set: every non-empty
+// Events[].ID plus a non-empty Trigger.EventID (the trigger event may
+// have been dropped by the Story 1.14 overflow cap, so trigger
+// membership avoids a false violation; BI-6.5). Empty ids are excluded
+// on both sides: the schema's event_id minLength 1 means "" can never
+// be cited, so counting it would defeat the ErrNoCitableEvents
+// impossibility guard (round-2 review).
 func citableEventIDs(pkg schema.EvidencePackage) map[string]struct{} {
 	known := make(map[string]struct{}, len(pkg.Events)+1)
 	for _, ev := range pkg.Events {
-		known[ev.ID] = struct{}{}
+		if ev.ID != "" {
+			known[ev.ID] = struct{}{}
+		}
 	}
 	if pkg.Trigger.EventID != "" {
 		known[pkg.Trigger.EventID] = struct{}{}
@@ -395,12 +400,15 @@ func parseL1Hypothesis(sch *jsonschema.Schema, raw string, known map[string]stru
 	return hyp, nil
 }
 
-// boundForLog caps a model-controlled string before it is interpolated
-// into an error that callers will log.
+// boundForLog caps a model-controlled string at 64 bytes and launders
+// the cut to valid UTF-8 before it is interpolated into an error that
+// callers will log (the byte cut can bite a multibyte rune; same
+// standard as the provider snippet sanitizers, Story 3.3 round-2
+// lesson).
 func boundForLog(s string) string {
 	const maxLen = 64
 	if len(s) > maxLen {
-		return s[:maxLen] + "..."
+		return strings.ToValidUTF8(s[:maxLen], "") + "..."
 	}
 	return s
 }
@@ -408,10 +416,12 @@ func boundForLog(s string) string {
 // stripWrappingFence removes ONE wrapping markdown code fence if and
 // only if the trimmed body starts with a fence line and ends with a
 // closing fence (Story 3.5 BI-6.2). The entire first line (the fence
-// and any language tag or other content sharing it) is discarded, so a
-// payload crammed onto the fence line falls out as a decode failure
-// downstream. Partial or unclosed fences are returned unchanged and
-// fail JSON decoding as schema violations. Both LF and bare-CR line
+// and any language tag or other content sharing it) is discarded: a
+// payload crammed entirely onto a single fence line therefore strips
+// to "" and lands in the empty-after-fence violation branch, while a
+// multi-line crammed payload reaches the JSON decoder and fails there;
+// both classify as schema violations. Partial or unclosed fences are
+// returned unchanged and fail JSON decoding. Both LF and bare-CR line
 // endings terminate the fence line (round-1 review: a CR-only reply
 // must not retain its fence).
 func stripWrappingFence(body string) string {
