@@ -20,6 +20,54 @@ const decisionCallsMetricHelp = "Investigation-chain analyst calls by provider, 
 	"then). One increment per Run; bounded label set (Story 3.5 BI-8, " +
 	"architecture.md:318 llm_status enum)."
 
+// L2SkippedMetricName is the AC4-named chain-gate counter family: one
+// increment per investigation chain that skips L2 (Story 3.6 BI-6).
+const L2SkippedMetricName = "olaitan_decision_llm_l2_skipped_total"
+
+const l2SkippedMetricHelp = "Investigation chains that skipped the L2 verification stage, by reason. " +
+	"Bounded reason set: l1_unavailable (the L1 stage failed with provider " +
+	"unavailability, so the chain short-circuits to Senior-on-evidence-only " +
+	"mode; Story 3.10 may extend the set). Incremented by the Story 3.7 " +
+	"orchestrator at the ShouldSkipL2 gate (Story 3.6 BI-6)."
+
+// RegisterL2SkippedMetric registers (or re-uses) the
+// olaitan_decision_llm_l2_skipped_total counter on reg, idempotently
+// like RegisterDecisionCallsMetric.
+func RegisterL2SkippedMetric(reg *metrics.Registry) (*prometheus.CounterVec, error) {
+	return registerCounterVec(reg, L2SkippedMetricName, l2SkippedMetricHelp, []string{"reason"})
+}
+
+// RecordL2Skip increments the skip counter under a bounded reason. It
+// refuses an empty reason (ShouldSkipL2 returns "" on the no-skip path;
+// incrementing unconditionally would mint an empty-label series) so the
+// bounded-label guarantee does not rest on every caller checking the
+// bool first (Story 3.6 round-1 review).
+func RecordL2Skip(vec *prometheus.CounterVec, reason string) {
+	if vec == nil || reason == "" {
+		return
+	}
+	vec.WithLabelValues(reason).Inc()
+}
+
+// registerCounterVec is the shared idempotent registration dance every
+// decision-ring family uses (Story 3.6 round-1 hoist): when the family
+// is already registered it unwraps prometheus.AlreadyRegisteredError
+// and returns the EXISTING collector.
+func registerCounterVec(reg *metrics.Registry, name, help string, labels []string) (*prometheus.CounterVec, error) {
+	vec, err := reg.RegisterCounterVec(name, help, labels)
+	if err != nil {
+		var already prometheus.AlreadyRegisteredError
+		if errors.As(err, &already) {
+			if existing, ok := already.ExistingCollector.(*prometheus.CounterVec); ok {
+				return existing, nil
+			}
+			return nil, fmt.Errorf("analyst: %s already registered with a different collector type: %w", name, err)
+		}
+		return nil, fmt.Errorf("analyst: register %s: %w", name, err)
+	}
+	return vec, nil
+}
+
 // RegisterDecisionCallsMetric registers (or re-uses) the shared
 // olaitan_decision_llm_calls_total counter on reg and returns the handle.
 //
@@ -30,16 +78,5 @@ const decisionCallsMetricHelp = "Investigation-chain analyst calls by provider, 
 // error. The cardinality bound is {providers} x 3 emitting roles x 4
 // statuses, well within the metrics.go:357-362 rule.
 func RegisterDecisionCallsMetric(reg *metrics.Registry) (*prometheus.CounterVec, error) {
-	vec, err := reg.RegisterCounterVec(DecisionCallsMetricName, decisionCallsMetricHelp, []string{"provider", "role", "status"})
-	if err != nil {
-		var already prometheus.AlreadyRegisteredError
-		if errors.As(err, &already) {
-			if existing, ok := already.ExistingCollector.(*prometheus.CounterVec); ok {
-				return existing, nil
-			}
-			return nil, fmt.Errorf("analyst: %s already registered with a different collector type: %w", DecisionCallsMetricName, err)
-		}
-		return nil, fmt.Errorf("analyst: register %s: %w", DecisionCallsMetricName, err)
-	}
-	return vec, nil
+	return registerCounterVec(reg, DecisionCallsMetricName, decisionCallsMetricHelp, []string{"provider", "role", "status"})
 }

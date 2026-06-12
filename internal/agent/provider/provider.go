@@ -81,12 +81,13 @@ func (r Role) Valid() bool {
 // analyst instructions itself.
 //
 // REDACTION CONTRACT (AC3 boundary): the provider redacts Request.Package
-// before any byte leaves the process, but Prompt text and PriorAssessment
-// cross the wire VERBATIM. Callers must therefore never interpolate raw
-// event excerpts or any other un-redacted evidence into the prompt;
-// evidence travels exclusively on Request.Package, where Story 3.1's
-// pipeline guards it. A PriorAssessment derived from previously redacted
-// evidence is clean by construction.
+// before any byte leaves the process, but Prompt text crosses the wire
+// VERBATIM, and PriorHypothesis/PriorAssessment cross with framing
+// escapes only (no redaction pass). Callers must therefore never
+// interpolate raw event excerpts or any other un-redacted evidence into
+// the prompt; evidence travels exclusively on Request.Package, where
+// Story 3.1's pipeline guards it. A PriorHypothesis or PriorAssessment
+// derived from previously redacted evidence is clean by construction.
 //
 // Callers that surface model output to operators should include a
 // final-answer-only instruction in System: with thinking disabled
@@ -108,13 +109,23 @@ type JSONSchema = json.RawMessage
 // Request is the role-typed call envelope. It carries everything one
 // analyst call needs: the role (timeout + metric label), the evidence
 // package (redacted by the provider before any byte leaves the process),
-// the prompt pair, the expected output schema, and the optional prior
-// assessment for L2/Senior re-evaluation.
+// the prompt pair, the expected output schema, the optional L1
+// hypothesis the L2/Senior roles re-examine (Story 3.6 BI-2), and the
+// optional prior assessment for Senior re-evaluation (Story 3.7; the
+// L2 role carries PriorHypothesis instead, never a PriorAssessment).
+//
+// PriorHypothesis and PriorAssessment are derived from previously
+// redacted evidence, so they are clean by construction under the
+// REDACTION CONTRACT; both are nonetheless model-controlled content and
+// are angle-bracket-escaped by BuildAnalystContent before framing.
+// Callers must pass them HERE rather than interpolating them into
+// Prompt text, which crosses the wire verbatim and unescaped.
 type Request struct {
 	Role            Role
 	Package         schema.EvidencePackage
 	Prompt          Prompt
 	Schema          JSONSchema
+	PriorHypothesis *schema.L1Hypothesis
 	PriorAssessment *schema.ThreatAssessment
 }
 

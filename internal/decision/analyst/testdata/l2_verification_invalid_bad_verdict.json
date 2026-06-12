@@ -1,0 +1,7 @@
+{
+  "verdict": "maybe",
+  "verified_evidence": [
+    {"event_id": "evt-1", "finding": "unsure"}
+  ],
+  "confidence": 50
+}

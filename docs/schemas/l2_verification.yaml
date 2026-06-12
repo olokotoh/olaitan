@@ -1,0 +1,56 @@
+# Canonical on-wire shape of schema.L2Verification.
+#
+# AUTHORITATIVE validation source: docs/schemas/l2_verification.json
+# (draft 2020-12). This YAML is the documentation mirror in the
+# docs/schemas/state_transition.yaml style; the .json is what the
+# Story 3.6 L2 runner validates model responses against, via the
+# byte-identical embedded copy at
+# internal/decision/analyst/l2_verification_schema.json. Source of
+# truth for the Go shape: internal/schema/verification.go
+# (type L2Verification).
+#
+# Story 3.6 (FR23). The structured verification verdict of the L2
+# analyst over an EvidencePackage plus the Story 3.5 L1Hypothesis.
+# schema_version is optional (or null) on the model side and
+# force-stamped to l2_verification.v1 by the runner after validation.
+# The referential rule (every verified_evidence event_id must exist in
+# the input EvidencePackage) and the whitespace-only rejection of
+# finding and contradictory_findings entries are enforced
+# programmatically by the runner. Size bounds follow the Story 3.5
+# round-1 convention.
+schema: l2_verification.v1
+fields:
+  schema_version:
+    type: string-or-null
+    required: false
+    description: >
+      Stamped to "l2_verification.v1" by the runner; optional (or null)
+      from the model (JSON type ["string", "null"]). maxLength 64.
+  verdict:
+    type: string
+    required: true
+    enum: [confirmed, refuted, inconclusive]
+    description: The L2 verdict on the L1 hypothesis (FR23 closed set).
+  verified_evidence:
+    type: array
+    required: true
+    description: >
+      Evidence-by-evidence verification narrative. 1 to 50 entries,
+      uniqueItems, and one entry per event_id (the per-id rule is
+      runner-enforced; uniqueItems only rejects whole-object
+      duplicates). Each entry carries event_id (required, maxLength 256,
+      must exist in the input EvidencePackage) and finding (required,
+      non-whitespace, maxLength 500).
+  contradictory_findings:
+    type: array
+    required: false
+    description: >
+      Findings that contradict the L1 hypothesis; preserved verbatim for
+      the Senior's challenge (AC3). Up to 20 entries, each minLength 1
+      and maxLength 500. Empty entries and null arrays are rejected
+      schema-side (minLength and type: array); whitespace-only entries
+      are rejected by the runner.
+  confidence:
+    type: integer
+    required: true
+    description: Structured confidence in [0,100] (FR23).

@@ -1,0 +1,12 @@
+{
+  "schema_version": "l2_verification.v1",
+  "verdict": "refuted",
+  "verified_evidence": [
+    {"event_id": "evt-1", "finding": "binary hash matches fluent-bit, a log shipper, not a miner"},
+    {"event_id": "evt-2", "finding": "secret read is the documented startup path of the same pod"}
+  ],
+  "contradictory_findings": [
+    "L1 cited evt-1 as a miner launch; the executable is a known log shipper"
+  ],
+  "confidence": 82
+}

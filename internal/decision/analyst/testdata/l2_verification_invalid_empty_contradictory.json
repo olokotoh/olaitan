@@ -1,0 +1,8 @@
+{
+  "verdict": "refuted",
+  "verified_evidence": [
+    {"event_id": "evt-1", "finding": "fine"}
+  ],
+  "contradictory_findings": [""],
+  "confidence": 50
+}

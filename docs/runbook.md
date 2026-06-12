@@ -536,21 +536,43 @@ records nothing): this is the DECISION-level outcome after
 response validation, complementing the transport-level
 `olaitan_llm_calls_total` (one `Run` maps to exactly one `Analyse` call,
 which may itself have retried internally). Bounded envelope 3 providers
-x 3 roles x 4 statuses = 36 series; only `role="l1"` emits as of Story
-3.5. Registration is SHARED and idempotent
+x 3 roles x 4 statuses = 36 series. The l1 (Story 3.5) and l2 (Story
+3.6) runners increment the family; registration happens in the runner
+constructors, so before the Story 3.7/3.8 orchestrator wires the
+runners into the chain the family is neither registered nor populated
+in the production binary. `senior` lands with Story 3.7. Registration is SHARED and idempotent
 (`analyst.RegisterDecisionCallsMetric`), so the Story 3.6/3.7 runners
 join the same family.
 
 | status | Meaning |
 |---|---|
-| `success` | The reply parsed, validated against `l1_hypothesis.v1` and passed the referential checks. |
+| `success` | The reply parsed, validated against its role schema (`l1_hypothesis.v1` / `l2_verification.v1`) and passed the referential checks. |
 | `unavailable` | `Provider.Analyse` failed (transport failure, exhausted retries, the per-role timeout, or caller-context cancellation), or the reply was truncated by the output-token ceiling (stop reason `max_tokens`/`length`). |
-| `schema_violation` | The reply failed the role schema contract: empty body, undecodable JSON, JSON-Schema failure (incl. the size bounds), a whitespace-only hypothesis, or a cited `event_id` absent from the input package. |
+| `schema_violation` | The reply failed its role schema contract: empty body, undecodable JSON, JSON-Schema failure (incl. the size bounds), whitespace-only hypothesis/finding text, a duplicated narrative `event_id` (L2), or a referenced `event_id` absent from the input package. |
 | `success_low_confidence` | RESERVED for the Story 3.7 Senior (validated assessment below the acting threshold); never emitted before then. |
 
 Sample PromQL -- schema-violation rate per provider (feeds the Story
 3.10 three-strike policy dashboards):
 `sum by (provider) (rate(olaitan_decision_llm_calls_total{status="schema_violation"}[10m]))`.
+
+**Metric: `olaitan_decision_llm_l2_skipped_total`** (counter, unitless).
+Labels: `{reason}`, bounded set: `l1_unavailable` (the L1 stage failed
+with provider unavailability, so the chain short-circuits to
+Senior-on-evidence-only mode; Story 3.10 may extend the set). One
+increment per investigation chain that skips L2, recorded by the Story
+3.7 orchestrator at the `analyst.ShouldSkipL2` gate (Story 3.6 BI-6).
+A schema violation does NOT skip L2 before Story 3.10's three-strike
+escalation. NOTE the `l1_unavailable` reason inherits the full
+`unavailable` status semantics of the decision family: transport
+failure, exhausted retries, the per-role timeout, output-token-ceiling
+truncation, and caller-context cancellation all qualify, so the label
+measures chain short-circuits, not provider outages specifically
+(Story 3.10 may split the reason set). Increment via
+`analyst.RecordL2Skip` (refuses the empty no-skip reason). Registration
+is shared and idempotent (`analyst.RegisterL2SkippedMetric`). Alerting
+sketch, effective once Story 3.7 wires the gate -- sustained L1 failure
+starving the verification stage:
+`sum(rate(olaitan_decision_llm_l2_skipped_total{reason="l1_unavailable"}[10m])) > 0.05`.
 
 **Per-role timeout table (total budget across ALL retry attempts):**
 
