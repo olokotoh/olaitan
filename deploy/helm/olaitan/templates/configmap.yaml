@@ -642,10 +642,16 @@ data:
     {{- if not (mustRegexFind $pLocalModel $cfg) }}{{- fail (printf "helm bridge: overlay anchor for analyst.local.model not found (pattern %q)" $pLocalModel) }}{{- end }}
     {{- $cfg = regexReplaceAll $pLocalModel $cfg (printf "${1}model: %s" (replace "$" "$$" (printf "%q" (toString .)))) }}
     {{- end }}
-    {{- with $analystVals.score_cap }}
+    {{- /* `with` would skip a literal 0 (falsy), silently rendering
+           the file-side 35 where the operator configured zero trust
+           (round-2 review); an explicit nil check honours 0, and a
+           non-numeric value fails the render instead of int-coercing
+           to 0. */ -}}
+    {{- if not (kindIs "invalid" $analystVals.score_cap) }}
+    {{- if not (regexMatch "^[0-9]+$" (toString $analystVals.score_cap)) }}{{- fail (printf "analyst.score_cap must be a non-negative integer (got %q)" (toString $analystVals.score_cap)) }}{{- end }}
     {{- $pScoreCap := "(\\n  score_cap:[[:space:]]+)[0-9]+" -}}
     {{- if not (mustRegexFind $pScoreCap $cfg) }}{{- fail (printf "helm bridge: overlay anchor for analyst.score_cap not found (pattern %q)" $pScoreCap) }}{{- end }}
-    {{- $cfg = regexReplaceAll $pScoreCap $cfg (printf "${1}%d" (int .)) }}
+    {{- $cfg = regexReplaceAll $pScoreCap $cfg (printf "${1}%d" (int $analystVals.score_cap)) }}
     {{- end }}
     {{- /* AC2: under evaluation.config=F the rendered config must keep
            only the Falco sensor adapter active. Disable audit /

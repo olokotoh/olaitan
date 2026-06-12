@@ -195,9 +195,14 @@ func New(cfg Config, reg *metrics.Registry, sink *redact.RedactionAuditSink, log
 	// Round-1 review: query strings and fragments are rejected too, not
 	// just userinfo/bad schemes; "/api/chat" appended after a "?" or "#"
 	// would land inside the query/fragment and every call would 404.
+	// The string check covers the bare forms ("...11434#") that parse to
+	// EMPTY RawQuery/Fragment fields (round-2 review: url.Parse has a
+	// ForceQuery flag for a bare "?" but no fragment analog).
+	if strings.ContainsAny(endpoint, "?#") {
+		return nil, ErrBadEndpoint
+	}
 	if u, err := url.Parse(endpoint); err != nil ||
-		(u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil ||
-		u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		(u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
 		return nil, ErrBadEndpoint
 	}
 

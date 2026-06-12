@@ -48,6 +48,7 @@ func TestNewRejectsBadEndpoint(t *testing.T) {
 		{"query string", "http://host:11434?keep_alive=5m"},
 		{"bare query", "http://host:11434?"},
 		{"fragment", "http://host:11434#frag"},
+		{"bare fragment", "http://host:11434#"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

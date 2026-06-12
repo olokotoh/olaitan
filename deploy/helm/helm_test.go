@@ -1437,22 +1437,31 @@ func TestKubeconform(t *testing.T) {
 		t.Skip("kubeconform not on PATH; install via `go install github.com/yannh/kubeconform/cmd/kubeconform@v0.6.7`")
 	}
 
-	rendered := helmTemplate(t, nil)
+	// Story 3.4 round-2 review: conditional objects must be validated
+	// too, or new gated YAML (the ollama Deployment/Service/
+	// NetworkPolicy and the release-policy matchExpressions exclusion)
+	// ships schema-unchecked.
+	for name, sets := range map[string][]string{
+		"default":        nil,
+		"ollama-enabled": {"ollama.enabled=true", "analyst.provider=local"},
+	} {
+		rendered := helmTemplate(t, sets)
 
-	cmd := exec.Command("kubeconform",
-		"-strict",
-		"-summary",
-		"-kubernetes-version", "1.29.0",
-		"-schema-location", "default",
-		"-skip", "CustomResourceDefinition",
-	)
-	cmd.Stdin = strings.NewReader(rendered)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("kubeconform failed: %v\nstdout:\n%s\nstderr:\n%s",
-			err, stdout.String(), stderr.String())
+		cmd := exec.Command("kubeconform",
+			"-strict",
+			"-summary",
+			"-kubernetes-version", "1.29.0",
+			"-schema-location", "default",
+			"-skip", "CustomResourceDefinition",
+		)
+		cmd.Stdin = strings.NewReader(rendered)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("kubeconform (%s render) failed: %v\nstdout:\n%s\nstderr:\n%s",
+				name, err, stdout.String(), stderr.String())
+		}
 	}
 }
 
@@ -3502,12 +3511,19 @@ func TestValuesAirgappedOverlay(t *testing.T) {
 
 // TestAnalystScoreCapBridge: round-1 review - the third bridge. A
 // Helm-set analyst.score_cap lands in the rendered config; unset keeps
-// the file-side 35.
+// the file-side 35; an EXPLICIT ZERO is honoured (round-2 review: a
+// `with` gate would treat 0 as falsy and silently render 35 where the
+// operator configured zero trust).
 func TestAnalystScoreCapBridge(t *testing.T) {
 	overridden := helmTemplate(t, []string{"analyst.score_cap=25"})
 	embedded := extractEmbeddedConfigYAML(t, overridden)
 	assertContains(t, embedded, "score_cap: 25",
 		"analyst.score_cap bridge must rewrite the rendered config")
+
+	zero := helmTemplate(t, []string{"analyst.score_cap=0"})
+	embeddedZero := extractEmbeddedConfigYAML(t, zero)
+	assertContains(t, embeddedZero, "score_cap: 0",
+		"an explicit analyst.score_cap=0 must be honoured, not skipped as falsy")
 
 	defaults := helmTemplate(t, nil)
 	embeddedDefaults := extractEmbeddedConfigYAML(t, defaults)
