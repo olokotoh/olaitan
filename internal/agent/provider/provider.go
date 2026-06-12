@@ -108,13 +108,22 @@ type JSONSchema = json.RawMessage
 // Request is the role-typed call envelope. It carries everything one
 // analyst call needs: the role (timeout + metric label), the evidence
 // package (redacted by the provider before any byte leaves the process),
-// the prompt pair, the expected output schema, and the optional prior
-// assessment for L2/Senior re-evaluation.
+// the prompt pair, the expected output schema, the optional L1
+// hypothesis the L2/Senior roles re-examine (Story 3.6 BI-2), and the
+// optional prior assessment for L2/Senior re-evaluation.
+//
+// PriorHypothesis and PriorAssessment are derived from previously
+// redacted evidence, so they are clean by construction under the
+// REDACTION CONTRACT; both are nonetheless model-controlled content and
+// are angle-bracket-escaped by BuildAnalystContent before framing.
+// Callers must pass them HERE rather than interpolating them into
+// Prompt text, which crosses the wire verbatim and unescaped.
 type Request struct {
 	Role            Role
 	Package         schema.EvidencePackage
 	Prompt          Prompt
 	Schema          JSONSchema
+	PriorHypothesis *schema.L1Hypothesis
 	PriorAssessment *schema.ThreatAssessment
 }
 

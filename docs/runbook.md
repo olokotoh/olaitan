@@ -536,8 +536,8 @@ records nothing): this is the DECISION-level outcome after
 response validation, complementing the transport-level
 `olaitan_llm_calls_total` (one `Run` maps to exactly one `Analyse` call,
 which may itself have retried internally). Bounded envelope 3 providers
-x 3 roles x 4 statuses = 36 series; only `role="l1"` emits as of Story
-3.5. Registration is SHARED and idempotent
+x 3 roles x 4 statuses = 36 series; `role="l1"` (Story 3.5) and
+`role="l2"` (Story 3.6) emit today; `senior` lands with Story 3.7. Registration is SHARED and idempotent
 (`analyst.RegisterDecisionCallsMetric`), so the Story 3.6/3.7 runners
 join the same family.
 
@@ -551,6 +551,18 @@ join the same family.
 Sample PromQL -- schema-violation rate per provider (feeds the Story
 3.10 three-strike policy dashboards):
 `sum by (provider) (rate(olaitan_decision_llm_calls_total{status="schema_violation"}[10m]))`.
+
+**Metric: `olaitan_decision_llm_l2_skipped_total`** (counter, unitless).
+Labels: `{reason}`, bounded set: `l1_unavailable` (the L1 stage failed
+with provider unavailability, so the chain short-circuits to
+Senior-on-evidence-only mode; Story 3.10 may extend the set). One
+increment per investigation chain that skips L2, recorded by the Story
+3.7 orchestrator at the `analyst.ShouldSkipL2` gate (Story 3.6 BI-6).
+A schema violation does NOT skip L2 before Story 3.10's three-strike
+escalation. Registration is shared and idempotent
+(`analyst.RegisterL2SkippedMetric`). Alerting sketch -- sustained L1
+outage starving the verification stage:
+`sum(rate(olaitan_decision_llm_l2_skipped_total{reason="l1_unavailable"}[10m])) > 0.05`.
 
 **Per-role timeout table (total budget across ALL retry attempts):**
 

@@ -188,35 +188,44 @@ func NewL1(p provider.Provider, spec PromptSpec, reg *metrics.Registry, log *slo
 	return &L1{provider: p, spec: spec, calls: calls, log: log, schema: sch}, nil
 }
 
-var (
-	l1SchemaOnce     sync.Once
-	l1SchemaCompiled *jsonschema.Schema
-	l1SchemaErr      error
-)
-
-// compiledL1Schema compiles the embedded schema exactly once per
-// process; a compile failure is a build-artifact corruption and fails
-// every NewL1 with the same error.
-func compiledL1Schema() (*jsonschema.Schema, error) {
-	l1SchemaOnce.Do(func() {
-		doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(l1SchemaJSON))
-		if err != nil {
-			l1SchemaErr = fmt.Errorf("analyst: unmarshal embedded l1_hypothesis schema: %w", err)
-			return
-		}
-		c := jsonschema.NewCompiler()
-		const name = "l1_hypothesis_schema.json"
-		if err := c.AddResource(name, doc); err != nil {
-			l1SchemaErr = fmt.Errorf("analyst: add l1_hypothesis schema resource: %w", err)
-			return
-		}
-		l1SchemaCompiled, err = c.Compile(name)
-		if err != nil {
-			l1SchemaErr = fmt.Errorf("analyst: compile l1_hypothesis schema: %w", err)
-		}
-	})
-	return l1SchemaCompiled, l1SchemaErr
+// schemaCompiler compiles one embedded role schema exactly once per
+// process (Story 3.6 BI-4 generalization of the Story 3.5 L1-only
+// helper); a compile failure is a build-artifact corruption and fails
+// every runner constructor with the same error.
+type schemaCompiler struct {
+	name string
+	doc  []byte
+	once sync.Once
+	sch  *jsonschema.Schema
+	err  error
 }
+
+func (c *schemaCompiler) compiled() (*jsonschema.Schema, error) {
+	c.once.Do(func() {
+		doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(c.doc))
+		if err != nil {
+			c.err = fmt.Errorf("analyst: unmarshal embedded %s: %w", c.name, err)
+			return
+		}
+		comp := jsonschema.NewCompiler()
+		if err := comp.AddResource(c.name, doc); err != nil {
+			c.err = fmt.Errorf("analyst: add %s resource: %w", c.name, err)
+			return
+		}
+		sch, err := comp.Compile(c.name)
+		if err != nil {
+			c.err = fmt.Errorf("analyst: compile %s: %w", c.name, err)
+			return
+		}
+		c.sch = sch
+	})
+	return c.sch, c.err
+}
+
+var l1Schema = &schemaCompiler{name: "l1_hypothesis_schema.json", doc: l1SchemaJSON}
+
+// compiledL1Schema preserves the Story 3.5 accessor.
+func compiledL1Schema() (*jsonschema.Schema, error) { return l1Schema.compiled() }
 
 // Run issues one L1 analyst call for pkg and returns the audit record
 // plus the control-flow error. Exactly one outcome is recorded on
@@ -319,21 +328,30 @@ func citableEventIDs(pkg schema.EvidencePackage) map[string]struct{} {
 }
 
 // record increments the decision metric and emits the one structured
-// log line per invocation (no payload bytes; NFR18-safe fields only).
-// Failure outcomes log at Warn so operators can filter on level.
+// log line per invocation.
 func (a *L1) record(res L1Result, packageID string) {
-	a.calls.WithLabelValues(res.Provider, string(provider.RoleL1), res.Status).Inc()
+	recordDecisionCall(a.calls, a.log, provider.RoleL1, packageID,
+		res.Provider, res.Model, res.Status, res.PromptVersion, res.Latency)
+}
+
+// recordDecisionCall is the shared per-invocation outcome recorder for
+// every chain runner (Story 3.6 BI-4 hoist; no payload bytes,
+// NFR18-safe fields only). Failure outcomes log at Warn so operators
+// can filter on level. The log message renders as
+// "<role> analyst call", byte-identical to the Story 3.5 L1 line.
+func recordDecisionCall(calls *prometheus.CounterVec, log *slog.Logger, role provider.Role, packageID, providerName, model, status, promptVersion string, latency time.Duration) {
+	calls.WithLabelValues(providerName, string(role), status).Inc()
 	level := slog.LevelInfo
-	if res.Status != StatusSuccess {
+	if status != StatusSuccess {
 		level = slog.LevelWarn
 	}
-	a.log.Log(context.Background(), level, "l1 analyst call",
+	log.Log(context.Background(), level, string(role)+" analyst call",
 		"package_id", packageID,
-		"provider", res.Provider,
-		"model", res.Model,
-		"status", res.Status,
-		"latency_ms", res.Latency.Milliseconds(),
-		"prompt_version", res.PromptVersion,
+		"provider", providerName,
+		"model", model,
+		"status", status,
+		"latency_ms", latency.Milliseconds(),
+		"prompt_version", promptVersion,
 	)
 }
 

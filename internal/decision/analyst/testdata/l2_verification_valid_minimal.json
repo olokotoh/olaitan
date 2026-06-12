@@ -1,0 +1,7 @@
+{
+  "verdict": "confirmed",
+  "verified_evidence": [
+    {"event_id": "evt-1", "finding": "process ancestry confirms the exploit chain"}
+  ],
+  "confidence": 71
+}
