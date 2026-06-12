@@ -38,6 +38,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 
 	claudeprovider "github.com/olokotoh/olaitan/internal/agent/provider/claude"
+	ollamaprovider "github.com/olokotoh/olaitan/internal/agent/provider/ollama"
 	"github.com/olokotoh/olaitan/internal/collector/audit"
 	"github.com/olokotoh/olaitan/internal/collector/cni"
 	"github.com/olokotoh/olaitan/internal/collector/cri"
@@ -770,6 +771,25 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	// does not exist yet (BI-8). Reference it so the wiring is live and the
 	// build does not flag it unused until those stories land.
 	_ = claudeProvider
+
+	// Story 3.4 (BI-6): the Ollama provider is constructed only when the
+	// operator selected the local provider path (config value "local";
+	// the PRD-level name "analyst.provider: ollama" maps onto it at the
+	// Helm layer in Story 3.16). Provider type changes stay
+	// restart-required (architecture.md:351).
+	var ollamaProvider *ollamaprovider.Provider
+	if analystSelectsLocalProvider(cfg.Analyst.Provider) {
+		op, perr := wireOllamaProvider(cfg, metricsReg, redactionAuditSink, log)
+		if perr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: ollama provider: %w", perr)
+		}
+		ollamaProvider = op
+	}
+	// ollamaProvider is consumed by the Story 3.5-3.7 orchestrator, which
+	// does not exist yet. Reference it so the wiring is live and the build
+	// does not flag it unused until those stories land.
+	_ = ollamaProvider
 
 	var sinks fsm.MultiSink
 	var fsmStore *fsm.Store
@@ -1614,6 +1634,47 @@ Olaitan -- LLM-powered autonomous runtime security agent for Kubernetes.
 // rejects it at load time, so it can never reach this wiring.
 func analystSelectsAPIProvider(provider string) bool {
 	return strings.EqualFold(provider, "api")
+}
+
+// analystSelectsLocalProvider gates the Story 3.4 Ollama wiring on the
+// config value "local" (the schema home for the in-cluster LLM path;
+// the PRD-level "ollama" spelling maps onto it at the Helm layer in
+// Story 3.16). Case-insensitive to mirror the config validator's
+// ToLower allow-set (the Story 3.2 round-1 lesson, binding on every
+// provider gate).
+func analystSelectsLocalProvider(provider string) bool {
+	return strings.EqualFold(provider, "local")
+}
+
+// wireOllamaProvider constructs the Story 3.4 Ollama provider from the
+// analyst.local config block. There is NO API key: the in-cluster
+// NetworkPolicy is the auth boundary (architecture.md:263). An empty
+// analyst.local.model returns (nil, nil) and the aggregator runs
+// rules-only, the exact parity of the claude empty-key path; NOTE the
+// endpoint is not validated on that path, so fail-fast on a malformed
+// endpoint applies only once a model is configured (round-1 review:
+// the comment must not over-claim). The shared analyst.score_cap is
+// passed through; a value above the Ollama-tier ladder default is
+// logged loudly because a smaller local model earns less algebraic
+// trust (PRD ladder 35 Claude / 30 OpenAI-class / 25 Ollama; Story 3.7
+// owns enforcement, this is observability).
+func wireOllamaProvider(cfg *config.Config, reg *metrics.Registry, sink *reportredact.RedactionAuditSink, log *slog.Logger) (*ollamaprovider.Provider, error) {
+	if cfg.Analyst.Local.Model == "" {
+		log.Info("aggregator: ollama provider not wired; running rules-only",
+			"provider", "ollama", "model_set", false)
+		return nil, nil
+	}
+	if cfg.Analyst.ScoreCap > ollamaprovider.DefaultScoreCap {
+		log.Warn("aggregator: analyst.score_cap exceeds the Ollama-tier trust ladder",
+			"provider", "ollama",
+			"score_cap", cfg.Analyst.ScoreCap,
+			"ladder_default", ollamaprovider.DefaultScoreCap)
+	}
+	return ollamaprovider.New(ollamaprovider.Config{
+		Model:    cfg.Analyst.Local.Model,
+		Endpoint: cfg.Analyst.Local.Endpoint,
+		ScoreCap: cfg.Analyst.ScoreCap,
+	}, reg, sink, log)
 }
 
 // analystAPIKeyFromEnv reads the projected analyst API key from the env

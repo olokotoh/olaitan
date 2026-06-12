@@ -601,6 +601,58 @@ data:
     {{- $pEvAnalyst := "(\\nanalyst:[[:space:]]*\\n  )provider:[[:space:]]+[a-z0-9_-]+" -}}
     {{- if not (mustRegexFind $pEvAnalyst $cfg) }}{{- fail (printf "helm bridge: evaluation overlay anchor for analyst.provider not found (pattern %q)" $pEvAnalyst) }}{{- end }}
     {{- $cfg = regexReplaceAll $pEvAnalyst $cfg (printf "${1}provider: %s" $analystProvider) }}
+    {{- /*
+    Story 3.4 (FR48): bridge analyst.local.{endpoint,model} and
+    analyst.score_cap from Helm values into the rendered config -- the
+    same C11-pattern overlay as analyst.provider above, so a Helm-set
+    value is never a silent no-op while empty values keep the file-side
+    defaults. Anchors: `  local:` is the unique 2-space child of the
+    column-0 `analyst:` block in config/olaitan.yaml (the chain.l1/l2
+    endpoint/model lines are nested deeper and cannot match); the model
+    pattern rides on the adjacent endpoint line so the api block's
+    identical field names cannot match either; `  score_cap:` appears
+    exactly once. fail-fast on a missing anchor, like every bridge
+    above. Round-1 review hardening: bridged values pass through
+    toString (a numeric YAML value would render as a rune literal under
+    %q) and `$` is doubled so Go's regex replacer cannot expand
+    $1-style sequences inside operator values as capture-group
+    references.
+
+    When the chart manages Ollama (ollama.enabled) and the operator did
+    not pin an endpoint, the endpoint is DERIVED from the rendered
+    Service DNS (<fullname>-ollama.<namespace>.svc.cluster.local);
+    otherwise the file-side default (http://ollama:11434) points at a
+    Service this chart never creates and every call would dial nothing.
+    An operator-set endpoint always wins (external user-managed Ollama).
+    */ -}}
+    {{- $analystVals := default (dict) .Values.analyst -}}
+    {{- $localVals := default (dict) $analystVals.local -}}
+    {{- $ollamaVals := default (dict) .Values.ollama -}}
+    {{- $localEndpoint := default "" $localVals.endpoint -}}
+    {{- if and (not $localEndpoint) $ollamaVals.enabled }}
+    {{- $localEndpoint = printf "http://%s-ollama.%s.svc.cluster.local:11434" (include "olaitan.fullname" .) .Release.Namespace }}
+    {{- end }}
+    {{- with $localEndpoint }}
+    {{- $pLocalEndpoint := "(\\n  local:[[:space:]]*\\n    )endpoint:[^\\n]*" -}}
+    {{- if not (mustRegexFind $pLocalEndpoint $cfg) }}{{- fail (printf "helm bridge: overlay anchor for analyst.local.endpoint not found (pattern %q)" $pLocalEndpoint) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pLocalEndpoint $cfg (printf "${1}endpoint: %s" (replace "$" "$$" (printf "%q" (toString .)))) }}
+    {{- end }}
+    {{- with $localVals.model }}
+    {{- $pLocalModel := "(\\n  local:[[:space:]]*\\n    endpoint:[^\\n]*\\n    )model:[^\\n]*" -}}
+    {{- if not (mustRegexFind $pLocalModel $cfg) }}{{- fail (printf "helm bridge: overlay anchor for analyst.local.model not found (pattern %q)" $pLocalModel) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pLocalModel $cfg (printf "${1}model: %s" (replace "$" "$$" (printf "%q" (toString .)))) }}
+    {{- end }}
+    {{- /* `with` would skip a literal 0 (falsy), silently rendering
+           the file-side 35 where the operator configured zero trust
+           (round-2 review); an explicit nil check honours 0, and a
+           non-numeric value fails the render instead of int-coercing
+           to 0. */ -}}
+    {{- if not (kindIs "invalid" $analystVals.score_cap) }}
+    {{- if not (regexMatch "^[0-9]+$" (toString $analystVals.score_cap)) }}{{- fail (printf "analyst.score_cap must be a non-negative integer (got %q)" (toString $analystVals.score_cap)) }}{{- end }}
+    {{- $pScoreCap := "(\\n  score_cap:[[:space:]]+)[0-9]+" -}}
+    {{- if not (mustRegexFind $pScoreCap $cfg) }}{{- fail (printf "helm bridge: overlay anchor for analyst.score_cap not found (pattern %q)" $pScoreCap) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pScoreCap $cfg (printf "${1}%d" (int $analystVals.score_cap)) }}
+    {{- end }}
     {{- /* AC2: under evaluation.config=F the rendered config must keep
            only the Falco sensor adapter active. Disable audit /
            containerd / calico source adapters and the posture

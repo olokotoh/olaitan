@@ -1,0 +1,46 @@
+{{/*
+Story 3.4 AC3 (FR48): the Ollama pod is reachable ONLY from the
+olaitan-controller, per architecture.md:263 ("Ollama treated as an
+in-cluster service; protected by NetworkPolicy from external reach; no
+API-key auth needed" -- the policy IS the auth boundary, there is no
+credential).
+
+RECONCILIATION: the AC says "reachable only from olaitan-controller's
+ServiceAccount"; NetworkPolicy selects PODS, not ServiceAccounts, so
+the ingress peer is the aggregator Deployment's pod selector (the
+chart's name for the controller ring). The aggregator pods run under
+the controller ServiceAccount, so the intent is preserved.
+
+Egress is DECLARED and EMPTY on purpose: a serving Ollama needs no
+egress at all (model provisioning is operator-owned via baked image or
+pre-pulled volume), and the empty list under a declared Egress
+policyType is the explicit air-gap statement -- this pod talks to
+nobody. The release-level NetworkPolicy's intra-namespace egress
+already allows aggregator -> ollama; no change there.
+*/}}
+{{- if (default (dict) .Values.ollama).enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "olaitan.fullname" . }}-ollama
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ollama
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "olaitan.ollama.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "olaitan.aggregator.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 11434
+  egress: []
+{{- end }}

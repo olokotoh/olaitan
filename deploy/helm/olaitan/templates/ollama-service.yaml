@@ -1,0 +1,32 @@
+{{/*
+Story 3.4 (FR48): ClusterIP Service fronting the optional in-cluster
+Ollama. NAMING RECONCILIATION: the epic's default endpoint constant
+(http://ollama.olaitan.svc.cluster.local:11434, baked into the
+provider's DefaultEndpoint) assumes a Service literally named `ollama`
+in namespace `olaitan`; the chart renders the fullname-prefixed
+`<release>-ollama` per chart idiom instead. When ollama.enabled and no
+operator endpoint is set, the configmap bridge DERIVES the rendered
+Service DNS for the analyst config (round-1 review: a hardcoded or
+defaulted endpoint pointing at a Service this chart never creates
+would dial nothing forever) -- the provider constant is the
+convention, the derivation is the truth for a chart-managed Ollama.
+*/}}
+{{- if (default (dict) .Values.ollama).enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "olaitan.fullname" . }}-ollama
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ollama
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "olaitan.ollama.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: 11434
+      targetPort: http
+      protocol: TCP
+{{- end }}

@@ -71,6 +71,11 @@ app.kubernetes.io/component: collector
 app.kubernetes.io/component: aggregator
 {{- end -}}
 
+{{- define "olaitan.ollama.selectorLabels" -}}
+{{ include "olaitan.selectorLabels" . }}
+app.kubernetes.io/component: ollama
+{{- end -}}
+
 {{/*
 ServiceAccount name helpers. Each ring has its own SA so the RBAC grant
 stays ring-scoped (Dev Notes § "RBAC: Role vs ClusterRole split"). The
