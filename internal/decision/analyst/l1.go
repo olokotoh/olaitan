@@ -52,10 +52,12 @@ var l1SchemaJSON []byte
 // policy. Errors returned by Run wrap exactly one of these; callers
 // branch with errors.Is.
 var (
-	// ErrSchemaViolation marks a response that failed the L1Hypothesis
-	// contract: empty body, undecodable JSON, JSON-schema validation
-	// failure, or a cited event_id absent from the input package (AC3).
-	ErrSchemaViolation = errors.New("analyst: response violates the L1Hypothesis contract")
+	// ErrSchemaViolation marks a response that failed its role schema
+	// contract (l1_hypothesis.v1 or l2_verification.v1): empty body,
+	// undecodable JSON, JSON-schema validation failure, or a referenced
+	// event_id absent from the input package. The wrapped detail names
+	// the violated schema version.
+	ErrSchemaViolation = errors.New("analyst: response violates the role schema contract")
 	// ErrProviderUnavailable marks a provider.Analyse failure of any
 	// kind, including the per-role timeout (the transport metric
 	// distinguishes timeouts; the decision level does not), a reply
@@ -74,6 +76,16 @@ var (
 	// (the olaitan_decision_llm_calls_total family counts
 	// provider-reaching runs; round-1 review amendment to BI-8).
 	ErrNoCitableEvents = errors.New("analyst: evidence package has no citable event ids")
+	// ErrNoHypothesis marks an empty (or whitespace-only) L1 hypothesis
+	// handed to the L2 runner: there is nothing to verify, so no
+	// provider call is spent and no decision metric is recorded (the
+	// same precondition pattern as ErrNoCitableEvents; Story 3.6
+	// round-1 review). The Story 3.7 orchestrator must never reach this
+	// in practice: a failed L1 run yields a zero-value Hypothesis AND a
+	// sentinel error that either skips L2 (ShouldSkipL2) or aborts the
+	// chain; this guard makes the contract explicit for any other
+	// caller.
+	ErrNoHypothesis = errors.New("analyst: no L1 hypothesis to verify")
 )
 
 // Decision-outcome status label values for
@@ -136,8 +148,13 @@ type L1Result struct {
 	Hypothesis schema.L1Hypothesis
 	// PromptVersion echoes PromptSpec.Version (AC4 "prompt version").
 	PromptVersion string
-	// System and User are the full input prompt pair as sent (clean by
-	// the REDACTION CONTRACT: evidence never enters prompt text).
+	// System and User are the prompt-pair INPUTS (the ConfigMap system
+	// prompt and the fixed user instruction; clean by the REDACTION
+	// CONTRACT: evidence never enters prompt text). The full user turn
+	// that crossed the wire is composed provider-side by
+	// BuildAnalystContent and is deterministic from these inputs plus
+	// the package; Story 3.13/3.14 own the prompt-content hash that
+	// pins the composed form.
 	System string
 	User   string
 	// Provider is the provider's metric label (e.g. "claude").
@@ -153,7 +170,9 @@ type L1Result struct {
 	// Latency is the wall-clock duration of the provider call.
 	Latency time.Duration
 	// Status is the BI-8 decision-outcome enum value recorded on the
-	// metric for this invocation.
+	// metric for this invocation; empty on the precondition-failure
+	// path (ErrNoCitableEvents), where no provider call was made and
+	// nothing was recorded.
 	Status string
 }
 
@@ -229,10 +248,12 @@ func compiledL1Schema() (*jsonschema.Schema, error) { return l1Schema.compiled()
 
 // Run issues one L1 analyst call for pkg and returns the audit record
 // plus the control-flow error. Exactly one outcome is recorded on
-// olaitan_decision_llm_calls_total per call (AC4). The 30-second L1
-// budget is enforced by the provider via Request.Role (Story 3.5
-// BI-10); Run makes exactly ONE provider attempt (the Story 3.10
-// three-strike policy sits above this, transport-level retries below).
+// olaitan_decision_llm_calls_total per PROVIDER-REACHING call (AC4 as
+// amended by the round-1 review: the ErrNoCitableEvents precondition
+// path records nothing). The 30-second L1 budget is enforced by the
+// provider via Request.Role (Story 3.5 BI-10); Run makes exactly ONE
+// provider attempt (the Story 3.10 three-strike policy sits above
+// this, transport-level retries below).
 func (a *L1) Run(ctx context.Context, pkg schema.EvidencePackage) (L1Result, error) {
 	res := L1Result{
 		PromptVersion: a.spec.Version,

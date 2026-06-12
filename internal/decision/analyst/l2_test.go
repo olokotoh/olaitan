@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -132,17 +133,30 @@ func TestL2RunSchemaViolations(t *testing.T) {
 		raw  string
 	}{
 		{"empty body", ""},
+		{"whitespace body", "   \n\t  "},
+		{"empty fence body", "```json\n```"},
+		{"unclosed fence", "```json\n" + `{"verdict":"confirmed"`},
+		{"payload crammed onto the fence line", "```json " + validL2Verdict + "\n```"},
 		{"not json", "looks fine to me"},
 		{"bad verdict", `{"verdict":"maybe","verified_evidence":[{"event_id":"evt-1","finding":"x"}],"confidence":50}`},
+		{"uppercase verdict", `{"verdict":"Confirmed","verified_evidence":[{"event_id":"evt-1","finding":"x"}],"confidence":50}`},
 		{"missing verdict", `{"verified_evidence":[{"event_id":"evt-1","finding":"x"}],"confidence":50}`},
 		{"empty verified_evidence", `{"verdict":"confirmed","verified_evidence":[],"confidence":50}`},
 		{"missing finding", `{"verdict":"confirmed","verified_evidence":[{"event_id":"evt-1"}],"confidence":50}`},
+		{"missing event_id", `{"verdict":"confirmed","verified_evidence":[{"finding":"x"}],"confidence":50}`},
 		{"whitespace finding", `{"verdict":"confirmed","verified_evidence":[{"event_id":"evt-1","finding":"   "}],"confidence":50}`},
 		{"whitespace contradictory entry", `{"verdict":"refuted","verified_evidence":[{"event_id":"evt-1","finding":"x"}],"contradictory_findings":["  "],"confidence":50}`},
+		{"empty contradictory entry", `{"verdict":"refuted","verified_evidence":[{"event_id":"evt-1","finding":"x"}],"contradictory_findings":[""],"confidence":50}`},
+		{"null contradictory_findings", `{"verdict":"refuted","verified_evidence":[{"event_id":"evt-1","finding":"x"}],"contradictory_findings":null,"confidence":50}`},
+		{"oversized contradictory entry", `{"verdict":"refuted","verified_evidence":[{"event_id":"evt-1","finding":"x"}],"contradictory_findings":["` + strings.Repeat("c", 501) + `"],"confidence":50}`},
 		{"unknown event_id", `{"verdict":"confirmed","verified_evidence":[{"event_id":"evt-999","finding":"x"}],"confidence":50}`},
+		{"duplicate event_id different findings", `{"verdict":"confirmed","verified_evidence":[{"event_id":"evt-1","finding":"it is a miner"},{"event_id":"evt-1","finding":"it is NOT a miner"}],"confidence":50}`},
+		{"duplicate identical entries", `{"verdict":"confirmed","verified_evidence":[{"event_id":"evt-1","finding":"x"},{"event_id":"evt-1","finding":"x"}],"confidence":50}`},
+		{"too many verified entries", `{"verdict":"confirmed","verified_evidence":[` + manyVerified(51) + `],"confidence":50}`},
 		{"extra top-level field", `{"verdict":"confirmed","verified_evidence":[{"event_id":"evt-1","finding":"x"}],"confidence":50,"threat_type":"miner"}`},
 		{"extra item field", `{"verdict":"confirmed","verified_evidence":[{"event_id":"evt-1","finding":"x","severity":"high"}],"confidence":50}`},
 		{"confidence above range", `{"verdict":"confirmed","verified_evidence":[{"event_id":"evt-1","finding":"x"}],"confidence":101}`},
+		{"confidence below range", `{"verdict":"confirmed","verified_evidence":[{"event_id":"evt-1","finding":"x"}],"confidence":-1}`},
 		{"non-integer confidence", `{"verdict":"confirmed","verified_evidence":[{"event_id":"evt-1","finding":"x"}],"confidence":55.5}`},
 		{"oversized finding", `{"verdict":"confirmed","verified_evidence":[{"event_id":"evt-1","finding":"` + strings.Repeat("f", 501) + `"}],"confidence":50}`},
 		{"too many contradictions", `{"verdict":"refuted","verified_evidence":[{"event_id":"evt-1","finding":"x"}],"contradictory_findings":[` + manyProbes(21) + `],"confidence":50}`},
@@ -179,6 +193,8 @@ func TestL2RunAcceptanceVariants(t *testing.T) {
 		{"fence wrapped", "```json\n" + validL2Verdict + "\n```"},
 		{"cr-only fence", "```json\r" + validL2Verdict + "\r```"},
 		{"integer-valued float confidence", `{"verdict":"confirmed","verified_evidence":[{"event_id":"evt-1","finding":"x"}],"confidence":66.0}`},
+		{"exponent integer confidence", `{"verdict":"confirmed","verified_evidence":[{"event_id":"evt-1","finding":"x"}],"confidence":1e2}`},
+		{"model schema_version overwritten", `{"schema_version":"bogus.v9","verdict":"confirmed","verified_evidence":[{"event_id":"evt-1","finding":"x"}],"confidence":66}`},
 		{"null schema_version", `{"schema_version":null,"verdict":"confirmed","verified_evidence":[{"event_id":"evt-1","finding":"x"}],"confidence":66}`},
 		{"trigger event id accepted", `{"verdict":"confirmed","verified_evidence":[{"event_id":"evt-trigger","finding":"x"}],"confidence":66}`},
 		{"confidence bound 0", `{"verdict":"inconclusive","verified_evidence":[{"event_id":"evt-1","finding":"x"}],"confidence":0}`},
@@ -199,6 +215,97 @@ func TestL2RunAcceptanceVariants(t *testing.T) {
 	}
 }
 
+// manyVerified builds n distinct verified_evidence objects for the
+// schema-stage maxItems check.
+func manyVerified(n int) string {
+	parts := make([]string, n)
+	for i := range parts {
+		parts[i] = `{"event_id":"evt-gen-` + string(rune('a'+i%26)) + strings.Repeat("x", i/26+1) + `","finding":"f"}`
+	}
+	return strings.Join(parts, ",")
+}
+
+// TestL2RunModelEcho pins the Response.Model echo on success and the
+// pinned-constructor fallback when the provider does not echo.
+func TestL2RunModelEcho(t *testing.T) {
+	fp := &fakeProvider{name: "fake", model: "fake-model", resp: provider.Response{Raw: validL2Verdict, Model: "fake-model-served"}}
+	l2, _ := newL2Runner(t, fp)
+	res, err := l2.Run(context.Background(), testPackage(), testL1Hypothesis())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Model != "fake-model-served" {
+		t.Errorf("model = %q, want the Response-echoed model", res.Model)
+	}
+	if res.System != "you are the L2 verifier" || res.User != l2UserInstruction {
+		t.Error("audit record does not carry the prompt-pair inputs")
+	}
+
+	fp2 := &fakeProvider{name: "fake", model: "fake-model", resp: provider.Response{Raw: validL2Verdict}}
+	l2b, _ := newL2Runner(t, fp2)
+	res2, err := l2b.Run(context.Background(), testPackage(), testL1Hypothesis())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res2.Model != "fake-model" {
+		t.Errorf("model = %q, want the pinned constructor model when Response.Model is empty", res2.Model)
+	}
+}
+
+// TestL2RunEmptyHypothesisRejected pins the round-1 precondition: a
+// zero-value (or whitespace) hypothesis means there is nothing to
+// verify; no provider call is spent and nothing is recorded.
+func TestL2RunEmptyHypothesisRejected(t *testing.T) {
+	for _, hyp := range []schema.L1Hypothesis{{}, {Hypothesis: "   \n"}} {
+		fp := &fakeProvider{name: "fake", model: "fake-model", resp: provider.Response{Raw: validL2Verdict}}
+		l2, reg := newL2Runner(t, fp)
+		res, err := l2.Run(context.Background(), testPackage(), hyp)
+		if !errors.Is(err, ErrNoHypothesis) {
+			t.Fatalf("err = %v, want ErrNoHypothesis", err)
+		}
+		if fp.calls != 0 {
+			t.Errorf("provider called %d times; the guard must fire first", fp.calls)
+		}
+		if got := familyTotal(t, reg); got != 0 {
+			t.Errorf("family total = %v, want 0", got)
+		}
+		if res.Status != "" {
+			t.Errorf("status = %q, want empty on the precondition path", res.Status)
+		}
+	}
+}
+
+// TestL2RecordLogLevels pins the Warn-on-failure escalation and the
+// per-role log message of the shared recordDecisionCall.
+func TestL2RecordLogLevels(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	reg := metrics.NewRegistry()
+	fp := &fakeProvider{name: "fake", model: "fake-model", err: errors.New("boom")}
+	l2, err := NewL2(fp, PromptSpec{System: "s", Version: "v"}, reg, logger)
+	if err != nil {
+		t.Fatalf("NewL2: %v", err)
+	}
+	_, _ = l2.Run(context.Background(), testPackage(), testL1Hypothesis())
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") {
+		t.Errorf("failure outcome not logged at Warn: %s", out)
+	}
+	if !strings.Contains(out, `msg="l2 analyst call"`) {
+		t.Errorf("log message does not carry the l2 role: %s", out)
+	}
+
+	buf.Reset()
+	fp.err = nil
+	fp.resp = provider.Response{Raw: validL2Verdict}
+	if _, err := l2.Run(context.Background(), testPackage(), testL1Hypothesis()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(buf.String(), "level=INFO") {
+		t.Errorf("success outcome not logged at Info: %s", buf.String())
+	}
+}
+
 func TestL2RunProviderError(t *testing.T) {
 	fp := &fakeProvider{name: "fake", model: "fake-model", err: errors.New("upstream 529")}
 	l2, reg := newL2Runner(t, fp)
@@ -212,10 +319,13 @@ func TestL2RunProviderError(t *testing.T) {
 	if got := counterValue(t, reg, "fake", "l2", StatusUnavailable); got != 1 {
 		t.Errorf("unavailable series = %v, want 1", got)
 	}
+	if got := familyTotal(t, reg); got != 1 {
+		t.Errorf("family total = %v, want exactly 1", got)
+	}
 }
 
 func TestL2RunTruncatedReply(t *testing.T) {
-	for _, stop := range []string{"max_tokens", "length"} {
+	for _, stop := range []string{"max_tokens", "length", "MAX_TOKENS"} {
 		fp := &fakeProvider{name: "fake", model: "fake-model", resp: provider.Response{Raw: `{"verdict":"conf`, StopReason: stop}}
 		l2, reg := newL2Runner(t, fp)
 		_, err := l2.Run(context.Background(), testPackage(), testL1Hypothesis())
@@ -224,6 +334,9 @@ func TestL2RunTruncatedReply(t *testing.T) {
 		}
 		if got := counterValue(t, reg, "fake", "l2", StatusUnavailable); got != 1 {
 			t.Errorf("unavailable series = %v, want 1", got)
+		}
+		if got := familyTotal(t, reg); got != 1 {
+			t.Errorf("family total = %v, want exactly 1", got)
 		}
 	}
 }
@@ -269,6 +382,37 @@ func TestL2RunOversizedEventIDInErrorBounded(t *testing.T) {
 	if strings.Contains(err.Error(), longID) {
 		t.Error("error carries the full 100-byte event_id; boundForLog not applied")
 	}
+	if !strings.Contains(err.Error(), strings.Repeat("z", 64)+"...") {
+		t.Errorf("error does not carry the bounded id form: %v", err)
+	}
+}
+
+func TestRecordL2Skip(t *testing.T) {
+	reg := metrics.NewRegistry()
+	vec, err := RegisterL2SkippedMetric(reg)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	RecordL2Skip(vec, "")
+	RecordL2Skip(nil, L2SkipReasonL1Unavailable)
+	RecordL2Skip(vec, L2SkipReasonL1Unavailable)
+	mfs, err := reg.Gatherer().Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != L2SkippedMetricName {
+			continue
+		}
+		if got := len(mf.GetMetric()); got != 1 {
+			t.Fatalf("family has %d series, want 1 (the empty reason must not mint a series)", got)
+		}
+		if got := mf.GetMetric()[0].GetCounter().GetValue(); got != 1 {
+			t.Errorf("skip counter = %v, want 1", got)
+		}
+		return
+	}
+	t.Fatalf("%s not found in registry", L2SkippedMetricName)
 }
 
 func TestNewL2Validation(t *testing.T) {

@@ -78,7 +78,7 @@ func TestL2SchemaJSONYAMLAgreement(t *testing.T) {
 // reported under.
 var invalidL2ExemplarKeyword = map[string]string{
 	"l2_verification_invalid_bad_verdict.json":      "value must be one of",
-	"l2_verification_invalid_missing_finding.json":  "finding",
+	"l2_verification_invalid_missing_finding.json":  "missing property",
 	"l2_verification_invalid_empty_verified.json":   "minItems",
 	"l2_verification_invalid_confidence_range.json": "maximum",
 }

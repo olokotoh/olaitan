@@ -5,16 +5,27 @@
   "description": "Story 3.6 structured verification verdict (FR23). AUTHORITATIVE validation source for the L2 sub-agent response contract; l2_verification.yaml is the human-readable mirror and internal/decision/analyst/l2_verification_schema.json is the byte-identical embedded runtime copy. schema_version is optional (or null) on the model side: the L2 runner force-stamps l2_verification.v1 after validation. The referential rule that every verified_evidence event_id must exist in the input EvidencePackage, and the whitespace-only rejection of finding and contradictory_findings entries, are enforced programmatically by the runner. Size bounds on every model-controlled field follow the Story 3.5 round-1 convention so a hostile or runaway reply cannot relay unbounded content into checkpointing, audit, or the Senior prompt.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["verdict", "verified_evidence", "confidence"],
+  "required": [
+    "verdict",
+    "verified_evidence",
+    "confidence"
+  ],
   "properties": {
     "schema_version": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "maxLength": 64,
       "description": "Stamped to l2_verification.v1 by the runner; optional (or null) from the model."
     },
     "verdict": {
       "type": "string",
-      "enum": ["confirmed", "refuted", "inconclusive"],
+      "enum": [
+        "confirmed",
+        "refuted",
+        "inconclusive"
+      ],
       "description": "The L2 verdict on the L1 hypothesis (FR23 closed set)."
     },
     "verified_evidence": {
@@ -26,7 +37,10 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["event_id", "finding"],
+        "required": [
+          "event_id",
+          "finding"
+        ],
         "properties": {
           "event_id": {
             "type": "string",
@@ -49,7 +63,8 @@
       "description": "Findings that contradict the L1 hypothesis; preserved verbatim for the Senior's challenge (AC3).",
       "items": {
         "type": "string",
-        "maxLength": 500
+        "maxLength": 500,
+        "minLength": 1
       }
     },
     "confidence": {

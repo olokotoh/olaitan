@@ -37,9 +37,9 @@ var l2Schema = &schemaCompiler{name: "l2_verification_schema.json", doc: l2Schem
 // instruction after this text.
 const l2UserInstruction = "Verify the L1 analyst's hypothesis (provided in the l1_hypothesis block) against the " +
 	"following Kubernetes runtime evidence package, evidence by evidence. State your verdict as exactly one of " +
-	"confirmed, refuted, or inconclusive; give a per-event finding for each event you examined, citing its event id " +
-	"from the package; list any findings that contradict the L1 hypothesis; and give an integer confidence between " +
-	"0 and 100."
+	"confirmed, refuted, or inconclusive; give one finding per examined event (at most the 50 most relevant events, " +
+	"one entry per event id), citing its event id from the package; list any findings that contradict the L1 " +
+	"hypothesis; and give an integer confidence between 0 and 100."
 
 // L2SkipReasonL1Unavailable is the bounded reason label recorded when
 // the chain skips L2 because L1 was unavailable (AC4).
@@ -73,9 +73,13 @@ type L2Result struct {
 	Verification schema.L2Verification
 	// PromptVersion echoes PromptSpec.Version.
 	PromptVersion string
-	// System and User are the full input prompt pair as sent (clean by
-	// the REDACTION CONTRACT; the L1 hypothesis travels on
-	// Request.PriorHypothesis, never in prompt text).
+	// System and User are the prompt-pair INPUTS (the ConfigMap system
+	// prompt and the fixed user instruction; clean by the REDACTION
+	// CONTRACT). The full user turn that crossed the wire is composed
+	// provider-side by BuildAnalystContent (instruction + framed
+	// evidence + framed hypothesis + output contract) and is
+	// deterministic from these inputs plus the package; Story 3.13/3.14
+	// own the prompt-content hash that pins the composed form.
 	System string
 	User   string
 	// Provider is the provider's metric label (e.g. "claude").
@@ -91,7 +95,9 @@ type L2Result struct {
 	// Latency is the wall-clock duration of the provider call.
 	Latency time.Duration
 	// Status is the BI-8 decision-outcome enum value recorded on the
-	// metric for this invocation.
+	// metric for this invocation; empty on the precondition-failure
+	// paths (ErrNoHypothesis, ErrNoCitableEvents), where no provider
+	// call was made and nothing was recorded.
 	Status string
 }
 
@@ -140,6 +146,10 @@ func (a *L2) Run(ctx context.Context, pkg schema.EvidencePackage, hyp schema.L1H
 		User:          l2UserInstruction,
 		Provider:      a.provider.Name(),
 		Model:         a.provider.Model(),
+	}
+
+	if strings.TrimSpace(hyp.Hypothesis) == "" {
+		return res, fmt.Errorf("%w: package %s arrived with an empty hypothesis (a failed L1 run yields a zero value; consult ShouldSkipL2 before spawning L2)", ErrNoHypothesis, pkg.PackageID)
 	}
 
 	known := citableEventIDs(pkg)
@@ -235,6 +245,12 @@ func parseL2Verification(sch *jsonschema.Schema, raw string, known map[string]st
 		Confidence:            int(wire.Confidence),
 	}
 
+	// One narrative entry per event: duplicate event_ids would let a
+	// reply spend every slot restating (or contradicting) one event,
+	// and two verdicts for the same event would reach the Senior as one
+	// clean success (round-1 review). uniqueItems only rejects
+	// whole-object duplicates, so the per-id rule lives here.
+	seen := make(map[string]struct{}, len(verification.VerifiedEvidence))
 	for i, v := range verification.VerifiedEvidence {
 		if strings.TrimSpace(v.Finding) == "" {
 			return zero, fmt.Errorf("verified_evidence[%d].finding is whitespace-only", i)
@@ -242,6 +258,10 @@ func parseL2Verification(sch *jsonschema.Schema, raw string, known map[string]st
 		if _, ok := known[v.EventID]; !ok {
 			return zero, fmt.Errorf("verified event_id %q is not present in package %s", boundForLog(v.EventID), packageID)
 		}
+		if _, dup := seen[v.EventID]; dup {
+			return zero, fmt.Errorf("verified_evidence[%d] repeats event_id %q; the narrative is one entry per event", i, boundForLog(v.EventID))
+		}
+		seen[v.EventID] = struct{}{}
 	}
 	for i, c := range verification.ContradictoryFindings {
 		if strings.TrimSpace(c) == "" {

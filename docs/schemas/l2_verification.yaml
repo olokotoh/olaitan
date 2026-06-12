@@ -21,11 +21,11 @@
 schema: l2_verification.v1
 fields:
   schema_version:
-    type: string
+    type: string-or-null
     required: false
     description: >
       Stamped to "l2_verification.v1" by the runner; optional (or null)
-      from the model. maxLength 64.
+      from the model (JSON type ["string", "null"]). maxLength 64.
   verdict:
     type: string
     required: true
@@ -44,8 +44,11 @@ fields:
     required: false
     description: >
       Findings that contradict the L1 hypothesis; preserved verbatim for
-      the Senior's challenge (AC3). Up to 20 entries, each maxLength 500,
-      non-whitespace (runner-enforced).
+      the Senior's challenge (AC3). Up to 20 entries, each minLength 1
+      and maxLength 500; whitespace-only entries and null arrays are
+      rejected (minLength schema-side, the rest runner-enforced). One
+      narrative entry per event_id across verified_evidence
+      (runner-enforced).
   confidence:
     type: integer
     required: true
