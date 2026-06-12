@@ -1,0 +1,8 @@
+{
+  "hypothesis": "A verdict smuggling an unknown field.",
+  "cited_evidence": [
+    {"event_id": "evt-1"}
+  ],
+  "confidence": 40,
+  "recommended_state": "QUARANTINED"
+}

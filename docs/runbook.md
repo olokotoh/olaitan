@@ -499,8 +499,8 @@ official `anthropic-sdk-go`. This resolves the architecture.md:308 deferral
 (official SDK chosen over a raw HTTPS client: stable, typed error classes for
 the retry predicate, custom base URL for the integration boundary, structured
 output support). The package layout follows architecture.md:292 --
-`internal/agent/provider/`, NOT the empty `internal/decision/analyst/`
-placeholder, which is reserved for the Story 3.5-3.7 agent code.
+`internal/agent/provider/`, NOT `internal/decision/analyst/`, which
+hosts the Story 3.5-3.7 agent code (the L1 runner landed in Story 3.5).
 
 **Metric: `olaitan_llm_calls_total`** (counter, unitless).
 Labels: `{provider, role, status}`; `provider` in `{claude, openai,
@@ -525,6 +525,32 @@ Sample PromQL -- dashboard rate:
 `sum by (role, status) (rate(olaitan_llm_calls_total[5m]))`;
 alerting predicate (sustained transport failure):
 `sum(rate(olaitan_llm_calls_total{status=~"transient_failure|timeout"}[10m])) > 0.1`.
+
+**Metric: `olaitan_decision_llm_calls_total`** (counter, unitless).
+Labels: `{provider, role, status}`; `role` in `{l1, l2, senior}` (the
+emitting chain roles; the DFIR agent reports through the transport family
+only), `status` is the architecture B7 `llm_status` enum. One increment
+per PROVIDER-REACHING runner `Run` (Story 3.5; a package with no citable
+event ids fails fast with ErrNoCitableEvents before the provider call and
+records nothing): this is the DECISION-level outcome after
+response validation, complementing the transport-level
+`olaitan_llm_calls_total` (one `Run` maps to exactly one `Analyse` call,
+which may itself have retried internally). Bounded envelope 3 providers
+x 3 roles x 4 statuses = 36 series; only `role="l1"` emits as of Story
+3.5. Registration is SHARED and idempotent
+(`analyst.RegisterDecisionCallsMetric`), so the Story 3.6/3.7 runners
+join the same family.
+
+| status | Meaning |
+|---|---|
+| `success` | The reply parsed, validated against `l1_hypothesis.v1` and passed the referential checks. |
+| `unavailable` | `Provider.Analyse` failed (transport failure, exhausted retries, the per-role timeout, or caller-context cancellation), or the reply was truncated by the output-token ceiling (stop reason `max_tokens`/`length`). |
+| `schema_violation` | The reply failed the role schema contract: empty body, undecodable JSON, JSON-Schema failure (incl. the size bounds), a whitespace-only hypothesis, or a cited `event_id` absent from the input package. |
+| `success_low_confidence` | RESERVED for the Story 3.7 Senior (validated assessment below the acting threshold); never emitted before then. |
+
+Sample PromQL -- schema-violation rate per provider (feeds the Story
+3.10 three-strike policy dashboards):
+`sum by (provider) (rate(olaitan_decision_llm_calls_total{status="schema_violation"}[10m]))`.
 
 **Per-role timeout table (total budget across ALL retry attempts):**
 

@@ -1,0 +1,52 @@
+# Canonical on-wire shape of schema.L1Hypothesis.
+#
+# AUTHORITATIVE validation source: docs/schemas/l1_hypothesis.json
+# (draft 2020-12). This YAML is the documentation mirror in the
+# docs/schemas/state_transition.yaml style; the .json is what the
+# Story 3.5 L1 runner validates model responses against, via the
+# byte-identical embedded copy at
+# internal/decision/analyst/l1_hypothesis_schema.json. Source of truth
+# for the Go shape: internal/schema/hypothesis.go (type L1Hypothesis).
+#
+# Story 3.5 (FR21). The structured first-pass verdict of the L1 triage
+# analyst. schema_version is optional (or null) on the model side and
+# force-stamped to l1_hypothesis.v1 by the runner after validation. The
+# AC3 referential rule (every cited event_id must exist in the input
+# EvidencePackage) and the whitespace-only-hypothesis rejection are
+# enforced programmatically by the runner; JSON Schema cannot express
+# either. Size bounds on every model-controlled field (round-1 review)
+# cap what a hostile or runaway reply can relay into checkpointing
+# (Story 3.9), audit (Story 3.14), or later chain prompts.
+schema: l1_hypothesis.v1
+fields:
+  schema_version:
+    type: string
+    required: false
+    description: >
+      Stamped to "l1_hypothesis.v1" by the runner; optional (or null)
+      from the model. maxLength 64.
+  hypothesis:
+    type: string
+    required: true
+    description: >
+      The single most plausible hypothesis about the observed activity.
+      Non-empty, maxLength 2000; whitespace-only text is rejected by the
+      runner.
+  cited_evidence:
+    type: array
+    required: true
+    description: >
+      Events from the input package the hypothesis rests on. 1 to 50
+      entries, uniqueItems. Each entry carries event_id (required,
+      maxLength 256, must exist in the input EvidencePackage per AC3)
+      and an optional one-line relevance note (maxLength 500).
+  follow_up_probes:
+    type: array
+    required: false
+    description: >
+      Free-text follow-up probes the L1 analyst requests; consumed by
+      later chain stages. Up to 20 entries, each maxLength 500.
+  confidence:
+    type: integer
+    required: true
+    description: Structured confidence in [0,100] (FR21).

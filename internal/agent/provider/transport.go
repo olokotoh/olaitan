@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -61,16 +62,40 @@ func ResolveStatus(err error, isPermanent func(error) bool, callCtx, parentCtx c
 	}
 }
 
+// escapeAngleBrackets rewrites every '<' byte in a marshalled JSON
+// document to the JSON string escape sequence \u003c. In valid JSON a
+// literal '<' can only occur inside a string literal, so the rewrite is
+// JSON-equivalent; afterwards the document cannot contain the angle
+// bracket the framing delimiters below depend on (DW3.3-1, Story 3.5
+// BI-7). encoding/json already escapes '<' in the strings it encodes
+// itself, but json.RawMessage fields (schema.Event.Raw) pass through
+// marshalling verbatim, so the guarantee must be enforced here.
+func escapeAngleBrackets(doc []byte) []byte {
+	return bytes.ReplaceAll(doc, []byte("<"), []byte(`\u003c`))
+}
+
 // BuildAnalystContent composes the user-turn text every provider
 // transports (Story 3.2 BI-9 / Story 3.3 BI-2.1, byte-compatible across
 // providers): the orchestrator's user prompt, the REDACTED evidence
 // package in a tagged block, the optional prior assessment, and the
 // output-contract instruction. The caller passes the redacted copy; this
 // function never sees the un-redacted package.
+//
+// Framing hardening (DW3.3-1, Story 3.5 BI-7): the evidence and
+// prior-assessment payloads are angle-bracket-escaped after marshalling
+// so no payload byte can close (or open) a framing tag; a defensive
+// invariant check rejects any payload that somehow retains a '<'. The
+// framing tags themselves and the req.Schema block are NOT escaped:
+// the schema is repo-owned trusted content (the committed role schema),
+// never attacker-influenced evidence.
 func BuildAnalystContent(redacted schema.EvidencePackage, req Request) (string, error) {
 	evidence, err := json.Marshal(redacted)
 	if err != nil {
 		return "", fmt.Errorf("provider: marshal redacted evidence: %w", err)
+	}
+	evidence = escapeAngleBrackets(evidence)
+	if bytes.IndexByte(evidence, '<') >= 0 {
+		return "", errors.New("provider: evidence payload retained a '<' after escaping")
 	}
 
 	var sb strings.Builder
@@ -82,6 +107,10 @@ func BuildAnalystContent(redacted schema.EvidencePackage, req Request) (string, 
 		prior, perr := json.Marshal(req.PriorAssessment)
 		if perr != nil {
 			return "", fmt.Errorf("provider: marshal prior assessment: %w", perr)
+		}
+		prior = escapeAngleBrackets(prior)
+		if bytes.IndexByte(prior, '<') >= 0 {
+			return "", errors.New("provider: prior assessment retained a '<' after escaping")
 		}
 		sb.WriteString("\n\n<prior_assessment>\n")
 		sb.Write(prior)
