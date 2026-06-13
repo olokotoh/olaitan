@@ -142,18 +142,19 @@ type Config struct {
 
 // Provider is the OpenAI-compatible implementation of provider.Provider.
 type Provider struct {
-	httpc     *http.Client
-	baseURL   string
-	key       string
-	model     string
-	maxTokens int64
-	scoreCap  int
-	maxCtx    int
-	calls     *prometheus.CounterVec
-	sink      *redact.RedactionAuditSink
-	log       *slog.Logger
-	timeouts  map[provider.Role]time.Duration
-	strategy  retry.Strategy
+	httpc        *http.Client
+	baseURL      string
+	key          string
+	model        string
+	maxTokens    int64
+	scoreCap     int
+	maxCtx       int
+	calls        *prometheus.CounterVec
+	callDuration *prometheus.HistogramVec
+	sink         *redact.RedactionAuditSink
+	log          *slog.Logger
+	timeouts     map[provider.Role]time.Duration
+	strategy     retry.Strategy
 }
 
 // Compile-time interface conformance.
@@ -218,6 +219,10 @@ func New(cfg Config, apiKey string, reg *metrics.Registry, sink *redact.Redactio
 	if err != nil {
 		return nil, fmt.Errorf("openai: %w", err)
 	}
+	callDuration, err := provider.RegisterCallDurationMetric(reg)
+	if err != nil {
+		return nil, fmt.Errorf("openai: %w", err)
+	}
 
 	p := &Provider{
 		// No client-level timeout: the per-role context is the sole,
@@ -232,16 +237,17 @@ func New(cfg Config, apiKey string, reg *metrics.Registry, sink *redact.Redactio
 				return http.ErrUseLastResponse
 			},
 		},
-		baseURL:   baseURL,
-		key:       apiKey,
-		model:     cfg.Model,
-		maxTokens: maxTokens,
-		scoreCap:  scoreCap,
-		maxCtx:    maxCtx,
-		calls:     calls,
-		sink:      sink,
-		log:       log,
-		timeouts:  provider.DefaultRoleTimeouts(),
+		baseURL:      baseURL,
+		key:          apiKey,
+		model:        cfg.Model,
+		maxTokens:    maxTokens,
+		scoreCap:     scoreCap,
+		maxCtx:       maxCtx,
+		calls:        calls,
+		callDuration: callDuration,
+		sink:         sink,
+		log:          log,
+		timeouts:     provider.DefaultRoleTimeouts(),
 		strategy: retry.Strategy{
 			Min:         1 * time.Second,
 			Max:         16 * time.Second,
@@ -340,8 +346,10 @@ func (p *Provider) Analyse(ctx context.Context, req provider.Request) (provider.
 	}
 
 	status := provider.StatusTransient
+	start := time.Now()
 	defer func() {
 		p.calls.WithLabelValues(providerName, string(req.Role), status).Inc()
+		p.callDuration.WithLabelValues(providerName, string(req.Role)).Observe(time.Since(start).Seconds())
 	}()
 
 	cctx, cancel := context.WithTimeout(ctx, p.timeouts[req.Role])

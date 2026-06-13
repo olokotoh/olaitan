@@ -259,6 +259,41 @@ func TestAnalyseSuccessAndWireShape(t *testing.T) {
 	if v, _ := counterValue(t, reg, "ollama", "l1", provider.StatusSuccess); v != 1 {
 		t.Errorf("metric {ollama,l1,success} = %v, want 1", v)
 	}
+	// Story 3.15 (FR50): the call observed exactly one latency sample on
+	// olaitan_llm_call_duration_seconds{provider=ollama,role=l1}.
+	if n := durationSampleCount(t, reg, "ollama", "l1"); n != 1 {
+		t.Errorf("olaitan_llm_call_duration_seconds{ollama,l1} sample count = %d, want 1", n)
+	}
+}
+
+// durationSampleCount returns the observation count of the
+// olaitan_llm_call_duration_seconds histogram for {provider,role}.
+func durationSampleCount(t *testing.T, reg *metrics.Registry, prov, role string) uint64 {
+	t.Helper()
+	mfs, err := reg.Gatherer().Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != provider.CallDurationMetricName {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			for name := range labels {
+				if name != "provider" && name != "role" {
+					t.Errorf("unexpected duration label %q (bounded set is provider/role)", name)
+				}
+			}
+			if labels["provider"] == prov && labels["role"] == role {
+				return m.GetHistogram().GetSampleCount()
+			}
+		}
+	}
+	return 0
 }
 
 func TestAnalyse500Then200Retries(t *testing.T) {

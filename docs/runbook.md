@@ -593,14 +593,16 @@ sketch, effective once Story 3.8 wires the chain trigger -- sustained
 L1 failure starving the verification stage:
 `sum(rate(olaitan_decision_llm_l2_skipped_total{reason="l1_unavailable"}[10m])) > 0.05`.
 
-**Metric: `olaitan_decision_llm_cap_violation_total`** (counter, no labels).
+**Metric: `olaitan_llm_cap_violation_total`** (counter, no labels; renamed
+from `olaitan_decision_llm_cap_violation_total` to the FR50 canonical name in
+Story 3.15).
 Refused attempts to write an `llm_capped_confidence` above the Senior
 provider's score cap: the Trust-Bounded LLM Integration code guard
 (Story 3.7 AC3, `analyst.GuardCappedConfidence`). ZERO in healthy
 operation -- the orchestrator caps by construction via
 `min(raw_confidence, ScoreCap)`, so any increment means a code path
 bypassed the cap arithmetic; alert on ANY increment:
-`increase(olaitan_decision_llm_cap_violation_total[5m]) > 0`. The Story
+`increase(olaitan_llm_cap_violation_total[5m]) > 0`. The Story
 3.11 FSM-feeding path MUST route through the same guard. Both
 `raw_confidence` and `llm_capped_confidence` are recorded on the
 assessment for audit traceability (AC2); the architecture bound
@@ -909,6 +911,32 @@ client (no SDK, no external egress).
   when `ollama.enabled` is on and no endpoint is set, the chart
   DERIVES the rendered Service DNS for the actual release and
   namespace, so the overlay works under any install name.
+
+### 1.4d LLM observability surface (Story 3.15, FR50/NFR32)
+
+The complete FR50 LLM-tier metric set. Each carries a documented type, unit,
+and bounded label set (NFR32). The five Epic-6 Grafana panels ("LLM provider
+health", "Per-role latency", "Cap-violation alerts", "Circuit breaker
+engagement", "Prompt version history") derive from exactly these.
+
+| Metric | Type | Unit | Labels | Story |
+|---|---|---|---|---|
+| `olaitan_llm_calls_total` | counter | calls | `provider`, `role`, `status` | 3.2 |
+| `olaitan_llm_call_duration_seconds` | histogram | seconds | `provider`, `role` | 3.15 NEW |
+| `olaitan_llm_fallback_total` | counter | fall-throughs | `from_provider`, `to_provider`, `role` | 3.10 |
+| `olaitan_llm_cap_violation_total` | counter | violations | (none) | 3.7 (renamed 3.15) |
+| `olaitan_llm_circuit_breaker_engaged_total` | counter | engagements | (none) | 3.12 |
+| `olaitan_llm_prompt_version` | gauge (info) | 1 | `role`, `hash` | 3.15 NEW |
+
+Sample PromQL (one per panel):
+- **Provider error rate:** `sum by (provider) (rate(olaitan_llm_calls_total{status!="success"}[5m])) / sum by (provider) (rate(olaitan_llm_calls_total[5m]))`.
+- **Per-role p99 latency:** `histogram_quantile(0.99, sum by (le,role) (rate(olaitan_llm_call_duration_seconds_bucket[5m])))` — alert when the L1/L2 series exceeds the 30 s budget or Senior the 60 s budget (NFR4/NFR5).
+- **Fallback rate (primary flaky):** `sum by (role) (rate(olaitan_llm_fallback_total[10m])) > 0` sustained means the primary provider is failing and Ollama is absorbing.
+- **Cap-violation alert (trust-bound breach):** `increase(olaitan_llm_cap_violation_total[5m]) > 0` — page on ANY increment; a healthy system caps by construction.
+- **Circuit-breaker engagement:** `increase(olaitan_llm_circuit_breaker_engaged_total[10m]) > 0` — an attack-driven cost burst or a too-low `rate_per_min`.
+- **Prompt-version history (drift):** `olaitan_llm_prompt_version` — exactly one series per role reads 1; `count by (role) (olaitan_llm_prompt_version) > 1` should never fire, and a `changes()` over the `{role,hash}` series timeline shows when a prompt was tuned (correlate with the `prompt_version_changed` log and the `AUDIT.assessments` prompt hashes).
+
+Note: `olaitan_decision_llm_calls_total{provider,role,status}` (the analyst DECISION-outcome counter) and `olaitan_decision_llm_l2_skipped_total` are additional internal metrics distinct from the FR50 transport surface above; they keep their `decision_` names.
 
 ### 1.5 Naming-convention reconciliation
 

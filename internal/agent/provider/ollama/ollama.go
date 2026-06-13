@@ -155,17 +155,18 @@ type Config struct {
 
 // Provider is the Ollama implementation of provider.Provider.
 type Provider struct {
-	httpc      *http.Client
-	endpoint   string
-	model      string
-	numPredict int64
-	scoreCap   int
-	maxCtx     int
-	calls      *prometheus.CounterVec
-	sink       *redact.RedactionAuditSink
-	log        *slog.Logger
-	timeouts   map[provider.Role]time.Duration
-	strategy   retry.Strategy
+	httpc        *http.Client
+	endpoint     string
+	model        string
+	numPredict   int64
+	scoreCap     int
+	maxCtx       int
+	calls        *prometheus.CounterVec
+	callDuration *prometheus.HistogramVec
+	sink         *redact.RedactionAuditSink
+	log          *slog.Logger
+	timeouts     map[provider.Role]time.Duration
+	strategy     retry.Strategy
 }
 
 // Compile-time interface conformance.
@@ -219,6 +220,10 @@ func New(cfg Config, reg *metrics.Registry, sink *redact.RedactionAuditSink, log
 		maxCtx = DefaultMaxContextTokens
 	}
 
+	callDuration, err := provider.RegisterCallDurationMetric(reg)
+	if err != nil {
+		return nil, fmt.Errorf("ollama: %w", err)
+	}
 	calls, err := provider.RegisterCallsMetric(reg)
 	if err != nil {
 		return nil, fmt.Errorf("ollama: %w", err)
@@ -236,15 +241,16 @@ func New(cfg Config, reg *metrics.Registry, sink *redact.RedactionAuditSink, log
 				return http.ErrUseLastResponse
 			},
 		},
-		endpoint:   endpoint,
-		model:      cfg.Model,
-		numPredict: numPredict,
-		scoreCap:   scoreCap,
-		maxCtx:     maxCtx,
-		calls:      calls,
-		sink:       sink,
-		log:        log,
-		timeouts:   provider.DefaultRoleTimeouts(),
+		endpoint:     endpoint,
+		model:        cfg.Model,
+		numPredict:   numPredict,
+		scoreCap:     scoreCap,
+		maxCtx:       maxCtx,
+		calls:        calls,
+		callDuration: callDuration,
+		sink:         sink,
+		log:          log,
+		timeouts:     provider.DefaultRoleTimeouts(),
 		strategy: retry.Strategy{
 			Min:         1 * time.Second,
 			Max:         16 * time.Second,
@@ -346,8 +352,10 @@ func (p *Provider) Analyse(ctx context.Context, req provider.Request) (provider.
 	}
 
 	status := provider.StatusTransient
+	start := time.Now()
 	defer func() {
 		p.calls.WithLabelValues(providerName, string(req.Role), status).Inc()
+		p.callDuration.WithLabelValues(providerName, string(req.Role)).Observe(time.Since(start).Seconds())
 	}()
 
 	cctx, cancel := context.WithTimeout(ctx, p.timeouts[req.Role])

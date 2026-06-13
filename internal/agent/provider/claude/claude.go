@@ -137,15 +137,16 @@ type Config struct {
 
 // Provider is the Claude implementation of provider.Provider.
 type Provider struct {
-	client    anthropic.Client
-	model     string
-	maxTokens int64
-	scoreCap  int
-	calls     *prometheus.CounterVec
-	sink      *redact.RedactionAuditSink
-	log       *slog.Logger
-	timeouts  map[provider.Role]time.Duration
-	strategy  retry.Strategy
+	client       anthropic.Client
+	model        string
+	maxTokens    int64
+	scoreCap     int
+	calls        *prometheus.CounterVec
+	callDuration *prometheus.HistogramVec
+	sink         *redact.RedactionAuditSink
+	log          *slog.Logger
+	timeouts     map[provider.Role]time.Duration
+	strategy     retry.Strategy
 }
 
 // Compile-time interface conformance (Story 3.2 Task 2.2).
@@ -183,6 +184,10 @@ func New(cfg Config, apiKey string, reg *metrics.Registry, sink *redact.Redactio
 	if err != nil {
 		return nil, fmt.Errorf("claude: %w", err)
 	}
+	callDuration, err := provider.RegisterCallDurationMetric(reg)
+	if err != nil {
+		return nil, fmt.Errorf("claude: %w", err)
+	}
 
 	// WithoutEnvironmentDefaults keeps construction deterministic: a stray
 	// ANTHROPIC_API_KEY or ANTHROPIC_BASE_URL on the host can neither
@@ -199,14 +204,15 @@ func New(cfg Config, apiKey string, reg *metrics.Registry, sink *redact.Redactio
 	}
 
 	p := &Provider{
-		client:    anthropic.NewClient(opts...),
-		model:     model,
-		maxTokens: maxTokens,
-		scoreCap:  scoreCap,
-		calls:     calls,
-		sink:      sink,
-		log:       log,
-		timeouts:  roleTimeouts,
+		client:       anthropic.NewClient(opts...),
+		model:        model,
+		maxTokens:    maxTokens,
+		scoreCap:     scoreCap,
+		calls:        calls,
+		callDuration: callDuration,
+		sink:         sink,
+		log:          log,
+		timeouts:     roleTimeouts,
 		strategy: retry.Strategy{
 			Min:         1 * time.Second,
 			Max:         16 * time.Second,
@@ -263,8 +269,10 @@ func (p *Provider) Analyse(ctx context.Context, req provider.Request) (provider.
 	}
 
 	status := statusTransient
+	start := time.Now()
 	defer func() {
 		p.calls.WithLabelValues(providerName, string(req.Role), status).Inc()
+		p.callDuration.WithLabelValues(providerName, string(req.Role)).Observe(time.Since(start).Seconds())
 	}()
 
 	cctx, cancel := context.WithTimeout(ctx, p.timeouts[req.Role])
