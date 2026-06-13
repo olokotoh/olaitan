@@ -2,14 +2,12 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"time"
 
-	"github.com/nats-io/nats.go/jetstream"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/olokotoh/olaitan/internal/agent/provider"
@@ -19,11 +17,9 @@ import (
 	"github.com/olokotoh/olaitan/internal/config"
 	"github.com/olokotoh/olaitan/internal/decision/analyst"
 	"github.com/olokotoh/olaitan/internal/metrics"
-	natsclient "github.com/olokotoh/olaitan/internal/nats"
 	reportredact "github.com/olokotoh/olaitan/internal/report/redact"
 	responseaudit "github.com/olokotoh/olaitan/internal/response/audit"
 	"github.com/olokotoh/olaitan/internal/schema"
-	"github.com/olokotoh/olaitan/internal/subjects"
 )
 
 // Default per-role system prompts (Story 3.8). The prompt ConfigMap that
@@ -277,74 +273,17 @@ func buildInvestigationChain(cfg *config.Config, apiKey string, reg *metrics.Reg
 	return chain, true, nil
 }
 
-// wireInvestigationChain runs the Story 3.8 investigation-chain consumer
-// alongside the deterministic FSM consumer. For each qualifying package
-// (the FR19 trigger gate) it runs the chain and publishes the resulting
-// assessment to AUDIT.assessments. It does NOT drive an FSM transition:
-// the LLM score fold is Story 3.11.
-func wireInvestigationChain(ctx context.Context, g groupGoer, log *slog.Logger, nc *natsclient.Client, chain *analyst.Chain, auditPub responseaudit.AssessmentAuditPublisher, runs *prometheus.CounterVec) error {
-	stream, err := nc.JetStream().Stream(ctx, "EVIDENCE")
-	if err != nil {
-		return fmt.Errorf("stream EVIDENCE: %w", err)
-	}
-	consumer, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
-		Durable:       "olaitan-investigation-chain",
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		FilterSubject: subjects.EvidencePackages,
-		MaxDeliver:    fsmConsumerMaxDeliver,
-	})
-	if err != nil {
-		return fmt.Errorf("consumer: %w", err)
-	}
-
-	mode := chain.Mode()
-	g.Go(func() error {
-		for {
-			if err := ctx.Err(); err != nil {
-				return nil
-			}
-			msg, err := consumer.Next(jetstream.FetchMaxWait(250 * time.Millisecond))
-			if err != nil {
-				if isFSMFetchTimeout(err) {
-					continue
-				}
-				log.Warn("aggregator: investigation-chain fetch failed", "err", err)
-				select {
-				case <-ctx.Done():
-					return nil
-				case <-time.After(fsmFetchBackoff):
-				}
-				continue
-			}
-
-			var pkg schema.EvidencePackage
-			if jerr := json.Unmarshal(msg.Data(), &pkg); jerr != nil {
-				log.Warn("aggregator: investigation-chain decode failed; dropping", "err", jerr)
-				_ = msg.Ack()
-				continue
-			}
-			if pkg.WorkloadID == "" {
-				log.Warn("aggregator: investigation-chain dropping package with empty workload_id", "package_id", pkg.PackageID)
-				_ = msg.Ack()
-				continue
-			}
-
-			processChainPackage(ctx, pkg, chain, mode, auditPub, runs, log)
-			_ = msg.Ack()
-		}
-	})
-	return nil
-}
-
 // processChainPackage applies the FR19 trigger gate, runs the chain on a
 // qualifying package, publishes the assessment to AUDIT.assessments, and
-// records the outcome metric. It is the per-message body of the chain
-// consumer, factored out so it is unit-testable without a live JetStream
-// connection. It returns the recorded outcome label.
-func processChainPackage(ctx context.Context, pkg schema.EvidencePackage, chain *analyst.Chain, mode string, auditPub responseaudit.AssessmentAuditPublisher, runs *prometheus.CounterVec, log *slog.Logger) string {
+// records the outcome metric. It is the per-message body of the merged FSM
+// driver (Story 3.11), factored out so it is unit-testable without a live
+// JetStream connection. It returns the per-provider-capped LLM confidence to
+// fold into the ThreatScore (0 when not triggered / errored / unavailable)
+// and the recorded outcome label.
+func processChainPackage(ctx context.Context, pkg schema.EvidencePackage, chain *analyst.Chain, mode string, auditPub responseaudit.AssessmentAuditPublisher, runs *prometheus.CounterVec, log *slog.Logger) (int, string) {
 	if !analyst.ShouldTriggerChain(pkg) {
 		analyst.RecordChainRun(runs, mode, analyst.ChainOutcomeNotTriggered)
-		return analyst.ChainOutcomeNotTriggered
+		return 0, analyst.ChainOutcomeNotTriggered
 	}
 
 	res, rerr := chain.Run(ctx, pkg)
@@ -354,8 +293,8 @@ func processChainPackage(ctx context.Context, pkg schema.EvidencePackage, chain 
 			outcome = analyst.ChainOutcomeNoCitable
 		}
 		analyst.RecordChainRun(runs, res.Mode, outcome)
-		log.Warn("aggregator: investigation chain run failed; dropping", "err", rerr, "package_id", pkg.PackageID)
-		return outcome
+		log.Warn("aggregator: investigation chain run failed; folding zero LLM confidence", "err", rerr, "package_id", pkg.PackageID)
+		return 0, outcome
 	}
 
 	evt := responseaudit.AssessmentFromChain(pkg.PackageID, pkg.WorkloadID, res.Mode, res.Assessment, time.Now().UTC())
@@ -365,11 +304,7 @@ func processChainPackage(ctx context.Context, pkg schema.EvidencePackage, chain 
 	}
 	cancel()
 	analyst.RecordChainRun(runs, res.Mode, analyst.ChainOutcomeAssessed)
-	return analyst.ChainOutcomeAssessed
-}
-
-// groupGoer is the subset of *errgroup.Group the chain consumer needs,
-// so a test can inject a capturing fake.
-type groupGoer interface {
-	Go(func() error)
+	// LLMCappedConfidence is 0 on the llm_unavailable degrade (Story 3.10),
+	// so a degraded assessment folds a zero LLM term -> deterministic-only.
+	return res.Assessment.LLMCappedConfidence, analyst.ChainOutcomeAssessed
 }

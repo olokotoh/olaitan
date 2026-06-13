@@ -209,9 +209,14 @@ func triggeringPackage(severity string) schema.EvidencePackage {
 func TestProcessChainPackageAssessedAndAudited(t *testing.T) {
 	chain := scriptedFullChain(t)
 	pub := &fakeAssessmentPub{}
-	out := processChainPackage(context.Background(), triggeringPackage("80"), chain, chain.Mode(), pub, nil, chainTestLogger())
+	llm, out := processChainPackage(context.Background(), triggeringPackage("80"), chain, chain.Mode(), pub, nil, chainTestLogger())
 	if out != analyst.ChainOutcomeAssessed {
 		t.Errorf("outcome = %q, want assessed", out)
+	}
+	// Story 3.11: an assessed run returns the per-provider-capped LLM
+	// confidence to fold into the ThreatScore (> 0 for this scripted verdict).
+	if llm <= 0 {
+		t.Errorf("assessed run returned llm_capped_confidence = %d, want > 0", llm)
 	}
 	if len(pub.got) != 1 {
 		t.Fatalf("audit publishes = %d, want 1", len(pub.got))
@@ -228,9 +233,12 @@ func TestProcessChainPackageAssessedAndAudited(t *testing.T) {
 func TestProcessChainPackageNotTriggered(t *testing.T) {
 	chain := scriptedFullChain(t)
 	pub := &fakeAssessmentPub{}
-	out := processChainPackage(context.Background(), triggeringPackage("10"), chain, chain.Mode(), pub, nil, chainTestLogger())
+	llm, out := processChainPackage(context.Background(), triggeringPackage("10"), chain, chain.Mode(), pub, nil, chainTestLogger())
 	if out != analyst.ChainOutcomeNotTriggered {
 		t.Errorf("outcome = %q, want not_triggered", out)
+	}
+	if llm != 0 {
+		t.Errorf("a non-triggering package must fold zero LLM confidence, got %d", llm)
 	}
 	if len(pub.got) != 0 {
 		t.Errorf("a non-triggering package must not publish an assessment: %v", pub.got)

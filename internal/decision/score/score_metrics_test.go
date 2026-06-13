@@ -41,7 +41,7 @@ func TestNew_RegistersMetricFamilies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newWithGetter: %v", err)
 	}
-	if _, err := c.Score(&schema.EvidencePackage{}); err != nil {
+	if _, err := c.Score(&schema.EvidencePackage{}, 0); err != nil {
 		t.Fatalf("Score: %v", err)
 	}
 
@@ -78,7 +78,7 @@ func TestScore_IncrementsEvaluationsCounter(t *testing.T) {
 	}
 
 	before := gatheredCounter(t, reg, "olaitan_decision_score_evaluations_total")
-	if _, err := c.Score(&schema.EvidencePackage{}); err != nil {
+	if _, err := c.Score(&schema.EvidencePackage{}, 0); err != nil {
 		t.Fatalf("Score: %v", err)
 	}
 	after := gatheredCounter(t, reg, "olaitan_decision_score_evaluations_total")
@@ -107,7 +107,7 @@ func TestScore_SkippedSigmaIncrementsAnomalyCounter(t *testing.T) {
 			{Metric: "neg", Sigma: -1.0},
 			{Metric: "nan", Sigma: math.NaN()},
 		},
-	}); err != nil {
+	}, 0); err != nil {
 		t.Fatalf("Score: %v", err)
 	}
 	after := gatheredCounter(t, reg, "olaitan_decision_score_anomalies_total")
@@ -134,7 +134,7 @@ func TestScore_HistogramLabelCardinalityFinite(t *testing.T) {
 		{RuleMatches: []schema.RuleMatch{{Severity: "100"}}, BaselineDeviations: []schema.BaselineDeviation{{Sigma: 10}}},
 	}
 	for _, p := range cases {
-		if _, err := c.Score(p); err != nil {
+		if _, err := c.Score(p, 0); err != nil {
 			t.Fatalf("Score: %v", err)
 		}
 	}
@@ -167,7 +167,7 @@ func TestScore_NilRegistryConstructs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newWithGetter: %v", err)
 	}
-	if _, err := c.Score(&schema.EvidencePackage{}); err != nil {
+	if _, err := c.Score(&schema.EvidencePackage{}, 0); err != nil {
 		t.Fatalf("Score: %v", err)
 	}
 }

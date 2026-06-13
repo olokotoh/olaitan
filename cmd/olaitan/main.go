@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/errgroup"
 
 	"k8s.io/client-go/kubernetes"
@@ -767,8 +768,15 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		return fmt.Errorf("aggregator: chain-enabled gauge: %w", gerr)
 	}
 	chainEnabledGauge.WithLabelValues().Set(0)
+	// Story 3.11: the chain (when enabled) is run INLINE by the single FSM
+	// driver (wireFSMConsumer), not a separate consumer. These carry the chain
+	// plumbing into that call; they stay nil/zero when the chain is disabled.
+	var assessmentPub responseaudit.AssessmentAuditPublisher
+	var chainRuns *prometheus.CounterVec
+	var chainMode string
 	if chainEnabled {
 		chainEnabledGauge.WithLabelValues().Set(1)
+		chainMode = chain.Mode()
 		// Story 3.9: attach the NATS-backed checkpoint store so the chain
 		// checkpoints L1/L2 to INVESTIGATIONS.* and resumes from them after a
 		// controller restart (the JetStream redelivery of the un-acked package
@@ -779,20 +787,18 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 			return fmt.Errorf("aggregator: checkpoint store: %w", ckErr)
 		}
 		chain.WithCheckpoints(ckStore)
-		assessmentPub, aerr := responseaudit.NewNATSAssessmentPublisher(nc)
+		pub, aerr := responseaudit.NewNATSAssessmentPublisher(nc)
 		if aerr != nil {
 			closeNATS()
 			return fmt.Errorf("aggregator: assessment audit publisher: %w", aerr)
 		}
-		chainRuns, merr := analyst.RegisterChainRunsMetric(metricsReg)
+		assessmentPub = pub
+		runs, merr := analyst.RegisterChainRunsMetric(metricsReg)
 		if merr != nil {
 			closeNATS()
 			return fmt.Errorf("aggregator: chain-runs metric: %w", merr)
 		}
-		if err := wireInvestigationChain(ctx, g, log, nc, chain, assessmentPub, chainRuns); err != nil {
-			closeNATS()
-			return fmt.Errorf("aggregator: wire investigation chain: %w", err)
-		}
+		chainRuns = runs
 	}
 
 	var sinks fsm.MultiSink
@@ -903,7 +909,7 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 			return err
 		})
 	}
-	if err := wireFSMConsumer(ctx, g, log, nc, scoreCalc, stateMachine); err != nil {
+	if err := wireFSMConsumer(ctx, g, log, nc, scoreCalc, stateMachine, chain, chainMode, assessmentPub, chainRuns); err != nil {
 		closeNATS()
 		return fmt.Errorf("aggregator: fsm consumer: %w", err)
 	}
@@ -1136,14 +1142,17 @@ const fsmConsumerMaxDeliver = 5
 // engine.
 const fsmFetchBackoff = time.Second
 
-// wireFSMConsumer wires the Story 2.2 scoring + FSM evidence consumer.
-// It creates a durable JetStream consumer on subjects.EvidencePackages,
-// scores each inbound package via scoreCalc, and folds
-// ConfidenceScore.Total into stateMachine.Evaluate keyed by the
-// package's WorkloadID (AC1/AC4). It runs on its own errgroup goroutine
-// and returns nil on graceful ctx cancellation. The FSM is the documented
-// Story 2.2 consumer of the Story 2.1 calculator; see startAggregatorRing.
-func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, nc *natsclient.Client, scoreCalc *score.Calculator, stateMachine *fsm.Machine) error {
+// wireFSMConsumer wires the Story 2.2 scoring + FSM evidence consumer, which
+// Story 3.11 makes the SINGLE FSM driver: for each package it (optionally)
+// runs the investigation chain inline when the FR19 gate triggers, folds the
+// chain's per-provider-capped LLM confidence into the ThreatScore (FR30), and
+// drives stateMachine.Evaluate once keyed by WorkloadID. A nil chain (RS mode
+// / analyst.provider=none) folds a zero LLM term, keeping the deterministic
+// Epic 2 behaviour byte-identical. The chain's audit publish + run metric are
+// recorded inline (the standalone investigation-chain consumer is removed).
+// It runs on its own errgroup goroutine and returns nil on graceful ctx
+// cancellation.
+func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, nc *natsclient.Client, scoreCalc *score.Calculator, stateMachine *fsm.Machine, chain *analyst.Chain, chainMode string, auditPub responseaudit.AssessmentAuditPublisher, chainRuns *prometheus.CounterVec) error {
 	stream, err := nc.JetStream().Stream(ctx, "EVIDENCE")
 	if err != nil {
 		return fmt.Errorf("stream EVIDENCE: %w", err)
@@ -1186,18 +1195,28 @@ func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, n
 				continue
 			}
 
-			sc, serr := scoreCalc.Score(&pkg)
-			if serr != nil {
-				log.Warn("aggregator: fsm score failed; dropping", "err", serr, "package_id", pkg.PackageID)
+			// An empty WorkloadID would key every unattributed package into a
+			// single shared FSM state, so one orphan's score would drive the
+			// state reported for all orphans. Drop and ack instead. (Checked
+			// before the chain so a chain run never fires for an undeliverable
+			// transition.)
+			if pkg.WorkloadID == "" {
+				log.Warn("aggregator: fsm consumer dropping package with empty workload_id", "package_id", pkg.PackageID)
 				_ = msg.Ack()
 				continue
 			}
 
-			// An empty WorkloadID would key every unattributed package into a
-			// single shared FSM state, so one orphan's score would drive the
-			// state reported for all orphans. Drop and ack instead.
-			if pkg.WorkloadID == "" {
-				log.Warn("aggregator: fsm consumer dropping package with empty workload_id", "package_id", pkg.PackageID)
+			// Story 3.11: run the investigation chain inline when enabled and
+			// the FR19 gate triggers, and fold its capped LLM confidence into
+			// the score. A nil chain folds 0 (deterministic-only, Epic 2).
+			llmCapped := 0
+			if chain != nil {
+				llmCapped, _ = processChainPackage(ctx, pkg, chain, chainMode, auditPub, chainRuns, log)
+			}
+
+			sc, serr := scoreCalc.Score(&pkg, llmCapped)
+			if serr != nil {
+				log.Warn("aggregator: fsm score failed; dropping", "err", serr, "package_id", pkg.PackageID)
 				_ = msg.Ack()
 				continue
 			}
