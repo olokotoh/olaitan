@@ -121,6 +121,17 @@ spec:
                 secretKeyRef:
                   name: {{ include "olaitan.fullname" . }}-secrets
                   key: redis-password
+            # Story 3.16: project the LLM API key Secret into the env var the
+            # analyst reads (config analyst.api.api_key_secret, default
+            # olaitan-llm). The aggregator runs the investigation chain; the
+            # "api" provider (claude / openai_compat) reads its key from this
+            # env. An empty Secret value degrades the chain to rules-only
+            # (NFR27) -- so this is safe to project unconditionally.
+            - name: {{ (default dict (default dict .Values.analyst).api).apiKeySecret | default "olaitan-llm" }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "olaitan.fullname" . }}-secrets
+                  key: llm-api-key
             {{- with .Values.nats.streamMaxBytesOverride }}
             # Story 1.19 D6: caps every JetStream stream's MaxBytes at
             # the given int64 byte count. Set this in CI/kind where the

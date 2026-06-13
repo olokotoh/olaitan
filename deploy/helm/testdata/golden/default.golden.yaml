@@ -873,7 +873,7 @@ data:
       api:
         endpoint: ""
         model: ""
-        api_key_secret: olaitan-llm
+        api_key_secret: "olaitan-llm"
       local:
         endpoint: "http://ollama:11434"
         model: "gemma:2b"
@@ -2126,6 +2126,17 @@ spec:
                 secretKeyRef:
                   name: olaitan-secrets
                   key: redis-password
+            # Story 3.16: project the LLM API key Secret into the env var the
+            # analyst reads (config analyst.api.api_key_secret, default
+            # olaitan-llm). The aggregator runs the investigation chain; the
+            # "api" provider (claude / openai_compat) reads its key from this
+            # env. An empty Secret value degrades the chain to rules-only
+            # (NFR27) -- so this is safe to project unconditionally.
+            - name: olaitan-llm
+              valueFrom:
+                secretKeyRef:
+                  name: olaitan-secrets
+                  key: llm-api-key
           livenessProbe:
             httpGet:
               path: /healthz

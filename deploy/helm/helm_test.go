@@ -241,12 +241,12 @@ func TestSubchartsDisabled(t *testing.T) {
 	// added here so a future PR that introduces an unintended kind
 	// (e.g. an extra Secret) trips this test.
 	want := map[string]int{
-		"ServiceAccount":        2,
-		"Role":                  1,
-		"RoleBinding":           1,
-		"ClusterRole":           1,
-		"ClusterRoleBinding":    1,
-		"Secret":                1,
+		"ServiceAccount":     2,
+		"Role":               1,
+		"RoleBinding":        1,
+		"ClusterRole":        1,
+		"ClusterRoleBinding": 1,
+		"Secret":             1,
 		// config + rules + prompts (Story 3.13 added the prompts ConfigMap).
 		"ConfigMap":             3,
 		"PersistentVolumeClaim": 1,
@@ -3494,6 +3494,141 @@ func TestAnalystLocalBridge(t *testing.T) {
 		"unset analyst.local.endpoint must keep the file-side default")
 	assertContains(t, embeddedDefaults, `model: "gemma:2b"`,
 		"unset analyst.local.model must keep the file-side default")
+}
+
+// TestEvaluationArmAblationToggles (Story 3.16, FR53) pins the LLM-bearing
+// evaluation arms: each --set evaluation.config=<arm> renders the correct
+// analyst.{provider,l2_enabled,senior_enabled}, round-trips through
+// config.Load, and resolves to the intended chain ablation mode. The legacy
+// "RSLT" alias maps to RSLT-full.
+func TestEvaluationArmAblationToggles(t *testing.T) {
+	cases := []struct {
+		arm          string
+		wantProvider string
+		wantL2       bool // L2EnabledOrDefault
+		wantSenior   bool // SeniorEnabledOrDefault (precedence: L2 off => Senior off)
+	}{
+		{"RSL", "api", false, false},          // Standard single-LLM (L1-as-Senior => L1-only)
+		{"RSLT-full", "api", true, true},      // full L1 -> L2 -> Senior
+		{"RSLT", "api", true, true},           // legacy alias for RSLT-full
+		{"RSLT-L1-only", "api", false, false}, // L1-only ablation
+		{"RSLT-L1+L2", "api", true, false},    // L1+L2 ablation (Senior off)
+	}
+	for _, tc := range cases {
+		t.Run(tc.arm, func(t *testing.T) {
+			rendered := helmTemplate(t, []string{"evaluation.config=" + tc.arm})
+			embedded := extractEmbeddedConfigYAML(t, rendered)
+			tmp := filepath.Join(t.TempDir(), "olaitan.yaml")
+			if err := os.WriteFile(tmp, []byte(embedded), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg, err := configLoad(t, tmp)
+			if err != nil {
+				t.Fatalf("arm %s config rejected by config.Load: %v", tc.arm, err)
+			}
+			if cfg.Analyst.Provider != tc.wantProvider {
+				t.Errorf("arm %s: analyst.provider = %q, want %q", tc.arm, cfg.Analyst.Provider, tc.wantProvider)
+			}
+			if cfg.Analyst.L2EnabledOrDefault() != tc.wantL2 {
+				t.Errorf("arm %s: L2EnabledOrDefault = %v, want %v", tc.arm, cfg.Analyst.L2EnabledOrDefault(), tc.wantL2)
+			}
+			if cfg.Analyst.SeniorEnabledOrDefault() != tc.wantSenior {
+				t.Errorf("arm %s: SeniorEnabledOrDefault = %v, want %v", tc.arm, cfg.Analyst.SeniorEnabledOrDefault(), tc.wantSenior)
+			}
+		})
+	}
+}
+
+// TestEvaluationArmRejectsUnknown pins the fail-fast enum: an unknown
+// RSLT-style arm fails the render with the canonical message.
+func TestEvaluationArmRejectsUnknown(t *testing.T) {
+	cmd := exec.Command("helm", "template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+		"--set", "evaluation.config=RSLT-bogus",
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatal("helm template succeeded with evaluation.config=RSLT-bogus; expected fail-fast")
+	}
+	if !strings.Contains(stderr.String(), "evaluation.config must be one of") {
+		t.Errorf("stderr did not mention the evaluation.config guard:\n%s", stderr.String())
+	}
+}
+
+// TestOllamaModeRoutesLocalWithNetworkPolicy (Story 3.16 AC5/FR48): with
+// analyst.provider=local + ollama.enabled the chart renders the in-cluster
+// Ollama Deployment + the egress-restricting NetworkPolicy, and the analyst
+// routes to the local provider (no external egress).
+func TestOllamaModeRoutesLocalWithNetworkPolicy(t *testing.T) {
+	rendered := helmTemplate(t, []string{"analyst.provider=local", "ollama.enabled=true"})
+	if !strings.Contains(rendered, "olaitan-ollama") {
+		t.Fatal("ollama Deployment/Service not rendered when ollama.enabled=true")
+	}
+	ms := parseManifests(t, rendered)
+	var sawOllamaNetpol bool
+	for _, m := range ms {
+		if m.Kind == "NetworkPolicy" && strings.Contains(m.Metadata.Name, "ollama") {
+			sawOllamaNetpol = true
+		}
+	}
+	if !sawOllamaNetpol {
+		t.Error("ollama NetworkPolicy must render to restrict Ollama reachability (FR48)")
+	}
+	embedded := extractEmbeddedConfigYAML(t, rendered)
+	tmp := filepath.Join(t.TempDir(), "olaitan.yaml")
+	if err := os.WriteFile(tmp, []byte(embedded), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := configLoad(t, tmp)
+	if err != nil {
+		t.Fatalf("ollama config rejected: %v", err)
+	}
+	if cfg.Analyst.Provider != "local" {
+		t.Errorf("analyst.provider = %q, want local (Ollama)", cfg.Analyst.Provider)
+	}
+}
+
+// loadEmbedded renders, extracts, and config.Loads the embedded config in
+// one step (Story 3.16 helper).
+func loadEmbedded(t *testing.T, sets []string) *config.Config {
+	t.Helper()
+	tmp := filepath.Join(t.TempDir(), "olaitan.yaml")
+	if err := os.WriteFile(tmp, []byte(extractEmbeddedConfigYAML(t, helmTemplate(t, sets))), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := configLoad(t, tmp)
+	if err != nil {
+		t.Fatalf("config.Load rejected the render: %v", err)
+	}
+	return cfg
+}
+
+// TestAnalystAPIEndpointAndKeyWiring (Story 3.16) pins the LLM-tier
+// deployability gap round-1 review caught: the api provider must get both its
+// endpoint (so it dials the configured server, not the vendor default) and
+// its API key (projected from the Secret into the env var the analyst reads).
+func TestAnalystAPIEndpointAndKeyWiring(t *testing.T) {
+	rendered := helmTemplate(t, []string{"secrets.llmApiKey=k"})
+	if !strings.Contains(rendered, "name: olaitan-llm") || !strings.Contains(rendered, "key: llm-api-key") {
+		t.Errorf("aggregator must project the LLM key Secret into the olaitan-llm env var\n%s", snippet(rendered, "llm-api-key"))
+	}
+	cfg := loadEmbedded(t, []string{"analyst.api.endpoint=http://fake-llm:8080/v1", "analyst.api.model=fake"})
+	if cfg.Analyst.API.Endpoint != "http://fake-llm:8080/v1" {
+		t.Errorf("analyst.api.endpoint = %q, want the bridged value", cfg.Analyst.API.Endpoint)
+	}
+	if cfg.Analyst.API.Model != "fake" {
+		t.Errorf("analyst.api.model = %q, want fake", cfg.Analyst.API.Model)
+	}
+	// A custom apiKeySecret renames the env var AND the config key in lockstep.
+	renamed := helmTemplate(t, []string{"analyst.api.apiKeySecret=MY_LLM_KEY", "secrets.llmApiKey=k"})
+	if !strings.Contains(renamed, "name: MY_LLM_KEY") {
+		t.Errorf("custom apiKeySecret must rename the env var\n%s", snippet(renamed, "llm-api-key"))
+	}
+	cfg2 := loadEmbedded(t, []string{"analyst.api.apiKeySecret=MY_LLM_KEY"})
+	if cfg2.Analyst.API.APIKeySecret != "MY_LLM_KEY" {
+		t.Errorf("analyst.api.api_key_secret = %q, want MY_LLM_KEY (env name + config must agree)", cfg2.Analyst.API.APIKeySecret)
+	}
 }
 
 // TestAnalystPerRoleBridge (Story 3.8) pins the per-role routing +

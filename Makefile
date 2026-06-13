@@ -188,5 +188,38 @@ e2e-local: helm-prepare helm-deps docker-build
 		--wait --timeout 5m
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) go test -tags=e2e -v -count=1 ./tests/e2e/...
 
+# Story 3.16 (AC7): the RSLT-full smoke. Same cluster bring-up as e2e-local,
+# but it first applies the in-cluster fake-LLM fixture (the olaitan binary's
+# `fake-llm` OpenAI-compatible canned-verdict server), then installs the chart
+# under evaluation.config=RSLT-full with every analyst role routed to the
+# fake-LLM via the openai_compat provider (analyst.api.endpoint -> the fake-LLM
+# Service), so the deployed full L1->L2->Senior chain runs against a real
+# provider transport with no external egress. The OLT_E2E_RSLT gate selects
+# the RSLT assertion test (skips the RS smoke). FR48 air-gapped: no paid LLM.
+e2e-local-rslt: helm-prepare helm-deps docker-build
+	kind get clusters | grep -q '^$(KIND_CLUSTER_NAME)$$' || \
+		kind create cluster --name $(KIND_CLUSTER_NAME) --config hack/kind-config.yaml
+	kind load docker-image $(IMAGE):$(TAG) --name $(KIND_CLUSTER_NAME)
+	kubectl apply -f tests/e2e/fixtures/fake-llm.yaml
+	kubectl wait --for=condition=available --timeout=120s deploy/fake-llm
+	helm install olaitan $(CHART_DIR) \
+		--set image.repository=$(IMAGE) \
+		--set-string image.tag=$(TAG) \
+		--set image.pullPolicy=Never \
+		--set evaluation.config=RSLT-full \
+		--set analyst.l1_provider=openai \
+		--set analyst.l2_provider=openai \
+		--set analyst.senior_provider=openai \
+		--set analyst.l1_model=fake --set analyst.l2_model=fake --set analyst.senior_model=fake \
+		--set analyst.api.endpoint=http://fake-llm:8080/v1 \
+		--set secrets.llmApiKey=fake-key \
+		--set baselines.warmupDuration=5s \
+		--set secrets.redisPassword=ci-test \
+		--set falco.enabled=false \
+		--set endpoints.falco=tcp://127.0.0.1:0 \
+		--set nats.streamMaxBytesOverride=1073741824 \
+		--wait --timeout 5m
+	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) OLT_E2E_RSLT=1 go test -tags=e2e -v -count=1 ./tests/e2e/...
+
 e2e-local-down:
 	kind delete cluster --name $(KIND_CLUSTER_NAME)

@@ -1,0 +1,54 @@
+# Story 3.16 (AC7): the in-cluster fake-LLM fixture for the RSLT-full kind
+# e2e smoke. It runs the olaitan binary's `fake-llm` subcommand (an
+# OpenAI-compatible canned-verdict server), so the deployed RSLT-full chain
+# can be exercised against a real provider transport with no external egress
+# and no paid LLM. Applied by `make e2e-local-rslt` BEFORE the chart install.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fake-llm
+  labels:
+    app: fake-llm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fake-llm
+  template:
+    metadata:
+      labels:
+        app: fake-llm
+    spec:
+      containers:
+        - name: fake-llm
+          image: olaitan:dev
+          imagePullPolicy: Never
+          command: ["/olaitan", "fake-llm", "--addr=:8080"]
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 1
+            periodSeconds: 2
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fake-llm
+  labels:
+    app: fake-llm
+spec:
+  selector:
+    app: fake-llm
+  ports:
+    - port: 8080
+      targetPort: 8080
