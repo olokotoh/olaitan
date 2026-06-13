@@ -1,0 +1,20 @@
+{
+  "schema_version": "audit.assessments.v2",
+  "package_id": "pkg-full-1",
+  "workload_id": "ns/Deployment/web",
+  "mode": "full",
+  "agents_available": ["l1", "l2", "senior"],
+  "prompt_versions": {"l1": "7bbffc43", "l2": "b9c72082", "senior": "c528d152"},
+  "providers": {"l1": "claude", "l2": "claude", "senior": "claude"},
+  "models": {"l1": "claude-haiku-4-5", "l2": "claude-haiku-4-5", "senior": "claude-opus-4-8"},
+  "threat_type": "cryptomining",
+  "raw_confidence": 80,
+  "llm_capped_confidence": 30,
+  "l1_hypothesis": {"hypothesis": "crypto miner launched", "confidence": 70},
+  "l2_verification": {"verdict": "confirmed", "confidence": 66},
+  "threat_assessment": {"threat_type": "cryptomining", "reasoning": "miner confirmed", "confidence": 80},
+  "redacted_evidence": {"package_id": "pkg-full-1", "workload_id": "ns/Deployment/web"},
+  "redaction_applied": true,
+  "decided_at": "2026-06-13T00:00:00Z",
+  "published_at": "2026-06-13T00:00:00Z"
+}

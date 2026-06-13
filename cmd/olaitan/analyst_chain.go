@@ -311,7 +311,7 @@ func processChainPackage(ctx context.Context, pkg schema.EvidencePackage, chain 
 		return 0, outcome
 	}
 
-	evt := responseaudit.AssessmentFromChain(pkg.PackageID, pkg.WorkloadID, res.Mode, res.Assessment, time.Now().UTC())
+	evt := responseaudit.AssessmentFromChain(buildAssessmentInput(pkg, res, time.Now().UTC()))
 	pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	if perr := auditPub.PublishAuditAssessment(pctx, evt); perr != nil {
 		log.Warn("aggregator: investigation-chain assessment audit publish failed", "err", perr, "package_id", pkg.PackageID)
@@ -321,6 +321,86 @@ func processChainPackage(ctx context.Context, pkg schema.EvidencePackage, chain 
 	// LLMCappedConfidence is 0 on the llm_unavailable degrade (Story 3.10),
 	// so a degraded assessment folds a zero LLM term -> deterministic-only.
 	return res.Assessment.LLMCappedConfidence, analyst.ChainOutcomeAssessed
+}
+
+// buildAssessmentInput flattens a successful ChainResult onto the ring-clean
+// audit.AssessmentInput (Story 3.14 BI-2a/BI-3): cmd is the only ring that
+// imports both internal/decision/analyst and internal/response/audit, so the
+// projection lives here, keeping the audit package free of an analyst import.
+// It redacts the package at the audit boundary (redact.Redact is the same
+// pure redaction the providers ran, so this reproduces the bytes the LLM
+// saw) and records redaction_applied=true; the RAW pkg is never put on the
+// event. Per-role prompt-version/provider/model entries are added only for
+// roles that actually ran in this mode (ablation omits the rest).
+func buildAssessmentInput(pkg schema.EvidencePackage, res analyst.ChainResult, now time.Time) responseaudit.AssessmentInput {
+	redacted, _ := reportredact.Redact(pkg)
+	assessment := res.Assessment
+	in := responseaudit.AssessmentInput{
+		PackageID:        pkg.PackageID,
+		WorkloadID:       pkg.WorkloadID,
+		Mode:             res.Mode,
+		AgentsAvailable:  assessment.AgentsAvailable,
+		PromptVersions:   map[string]string{},
+		Providers:        map[string]string{},
+		Models:           map[string]string{},
+		RawConfidence:    assessment.RawConfidence,
+		CappedConfidence: assessment.LLMCappedConfidence,
+		ThreatAssessment: &assessment,
+		RedactedEvidence: redacted,
+		RedactionApplied: true,
+		Now:              now,
+	}
+	// A role's per-role metadata is recorded only for roles that actually
+	// CONTRIBUTED to the assessment -- the authoritative set is the
+	// assessment's AgentsAvailable. This keeps the maps consistent with
+	// agents_available (round-1: a full-mode Senior that DEGRADED has its
+	// provider set before the failed call, but is excluded from
+	// AgentsAvailable, so it must not appear in the maps). Within a
+	// contributing role, an EMPTY metadata value is omitted rather than
+	// recorded as "" (round-1: a Story 3.9 checkpoint-RESUMED role carries
+	// its real hypothesis/verification but zero provider/model/version,
+	// since no provider call was made on resume).
+	contributed := make(map[string]bool, len(assessment.AgentsAvailable))
+	for _, r := range assessment.AgentsAvailable {
+		contributed[r] = true
+	}
+	addRole := func(role, version, provider, model string) {
+		if !contributed[role] {
+			return
+		}
+		if version != "" {
+			in.PromptVersions[role] = version
+		}
+		if provider != "" {
+			in.Providers[role] = provider
+		}
+		if model != "" {
+			in.Models[role] = model
+		}
+	}
+	if res.L1 != nil && contributed["l1"] {
+		addRole("l1", res.L1.PromptVersion, res.L1.Provider, res.L1.Model)
+		hyp := res.L1.Hypothesis
+		in.L1Hypothesis = &hyp
+	}
+	if res.L2 != nil && contributed["l2"] {
+		addRole("l2", res.L2.PromptVersion, res.L2.Provider, res.L2.Model)
+		ver := res.L2.Verification
+		in.L2Verification = &ver
+	}
+	addRole("senior", res.Senior.PromptVersion, res.Senior.Provider, res.Senior.Model)
+	// Drop empty (non-nil) maps so omitempty omits them entirely rather than
+	// emitting "prompt_versions":{} on a metadata-less run.
+	if len(in.PromptVersions) == 0 {
+		in.PromptVersions = nil
+	}
+	if len(in.Providers) == 0 {
+		in.Providers = nil
+	}
+	if len(in.Models) == 0 {
+		in.Models = nil
+	}
+	return in
 }
 
 // safeChainConfidence runs processChainPackage inside a recover so a panic in

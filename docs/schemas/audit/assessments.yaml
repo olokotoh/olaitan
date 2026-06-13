@@ -1,0 +1,89 @@
+# Human-readable mirror of the AUDIT.assessments wire event.
+#
+# AUTHORITATIVE validation source: docs/schemas/audit/assessments.json
+# (draft 2020-12). This YAML is the documentation mirror; the .json is what
+# the integration tests validate against. Source of truth for the Go shape:
+# internal/response/audit/assessment_sink.go (type AuditAssessment).
+#
+# Story 3.14 (FR41). The append-only SIEM copy of every investigation-chain
+# run, published to AUDIT.assessments (365 d LimitsPolicy retention, NFR16
+# append-only; Helm-tunable via response.audit.retention_assessments_days).
+# CRITICAL: redacted_evidence is the EvidencePackage AFTER redaction; the raw
+# package is NEVER serialised, so the audit trail carries no secret values
+# (NFR15/NFR18). v2 extends the Story 3.8 minimal v1 additively (NFR29).
+schema: audit.assessments.v2
+subject: AUDIT.assessments
+fields:
+  schema_version:
+    type: string
+    required: true
+    description: Always "audit.assessments.v2".
+  package_id:
+    type: string
+    required: true
+    description: The EvidencePackage.PackageID this chain run assessed (also the NATS msgID for dedup).
+  workload_id:
+    type: string
+    required: true
+    description: The WorkloadIdentity canonical string, for SIEM correlation.
+  mode:
+    type: string
+    required: true
+    enum: [full, l1_l2, l1_only]
+    description: The chain ablation mode that produced this assessment.
+  agents_available:
+    type: array
+    required: false
+    description: The roles that contributed (e.g. ["l1","l2","senior"]); the complement is the skipped set.
+  prompt_versions:
+    type: object
+    required: false
+    description: Role-keyed ("l1","l2","senior") content hashes of the system prompt each role ran (Story 3.13, NFR41). A role absent did not run.
+  providers:
+    type: object
+    required: false
+    description: Role-keyed LLM provider family that served each role (FR25 per-role routing).
+  models:
+    type: object
+    required: false
+    description: Role-keyed model id that served each role.
+  threat_type:
+    type: string
+    required: false
+    description: The Senior verdict's threat type; absent in an ablation mode where no Senior ran.
+  raw_confidence:
+    type: integer
+    required: true
+    description: The boundary role's model-reported confidence (0-100).
+  llm_capped_confidence:
+    type: integer
+    required: true
+    description: min(raw_confidence, boundary-provider anti-hallucination cap) — the value folded into the FSM ThreatScore.
+  l1_hypothesis:
+    type: object
+    required: false
+    description: The validated schema.L1Hypothesis (absent when L1 produced nothing). Shape documented at docs/schemas (L1Hypothesis).
+  l2_verification:
+    type: object
+    required: false
+    description: The validated schema.L2Verification (absent in l1_only). Shape documented at docs/schemas (L2Verification).
+  threat_assessment:
+    type: object
+    required: false
+    description: The final schema.ThreatAssessment (the capped verdict; in ablation modes it is the boundary-role assessment).
+  redacted_evidence:
+    type: object
+    required: true
+    description: The EvidencePackage AFTER redaction — the exact inputs the LLM saw. Never carries secret values (NFR15/NFR18).
+  redaction_applied:
+    type: boolean
+    required: true
+    description: True on every production path (the chain always redacts before the LLM); a false in any non-test path is a CI-enforced violation (AC3).
+  decided_at:
+    type: string
+    required: true
+    description: When the chain produced the assessment (RFC3339).
+  published_at:
+    type: string
+    required: true
+    description: The audit-emission time (== decided_at in the synchronous publish path).

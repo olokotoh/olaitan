@@ -549,7 +549,7 @@ data:
     {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.audit.enabled anchor not found (pattern %q)" $p) }}{{- end }}
     {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v${2}" $au.enabled) }}
     {{- end }}
-    {{- range $k, $cfgKey := dict "retentionTransitionsDays" "retention_transitions_days" "retentionOverridesDays" "retention_overrides_days" "retentionPoliciesDays" "retention_policies_days" }}
+    {{- range $k, $cfgKey := dict "retentionTransitionsDays" "retention_transitions_days" "retentionOverridesDays" "retention_overrides_days" "retentionPoliciesDays" "retention_policies_days" "retentionAssessmentsDays" "retention_assessments_days" }}
     {{- if hasKey $au $k }}
     {{- $p := printf "(\\n    %s: )[0-9]+" $cfgKey -}}
     {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.audit.%s anchor not found (pattern %q)" $cfgKey $p) }}{{- end }}

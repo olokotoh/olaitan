@@ -1,0 +1,19 @@
+{
+  "schema_version": "audit.assessments.v2",
+  "package_id": "pkg-l1l2-1",
+  "workload_id": "ns/Deployment/api",
+  "mode": "l1_l2",
+  "agents_available": ["l1", "l2"],
+  "prompt_versions": {"l1": "7bbffc43", "l2": "b9c72082"},
+  "providers": {"l1": "claude", "l2": "claude"},
+  "models": {"l1": "claude-haiku-4-5", "l2": "claude-haiku-4-5"},
+  "raw_confidence": 66,
+  "llm_capped_confidence": 30,
+  "l1_hypothesis": {"hypothesis": "suspicious egress", "confidence": 60},
+  "l2_verification": {"verdict": "confirmed", "confidence": 66},
+  "threat_assessment": {"reasoning": "l2 confirmed the egress", "confidence": 66},
+  "redacted_evidence": {"package_id": "pkg-l1l2-1", "workload_id": "ns/Deployment/api"},
+  "redaction_applied": true,
+  "decided_at": "2026-06-13T00:00:00Z",
+  "published_at": "2026-06-13T00:00:00Z"
+}

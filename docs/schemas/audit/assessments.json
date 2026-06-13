@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/olokotoh/olaitan/docs/schemas/audit/assessments.json",
+  "title": "AUDIT.assessments (audit.assessments.v2)",
+  "description": "Story 3.14 append-only SIEM projection of one investigation-chain run (FR41). AUTHORITATIVE validation source for AUDIT.assessments; assessments.yaml is the human-readable mirror. Carries the per-role prompt versions, the REDACTED evidence inputs (never raw secrets, NFR15/NFR18), the L1/L2/Senior verdicts, per-role provider attribution, and the raw + capped confidences. v2 extends the Story 3.8 minimal v1 additively (NFR29 MINOR). The per-role maps and the l1_hypothesis/l2_verification/threat_assessment objects are present only for the roles an ablation mode actually ran.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "package_id",
+    "workload_id",
+    "mode",
+    "raw_confidence",
+    "llm_capped_confidence",
+    "redacted_evidence",
+    "redaction_applied",
+    "decided_at",
+    "published_at"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "audit.assessments.v2"},
+    "package_id": {"type": "string"},
+    "workload_id": {"type": "string"},
+    "mode": {"type": "string", "enum": ["full", "l1_l2", "l1_only"]},
+    "agents_available": {"type": "array", "items": {"type": "string"}},
+    "prompt_versions": {"type": "object", "additionalProperties": {"type": "string"}},
+    "providers": {"type": "object", "additionalProperties": {"type": "string"}},
+    "models": {"type": "object", "additionalProperties": {"type": "string"}},
+    "threat_type": {"type": "string"},
+    "raw_confidence": {"type": "integer"},
+    "llm_capped_confidence": {"type": "integer"},
+    "l1_hypothesis": {"type": "object"},
+    "l2_verification": {"type": "object"},
+    "threat_assessment": {"type": "object"},
+    "redacted_evidence": {"type": "object"},
+    "redaction_applied": {"type": "boolean"},
+    "decided_at": {"type": "string", "format": "date-time"},
+    "published_at": {"type": "string", "format": "date-time"}
+  }
+}

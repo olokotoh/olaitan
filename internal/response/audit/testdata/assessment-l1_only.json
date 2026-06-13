@@ -1,0 +1,18 @@
+{
+  "schema_version": "audit.assessments.v2",
+  "package_id": "pkg-l1only-1",
+  "workload_id": "ns/Deployment/worker",
+  "mode": "l1_only",
+  "agents_available": ["l1"],
+  "prompt_versions": {"l1": "7bbffc43"},
+  "providers": {"l1": "claude"},
+  "models": {"l1": "claude-haiku-4-5"},
+  "raw_confidence": 40,
+  "llm_capped_confidence": 25,
+  "l1_hypothesis": {"hypothesis": "anomalous process exec", "confidence": 40},
+  "threat_assessment": {"reasoning": "anomalous process exec", "confidence": 40},
+  "redacted_evidence": {"package_id": "pkg-l1only-1", "workload_id": "ns/Deployment/worker"},
+  "redaction_applied": true,
+  "decided_at": "2026-06-13T00:00:00Z",
+  "published_at": "2026-06-13T00:00:00Z"
+}
