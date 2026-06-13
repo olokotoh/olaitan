@@ -160,6 +160,33 @@ func TestCircuitBreakerHotReload(t *testing.T) {
 	}
 }
 
+// TestCircuitBreakerReEnableColdStart (round-2 fix): a disable -> re-enable
+// must start with a COLD window. Without clearing the buckets on the enable
+// transition, the stale burst counts still inside the 1-minute window would
+// instantly re-engage the breaker on the first Admit after re-enable.
+func TestCircuitBreakerReEnableColdStart(t *testing.T) {
+	fc := &cbFakeClock{t: time.Unix(1_000_000, 0)}
+	b := newTestBreaker(fc, nil)
+	for i := 0; i < 11; i++ { // engage (11 > rate 10)
+		b.Admit()
+	}
+	if !b.IsEngaged() {
+		t.Fatal("setup: should be engaged")
+	}
+	// Operator disables then re-enables within the same window (no clock
+	// advance), e.g. to clear the breaker.
+	b.UpdateEnabled(false)
+	b.UpdateEnabled(true)
+	// The first Admit after re-enable must admit on a cold window, not bypass
+	// on the stale burst counts.
+	if !b.Admit() {
+		t.Error("re-enabled breaker must start cold and admit; it re-engaged on stale buckets")
+	}
+	if b.IsEngaged() {
+		t.Error("re-enabled breaker must not be engaged on a cold window")
+	}
+}
+
 // TestCircuitBreakerConcurrentAdmit proves the breaker is safe for concurrent
 // Admit + hot-reload (its core design claim), under `go test -race`. The
 // engage count must not exceed the number of engage edges regardless of
