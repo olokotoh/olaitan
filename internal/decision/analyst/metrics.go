@@ -76,7 +76,7 @@ func registerCounterVec(reg *metrics.Registry, name, help string, labels []strin
 const ChainRunsMetricName = "olaitan_investigation_chain_runs_total"
 
 const chainRunsMetricHelp = "Investigation-chain runs by mode (full, l1_l2, l1_only) and outcome " +
-	"(assessed, not_triggered, no_citable, error). One increment per " +
+	"(assessed, not_triggered, no_citable, error, breaker_bypassed). One increment per " +
 	"EvidencePackage the chain consumer handles: not_triggered when the " +
 	"FR19 gate declines, assessed on a produced assessment, no_citable " +
 	"when the chain aborts on empty evidence, error otherwise (Story 3.8 " +
@@ -85,10 +85,11 @@ const chainRunsMetricHelp = "Investigation-chain runs by mode (full, l1_l2, l1_o
 // Chain-run outcome label values (the bounded outcome enum, Story 3.8
 // BI-6).
 const (
-	ChainOutcomeAssessed     = "assessed"
-	ChainOutcomeNotTriggered = "not_triggered"
-	ChainOutcomeNoCitable    = "no_citable"
-	ChainOutcomeError        = "error"
+	ChainOutcomeAssessed        = "assessed"
+	ChainOutcomeNotTriggered    = "not_triggered"
+	ChainOutcomeNoCitable       = "no_citable"
+	ChainOutcomeError           = "error"
+	ChainOutcomeBreakerBypassed = "breaker_bypassed" // Story 3.12: LLM-tier breaker engaged, chain bypassed
 )
 
 // RegisterChainRunsMetric registers (or re-uses) the chain-runs counter

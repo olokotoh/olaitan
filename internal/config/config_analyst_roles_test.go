@@ -89,6 +89,35 @@ func TestAnalystCheckpointRetention(t *testing.T) {
 	}
 }
 
+// TestAnalystCircuitBreaker (Story 3.12) pins the breaker defaults (10/min,
+// 60s, enabled) and the validate() rejection of an enabled breaker with an
+// out-of-range threshold.
+func TestAnalystCircuitBreaker(t *testing.T) {
+	cfg, err := config.Load(writeConfig(t, analystRolesBaseYAML+"  circuit_breaker:\n    rate_per_min: 25\n    cooling_seconds: 90\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Analyst.CircuitBreaker.RatePerMinOrDefault() != 25 || cfg.Analyst.CircuitBreaker.CoolingSecondsOrDefault() != 90 {
+		t.Errorf("breaker = %d/%d, want 25/90", cfg.Analyst.CircuitBreaker.RatePerMinOrDefault(), cfg.Analyst.CircuitBreaker.CoolingSecondsOrDefault())
+	}
+	// Unset = defaults (10/60, enabled).
+	cfgD, err := config.Load(writeConfig(t, analystRolesBaseYAML))
+	if err != nil {
+		t.Fatalf("Load defaults: %v", err)
+	}
+	if cfgD.Analyst.CircuitBreaker.RatePerMinOrDefault() != 10 || cfgD.Analyst.CircuitBreaker.CoolingSecondsOrDefault() != 60 || !cfgD.Analyst.CircuitBreaker.EnabledOrDefault() {
+		t.Errorf("breaker defaults = %d/%d/%v, want 10/60/true", cfgD.Analyst.CircuitBreaker.RatePerMinOrDefault(), cfgD.Analyst.CircuitBreaker.CoolingSecondsOrDefault(), cfgD.Analyst.CircuitBreaker.EnabledOrDefault())
+	}
+	// An enabled breaker with rate_per_min < 1 is rejected.
+	if _, err := config.Load(writeConfig(t, analystRolesBaseYAML+"  circuit_breaker:\n    rate_per_min: 0\n")); err == nil {
+		t.Error("enabled breaker with rate_per_min 0 must be rejected")
+	}
+	// A DISABLED breaker does not validate its thresholds.
+	if _, err := config.Load(writeConfig(t, analystRolesBaseYAML+"  circuit_breaker:\n    enabled: false\n    rate_per_min: 0\n")); err != nil {
+		t.Errorf("disabled breaker must skip threshold validation: %v", err)
+	}
+}
+
 // TestAnalystEnabledAccessors pins the ablation default + precedence
 // (Story 3.8 BI-3): unset = enabled; senior_enabled: false = L1+L2;
 // l2_enabled: false forces L1-only (Senior implicitly off).

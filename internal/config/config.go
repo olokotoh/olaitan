@@ -1385,6 +1385,44 @@ type AnalystConfig struct {
 	// resume. Zero/unset selects the architecture's 6h default at the
 	// wiring layer; a negative value is rejected by validate().
 	CheckpointRetention DurationYAML `yaml:"checkpoint_retention"`
+
+	// CircuitBreaker is the Story 3.12 LLM-tier backpressure breaker
+	// (FR51/NFR23): bypass the LLM tier above RatePerMin LLM-eligible
+	// packages/min globally for a CoolingSeconds window.
+	CircuitBreaker AnalystCircuitBreakerConfig `yaml:"circuit_breaker"`
+}
+
+// AnalystCircuitBreakerConfig configures the Story 3.12 LLM-tier circuit
+// breaker. Pointers so an unset field takes the default while an explicit
+// value (incl. enabled:false) is honoured (the Story 3.4 falsy-value lesson).
+type AnalystCircuitBreakerConfig struct {
+	RatePerMin     *int  `yaml:"rate_per_min"`
+	CoolingSeconds *int  `yaml:"cooling_seconds"`
+	Enabled        *bool `yaml:"enabled"`
+}
+
+// RatePerMinOrDefault returns the engagement threshold (default 10/min).
+func (c AnalystCircuitBreakerConfig) RatePerMinOrDefault() int {
+	if c.RatePerMin == nil {
+		return 10
+	}
+	return *c.RatePerMin
+}
+
+// CoolingSecondsOrDefault returns the cooling window in seconds (default 60).
+func (c AnalystCircuitBreakerConfig) CoolingSecondsOrDefault() int {
+	if c.CoolingSeconds == nil {
+		return 60
+	}
+	return *c.CoolingSeconds
+}
+
+// EnabledOrDefault reports whether the breaker is active (default true).
+func (c AnalystCircuitBreakerConfig) EnabledOrDefault() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
 }
 
 // L2EnabledOrDefault reports whether the L2 role runs. Unset = true; an
@@ -1931,6 +1969,16 @@ func (a AnalystConfig) validate() error {
 	// the wiring layer; a negative value is a misconfiguration.
 	if a.CheckpointRetention.Duration() < 0 {
 		return fmt.Errorf("analyst.checkpoint_retention: must be >= 0 (got %s)", a.CheckpointRetention.Duration())
+	}
+	// Story 3.12: the circuit-breaker thresholds are validated only when the
+	// breaker is enabled (a disabled breaker never reads them).
+	if a.CircuitBreaker.EnabledOrDefault() {
+		if r := a.CircuitBreaker.RatePerMinOrDefault(); r < 1 {
+			return fmt.Errorf("analyst.circuit_breaker.rate_per_min: must be >= 1 (got %d)", r)
+		}
+		if cs := a.CircuitBreaker.CoolingSecondsOrDefault(); cs < 1 {
+			return fmt.Errorf("analyst.circuit_breaker.cooling_seconds: must be >= 1 (got %d)", cs)
+		}
 	}
 	// Endpoint/model emptiness is NOT rejected here: the shipped default
 	// olaitan.yaml leaves them blank for operators to fill in (AC8). The

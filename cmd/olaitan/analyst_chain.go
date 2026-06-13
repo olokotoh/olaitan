@@ -280,10 +280,21 @@ func buildInvestigationChain(cfg *config.Config, apiKey string, reg *metrics.Reg
 // JetStream connection. It returns the per-provider-capped LLM confidence to
 // fold into the ThreatScore (0 when not triggered / errored / unavailable)
 // and the recorded outcome label.
-func processChainPackage(ctx context.Context, pkg schema.EvidencePackage, chain *analyst.Chain, mode string, auditPub responseaudit.AssessmentAuditPublisher, runs *prometheus.CounterVec, log *slog.Logger) (int, string) {
+func processChainPackage(ctx context.Context, pkg schema.EvidencePackage, chain *analyst.Chain, mode string, breaker *analyst.CircuitBreaker, auditPub responseaudit.AssessmentAuditPublisher, runs *prometheus.CounterVec, log *slog.Logger) (int, string) {
 	if !analyst.ShouldTriggerChain(pkg) {
 		analyst.RecordChainRun(runs, mode, analyst.ChainOutcomeNotTriggered)
 		return 0, analyst.ChainOutcomeNotTriggered
+	}
+
+	// Story 3.12: the LLM-tier circuit breaker counts every LLM-eligible
+	// package; when the global rate exceeds the threshold it engages and the
+	// chain is BYPASSED (deterministic-only) for the cooling window, so an
+	// attacker spraying triggering events cannot amplify LLM cost (FR51/NFR23).
+	// The engage/disengage log + olaitan_llm_circuit_breaker_engaged_total are
+	// emitted by the breaker's transition callback, NOT per package.
+	if breaker != nil && !breaker.Admit() {
+		analyst.RecordChainRun(runs, mode, analyst.ChainOutcomeBreakerBypassed)
+		return 0, analyst.ChainOutcomeBreakerBypassed
 	}
 
 	res, rerr := chain.Run(ctx, pkg)
@@ -315,13 +326,13 @@ func processChainPackage(ctx context.Context, pkg schema.EvidencePackage, chain 
 // merge (Story 3.11) put it on. The Trust-Bound's promise is that the LLM tier
 // can never break containment; that must include a crashing LLM tier. On a
 // panic the deterministic rules+baselines score still drives the FSM (NFR27).
-func safeChainConfidence(ctx context.Context, pkg schema.EvidencePackage, chain *analyst.Chain, mode string, auditPub responseaudit.AssessmentAuditPublisher, runs *prometheus.CounterVec, log *slog.Logger) (capped int) {
+func safeChainConfidence(ctx context.Context, pkg schema.EvidencePackage, chain *analyst.Chain, mode string, breaker *analyst.CircuitBreaker, auditPub responseaudit.AssessmentAuditPublisher, runs *prometheus.CounterVec, log *slog.Logger) (capped int) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Error("aggregator: investigation chain panicked; folding zero LLM confidence (deterministic-only)", "panic", r, "package_id", pkg.PackageID)
 			capped = 0
 		}
 	}()
-	capped, _ = processChainPackage(ctx, pkg, chain, mode, auditPub, runs, log)
+	capped, _ = processChainPackage(ctx, pkg, chain, mode, breaker, auditPub, runs, log)
 	return capped
 }

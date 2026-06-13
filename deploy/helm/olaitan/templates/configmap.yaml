@@ -684,6 +684,23 @@ data:
     {{- if not (mustRegexFind $pCkRet $cfg) }}{{- fail (printf "helm bridge: overlay anchor for analyst.checkpoint_retention not found (pattern %q)" $pCkRet) }}{{- end }}
     {{- $cfg = regexReplaceAll $pCkRet $cfg (printf "${1}checkpoint_retention: %s" (replace "$" "$$" (printf "%q" (toString .)))) }}
     {{- end }}
+    {{- /* Story 3.12 (FR51/NFR23): bridge analyst.circuit_breaker.{rate_per_min,
+           cooling_seconds} (integers) over the file-side defaults. Nested
+           4-space anchors; values rendered UNQUOTED so the Go decoder reads
+           them as int. `with` skips an empty (unset) value. AC4 names only
+           these two knobs; `enabled` stays a config-file default (true). */ -}}
+    {{- with $cb := $analystVals.circuit_breaker }}
+    {{- with $cb.rate_per_min }}
+    {{- $pRate := "(\\n    )rate_per_min:[^\\n]*" -}}
+    {{- if not (mustRegexFind $pRate $cfg) }}{{- fail (printf "helm bridge: anchor for analyst.circuit_breaker.rate_per_min not found (pattern %q)" $pRate) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pRate $cfg (printf "${1}rate_per_min: %s" (toString .)) }}
+    {{- end }}
+    {{- with $cb.cooling_seconds }}
+    {{- $pCool := "(\\n    )cooling_seconds:[^\\n]*" -}}
+    {{- if not (mustRegexFind $pCool $cfg) }}{{- fail (printf "helm bridge: anchor for analyst.circuit_breaker.cooling_seconds not found (pattern %q)" $pCool) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pCool $cfg (printf "${1}cooling_seconds: %s" (toString .)) }}
+    {{- end }}
+    {{- end }}
     {{- /* AC2: under evaluation.config=F the rendered config must keep
            only the Falco sensor adapter active. Disable audit /
            containerd / calico source adapters and the posture
