@@ -1390,6 +1390,16 @@ type AnalystConfig struct {
 	// (FR51/NFR23): bypass the LLM tier above RatePerMin LLM-eligible
 	// packages/min globally for a CoolingSeconds window.
 	CircuitBreaker AnalystCircuitBreakerConfig `yaml:"circuit_breaker"`
+
+	// PromptsDir is the directory the per-role system prompts are loaded
+	// from (Story 3.13, NFR41/FR49 prompt half): the Helm chart mounts the
+	// prompts ConfigMap here. Unset selects /etc/olaitan/prompts. A role
+	// whose "<role>.txt" is absent from the directory uses the
+	// binary-embedded default, so a missing directory means "all roles use
+	// embedded defaults". The directory is a Deployment-spec mountPath, so
+	// the path itself is not hot-reloaded (the rules-loader D3 precedent);
+	// the prompts CONTENT is hot-reloaded by the prompts watcher.
+	PromptsDir *string `yaml:"prompts_dir"`
 }
 
 // AnalystCircuitBreakerConfig configures the Story 3.12 LLM-tier circuit
@@ -1423,6 +1433,15 @@ func (c AnalystCircuitBreakerConfig) EnabledOrDefault() bool {
 		return true
 	}
 	return *c.Enabled
+}
+
+// PromptsDirOrDefault returns the prompts mount directory (Story 3.13).
+// Unset selects the chart's default mountPath /etc/olaitan/prompts.
+func (a AnalystConfig) PromptsDirOrDefault() string {
+	if a.PromptsDir == nil || strings.TrimSpace(*a.PromptsDir) == "" {
+		return "/etc/olaitan/prompts"
+	}
+	return *a.PromptsDir
 }
 
 // L2EnabledOrDefault reports whether the L2 role runs. Unset = true; an
@@ -1979,6 +1998,12 @@ func (a AnalystConfig) validate() error {
 		if cs := a.CircuitBreaker.CoolingSecondsOrDefault(); cs < 1 {
 			return fmt.Errorf("analyst.circuit_breaker.cooling_seconds: must be >= 1 (got %d)", cs)
 		}
+	}
+	// Story 3.13: prompts_dir, when set, must be a non-empty path. The
+	// directory need not exist at validate time (a missing dir means all
+	// roles fall back to the binary-embedded defaults).
+	if a.PromptsDir != nil && strings.TrimSpace(*a.PromptsDir) == "" {
+		return errors.New("analyst.prompts_dir: must be a non-empty path when set")
 	}
 	// Endpoint/model emptiness is NOT rejected here: the shipped default
 	// olaitan.yaml leaves them blank for operators to fill in (AC8). The

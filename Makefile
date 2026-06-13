@@ -9,7 +9,7 @@ CONFIG_SRC       := config/olaitan.yaml
 AUDIT_POLICY_SRC := config/audit-policy-default.yaml
 CHART_FILES      := $(CHART_DIR)/files/olaitan.yaml $(CHART_DIR)/files/audit-policy-default.yaml
 
-.PHONY: build test lint docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-down
+.PHONY: build test lint docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-down
 
 # envtest-bin downloads the kube-apiserver and etcd binaries that the
 # Story 1.11 posture-client integration tests (and any future
@@ -59,7 +59,7 @@ version-tag:
 # gitignored; the canonical sources stay under config/. Story 1.7
 # extends the set with the audit-policy default; Story 1.16 extends
 # the set with the OLT rule corpus via the helm-prepare-rules target.
-helm-prepare: $(CHART_FILES) helm-prepare-rules
+helm-prepare: $(CHART_FILES) helm-prepare-rules helm-prepare-prompts
 
 $(CHART_DIR)/files/olaitan.yaml: $(CONFIG_SRC)
 	@mkdir -p $(CHART_DIR)/files
@@ -115,6 +115,29 @@ $(CHART_DIR)/files/rules/$(notdir $(1)): $(1) | clean-staged-rules
 	cp $$< $$@
 endef
 $(foreach src,$(RULE_SRCS),$(eval $(call stage_rule,$(src))))
+
+# helm-prepare-prompts stages the per-role default prompts (Story 3.13)
+# from the canonical internal/agent/prompts/defaults/<role>.txt into
+# deploy/helm/olaitan/files/prompts/<role>.txt so the prompts ConfigMap
+# template can enumerate them via .Files.Glob (which cannot traverse into
+# parent directories). The staged copies are build artefacts covered by
+# the deploy/helm/olaitan/files/ wildcard in .gitignore; the canonical
+# source is the same defaults/ tree the controller binary embeds, so the
+# mounted ConfigMap and the embedded fallback are byte-identical at build.
+PROMPT_SRCS    := $(wildcard internal/agent/prompts/defaults/*.txt)
+PROMPT_STAGED  := $(patsubst internal/agent/prompts/defaults/%,$(CHART_DIR)/files/prompts/%,$(PROMPT_SRCS))
+
+clean-staged-prompts:
+	@rm -rf $(CHART_DIR)/files/prompts
+
+helm-prepare-prompts: clean-staged-prompts $(PROMPT_STAGED)
+
+define stage_prompt
+$(CHART_DIR)/files/prompts/$(notdir $(1)): $(1) | clean-staged-prompts
+	@mkdir -p $$(@D)
+	cp $$< $$@
+endef
+$(foreach src,$(PROMPT_SRCS),$(eval $(call stage_prompt,$(src))))
 
 # helm-deps runs `helm dependency update` so the subchart tarballs
 # (Falco, NATS, Redis) land in deploy/helm/olaitan/charts/. Required

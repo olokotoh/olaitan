@@ -733,6 +733,42 @@ never logged, never a metric or audit label, and never embedded in an error;
 the construction log records the BOOLEAN `api_key_set` only. The Helm wiring
 that projects the Secret lands in Story 3.16.
 
+### Agent prompt tuning and versioning (Story 3.13, NFR41/FR49 prompt half)
+
+The per-role L1/L2/Senior system prompts (and an Epic-4 DFIR placeholder)
+live as files: `internal/agent/prompts/defaults/<role>.txt` in the repo, and
+at runtime in the `{release}-prompts` ConfigMap mounted read-only at
+`analyst.prompts.mountPath` (default `/etc/olaitan/prompts/`; the rendered
+config's `analyst.prompts_dir` tracks it). A role whose `<role>.txt` is absent
+from the mount falls back to the controller's binary-embedded default, so an
+operator may override a subset of roles.
+
+**Hot-reload (no restart).** Edit the ConfigMap (`kubectl edit configmap
+{release}-prompts`, or `helm upgrade` with a values override). The prompts
+watcher — a dedicated fsnotify listener on the mount directory, mirroring the
+rules-corpus loader — catches the K8s projected-volume `..data` symlink swap,
+debounces 50 ms, content-hashes the new prompts, and atomically swaps the
+prompt on every chain runner (primary L1/L2/Senior plus their Ollama-fallback
+twins). The change is picked up on the **next** investigation call; no
+`kubectl rollout restart`. Each role whose content hash moved emits one
+`prompt_version_changed{role,old_hash,new_hash}` log line. A reload that fails
+to parse (oversized or unreadable file) is logged `prompts: reload rejected`
+and the prior prompts are retained — the pod stays Ready.
+
+**Versioning and audit (NFR41).** The prompt-content hash (lowercase hex
+SHA-256 of the newline-trimmed text) is the prompt version recorded with every
+assessment on `AUDIT.assessments` (Story 3.14), so each verdict is traceable to
+an exact prompt revision — essential for evaluation reproducibility. Any change
+to a `defaults/*.txt` file MUST be recorded in `docs/prompt-changelog.md` with
+the new hash in the same PR; the `prompt-changelog` CI job
+(`hack/check-prompt-changelog.sh`) fails the PR otherwise. To compute a hash
+locally: `printf '%s' "$(cat internal/agent/prompts/defaults/l1.txt)" |
+sha256sum`.
+
+**Disabling the ConfigMap.** Set `analyst.prompts.enabled: false` to drop the
+ConfigMap and its mount; the controller then runs on the image-baked embedded
+defaults for every role (operators lose hot-reload and per-role override).
+
 **Clean degradation (no key).** When `analyst.provider` is not the API path
 or the projected env var is empty, the Claude provider is simply not
 constructed: the controller starts normally and runs rules-only (RS mode);

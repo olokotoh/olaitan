@@ -297,6 +297,12 @@ analyst:
     rate_per_min: 10
     cooling_seconds: 60
     enabled: true
+  # Story 3.13 (NFR41, FR49 prompt half): directory the per-role system
+  # prompts are loaded from (the Helm prompts ConfigMap mount). A role whose
+  # "<role>.txt" is absent uses the binary-embedded default. configmap.yaml
+  # bridges Helm's analyst.prompts.mountPath over this so the rendered path
+  # always tracks the actual mount.
+  prompts_dir: /etc/olaitan/prompts
   timeout: 10s
   chain:
     enabled: false

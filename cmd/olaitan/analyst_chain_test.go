@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/olokotoh/olaitan/internal/agent/prompts"
 	"github.com/olokotoh/olaitan/internal/agent/provider"
 	"github.com/olokotoh/olaitan/internal/config"
 	"github.com/olokotoh/olaitan/internal/decision/analyst"
@@ -19,6 +20,18 @@ import (
 )
 
 func chainTestLogger() *slog.Logger { return slog.New(slog.NewJSONHandler(new(bytes.Buffer), nil)) }
+
+// testPromptSet returns the binary-embedded default prompt set (an empty
+// temp dir makes every role fall back to its default), so chain-builder
+// tests run with the Story 3.13 prompt seam without a mounted ConfigMap.
+func testPromptSet(t *testing.T) *prompts.Set {
+	t.Helper()
+	s := prompts.New(t.TempDir(), nil)
+	if err := s.Load(); err != nil {
+		t.Fatalf("load default prompts: %v", err)
+	}
+	return s.Get()
+}
 
 func TestResolveRoleFamily(t *testing.T) {
 	cases := []struct{ role, global, want string }{
@@ -92,14 +105,14 @@ func apiCfg(model string) *config.Config {
 func TestBuildInvestigationChainNoneDisabled(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Analyst.Provider = "none"
-	chain, enabled, err := buildInvestigationChain(cfg, "k", metrics.NewRegistry(), nil, chainTestLogger())
+	chain, enabled, err := buildInvestigationChain(cfg, "k", testPromptSet(t), metrics.NewRegistry(), nil, chainTestLogger())
 	if err != nil || enabled || chain != nil {
 		t.Errorf("provider=none: chain=%v enabled=%v err=%v, want nil/false/nil", chain, enabled, err)
 	}
 }
 
 func TestBuildInvestigationChainFull(t *testing.T) {
-	chain, enabled, err := buildInvestigationChain(apiCfg("claude-opus-4-8"), "test-key", metrics.NewRegistry(), nil, chainTestLogger())
+	chain, enabled, err := buildInvestigationChain(apiCfg("claude-opus-4-8"), "test-key", testPromptSet(t), metrics.NewRegistry(), nil, chainTestLogger())
 	if err != nil || !enabled || chain == nil {
 		t.Fatalf("full chain: enabled=%v err=%v chain=%v", enabled, err, chain)
 	}
@@ -113,14 +126,14 @@ func TestBuildInvestigationChainAblation(t *testing.T) {
 	// l2_enabled: false => L1-only.
 	cfg := apiCfg("claude-opus-4-8")
 	cfg.Analyst.L2Enabled = &f
-	chain, _, err := buildInvestigationChain(cfg, "k", metrics.NewRegistry(), nil, chainTestLogger())
+	chain, _, err := buildInvestigationChain(cfg, "k", testPromptSet(t), metrics.NewRegistry(), nil, chainTestLogger())
 	if err != nil || chain == nil || chain.Mode() != analyst.ChainModeL1Only {
 		t.Errorf("l2_enabled=false: mode=%v err=%v, want l1_only", chainModeOrNil(chain), err)
 	}
 	// senior_enabled: false => L1+L2.
 	cfg2 := apiCfg("claude-opus-4-8")
 	cfg2.Analyst.SeniorEnabled = &f
-	chain2, _, err2 := buildInvestigationChain(cfg2, "k", metrics.NewRegistry(), nil, chainTestLogger())
+	chain2, _, err2 := buildInvestigationChain(cfg2, "k", testPromptSet(t), metrics.NewRegistry(), nil, chainTestLogger())
 	if err2 != nil || chain2 == nil || chain2.Mode() != analyst.ChainModeL1L2 {
 		t.Errorf("senior_enabled=false: mode=%v err=%v, want l1_l2", chainModeOrNil(chain2), err2)
 	}
@@ -135,7 +148,7 @@ func chainModeOrNil(c *analyst.Chain) string {
 
 func TestBuildInvestigationChainEmptyKeyDegrades(t *testing.T) {
 	var buf bytes.Buffer
-	chain, enabled, err := buildInvestigationChain(apiCfg("claude-opus-4-8"), "", metrics.NewRegistry(), nil, slog.New(slog.NewJSONHandler(&buf, nil)))
+	chain, enabled, err := buildInvestigationChain(apiCfg("claude-opus-4-8"), "", testPromptSet(t), metrics.NewRegistry(), nil, slog.New(slog.NewJSONHandler(&buf, nil)))
 	if err != nil || enabled || chain != nil {
 		t.Fatalf("empty key must degrade to rules-only: enabled=%v err=%v", enabled, err)
 	}
@@ -151,7 +164,7 @@ func TestBuildInvestigationChainOpenAIReachable(t *testing.T) {
 	cfg := apiCfg("claude-opus-4-8")
 	cfg.Analyst.L1Provider = "openai"
 	cfg.Analyst.L1Model = "gpt-4o-mini"
-	chain, enabled, err := buildInvestigationChain(cfg, "k", metrics.NewRegistry(), nil, chainTestLogger())
+	chain, enabled, err := buildInvestigationChain(cfg, "k", testPromptSet(t), metrics.NewRegistry(), nil, chainTestLogger())
 	if err != nil || !enabled || chain == nil {
 		t.Fatalf("openai-routed L1: enabled=%v err=%v", enabled, err)
 	}

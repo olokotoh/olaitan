@@ -158,6 +158,15 @@ spec:
             - name: rules
               mountPath: /etc/olaitan/rules
               readOnly: true
+            {{- if .Values.analyst.prompts.enabled }}
+            # Story 3.13: the per-role analyst system prompts ConfigMap,
+            # mounted read-only. analyst.prompts_dir in the config points
+            # here; a role absent from the mount uses the binary-embedded
+            # default, so this mount is overridable per role.
+            - name: prompts
+              mountPath: {{ .Values.analyst.prompts.mountPath }}
+              readOnly: true
+            {{- end }}
             - name: secrets
               mountPath: /etc/olaitan/secrets
               readOnly: true
@@ -174,6 +183,11 @@ spec:
         - name: rules
           configMap:
             name: {{ include "olaitan.fullname" . }}-rules
+        {{- if .Values.analyst.prompts.enabled }}
+        - name: prompts
+          configMap:
+            name: {{ include "olaitan.fullname" . }}-prompts
+        {{- end }}
         - name: secrets
           secret:
             secretName: {{ include "olaitan.fullname" . }}-secrets

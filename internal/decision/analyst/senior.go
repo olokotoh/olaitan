@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -80,11 +81,26 @@ type SeniorResult struct {
 // with NewSenior; issue calls with Run.
 type Senior struct {
 	provider provider.Provider
-	spec     PromptSpec
-	calls    *prometheus.CounterVec
-	log      *slog.Logger
-	schema   *jsonschema.Schema
+	// spec is hot-swappable (Story 3.13); see L1 for the rationale. Run
+	// reads the current spec, so a ConfigMap reload is picked up on the
+	// next call.
+	spec   atomic.Pointer[PromptSpec]
+	calls  *prometheus.CounterVec
+	log    *slog.Logger
+	schema *jsonschema.Schema
 }
+
+// currentSpec returns the active prompt spec (never nil after NewSenior).
+func (a *Senior) currentSpec() PromptSpec {
+	if sp := a.spec.Load(); sp != nil {
+		return *sp
+	}
+	return PromptSpec{}
+}
+
+// SetPrompt atomically swaps the Senior system prompt and its version
+// (Story 3.13 hot-reload). Safe for concurrent callers against Run.
+func (a *Senior) SetPrompt(spec PromptSpec) { a.spec.Store(&spec) }
 
 // NewSenior builds a Senior runner on top of an already-constructed
 // provider (per-role provider selection is Story 3.8).
@@ -103,7 +119,9 @@ func NewSenior(p provider.Provider, spec PromptSpec, reg *metrics.Registry, log 
 	if err != nil {
 		return nil, err
 	}
-	return &Senior{provider: p, spec: spec, calls: calls, log: log, schema: sch}, nil
+	s := &Senior{provider: p, calls: calls, log: log, schema: sch}
+	s.spec.Store(&spec)
+	return s, nil
 }
 
 // ScoreCap exposes the Senior provider's per-provider anti-hallucination
@@ -122,9 +140,10 @@ func (a *Senior) ProviderName() string { return a.provider.Name() }
 // recorded on olaitan_decision_llm_calls_total per provider-reaching
 // call; the ErrNoCitableEvents precondition records nothing.
 func (a *Senior) Run(ctx context.Context, pkg schema.EvidencePackage, hyp *schema.L1Hypothesis, ver *schema.L2Verification) (SeniorResult, error) {
+	spec := a.currentSpec()
 	res := SeniorResult{
-		PromptVersion: a.spec.Version,
-		System:        a.spec.System,
+		PromptVersion: spec.Version,
+		System:        spec.System,
 		User:          seniorUserInstruction,
 		Provider:      a.provider.Name(),
 		Model:         a.provider.Model(),
@@ -138,7 +157,7 @@ func (a *Senior) Run(ctx context.Context, pkg schema.EvidencePackage, hyp *schem
 	req := provider.Request{
 		Role:              provider.RoleSenior,
 		Package:           pkg,
-		Prompt:            provider.Prompt{System: a.spec.System, User: seniorUserInstruction},
+		Prompt:            provider.Prompt{System: spec.System, User: seniorUserInstruction},
 		Schema:            provider.JSONSchema(bytes.Clone(seniorSchemaJSON)),
 		PriorHypothesis:   hyp,
 		PriorVerification: ver,

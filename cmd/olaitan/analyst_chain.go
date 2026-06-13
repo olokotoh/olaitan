@@ -10,6 +10,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/olokotoh/olaitan/internal/agent/prompts"
 	"github.com/olokotoh/olaitan/internal/agent/provider"
 	claudeprovider "github.com/olokotoh/olaitan/internal/agent/provider/claude"
 	ollamaprovider "github.com/olokotoh/olaitan/internal/agent/provider/ollama"
@@ -22,16 +23,18 @@ import (
 	"github.com/olokotoh/olaitan/internal/schema"
 )
 
-// Default per-role system prompts (Story 3.8). The prompt ConfigMap that
-// lets operators override these is Story 3.13; until then the chain runs
-// with these built-in defaults so per-role provider routing is testable
-// end to end.
-const (
-	defaultL1System     = "You are the L1 triage analyst. Form a first-pass hypothesis from the redacted evidence."
-	defaultL2System     = "You are the L2 verification analyst. Verify or refute the L1 hypothesis against the evidence."
-	defaultSeniorSystem = "You are the Senior analyst. Challenge L1 and L2 and produce a final threat assessment."
-	defaultPromptVer    = "story-3.8-default.v1"
-)
+// promptSpecFor builds the analyst PromptSpec for a role from the loaded
+// prompt set (Story 3.13). The System text is the role's ConfigMap-mounted
+// (or binary-embedded default) prompt; the Version is its content hash, so
+// every investigation is traceable to a specific prompt revision (NFR41).
+// The Story 3.8 default prompt text now lives in
+// internal/agent/prompts/defaults/<role>.txt and is byte-identical to the
+// former built-in consts (the Version changes from a static string to the
+// content hash).
+func promptSpecFor(set *prompts.Set, role prompts.Role) analyst.PromptSpec {
+	p := set.Prompt(role)
+	return analyst.PromptSpec{System: p.Text, Version: p.Hash}
+}
 
 // resolveRoleFamily maps a per-role provider value onto a concrete
 // provider family (Story 3.8 BI-3). A non-empty value is the explicit
@@ -169,7 +172,7 @@ func buildRoleProvider(family, model string, cfg *config.Config, apiKey string, 
 // degrades to rules-and-baselines-only, NFR27); a non-nil error is a
 // fatal misconfiguration. Ablation toggles (l2_enabled / senior_enabled)
 // truncate the chain by leaving the runner nil.
-func buildInvestigationChain(cfg *config.Config, apiKey string, reg *metrics.Registry, sink *reportredact.RedactionAuditSink, log *slog.Logger) (*analyst.Chain, bool, error) {
+func buildInvestigationChain(cfg *config.Config, apiKey string, promptSet *prompts.Set, reg *metrics.Registry, sink *reportredact.RedactionAuditSink, log *slog.Logger) (*analyst.Chain, bool, error) {
 	a := cfg.Analyst
 	if strings.EqualFold(a.Provider, "none") {
 		log.Info("aggregator: investigation chain disabled (analyst.provider=none); running rules+baselines only (FR27/NFR27)")
@@ -187,7 +190,7 @@ func buildInvestigationChain(cfg *config.Config, apiKey string, reg *metrics.Reg
 	if err != nil {
 		return nil, false, fmt.Errorf("aggregator: L1 provider: %w", err)
 	}
-	l1, err := analyst.NewL1(l1p, analyst.PromptSpec{System: defaultL1System, Version: defaultPromptVer}, reg, log)
+	l1, err := analyst.NewL1(l1p, promptSpecFor(promptSet, prompts.RoleL1), reg, log)
 	if err != nil {
 		return nil, false, fmt.Errorf("aggregator: L1 runner: %w", err)
 	}
@@ -204,7 +207,7 @@ func buildInvestigationChain(cfg *config.Config, apiKey string, reg *metrics.Reg
 		if perr != nil {
 			return nil, false, fmt.Errorf("aggregator: L2 provider: %w", perr)
 		}
-		l2, err = analyst.NewL2(l2p, analyst.PromptSpec{System: defaultL2System, Version: defaultPromptVer}, reg, log)
+		l2, err = analyst.NewL2(l2p, promptSpecFor(promptSet, prompts.RoleL2), reg, log)
 		if err != nil {
 			return nil, false, fmt.Errorf("aggregator: L2 runner: %w", err)
 		}
@@ -222,7 +225,7 @@ func buildInvestigationChain(cfg *config.Config, apiKey string, reg *metrics.Reg
 		if perr != nil {
 			return nil, false, fmt.Errorf("aggregator: Senior provider: %w", perr)
 		}
-		senior, err = analyst.NewSenior(srp, analyst.PromptSpec{System: defaultSeniorSystem, Version: defaultPromptVer}, reg, log)
+		senior, err = analyst.NewSenior(srp, promptSpecFor(promptSet, prompts.RoleSenior), reg, log)
 		if err != nil {
 			return nil, false, fmt.Errorf("aggregator: Senior runner: %w", err)
 		}
@@ -249,17 +252,17 @@ func buildInvestigationChain(cfg *config.Config, apiKey string, reg *metrics.Reg
 		var l2fb *analyst.L2
 		var srfb *analyst.Senior
 		if l1Family != "ollama" {
-			if l1fb, err = analyst.NewL1(fbp, analyst.PromptSpec{System: defaultL1System, Version: defaultPromptVer}, reg, log); err != nil {
+			if l1fb, err = analyst.NewL1(fbp, promptSpecFor(promptSet, prompts.RoleL1), reg, log); err != nil {
 				return nil, false, fmt.Errorf("aggregator: L1 Ollama fallback runner: %w", err)
 			}
 		}
 		if l2 != nil && resolveRoleFamily(a.L2Provider, a.Provider) != "ollama" {
-			if l2fb, err = analyst.NewL2(fbp, analyst.PromptSpec{System: defaultL2System, Version: defaultPromptVer}, reg, log); err != nil {
+			if l2fb, err = analyst.NewL2(fbp, promptSpecFor(promptSet, prompts.RoleL2), reg, log); err != nil {
 				return nil, false, fmt.Errorf("aggregator: L2 Ollama fallback runner: %w", err)
 			}
 		}
 		if senior != nil && resolveRoleFamily(a.SeniorProvider, a.Provider) != "ollama" {
-			if srfb, err = analyst.NewSenior(fbp, analyst.PromptSpec{System: defaultSeniorSystem, Version: defaultPromptVer}, reg, log); err != nil {
+			if srfb, err = analyst.NewSenior(fbp, promptSpecFor(promptSet, prompts.RoleSenior), reg, log); err != nil {
 				return nil, false, fmt.Errorf("aggregator: Senior Ollama fallback runner: %w", err)
 			}
 		}

@@ -38,6 +38,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
+	"github.com/olokotoh/olaitan/internal/agent/prompts"
 	ollamaprovider "github.com/olokotoh/olaitan/internal/agent/provider/ollama"
 	"github.com/olokotoh/olaitan/internal/collector/audit"
 	"github.com/olokotoh/olaitan/internal/collector/cni"
@@ -753,7 +754,18 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	// Story 3.11, so the chain runs and audits ALONGSIDE the deterministic
 	// FSM consumer without yet moving the FSM ThreatScore.
 	apiKey := analystAPIKeyFromEnv(cfg.Analyst.API.APIKeySecret)
-	chain, chainEnabled, cerr := buildInvestigationChain(cfg, apiKey, metricsReg, redactionAuditSink, log)
+	// Story 3.13: load the per-role system prompts from the ConfigMap mount
+	// (analyst.prompts_dir, default /etc/olaitan/prompts). A role whose file
+	// is absent falls back to its binary-embedded default, so a missing mount
+	// runs on the defaults; an unreadable/oversized present file is fatal at
+	// startup (mirrors the rules loader). The chain is built from this set
+	// and hot-reloads from it via the watcher wired below when enabled.
+	promptStore := prompts.New(cfg.Analyst.PromptsDirOrDefault(), log)
+	if perr := promptStore.Load(); perr != nil {
+		closeNATS()
+		return fmt.Errorf("aggregator: prompts: %w", perr)
+	}
+	chain, chainEnabled, cerr := buildInvestigationChain(cfg, apiKey, promptStore.Get(), metricsReg, redactionAuditSink, log)
 	if cerr != nil {
 		closeNATS()
 		return fmt.Errorf("aggregator: %w", cerr)
@@ -839,6 +851,37 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 			if cs := c.Analyst.CircuitBreaker.CoolingSecondsOrDefault(); !cb.UpdateCooling(time.Duration(cs) * time.Second) {
 				log.Warn("aggregator: circuit-breaker cooling_seconds reload rejected; keeping prior value", "rejected", cs)
 			}
+		})
+
+		// Story 3.13: hot-reload the per-role prompts. On every successful
+		// reload of the prompts ConfigMap the store fans out the new *Set; we
+		// log one prompt_version_changed line per role whose content hash
+		// moved (AC2) and atomically swap the prompt on every chain runner
+		// (primary + Ollama fallback) so the change is picked up on the next
+		// call without rebuilding the chain. prevPrompts holds the
+		// last-applied set so the diff has an old hash to report against.
+		prevPrompts := promptStore.Get()
+		promptStore.Subscribe(func(set *prompts.Set) {
+			for _, role := range prompts.Roles() {
+				if oldH, newH := prevPrompts.Hash(role), set.Hash(role); oldH != newH {
+					log.Info("prompt_version_changed", "role", string(role), "old_hash", oldH, "new_hash", newH)
+				}
+			}
+			chain.SetPrompts(
+				promptSpecFor(set, prompts.RoleL1),
+				promptSpecFor(set, prompts.RoleL2),
+				promptSpecFor(set, prompts.RoleSenior),
+			)
+			prevPrompts = set
+		})
+		// Watch the prompts directory for ConfigMap swaps. Like the rules
+		// watcher, a reload failure is logged and the prior set retained; the
+		// watcher only exits on ctx cancellation.
+		g.Go(func() error {
+			if werr := promptStore.Watch(ctx); werr != nil {
+				return fmt.Errorf("aggregator: prompts watcher: %w", werr)
+			}
+			return nil
 		})
 	}
 

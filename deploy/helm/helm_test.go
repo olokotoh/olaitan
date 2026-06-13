@@ -247,7 +247,8 @@ func TestSubchartsDisabled(t *testing.T) {
 		"ClusterRole":           1,
 		"ClusterRoleBinding":    1,
 		"Secret":                1,
-		"ConfigMap":             2,
+		// config + rules + prompts (Story 3.13 added the prompts ConfigMap).
+		"ConfigMap":             3,
 		"PersistentVolumeClaim": 1,
 		"NetworkPolicy":         1,
 		"DaemonSet":             1,
@@ -928,6 +929,53 @@ func TestAuditPolicyConfigMapRenders_WhenEnabled(t *testing.T) {
 	}
 	if !strings.Contains(rendered, "rolebindings") {
 		t.Errorf("default audit policy missing rolebindings rule")
+	}
+}
+
+// TestPromptsConfigMapRenders_Default is the Story 3.13 golden assertion:
+// with defaults the per-role prompts ConfigMap renders with all four role
+// keys, the aggregator mounts it read-only at /etc/olaitan/prompts, and the
+// rendered config's analyst.prompts_dir tracks the mountPath.
+func TestPromptsConfigMapRenders_Default(t *testing.T) {
+	rendered := helmTemplate(t, []string{"falco.enabled=false", "nats.enabled=false", "redis.enabled=false"})
+	if !strings.Contains(rendered, "olaitan-prompts") {
+		t.Fatalf("prompts ConfigMap not rendered\n%s", snippet(rendered, "prompts"))
+	}
+	for _, key := range []string{"l1.txt:", "l2.txt:", "senior.txt:", "dfir.txt:"} {
+		if !strings.Contains(rendered, key) {
+			t.Errorf("prompts ConfigMap missing key %q\n%s", key, snippet(rendered, "olaitan-prompts"))
+		}
+	}
+	if !strings.Contains(rendered, "mountPath: /etc/olaitan/prompts") {
+		t.Errorf("aggregator missing prompts mount\n%s", snippet(rendered, "prompts"))
+	}
+	if !strings.Contains(rendered, `prompts_dir: "/etc/olaitan/prompts"`) {
+		t.Errorf("rendered config analyst.prompts_dir not bridged to mountPath\n%s", snippet(rendered, "prompts_dir"))
+	}
+}
+
+// TestPromptsConfigMapDisabled proves analyst.prompts.enabled=false drops
+// the ConfigMap and its mount so the controller runs on embedded defaults.
+func TestPromptsConfigMapDisabled(t *testing.T) {
+	rendered := helmTemplate(t, []string{"falco.enabled=false", "nats.enabled=false", "redis.enabled=false", "analyst.prompts.enabled=false"})
+	if strings.Contains(rendered, "olaitan-prompts") {
+		t.Errorf("prompts ConfigMap rendered despite analyst.prompts.enabled=false\n%s", snippet(rendered, "prompts"))
+	}
+	if strings.Contains(rendered, "mountPath: /etc/olaitan/prompts") {
+		t.Errorf("prompts mount rendered despite analyst.prompts.enabled=false")
+	}
+}
+
+// TestPromptsDirBridgeFollowsMountPath proves an operator-overridden
+// mountPath flows into both the volumeMount and the rendered config, so the
+// controller loads from the actual mount (no silent path skew).
+func TestPromptsDirBridgeFollowsMountPath(t *testing.T) {
+	rendered := helmTemplate(t, []string{"falco.enabled=false", "nats.enabled=false", "redis.enabled=false", "analyst.prompts.mountPath=/custom/prompts"})
+	if !strings.Contains(rendered, "mountPath: /custom/prompts") {
+		t.Errorf("custom prompts mountPath not applied to volumeMount\n%s", snippet(rendered, "prompts"))
+	}
+	if !strings.Contains(rendered, `prompts_dir: "/custom/prompts"`) {
+		t.Errorf("custom mountPath not bridged into analyst.prompts_dir\n%s", snippet(rendered, "prompts_dir"))
 	}
 }
 

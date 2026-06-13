@@ -902,6 +902,12 @@ data:
         rate_per_min: 10
         cooling_seconds: 60
         enabled: true
+      # Story 3.13 (NFR41, FR49 prompt half): directory the per-role system
+      # prompts are loaded from (the Helm prompts ConfigMap mount). A role whose
+      # "<role>.txt" is absent uses the binary-embedded default. configmap.yaml
+      # bridges Helm's analyst.prompts.mountPath over this so the rendered path
+      # always tracks the actual mount.
+      prompts_dir: "/etc/olaitan/prompts"
       timeout: 10s
       chain:
         enabled: false
@@ -1288,6 +1294,41 @@ data:
       - objectRef.resource
       - objectRef.namespace
       - user.username
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: olaitan-prompts
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+# Story 3.13 (NFR41, FR49 prompt half): the per-role analyst system prompts.
+# Every <role>.txt under deploy/helm/olaitan/files/prompts/ is enumerated
+# via .Files.Glob and emitted as a ConfigMap key. The controller mounts
+# this at analyst.prompts.mountPath (default /etc/olaitan/prompts) and loads
+# "<role>.txt" per role; a role absent here falls back to the controller's
+# binary-embedded default, so operators may override a subset. The files/
+# tree is staged by `make helm-prepare-prompts` from the canonical
+# internal/agent/prompts/defaults/ source (Helm's .Files.Glob cannot
+# traverse into parent directories). The else branch renders an empty data
+# map so a freshly-cloned chart (before staging) still produces a valid
+# ConfigMap; the controller then runs on embedded defaults for every role.
+data:
+  dfir.txt: |
+    You are the DFIR forensic analyst. Produce an analyst-grade post-mortem of the incident. (Epic 4 owns this prompt; this is a placeholder so the ConfigMap carries all four roles.)
+    
+  l1.txt: |
+    You are the L1 triage analyst. Form a first-pass hypothesis from the redacted evidence.
+    
+  l2.txt: |
+    You are the L2 verification analyst. Verify or refute the L1 hypothesis against the evidence.
+    
+  senior.txt: |
+    You are the Senior analyst. Challenge L1 and L2 and produce a final threat assessment.
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -2116,6 +2157,13 @@ spec:
             - name: rules
               mountPath: /etc/olaitan/rules
               readOnly: true
+            # Story 3.13: the per-role analyst system prompts ConfigMap,
+            # mounted read-only. analyst.prompts_dir in the config points
+            # here; a role absent from the mount uses the binary-embedded
+            # default, so this mount is overridable per role.
+            - name: prompts
+              mountPath: /etc/olaitan/prompts
+              readOnly: true
             - name: secrets
               mountPath: /etc/olaitan/secrets
               readOnly: true
@@ -2132,6 +2180,9 @@ spec:
         - name: rules
           configMap:
             name: olaitan-rules
+        - name: prompts
+          configMap:
+            name: olaitan-prompts
         - name: secrets
           secret:
             secretName: olaitan-secrets

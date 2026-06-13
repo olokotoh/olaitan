@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -116,11 +117,26 @@ type L2Result struct {
 // NewL2; issue calls with Run.
 type L2 struct {
 	provider provider.Provider
-	spec     PromptSpec
-	calls    *prometheus.CounterVec
-	log      *slog.Logger
-	schema   *jsonschema.Schema
+	// spec is hot-swappable (Story 3.13); see L1 for the rationale. Run
+	// reads the current spec, so a ConfigMap reload is picked up on the
+	// next call.
+	spec   atomic.Pointer[PromptSpec]
+	calls  *prometheus.CounterVec
+	log    *slog.Logger
+	schema *jsonschema.Schema
 }
+
+// currentSpec returns the active prompt spec (never nil after NewL2).
+func (a *L2) currentSpec() PromptSpec {
+	if sp := a.spec.Load(); sp != nil {
+		return *sp
+	}
+	return PromptSpec{}
+}
+
+// SetPrompt atomically swaps the L2 system prompt and its version (Story
+// 3.13 hot-reload). Safe for concurrent callers against Run.
+func (a *L2) SetPrompt(spec PromptSpec) { a.spec.Store(&spec) }
 
 // ScoreCap exposes the L2 provider's per-provider anti-hallucination cap
 // so the orchestrator can cap an L1+L2 ablation assessment at the
@@ -149,7 +165,9 @@ func NewL2(p provider.Provider, spec PromptSpec, reg *metrics.Registry, log *slo
 	if err != nil {
 		return nil, err
 	}
-	return &L2{provider: p, spec: spec, calls: calls, log: log, schema: sch}, nil
+	l := &L2{provider: p, calls: calls, log: log, schema: sch}
+	l.spec.Store(&spec)
+	return l, nil
 }
 
 // Run issues one L2 analyst call for pkg plus the L1 hypothesis and
@@ -160,9 +178,10 @@ func NewL2(p provider.Provider, spec PromptSpec, reg *metrics.Registry, log *slo
 // exactly ONE provider attempt (Story 3.10 retries sit above,
 // transport-level retries below).
 func (a *L2) Run(ctx context.Context, pkg schema.EvidencePackage, hyp schema.L1Hypothesis) (L2Result, error) {
+	spec := a.currentSpec()
 	res := L2Result{
-		PromptVersion: a.spec.Version,
-		System:        a.spec.System,
+		PromptVersion: spec.Version,
+		System:        spec.System,
 		User:          l2UserInstruction,
 		Provider:      a.provider.Name(),
 		Model:         a.provider.Model(),
@@ -180,7 +199,7 @@ func (a *L2) Run(ctx context.Context, pkg schema.EvidencePackage, hyp schema.L1H
 	req := provider.Request{
 		Role:            provider.RoleL2,
 		Package:         pkg,
-		Prompt:          provider.Prompt{System: a.spec.System, User: l2UserInstruction},
+		Prompt:          provider.Prompt{System: spec.System, User: l2UserInstruction},
 		Schema:          provider.JSONSchema(bytes.Clone(l2SchemaJSON)),
 		PriorHypothesis: &hyp,
 	}
