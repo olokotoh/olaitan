@@ -264,3 +264,118 @@ func TestChainNoFallbackWiringIsByteIdentical(t *testing.T) {
 		t.Error("no fall-through happened; metric must stay 0")
 	}
 }
+
+// TestChainRetryL2ThenSuccess (AC6, L2 role): an L2 transient error is retried
+// and the second attempt succeeds.
+func TestChainRetryL2ThenSuccess(t *testing.T) {
+	l1fp := &fakeProvider{name: "claude", model: "m", resp: provider.Response{Raw: validVerdict}}
+	l2fp := &fakeProvider{name: "claude", model: "m", resp: provider.Response{Raw: validL2Verdict}, failTimes: 1, failErr: errors.New("l2 529")}
+	srfp := &fakeProvider{name: "claude", model: "m", resp: provider.Response{Raw: validSeniorVerdict}}
+	chain, _ := newTestChain(t, l1fp, l2fp, srfp)
+
+	res, err := chain.Run(context.Background(), testPackage())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if l2fp.calls != 2 {
+		t.Errorf("L2 calls = %d, want 2 (one transient + one success)", l2fp.calls)
+	}
+	if strings.Join(res.Assessment.AgentsAvailable, ",") != "l1,l2,senior" {
+		t.Errorf("agents_available = %v, want l1,l2,senior", res.Assessment.AgentsAvailable)
+	}
+}
+
+// TestChainRetrySeniorThenSuccess (AC6, Senior role): a Senior schema violation
+// is retried and the second attempt succeeds (no degrade).
+func TestChainRetrySeniorThenSuccess(t *testing.T) {
+	l1fp := &fakeProvider{name: "claude", model: "m", resp: provider.Response{Raw: validVerdict}}
+	l2fp := &fakeProvider{name: "claude", model: "m", resp: provider.Response{Raw: validL2Verdict}}
+	srfp := &fakeProvider{name: "claude", model: "m", resp: provider.Response{Raw: validSeniorVerdict}, failTimes: 1, failResp: provider.Response{Raw: "not json"}}
+	chain, _ := newTestChain(t, l1fp, l2fp, srfp)
+
+	res, err := chain.Run(context.Background(), testPackage())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if srfp.calls != 2 {
+		t.Errorf("Senior calls = %d, want 2", srfp.calls)
+	}
+	if res.Assessment.LLMUnavailable || res.Assessment.ThreatType == "" {
+		t.Errorf("Senior recovered on retry; must produce a real verdict, got %+v", res.Assessment)
+	}
+}
+
+// TestChainFallbackL2AlsoFails (AC6, L2 both-exhaust): primary and Ollama
+// fallback both exhaust for L2; the metric increments once and the chain runs
+// the Senior hypothesis-only.
+func TestChainFallbackL2AlsoFails(t *testing.T) {
+	l1fp := &fakeProvider{name: "claude", model: "m", resp: provider.Response{Raw: validVerdict}}
+	l2fp := &fakeProvider{name: "claude", model: "m", err: errors.New("l2 primary down")}
+	srfp := &fakeProvider{name: "claude", model: "m", resp: provider.Response{Raw: validSeniorVerdict}}
+	l2fb := &fakeProvider{name: "ollama", model: "gemma", err: errors.New("l2 ollama down")}
+	chain, reg := chainWithFallbacks(t, l1fp, l2fp, srfp, nil, l2fb, nil)
+
+	res, err := chain.Run(context.Background(), testPackage())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if l2fp.calls != 3 || l2fb.calls != 3 {
+		t.Errorf("primary/fallback L2 calls = %d/%d, want 3/3", l2fp.calls, l2fb.calls)
+	}
+	if got := fallbackCounter(t, reg, "claude", "ollama", "l2"); got != 1 {
+		t.Errorf("fallback counter = %v, want 1", got)
+	}
+	// L2 unavailable -> Senior runs hypothesis-only (l1 + senior available).
+	if strings.Join(res.Assessment.AgentsAvailable, ",") != "l1,senior" {
+		t.Errorf("agents_available = %v, want l1,senior (L2 unavailable)", res.Assessment.AgentsAvailable)
+	}
+}
+
+// TestChainFallbackSeniorAlsoFails (AC6, Senior both-exhaust): primary and
+// Ollama fallback both exhaust for Senior; the metric increments once and the
+// chain degrades to the llm_unavailable assessment.
+func TestChainFallbackSeniorAlsoFails(t *testing.T) {
+	l1fp := &fakeProvider{name: "claude", model: "m", resp: provider.Response{Raw: validVerdict}}
+	l2fp := &fakeProvider{name: "claude", model: "m", resp: provider.Response{Raw: validL2Verdict}}
+	srfp := &fakeProvider{name: "claude", model: "m", err: errors.New("senior primary down")}
+	srfb := &fakeProvider{name: "ollama", model: "gemma", err: errors.New("senior ollama down")}
+	chain, reg := chainWithFallbacks(t, l1fp, l2fp, srfp, nil, nil, srfb)
+
+	res, err := chain.Run(context.Background(), testPackage())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if srfp.calls != 3 || srfb.calls != 3 {
+		t.Errorf("primary/fallback Senior calls = %d/%d, want 3/3", srfp.calls, srfb.calls)
+	}
+	if got := fallbackCounter(t, reg, "claude", "ollama", "senior"); got != 1 {
+		t.Errorf("fallback counter = %v, want 1", got)
+	}
+	if !res.Assessment.LLMUnavailable || res.Assessment.LLMCappedConfidence != 0 {
+		t.Errorf("both-exhausted Senior must degrade to llm_unavailable capped 0, got %+v", res.Assessment)
+	}
+}
+
+// TestChainCancelledCtxNoFallback (round-1 fix): a cancelled parent ctx is not
+// a primary-provider fault, so the chain must NOT fall through to the fallback
+// or record a fall-through (shutdown/supersede must not pollute the FR28
+// metric). The fallback runners are never invoked.
+func TestChainCancelledCtxNoFallback(t *testing.T) {
+	l1fp := &fakeProvider{name: "claude", model: "m", resp: provider.Response{Raw: validVerdict}}
+	l2fp := &fakeProvider{name: "claude", model: "m", resp: provider.Response{Raw: validL2Verdict}}
+	srfp := &fakeProvider{name: "claude", model: "m", resp: provider.Response{Raw: validSeniorVerdict}}
+	l1fb := &fakeProvider{name: "ollama", model: "gemma", resp: provider.Response{Raw: validVerdict}}
+	srfb := &fakeProvider{name: "ollama", model: "gemma", resp: provider.Response{Raw: validSeniorVerdict}}
+	chain, reg := chainWithFallbacks(t, l1fp, l2fp, srfp, l1fb, nil, srfb)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _ = chain.Run(ctx, testPackage())
+
+	if l1fb.calls != 0 || srfb.calls != 0 {
+		t.Errorf("fallback invoked under a cancelled ctx: l1fb=%d srfb=%d, want 0/0", l1fb.calls, srfb.calls)
+	}
+	if got := fallbackCounter(t, reg, "claude", "ollama", "l1"); got != 0 {
+		t.Errorf("fall-through recorded under a cancelled ctx: %v, want 0", got)
+	}
+}

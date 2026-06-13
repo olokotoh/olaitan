@@ -37,10 +37,17 @@ func defaultRetryStrategy() retry.Strategy {
 // retryClassify marks the deterministic precondition sentinels permanent so
 // retry.Do stops immediately without burning attempts or sleeping: a re-call
 // cannot change ErrNoCitableEvents / ErrNoHypothesis (they are derived from
-// the package, not the provider). ErrSchemaViolation and ErrProviderUnavailable
-// stay retryable (Story 3.10 AC2). The analyst runners surface
-// ErrProviderUnavailable as a sentinel without chaining the provider's
-// internal ctx error, so a per-call timeout does not short-circuit the retry.
+// the package, not the provider). ErrSchemaViolation and non-timeout transient
+// ErrProviderUnavailable stay retryable (Story 3.10 AC2).
+//
+// NOTE on timeouts: the runners wrap the provider error (fmt.Errorf("%w: %w",
+// ErrProviderUnavailable, err)), so a provider per-call timeout keeps
+// context.DeadlineExceeded in the chain. retry.Do treats a ctx error as
+// terminal, so a timed-out primary attempt does NOT burn the remaining strikes
+// -- it yields immediately to the Ollama fallback (the faster local tier),
+// which is the intended trade-off: do not retry-and-wait on a slow primary
+// when a fallback exists. Non-timeout transient errors (5xx/overload/refused)
+// and schema violations still get the full 3-strike retry.
 func retryClassify(err error) error {
 	if err == nil {
 		return nil
@@ -71,6 +78,15 @@ func (c *Chain) retryThenFallback(ctx context.Context, role, fromProvider, toPro
 		return nil
 	}
 	if isPrecondition(perr) || fallback == nil {
+		return perr
+	}
+	// A cancelled/expired PARENT ctx (controller shutdown, superseded
+	// workload, or the chain's overall deadline) is not a primary-provider
+	// fault: do not record a fall-through or attempt a doomed fallback under
+	// a dead ctx (that would pollute the FR28 olaitan_llm_fallback_total
+	// alert with shutdown noise). A provider per-call timeout, by contrast,
+	// leaves the parent ctx alive and DOES fall through.
+	if ctx.Err() != nil {
 		return perr
 	}
 	if c.fallbacks != nil {

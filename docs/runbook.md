@@ -658,8 +658,11 @@ floor). Operational note: the INVESTIGATIONS stream is NOT a SIEM audit
 subject (it is short-lived resume data); do not point SIEM ingest at it.
 
 **LLM retry, Ollama fallback, and `llm_unavailable`** (Story 3.10, FR26/FR28).
-Each role's provider call runs under a 3-strike retry (base delays 1s, 4s, 16s
-plus jitter): a schema violation or a transient provider error is retried; a
+Each role's provider call runs under a 3-strike retry (exponential base delays
+1s then 4s, capped at 16s, plus jitter; with 3 strikes only the 1s and 4s
+back-offs are slept): a schema violation or a non-timeout transient provider
+error is retried, while a per-call timeout yields immediately to the fallback
+rather than retry-and-wait; a
 deterministic precondition (no citable events / no hypothesis) fails fast and
 is never retried. On primary exhaustion the chain falls through to the
 configured Ollama endpoint (`analyst.local`) for that single role call — not
