@@ -146,6 +146,76 @@ func TestOversizeFileRejected(t *testing.T) {
 	}
 }
 
+// TestPresentEmptyFileRejected proves a present-but-empty (or whitespace-
+// only) prompt file fails the load and retains the prior set, rather than
+// silently serving an empty system prompt (round-1 edge-case HIGH).
+func TestPresentEmptyFileRejected(t *testing.T) {
+	for _, body := range []string{"", "\n", "   \n\t"} {
+		dir := t.TempDir()
+		writePrompt(t, dir, RoleL1, "good")
+		s := New(dir, nil)
+		if err := s.Load(); err != nil {
+			t.Fatalf("initial Load: %v", err)
+		}
+		prior := s.Get().Hash(RoleL1)
+
+		if err := os.WriteFile(filepath.Join(dir, "l1.txt"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Load(); err == nil {
+			t.Errorf("empty/whitespace prompt (%q) must fail Load", body)
+		}
+		if s.Get().Hash(RoleL1) != prior {
+			t.Errorf("rejected Load must retain prior set (body %q)", body)
+		}
+	}
+}
+
+// TestFileAtExactlyCapAccepted pins the size-cap boundary: a file at exactly
+// maxPromptFileBytes loads (the comparison is `>`, not `>=`).
+func TestFileAtExactlyCapAccepted(t *testing.T) {
+	dir := t.TempDir()
+	body := strings.Repeat("x", maxPromptFileBytes)
+	if err := os.WriteFile(filepath.Join(dir, "l1.txt"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range []Role{RoleL2, RoleSenior, RoleDFIR} {
+		writePrompt(t, dir, r, string(r))
+	}
+	s := New(dir, nil)
+	if err := s.Load(); err != nil {
+		t.Fatalf("file at exactly the cap must load: %v", err)
+	}
+	if got := len(s.Get().Prompt(RoleL1).Text); got != maxPromptFileBytes {
+		t.Errorf("loaded length = %d, want %d", got, maxPromptFileBytes)
+	}
+}
+
+// TestWatchToleratesMissingDir proves a watcher on a nonexistent prompts
+// directory (the analyst.prompts.enabled=false case) does NOT error — it
+// disables hot-reload and returns nil on ctx cancel, so it never tears down
+// the aggregator errgroup (round-1 edge-case HIGH).
+func TestWatchToleratesMissingDir(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	s := New(missing, nil)
+	if err := s.Load(); err != nil {
+		t.Fatalf("Load on missing dir must succeed on embedded defaults: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Watch(ctx) }()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Watch on missing dir returned %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Watch on missing dir did not return after ctx cancel")
+	}
+}
+
 // TestReloadSwapsSet drives the watcher: an in-place file edit triggers a
 // reload that the Subscribe callback observes with the new hash.
 func TestReloadSwapsSet(t *testing.T) {

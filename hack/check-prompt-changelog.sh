@@ -46,10 +46,14 @@ for f in "${CHANGED[@]}"; do
     continue
   fi
   hash="$(printf '%s' "$(cat "${f}")" | sha256sum | cut -d' ' -f1)"
-  if grep -qF "${hash}" "${CHANGELOG}"; then
+  base="$(basename "${f}")"
+  # Require the basename AND the new hash on the SAME changelog line, so an
+  # unrelated/stale hash elsewhere in the doc cannot satisfy this file's
+  # entry (the changelog table puts `<role>.txt` and its hash on one row).
+  if grep -E "${base}" "${CHANGELOG}" | grep -qF "${hash}"; then
     echo "ok: ${f} -> ${hash} (documented)"
   else
-    echo "FAIL: ${f} changed but its new content hash ${hash} is not in ${CHANGELOG}." >&2
+    echo "FAIL: ${f} changed but ${CHANGELOG} has no row naming '${base}' with its new hash ${hash}." >&2
     fail=1
   fi
 done

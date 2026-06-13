@@ -180,6 +180,18 @@ func (s *Store) Watch(ctx context.Context) error {
 	}
 	defer s.running.Store(false)
 
+	// The prompts directory is absent when the Helm prompts ConfigMap is
+	// disabled (analyst.prompts.enabled=false): Load() still succeeds on the
+	// binary-embedded defaults, so a missing directory must NOT crash the
+	// controller. Watching a nonexistent path would fail w.Add and tear down
+	// the errgroup; instead disable hot-reload (there is nothing to watch) and
+	// run on the loaded prompts. This mirrors Load()'s missing-dir tolerance.
+	if _, statErr := os.Stat(s.dir); errors.Is(statErr, os.ErrNotExist) {
+		s.log.Warn("prompts: directory absent; hot-reload disabled, running on loaded prompts", "dir", s.dir)
+		<-ctx.Done()
+		return nil
+	}
+
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		return fmt.Errorf("prompts: fsnotify: %w", err)
@@ -306,7 +318,17 @@ func (s *Store) readRole(role Role) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("prompts: read %s: %w", path, err)
 	}
-	return canonical(string(raw)), nil
+	text := canonical(string(raw))
+	// An empty (or whitespace-only) present file is a misconfiguration, not a
+	// request to drop the system prompt: every provider silently omits an
+	// empty System block, which would run the analyst with no role framing and
+	// no error. Reject it like an unreadable file (reload-rejected -> retain
+	// prior; fatal at startup) rather than serving "". An operator who wants
+	// the built-in prompt simply omits the file (absent -> embedded default).
+	if strings.TrimSpace(text) == "" {
+		return "", fmt.Errorf("prompts: %s is empty (a present prompt file must be non-empty; omit the file to use the embedded default)", path)
+	}
+	return text, nil
 }
 
 // embeddedDefault returns the binary-embedded default text for role. A

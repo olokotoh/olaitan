@@ -855,14 +855,19 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 
 		// Story 3.13: hot-reload the per-role prompts. On every successful
 		// reload of the prompts ConfigMap the store fans out the new *Set; we
-		// log one prompt_version_changed line per role whose content hash
-		// moved (AC2) and atomically swap the prompt on every chain runner
-		// (primary + Ollama fallback) so the change is picked up on the next
-		// call without rebuilding the chain. prevPrompts holds the
+		// log one prompt_version_changed line per CHAIN role whose content
+		// hash moved (AC2) and atomically swap the prompt on every chain
+		// runner (primary + Ollama fallback) so the change is picked up on the
+		// next call without rebuilding the chain. prevPrompts holds the
 		// last-applied set so the diff has an old hash to report against.
+		// Only the L1/L2/Senior roles are reported here: the DFIR prompt is
+		// carried in the ConfigMap for Epic 4 but no Epic-3 assessment
+		// references it, so emitting a version-changed signal for it would be
+		// a misleading reproducibility trail (round-1 edge-case review).
+		chainRoles := []prompts.Role{prompts.RoleL1, prompts.RoleL2, prompts.RoleSenior}
 		prevPrompts := promptStore.Get()
 		promptStore.Subscribe(func(set *prompts.Set) {
-			for _, role := range prompts.Roles() {
+			for _, role := range chainRoles {
 				if oldH, newH := prevPrompts.Hash(role), set.Hash(role); oldH != newH {
 					log.Info("prompt_version_changed", "role", string(role), "old_hash", oldH, "new_hash", newH)
 				}
