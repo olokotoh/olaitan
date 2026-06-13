@@ -37,7 +37,6 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
-	claudeprovider "github.com/olokotoh/olaitan/internal/agent/provider/claude"
 	ollamaprovider "github.com/olokotoh/olaitan/internal/agent/provider/ollama"
 	"github.com/olokotoh/olaitan/internal/collector/audit"
 	"github.com/olokotoh/olaitan/internal/collector/cni"
@@ -47,6 +46,7 @@ import (
 	"github.com/olokotoh/olaitan/internal/config"
 	"github.com/olokotoh/olaitan/internal/correlator"
 	correlatorasm "github.com/olokotoh/olaitan/internal/correlator/assembler"
+	"github.com/olokotoh/olaitan/internal/decision/analyst"
 	"github.com/olokotoh/olaitan/internal/decision/baseline"
 	"github.com/olokotoh/olaitan/internal/decision/rules"
 	rulesloader "github.com/olokotoh/olaitan/internal/decision/rules/loader"
@@ -742,54 +742,36 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	// off-by-default redaction audit sink wired above is threaded in so
 	// every Analyse call routes reportredact.RedactAndAudit through the
 	// same sink (nil unless report.redact.audit_enabled).
-	var claudeProvider *claudeprovider.Provider
-	if analystSelectsAPIProvider(cfg.Analyst.Provider) {
-		keyEnv := cfg.Analyst.API.APIKeySecret
-		apiKey := analystAPIKeyFromEnv(keyEnv)
-		if apiKey == "" {
-			// NFR18: log the BOOLEAN presence flag and the env NAME,
-			// never a key value.
-			log.Info("aggregator: claude provider not wired; running rules-only",
-				"provider", "claude", "api_key_set", false, "api_key_env", keyEnv)
-		} else {
-			cp, perr := claudeprovider.New(claudeprovider.Config{
-				Model:    cfg.Analyst.API.Model,
-				BaseURL:  cfg.Analyst.API.Endpoint,
-				ScoreCap: cfg.Analyst.ScoreCap,
-			}, apiKey, metricsReg, redactionAuditSink, log)
-			if perr != nil {
-				closeNATS()
-				return fmt.Errorf("aggregator: claude provider: %w", perr)
-			}
-			claudeProvider = cp
-		}
-	} else {
-		log.Info("aggregator: analyst provider is not the API path; claude provider not wired",
-			"analyst_provider", cfg.Analyst.Provider)
+	// Story 3.8: build the per-role investigation chain (FR19 trigger gate
+	// + FR25 per-role provider routing + FR53 ablation). The API key is
+	// read once here (analyst.api.api_key_secret NAMES the env var; the
+	// loader never reads the value). A provider:none, an unconfigured
+	// role, or a missing key degrades cleanly to rules-and-baselines-only
+	// (NFR27); a genuine misconfiguration is fatal. The LLM score fold is
+	// Story 3.11, so the chain runs and audits ALONGSIDE the deterministic
+	// FSM consumer without yet moving the FSM ThreatScore.
+	apiKey := analystAPIKeyFromEnv(cfg.Analyst.API.APIKeySecret)
+	chain, chainEnabled, cerr := buildInvestigationChain(cfg, apiKey, metricsReg, redactionAuditSink, log)
+	if cerr != nil {
+		closeNATS()
+		return fmt.Errorf("aggregator: %w", cerr)
 	}
-	// claudeProvider is consumed by the Story 3.5-3.7 orchestrator, which
-	// does not exist yet (BI-8). Reference it so the wiring is live and the
-	// build does not flag it unused until those stories land.
-	_ = claudeProvider
-
-	// Story 3.4 (BI-6): the Ollama provider is constructed only when the
-	// operator selected the local provider path (config value "local";
-	// the PRD-level name "analyst.provider: ollama" maps onto it at the
-	// Helm layer in Story 3.16). Provider type changes stay
-	// restart-required (architecture.md:351).
-	var ollamaProvider *ollamaprovider.Provider
-	if analystSelectsLocalProvider(cfg.Analyst.Provider) {
-		op, perr := wireOllamaProvider(cfg, metricsReg, redactionAuditSink, log)
-		if perr != nil {
+	if chainEnabled {
+		assessmentPub, aerr := responseaudit.NewNATSAssessmentPublisher(nc)
+		if aerr != nil {
 			closeNATS()
-			return fmt.Errorf("aggregator: ollama provider: %w", perr)
+			return fmt.Errorf("aggregator: assessment audit publisher: %w", aerr)
 		}
-		ollamaProvider = op
+		chainRuns, merr := analyst.RegisterChainRunsMetric(metricsReg)
+		if merr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: chain-runs metric: %w", merr)
+		}
+		if err := wireInvestigationChain(ctx, g, log, nc, chain, assessmentPub, chainRuns); err != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: wire investigation chain: %w", err)
+		}
 	}
-	// ollamaProvider is consumed by the Story 3.5-3.7 orchestrator, which
-	// does not exist yet. Reference it so the wiring is live and the build
-	// does not flag it unused until those stories land.
-	_ = ollamaProvider
 
 	var sinks fsm.MultiSink
 	var fsmStore *fsm.Store

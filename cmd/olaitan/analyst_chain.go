@@ -1,0 +1,319 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	"github.com/nats-io/nats.go/jetstream"
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/olokotoh/olaitan/internal/agent/provider"
+	claudeprovider "github.com/olokotoh/olaitan/internal/agent/provider/claude"
+	ollamaprovider "github.com/olokotoh/olaitan/internal/agent/provider/ollama"
+	openaiprovider "github.com/olokotoh/olaitan/internal/agent/provider/openai_compat"
+	"github.com/olokotoh/olaitan/internal/config"
+	"github.com/olokotoh/olaitan/internal/decision/analyst"
+	"github.com/olokotoh/olaitan/internal/metrics"
+	natsclient "github.com/olokotoh/olaitan/internal/nats"
+	reportredact "github.com/olokotoh/olaitan/internal/report/redact"
+	responseaudit "github.com/olokotoh/olaitan/internal/response/audit"
+	"github.com/olokotoh/olaitan/internal/schema"
+	"github.com/olokotoh/olaitan/internal/subjects"
+)
+
+// Default per-role system prompts (Story 3.8). The prompt ConfigMap that
+// lets operators override these is Story 3.13; until then the chain runs
+// with these built-in defaults so per-role provider routing is testable
+// end to end.
+const (
+	defaultL1System     = "You are the L1 triage analyst. Form a first-pass hypothesis from the redacted evidence."
+	defaultL2System     = "You are the L2 verification analyst. Verify or refute the L1 hypothesis against the evidence."
+	defaultSeniorSystem = "You are the Senior analyst. Challenge L1 and L2 and produce a final threat assessment."
+	defaultPromptVer    = "story-3.8-default.v1"
+)
+
+// resolveRoleFamily maps a per-role provider value onto a concrete
+// provider family (Story 3.8 BI-3). A non-empty value is the explicit
+// family; an empty value inherits the top-level provider mapping
+// (api -> claude, local -> ollama). A global "none" is the kill-switch
+// handled by the caller before this is reached.
+func resolveRoleFamily(roleProvider, globalProvider string) string {
+	if roleProvider != "" {
+		return strings.ToLower(roleProvider)
+	}
+	switch {
+	case analystSelectsAPIProvider(globalProvider):
+		return "claude"
+	case analystSelectsLocalProvider(globalProvider):
+		return "ollama"
+	}
+	return "none"
+}
+
+// roleScoreCap returns the per-provider anti-hallucination cap for a role
+// (Story 3.8 DW3.7-1). Each family has a trust-ladder default (claude 35,
+// openai 30, ollama 25); a globally-configured analyst.score_cap that is
+// TIGHTER than the family default lowers it (an operator ceiling). This
+// closes DW3.7-1: an openai-routed role caps at 30 rather than inheriting
+// the claude-tier 35, even when the shipped global score_cap is 35.
+func roleScoreCap(family string, globalCap int) int {
+	def := 35
+	switch strings.ToLower(family) {
+	case "openai":
+		def = 30
+	case "ollama":
+		def = 25
+	}
+	if globalCap > 0 && globalCap < def {
+		return globalCap
+	}
+	return def
+}
+
+// firstNonEmpty returns a if non-empty, else b.
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
+// roleSpec resolves a role's (family, model) and a degrade reason. A
+// non-empty reason means the role cannot be constructed and the whole
+// chain degrades to rules-and-baselines-only (Story 3.8 BI-4). claude
+// tolerates an empty model (its constructor defaults it); openai and
+// ollama require a model.
+func roleSpec(roleProvider, roleModel string, cfg *config.Config, apiKey string) (family, model, degrade string) {
+	family = resolveRoleFamily(roleProvider, cfg.Analyst.Provider)
+	switch family {
+	case "claude", "openai":
+		model = firstNonEmpty(roleModel, cfg.Analyst.API.Model)
+	case "ollama":
+		model = firstNonEmpty(roleModel, cfg.Analyst.Local.Model)
+	}
+	switch family {
+	case "claude":
+		if apiKey == "" {
+			return family, model, "api key not set"
+		}
+	case "openai":
+		if apiKey == "" {
+			return family, model, "api key not set"
+		}
+		if model == "" {
+			return family, model, "model not set"
+		}
+	case "ollama":
+		if model == "" {
+			return family, model, "model not set"
+		}
+	default:
+		return family, model, "provider resolved to none"
+	}
+	return family, model, ""
+}
+
+// buildRoleProvider constructs the concrete provider for a resolved role
+// family + model (Story 3.8 BI-4). It assumes roleSpec already cleared
+// the degrade preconditions (key/model presence); the errors it returns
+// are genuine misconfiguration (e.g. a bad endpoint) and are fatal.
+func buildRoleProvider(family, model string, cfg *config.Config, apiKey string, reg *metrics.Registry, sink *reportredact.RedactionAuditSink, log *slog.Logger) (provider.Provider, error) {
+	scoreCap := roleScoreCap(family, cfg.Analyst.ScoreCap)
+	switch strings.ToLower(family) {
+	case "claude":
+		return claudeprovider.New(claudeprovider.Config{
+			Model:    model,
+			BaseURL:  cfg.Analyst.API.Endpoint,
+			ScoreCap: scoreCap,
+		}, apiKey, reg, sink, log)
+	case "openai":
+		return openaiprovider.New(openaiprovider.Config{
+			Model:    model,
+			BaseURL:  cfg.Analyst.API.Endpoint,
+			ScoreCap: scoreCap,
+		}, apiKey, reg, sink, log)
+	case "ollama":
+		return ollamaprovider.New(ollamaprovider.Config{
+			Model:    model,
+			Endpoint: cfg.Analyst.Local.Endpoint,
+			ScoreCap: scoreCap,
+		}, reg, sink, log)
+	default:
+		return nil, fmt.Errorf("analyst: unknown provider family %q", family)
+	}
+}
+
+// buildInvestigationChain wires the per-role investigation chain from
+// config (Story 3.8 AC2/AC3/AC4). It returns (nil, false, nil) when the
+// chain is disabled or any enabled role cannot be configured (the chain
+// degrades to rules-and-baselines-only, NFR27); a non-nil error is a
+// fatal misconfiguration. Ablation toggles (l2_enabled / senior_enabled)
+// truncate the chain by leaving the runner nil.
+func buildInvestigationChain(cfg *config.Config, apiKey string, reg *metrics.Registry, sink *reportredact.RedactionAuditSink, log *slog.Logger) (*analyst.Chain, bool, error) {
+	a := cfg.Analyst
+	if strings.EqualFold(a.Provider, "none") {
+		log.Info("aggregator: investigation chain disabled (analyst.provider=none); running rules+baselines only (FR27/NFR27)")
+		return nil, false, nil
+	}
+
+	// L1 is always required for a chain.
+	l1Family, l1Model, degrade := roleSpec(a.L1Provider, a.L1Model, cfg, apiKey)
+	if degrade != "" {
+		log.Info("aggregator: investigation chain not wired; running rules+baselines only",
+			"role", "l1", "reason", degrade, "provider", l1Family, "api_key_set", apiKey != "", "model_set", l1Model != "")
+		return nil, false, nil
+	}
+	l1p, err := buildRoleProvider(l1Family, l1Model, cfg, apiKey, reg, sink, log)
+	if err != nil {
+		return nil, false, fmt.Errorf("aggregator: L1 provider: %w", err)
+	}
+	l1, err := analyst.NewL1(l1p, analyst.PromptSpec{System: defaultL1System, Version: defaultPromptVer}, reg, log)
+	if err != nil {
+		return nil, false, fmt.Errorf("aggregator: L1 runner: %w", err)
+	}
+
+	var l2 *analyst.L2
+	if a.L2EnabledOrDefault() {
+		l2Family, l2Model, degrade := roleSpec(a.L2Provider, a.L2Model, cfg, apiKey)
+		if degrade != "" {
+			log.Info("aggregator: investigation chain not wired; running rules+baselines only",
+				"role", "l2", "reason", degrade, "provider", l2Family, "api_key_set", apiKey != "", "model_set", l2Model != "")
+			return nil, false, nil
+		}
+		l2p, perr := buildRoleProvider(l2Family, l2Model, cfg, apiKey, reg, sink, log)
+		if perr != nil {
+			return nil, false, fmt.Errorf("aggregator: L2 provider: %w", perr)
+		}
+		l2, err = analyst.NewL2(l2p, analyst.PromptSpec{System: defaultL2System, Version: defaultPromptVer}, reg, log)
+		if err != nil {
+			return nil, false, fmt.Errorf("aggregator: L2 runner: %w", err)
+		}
+	}
+
+	var senior *analyst.Senior
+	if a.SeniorEnabledOrDefault() {
+		srFamily, srModel, degrade := roleSpec(a.SeniorProvider, a.SeniorModel, cfg, apiKey)
+		if degrade != "" {
+			log.Info("aggregator: investigation chain not wired; running rules+baselines only",
+				"role", "senior", "reason", degrade, "provider", srFamily, "api_key_set", apiKey != "", "model_set", srModel != "")
+			return nil, false, nil
+		}
+		srp, perr := buildRoleProvider(srFamily, srModel, cfg, apiKey, reg, sink, log)
+		if perr != nil {
+			return nil, false, fmt.Errorf("aggregator: Senior provider: %w", perr)
+		}
+		senior, err = analyst.NewSenior(srp, analyst.PromptSpec{System: defaultSeniorSystem, Version: defaultPromptVer}, reg, log)
+		if err != nil {
+			return nil, false, fmt.Errorf("aggregator: Senior runner: %w", err)
+		}
+	}
+
+	chain, err := analyst.NewChain(l1, l2, senior, reg, log)
+	if err != nil {
+		return nil, false, fmt.Errorf("aggregator: chain: %w", err)
+	}
+	log.Info("aggregator: investigation chain wired", "mode", chain.Mode())
+	return chain, true, nil
+}
+
+// wireInvestigationChain runs the Story 3.8 investigation-chain consumer
+// alongside the deterministic FSM consumer. For each qualifying package
+// (the FR19 trigger gate) it runs the chain and publishes the resulting
+// assessment to AUDIT.assessments. It does NOT drive an FSM transition:
+// the LLM score fold is Story 3.11.
+func wireInvestigationChain(ctx context.Context, g groupGoer, log *slog.Logger, nc *natsclient.Client, chain *analyst.Chain, auditPub responseaudit.AssessmentAuditPublisher, runs *prometheus.CounterVec) error {
+	stream, err := nc.JetStream().Stream(ctx, "EVIDENCE")
+	if err != nil {
+		return fmt.Errorf("stream EVIDENCE: %w", err)
+	}
+	consumer, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+		Durable:       "olaitan-investigation-chain",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		FilterSubject: subjects.EvidencePackages,
+		MaxDeliver:    fsmConsumerMaxDeliver,
+	})
+	if err != nil {
+		return fmt.Errorf("consumer: %w", err)
+	}
+
+	mode := chain.Mode()
+	g.Go(func() error {
+		for {
+			if err := ctx.Err(); err != nil {
+				return nil
+			}
+			msg, err := consumer.Next(jetstream.FetchMaxWait(250 * time.Millisecond))
+			if err != nil {
+				if isFSMFetchTimeout(err) {
+					continue
+				}
+				log.Warn("aggregator: investigation-chain fetch failed", "err", err)
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(fsmFetchBackoff):
+				}
+				continue
+			}
+
+			var pkg schema.EvidencePackage
+			if jerr := json.Unmarshal(msg.Data(), &pkg); jerr != nil {
+				log.Warn("aggregator: investigation-chain decode failed; dropping", "err", jerr)
+				_ = msg.Ack()
+				continue
+			}
+			if pkg.WorkloadID == "" {
+				log.Warn("aggregator: investigation-chain dropping package with empty workload_id", "package_id", pkg.PackageID)
+				_ = msg.Ack()
+				continue
+			}
+
+			processChainPackage(ctx, pkg, chain, mode, auditPub, runs, log)
+			_ = msg.Ack()
+		}
+	})
+	return nil
+}
+
+// processChainPackage applies the FR19 trigger gate, runs the chain on a
+// qualifying package, publishes the assessment to AUDIT.assessments, and
+// records the outcome metric. It is the per-message body of the chain
+// consumer, factored out so it is unit-testable without a live JetStream
+// connection. It returns the recorded outcome label.
+func processChainPackage(ctx context.Context, pkg schema.EvidencePackage, chain *analyst.Chain, mode string, auditPub responseaudit.AssessmentAuditPublisher, runs *prometheus.CounterVec, log *slog.Logger) string {
+	if !analyst.ShouldTriggerChain(pkg) {
+		analyst.RecordChainRun(runs, mode, analyst.ChainOutcomeNotTriggered)
+		return analyst.ChainOutcomeNotTriggered
+	}
+
+	res, rerr := chain.Run(ctx, pkg)
+	if rerr != nil {
+		outcome := analyst.ChainOutcomeError
+		if errors.Is(rerr, analyst.ErrNoCitableEvents) {
+			outcome = analyst.ChainOutcomeNoCitable
+		}
+		analyst.RecordChainRun(runs, res.Mode, outcome)
+		log.Warn("aggregator: investigation chain run failed; dropping", "err", rerr, "package_id", pkg.PackageID)
+		return outcome
+	}
+
+	evt := responseaudit.AssessmentFromChain(pkg.PackageID, pkg.WorkloadID, res.Mode, res.Assessment, time.Now().UTC())
+	pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	if perr := auditPub.PublishAuditAssessment(pctx, evt); perr != nil {
+		log.Warn("aggregator: investigation-chain assessment audit publish failed", "err", perr, "package_id", pkg.PackageID)
+	}
+	cancel()
+	analyst.RecordChainRun(runs, res.Mode, analyst.ChainOutcomeAssessed)
+	return analyst.ChainOutcomeAssessed
+}
+
+// groupGoer is the subset of *errgroup.Group the chain consumer needs,
+// so a test can inject a capturing fake.
+type groupGoer interface {
+	Go(func() error)
+}

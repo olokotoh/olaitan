@@ -1362,6 +1362,40 @@ type AnalystConfig struct {
 	Timeout  DurationYAML       `yaml:"timeout"`
 	Chain    AnalystChain       `yaml:"chain"`
 	Subtasks AnalystSubtasks    `yaml:"subtasks"`
+
+	// Per-role provider routing (Story 3.8, FR25). Each *Provider names a
+	// CONCRETE family {claude, openai, ollama, none} or "" to inherit the
+	// top-level Provider mapping (api -> claude, local -> ollama). This is
+	// distinct from the top-level Provider enum {api, local, none}: the
+	// concrete family is what lets a role route to openai per FR25.
+	// L2Enabled / SeniorEnabled are *bool so an unset flag defaults to
+	// true while an explicit false (the AC4 ablation toggle) is honoured
+	// rather than swallowed (the Story 3.4 falsy-value lesson).
+	L1Provider     string `yaml:"l1_provider"`
+	L1Model        string `yaml:"l1_model"`
+	L2Provider     string `yaml:"l2_provider"`
+	L2Model        string `yaml:"l2_model"`
+	L2Enabled      *bool  `yaml:"l2_enabled"`
+	SeniorProvider string `yaml:"senior_provider"`
+	SeniorModel    string `yaml:"senior_model"`
+	SeniorEnabled  *bool  `yaml:"senior_enabled"`
+}
+
+// L2EnabledOrDefault reports whether the L2 role runs. Unset = true; an
+// explicit false is the RSLT L1-only ablation toggle (Story 3.8 AC4).
+func (a AnalystConfig) L2EnabledOrDefault() bool {
+	return a.L2Enabled == nil || *a.L2Enabled
+}
+
+// SeniorEnabledOrDefault reports whether the Senior role runs. Unset =
+// true; an explicit false is the RSLT L1+L2 ablation (Story 3.8 AC4).
+// Precedence: when L2 is disabled the chain is L1-only, so Senior is
+// implicitly off regardless of SeniorEnabled.
+func (a AnalystConfig) SeniorEnabledOrDefault() bool {
+	if !a.L2EnabledOrDefault() {
+		return false
+	}
+	return a.SeniorEnabled == nil || *a.SeniorEnabled
 }
 
 // AnalystAPIConfig points at an external LLM API. APIKeySecret names a
@@ -1850,6 +1884,17 @@ func (r ResponseConfig) validate() error {
 	return nil
 }
 
+// validRoleProvider reports whether p is an acceptable per-role provider
+// family (Story 3.8 BI-3): a concrete family, "none", or "" to inherit
+// the top-level provider mapping.
+func validRoleProvider(p string) bool {
+	switch strings.ToLower(p) {
+	case "", "claude", "openai", "ollama", "none":
+		return true
+	}
+	return false
+}
+
 func (a AnalystConfig) validate() error {
 	switch strings.ToLower(a.Provider) {
 	case "api", "local", "none":
@@ -1863,6 +1908,15 @@ func (a AnalystConfig) validate() error {
 	}
 	if a.ScoreCap < 0 || a.ScoreCap > 100 {
 		return fmt.Errorf("analyst.score_cap: must be in [0,100] (got %d)", a.ScoreCap)
+	}
+	for _, rp := range []struct{ field, val string }{
+		{"l1_provider", a.L1Provider},
+		{"l2_provider", a.L2Provider},
+		{"senior_provider", a.SeniorProvider},
+	} {
+		if !validRoleProvider(rp.val) {
+			return fmt.Errorf("analyst.%s: must be one of [claude openai ollama none] or empty to inherit (got %q)", rp.field, rp.val)
+		}
 	}
 	if a.Timeout.Duration() <= 0 {
 		return fmt.Errorf("analyst.timeout: must be > 0 (got %s)", a.Timeout.Duration())

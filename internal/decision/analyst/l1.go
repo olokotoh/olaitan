@@ -187,6 +187,11 @@ type L1 struct {
 	schema   *jsonschema.Schema
 }
 
+// ScoreCap exposes the L1 provider's per-provider anti-hallucination cap
+// so the orchestrator can cap an L1-only ablation assessment at the
+// boundary role's cap (Story 3.8 BI-5; mirrors Senior.ScoreCap).
+func (a *L1) ScoreCap() int { return a.provider.ScoreCap() }
+
 // NewL1 builds an L1 runner on top of an already-constructed provider
 // (per-role provider selection is Story 3.8). It registers (or re-uses)
 // the decision-outcome metric family on reg.

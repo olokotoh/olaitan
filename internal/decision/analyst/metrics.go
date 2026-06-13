@@ -70,6 +70,44 @@ func registerCounterVec(reg *metrics.Registry, name, help string, labels []strin
 	return vec, nil
 }
 
+// ChainRunsMetricName counts investigation-chain runs by mode and
+// outcome (Story 3.8 BI-6): the observability surface for the trigger
+// gate and the ablation boundary.
+const ChainRunsMetricName = "olaitan_investigation_chain_runs_total"
+
+const chainRunsMetricHelp = "Investigation-chain runs by mode (full, l1_l2, l1_only) and outcome " +
+	"(assessed, not_triggered, no_citable, error). One increment per " +
+	"EvidencePackage the chain consumer handles: not_triggered when the " +
+	"FR19 gate declines, assessed on a produced assessment, no_citable " +
+	"when the chain aborts on empty evidence, error otherwise (Story 3.8 " +
+	"BI-6)."
+
+// Chain-run outcome label values (the bounded outcome enum, Story 3.8
+// BI-6).
+const (
+	ChainOutcomeAssessed     = "assessed"
+	ChainOutcomeNotTriggered = "not_triggered"
+	ChainOutcomeNoCitable    = "no_citable"
+	ChainOutcomeError        = "error"
+)
+
+// RegisterChainRunsMetric registers (or re-uses) the chain-runs counter
+// on reg, idempotently like the other decision-ring families.
+func RegisterChainRunsMetric(reg *metrics.Registry) (*prometheus.CounterVec, error) {
+	return registerCounterVec(reg, ChainRunsMetricName, chainRunsMetricHelp, []string{"mode", "outcome"})
+}
+
+// RecordChainRun increments the chain-runs counter for a (mode, outcome)
+// pair. A nil vec or an empty label is a no-op so the bounded-label
+// guarantee does not rest on every caller checking first (the
+// RecordL2Skip precedent).
+func RecordChainRun(vec *prometheus.CounterVec, mode, outcome string) {
+	if vec == nil || mode == "" || outcome == "" {
+		return
+	}
+	vec.WithLabelValues(mode, outcome).Inc()
+}
+
 // RegisterDecisionCallsMetric registers (or re-uses) the shared
 // olaitan_decision_llm_calls_total counter on reg and returns the handle.
 //

@@ -31,7 +31,9 @@ const (
 // DefaultRoleTimeouts returns the AC-mandated per-role TOTAL retry budget
 // (Story 3.2 AC2: 30s l1, 30s l2, 60s senior, 120s dfir-reserved). A fresh
 // map is returned per call so one provider's test seam cannot mutate
-// another provider's table. Story 3.8 makes these config-routable.
+// another provider's table. Making these config-routable is DEFERRED
+// (DW3.8-1): no Story 3.8 AC requires it, so the per-role timeout config
+// knob lands with Story 3.16 mode wiring or whenever an AC needs it.
 func DefaultRoleTimeouts() map[Role]time.Duration {
 	return map[Role]time.Duration{
 		RoleL1:     30 * time.Second,

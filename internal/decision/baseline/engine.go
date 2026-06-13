@@ -604,9 +604,14 @@ func resolveWorkloadKey(pkg *schema.EvidencePackage) (string, string) {
 }
 
 // resolvePodUID returns the first non-empty Pod.UID across events
-// in pkg. BI-5 explicit: an empty result is acceptable; the
-// downstream trigger constructor falls back to the package's
-// PackageID hash for trigger.EventID.
+// in pkg. BI-5 explicit: an empty result is acceptable. The downstream
+// baseline trigger constructor (correlator/trigger.BaselineDeviation)
+// sets trigger.EventID to this Pod UID directly, so when no Pod UID
+// resolves the EventID is left empty; package uniqueness is guaranteed
+// by PackageID (the assembler's per-Assembler seq counter), NOT by
+// EventID. (Story 3.8 DW3.5-2: the earlier "PackageID hash fallback"
+// note described a derivation that was never implemented; corrected
+// here to match the trigger constructor's actual behaviour.)
 func resolvePodUID(pkg *schema.EvidencePackage) string {
 	for i := range pkg.Events {
 		if uid := pkg.Events[i].Pod.UID; uid != "" {

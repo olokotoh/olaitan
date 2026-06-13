@@ -183,6 +183,16 @@ func New(cfg Config, apiKey string, reg *metrics.Registry, sink *redact.Redactio
 		baseURL = DefaultBaseURL
 	}
 	baseURL = strings.TrimRight(baseURL, "/")
+	// Story 3.8 (DW3.4-1): reject query strings and fragments too, not
+	// just userinfo/bad schemes, reaching parity with the ollama
+	// provider. The Chat Completions path appended after a "?" or "#"
+	// would land inside the query/fragment and every call would 404. The
+	// string check covers the bare forms ("...v1#") that parse to EMPTY
+	// RawQuery/Fragment (url.Parse has a ForceQuery flag for a bare "?"
+	// but no fragment analog -- the ollama round-2 lesson).
+	if strings.ContainsAny(baseURL, "?#") {
+		return nil, ErrBadBaseURL
+	}
 	// Round-1 review: validate the endpoint at construction. A relative or
 	// scheme-less URL would fail on every attempt as a retried transient,
 	// masking a permanent misconfiguration; userinfo would leak into the

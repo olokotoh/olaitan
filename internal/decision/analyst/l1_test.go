@@ -21,18 +21,27 @@ import (
 // retries, no timeout; those are real-provider concerns the L1 runner
 // must not depend on.
 type fakeProvider struct {
-	name  string
-	model string
-	resp  provider.Response
-	err   error
-	got   provider.Request
-	calls int
+	name string
+	// capOverride, when non-zero, is the ScoreCap the fake reports;
+	// otherwise it defaults to 25. Lets a per-role ablation test prove
+	// the orchestrator reads the BOUNDARY role's cap (Story 3.8).
+	capOverride int
+	model       string
+	resp        provider.Response
+	err         error
+	got         provider.Request
+	calls       int
 }
 
-func (f *fakeProvider) Name() string                 { return f.name }
-func (f *fakeProvider) Model() string                { return f.model }
-func (f *fakeProvider) MaxContextTokens() int        { return 200000 }
-func (f *fakeProvider) ScoreCap() int                { return 25 }
+func (f *fakeProvider) Name() string          { return f.name }
+func (f *fakeProvider) Model() string         { return f.model }
+func (f *fakeProvider) MaxContextTokens() int { return 200000 }
+func (f *fakeProvider) ScoreCap() int {
+	if f.capOverride != 0 {
+		return f.capOverride
+	}
+	return 25
+}
 func (f *fakeProvider) SupportsStreaming() bool      { return false }
 func (f *fakeProvider) Health(context.Context) error { return nil }
 

@@ -593,6 +593,48 @@ assessment for audit traceability (AC2); the architecture bound
 max(LLM-only ThreatScore) = 0.3 x 35 = 10.5 is pinned by
 TestCapBoundProperty against the score package constants.
 
+**Metric: `olaitan_investigation_chain_runs_total`** (counter, labels
+`mode`, `outcome`). One increment per `EvidencePackage` the Story 3.8
+investigation-chain consumer (`olaitan-investigation-chain`, a durable
+JetStream consumer on `EVIDENCE.packages` that runs ALONGSIDE the
+deterministic FSM consumer) handles. `mode` is the configured chain
+boundary: `full` (L1->L2->Senior), `l1_l2` (Senior ablated off), or
+`l1_only` (L2 + Senior ablated off). `outcome` is `not_triggered` (the
+FR19 gate declined: no rule severity >= 50 and no baseline sigma >= 3.0),
+`assessed` (an assessment was produced and published to
+`AUDIT.assessments`), `no_citable` (the chain aborted on empty citable
+evidence -- the Story 3.6 chain-level concern, no retry; Story 3.10 owns
+retries), or `error`. A high `not_triggered` ratio is expected and
+healthy (the gate controls LLM cost). A sustained `error` rate is a
+provider/transport problem:
+`sum(rate(olaitan_investigation_chain_runs_total{outcome="error"}[10m]))`.
+
+**Investigation chain (Story 3.8, FR19/FR25/FR27/FR53).** The chain is
+TRIGGERED only on qualifying packages (FR19 gate above) and routes each
+role to its own provider+model via the Helm values
+`analyst.{l1,l2,senior}_{provider,model}` (FR25; per-role provider is a
+concrete family claude/openai/ollama or "" to inherit the top-level
+`analyst.provider` mapping api->claude / local->ollama). Per-provider
+trust caps are enforced in code (claude 35 / openai 30 / ollama 25); an
+openai-routed role caps at 30, never the claude-tier 35, with a tighter
+global `analyst.score_cap` acting as an operator ceiling. **Ablation
+(FR53):** `analyst.l2_enabled: false` runs L1-only (Senior also off);
+`analyst.senior_enabled: false` runs L1+L2; the assessment records which
+roles ran via `agents_available`. **Bypass (FR27/NFR27):**
+`analyst.provider: none` builds no chain -- `EvidencePackage` objects are
+still consumed and scored by the FSM on rules-and-baselines-only
+ThreatScores, and the rules-only mode is disclosed once at startup. NOTE
+the chain produces and audits assessments but does NOT yet move the FSM
+ThreatScore: the LLM score fold is Story 3.11 (`score.go` LLM term stays
+0 until then).
+
+**Audit subject `AUDIT.assessments`** (`audit.assessments.v1`, Story 3.8
+AC4). One event per investigation-chain run, carrying `mode` and
+`agents_available` so the ablation boundary is auditable, plus
+`raw_confidence`/`llm_capped_confidence` for trust-bound traceability.
+Published synchronously by the chain consumer (`WithMsgID` = package_id).
+Story 3.14 owns the broader audit pipeline and may extend the payload.
+
 **Per-role timeout table (total budget across ALL retry attempts):**
 
 | role | budget |

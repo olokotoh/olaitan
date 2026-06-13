@@ -89,34 +89,69 @@ func GuardCappedConfidence(a *schema.ThreatAssessment, scoreCap int, vec *promet
 	return nil
 }
 
+// Chain mode labels (Story 3.8 BI-5): which roles the chain is
+// configured to run. They drive the ChainResult.Mode audit field and the
+// olaitan_investigation_chain_runs_total{mode} metric. A mode is fixed at
+// construction by the deliberate-ablation toggles, distinct from a
+// runtime degrade (a role failing mid-run).
+const (
+	ChainModeFull   = "full"    // L1 -> L2 -> Senior
+	ChainModeL1L2   = "l1_l2"   // L1 -> L2 (RSLT L1+L2 ablation, Senior off)
+	ChainModeL1Only = "l1_only" // L1 (RSLT L1-only ablation, L2 + Senior off)
+)
+
 // ChainResult is the full audit trail of one investigation chain run
 // (consumed by the Story 3.14 publisher and the Story 3.9
-// checkpointer). Stage pointers are nil where a stage did not run.
+// checkpointer). Stage pointers are nil where a stage did not run. Mode
+// records the deliberate-ablation boundary (Story 3.8 BI-5).
 type ChainResult struct {
 	L1         *L1Result
 	L2         *L2Result
 	L2Skipped  bool
 	SkipReason string
 	Senior     SeniorResult
+	Mode       string
 	Assessment schema.ThreatAssessment
 }
 
 // Chain sequences L1 -> (gate) -> L2 -> Senior over one EvidencePackage
-// (Story 3.7 BI-7). Triggering and per-role provider routing are Story
-// 3.8; retries and fallback are Story 3.10.
+// (Story 3.7 BI-7). Per-role provider routing and deliberate ablation
+// are Story 3.8; retries and fallback are Story 3.10. The mode is fixed
+// at construction: a nil senior runner = L1+L2 ablation, a nil l2 AND
+// nil senior = L1-only ablation.
 type Chain struct {
 	l1            *L1
 	l2            *L2
 	senior        *Senior
+	mode          string
 	skips         *prometheus.CounterVec
 	capViolations *prometheus.CounterVec
 	log           *slog.Logger
 }
 
-// NewChain builds the chain orchestrator from the three role runners.
+// Mode reports the chain's construction-time ablation mode (one of
+// ChainModeFull / ChainModeL1L2 / ChainModeL1Only). The consumer uses it
+// as the metric label and the audit mode (Story 3.8 BI-5/BI-8).
+func (c *Chain) Mode() string { return c.mode }
+
+// NewChain builds the chain orchestrator from the role runners. l1 is
+// always required. Deliberate ablation (Story 3.8 AC4) is expressed by
+// nil runners: senior == nil (l2 present) = L1+L2; l2 == nil && senior
+// == nil = L1-only. l2 == nil with a non-nil senior is rejected: that is
+// not a named ablation cell.
 func NewChain(l1 *L1, l2 *L2, senior *Senior, reg *metrics.Registry, log *slog.Logger) (*Chain, error) {
-	if l1 == nil || l2 == nil || senior == nil {
-		return nil, errors.New("analyst: nil runner")
+	if l1 == nil {
+		return nil, errors.New("analyst: nil L1 runner")
+	}
+	if l2 == nil && senior != nil {
+		return nil, errors.New("analyst: senior without L2 is not a valid ablation (want full, L1+L2, or L1-only)")
+	}
+	mode := ChainModeFull
+	switch {
+	case l2 == nil:
+		mode = ChainModeL1Only
+	case senior == nil:
+		mode = ChainModeL1L2
 	}
 	if log == nil {
 		log = slog.Default()
@@ -129,19 +164,127 @@ func NewChain(l1 *L1, l2 *L2, senior *Senior, reg *metrics.Registry, log *slog.L
 	if err != nil {
 		return nil, err
 	}
-	return &Chain{l1: l1, l2: l2, senior: senior, skips: skips, capViolations: capViolations, log: log}, nil
+	return &Chain{l1: l1, l2: l2, senior: senior, mode: mode, skips: skips, capViolations: capViolations, log: log}, nil
 }
 
-// Run executes the full investigation chain for pkg. Degradation
-// semantics (BI-7): an unavailable L1 skips L2 (reason l1_unavailable)
-// into Senior-on-evidence-only mode; an L1 schema violation (the single
-// pre-3.10 attempt IS the L1 outcome) skips L2 under
-// l1_schema_violation, also evidence-only; ErrNoCitableEvents aborts
-// the chain (nothing to assess); an L2 failure of any kind runs the
-// Senior hypothesis-only (L2 was attempted, not skipped); a Senior
-// failure aborts the chain (Story 3.10 owns retries and fallback).
+// Run executes the configured investigation chain for pkg, dispatching
+// on the construction-time ablation mode (Story 3.8 BI-5).
 func (c *Chain) Run(ctx context.Context, pkg schema.EvidencePackage) (ChainResult, error) {
+	switch c.mode {
+	case ChainModeL1Only:
+		return c.runL1Only(ctx, pkg)
+	case ChainModeL1L2:
+		return c.runL1L2(ctx, pkg)
+	default:
+		return c.runFull(ctx, pkg)
+	}
+}
+
+// runL1Only is the RSLT L1-only ablation (Story 3.8 AC4): L1 runs and the
+// assessment is built from the hypothesis. There is no role below L1 to
+// absorb a failure, so any L1 failure aborts the chain.
+func (c *Chain) runL1Only(ctx context.Context, pkg schema.EvidencePackage) (ChainResult, error) {
+	result := ChainResult{Mode: ChainModeL1Only}
+
+	l1res, l1err := c.l1.Run(ctx, pkg)
+	if l1err != nil {
+		if errors.Is(l1err, ErrNoCitableEvents) {
+			return result, fmt.Errorf("chain aborted before L1: %w", l1err)
+		}
+		result.L1 = &l1res
+		return result, fmt.Errorf("L1-only chain aborted at L1: %w", l1err)
+	}
+	result.L1 = &l1res
+
+	hyp := l1res.Hypothesis
+	scoreCap := c.l1.ScoreCap()
+	assessment := schema.ThreatAssessment{
+		Reasoning:           hyp.Hypothesis,
+		Mode:                schema.ModeLLM,
+		RawConfidence:       hyp.Confidence,
+		LLMCappedConfidence: CapConfidence(hyp.Confidence, scoreCap),
+		AgentsAvailable:     []string{"l1"},
+	}
+	if err := GuardCappedConfidence(&assessment, scoreCap, c.capViolations); err != nil {
+		return result, err
+	}
+	result.Assessment = assessment
+	return result, nil
+}
+
+// runL1L2 is the RSLT L1+L2 ablation (Story 3.8 AC4): L1 -> L2, Senior
+// off. The assessment is built from L2 when it succeeds, else from L1 (a
+// runtime degrade within the ablation). Any L1 failure aborts: there is
+// no Senior to absorb it. The Reasoning carries the L1 hypothesis (the
+// verified narrative); ThreatType/MitreTechniques are empty because no
+// Senior produced them.
+func (c *Chain) runL1L2(ctx context.Context, pkg schema.EvidencePackage) (ChainResult, error) {
+	result := ChainResult{Mode: ChainModeL1L2}
+
+	l1res, l1err := c.l1.Run(ctx, pkg)
+	if l1err != nil {
+		if errors.Is(l1err, ErrNoCitableEvents) {
+			return result, fmt.Errorf("chain aborted before L1: %w", l1err)
+		}
+		result.L1 = &l1res
+		return result, fmt.Errorf("L1+L2 chain aborted at L1: %w", l1err)
+	}
+	result.L1 = &l1res
+
+	l2res, l2err := c.l2.Run(ctx, pkg, l1res.Hypothesis)
+	result.L2 = &l2res
+
+	var (
+		raw       int
+		scoreCap  int
+		available []string
+		disagree  []string
+	)
+	if l2err == nil {
+		ver := l2res.Verification
+		raw = ver.Confidence
+		scoreCap = c.l2.ScoreCap()
+		available = []string{"l1", "l2"}
+		if ver.Verdict == schema.VerdictRefuted {
+			entry := "L2 refuted the L1 hypothesis"
+			if len(ver.ContradictoryFindings) > 0 {
+				entry += ": " + boundForLog(ver.ContradictoryFindings[0])
+			}
+			disagree = []string{entry}
+		}
+	} else {
+		// L2 failed; degrade to L1 within the ablation.
+		raw = l1res.Hypothesis.Confidence
+		scoreCap = c.l1.ScoreCap()
+		available = []string{"l1"}
+	}
+
+	assessment := schema.ThreatAssessment{
+		Reasoning:           l1res.Hypothesis.Hypothesis,
+		Mode:                schema.ModeLLM,
+		NotedDisagreements:  disagree,
+		RawConfidence:       raw,
+		LLMCappedConfidence: CapConfidence(raw, scoreCap),
+		AgentsAvailable:     available,
+	}
+	if err := GuardCappedConfidence(&assessment, scoreCap, c.capViolations); err != nil {
+		return result, err
+	}
+	result.Assessment = assessment
+	return result, nil
+}
+
+// runFull is the Story 3.7 L1 -> (gate) -> L2 -> Senior path. Degradation
+// semantics (3.7 BI-7): an unavailable L1 skips L2 (reason
+// l1_unavailable) into Senior-on-evidence-only mode; an L1 schema
+// violation (the single pre-3.10 attempt IS the L1 outcome) skips L2
+// under l1_schema_violation, also evidence-only; ErrNoCitableEvents
+// aborts the chain (nothing to assess); an L2 failure of any kind runs
+// the Senior hypothesis-only (L2 was attempted, not skipped); a Senior
+// failure aborts the chain (Story 3.10 owns retries and fallback).
+func (c *Chain) runFull(ctx context.Context, pkg schema.EvidencePackage) (ChainResult, error) {
 	var result ChainResult
+	result.Mode = ChainModeFull
 
 	l1res, l1err := c.l1.Run(ctx, pkg)
 	result.L1 = &l1res

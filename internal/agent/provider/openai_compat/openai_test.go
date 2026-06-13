@@ -49,6 +49,11 @@ func TestNewRejectsBadBaseURL(t *testing.T) {
 		{"unparseable", "://nope"},
 		{"non-http scheme", "ftp://host/v1"},
 		{"userinfo credentials", "https://user:secret-cred@host/v1"},
+		// Story 3.8 (DW3.4-1): query/fragment forms reach ollama parity.
+		{"query string", "https://host/v1?key=x"},
+		{"fragment", "https://host/v1#frag"},
+		{"bare query", "https://host/v1?"},
+		{"bare fragment", "https://host/v1#"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
