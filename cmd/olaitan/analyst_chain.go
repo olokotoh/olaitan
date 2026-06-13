@@ -311,7 +311,7 @@ func processChainPackage(ctx context.Context, pkg schema.EvidencePackage, chain 
 		return 0, outcome
 	}
 
-	evt := responseaudit.AssessmentFromChain(pkg.PackageID, pkg.WorkloadID, res.Mode, res.Assessment, time.Now().UTC())
+	evt := responseaudit.AssessmentFromChain(buildAssessmentInput(pkg, res, time.Now().UTC()))
 	pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	if perr := auditPub.PublishAuditAssessment(pctx, evt); perr != nil {
 		log.Warn("aggregator: investigation-chain assessment audit publish failed", "err", perr, "package_id", pkg.PackageID)
@@ -321,6 +321,57 @@ func processChainPackage(ctx context.Context, pkg schema.EvidencePackage, chain 
 	// LLMCappedConfidence is 0 on the llm_unavailable degrade (Story 3.10),
 	// so a degraded assessment folds a zero LLM term -> deterministic-only.
 	return res.Assessment.LLMCappedConfidence, analyst.ChainOutcomeAssessed
+}
+
+// buildAssessmentInput flattens a successful ChainResult onto the ring-clean
+// audit.AssessmentInput (Story 3.14 BI-2a/BI-3): cmd is the only ring that
+// imports both internal/decision/analyst and internal/response/audit, so the
+// projection lives here, keeping the audit package free of an analyst import.
+// It redacts the package at the audit boundary (redact.Redact is the same
+// pure redaction the providers ran, so this reproduces the bytes the LLM
+// saw) and records redaction_applied=true; the RAW pkg is never put on the
+// event. Per-role prompt-version/provider/model entries are added only for
+// roles that actually ran in this mode (ablation omits the rest).
+func buildAssessmentInput(pkg schema.EvidencePackage, res analyst.ChainResult, now time.Time) responseaudit.AssessmentInput {
+	redacted, _ := reportredact.Redact(pkg)
+	assessment := res.Assessment
+	in := responseaudit.AssessmentInput{
+		PackageID:        pkg.PackageID,
+		WorkloadID:       pkg.WorkloadID,
+		Mode:             res.Mode,
+		AgentsAvailable:  assessment.AgentsAvailable,
+		PromptVersions:   map[string]string{},
+		Providers:        map[string]string{},
+		Models:           map[string]string{},
+		RawConfidence:    assessment.RawConfidence,
+		CappedConfidence: assessment.LLMCappedConfidence,
+		ThreatAssessment: &assessment,
+		RedactedEvidence: redacted,
+		RedactionApplied: true,
+		Now:              now,
+	}
+	if res.L1 != nil {
+		in.PromptVersions["l1"] = res.L1.PromptVersion
+		in.Providers["l1"] = res.L1.Provider
+		in.Models["l1"] = res.L1.Model
+		hyp := res.L1.Hypothesis
+		in.L1Hypothesis = &hyp
+	}
+	if res.L2 != nil {
+		in.PromptVersions["l2"] = res.L2.PromptVersion
+		in.Providers["l2"] = res.L2.Provider
+		in.Models["l2"] = res.L2.Model
+		ver := res.L2.Verification
+		in.L2Verification = &ver
+	}
+	// Senior ran iff a provider call was attributed to it (full mode); the
+	// l1_only / l1_l2 ablations leave SeniorResult zero-valued.
+	if res.Senior.Provider != "" {
+		in.PromptVersions["senior"] = res.Senior.PromptVersion
+		in.Providers["senior"] = res.Senior.Provider
+		in.Models["senior"] = res.Senior.Model
+	}
+	return in
 }
 
 // safeChainConfidence runs processChainPackage inside a recover so a panic in

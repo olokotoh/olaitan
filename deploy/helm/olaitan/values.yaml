@@ -832,6 +832,8 @@ response:
     retentionTransitionsDays: 90
     retentionOverridesDays: 365
     retentionPoliciesDays: 365
+    # Story 3.14 (FR41): AUDIT.assessments SIEM-audit stream retention.
+    retentionAssessmentsDays: 365
 
 # Story 1.19: Evaluation matrix configuration (FR53). One-flag switch
 # that places the chart into one of the canonical evaluation arms (F,

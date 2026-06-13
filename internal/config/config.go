@@ -1200,6 +1200,9 @@ type AuditConfig struct {
 	RetentionTransitionsDays *int  `yaml:"retention_transitions_days,omitempty"`
 	RetentionOverridesDays   *int  `yaml:"retention_overrides_days,omitempty"`
 	RetentionPoliciesDays    *int  `yaml:"retention_policies_days,omitempty"`
+	// RetentionAssessmentsDays tunes the AUDIT_ASSESSMENTS stream MaxAge
+	// (Story 3.14, FR41/NFR16). Default 365 d (the SIEM-audit window).
+	RetentionAssessmentsDays *int `yaml:"retention_assessments_days,omitempty"`
 }
 
 // Default audit retention days (AC4). Transitions default to 90 d (matching the
@@ -1209,6 +1212,7 @@ const (
 	DefaultAuditRetentionTransitionsDays = 90
 	DefaultAuditRetentionOverridesDays   = 365
 	DefaultAuditRetentionPoliciesDays    = 365
+	DefaultAuditRetentionAssessmentsDays = 365
 )
 
 // DefaultAudit returns the Story 2.8 defaults: disabled, with 90/365/365 d
@@ -1218,11 +1222,13 @@ func DefaultAudit() AuditConfig {
 	t := DefaultAuditRetentionTransitionsDays
 	o := DefaultAuditRetentionOverridesDays
 	p := DefaultAuditRetentionPoliciesDays
+	as := DefaultAuditRetentionAssessmentsDays
 	return AuditConfig{
 		Enabled:                  &enabled,
 		RetentionTransitionsDays: &t,
 		RetentionOverridesDays:   &o,
 		RetentionPoliciesDays:    &p,
+		RetentionAssessmentsDays: &as,
 	}
 }
 
@@ -1251,6 +1257,15 @@ func (a AuditConfig) RetentionOverridesDaysOrDefault() int {
 		return DefaultAuditRetentionOverridesDays
 	}
 	return *a.RetentionOverridesDays
+}
+
+// RetentionAssessmentsDaysOrDefault returns the effective AUDIT.assessments
+// retention in days, substituting the 365 d default when omitted (Story 3.14).
+func (a AuditConfig) RetentionAssessmentsDaysOrDefault() int {
+	if a.RetentionAssessmentsDays == nil {
+		return DefaultAuditRetentionAssessmentsDays
+	}
+	return *a.RetentionAssessmentsDays
 }
 
 // RetentionPoliciesDaysOrDefault returns the effective policies retention in

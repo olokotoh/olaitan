@@ -16,6 +16,15 @@ func TestAuditConfig_Defaults(t *testing.T) {
 	if d.RetentionPoliciesDaysOrDefault() != 365 {
 		t.Errorf("policies retention default = %d, want 365", d.RetentionPoliciesDaysOrDefault())
 	}
+	if d.RetentionAssessmentsDaysOrDefault() != 365 {
+		t.Errorf("assessments retention default = %d, want 365", d.RetentionAssessmentsDaysOrDefault())
+	}
+	// Explicit override survives.
+	thirty := 30
+	a := AuditConfig{RetentionAssessmentsDays: &thirty}
+	if a.RetentionAssessmentsDaysOrDefault() != 30 {
+		t.Errorf("explicit assessments retention = %d, want 30", a.RetentionAssessmentsDaysOrDefault())
+	}
 }
 
 func TestAuditConfig_OrDefaultOnNil(t *testing.T) {
@@ -25,6 +34,9 @@ func TestAuditConfig_OrDefaultOnNil(t *testing.T) {
 	}
 	if a.RetentionTransitionsDaysOrDefault() != 90 || a.RetentionOverridesDaysOrDefault() != 365 || a.RetentionPoliciesDaysOrDefault() != 365 {
 		t.Error("nil retentions must read as 90/365/365")
+	}
+	if a.RetentionAssessmentsDaysOrDefault() != 365 {
+		t.Error("nil assessments retention must read as 365")
 	}
 }
 

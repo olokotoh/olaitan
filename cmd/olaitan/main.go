@@ -440,6 +440,9 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		// unconditionally; the stream is provisioned alongside the others so
 		// startup order does not matter (the Story 2.8 round-2 amendment).
 		Redactions: time.Duration(cfg.Report.Redact.RetentionRedactionsDaysOrDefault()) * 24 * time.Hour,
+		// Story 3.14: the AUDIT_ASSESSMENTS SIEM stream MaxAge (365 d default,
+		// Helm-tunable via response.audit.retention_assessments_days).
+		Assessments: time.Duration(cfg.Response.Audit.RetentionAssessmentsDaysOrDefault()) * 24 * time.Hour,
 	}
 	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigsWithRetention(auditRetention, cfg.Analyst.CheckpointRetention.Duration())); err != nil {
 		closeNATS()
@@ -1467,6 +1470,9 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 		// aggregator so whichever ring wins the startup race provisions the
 		// stream with the same MaxAge.
 		Redactions: time.Duration(cfg.Report.Redact.RetentionRedactionsDaysOrDefault()) * 24 * time.Hour,
+		// Story 3.14: the AUDIT_ASSESSMENTS SIEM stream MaxAge (365 d default,
+		// Helm-tunable via response.audit.retention_assessments_days).
+		Assessments: time.Duration(cfg.Response.Audit.RetentionAssessmentsDaysOrDefault()) * 24 * time.Hour,
 	}
 	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigsWithRetention(auditRetention, cfg.Analyst.CheckpointRetention.Duration())); err != nil {
 		closeNATS()

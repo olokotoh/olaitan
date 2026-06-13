@@ -726,8 +726,9 @@ func TestStreamConfigsWithAuditOverridesMaxAge(t *testing.T) {
 	ar := natsclient.AuditRetention{
 		Transitions: 7 * 24 * time.Hour,
 		// Overrides left zero -> keep default 365 d.
-		Policies:   30 * 24 * time.Hour,
-		Redactions: 14 * 24 * time.Hour,
+		Policies:    30 * 24 * time.Hour,
+		Redactions:  14 * 24 * time.Hour,
+		Assessments: 21 * 24 * time.Hour,
 	}
 	configs := natsclient.StreamConfigsWithAudit(ar)
 	if got := findStreamFor(t, configs, subjects.AuditTransitions).MaxAge; got != 7*24*time.Hour {
@@ -741,6 +742,9 @@ func TestStreamConfigsWithAuditOverridesMaxAge(t *testing.T) {
 	}
 	if got := findStreamFor(t, configs, subjects.AuditRedactions).MaxAge; got != 14*24*time.Hour {
 		t.Errorf("redactions MaxAge = %s, want 14d (operator override)", got)
+	}
+	if got := findStreamFor(t, configs, subjects.AuditAssessments).MaxAge; got != 21*24*time.Hour {
+		t.Errorf("assessments MaxAge = %s, want 21d (operator override)", got)
 	}
 	// A non-audit stream is untouched by the override.
 	if got := findStreamFor(t, configs, subjects.OverridesApplied).MaxAge; got != 365*24*time.Hour {

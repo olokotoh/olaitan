@@ -422,6 +422,20 @@ Operational notes:
 - **Append-only via LimitsPolicy (NFR16), 365 d default.** The `AUDIT_REDACTIONS` stream is `LimitsPolicy` (consumers cannot delete events), Helm-tunable via `report.redact.retention_redactions_days`. Unlike transitions' 90 d, no AC carves out a shorter window for redactions, so it takes the architecture's generalised "AUDIT.* 365 d" default.
 - **Best-effort, never blocks or fails the redaction (BI-6.2).** A NATS outage drops redaction-audit events (with a warn + a dropped counter on the buffered sink) rather than adding latency to or failing the redaction / LLM call. The redaction is the security guarantee; the audit line is observability.
 
+### AUDIT.assessments, the LLM-verdict SIEM subject (Story 3.14, FR41/NFR15/NFR18)
+
+`AUDIT.assessments` is the append-only SIEM copy of every investigation-chain run. Inspect it the same way: `nats sub AUDIT.assessments --raw`. Each event is structured JSON validated against `docs/schemas/audit/assessments.json` (authoritative, with the `assessments.yaml` mirror).
+
+| Subject | Stream | Default retention | Records |
+|---|---|---|---|
+| `AUDIT.assessments` | `AUDIT_ASSESSMENTS` | 365 d (`response.audit.retention_assessments_days`) | one event per chain run: per-role prompt versions/providers/models, the L1/L2/Senior verdicts, the **redacted** evidence, raw + capped confidences, `redaction_applied` |
+
+Operational notes:
+- **Full chain trail, keyed on `package_id`.** The event carries `prompt_versions{l1,l2,senior}` (the Story 3.13 content hashes — so a verdict is reproducible to an exact prompt revision), `providers`/`models` per role, the `l1_hypothesis`/`l2_verification`/`threat_assessment`, and `raw_confidence`/`llm_capped_confidence`. An ablation mode (`l1_only`/`l1_l2`) omits the roles it did not run. The msgID is `package_id`, so a chain re-run of the same package is server-side deduplicated within the stream's dedup window.
+- **Redaction at the audit boundary (NFR15/NFR18).** `redacted_evidence` is the EvidencePackage AFTER `redact.Redact` — the exact bytes the LLM saw, with secret env values, JWT bodies, and raw payloads stripped. The raw package is NEVER serialised into the event, so `AUDIT.assessments` is safe to ship to a SIEM. `redaction_applied` is `true` on every production path; a `false` is a CI-enforced violation (a property test asserts no production call builds an assessment with redaction skipped, and an adversarial secret-bearing package proves no secret reaches the payload).
+- **Append-only via LimitsPolicy (NFR16), 365 d default.** The `AUDIT_ASSESSMENTS` stream is `LimitsPolicy` (consumers cannot delete events), Helm-tunable via `response.audit.retention_assessments_days`. The operational `ASSESSMENTS.completed` 30-day read-model named in the architecture is deferred until a query consumer needs it (no Epic-3 consumer reads it; the SIEM copy here is the load-bearing audit trail).
+- **Schema is v2, additive over the Story 3.8 v1 (NFR29).** Older consumers ignore the new fields. `decided_at` (chain decision) equals `published_at` in the synchronous publish path.
+
 Operational notes:
 - **Two events per applied override, by design (BI-10):** an applied operator override emits one `AUDIT.transitions` (the state change, `trigger_type=override`) AND one `AUDIT.overrides` (the application, with TTL/source/attribution); a rejected override emits only `AUDIT.overrides`. They are complementary, correlated on `workload_id` + time. Do NOT "deduplicate" them.
 - **Mutations only, not heartbeats (BI-9, Open Assumption 2):** an idempotent NetworkPolicy noop, a NotFound delete, and a no-op FSM evaluation produce NO audit event. Audit-stream volume tracks real activity, not reconcile cadence. For reconcile-cadence telemetry use the Story 2.9 Prometheus metrics.
