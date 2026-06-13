@@ -5,6 +5,7 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -206,7 +207,7 @@ func TestFSMConsumerFoldsChainConfidenceIntoScore(t *testing.T) {
 // is engaged, an LLM-eligible package bypasses the chain (no chain.Run, no
 // assessment published, folds 0) and records the breaker_bypassed outcome.
 func TestProcessChainPackageBreakerBypass(t *testing.T) {
-	chain := scriptedFullChain(t)
+	chain, cp := countingChain(t)
 	pub := &fakeAssessmentPub{}
 	breaker := analyst.NewCircuitBreaker(analyst.CircuitBreakerOptions{RatePerMin: 1, Cooling: 60 * time.Second, Enabled: true})
 	// Pre-engage: 2 admits exceed the rate of 1/min.
@@ -220,8 +221,12 @@ func TestProcessChainPackageBreakerBypass(t *testing.T) {
 	if out != analyst.ChainOutcomeBreakerBypassed || llm != 0 {
 		t.Errorf("engaged breaker: out=%q llm=%d, want breaker_bypassed/0", out, llm)
 	}
+	// The cost-amplification guarantee: NO LLM call was made.
+	if cp.calls.Load() != 0 {
+		t.Errorf("a bypassed package must not invoke the LLM, got %d Analyse calls", cp.calls.Load())
+	}
 	if len(pub.got) != 0 {
-		t.Errorf("a bypassed package must not run the chain or publish an assessment, got %d publishes", len(pub.got))
+		t.Errorf("a bypassed package must not publish an assessment, got %d publishes", len(pub.got))
 	}
 }
 
@@ -235,6 +240,42 @@ func TestProcessChainPackageBreakerDisengagedRuns(t *testing.T) {
 	if out != analyst.ChainOutcomeAssessed || llm <= 0 {
 		t.Errorf("disengaged breaker: out=%q llm=%d, want assessed/>0", out, llm)
 	}
+}
+
+// countingProvider replies per role like scriptedProvider but counts Analyse
+// calls so a bypass test can assert the LLM was never invoked.
+type countingProvider struct {
+	calls  atomic.Int64
+	byRole map[provider.Role]string
+}
+
+func (c *countingProvider) Name() string                 { return "counting" }
+func (c *countingProvider) Model() string                { return "m" }
+func (c *countingProvider) MaxContextTokens() int        { return 200000 }
+func (c *countingProvider) ScoreCap() int                { return 35 }
+func (c *countingProvider) SupportsStreaming() bool      { return false }
+func (c *countingProvider) Health(context.Context) error { return nil }
+func (c *countingProvider) Analyse(_ context.Context, req provider.Request) (provider.Response, error) {
+	c.calls.Add(1)
+	return provider.Response{Raw: c.byRole[req.Role]}, nil
+}
+
+func countingChain(t *testing.T) (*analyst.Chain, *countingProvider) {
+	t.Helper()
+	cp := &countingProvider{byRole: map[provider.Role]string{
+		provider.RoleL1:     `{"hypothesis":"crypto miner","cited_evidence":[{"event_id":"evt-1"}],"confidence":70}`,
+		provider.RoleL2:     `{"verdict":"confirmed","verified_evidence":[{"event_id":"evt-1","finding":"confirmed"}],"confidence":66}`,
+		provider.RoleSenior: `{"threat_type":"cryptomining","reasoning":"miner confirmed","confidence":80}`,
+	}}
+	reg := metrics.NewRegistry()
+	l1, _ := analyst.NewL1(cp, analyst.PromptSpec{System: "s", Version: "v"}, reg, nil)
+	l2, _ := analyst.NewL2(cp, analyst.PromptSpec{System: "s", Version: "v"}, reg, nil)
+	sr, _ := analyst.NewSenior(cp, analyst.PromptSpec{System: "s", Version: "v"}, reg, nil)
+	chain, err := analyst.NewChain(l1, l2, sr, reg, nil)
+	if err != nil {
+		t.Fatalf("NewChain: %v", err)
+	}
+	return chain, cp
 }
 
 // panicProvider panics on every Analyse, to prove the merge's recover guard.

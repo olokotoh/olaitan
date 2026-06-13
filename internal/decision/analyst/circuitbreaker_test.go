@@ -1,6 +1,7 @@
 package analyst
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -156,5 +157,34 @@ func TestCircuitBreakerHotReload(t *testing.T) {
 	// Invalid updates are rejected and retain the prior value.
 	if b.UpdateRatePerMin(0) || b.UpdateCooling(time.Millisecond) {
 		t.Error("invalid Update* values must be rejected")
+	}
+}
+
+// TestCircuitBreakerConcurrentAdmit proves the breaker is safe for concurrent
+// Admit + hot-reload (its core design claim), under `go test -race`. The
+// engage count must not exceed the number of engage edges regardless of
+// interleaving; the run must be race-free.
+func TestCircuitBreakerConcurrentAdmit(t *testing.T) {
+	// Real clock so concurrent callers share a live window.
+	b := NewCircuitBreaker(CircuitBreakerOptions{RatePerMin: 5, Cooling: time.Second, Enabled: true})
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				b.Admit()
+				if j%50 == 0 {
+					b.UpdateRatePerMin(5 + j%3)
+					b.UpdateCooling(time.Second)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	// 16*200 = 3200 admits well above rate 5 => engaged at least once; the
+	// count is bounded and non-negative (no torn writes).
+	if b.EngagedTotal() < 1 {
+		t.Errorf("EngagedTotal = %d, want >= 1 under a 3200-admit burst", b.EngagedTotal())
 	}
 }

@@ -145,11 +145,20 @@ func (b *CircuitBreaker) UpdateCooling(cooling time.Duration) bool {
 
 func (b *CircuitBreaker) UpdateEnabled(enabled bool) {
 	prev := b.enabled.Swap(enabled)
-	if prev && !enabled {
+	if prev != enabled {
+		// On ANY enable transition, reset the engaged state AND clear the
+		// sliding-window buckets (round-1 review): a disable->re-enable (e.g.
+		// an operator clearing the breaker) must start with a COLD window, not
+		// instantly re-engage on stale burst counts that are still inside the
+		// 1-minute window. During the disabled period Admit does not record,
+		// so the window would otherwise carry a torn pre-disable count.
 		b.mu.Lock()
 		b.engaged = false
 		b.engagedSinceNanos = 0
 		b.belowSinceNanos = 0
+		for i := range b.buckets {
+			b.buckets[i] = cbBucket{}
+		}
 		b.mu.Unlock()
 	}
 }
@@ -157,6 +166,13 @@ func (b *CircuitBreaker) UpdateEnabled(enabled bool) {
 // Admit records one LLM-eligible package in the sliding window and reports
 // whether the chain should run. It returns false while the breaker is engaged
 // (bypass => deterministic-only). A disabled breaker always returns true.
+//
+// Engage AND disengage are evaluated lazily here on the hot path -- there is
+// no background timer or goroutine (mirroring the ratelimit.Limiter design,
+// guardrail 30). A consequence: if LLM-eligible traffic ceases entirely while
+// engaged, the breaker stays engaged until the next eligible package arrives
+// to re-evaluate the window; the worst case is one extra deterministic-only
+// decision on the first package after a quiet gap, which is safe (NFR27).
 func (b *CircuitBreaker) Admit() bool {
 	if !b.enabled.Load() {
 		return true

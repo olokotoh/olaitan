@@ -831,8 +831,14 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		}
 		subscribe(func(c *config.Config) {
 			cb.UpdateEnabled(c.Analyst.CircuitBreaker.EnabledOrDefault())
-			cb.UpdateRatePerMin(c.Analyst.CircuitBreaker.RatePerMinOrDefault())
-			cb.UpdateCooling(time.Duration(c.Analyst.CircuitBreaker.CoolingSecondsOrDefault()) * time.Second)
+			// A rejected update retains the prior value; log it so a reload
+			// that silently fails to apply is visible (round-1 review).
+			if r := c.Analyst.CircuitBreaker.RatePerMinOrDefault(); !cb.UpdateRatePerMin(r) {
+				log.Warn("aggregator: circuit-breaker rate_per_min reload rejected; keeping prior value", "rejected", r)
+			}
+			if cs := c.Analyst.CircuitBreaker.CoolingSecondsOrDefault(); !cb.UpdateCooling(time.Duration(cs) * time.Second) {
+				log.Warn("aggregator: circuit-breaker cooling_seconds reload rejected; keeping prior value", "rejected", cs)
+			}
 		})
 	}
 
