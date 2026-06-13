@@ -105,6 +105,11 @@ type L2Result struct {
 	// paths (ErrNoHypothesis, ErrNoCitableEvents), where no provider
 	// call was made and nothing was recorded.
 	Status string
+	// Resumed marks a step reconstructed from a Story 3.9 checkpoint
+	// rather than a fresh provider call (BI-4): on a checkpoint hit
+	// l2Step returns a minimal success record with Resumed=true. No
+	// provider call was made, so Provider/Model/Latency are zero.
+	Resumed bool
 }
 
 // L2 is the verification analyst runner (FR22/FR23). Construct with

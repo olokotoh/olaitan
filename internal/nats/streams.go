@@ -188,6 +188,13 @@ var streamConfigs = []jetstream.StreamConfig{
 		Storage:    jetstream.FileStorage,
 		Retention:  jetstream.LimitsPolicy,
 		Duplicates: 2 * time.Minute,
+		// A checkpoint subject (INVESTIGATIONS.{id}.{l1,l2}) holds exactly
+		// one logical value: the latest L1/L2 output for that package. Cap
+		// at one message per subject so GetLastMsgForSubject is the canonical
+		// last-value read and a re-publish after the 2 m dedup window cannot
+		// accumulate stale duplicates (the resume idempotency guarantee holds
+		// for the full 6 h retention, not just the dedup window).
+		MaxMsgsPerSubject: 1,
 	},
 }
 

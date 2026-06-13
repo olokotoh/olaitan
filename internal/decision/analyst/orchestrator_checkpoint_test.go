@@ -17,6 +17,8 @@ type fakeCheckpointStore struct {
 	l2               map[string]schema.L2Verification
 	saveL1Err        error
 	loadL1Err        error
+	saveL2Err        error
+	loadL2Err        error
 	savedL1, savedL2 int
 }
 
@@ -32,6 +34,9 @@ func (f *fakeCheckpointStore) SaveL1(_ context.Context, id string, h schema.L1Hy
 	return nil
 }
 func (f *fakeCheckpointStore) SaveL2(_ context.Context, id string, v schema.L2Verification) error {
+	if f.saveL2Err != nil {
+		return f.saveL2Err
+	}
 	f.l2[id] = v
 	f.savedL2++
 	return nil
@@ -44,6 +49,9 @@ func (f *fakeCheckpointStore) LoadL1(_ context.Context, id string) (schema.L1Hyp
 	return h, ok, nil
 }
 func (f *fakeCheckpointStore) LoadL2(_ context.Context, id string) (schema.L2Verification, bool, error) {
+	if f.loadL2Err != nil {
+		return schema.L2Verification{}, false, f.loadL2Err
+	}
 	v, ok := f.l2[id]
 	return v, ok, nil
 }
@@ -63,11 +71,17 @@ func TestChainCheckpointSavesOnSuccess(t *testing.T) {
 	chain, _, _, _ := checkpointChain(t)
 	store := newFakeStore()
 	chain.WithCheckpoints(store)
-	if _, err := chain.Run(context.Background(), testPackage()); err != nil {
+	res, err := chain.Run(context.Background(), testPackage())
+	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if store.savedL1 != 1 || store.savedL2 != 1 {
 		t.Errorf("saved l1/l2 = %d/%d, want 1/1", store.savedL1, store.savedL2)
+	}
+	// Freshly-run steps are NOT marked resumed (BI-4 mutation-killer: a
+	// blanket Resumed=true would fail here).
+	if res.L1 == nil || res.L1.Resumed || res.L2 == nil || res.L2.Resumed {
+		t.Errorf("fresh run marked resumed: l1=%+v l2=%+v", res.L1, res.L2)
 	}
 }
 
@@ -82,7 +96,8 @@ func TestChainCheckpointResumesL1(t *testing.T) {
 		Confidence:    70,
 	}
 	chain.WithCheckpoints(store)
-	if _, err := chain.Run(context.Background(), testPackage()); err != nil {
+	res, err := chain.Run(context.Background(), testPackage())
+	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if l1fp.calls != 0 {
@@ -93,6 +108,13 @@ func TestChainCheckpointResumesL1(t *testing.T) {
 	}
 	if store.savedL1 != 0 {
 		t.Errorf("resumed L1 must not be re-saved, savedL1 = %d", store.savedL1)
+	}
+	// BI-4: the resumed L1 is marked resumed; the freshly-run L2 is not.
+	if res.L1 == nil || !res.L1.Resumed {
+		t.Errorf("resumed L1 not marked: %+v", res.L1)
+	}
+	if res.L2 == nil || res.L2.Resumed {
+		t.Errorf("freshly-run L2 must not be marked resumed: %+v", res.L2)
 	}
 }
 
@@ -105,7 +127,8 @@ func TestChainCheckpointResumesL1AndL2(t *testing.T) {
 	store.l1[id] = schema.L1Hypothesis{Hypothesis: "resumed", CitedEvidence: []schema.EvidenceCitation{{EventID: "evt-1"}}, Confidence: 70}
 	store.l2[id] = schema.L2Verification{Verdict: schema.VerdictConfirmed, VerifiedEvidence: []schema.EvidenceVerification{{EventID: "evt-1", Finding: "ok"}}, Confidence: 66}
 	chain.WithCheckpoints(store)
-	if _, err := chain.Run(context.Background(), testPackage()); err != nil {
+	res, err := chain.Run(context.Background(), testPackage())
+	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if l1fp.calls != 0 || l2fp.calls != 0 {
@@ -113,6 +136,10 @@ func TestChainCheckpointResumesL1AndL2(t *testing.T) {
 	}
 	if srfp.calls != 1 {
 		t.Errorf("senior calls = %d, want 1", srfp.calls)
+	}
+	// BI-4: both resumed steps are marked resumed in the ChainResult.
+	if res.L1 == nil || !res.L1.Resumed || res.L2 == nil || !res.L2.Resumed {
+		t.Errorf("both steps should be marked resumed: l1=%+v l2=%+v", res.L1, res.L2)
 	}
 }
 
@@ -144,5 +171,36 @@ func TestChainCheckpointLoadErrorReruns(t *testing.T) {
 	}
 	if l1fp.calls != 1 {
 		t.Errorf("L1 runner called %d times, want 1 (re-run on load error)", l1fp.calls)
+	}
+}
+
+// TestChainCheckpointSaveL2FailureNonFatal mirrors the L1 best-effort
+// guarantee for L2: a SaveL2 failure must NOT abort the chain.
+func TestChainCheckpointSaveL2FailureNonFatal(t *testing.T) {
+	chain, _, _, _ := checkpointChain(t)
+	store := newFakeStore()
+	store.saveL2Err = errors.New("nats down")
+	chain.WithCheckpoints(store)
+	res, err := chain.Run(context.Background(), testPackage())
+	if err != nil {
+		t.Fatalf("an L2 checkpoint save failure must not abort the chain: %v", err)
+	}
+	if res.Assessment.ThreatType != "cryptomining" {
+		t.Errorf("assessment not produced despite L2 save failure: %+v", res.Assessment)
+	}
+}
+
+// TestChainCheckpointLoadL2ErrorReruns mirrors the L1 path: a LoadL2 error
+// (not a miss) re-runs L2 rather than aborting.
+func TestChainCheckpointLoadL2ErrorReruns(t *testing.T) {
+	chain, _, l2fp, _ := checkpointChain(t)
+	store := newFakeStore()
+	store.loadL2Err = errors.New("get last msg failed")
+	chain.WithCheckpoints(store)
+	if _, err := chain.Run(context.Background(), testPackage()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if l2fp.calls != 1 {
+		t.Errorf("L2 runner called %d times, want 1 (re-run on load error)", l2fp.calls)
 	}
 }

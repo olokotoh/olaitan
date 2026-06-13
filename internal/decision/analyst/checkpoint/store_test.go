@@ -180,3 +180,43 @@ func TestResumeAcrossRestart(t *testing.T) {
 		t.Errorf("assessment not reproduced: %q vs %q", res1.Assessment.ThreatType, res2.Assessment.ThreatType)
 	}
 }
+
+// TestResumeFromL1Checkpoint is the BI-8 boundary (b) over REAL NATS: a
+// post-L1 crash leaves only the L1 checkpoint, so a restart resumes L1 from
+// the checkpoint (call count 0, marked resumed) but re-runs L2 (call count 1)
+// and the Senior. The fake-store TestChainCheckpointResumesL1 proves the
+// orchestrator branch; this proves the real natsCheckpointStore over the
+// embedded JetStream server.
+func TestResumeFromL1Checkpoint(t *testing.T) {
+	c := startNATS(t)
+	store, _ := checkpoint.New(c)
+	ctx := context.Background()
+
+	// Pre-seed ONLY the L1 checkpoint (the post-L1 boundary).
+	if err := store.SaveL1(ctx, resumePackage().PackageID, schema.L1Hypothesis{
+		Hypothesis:    "crypto miner",
+		CitedEvidence: []schema.EvidenceCitation{{EventID: "evt-1"}},
+		Confidence:    70,
+	}); err != nil {
+		t.Fatalf("seed L1 checkpoint: %v", err)
+	}
+
+	chain, sp := newChain(t, store)
+	res, err := chain.Run(ctx, resumePackage())
+	if err != nil {
+		t.Fatalf("resume run: %v", err)
+	}
+	if sp.callCount(provider.RoleL1) != 0 {
+		t.Errorf("L1 re-invoked (calls %d), want 0 (resumed from checkpoint)", sp.callCount(provider.RoleL1))
+	}
+	if sp.callCount(provider.RoleL2) != 1 || sp.callCount(provider.RoleSenior) != 1 {
+		t.Errorf("l2/senior calls = %d/%d, want 1/1", sp.callCount(provider.RoleL2), sp.callCount(provider.RoleSenior))
+	}
+	// BI-4: the resumed L1 is marked resumed; the re-run L2 is not.
+	if res.L1 == nil || !res.L1.Resumed {
+		t.Errorf("resumed L1 not marked: %+v", res.L1)
+	}
+	if res.L2 == nil || res.L2.Resumed {
+		t.Errorf("re-run L2 must not be marked resumed: %+v", res.L2)
+	}
+}

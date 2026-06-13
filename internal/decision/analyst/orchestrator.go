@@ -154,7 +154,7 @@ func (c *Chain) l1Step(ctx context.Context, pkg schema.EvidencePackage) (L1Resul
 		if hyp, ok, err := c.checkpoints.LoadL1(ctx, pkg.PackageID); err != nil {
 			c.log.Warn("checkpoint LoadL1 failed; re-running L1", "err", err, "package_id", pkg.PackageID)
 		} else if ok {
-			return L1Result{Hypothesis: hyp, Status: StatusSuccess}, nil
+			return L1Result{Hypothesis: hyp, Status: StatusSuccess, Resumed: true}, nil
 		}
 	}
 	res, err := c.l1.Run(ctx, pkg)
@@ -173,7 +173,7 @@ func (c *Chain) l2Step(ctx context.Context, pkg schema.EvidencePackage, hyp sche
 		if ver, ok, err := c.checkpoints.LoadL2(ctx, pkg.PackageID); err != nil {
 			c.log.Warn("checkpoint LoadL2 failed; re-running L2", "err", err, "package_id", pkg.PackageID)
 		} else if ok {
-			return L2Result{Verification: ver, Status: StatusSuccess}, nil
+			return L2Result{Verification: ver, Status: StatusSuccess, Resumed: true}, nil
 		}
 	}
 	res, err := c.l2.Run(ctx, pkg, hyp)

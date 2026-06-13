@@ -91,6 +91,12 @@ func (s *Store) LoadL2(ctx context.Context, packageID string) (schema.L2Verifica
 func (s *Store) loadInto(ctx context.Context, subj string, into any) (bool, error) {
 	stream, err := s.nc.JetStream().Stream(ctx, streamName)
 	if err != nil {
+		// A not-yet-created stream (cold start before EnsureStreams, or a
+		// pruned env) is a clean miss, not a hard error: the step re-runs
+		// and re-checkpoints, matching the best-effort durability contract.
+		if errors.Is(err, jetstream.ErrStreamNotFound) {
+			return false, nil
+		}
 		return false, fmt.Errorf("checkpoint: stream %s: %w", streamName, err)
 	}
 	msg, err := stream.GetLastMsgForSubject(ctx, subj)

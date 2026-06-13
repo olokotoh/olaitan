@@ -643,7 +643,10 @@ Story 3.14 owns the broader audit pipeline and may extend the payload.
 retention, Helm-tunable via `analyst.checkpoint_retention`) so a controller
 restart resumes from the last completed step rather than re-spawning it. The
 checkpoint store publishes with `WithMsgID = package_id + step` (idempotent
-re-publish) and resumes by reading the last message per subject. **Resume is
+re-publish within the dedup window) and resumes by reading the last message
+per subject. The stream is capped at `MaxMsgsPerSubject: 1`, so even a
+re-publish after the dedup window expires cannot accumulate stale duplicates —
+the resume read is the canonical last value for the full retention. **Resume is
 structural:** the chain consumer acks the `EvidencePackage` only AFTER the
 chain completes, so a crash mid-chain leaves it un-acked; JetStream
 redelivers it and the chain re-checks the checkpoints, re-running only the
