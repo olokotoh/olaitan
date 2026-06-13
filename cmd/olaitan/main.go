@@ -1142,6 +1142,22 @@ const fsmConsumerMaxDeliver = 5
 // engine.
 const fsmFetchBackoff = time.Second
 
+// chainAdjustedScore runs the investigation chain inline when enabled, folds
+// its per-provider-capped LLM confidence into the deterministic ThreatScore,
+// and returns the combined score that drives the FSM (Story 3.11). A nil chain
+// folds 0 (deterministic-only, byte-identical to Epic 2). Extracted from the
+// FSM consumer loop so the chain->fold->score wiring is unit-testable without
+// a live JetStream consumer (round-2 review: the inline call site was
+// otherwise untested -- a regression feeding 0 instead of llmCapped shipped
+// green).
+func chainAdjustedScore(ctx context.Context, pkg schema.EvidencePackage, scoreCalc *score.Calculator, chain *analyst.Chain, chainMode string, auditPub responseaudit.AssessmentAuditPublisher, chainRuns *prometheus.CounterVec, log *slog.Logger) (schema.ConfidenceScore, error) {
+	llmCapped := 0
+	if chain != nil {
+		llmCapped = safeChainConfidence(ctx, pkg, chain, chainMode, auditPub, chainRuns, log)
+	}
+	return scoreCalc.Score(&pkg, llmCapped)
+}
+
 // wireFSMConsumer wires the Story 2.2 scoring + FSM evidence consumer, which
 // Story 3.11 makes the SINGLE FSM driver: for each package it (optionally)
 // runs the investigation chain inline when the FR19 gate triggers, folds the
@@ -1207,14 +1223,11 @@ func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, n
 			}
 
 			// Story 3.11: run the investigation chain inline when enabled and
-			// the FR19 gate triggers, and fold its capped LLM confidence into
-			// the score. A nil chain folds 0 (deterministic-only, Epic 2).
-			llmCapped := 0
-			if chain != nil {
-				llmCapped = safeChainConfidence(ctx, pkg, chain, chainMode, auditPub, chainRuns, log)
-			}
-
-			sc, serr := scoreCalc.Score(&pkg, llmCapped)
+			// the FR19 gate triggers, fold its capped LLM confidence into the
+			// score (a nil chain folds 0 = deterministic-only, Epic 2). The
+			// chain->fold->score wiring lives in chainAdjustedScore so it is
+			// unit-testable without a live JetStream consumer.
+			sc, serr := chainAdjustedScore(ctx, pkg, scoreCalc, chain, chainMode, auditPub, chainRuns, log)
 			if serr != nil {
 				log.Warn("aggregator: fsm score failed; dropping", "err", serr, "package_id", pkg.PackageID)
 				_ = msg.Ack()

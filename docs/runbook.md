@@ -594,10 +594,14 @@ max(LLM-only ThreatScore) = 0.3 x 35 = 10.5 is pinned by
 TestCapBoundProperty against the score package constants.
 
 **Metric: `olaitan_investigation_chain_runs_total`** (counter, labels
-`mode`, `outcome`). One increment per `EvidencePackage` the Story 3.8
-investigation-chain consumer (`olaitan-investigation-chain`, a durable
-JetStream consumer on `EVIDENCE.packages` that runs ALONGSIDE the
-deterministic FSM consumer) handles. `mode` is the configured chain
+`mode`, `outcome`). One increment per `EvidencePackage` for which the chain
+is invoked. **Story 3.11:** the standalone `olaitan-investigation-chain`
+consumer was REMOVED and the chain is now run INLINE by the single
+deterministic FSM consumer (`olaitan-response-fsm`) -- it runs the chain on
+the FR19 trigger, folds the capped LLM confidence into the ThreatScore, and
+drives the FSM once, so a workload's LLM contribution and its FSM transition
+are decided in one place (and an inline-chain panic is recovered to a
+deterministic-only score, never crashing the FSM). `mode` is the configured chain
 boundary: `full` (L1->L2->Senior), `l1_l2` (Senior ablated off), or
 `l1_only` (L2 + Senior ablated off). `outcome` is `not_triggered` (the
 FR19 gate declined: no rule severity >= 50 and no baseline sigma >= 3.0),

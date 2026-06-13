@@ -167,31 +167,37 @@ func TestFSMConsumerFoldsChainConfidenceIntoScore(t *testing.T) {
 	pub := &fakeAssessmentPub{}
 	pkg := triggeringPackage("80")
 
-	llmCapped, outcome := processChainPackage(context.Background(), pkg, chain, chain.Mode(), pub, nil, chainTestLogger())
-	if outcome != analyst.ChainOutcomeAssessed || llmCapped <= 0 {
-		t.Fatalf("setup: outcome=%q llm=%d, want assessed and > 0", outcome, llmCapped)
-	}
-
 	calc, err := score.New(nil, metrics.NewRegistry())
 	if err != nil {
 		t.Fatalf("score.New: %v", err)
 	}
-	withLLM, err := calc.Score(&pkg, llmCapped)
+
+	// Drive the ACTUAL FSM-consumer wiring (chainAdjustedScore), not a
+	// hand-reassembled composition: a regression that fed 0 instead of the
+	// chain's capped confidence at this call site must fail this test
+	// (round-2 Regression Hunter: the inline call site was previously
+	// unprotected).
+	withChain, err := chainAdjustedScore(context.Background(), pkg, calc, chain, chain.Mode(), pub, nil, chainTestLogger())
 	if err != nil {
-		t.Fatalf("Score(with llm): %v", err)
+		t.Fatalf("chainAdjustedScore(with chain): %v", err)
 	}
-	without, err := calc.Score(&pkg, 0)
+	noChain, err := chainAdjustedScore(context.Background(), pkg, calc, nil, "", nil, nil, chainTestLogger())
 	if err != nil {
-		t.Fatalf("Score(no llm): %v", err)
+		t.Fatalf("chainAdjustedScore(nil chain): %v", err)
 	}
-	if withLLM.LLM <= 0 {
-		t.Errorf("folded LLM term = %v, want > 0", withLLM.LLM)
+
+	if withChain.LLM <= 0 {
+		t.Errorf("folded LLM term = %v, want > 0 (the chain confidence must reach the score)", withChain.LLM)
 	}
-	if withLLM.Total <= without.Total {
-		t.Errorf("the chain's capped confidence did not raise the FSM-driving Total: with=%v without=%v", withLLM.Total, without.Total)
+	if withChain.Total <= noChain.Total {
+		t.Errorf("the chain's capped confidence did not raise the FSM-driving Total: with=%v no-chain=%v", withChain.Total, noChain.Total)
 	}
-	if withLLM.LLM > 10.5 {
-		t.Errorf("LLM contribution %v exceeds the 10.5 Trust-Bound", withLLM.LLM)
+	if withChain.LLM > 10.5 {
+		t.Errorf("LLM contribution %v exceeds the 10.5 Trust-Bound", withChain.LLM)
+	}
+	// A nil chain (RS mode) folds a zero LLM term -- byte-identical to Epic 2.
+	if noChain.LLM != 0 {
+		t.Errorf("nil chain must fold a zero LLM term, got %v", noChain.LLM)
 	}
 }
 
