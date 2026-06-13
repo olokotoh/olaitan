@@ -10,6 +10,7 @@ import (
 	"github.com/olokotoh/olaitan/internal/agent/provider"
 	"github.com/olokotoh/olaitan/internal/config"
 	"github.com/olokotoh/olaitan/internal/decision/analyst"
+	"github.com/olokotoh/olaitan/internal/decision/score"
 	"github.com/olokotoh/olaitan/internal/metrics"
 	responseaudit "github.com/olokotoh/olaitan/internal/response/audit"
 	"github.com/olokotoh/olaitan/internal/schema"
@@ -154,6 +155,87 @@ func TestBuildInvestigationChainOpenAIReachable(t *testing.T) {
 	}
 }
 
+// TestFSMConsumerFoldsChainConfidenceIntoScore is the Story 3.11 round-1
+// integration proof (the merge BI-7 gap all three reviewers flagged): it
+// threads a triggering package through the SAME composition the merged FSM
+// driver does -- processChainPackage -> Score -- and proves the chain's capped
+// confidence actually RAISES the FSM-driving Total, while the Trust-Bound
+// (LLM contribution <= 10.5) still holds. (The score isolation tests prove the
+// fold; this proves the wiring from the chain into the calculator.)
+func TestFSMConsumerFoldsChainConfidenceIntoScore(t *testing.T) {
+	chain := scriptedFullChain(t)
+	pub := &fakeAssessmentPub{}
+	pkg := triggeringPackage("80")
+
+	calc, err := score.New(nil, metrics.NewRegistry())
+	if err != nil {
+		t.Fatalf("score.New: %v", err)
+	}
+
+	// Drive the ACTUAL FSM-consumer wiring (chainAdjustedScore), not a
+	// hand-reassembled composition: a regression that fed 0 instead of the
+	// chain's capped confidence at this call site must fail this test
+	// (round-2 Regression Hunter: the inline call site was previously
+	// unprotected).
+	withChain, err := chainAdjustedScore(context.Background(), pkg, calc, chain, chain.Mode(), pub, nil, chainTestLogger())
+	if err != nil {
+		t.Fatalf("chainAdjustedScore(with chain): %v", err)
+	}
+	noChain, err := chainAdjustedScore(context.Background(), pkg, calc, nil, "", nil, nil, chainTestLogger())
+	if err != nil {
+		t.Fatalf("chainAdjustedScore(nil chain): %v", err)
+	}
+
+	if withChain.LLM <= 0 {
+		t.Errorf("folded LLM term = %v, want > 0 (the chain confidence must reach the score)", withChain.LLM)
+	}
+	if withChain.Total <= noChain.Total {
+		t.Errorf("the chain's capped confidence did not raise the FSM-driving Total: with=%v no-chain=%v", withChain.Total, noChain.Total)
+	}
+	if withChain.LLM > 10.5 {
+		t.Errorf("LLM contribution %v exceeds the 10.5 Trust-Bound", withChain.LLM)
+	}
+	// A nil chain (RS mode) folds a zero LLM term -- byte-identical to Epic 2.
+	if noChain.LLM != 0 {
+		t.Errorf("nil chain must fold a zero LLM term, got %v", noChain.LLM)
+	}
+}
+
+// panicProvider panics on every Analyse, to prove the merge's recover guard.
+type panicProvider struct{}
+
+func (panicProvider) Name() string                 { return "panic" }
+func (panicProvider) Model() string                { return "panic" }
+func (panicProvider) MaxContextTokens() int        { return 1000 }
+func (panicProvider) ScoreCap() int                { return 35 }
+func (panicProvider) SupportsStreaming() bool      { return false }
+func (panicProvider) Health(context.Context) error { return nil }
+func (panicProvider) Analyse(context.Context, provider.Request) (provider.Response, error) {
+	panic("provider boom")
+}
+
+// TestSafeChainConfidenceRecoversFromPanic proves the round-1 guard: a panic
+// in the LLM tier (now on the single FSM-driver goroutine after the merge)
+// degrades to a zero LLM contribution rather than crashing the FSM ring, so
+// the deterministic rules+baselines score still drives containment (NFR27).
+func TestSafeChainConfidenceRecoversFromPanic(t *testing.T) {
+	pp := panicProvider{}
+	reg := metrics.NewRegistry()
+	l1, _ := analyst.NewL1(pp, analyst.PromptSpec{System: "s", Version: "v"}, reg, nil)
+	l2, _ := analyst.NewL2(pp, analyst.PromptSpec{System: "s", Version: "v"}, reg, nil)
+	sr, _ := analyst.NewSenior(pp, analyst.PromptSpec{System: "s", Version: "v"}, reg, nil)
+	chain, err := analyst.NewChain(l1, l2, sr, reg, nil)
+	if err != nil {
+		t.Fatalf("NewChain: %v", err)
+	}
+	pub := &fakeAssessmentPub{}
+
+	capped := safeChainConfidence(context.Background(), triggeringPackage("80"), chain, chain.Mode(), pub, nil, chainTestLogger())
+	if capped != 0 {
+		t.Errorf("a panicking chain must fold 0 (deterministic-only), got %d", capped)
+	}
+}
+
 // scriptedProvider replies per role so a real analyst.Chain can be driven
 // end to end without a network call.
 type scriptedProvider struct {
@@ -209,9 +291,14 @@ func triggeringPackage(severity string) schema.EvidencePackage {
 func TestProcessChainPackageAssessedAndAudited(t *testing.T) {
 	chain := scriptedFullChain(t)
 	pub := &fakeAssessmentPub{}
-	out := processChainPackage(context.Background(), triggeringPackage("80"), chain, chain.Mode(), pub, nil, chainTestLogger())
+	llm, out := processChainPackage(context.Background(), triggeringPackage("80"), chain, chain.Mode(), pub, nil, chainTestLogger())
 	if out != analyst.ChainOutcomeAssessed {
 		t.Errorf("outcome = %q, want assessed", out)
+	}
+	// Story 3.11: an assessed run returns the per-provider-capped LLM
+	// confidence to fold into the ThreatScore (> 0 for this scripted verdict).
+	if llm <= 0 {
+		t.Errorf("assessed run returned llm_capped_confidence = %d, want > 0", llm)
 	}
 	if len(pub.got) != 1 {
 		t.Fatalf("audit publishes = %d, want 1", len(pub.got))
@@ -228,9 +315,12 @@ func TestProcessChainPackageAssessedAndAudited(t *testing.T) {
 func TestProcessChainPackageNotTriggered(t *testing.T) {
 	chain := scriptedFullChain(t)
 	pub := &fakeAssessmentPub{}
-	out := processChainPackage(context.Background(), triggeringPackage("10"), chain, chain.Mode(), pub, nil, chainTestLogger())
+	llm, out := processChainPackage(context.Background(), triggeringPackage("10"), chain, chain.Mode(), pub, nil, chainTestLogger())
 	if out != analyst.ChainOutcomeNotTriggered {
 		t.Errorf("outcome = %q, want not_triggered", out)
+	}
+	if llm != 0 {
+		t.Errorf("a non-triggering package must fold zero LLM confidence, got %d", llm)
 	}
 	if len(pub.got) != 0 {
 		t.Errorf("a non-triggering package must not publish an assessment: %v", pub.got)

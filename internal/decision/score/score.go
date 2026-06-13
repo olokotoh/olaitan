@@ -267,7 +267,15 @@ func (c *Calculator) resolve() Config {
 // step 3). The (ConfidenceScore, error) signature is retained for the
 // Epic 3 LLM tier, which may surface provider errors. Operator-
 // misconfigured weights are rejected upstream by ScoreConfig.validate().
-func (c *Calculator) Score(pkg *schema.EvidencePackage) (schema.ConfidenceScore, error) {
+// Score collapses pkg's deterministic annotations plus the investigation
+// chain's llmCappedConfidence into a single [0,100] ConfidenceScore (FR30).
+// llmCappedConfidence is the per-provider-capped LLM confidence from the
+// Story 3.7 chain (0 when the chain did not run, was not triggered, or was
+// unavailable). It is clamped here to [0, LLMCap] so the Trust-Bounded
+// algebraic bound (LLMWeight * LLMCap = 0.3 * 35 = 10.5 < SUSPICIOUS) is
+// enforced in the same FSM-feeding code path Epic 2 validates -- a third
+// defence layer below analyst.GuardCappedConfidence and the config validator.
+func (c *Calculator) Score(pkg *schema.EvidencePackage, llmCappedConfidence int) (schema.ConfidenceScore, error) {
 	start := time.Now()
 	defer func() {
 		if c.metrics != nil && c.metrics.evalSecondsHist != nil {
@@ -330,9 +338,30 @@ func (c *Calculator) Score(pkg *schema.EvidencePackage) (schema.ConfidenceScore,
 		normalised = math.Min(maxSigma/cfg.SigmaNormaliser, 1.0) * 100.0
 	}
 
+	// Clamp the LLM contribution to [0, LLMCap] before folding (Story 3.11
+	// BI-2): the per-provider cap is already applied upstream by
+	// analyst.GuardCappedConfidence, but clamping here makes the trust-bound
+	// (LLMWeight * LLMCap = 10.5) hold for ANY caller, enforced by the same
+	// code path Epic 2's TestProperty_NoLLMOnlyEscalation validates.
+	cappedLLM := llmCappedConfidence
+	if cappedLLM < 0 {
+		cappedLLM = 0
+	}
+	// The cap is ALWAYS applied (Story 3.11 round-1 fix): a non-positive
+	// LLMCap is clamped to 0, so an operator who sets llm_cap: 0 (disable the
+	// LLM contribution) gets a zero term -- NOT an un-clamped fold. The bound
+	// LLMWeight * LLMCap therefore holds for any caller AND any cap, including
+	// 0 and a (config-rejected but defensively-handled) negative.
+	capLimit := int(cfg.LLMCap)
+	if capLimit < 0 {
+		capLimit = 0
+	}
+	if cappedLLM > capLimit {
+		cappedLLM = capLimit
+	}
 	rules := cfg.RuleWeight * float64(maxSeverity)
 	baseline := cfg.BaselineWeight * normalised
-	llm := cfg.LLMWeight * 0.0
+	llm := cfg.LLMWeight * float64(cappedLLM)
 	total := rules + baseline + llm
 	if total < 0 {
 		total = 0

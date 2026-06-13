@@ -56,7 +56,7 @@ func newCalcForTest(t *testing.T, get func() *config.Config) *Calculator {
 func TestScore_ZeroPackage(t *testing.T) {
 	c := newCalcForTest(t, staticGetter(defaultScoreCfg()))
 
-	got, err := c.Score(&schema.EvidencePackage{})
+	got, err := c.Score(&schema.EvidencePackage{}, 0)
 	if err != nil {
 		t.Fatalf("Score: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestScore_SingleRuleMatch_AtMaxSeverity(t *testing.T) {
 
 	got, err := c.Score(&schema.EvidencePackage{
 		RuleMatches: []schema.RuleMatch{{Severity: "100"}},
-	})
+	}, 0)
 	if err != nil {
 		t.Fatalf("Score: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestScore_MultipleRuleMatches_UsesMax(t *testing.T) {
 		RuleMatches: []schema.RuleMatch{
 			{Severity: "30"}, {Severity: "75"}, {Severity: "50"},
 		},
-	})
+	}, 0)
 	if err != nil {
 		t.Fatalf("Score: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestScore_MultipleBaselineDeviations_UsesMaxSigma(t *testing.T) {
 		BaselineDeviations: []schema.BaselineDeviation{
 			{Sigma: 1.5}, {Sigma: 4.0}, {Sigma: 2.8},
 		},
-	})
+	}, 0)
 	if err != nil {
 		t.Fatalf("Score: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestScore_RuleAndBaselineTie(t *testing.T) {
 	got, err := c.Score(&schema.EvidencePackage{
 		RuleMatches:        []schema.RuleMatch{{Severity: "50"}},
 		BaselineDeviations: []schema.BaselineDeviation{{Sigma: 1.5}},
-	})
+	}, 0)
 	if err != nil {
 		t.Fatalf("Score: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestScore_SeverityClamping(t *testing.T) {
 
 	got, err := c.Score(&schema.EvidencePackage{
 		RuleMatches: []schema.RuleMatch{{Severity: "150"}},
-	})
+	}, 0)
 	if err != nil {
 		t.Fatalf("Score: %v", err)
 	}
@@ -171,7 +171,7 @@ func TestScore_SeverityParseFallback(t *testing.T) {
 			{Severity: "high"},
 			{Severity: "critical"},
 		},
-	})
+	}, 0)
 	if err != nil {
 		t.Fatalf("Score: %v", err)
 	}
@@ -188,7 +188,7 @@ func TestScore_SeverityParseFallback(t *testing.T) {
 func TestScore_LLMTermIsZero(t *testing.T) {
 	c := newCalcForTest(t, staticGetter(defaultScoreCfg()))
 
-	got, err := c.Score(&schema.EvidencePackage{})
+	got, err := c.Score(&schema.EvidencePackage{}, 0)
 	if err != nil {
 		t.Fatalf("Score: %v", err)
 	}
@@ -200,11 +200,102 @@ func TestScore_LLMTermIsZero(t *testing.T) {
 	}
 }
 
+// TestScore_LLMOnlyWorstCaseBound is the Story 3.11 AC3 Trust-Bounded proof:
+// with no rule or baseline signal and the LLM at its worst-case cap (35), the
+// score is exactly 0.3*35 = 10.5, below the SUSPICIOUS threshold (20) -- the
+// LLM tier alone can never escalate a workload past SUSPICIOUS (FR30).
+func TestScore_LLMOnlyWorstCaseBound(t *testing.T) {
+	c := newCalcForTest(t, staticGetter(defaultScoreCfg()))
+	got, err := c.Score(&schema.EvidencePackage{}, 35)
+	if err != nil {
+		t.Fatalf("Score: %v", err)
+	}
+	if got.LLM != 10.5 {
+		t.Errorf("LLM term = %v, want 10.5 (0.3 * 35)", got.LLM)
+	}
+	if got.Total != 10.5 {
+		t.Errorf("LLM-only Total = %v, want 10.5", got.Total)
+	}
+	if got.Total >= config.SuspiciousThreshold {
+		t.Errorf("LLM-only Total %v must stay below SUSPICIOUS (%v)", got.Total, config.SuspiciousThreshold)
+	}
+}
+
+// TestScore_LLMOverCapClamped pins the BI-2 clamp: an over-cap
+// llm_capped_confidence (a misconfigured or hostile caller) is clamped to
+// LLMCap at the calculator boundary, so the 10.5 bound holds regardless.
+func TestScore_LLMOverCapClamped(t *testing.T) {
+	c := newCalcForTest(t, staticGetter(defaultScoreCfg()))
+	got, err := c.Score(&schema.EvidencePackage{}, 100)
+	if err != nil {
+		t.Fatalf("Score: %v", err)
+	}
+	if got.LLM != 10.5 {
+		t.Errorf("over-cap LLM term = %v, want 10.5 (clamped to cap 35)", got.LLM)
+	}
+}
+
+// TestScore_LLMCapZeroContributesNothing is the round-1 fix for the clamp
+// hole: an operator who sets llm_cap: 0 (disable the LLM contribution) gets a
+// ZERO LLM term, not an un-clamped fold of the raw confidence. Without the
+// always-apply clamp a capped=90 would fold 0.3*90 = 27, escalating past
+// SUSPICIOUS on the LLM tier alone.
+func TestScore_LLMCapZeroContributesNothing(t *testing.T) {
+	c := newCalcForTest(t, staticGetter(scoreCfg(DefaultRuleWeight, DefaultBaselineWeight, DefaultLLMWeight, 0)))
+	got, err := c.Score(&schema.EvidencePackage{}, 90)
+	if err != nil {
+		t.Fatalf("Score: %v", err)
+	}
+	if got.LLM != 0 {
+		t.Errorf("llm_cap=0 must fold a zero LLM term, got %v", got.LLM)
+	}
+	if got.Total != 0 {
+		t.Errorf("llm_cap=0 with no rule/baseline must yield Total 0, got %v", got.Total)
+	}
+}
+
+// TestScore_LLMTermFolded proves the LLM term is folded into the Total
+// alongside rule + baseline (FR30 fully wired): llm_capped_confidence 20
+// yields 0.3*20 = 6.
+func TestScore_LLMTermFolded(t *testing.T) {
+	c := newCalcForTest(t, staticGetter(defaultScoreCfg()))
+	got, err := c.Score(&schema.EvidencePackage{}, 20)
+	if err != nil {
+		t.Fatalf("Score: %v", err)
+	}
+	if got.LLM != 6 {
+		t.Errorf("LLM term = %v, want 6 (0.3 * 20)", got.LLM)
+	}
+	if got.Total != 6 {
+		t.Errorf("Total = %v, want 6", got.Total)
+	}
+}
+
+// TestScore_LLMWeightHotReload is the AC2 proof for the LLM term: lowering
+// score.weights.llm and reloading is picked up live by the next Score call
+// (the calculator resolves the snapshot per call).
+func TestScore_LLMWeightHotReload(t *testing.T) {
+	var ptr atomic.Pointer[config.Config]
+	ptr.Store(defaultScoreCfg())
+	c := newCalcForTest(t, func() *config.Config { return ptr.Load() })
+
+	got, _ := c.Score(&schema.EvidencePackage{}, 35)
+	if got.LLM != 10.5 {
+		t.Fatalf("before reload: LLM = %v, want 10.5", got.LLM)
+	}
+	// Operator lowers the LLM weight to 0.1 and reloads.
+	ptr.Store(scoreCfg(DefaultRuleWeight, DefaultBaselineWeight, 0.1, int(DefaultLLMCap)))
+	got2, _ := c.Score(&schema.EvidencePackage{}, 35)
+	if got2.LLM != 3.5 {
+		t.Errorf("after reload: LLM = %v, want 3.5 (0.1 * 35)", got2.LLM)
+	}
+}
+
 // TestScore_NilPackage locks the AC3 / Task 2.6 nil-package contract.
 func TestScore_NilPackage(t *testing.T) {
 	c := newCalcForTest(t, staticGetter(defaultScoreCfg()))
 
-	got, err := c.Score(nil)
+	got, err := c.Score(nil, 0)
 	if err != nil {
 		t.Fatalf("nil package: unexpected err %v", err)
 	}
@@ -230,11 +321,11 @@ func TestScore_Determinism(t *testing.T) {
 		},
 	}
 
-	s1, err := c.Score(pkg)
+	s1, err := c.Score(pkg, 0)
 	if err != nil {
 		t.Fatalf("first Score: %v", err)
 	}
-	s2, err := c.Score(pkg)
+	s2, err := c.Score(pkg, 0)
 	if err != nil {
 		t.Fatalf("second Score: %v", err)
 	}
@@ -256,7 +347,7 @@ func TestScore_ConfigSnapshotChange(t *testing.T) {
 	c := newCalcForTest(t, func() *config.Config { return cur.Load() })
 
 	pkg := &schema.EvidencePackage{RuleMatches: []schema.RuleMatch{{Severity: "100"}}}
-	got1, err := c.Score(pkg)
+	got1, err := c.Score(pkg, 0)
 	if err != nil {
 		t.Fatalf("first Score: %v", err)
 	}
@@ -265,7 +356,7 @@ func TestScore_ConfigSnapshotChange(t *testing.T) {
 	}
 
 	cur.Store(scoreCfg(0.5, 0.3, 0.2, 35))
-	got2, err := c.Score(pkg)
+	got2, err := c.Score(pkg, 0)
 	if err != nil {
 		t.Fatalf("second Score: %v", err)
 	}
@@ -287,7 +378,7 @@ func TestScore_NegativeSigmaIsSkipped(t *testing.T) {
 	got, err := c.Score(&schema.EvidencePackage{
 		RuleMatches:        []schema.RuleMatch{{Severity: "100"}},
 		BaselineDeviations: []schema.BaselineDeviation{{Metric: "bad", Sigma: -1.0}},
-	})
+	}, 0)
 	if err != nil {
 		t.Fatalf("negative sigma: want skip-and-continue, got error %v", err)
 	}
@@ -309,7 +400,7 @@ func TestScore_NaNInfSigmaIsSkipped(t *testing.T) {
 		got, err := c.Score(&schema.EvidencePackage{
 			RuleMatches:        []schema.RuleMatch{{Severity: "100"}},
 			BaselineDeviations: []schema.BaselineDeviation{{Metric: "bad", Sigma: bad}},
-		})
+		}, 0)
 		if err != nil {
 			t.Fatalf("Sigma=%v: want skip-and-continue, got error %v", bad, err)
 		}
@@ -342,7 +433,7 @@ func TestScore_SigmaNormaliserFallsBackToBaselines(t *testing.T) {
 
 	got, err := c.Score(&schema.EvidencePackage{
 		BaselineDeviations: []schema.BaselineDeviation{{Sigma: 4.0}},
-	})
+	}, 0)
 	if err != nil {
 		t.Fatalf("Score: %v", err)
 	}
@@ -362,7 +453,7 @@ func TestScore_TotalClamping(t *testing.T) {
 	got, err := c.Score(&schema.EvidencePackage{
 		RuleMatches:        []schema.RuleMatch{{Severity: "100"}},
 		BaselineDeviations: []schema.BaselineDeviation{{Sigma: 10.0}},
-	})
+	}, 0)
 	if err != nil {
 		t.Fatalf("Score: %v", err)
 	}

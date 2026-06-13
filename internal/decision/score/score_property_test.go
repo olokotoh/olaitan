@@ -54,7 +54,7 @@ func TestProperty_ScoreInRange(t *testing.T) {
 	props.Property("0 <= Total <= 100 for any in-range package", prop.ForAll(
 		func(sevs []int, sigmas []float64) bool {
 			pkg := makePkg(sevs, sigmas)
-			got, err := c.Score(pkg)
+			got, err := c.Score(pkg, 0)
 			if err != nil {
 				return false
 			}
@@ -98,9 +98,12 @@ func TestProperty_NoLLMOnlyEscalation(t *testing.T) {
 	}
 
 	props := gopter.NewProperties(pinnedParams())
-	props.Property("runtime LLM-only Total stays within the algebraic ceiling and below SUSPICIOUS", prop.ForAll(
-		func(_ int) bool {
-			got, err := c.Score(&schema.EvidencePackage{})
+	props.Property("runtime LLM-only Total stays within the algebraic ceiling and below SUSPICIOUS for ANY capped confidence (Story 3.11: now non-vacuous -- the term is folded, and over-cap inputs clamp)", prop.ForAll(
+		func(llmCapped int) bool {
+			// Drive llm_capped_confidence across [0, 1000] -- well past the
+			// cap (35) so the calculator clamp is exercised; rule and baseline
+			// are zero, so Total IS the LLM term. The bound must hold for all.
+			got, err := c.Score(&schema.EvidencePackage{}, llmCapped)
 			if err != nil {
 				return false
 			}
@@ -125,8 +128,8 @@ func TestProperty_MonotonicInRuleSeverity(t *testing.T) {
 			}
 			pkgA := makePkg([]int{a, a / 2}, []float64{})
 			pkgB := makePkg([]int{b, b / 2}, []float64{})
-			sA, errA := c.Score(pkgA)
-			sB, errB := c.Score(pkgB)
+			sA, errA := c.Score(pkgA, 0)
+			sB, errB := c.Score(pkgB, 0)
 			if errA != nil || errB != nil {
 				return false
 			}
@@ -151,8 +154,8 @@ func TestProperty_MonotonicInBaselineSigma(t *testing.T) {
 			}
 			pkgA := makePkg([]int{}, []float64{a, a / 2})
 			pkgB := makePkg([]int{}, []float64{b, b / 2})
-			sA, errA := c.Score(pkgA)
-			sB, errB := c.Score(pkgB)
+			sA, errA := c.Score(pkgA, 0)
+			sB, errB := c.Score(pkgB, 0)
 			if errA != nil || errB != nil {
 				return false
 			}
@@ -174,8 +177,8 @@ func TestProperty_DeterministicForFixedSnapshot(t *testing.T) {
 	props.Property("Score is referentially transparent for a fixed snapshot", prop.ForAll(
 		func(sevs []int, sigmas []float64) bool {
 			pkg := makePkg(sevs, sigmas)
-			a, errA := c.Score(pkg)
-			b, errB := c.Score(pkg)
+			a, errA := c.Score(pkg, 0)
+			b, errB := c.Score(pkg, 0)
 			if errA != nil || errB != nil {
 				return false
 			}
@@ -228,7 +231,7 @@ func TestProperty_HotReloadViaSubscribe(t *testing.T) {
 	}
 
 	pkg := &schema.EvidencePackage{RuleMatches: []schema.RuleMatch{{Severity: "100"}}}
-	got, err := c.Score(pkg)
+	got, err := c.Score(pkg, 0)
 	if err != nil {
 		t.Fatalf("first Score: %v", err)
 	}
@@ -244,7 +247,7 @@ func TestProperty_HotReloadViaSubscribe(t *testing.T) {
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		s, err := c.Score(pkg)
+		s, err := c.Score(pkg, 0)
 		if err != nil {
 			t.Fatalf("poll Score: %v", err)
 		}

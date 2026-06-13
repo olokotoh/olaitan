@@ -267,7 +267,7 @@ Wiring of the rate-limit counters above is in `cmd/olaitan/metrics.go:140-260` v
 - **Type:** histogram_vec
 - **Unit:** ratio (0-100 contribution space)
 - **Labels:** `component_contribution` (one of `rules`, `baseline`, `llm`; cardinality 3), `result_bucket` (one of `low`, `medium`, `high`, `critical` per `severitybucket.Bucket`; cardinality 4). Cartesian envelope 3 x 4 = 12 series, bounded.
-- **Help:** Observation of each ThreatScore component contribution (rules, baseline, llm) labelled by the package's result_bucket. Buckets `[0, 25, 50, 75, 100]` cover the 0-100 contribution range; the `llm` component is identically zero in Epic 2 (the slot is wired for Epic 3 to populate).
+- **Help:** Observation of each ThreatScore component contribution (rules, baseline, llm) labelled by the package's result_bucket. Buckets `[0, 25, 50, 75, 100]` cover the 0-100 contribution range. **Story 3.11:** the `llm` component is now live -- `LLMWeight × clamp(llm_capped_confidence, 0, LLMCap)` (FR30). It is `0` whenever the investigation chain is disabled (RS mode / `analyst.provider: none`), the FR19 gate did not trigger, or the chain degraded to `llm_unavailable`; it is bounded above by `LLMWeight × LLMCap = 0.3 × 35 = 10.5` (the Trust-Bound, enforced by the calculator clamp). The chain is run INLINE by the single FSM consumer (`olaitan-response-fsm`); the standalone `olaitan-investigation-chain` consumer was removed in 3.11, so a workload's LLM contribution and its FSM transition are now decided in one place.
 - **Sample PromQL (aggregate):** `sum(rate(olaitan_decision_score_total_count[5m])) by (component_contribution, result_bucket)`.
 - **Sample PromQL (alert):** `histogram_quantile(0.99, sum(rate(olaitan_decision_score_total_bucket{component_contribution="rules"}[5m])) by (le)) > 20` for 10 minutes (page when the p99 rule contribution sustains above the SUSPICIOUS threshold; suggests a noisy rule or a sustained attack).
 
@@ -594,10 +594,14 @@ max(LLM-only ThreatScore) = 0.3 x 35 = 10.5 is pinned by
 TestCapBoundProperty against the score package constants.
 
 **Metric: `olaitan_investigation_chain_runs_total`** (counter, labels
-`mode`, `outcome`). One increment per `EvidencePackage` the Story 3.8
-investigation-chain consumer (`olaitan-investigation-chain`, a durable
-JetStream consumer on `EVIDENCE.packages` that runs ALONGSIDE the
-deterministic FSM consumer) handles. `mode` is the configured chain
+`mode`, `outcome`). One increment per `EvidencePackage` for which the chain
+is invoked. **Story 3.11:** the standalone `olaitan-investigation-chain`
+consumer was REMOVED and the chain is now run INLINE by the single
+deterministic FSM consumer (`olaitan-response-fsm`) -- it runs the chain on
+the FR19 trigger, folds the capped LLM confidence into the ThreatScore, and
+drives the FSM once, so a workload's LLM contribution and its FSM transition
+are decided in one place (and an inline-chain panic is recovered to a
+deterministic-only score, never crashing the FSM). `mode` is the configured chain
 boundary: `full` (L1->L2->Senior), `l1_l2` (Senior ablated off), or
 `l1_only` (L2 + Senior ablated off). `outcome` is `not_triggered` (the
 FR19 gate declined: no rule severity >= 50 and no baseline sigma >= 3.0),
