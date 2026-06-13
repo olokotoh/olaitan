@@ -110,6 +110,10 @@ func NewSenior(p provider.Provider, spec PromptSpec, reg *metrics.Registry, log 
 // cap for the orchestrator's AC2 arithmetic.
 func (a *Senior) ScoreCap() int { return a.provider.ScoreCap() }
 
+// ProviderName exposes the Senior provider's metric label for the Story
+// 3.10 fallback counter.
+func (a *Senior) ProviderName() string { return a.provider.Name() }
+
 // Run issues one Senior analyst call. hyp and ver are NIL in degraded
 // modes (both nil = Senior-on-evidence-only, AC4; ver nil = L2-failed
 // hypothesis-only mode); nil is a legal input here, unlike the L2

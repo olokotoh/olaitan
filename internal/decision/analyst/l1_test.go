@@ -31,6 +31,13 @@ type fakeProvider struct {
 	err         error
 	got         provider.Request
 	calls       int
+	// failResp/failErr, when failTimes > 0, are returned for the first
+	// failTimes calls (decrementing each call) before the fake falls through
+	// to its normal (resp, err). Lets a Story 3.10 retry test script
+	// "fail N times then succeed". Zero failTimes = unchanged behaviour.
+	failTimes int
+	failResp  provider.Response
+	failErr   error
 }
 
 func (f *fakeProvider) Name() string          { return f.name }
@@ -48,6 +55,10 @@ func (f *fakeProvider) Health(context.Context) error { return nil }
 func (f *fakeProvider) Analyse(_ context.Context, req provider.Request) (provider.Response, error) {
 	f.calls++
 	f.got = req
+	if f.failTimes > 0 {
+		f.failTimes--
+		return f.failResp, f.failErr
+	}
 	return f.resp, f.err
 }
 

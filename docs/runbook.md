@@ -657,6 +657,30 @@ or read failure logs and the step re-runs, never aborting the chain. A
 floor). Operational note: the INVESTIGATIONS stream is NOT a SIEM audit
 subject (it is short-lived resume data); do not point SIEM ingest at it.
 
+**LLM retry, Ollama fallback, and `llm_unavailable`** (Story 3.10, FR26/FR28).
+Each role's provider call runs under a 3-strike retry (base delays 1s, 4s, 16s
+plus jitter): a schema violation or a transient provider error is retried; a
+deterministic precondition (no citable events / no hypothesis) fails fast and
+is never retried. On primary exhaustion the chain falls through to the
+configured Ollama endpoint (`analyst.local`) for that single role call — not
+the rest of the chain — under the same 3-strike retry, and increments
+`olaitan_llm_fallback_total{from_provider, to_provider, role}` once at the
+fall-through (regardless of whether Ollama then succeeds). A role with no
+fallback (already on Ollama, or `analyst.local` unset) skips the fall-through.
+When BOTH primary and fallback exhaust, the role is marked unavailable: L1 ->
+skip L2 and run the Senior on evidence only; L2 -> run the Senior on the
+hypothesis only; **Senior -> a degraded assessment marked `llm_unavailable`
+with `llm_capped_confidence: 0`, so the workload is decided on the deterministic
+ThreatScore alone** (the chain does NOT abort — rules-and-baselines-only is
+always available, NFR27). Expected signals: a sustained
+`rate(olaitan_llm_fallback_total[10m]) > 0` means the primary provider is
+flaky and Ollama is absorbing the load; a rising
+`olaitan_decision_llm_calls_total{status="unavailable"}` with fall-throughs
+also failing means both tiers are down and assessments are degrading to
+deterministic-only. The fallback retries multiply provider-reaching attempts,
+so `olaitan_decision_llm_calls_total` increments once per attempt (up to 3 per
+provider per role), not once per chain.
+
 **Per-role timeout table (total budget across ALL retry attempts):**
 
 | role | budget |

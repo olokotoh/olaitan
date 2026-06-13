@@ -236,7 +236,44 @@ func buildInvestigationChain(cfg *config.Config, apiKey string, reg *metrics.Reg
 	if err != nil {
 		return nil, false, fmt.Errorf("aggregator: chain: %w", err)
 	}
-	log.Info("aggregator: investigation chain wired", "mode", chain.Mode())
+
+	// Story 3.10 (FR28): wire a shared Ollama fallback for every role NOT
+	// already on Ollama, when analyst.local is configured (model set). A
+	// role on Ollama needs no fallback (it IS the local resilience tier);
+	// an unconfigured analyst.local means no fallback (the chain still runs,
+	// just without the fall-through). One Ollama provider instance backs all
+	// fallback runners (it is stateless across roles; the role rides the
+	// Request).
+	if cfg.Analyst.Local.Model != "" {
+		fbp, ferr := buildRoleProvider("ollama", cfg.Analyst.Local.Model, cfg, "", reg, sink, log)
+		if ferr != nil {
+			return nil, false, fmt.Errorf("aggregator: Ollama fallback provider: %w", ferr)
+		}
+		var l1fb *analyst.L1
+		var l2fb *analyst.L2
+		var srfb *analyst.Senior
+		if l1Family != "ollama" {
+			if l1fb, err = analyst.NewL1(fbp, analyst.PromptSpec{System: defaultL1System, Version: defaultPromptVer}, reg, log); err != nil {
+				return nil, false, fmt.Errorf("aggregator: L1 Ollama fallback runner: %w", err)
+			}
+		}
+		if l2 != nil && resolveRoleFamily(a.L2Provider, a.Provider) != "ollama" {
+			if l2fb, err = analyst.NewL2(fbp, analyst.PromptSpec{System: defaultL2System, Version: defaultPromptVer}, reg, log); err != nil {
+				return nil, false, fmt.Errorf("aggregator: L2 Ollama fallback runner: %w", err)
+			}
+		}
+		if senior != nil && resolveRoleFamily(a.SeniorProvider, a.Provider) != "ollama" {
+			if srfb, err = analyst.NewSenior(fbp, analyst.PromptSpec{System: defaultSeniorSystem, Version: defaultPromptVer}, reg, log); err != nil {
+				return nil, false, fmt.Errorf("aggregator: Senior Ollama fallback runner: %w", err)
+			}
+		}
+		chain.WithFallbacks(l1fb, l2fb, srfb)
+		log.Info("aggregator: investigation chain wired with Ollama fallback (FR28)",
+			"mode", chain.Mode(), "l1_fallback", l1fb != nil, "l2_fallback", l2fb != nil, "senior_fallback", srfb != nil)
+		return chain, true, nil
+	}
+
+	log.Info("aggregator: investigation chain wired (no Ollama fallback; analyst.local model unset)", "mode", chain.Mode())
 	return chain, true, nil
 }
 
