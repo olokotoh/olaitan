@@ -47,3 +47,35 @@ func TestRegisterCallsMetricNilRegistry(t *testing.T) {
 		t.Fatal("nil registry: err = nil, want error")
 	}
 }
+
+// Story 3.15 (FR50): the duration histogram registration is idempotent across
+// providers, like the calls counter.
+func TestRegisterCallDurationMetricIdempotent(t *testing.T) {
+	reg := metrics.NewRegistry()
+	first, err := RegisterCallDurationMetric(reg)
+	if err != nil {
+		t.Fatalf("first registration: %v", err)
+	}
+	second, err := RegisterCallDurationMetric(reg)
+	if err != nil {
+		t.Fatalf("second registration: %v (must reuse, not fail)", err)
+	}
+	if first != second {
+		t.Error("second registration returned a different collector; reuse broken")
+	}
+	first.WithLabelValues("claude", "l1").Observe(0.5)
+	second.WithLabelValues("ollama", "senior").Observe(2.0)
+	mfs, err := reg.Gatherer().Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() == CallDurationMetricName {
+			if got := len(mf.GetMetric()); got != 2 {
+				t.Errorf("family has %d series, want 2 (claude + ollama side by side)", got)
+			}
+			return
+		}
+	}
+	t.Fatalf("%s not found in registry", CallDurationMetricName)
+}

@@ -323,6 +323,17 @@ func processChainPackage(ctx context.Context, pkg schema.EvidencePackage, chain 
 	return res.Assessment.LLMCappedConfidence, analyst.ChainOutcomeAssessed
 }
 
+// applyPromptVersionGauge maintains the olaitan_llm_prompt_version info gauge
+// (Story 3.15): it retires the prior {role,oldHash} series (a no-op for the
+// seed call where oldHash is "") and lights the current {role,newHash} at 1,
+// so exactly one series per role is live at a time.
+func applyPromptVersionGauge(g *prometheus.GaugeVec, role, oldHash, newHash string) {
+	if oldHash != "" && oldHash != newHash {
+		g.DeleteLabelValues(role, oldHash)
+	}
+	g.WithLabelValues(role, newHash).Set(1)
+}
+
 // buildAssessmentInput flattens a successful ChainResult onto the ring-clean
 // audit.AssessmentInput (Story 3.14 BI-2a/BI-3): cmd is the only ring that
 // imports both internal/decision/analyst and internal/response/audit, so the

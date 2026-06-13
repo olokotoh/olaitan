@@ -869,10 +869,29 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		// a misleading reproducibility trail (round-1 edge-case review).
 		chainRoles := []prompts.Role{prompts.RoleL1, prompts.RoleL2, prompts.RoleSenior}
 		prevPrompts := promptStore.Get()
+		// Story 3.15 (FR50): the prompt-version "info" gauge — a value of 1 for
+		// the CURRENT {role,hash} of each chain role, so a SIEM/Grafana query
+		// shows prompt drift over time. Seeded from the loaded set; on reload
+		// the new {role,hash} is set to 1 and the prior series for that role is
+		// deleted, so exactly one series per role is live (cardinality bound:
+		// 3 roles x 1 live hash).
+		promptVersionGauge, pverr := metricsReg.RegisterGaugeVec("olaitan_llm_prompt_version",
+			"Active analyst prompt version: 1 for the current {role,hash} of each chain role (Story 3.15 FR50, prompt-drift observability). Exactly one series per role is live at a time.",
+			[]string{"role", "hash"})
+		if pverr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: prompt-version gauge: %w", pverr)
+		}
+		for _, role := range chainRoles {
+			applyPromptVersionGauge(promptVersionGauge, string(role), "", prevPrompts.Hash(role))
+		}
 		promptStore.Subscribe(func(set *prompts.Set) {
 			for _, role := range chainRoles {
 				if oldH, newH := prevPrompts.Hash(role), set.Hash(role); oldH != newH {
 					log.Info("prompt_version_changed", "role", string(role), "old_hash", oldH, "new_hash", newH)
+					// Retire the old series and light the new one so only the
+					// current {role,hash} reads 1 (info-gauge pattern).
+					applyPromptVersionGauge(promptVersionGauge, string(role), oldH, newH)
 				}
 			}
 			chain.SetPrompts(

@@ -44,3 +44,34 @@ func RegisterCallsMetric(reg *metrics.Registry) (*prometheus.CounterVec, error) 
 	}
 	return vec, nil
 }
+
+// CallDurationMetricName is the shared per-call latency histogram every
+// provider observes (Story 3.15 FR50): olaitan_llm_call_duration_seconds.
+const CallDurationMetricName = "olaitan_llm_call_duration_seconds"
+
+const callDurationMetricHelp = "LLM transport call wall-clock latency in seconds by provider and analyst role " +
+	"(Story 3.15 FR50). One observation per Analyse call, so a retry or Ollama fall-through " +
+	"each contributes its own sample. Unit: seconds."
+
+// callDurationBuckets span the per-role budgets (L1/L2 30 s, Senior 60 s):
+// sub-second detail for healthy calls plus coarse buckets up to the 60 s
+// Senior ceiling so a SLO breach is visible.
+var callDurationBuckets = []float64{0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60}
+
+// RegisterCallDurationMetric registers (or re-uses) the shared
+// olaitan_llm_call_duration_seconds histogram on reg and returns the handle.
+// Idempotent across providers in one process, mirroring RegisterCallsMetric.
+func RegisterCallDurationMetric(reg *metrics.Registry) (*prometheus.HistogramVec, error) {
+	vec, err := reg.RegisterHistogramVec(CallDurationMetricName, callDurationMetricHelp, []string{"provider", "role"}, callDurationBuckets)
+	if err != nil {
+		var already prometheus.AlreadyRegisteredError
+		if errors.As(err, &already) {
+			if existing, ok := already.ExistingCollector.(*prometheus.HistogramVec); ok {
+				return existing, nil
+			}
+			return nil, fmt.Errorf("provider: %s already registered with a different collector type: %w", CallDurationMetricName, err)
+		}
+		return nil, fmt.Errorf("provider: register %s: %w", CallDurationMetricName, err)
+	}
+	return vec, nil
+}

@@ -16,7 +16,7 @@ import (
 // CapViolationMetricName is the AC3-named safety-guard counter family:
 // one increment per refused attempt to carry an llm_capped_confidence
 // above the per-provider score cap (Story 3.7 BI-6).
-const CapViolationMetricName = "olaitan_decision_llm_cap_violation_total"
+const CapViolationMetricName = "olaitan_llm_cap_violation_total"
 
 const capViolationMetricHelp = "Refused attempts to write an llm_capped_confidence above the Senior " +
 	"provider's score cap (the Trust-Bounded LLM Integration code guard, " +
@@ -63,7 +63,7 @@ func CapConfidence(raw, scoreCap int) int {
 // GuardCappedConfidence is the exported AC3 chokepoint every path that
 // hands an assessment toward the FSM must call (the Story 3.11 score
 // fold included): if the assessment carries llm_capped_confidence above
-// cap, the guard increments olaitan_decision_llm_cap_violation_total
+// cap, the guard increments olaitan_llm_cap_violation_total
 // and refuses with ErrCapViolation. The orchestrator calls it as the
 // final gate before returning an assessment; on the normal path it
 // passes by construction.
