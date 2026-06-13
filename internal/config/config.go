@@ -1292,6 +1292,9 @@ func (a AuditConfig) validate() error {
 	if a.RetentionPoliciesDays != nil && *a.RetentionPoliciesDays < 1 {
 		return fmt.Errorf("response.audit.retention_policies_days: must be >= 1 (got %d)", *a.RetentionPoliciesDays)
 	}
+	if a.RetentionAssessmentsDays != nil && *a.RetentionAssessmentsDays < 1 {
+		return fmt.Errorf("response.audit.retention_assessments_days: must be >= 1 (got %d)", *a.RetentionAssessmentsDays)
+	}
 	return nil
 }
 

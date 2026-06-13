@@ -350,26 +350,55 @@ func buildAssessmentInput(pkg schema.EvidencePackage, res analyst.ChainResult, n
 		RedactionApplied: true,
 		Now:              now,
 	}
-	if res.L1 != nil {
-		in.PromptVersions["l1"] = res.L1.PromptVersion
-		in.Providers["l1"] = res.L1.Provider
-		in.Models["l1"] = res.L1.Model
+	// A role's per-role metadata is recorded only for roles that actually
+	// CONTRIBUTED to the assessment -- the authoritative set is the
+	// assessment's AgentsAvailable. This keeps the maps consistent with
+	// agents_available (round-1: a full-mode Senior that DEGRADED has its
+	// provider set before the failed call, but is excluded from
+	// AgentsAvailable, so it must not appear in the maps). Within a
+	// contributing role, an EMPTY metadata value is omitted rather than
+	// recorded as "" (round-1: a Story 3.9 checkpoint-RESUMED role carries
+	// its real hypothesis/verification but zero provider/model/version,
+	// since no provider call was made on resume).
+	contributed := make(map[string]bool, len(assessment.AgentsAvailable))
+	for _, r := range assessment.AgentsAvailable {
+		contributed[r] = true
+	}
+	addRole := func(role, version, provider, model string) {
+		if !contributed[role] {
+			return
+		}
+		if version != "" {
+			in.PromptVersions[role] = version
+		}
+		if provider != "" {
+			in.Providers[role] = provider
+		}
+		if model != "" {
+			in.Models[role] = model
+		}
+	}
+	if res.L1 != nil && contributed["l1"] {
+		addRole("l1", res.L1.PromptVersion, res.L1.Provider, res.L1.Model)
 		hyp := res.L1.Hypothesis
 		in.L1Hypothesis = &hyp
 	}
-	if res.L2 != nil {
-		in.PromptVersions["l2"] = res.L2.PromptVersion
-		in.Providers["l2"] = res.L2.Provider
-		in.Models["l2"] = res.L2.Model
+	if res.L2 != nil && contributed["l2"] {
+		addRole("l2", res.L2.PromptVersion, res.L2.Provider, res.L2.Model)
 		ver := res.L2.Verification
 		in.L2Verification = &ver
 	}
-	// Senior ran iff a provider call was attributed to it (full mode); the
-	// l1_only / l1_l2 ablations leave SeniorResult zero-valued.
-	if res.Senior.Provider != "" {
-		in.PromptVersions["senior"] = res.Senior.PromptVersion
-		in.Providers["senior"] = res.Senior.Provider
-		in.Models["senior"] = res.Senior.Model
+	addRole("senior", res.Senior.PromptVersion, res.Senior.Provider, res.Senior.Model)
+	// Drop empty (non-nil) maps so omitempty omits them entirely rather than
+	// emitting "prompt_versions":{} on a metadata-less run.
+	if len(in.PromptVersions) == 0 {
+		in.PromptVersions = nil
+	}
+	if len(in.Providers) == 0 {
+		in.Providers = nil
+	}
+	if len(in.Models) == 0 {
+		in.Models = nil
 	}
 	return in
 }

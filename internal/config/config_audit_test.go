@@ -55,6 +55,8 @@ func TestAuditConfig_ValidateRejectsNonPositive(t *testing.T) {
 		{RetentionTransitionsDays: &zero},
 		{RetentionOverridesDays: &neg},
 		{RetentionPoliciesDays: &zero},
+		{RetentionAssessmentsDays: &zero},
+		{RetentionAssessmentsDays: &neg},
 	}
 	for i, c := range cases {
 		if err := c.validate(); err == nil {

@@ -7,7 +7,7 @@
 #
 # Story 3.14 (FR41). The append-only SIEM copy of every investigation-chain
 # run, published to AUDIT.assessments (365 d LimitsPolicy retention, NFR16
-# append-only; Helm-tunable via response.audit.retention.assessments_days).
+# append-only; Helm-tunable via response.audit.retention_assessments_days).
 # CRITICAL: redacted_evidence is the EvidencePackage AFTER redaction; the raw
 # package is NEVER serialised, so the audit trail carries no secret values
 # (NFR15/NFR18). v2 extends the Story 3.8 minimal v1 additively (NFR29).
