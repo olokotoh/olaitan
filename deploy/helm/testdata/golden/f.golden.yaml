@@ -894,6 +894,14 @@ data:
       # architecture default (just enough for controller-restart resume); a
       # Helm value bridges over this.
       checkpoint_retention: 6h
+      # Story 3.12 (FR51/NFR23): LLM-tier backpressure circuit breaker. Above
+      # rate_per_min LLM-eligible packages/min globally the chain is bypassed
+      # (deterministic-only) for a cooling_seconds window. Helm values bridge over
+      # these defaults.
+      circuit_breaker:
+        rate_per_min: 10
+        cooling_seconds: 60
+        enabled: true
       timeout: 10s
       chain:
         enabled: false

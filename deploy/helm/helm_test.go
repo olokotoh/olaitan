@@ -3546,6 +3546,40 @@ func TestAnalystCheckpointRetentionBridge(t *testing.T) {
 	}
 }
 
+// TestAnalystCircuitBreakerBridge (Story 3.12) pins that
+// analyst.circuit_breaker.{rate_per_min,cooling_seconds} bridge into the
+// rendered config as integers and round-trip through config.Load; the unset
+// defaults stay 10 / 60.
+func TestAnalystCircuitBreakerBridge(t *testing.T) {
+	embedded := extractEmbeddedConfigYAML(t, helmTemplate(t, []string{
+		"analyst.circuit_breaker.rate_per_min=25",
+		"analyst.circuit_breaker.cooling_seconds=90",
+	}))
+	tmp := filepath.Join(t.TempDir(), "olaitan.yaml")
+	if err := os.WriteFile(tmp, []byte(embedded), 0o600); err != nil {
+		t.Fatalf("write tmp config: %v", err)
+	}
+	cfg, err := configLoad(t, tmp)
+	if err != nil {
+		t.Fatalf("bridged circuit_breaker rejected: %v", err)
+	}
+	if cfg.Analyst.CircuitBreaker.RatePerMinOrDefault() != 25 || cfg.Analyst.CircuitBreaker.CoolingSecondsOrDefault() != 90 {
+		t.Errorf("bridged breaker = %d/%d, want 25/90", cfg.Analyst.CircuitBreaker.RatePerMinOrDefault(), cfg.Analyst.CircuitBreaker.CoolingSecondsOrDefault())
+	}
+	embD := extractEmbeddedConfigYAML(t, helmTemplate(t, nil))
+	tmpD := filepath.Join(t.TempDir(), "olaitan.yaml")
+	if err := os.WriteFile(tmpD, []byte(embD), 0o600); err != nil {
+		t.Fatalf("write tmp config: %v", err)
+	}
+	cfgD, err := configLoad(t, tmpD)
+	if err != nil {
+		t.Fatalf("default config rejected: %v", err)
+	}
+	if cfgD.Analyst.CircuitBreaker.RatePerMinOrDefault() != 10 || cfgD.Analyst.CircuitBreaker.CoolingSecondsOrDefault() != 60 {
+		t.Errorf("default breaker = %d/%d, want 10/60", cfgD.Analyst.CircuitBreaker.RatePerMinOrDefault(), cfgD.Analyst.CircuitBreaker.CoolingSecondsOrDefault())
+	}
+}
+
 // TestValuesAirgappedOverlay renders with the FR48 reference overlay
 // and asserts the complete air-gapped posture: ollama surface present,
 // provider local with the overlay's endpoint/model bridged, and no

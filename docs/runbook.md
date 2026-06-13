@@ -661,6 +661,21 @@ or read failure logs and the step re-runs, never aborting the chain. A
 floor). Operational note: the INVESTIGATIONS stream is NOT a SIEM audit
 subject (it is short-lived resume data); do not point SIEM ingest at it.
 
+**LLM-tier circuit breaker** (Story 3.12, FR51/NFR23). A global breaker counts
+LLM-eligible packages (those past the FR19 trigger gate) over a sliding
+1-minute window; above `analyst.circuit_breaker.rate_per_min` (default 10)/min
+it ENGAGES and the chain is bypassed (deterministic-only score, no LLM call)
+until the rate stays at/below threshold for `cooling_seconds` (default 60s) --
+so an attacker spraying triggering events cannot amplify LLM cost. Signals:
+`olaitan_llm_circuit_breaker_engaged_total` increments once per engage edge,
+`olaitan_investigation_chain_runs_total{outcome="breaker_bypassed"}` counts the
+bypassed packages, and one structured log line is emitted per engage/disengage
+(NOT per package). Both thresholds are Helm-tunable
+(`analyst.circuit_breaker.{rate_per_min,cooling_seconds}`) and hot-reloaded.
+Alert on a sustained `rate(olaitan_llm_circuit_breaker_engaged_total[10m]) > 0`:
+either a real burst or a too-low threshold. Set
+`analyst.circuit_breaker.enabled: false` (config-file) to disable.
+
 **LLM retry, Ollama fallback, and `llm_unavailable`** (Story 3.10, FR26/FR28).
 Each role's provider call runs under a 3-strike retry (exponential base delays
 1s then 4s, capped at 16s, plus jitter; with 3 strikes only the 1s and 4s

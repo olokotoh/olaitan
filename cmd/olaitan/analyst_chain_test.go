@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/olokotoh/olaitan/internal/agent/provider"
 	"github.com/olokotoh/olaitan/internal/config"
@@ -177,11 +178,11 @@ func TestFSMConsumerFoldsChainConfidenceIntoScore(t *testing.T) {
 	// chain's capped confidence at this call site must fail this test
 	// (round-2 Regression Hunter: the inline call site was previously
 	// unprotected).
-	withChain, err := chainAdjustedScore(context.Background(), pkg, calc, chain, chain.Mode(), pub, nil, chainTestLogger())
+	withChain, err := chainAdjustedScore(context.Background(), pkg, calc, chain, chain.Mode(), nil, pub, nil, chainTestLogger())
 	if err != nil {
 		t.Fatalf("chainAdjustedScore(with chain): %v", err)
 	}
-	noChain, err := chainAdjustedScore(context.Background(), pkg, calc, nil, "", nil, nil, chainTestLogger())
+	noChain, err := chainAdjustedScore(context.Background(), pkg, calc, nil, "", nil, nil, nil, chainTestLogger())
 	if err != nil {
 		t.Fatalf("chainAdjustedScore(nil chain): %v", err)
 	}
@@ -198,6 +199,41 @@ func TestFSMConsumerFoldsChainConfidenceIntoScore(t *testing.T) {
 	// A nil chain (RS mode) folds a zero LLM term -- byte-identical to Epic 2.
 	if noChain.LLM != 0 {
 		t.Errorf("nil chain must fold a zero LLM term, got %v", noChain.LLM)
+	}
+}
+
+// TestProcessChainPackageBreakerBypass (Story 3.12): when the LLM-tier breaker
+// is engaged, an LLM-eligible package bypasses the chain (no chain.Run, no
+// assessment published, folds 0) and records the breaker_bypassed outcome.
+func TestProcessChainPackageBreakerBypass(t *testing.T) {
+	chain := scriptedFullChain(t)
+	pub := &fakeAssessmentPub{}
+	breaker := analyst.NewCircuitBreaker(analyst.CircuitBreakerOptions{RatePerMin: 1, Cooling: 60 * time.Second, Enabled: true})
+	// Pre-engage: 2 admits exceed the rate of 1/min.
+	breaker.Admit()
+	breaker.Admit()
+	if !breaker.IsEngaged() {
+		t.Fatal("setup: breaker should be engaged")
+	}
+
+	llm, out := processChainPackage(context.Background(), triggeringPackage("80"), chain, chain.Mode(), breaker, pub, nil, chainTestLogger())
+	if out != analyst.ChainOutcomeBreakerBypassed || llm != 0 {
+		t.Errorf("engaged breaker: out=%q llm=%d, want breaker_bypassed/0", out, llm)
+	}
+	if len(pub.got) != 0 {
+		t.Errorf("a bypassed package must not run the chain or publish an assessment, got %d publishes", len(pub.got))
+	}
+}
+
+// TestProcessChainPackageBreakerDisengagedRuns: a disengaged breaker lets an
+// eligible package run the chain normally.
+func TestProcessChainPackageBreakerDisengagedRuns(t *testing.T) {
+	chain := scriptedFullChain(t)
+	pub := &fakeAssessmentPub{}
+	breaker := analyst.NewCircuitBreaker(analyst.CircuitBreakerOptions{RatePerMin: 100, Cooling: 60 * time.Second, Enabled: true})
+	llm, out := processChainPackage(context.Background(), triggeringPackage("80"), chain, chain.Mode(), breaker, pub, nil, chainTestLogger())
+	if out != analyst.ChainOutcomeAssessed || llm <= 0 {
+		t.Errorf("disengaged breaker: out=%q llm=%d, want assessed/>0", out, llm)
 	}
 }
 
@@ -230,7 +266,7 @@ func TestSafeChainConfidenceRecoversFromPanic(t *testing.T) {
 	}
 	pub := &fakeAssessmentPub{}
 
-	capped := safeChainConfidence(context.Background(), triggeringPackage("80"), chain, chain.Mode(), pub, nil, chainTestLogger())
+	capped := safeChainConfidence(context.Background(), triggeringPackage("80"), chain, chain.Mode(), nil, pub, nil, chainTestLogger())
 	if capped != 0 {
 		t.Errorf("a panicking chain must fold 0 (deterministic-only), got %d", capped)
 	}
@@ -291,7 +327,7 @@ func triggeringPackage(severity string) schema.EvidencePackage {
 func TestProcessChainPackageAssessedAndAudited(t *testing.T) {
 	chain := scriptedFullChain(t)
 	pub := &fakeAssessmentPub{}
-	llm, out := processChainPackage(context.Background(), triggeringPackage("80"), chain, chain.Mode(), pub, nil, chainTestLogger())
+	llm, out := processChainPackage(context.Background(), triggeringPackage("80"), chain, chain.Mode(), nil, pub, nil, chainTestLogger())
 	if out != analyst.ChainOutcomeAssessed {
 		t.Errorf("outcome = %q, want assessed", out)
 	}
@@ -315,7 +351,7 @@ func TestProcessChainPackageAssessedAndAudited(t *testing.T) {
 func TestProcessChainPackageNotTriggered(t *testing.T) {
 	chain := scriptedFullChain(t)
 	pub := &fakeAssessmentPub{}
-	llm, out := processChainPackage(context.Background(), triggeringPackage("10"), chain, chain.Mode(), pub, nil, chainTestLogger())
+	llm, out := processChainPackage(context.Background(), triggeringPackage("10"), chain, chain.Mode(), nil, pub, nil, chainTestLogger())
 	if out != analyst.ChainOutcomeNotTriggered {
 		t.Errorf("outcome = %q, want not_triggered", out)
 	}

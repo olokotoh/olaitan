@@ -916,6 +916,13 @@ analyst:
   # value is bridged into the rendered config.
   checkpoint_retention: ""
 
+  # Story 3.12 (FR51/NFR23): LLM-tier circuit-breaker thresholds. Empty keeps
+  # the file-side defaults (10 LLM-eligible packages/min, 60s cooling); a
+  # non-empty integer is bridged into the rendered config (analyst.circuit_breaker).
+  circuit_breaker:
+    rate_per_min: ""
+    cooling_seconds: ""
+
   # Story 3.4 (FR48): the local (Ollama) provider's endpoint and model.
   # Empty values keep the file-side defaults from config/olaitan.yaml
   # (endpoint http://ollama:11434, model gemma:2b); non-empty values are

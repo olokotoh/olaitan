@@ -774,6 +774,7 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	var assessmentPub responseaudit.AssessmentAuditPublisher
 	var chainRuns *prometheus.CounterVec
 	var chainMode string
+	var breaker *analyst.CircuitBreaker
 	if chainEnabled {
 		chainEnabledGauge.WithLabelValues().Set(1)
 		chainMode = chain.Mode()
@@ -799,6 +800,40 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 			return fmt.Errorf("aggregator: chain-runs metric: %w", merr)
 		}
 		chainRuns = runs
+
+		// Story 3.12: the LLM-tier circuit breaker. It counts LLM-eligible
+		// packages (post-FR19-gate) and bypasses the chain when the global
+		// rate exceeds analyst.circuit_breaker.rate_per_min/min, for a
+		// cooling window (FR51/NFR23). Hot-reloaded via the config watcher.
+		cb := analyst.NewCircuitBreaker(analyst.CircuitBreakerOptions{
+			RatePerMin: cfg.Analyst.CircuitBreaker.RatePerMinOrDefault(),
+			Cooling:    time.Duration(cfg.Analyst.CircuitBreaker.CoolingSecondsOrDefault()) * time.Second,
+			Enabled:    cfg.Analyst.CircuitBreaker.EnabledOrDefault(),
+			OnTransition: func(tr analyst.CBTransition) {
+				if tr.Engaged {
+					log.Warn("aggregator: LLM-tier circuit breaker ENGAGED; bypassing the chain (deterministic-only)",
+						"packages_per_min", tr.PackagesPerMin, "rate_per_min", tr.RatePerMin)
+				} else {
+					log.Info("aggregator: LLM-tier circuit breaker disengaged; chain re-engaged",
+						"engaged_for_seconds", tr.EngagedFor.Seconds(), "rate_per_min", tr.RatePerMin)
+				}
+			},
+		})
+		breaker = cb
+		if rerr := metricsReg.RegisterCounter(
+			"olaitan_llm_circuit_breaker_engaged_total", "",
+			"Cumulative LLM-tier circuit-breaker engagements (FR51/NFR23): the chain was bypassed for an attack-driven burst of LLM-eligible packages above analyst.circuit_breaker.rate_per_min per minute. One increment per engage edge.",
+			nil,
+			func() int64 { return cb.EngagedTotal() },
+		); rerr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: circuit-breaker metric: %w", rerr)
+		}
+		subscribe(func(c *config.Config) {
+			cb.UpdateEnabled(c.Analyst.CircuitBreaker.EnabledOrDefault())
+			cb.UpdateRatePerMin(c.Analyst.CircuitBreaker.RatePerMinOrDefault())
+			cb.UpdateCooling(time.Duration(c.Analyst.CircuitBreaker.CoolingSecondsOrDefault()) * time.Second)
+		})
 	}
 
 	var sinks fsm.MultiSink
@@ -909,7 +944,7 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 			return err
 		})
 	}
-	if err := wireFSMConsumer(ctx, g, log, nc, scoreCalc, stateMachine, chain, chainMode, assessmentPub, chainRuns); err != nil {
+	if err := wireFSMConsumer(ctx, g, log, nc, scoreCalc, stateMachine, chain, chainMode, breaker, assessmentPub, chainRuns); err != nil {
 		closeNATS()
 		return fmt.Errorf("aggregator: fsm consumer: %w", err)
 	}
@@ -1150,10 +1185,10 @@ const fsmFetchBackoff = time.Second
 // a live JetStream consumer (round-2 review: the inline call site was
 // otherwise untested -- a regression feeding 0 instead of llmCapped shipped
 // green).
-func chainAdjustedScore(ctx context.Context, pkg schema.EvidencePackage, scoreCalc *score.Calculator, chain *analyst.Chain, chainMode string, auditPub responseaudit.AssessmentAuditPublisher, chainRuns *prometheus.CounterVec, log *slog.Logger) (schema.ConfidenceScore, error) {
+func chainAdjustedScore(ctx context.Context, pkg schema.EvidencePackage, scoreCalc *score.Calculator, chain *analyst.Chain, chainMode string, breaker *analyst.CircuitBreaker, auditPub responseaudit.AssessmentAuditPublisher, chainRuns *prometheus.CounterVec, log *slog.Logger) (schema.ConfidenceScore, error) {
 	llmCapped := 0
 	if chain != nil {
-		llmCapped = safeChainConfidence(ctx, pkg, chain, chainMode, auditPub, chainRuns, log)
+		llmCapped = safeChainConfidence(ctx, pkg, chain, chainMode, breaker, auditPub, chainRuns, log)
 	}
 	return scoreCalc.Score(&pkg, llmCapped)
 }
@@ -1168,7 +1203,7 @@ func chainAdjustedScore(ctx context.Context, pkg schema.EvidencePackage, scoreCa
 // recorded inline (the standalone investigation-chain consumer is removed).
 // It runs on its own errgroup goroutine and returns nil on graceful ctx
 // cancellation.
-func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, nc *natsclient.Client, scoreCalc *score.Calculator, stateMachine *fsm.Machine, chain *analyst.Chain, chainMode string, auditPub responseaudit.AssessmentAuditPublisher, chainRuns *prometheus.CounterVec) error {
+func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, nc *natsclient.Client, scoreCalc *score.Calculator, stateMachine *fsm.Machine, chain *analyst.Chain, chainMode string, breaker *analyst.CircuitBreaker, auditPub responseaudit.AssessmentAuditPublisher, chainRuns *prometheus.CounterVec) error {
 	stream, err := nc.JetStream().Stream(ctx, "EVIDENCE")
 	if err != nil {
 		return fmt.Errorf("stream EVIDENCE: %w", err)
@@ -1227,7 +1262,7 @@ func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, n
 			// score (a nil chain folds 0 = deterministic-only, Epic 2). The
 			// chain->fold->score wiring lives in chainAdjustedScore so it is
 			// unit-testable without a live JetStream consumer.
-			sc, serr := chainAdjustedScore(ctx, pkg, scoreCalc, chain, chainMode, auditPub, chainRuns, log)
+			sc, serr := chainAdjustedScore(ctx, pkg, scoreCalc, chain, chainMode, breaker, auditPub, chainRuns, log)
 			if serr != nil {
 				log.Warn("aggregator: fsm score failed; dropping", "err", serr, "package_id", pkg.PackageID)
 				_ = msg.Ack()
