@@ -101,6 +101,12 @@ func run(args []string, stderr io.Writer) int {
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
 		return runApplogWebhook(ctx, args[1:], stderr)
+	case "fake-llm":
+		// Story 3.16 (AC7): the OpenAI-compatible canned-verdict server the
+		// RSLT-full kind e2e routes the analyst at. Test fixture only.
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		return runFakeLLM(ctx, args[1:], stderr)
 	case "version":
 		fmt.Printf("olaitan %s\n", version)
 		return 0

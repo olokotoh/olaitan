@@ -853,24 +853,30 @@ response:
 #             baselines.enabled=true, analyst.provider=none. LLM tier
 #             bypassed; the deterministic detection layer runs
 #             end-to-end. This is the Epic 1 closure target.
-#   "RSL"  -- RS plus single-LLM analyst. Reserved for Epic 3 Story 3.x
-#             once analyst.provider=api wiring lands. Setting "RSL"
-#             today is accepted by the validator but functionally
-#             equivalent to "RS" because the LLM driver does not exist
-#             yet; the chart-side bridge still flips analyst.provider
-#             to "api" so the Epic 3 wire-up is a single-line story.
-#   "RSLT" -- RS plus full multi-agent chain (L1 + L2 + Senior).
-#             Reserved for Epic 3 Story 3.x; same caveat as RSL.
+#   "RSL"  -- RS plus single-LLM analyst (Standard mode). analyst.provider
+#             =api, and the chart sets l2_enabled=false / senior_enabled=
+#             true so L1 acts as Senior (effective L1-only chain). Story
+#             3.16 (FR53).
+#   "RSLT-full" -- RS plus the full multi-agent chain (L1 -> L2 -> Senior):
+#             analyst.provider=api, l2_enabled=true, senior_enabled=true.
+#             "RSLT" is a preserved legacy alias for "RSLT-full".
+#   "RSLT-L1-only" -- RSLT ablation: L1-only (l2_enabled=false; Senior
+#             implicitly off by precedence). Story 3.16.
+#   "RSLT-L1+L2" -- RSLT ablation: L1 + L2, no Senior (l2_enabled=true,
+#             senior_enabled=false). Story 3.16.
+#
+# The RSL / RSLT-* arms overlay analyst.{provider,l2_enabled,senior_enabled};
+# point the analyst at an LLM via analyst.api.endpoint + the llmApiKey secret
+# (or analyst.provider=local for the in-cluster Ollama, FR48 air-gapped).
 #
 # Restart semantics: changing evaluation.config drives changes to
-# rules.enabled, baselines.enabled, and analyst.provider, which are all
-# restart-required (see their per-block comments and the Story 1.15 /
-# 1.17 restart semantics). Use `kubectl rollout restart deploy/
+# rules.enabled, baselines.enabled, analyst.provider, and the ablation
+# toggles, which are restart-required. Use `kubectl rollout restart deploy/
 # olaitan-aggregator` after `helm upgrade --set evaluation.config=...`.
 evaluation:
-  # One of: "" (default), "F", "RS", "RSL", "RSLT". Chart fails render
-  # with a clear message on any other value (see _helpers.tpl
-  # olaitan.evaluation.validate).
+  # One of: "" (default), "F", "RS", "RSL", "RSLT", "RSLT-full",
+  # "RSLT-L1-only", "RSLT-L1+L2". Chart fails render with a clear message on
+  # any other value (see _helpers.tpl olaitan.evaluation.validate).
   config: ""
 
 # Story 1.19: Analyst tier provider selection. Mirrors the

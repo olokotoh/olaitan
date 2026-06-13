@@ -153,9 +153,11 @@ error rather than silent runtime trap).
 {{- define "olaitan.evaluation.validate" -}}
 {{- $eval := default (dict) .Values.evaluation -}}
 {{- $cfg := default "" $eval.config -}}
-{{- $valid := list "" "F" "RS" "RSL" "RSLT" -}}
+{{- /* Story 3.16: the LLM-bearing arms add RSLT-full and the two RSLT
+       ablation modes; "RSLT" is preserved as a legacy alias for RSLT-full. */ -}}
+{{- $valid := list "" "F" "RS" "RSL" "RSLT" "RSLT-full" "RSLT-L1-only" "RSLT-L1+L2" -}}
 {{- if not (has $cfg $valid) -}}
-{{- fail (printf "evaluation.config must be one of [\"\", \"F\", \"RS\", \"RSL\", \"RSLT\"] (got %q). See deploy/helm/olaitan/values.yaml for the canonical evaluation matrix arms." $cfg) -}}
+{{- fail (printf "evaluation.config must be one of [\"\", \"F\", \"RS\", \"RSL\", \"RSLT\", \"RSLT-full\", \"RSLT-L1-only\", \"RSLT-L1+L2\"] (got %q). See deploy/helm/olaitan/values.yaml for the canonical evaluation matrix arms." $cfg) -}}
 {{- end -}}
 {{- /* Normalise provider to lowercase before the enum check so the Helm validator agrees with the Go-side validator (internal/config/config.go strings.ToLower). Without this an operator passing analyst.provider=NONE would render-fail despite the Go loader accepting it. */ -}}
 {{- $analyst := default (dict) .Values.analyst -}}
@@ -190,7 +192,7 @@ Mapping:
 {{- $eval := default (dict) .Values.evaluation -}}
 {{- $cfg := default "" $eval.config -}}
 {{- if eq $cfg "F" -}}false
-{{- else if or (eq $cfg "RS") (eq $cfg "RSL") (eq $cfg "RSLT") -}}true
+{{- else if or (eq $cfg "RS") (eq $cfg "RSL") (hasPrefix "RSLT" $cfg) -}}true
 {{- else -}}
 {{- /* Bool literals false=zero-value confuse sprig's `default`, so
        check Hasley before falling through. .Values.rules is
@@ -216,7 +218,7 @@ Mapping:
 {{- $eval := default (dict) .Values.evaluation -}}
 {{- $cfg := default "" $eval.config -}}
 {{- if eq $cfg "F" -}}false
-{{- else if or (eq $cfg "RS") (eq $cfg "RSL") (eq $cfg "RSLT") -}}true
+{{- else if or (eq $cfg "RS") (eq $cfg "RSL") (hasPrefix "RSLT" $cfg) -}}true
 {{- else -}}
 {{- if hasKey (default (dict) .Values.baselines) "enabled" -}}{{ printf "%t" .Values.baselines.enabled }}{{- else -}}true{{- end -}}
 {{- end -}}
@@ -242,8 +244,47 @@ Mapping:
 {{- $cfg := default "" $eval.config -}}
 {{- $analyst := default (dict) .Values.analyst -}}
 {{- if or (eq $cfg "F") (eq $cfg "RS") -}}none
-{{- else if or (eq $cfg "RSL") (eq $cfg "RSLT") -}}api
+{{- else if or (eq $cfg "RSL") (hasPrefix "RSLT" $cfg) -}}api
 {{- else -}}{{ lower (default "none" $analyst.provider) }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+olaitan.evaluation.effectiveL2Enabled / effectiveSeniorEnabled (Story 3.16,
+FR53) -- return the literal "true"/"false" for analyst.l2_enabled /
+analyst.senior_enabled. The arm drives the chain ablation shape:
+
+  RSL            -> l2 false, senior true   (Standard single-LLM; L1 acts as
+                                             Senior -- effective L1-only)
+  RSLT-full/RSLT -> l2 true,  senior true   (full L1 -> L2 -> Senior)
+  RSLT-L1-only   -> l2 false, senior true   (L1-only ablation; SeniorEnabled
+                                             precedence makes Senior off)
+  RSLT-L1+L2     -> l2 true,  senior false  (L1+L2 ablation)
+  F / RS / ""    -> operator-supplied .Values.analyst.{l2,senior}_enabled
+
+The Go-side SeniorEnabledOrDefault precedence (L2 off => Senior off) means
+RSL / RSLT-L1-only resolve to the L1-only chain regardless of senior; the
+senior literal is set to the AC-mandated value for clarity.
+*/}}
+{{- define "olaitan.evaluation.effectiveL2Enabled" -}}
+{{- $eval := default (dict) .Values.evaluation -}}
+{{- $cfg := default "" $eval.config -}}
+{{- $analyst := default (dict) .Values.analyst -}}
+{{- if or (eq $cfg "RSL") (eq $cfg "RSLT-L1-only") -}}false
+{{- else if or (eq $cfg "RSLT") (eq $cfg "RSLT-full") (eq $cfg "RSLT-L1+L2") -}}true
+{{- else -}}
+{{- if hasKey $analyst "l2_enabled" -}}{{ printf "%t" $analyst.l2_enabled }}{{- else -}}true{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "olaitan.evaluation.effectiveSeniorEnabled" -}}
+{{- $eval := default (dict) .Values.evaluation -}}
+{{- $cfg := default "" $eval.config -}}
+{{- $analyst := default (dict) .Values.analyst -}}
+{{- if eq $cfg "RSLT-L1+L2" -}}false
+{{- else if or (eq $cfg "RSL") (eq $cfg "RSLT") (eq $cfg "RSLT-full") (eq $cfg "RSLT-L1-only") -}}true
+{{- else -}}
+{{- if hasKey $analyst "senior_enabled" -}}{{ printf "%t" $analyst.senior_enabled }}{{- else -}}true{{- end -}}
 {{- end -}}
 {{- end -}}
 

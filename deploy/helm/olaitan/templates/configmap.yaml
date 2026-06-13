@@ -676,6 +676,19 @@ data:
     {{- $cfg = regexReplaceAll $pAbl $cfg (printf "${1}%s" (toString $v)) }}
     {{- end }}
     {{- end }}
+    {{- /* Story 3.16 (FR53): the evaluation arm overlays the ablation toggles
+           AFTER the Story 3.8 operator bridge above, so an RSL / RSLT-* arm
+           takes precedence; the helpers return the operator (or file-default)
+           value when no arm, so this is idempotent for F / RS / "". The
+           anchors are the same unique 2-space keys. */ -}}
+    {{- $l2Eff := include "olaitan.evaluation.effectiveL2Enabled" . -}}
+    {{- $pEvL2 := "(\\n  l2_enabled:[[:space:]]+)(?:true|false)" -}}
+    {{- if not (mustRegexFind $pEvL2 $cfg) }}{{- fail (printf "helm bridge: evaluation overlay anchor for analyst.l2_enabled not found (pattern %q)" $pEvL2) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pEvL2 $cfg (printf "${1}%s" $l2Eff) }}
+    {{- $srEff := include "olaitan.evaluation.effectiveSeniorEnabled" . -}}
+    {{- $pEvSr := "(\\n  senior_enabled:[[:space:]]+)(?:true|false)" -}}
+    {{- if not (mustRegexFind $pEvSr $cfg) }}{{- fail (printf "helm bridge: evaluation overlay anchor for analyst.senior_enabled not found (pattern %q)" $pEvSr) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pEvSr $cfg (printf "${1}%s" $srEff) }}
     {{- /* Story 3.9 (FR29): bridge analyst.checkpoint_retention (a Go
            duration string) over the file-side 6h default. `with` skips an
            empty value; the anchor is the unique 2-space-indented key. */ -}}

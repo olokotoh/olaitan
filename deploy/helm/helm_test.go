@@ -241,12 +241,12 @@ func TestSubchartsDisabled(t *testing.T) {
 	// added here so a future PR that introduces an unintended kind
 	// (e.g. an extra Secret) trips this test.
 	want := map[string]int{
-		"ServiceAccount":        2,
-		"Role":                  1,
-		"RoleBinding":           1,
-		"ClusterRole":           1,
-		"ClusterRoleBinding":    1,
-		"Secret":                1,
+		"ServiceAccount":     2,
+		"Role":               1,
+		"RoleBinding":        1,
+		"ClusterRole":        1,
+		"ClusterRoleBinding": 1,
+		"Secret":             1,
 		// config + rules + prompts (Story 3.13 added the prompts ConfigMap).
 		"ConfigMap":             3,
 		"PersistentVolumeClaim": 1,
@@ -3494,6 +3494,99 @@ func TestAnalystLocalBridge(t *testing.T) {
 		"unset analyst.local.endpoint must keep the file-side default")
 	assertContains(t, embeddedDefaults, `model: "gemma:2b"`,
 		"unset analyst.local.model must keep the file-side default")
+}
+
+// TestEvaluationArmAblationToggles (Story 3.16, FR53) pins the LLM-bearing
+// evaluation arms: each --set evaluation.config=<arm> renders the correct
+// analyst.{provider,l2_enabled,senior_enabled}, round-trips through
+// config.Load, and resolves to the intended chain ablation mode. The legacy
+// "RSLT" alias maps to RSLT-full.
+func TestEvaluationArmAblationToggles(t *testing.T) {
+	cases := []struct {
+		arm          string
+		wantProvider string
+		wantL2       bool // L2EnabledOrDefault
+		wantSenior   bool // SeniorEnabledOrDefault (precedence: L2 off => Senior off)
+	}{
+		{"RSL", "api", false, false},          // Standard single-LLM (L1-as-Senior => L1-only)
+		{"RSLT-full", "api", true, true},      // full L1 -> L2 -> Senior
+		{"RSLT", "api", true, true},           // legacy alias for RSLT-full
+		{"RSLT-L1-only", "api", false, false}, // L1-only ablation
+		{"RSLT-L1+L2", "api", true, false},    // L1+L2 ablation (Senior off)
+	}
+	for _, tc := range cases {
+		t.Run(tc.arm, func(t *testing.T) {
+			rendered := helmTemplate(t, []string{"evaluation.config=" + tc.arm})
+			embedded := extractEmbeddedConfigYAML(t, rendered)
+			tmp := filepath.Join(t.TempDir(), "olaitan.yaml")
+			if err := os.WriteFile(tmp, []byte(embedded), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg, err := configLoad(t, tmp)
+			if err != nil {
+				t.Fatalf("arm %s config rejected by config.Load: %v", tc.arm, err)
+			}
+			if cfg.Analyst.Provider != tc.wantProvider {
+				t.Errorf("arm %s: analyst.provider = %q, want %q", tc.arm, cfg.Analyst.Provider, tc.wantProvider)
+			}
+			if cfg.Analyst.L2EnabledOrDefault() != tc.wantL2 {
+				t.Errorf("arm %s: L2EnabledOrDefault = %v, want %v", tc.arm, cfg.Analyst.L2EnabledOrDefault(), tc.wantL2)
+			}
+			if cfg.Analyst.SeniorEnabledOrDefault() != tc.wantSenior {
+				t.Errorf("arm %s: SeniorEnabledOrDefault = %v, want %v", tc.arm, cfg.Analyst.SeniorEnabledOrDefault(), tc.wantSenior)
+			}
+		})
+	}
+}
+
+// TestEvaluationArmRejectsUnknown pins the fail-fast enum: an unknown
+// RSLT-style arm fails the render with the canonical message.
+func TestEvaluationArmRejectsUnknown(t *testing.T) {
+	cmd := exec.Command("helm", "template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+		"--set", "evaluation.config=RSLT-bogus",
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatal("helm template succeeded with evaluation.config=RSLT-bogus; expected fail-fast")
+	}
+	if !strings.Contains(stderr.String(), "evaluation.config must be one of") {
+		t.Errorf("stderr did not mention the evaluation.config guard:\n%s", stderr.String())
+	}
+}
+
+// TestOllamaModeRoutesLocalWithNetworkPolicy (Story 3.16 AC5/FR48): with
+// analyst.provider=local + ollama.enabled the chart renders the in-cluster
+// Ollama Deployment + the egress-restricting NetworkPolicy, and the analyst
+// routes to the local provider (no external egress).
+func TestOllamaModeRoutesLocalWithNetworkPolicy(t *testing.T) {
+	rendered := helmTemplate(t, []string{"analyst.provider=local", "ollama.enabled=true"})
+	if !strings.Contains(rendered, "olaitan-ollama") {
+		t.Fatal("ollama Deployment/Service not rendered when ollama.enabled=true")
+	}
+	ms := parseManifests(t, rendered)
+	var sawOllamaNetpol bool
+	for _, m := range ms {
+		if m.Kind == "NetworkPolicy" && strings.Contains(m.Metadata.Name, "ollama") {
+			sawOllamaNetpol = true
+		}
+	}
+	if !sawOllamaNetpol {
+		t.Error("ollama NetworkPolicy must render to restrict Ollama reachability (FR48)")
+	}
+	embedded := extractEmbeddedConfigYAML(t, rendered)
+	tmp := filepath.Join(t.TempDir(), "olaitan.yaml")
+	if err := os.WriteFile(tmp, []byte(embedded), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := configLoad(t, tmp)
+	if err != nil {
+		t.Fatalf("ollama config rejected: %v", err)
+	}
+	if cfg.Analyst.Provider != "local" {
+		t.Errorf("analyst.provider = %q, want local (Ollama)", cfg.Analyst.Provider)
+	}
 }
 
 // TestAnalystPerRoleBridge (Story 3.8) pins the per-role routing +
