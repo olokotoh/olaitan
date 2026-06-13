@@ -156,8 +156,11 @@ var streamConfigs = []jetstream.StreamConfig{
 		// (the gap the round-1 review caught: the unit tests use a fake
 		// publisher). 365 d retention (the architecture's generalised
 		// "AUDIT.* 365 d" default; no AC carves out a shorter window),
-		// LimitsPolicy (NFR16 append-only), Helm-tunable via
-		// StreamConfigsWithAudit. The chain consumer publishes with
+		// LimitsPolicy (NFR16 append-only). The retention mechanism is
+		// tunable via AuditRetention.Assessments; the operator config knob
+		// that drives it (a response.audit.retention_assessments_days) is a
+		// follow-up, so today the baked-in 365 d default applies. The chain
+		// consumer publishes with
 		// jetstream.WithMsgID = package_id so a re-run of the same package is
 		// server-side deduplicated within the window. Story 3.14 owns the
 		// broader audit pipeline and may extend the payload.
