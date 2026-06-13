@@ -171,6 +171,24 @@ var streamConfigs = []jetstream.StreamConfig{
 		Retention:  jetstream.LimitsPolicy,
 		Duplicates: 2 * time.Minute,
 	},
+	{
+		// INVESTIGATIONS carries the Story 3.9 per-investigation checkpoints
+		// (INVESTIGATIONS.{package_id}.{l1,l2}, FR29): the L1Hypothesis and
+		// L2Verification of an in-flight chain, so a controller restart can
+		// resume from the last completed step rather than re-spawning it.
+		// 6 h retention (architecture.md:235 "just enough for controller-restart
+		// resume"), Helm-tunable via the analyst.checkpoint_retention config.
+		// This is NOT an append-only SIEM audit stream, so it is NOT in
+		// auditStreamNames; the checkpoint store publishes with
+		// jetstream.WithMsgID = package_id+step so a re-publish is idempotent
+		// and LoadL1/LoadL2 read the last message per subject for resume.
+		Name:       "INVESTIGATIONS",
+		Subjects:   []string{subjects.InvestigationPrefix + ">"},
+		MaxAge:     defaultInvestigationsMaxAge,
+		Storage:    jetstream.FileStorage,
+		Retention:  jetstream.LimitsPolicy,
+		Duplicates: 2 * time.Minute,
+	},
 }
 
 // defaultAudit*MaxAge are the Story 2.8 AC4 retention defaults baked into
@@ -189,6 +207,9 @@ const (
 	// default: the architecture's generalised "AUDIT.* 365 d" (no AC carves out
 	// a shorter window).
 	defaultAuditAssessmentsMaxAge = 365 * 24 * time.Hour
+	// defaultInvestigationsMaxAge is the Story 3.9 checkpoint retention default
+	// (architecture.md:235): just enough for a controller-restart resume.
+	defaultInvestigationsMaxAge = 6 * time.Hour
 )
 
 // AuditRetention carries the operator-tuned per-subject MaxAge for the
@@ -233,7 +254,7 @@ var auditStreamNames = map[string]func(AuditRetention) time.Duration{
 // fileStore.maxSize. Production deployments leave the env var unset
 // and size the NATS PVC to accommodate the configured sum.
 func StreamConfigs() []jetstream.StreamConfig {
-	return streamConfigsWith(AuditRetention{})
+	return streamConfigsWith(AuditRetention{}, 0)
 }
 
 // StreamConfigsWithAudit returns StreamConfigs() with the three Story 2.8
@@ -243,10 +264,19 @@ func StreamConfigs() []jetstream.StreamConfig {
 // AC4's Helm-tunability drives the real stream MaxAge; callers that want the
 // pure architecture defaults use StreamConfigs() (a zero AuditRetention).
 func StreamConfigsWithAudit(ar AuditRetention) []jetstream.StreamConfig {
-	return streamConfigsWith(ar)
+	return streamConfigsWith(ar, 0)
 }
 
-func streamConfigsWith(ar AuditRetention) []jetstream.StreamConfig {
+// StreamConfigsWithRetention returns StreamConfigs() with the AUDIT_* MaxAge
+// overridden by ar AND the INVESTIGATIONS MaxAge overridden by investigations
+// (Story 3.9 AC4); a non-positive value leaves the baked-in default (the
+// architecture's 6 h for investigations). The aggregator threads its
+// analyst.checkpoint_retention config in here.
+func StreamConfigsWithRetention(ar AuditRetention, investigations time.Duration) []jetstream.StreamConfig {
+	return streamConfigsWith(ar, investigations)
+}
+
+func streamConfigsWith(ar AuditRetention, investigations time.Duration) []jetstream.StreamConfig {
 	override := streamMaxBytesOverride()
 	out := make([]jetstream.StreamConfig, len(streamConfigs))
 	for i, cfg := range streamConfigs {
@@ -261,6 +291,9 @@ func streamConfigsWith(ar AuditRetention) []jetstream.StreamConfig {
 			if d := field(ar); d > 0 {
 				c.MaxAge = d
 			}
+		}
+		if c.Name == "INVESTIGATIONS" && investigations > 0 {
+			c.MaxAge = investigations
 		}
 		out[i] = c
 	}

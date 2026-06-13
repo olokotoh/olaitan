@@ -285,6 +285,10 @@ analyst:
   senior_provider: ""
   senior_model: ""
   senior_enabled: true
+  # Story 3.9 (FR29): INVESTIGATIONS checkpoint stream retention. 6h is the
+  # architecture default (just enough for controller-restart resume); a
+  # Helm value bridges over this.
+  checkpoint_retention: 6h
   timeout: 10s
   chain:
     enabled: false

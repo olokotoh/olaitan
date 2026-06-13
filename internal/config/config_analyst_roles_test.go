@@ -3,6 +3,7 @@ package config_test
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/olokotoh/olaitan/internal/config"
 )
@@ -69,6 +70,22 @@ func TestAnalystStrictDecodeRejectsTypo(t *testing.T) {
 	yaml := analystRolesBaseYAML + "  l1_provder: claude\n"
 	if _, err := config.Load(writeConfig(t, yaml)); err == nil {
 		t.Fatal("Load: got nil, want strict-decode rejection of typo'd key l1_provder")
+	}
+}
+
+// TestAnalystCheckpointRetention (Story 3.9): a valid duration round-trips,
+// an unset value is 0 (the wiring layer applies the 6h default), and a
+// negative duration is rejected at load.
+func TestAnalystCheckpointRetention(t *testing.T) {
+	cfg, err := config.Load(writeConfig(t, analystRolesBaseYAML+"  checkpoint_retention: 2h\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Analyst.CheckpointRetention.Duration() != 2*time.Hour {
+		t.Errorf("checkpoint_retention = %s, want 2h", cfg.Analyst.CheckpointRetention.Duration())
+	}
+	if _, err := config.Load(writeConfig(t, analystRolesBaseYAML+"  checkpoint_retention: -1h\n")); err == nil {
+		t.Error("negative checkpoint_retention must be rejected")
 	}
 }
 

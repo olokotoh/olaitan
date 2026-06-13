@@ -27,6 +27,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -3512,6 +3513,36 @@ func TestAnalystPerRoleBridge(t *testing.T) {
 	}
 	if cfgD.Analyst.L1Provider != "" || !cfgD.Analyst.L2EnabledOrDefault() || !cfgD.Analyst.SeniorEnabledOrDefault() {
 		t.Errorf("defaults drifted: l1_provider=%q l2=%v senior=%v", cfgD.Analyst.L1Provider, cfgD.Analyst.L2EnabledOrDefault(), cfgD.Analyst.SeniorEnabledOrDefault())
+	}
+}
+
+// TestAnalystCheckpointRetentionBridge (Story 3.9) pins that the
+// analyst.checkpoint_retention Helm value bridges into the rendered config
+// and round-trips through config.Load; the unset default stays 6h.
+func TestAnalystCheckpointRetentionBridge(t *testing.T) {
+	embedded := extractEmbeddedConfigYAML(t, helmTemplate(t, []string{"analyst.checkpoint_retention=2h"}))
+	tmp := filepath.Join(t.TempDir(), "olaitan.yaml")
+	if err := os.WriteFile(tmp, []byte(embedded), 0o600); err != nil {
+		t.Fatalf("write tmp config: %v", err)
+	}
+	cfg, err := configLoad(t, tmp)
+	if err != nil {
+		t.Fatalf("bridged checkpoint_retention rejected: %v", err)
+	}
+	if cfg.Analyst.CheckpointRetention.Duration() != 2*time.Hour {
+		t.Errorf("checkpoint_retention = %s, want 2h", cfg.Analyst.CheckpointRetention.Duration())
+	}
+	embD := extractEmbeddedConfigYAML(t, helmTemplate(t, nil))
+	tmpD := filepath.Join(t.TempDir(), "olaitan.yaml")
+	if err := os.WriteFile(tmpD, []byte(embD), 0o600); err != nil {
+		t.Fatalf("write tmp config: %v", err)
+	}
+	cfgD, err := configLoad(t, tmpD)
+	if err != nil {
+		t.Fatalf("default config rejected: %v", err)
+	}
+	if cfgD.Analyst.CheckpointRetention.Duration() != 6*time.Hour {
+		t.Errorf("default checkpoint_retention = %s, want 6h", cfgD.Analyst.CheckpointRetention.Duration())
 	}
 }
 

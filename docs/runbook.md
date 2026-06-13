@@ -637,6 +637,23 @@ AC4). One event per investigation-chain run, carrying `mode` and
 Published synchronously by the chain consumer (`WithMsgID` = package_id).
 Story 3.14 owns the broader audit pipeline and may extend the payload.
 
+**Investigation checkpoints `INVESTIGATIONS.{package_id}.{l1,l2}`** (Story
+3.9, FR29). The chain checkpoints each completed L1/L2 output to a dedicated
+`INVESTIGATIONS` JetStream stream (LimitsPolicy, FileStorage, 6h default
+retention, Helm-tunable via `analyst.checkpoint_retention`) so a controller
+restart resumes from the last completed step rather than re-spawning it. The
+checkpoint store publishes with `WithMsgID = package_id + step` (idempotent
+re-publish) and resumes by reading the last message per subject. **Resume is
+structural:** the chain consumer acks the `EvidencePackage` only AFTER the
+chain completes, so a crash mid-chain leaves it un-acked; JetStream
+redelivers it and the chain re-checks the checkpoints, re-running only the
+un-checkpointed steps (the Senior is never checkpointed, so a post-L2 restart
+re-runs only the Senior). Checkpointing is best-effort durability: a publish
+or read failure logs and the step re-runs, never aborting the chain. A
+6h-stale checkpoint simply means the chain re-runs from scratch (the retention
+floor). Operational note: the INVESTIGATIONS stream is NOT a SIEM audit
+subject (it is short-lived resume data); do not point SIEM ingest at it.
+
 **Per-role timeout table (total budget across ALL retry attempts):**
 
 | role | budget |

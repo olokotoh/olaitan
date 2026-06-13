@@ -1379,6 +1379,12 @@ type AnalystConfig struct {
 	SeniorProvider string `yaml:"senior_provider"`
 	SeniorModel    string `yaml:"senior_model"`
 	SeniorEnabled  *bool  `yaml:"senior_enabled"`
+
+	// CheckpointRetention is the INVESTIGATIONS stream MaxAge (Story 3.9
+	// FR29/AC4): how long L1/L2 checkpoints survive for controller-restart
+	// resume. Zero/unset selects the architecture's 6h default at the
+	// wiring layer; a negative value is rejected by validate().
+	CheckpointRetention DurationYAML `yaml:"checkpoint_retention"`
 }
 
 // L2EnabledOrDefault reports whether the L2 role runs. Unset = true; an
@@ -1920,6 +1926,11 @@ func (a AnalystConfig) validate() error {
 	}
 	if a.Timeout.Duration() <= 0 {
 		return fmt.Errorf("analyst.timeout: must be > 0 (got %s)", a.Timeout.Duration())
+	}
+	// checkpoint_retention is optional: zero/unset selects the 6h default at
+	// the wiring layer; a negative value is a misconfiguration.
+	if a.CheckpointRetention.Duration() < 0 {
+		return fmt.Errorf("analyst.checkpoint_retention: must be >= 0 (got %s)", a.CheckpointRetention.Duration())
 	}
 	// Endpoint/model emptiness is NOT rejected here: the shipped default
 	// olaitan.yaml leaves them blank for operators to fill in (AC8). The

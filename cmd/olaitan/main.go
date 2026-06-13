@@ -47,6 +47,7 @@ import (
 	"github.com/olokotoh/olaitan/internal/correlator"
 	correlatorasm "github.com/olokotoh/olaitan/internal/correlator/assembler"
 	"github.com/olokotoh/olaitan/internal/decision/analyst"
+	"github.com/olokotoh/olaitan/internal/decision/analyst/checkpoint"
 	"github.com/olokotoh/olaitan/internal/decision/baseline"
 	"github.com/olokotoh/olaitan/internal/decision/rules"
 	rulesloader "github.com/olokotoh/olaitan/internal/decision/rules/loader"
@@ -438,7 +439,7 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		// startup order does not matter (the Story 2.8 round-2 amendment).
 		Redactions: time.Duration(cfg.Report.Redact.RetentionRedactionsDaysOrDefault()) * 24 * time.Hour,
 	}
-	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigsWithAudit(auditRetention)); err != nil {
+	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigsWithRetention(auditRetention, cfg.Analyst.CheckpointRetention.Duration())); err != nil {
 		closeNATS()
 		if ctx.Err() != nil {
 			return nil
@@ -768,6 +769,16 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	chainEnabledGauge.WithLabelValues().Set(0)
 	if chainEnabled {
 		chainEnabledGauge.WithLabelValues().Set(1)
+		// Story 3.9: attach the NATS-backed checkpoint store so the chain
+		// checkpoints L1/L2 to INVESTIGATIONS.* and resumes from them after a
+		// controller restart (the JetStream redelivery of the un-acked package
+		// re-runs only the un-checkpointed steps).
+		ckStore, ckErr := checkpoint.New(nc)
+		if ckErr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: checkpoint store: %w", ckErr)
+		}
+		chain.WithCheckpoints(ckStore)
 		assessmentPub, aerr := responseaudit.NewNATSAssessmentPublisher(nc)
 		if aerr != nil {
 			closeNATS()
@@ -1336,7 +1347,7 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 		// stream with the same MaxAge.
 		Redactions: time.Duration(cfg.Report.Redact.RetentionRedactionsDaysOrDefault()) * 24 * time.Hour,
 	}
-	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigsWithAudit(auditRetention)); err != nil {
+	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigsWithRetention(auditRetention, cfg.Analyst.CheckpointRetention.Duration())); err != nil {
 		closeNATS()
 		return fmt.Errorf("collector: ensure streams: %w", err)
 	}
