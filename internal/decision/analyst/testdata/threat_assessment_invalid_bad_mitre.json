@@ -1,0 +1,6 @@
+{
+  "threat_type": "crypto_miner",
+  "reasoning": "Technique id is malformed.",
+  "mitre_techniques": ["TA0002"],
+  "confidence": 50
+}

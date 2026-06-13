@@ -1,0 +1,5 @@
+{
+  "threat_type": "benign_operations",
+  "reasoning": "Both analyses agree the activity matches the documented deployment runbook.",
+  "confidence": 10
+}

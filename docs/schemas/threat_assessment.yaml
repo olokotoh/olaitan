@@ -1,0 +1,67 @@
+# Canonical shape of the Senior analyst's model-facing verdict.
+#
+# AUTHORITATIVE validation source: docs/schemas/threat_assessment.json
+# (draft 2020-12). This YAML is the documentation mirror in the
+# docs/schemas/state_transition.yaml style; the .json is what the
+# Story 3.7 Senior runner validates model responses against, via the
+# byte-identical embedded copy at
+# internal/decision/analyst/threat_assessment_schema.json.
+#
+# Story 3.7 (FR24). This is the MODEL-facing verdict schema. The
+# persisted Go struct (internal/schema/threat.go, type ThreatAssessment)
+# additionally carries the orchestrator-computed raw_confidence and
+# llm_capped_confidence pair (AC2), agents_available (AC4), and the
+# Story 3.11 ConfidenceScore fold. schema_version is optional (or null)
+# on the model side and force-stamped to threat_assessment.v1 by the
+# runner. Whitespace-only threat_type, reasoning and noted_disagreements
+# entries are rejected programmatically by the runner. confidence is the
+# RAW model confidence; capping at the per-provider score cap happens
+# orchestrator-side. Size bounds follow the Story 3.5 round-1
+# convention.
+schema: threat_assessment.v1
+fields:
+  schema_version:
+    type: string-or-null
+    required: false
+    description: >
+      Stamped to "threat_assessment.v1" by the runner; optional (or
+      null) from the model (JSON type ["string", "null"]). maxLength 64.
+  threat_type:
+    type: string
+    required: true
+    description: >
+      Short classification of the assessed activity (e.g. crypto_miner,
+      benign_operations). Non-whitespace, maxLength 128.
+  reasoning:
+    type: string
+    required: true
+    description: >
+      The Senior's challenge-driven reasoning over the evidence, the L1
+      hypothesis and the L2 verification. Non-whitespace, maxLength 2000.
+  mitre_techniques:
+    type: array
+    required: false
+    description: >
+      ATT&CK technique annotations (FR24). Up to 20 entries, each
+      matching T####(.###) (schema pattern-enforced). Optional because a
+      benign verdict may carry none.
+  noted_disagreements:
+    type: array
+    required: false
+    description: >
+      Explicit disagreements between L1 and L2 the Senior records
+      (FR24); preserved for audit. Up to 20 entries, each minLength 1
+      and maxLength 500, non-whitespace (runner-enforced). When L2
+      refuted and the model emits none, the orchestrator appends a
+      deterministic disagreement entry (BI-7).
+  kill_chain_stage:
+    type: string
+    required: false
+    description: Optional kill-chain stage annotation. maxLength 64.
+  confidence:
+    type: integer
+    required: true
+    description: >
+      RAW Senior confidence in [0,100]; the orchestrator caps it at the
+      per-provider score cap and records both values on the persisted
+      assessment (AC2).

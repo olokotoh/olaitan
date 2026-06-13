@@ -78,18 +78,20 @@ func escapeAngleBrackets(doc []byte) []byte {
 // transports (Story 3.2 BI-9 / Story 3.3 BI-2.1, byte-compatible across
 // providers): the orchestrator's user prompt, the REDACTED evidence
 // package in a tagged block, the optional L1 hypothesis (Story 3.6
-// BI-2, the L2/Senior re-examination input), the optional prior
-// assessment, and the output-contract instruction. The caller passes
-// the redacted copy; this function never sees the un-redacted package.
+// BI-2, the L2/Senior re-examination input), the optional L2
+// verification (Story 3.7 BI-3, the Senior challenge input), the
+// optional prior assessment, and the output-contract instruction. The
+// caller passes the redacted copy; this function never sees the
+// un-redacted package.
 //
-// Framing hardening (DW3.3-1, Story 3.5 BI-7 / Story 3.6 BI-2): the
-// evidence, prior-hypothesis and prior-assessment payloads are
-// angle-bracket-escaped after marshalling so no payload byte can close
-// (or open) a framing tag; a defensive invariant check rejects any
-// payload that somehow retains a '<'. The framing tags themselves and
-// the req.Schema block are NOT escaped: the schema is repo-owned
-// trusted content (the committed role schema), never
-// attacker-influenced evidence.
+// Framing hardening (DW3.3-1, Story 3.5 BI-7 / 3.6 BI-2 / 3.7 BI-3):
+// the evidence, prior-hypothesis, prior-verification and
+// prior-assessment payloads are angle-bracket-escaped after marshalling
+// so no payload byte can close (or open) a framing tag; a defensive
+// invariant check rejects any payload that somehow retains a '<'. The
+// framing tags themselves and the req.Schema block are NOT escaped:
+// the schema is repo-owned trusted content (the committed role schema),
+// never attacker-influenced evidence.
 func BuildAnalystContent(redacted schema.EvidencePackage, req Request) (string, error) {
 	evidence, err := json.Marshal(redacted)
 	if err != nil {
@@ -117,6 +119,19 @@ func BuildAnalystContent(redacted schema.EvidencePackage, req Request) (string, 
 		sb.WriteString("\n\n<l1_hypothesis>\n")
 		sb.Write(hyp)
 		sb.WriteString("\n</l1_hypothesis>")
+	}
+	if req.PriorVerification != nil {
+		ver, verr := json.Marshal(req.PriorVerification)
+		if verr != nil {
+			return "", fmt.Errorf("provider: marshal prior verification: %w", verr)
+		}
+		ver = escapeAngleBrackets(ver)
+		if bytes.IndexByte(ver, '<') >= 0 {
+			return "", errors.New("provider: prior verification retained a '<' after escaping")
+		}
+		sb.WriteString("\n\n<l2_verification>\n")
+		sb.Write(ver)
+		sb.WriteString("\n</l2_verification>")
 	}
 	if req.PriorAssessment != nil {
 		prior, perr := json.Marshal(req.PriorAssessment)

@@ -537,10 +537,12 @@ response validation, complementing the transport-level
 `olaitan_llm_calls_total` (one `Run` maps to exactly one `Analyse` call,
 which may itself have retried internally). Bounded envelope 3 providers
 x 3 roles x 4 statuses = 36 series. The l1 (Story 3.5) and l2 (Story
-3.6) runners increment the family; registration happens in the runner
-constructors, so before the Story 3.7/3.8 orchestrator wires the
-runners into the chain the family is neither registered nor populated
-in the production binary. `senior` lands with Story 3.7. Registration is SHARED and idempotent
+3.6) and senior (Story 3.7) runners increment the family; registration
+happens in the runner constructors, so before the Story 3.8 trigger
+wires the chain into the production binary the family is neither
+registered nor populated there. The full 36-series envelope is live
+code as of Story 3.7 (the analyst.Chain orchestrator sequences all
+three roles). Registration is SHARED and idempotent
 (`analyst.RegisterDecisionCallsMetric`), so the Story 3.6/3.7 runners
 join the same family.
 
@@ -549,7 +551,7 @@ join the same family.
 | `success` | The reply parsed, validated against its role schema (`l1_hypothesis.v1` / `l2_verification.v1`) and passed the referential checks. |
 | `unavailable` | `Provider.Analyse` failed (transport failure, exhausted retries, the per-role timeout, or caller-context cancellation), or the reply was truncated by the output-token ceiling (stop reason `max_tokens`/`length`). |
 | `schema_violation` | The reply failed its role schema contract: empty body, undecodable JSON, JSON-Schema failure (incl. the size bounds), whitespace-only hypothesis/finding text, a duplicated narrative `event_id` (L2), or a referenced `event_id` absent from the input package. |
-| `success_low_confidence` | RESERVED for the Story 3.7 Senior (validated assessment below the acting threshold); never emitted before then. |
+| `success_low_confidence` | RESERVED for Story 3.11 (a validated assessment below the acting threshold; the threshold lives with the score fold, so the reservation moved from 3.7 to 3.11); never emitted before then. |
 
 Sample PromQL -- schema-violation rate per provider (feeds the Story
 3.10 three-strike policy dashboards):
@@ -562,7 +564,10 @@ Senior-on-evidence-only mode; Story 3.10 may extend the set). One
 increment per investigation chain that skips L2, recorded by the Story
 3.7 orchestrator at the `analyst.ShouldSkipL2` gate (Story 3.6 BI-6).
 A schema violation does NOT skip L2 before Story 3.10's three-strike
-escalation. NOTE the `l1_unavailable` reason inherits the full
+escalation. The bounded reason set as of Story 3.7: `l1_unavailable` and
+`l1_schema_violation` (the single pre-3.10 L1 attempt returned a schema
+violation, so there is no hypothesis to verify; Story 3.10's
+three-strike policy re-routes this class). NOTE the `l1_unavailable` reason inherits the full
 `unavailable` status semantics of the decision family: transport
 failure, exhausted retries, the per-role timeout, output-token-ceiling
 truncation, and caller-context cancellation all qualify, so the label
@@ -570,9 +575,23 @@ measures chain short-circuits, not provider outages specifically
 (Story 3.10 may split the reason set). Increment via
 `analyst.RecordL2Skip` (refuses the empty no-skip reason). Registration
 is shared and idempotent (`analyst.RegisterL2SkippedMetric`). Alerting
-sketch, effective once Story 3.7 wires the gate -- sustained L1 failure
-starving the verification stage:
+sketch, effective once Story 3.8 wires the chain trigger -- sustained
+L1 failure starving the verification stage:
 `sum(rate(olaitan_decision_llm_l2_skipped_total{reason="l1_unavailable"}[10m])) > 0.05`.
+
+**Metric: `olaitan_decision_llm_cap_violation_total`** (counter, no labels).
+Refused attempts to write an `llm_capped_confidence` above the Senior
+provider's score cap: the Trust-Bounded LLM Integration code guard
+(Story 3.7 AC3, `analyst.GuardCappedConfidence`). ZERO in healthy
+operation -- the orchestrator caps by construction via
+`min(raw_confidence, ScoreCap)`, so any increment means a code path
+bypassed the cap arithmetic; alert on ANY increment:
+`increase(olaitan_decision_llm_cap_violation_total[5m]) > 0`. The Story
+3.11 FSM-feeding path MUST route through the same guard. Both
+`raw_confidence` and `llm_capped_confidence` are recorded on the
+assessment for audit traceability (AC2); the architecture bound
+max(LLM-only ThreatScore) = 0.3 x 35 = 10.5 is pinned by
+TestCapBoundProperty against the score package constants.
 
 **Per-role timeout table (total budget across ALL retry attempts):**
 
