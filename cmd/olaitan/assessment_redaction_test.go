@@ -168,6 +168,61 @@ func TestBuildAssessmentInputAblationOmitsRolesEndToEnd(t *testing.T) {
 	}
 }
 
+// TestBuildAssessmentInputResumedRoleOmitsEmptyMetadata mutation-proves the
+// empty-value omission: a Story 3.9 checkpoint-RESUMED L1 carries a real
+// hypothesis but zero provider/model/version (no provider call on resume). The
+// event must carry the hypothesis while OMITTING the empty per-role metadata
+// (not "l1":""). Reverting the `if version != ""` omission fails this.
+func TestBuildAssessmentInputResumedRoleOmitsEmptyMetadata(t *testing.T) {
+	res := analyst.ChainResult{
+		Mode: analyst.ChainModeL1Only,
+		L1: &analyst.L1Result{
+			Hypothesis: schema.L1Hypothesis{Hypothesis: "resumed from checkpoint", Confidence: 50},
+			Status:     analyst.StatusSuccess,
+			Resumed:    true,
+			// PromptVersion/Provider/Model intentionally empty (resume).
+		},
+		Assessment: schema.ThreatAssessment{AgentsAvailable: []string{"l1"}, RawConfidence: 50, LLMCappedConfidence: 25},
+	}
+	in := buildAssessmentInput(triggeringPackage("80"), res, time.Now().UTC())
+	if in.L1Hypothesis == nil || in.L1Hypothesis.Hypothesis != "resumed from checkpoint" {
+		t.Fatal("resumed L1 hypothesis must still be carried")
+	}
+	if _, ok := in.PromptVersions["l1"]; ok {
+		t.Errorf("resumed L1 with empty version must be OMITTED, got %+v", in.PromptVersions)
+	}
+	if in.Providers != nil || in.Models != nil || in.PromptVersions != nil {
+		t.Errorf("all-empty per-role maps must be nil (omitempty), got pv=%v pr=%v m=%v", in.PromptVersions, in.Providers, in.Models)
+	}
+}
+
+// TestBuildAssessmentInputDegradedSeniorOmitted mutation-proves the
+// AgentsAvailable gating: a full-mode Senior that DEGRADED has its Provider set
+// (assigned before the failed call) but is excluded from AgentsAvailable, so it
+// must NOT appear in the per-role maps (round-1 consistency fix). Reverting to
+// the `res.Senior.Provider != ""` heuristic fails this.
+func TestBuildAssessmentInputDegradedSeniorOmitted(t *testing.T) {
+	res := analyst.ChainResult{
+		Mode: analyst.ChainModeFull,
+		L1:   &analyst.L1Result{Hypothesis: schema.L1Hypothesis{Hypothesis: "h"}, PromptVersion: "vL1", Provider: "claude", Model: "haiku"},
+		L2:   &analyst.L2Result{Verification: schema.L2Verification{Verdict: "confirmed"}, PromptVersion: "vL2", Provider: "claude", Model: "haiku"},
+		// Degraded senior: provider/version set before the failed call.
+		Senior:     analyst.SeniorResult{PromptVersion: "vSR", Provider: "claude", Model: "opus", Status: analyst.StatusUnavailable},
+		Assessment: schema.ThreatAssessment{AgentsAvailable: []string{"l1", "l2"}, RawConfidence: 66, LLMCappedConfidence: 30},
+	}
+	in := buildAssessmentInput(triggeringPackage("80"), res, time.Now().UTC())
+	if _, ok := in.PromptVersions["senior"]; ok {
+		t.Errorf("degraded senior (not in agents_available) must be omitted from prompt_versions: %+v", in.PromptVersions)
+	}
+	if _, ok := in.Providers["senior"]; ok {
+		t.Errorf("degraded senior must be omitted from providers: %+v", in.Providers)
+	}
+	// L1/L2 (which DID contribute) stay present.
+	if in.PromptVersions["l1"] != "vL1" || in.PromptVersions["l2"] != "vL2" {
+		t.Errorf("contributing l1/l2 must remain: %+v", in.PromptVersions)
+	}
+}
+
 // TestNoProductionPathSkipsRedaction is the AC3 STATIC guard: no non-test Go
 // source under cmd/ or internal/ may construct an assessment with redaction
 // disabled. This catches a FUTURE production caller that sets
