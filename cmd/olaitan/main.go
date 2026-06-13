@@ -756,7 +756,18 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		closeNATS()
 		return fmt.Errorf("aggregator: %w", cerr)
 	}
+	// NFR27 steady-state disclosure (Story 3.8 BI-7): a 0/1 gauge that says
+	// whether the LLM chain is wired or the aggregator runs rules-only,
+	// alongside the structured log emitted in buildInvestigationChain.
+	chainEnabledGauge, gerr := metricsReg.RegisterGaugeVec("olaitan_analyst_chain_enabled",
+		"Whether the LLM investigation chain is wired (1) or the aggregator runs rules-and-baselines-only (0) (Story 3.8 NFR27).", nil)
+	if gerr != nil {
+		closeNATS()
+		return fmt.Errorf("aggregator: chain-enabled gauge: %w", gerr)
+	}
+	chainEnabledGauge.WithLabelValues().Set(0)
 	if chainEnabled {
+		chainEnabledGauge.WithLabelValues().Set(1)
 		assessmentPub, aerr := responseaudit.NewNATSAssessmentPublisher(nc)
 		if aerr != nil {
 			closeNATS()

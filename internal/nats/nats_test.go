@@ -686,6 +686,8 @@ func TestStreamConfigsCoversAuditSubjects(t *testing.T) {
 		{subjects.AuditPolicies, "AUDIT_POLICIES", 365 * 24 * time.Hour},
 		// Story 3.1: the fifth SIEM audit subject, 365 d default (BI-3.2).
 		{subjects.AuditRedactions, "AUDIT_REDACTIONS", 365 * 24 * time.Hour},
+		// Story 3.8: the LLM-verdict audit subject, 365 d default.
+		{subjects.AuditAssessments, "AUDIT_ASSESSMENTS", 365 * 24 * time.Hour},
 	}
 	for _, c := range cases {
 		cfg := findStreamFor(t, configs, c.subject)

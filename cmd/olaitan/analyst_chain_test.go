@@ -67,9 +67,11 @@ func TestRoleSpecDegrade(t *testing.T) {
 	if _, _, d := roleSpec("", "", cfg, "k"); d != "" {
 		t.Errorf("claude with key+inherited model: degrade = %q, want none", d)
 	}
-	if _, _, d := roleSpec("openai", "", cfg, "k"); d != "" {
-		// openai inherits api.model (claude-opus-4-8); model present.
-		t.Errorf("openai with model: degrade = %q, want none", d)
+	if _, _, d := roleSpec("openai", "", cfg, "k"); d == "" {
+		t.Error("openai with no explicit model must degrade (api.model is a claude id, not inheritable)")
+	}
+	if _, m, d := roleSpec("openai", "gpt-4o-mini", cfg, "k"); d != "" || m != "gpt-4o-mini" {
+		t.Errorf("openai with explicit model: degrade=%q model=%q, want none/gpt-4o-mini", d, m)
 	}
 	if _, m, d := roleSpec("ollama", "", cfg, "k"); d == "" || m != "" {
 		t.Errorf("ollama no model: degrade = %q model = %q, want degrade", d, m)

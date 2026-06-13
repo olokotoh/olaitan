@@ -91,8 +91,17 @@ func firstNonEmpty(a, b string) string {
 func roleSpec(roleProvider, roleModel string, cfg *config.Config, apiKey string) (family, model, degrade string) {
 	family = resolveRoleFamily(roleProvider, cfg.Analyst.Provider)
 	switch family {
-	case "claude", "openai":
+	case "claude":
+		// claude inherits analyst.api.model when the role model is empty;
+		// the constructor defaults it further (to claude-opus-4-8) if still
+		// empty, so claude tolerates an empty model.
 		model = firstNonEmpty(roleModel, cfg.Analyst.API.Model)
+	case "openai":
+		// openai does NOT inherit analyst.api.model: that field carries a
+		// claude model id which an OpenAI-compatible endpoint would reject
+		// (round-1 review). An openai-routed role must set its own
+		// l1/l2/senior_model; an empty model degrades the chain.
+		model = roleModel
 	case "ollama":
 		model = firstNonEmpty(roleModel, cfg.Analyst.Local.Model)
 	}
@@ -122,6 +131,16 @@ func roleSpec(roleProvider, roleModel string, cfg *config.Config, apiKey string)
 // family + model (Story 3.8 BI-4). It assumes roleSpec already cleared
 // the degrade preconditions (key/model presence); the errors it returns
 // are genuine misconfiguration (e.g. a bad endpoint) and are fatal.
+//
+// CONSTRAINT (round-1 review): the api-family providers (claude, openai)
+// SHARE the single analyst.api.{endpoint,api_key_secret}. The supported
+// topologies are therefore: an all-claude chain on the native Anthropic
+// SDK with one key (the primary FR25 Haiku/Opus case); an all-openai
+// chain behind one OpenAI-compatible gateway (LiteLLM/vLLM/Together) with
+// one key+endpoint; or an all-ollama chain (no key). Mixing the NATIVE
+// claude provider and an openai_compat endpoint in one chain only works
+// when they share auth (e.g. both behind one gateway); per-role
+// endpoint/key secrets are a future enhancement.
 func buildRoleProvider(family, model string, cfg *config.Config, apiKey string, reg *metrics.Registry, sink *reportredact.RedactionAuditSink, log *slog.Logger) (provider.Provider, error) {
 	scoreCap := roleScoreCap(family, cfg.Analyst.ScoreCap)
 	switch strings.ToLower(family) {

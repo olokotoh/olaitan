@@ -148,6 +148,26 @@ var streamConfigs = []jetstream.StreamConfig{
 		Retention:  jetstream.LimitsPolicy,
 		Duplicates: 2 * time.Minute,
 	},
+	{
+		// AUDIT_ASSESSMENTS carries the Story 3.8 append-only SIEM audit
+		// copy of every investigation-chain run (subjects.AuditAssessments,
+		// AC4). Without this stream every assessment publish would fail with
+		// "no stream matches subject" and the audit subject would be silent
+		// (the gap the round-1 review caught: the unit tests use a fake
+		// publisher). 365 d retention (the architecture's generalised
+		// "AUDIT.* 365 d" default; no AC carves out a shorter window),
+		// LimitsPolicy (NFR16 append-only), Helm-tunable via
+		// StreamConfigsWithAudit. The chain consumer publishes with
+		// jetstream.WithMsgID = package_id so a re-run of the same package is
+		// server-side deduplicated within the window. Story 3.14 owns the
+		// broader audit pipeline and may extend the payload.
+		Name:       "AUDIT_ASSESSMENTS",
+		Subjects:   []string{subjects.AuditAssessments},
+		MaxAge:     defaultAuditAssessmentsMaxAge,
+		Storage:    jetstream.FileStorage,
+		Retention:  jetstream.LimitsPolicy,
+		Duplicates: 2 * time.Minute,
+	},
 }
 
 // defaultAudit*MaxAge are the Story 2.8 AC4 retention defaults baked into
@@ -162,6 +182,10 @@ const (
 	// No AC carves out a shorter window (unlike transitions' 90 d), so it takes
 	// the architecture's generalised "AUDIT.* 365 d" default (BI-3.2).
 	defaultAuditRedactionsMaxAge = 365 * 24 * time.Hour
+	// defaultAuditAssessmentsMaxAge is the Story 3.8 assessments retention
+	// default: the architecture's generalised "AUDIT.* 365 d" (no AC carves out
+	// a shorter window).
+	defaultAuditAssessmentsMaxAge = 365 * 24 * time.Hour
 )
 
 // AuditRetention carries the operator-tuned per-subject MaxAge for the
@@ -174,6 +198,7 @@ type AuditRetention struct {
 	Overrides   time.Duration
 	Policies    time.Duration
 	Redactions  time.Duration
+	Assessments time.Duration
 }
 
 // auditStreamNames maps each AUDIT_* stream name to the AuditRetention field
@@ -184,6 +209,7 @@ var auditStreamNames = map[string]func(AuditRetention) time.Duration{
 	"AUDIT_OVERRIDES":   func(a AuditRetention) time.Duration { return a.Overrides },
 	"AUDIT_POLICIES":    func(a AuditRetention) time.Duration { return a.Policies },
 	"AUDIT_REDACTIONS":  func(a AuditRetention) time.Duration { return a.Redactions },
+	"AUDIT_ASSESSMENTS": func(a AuditRetention) time.Duration { return a.Assessments },
 }
 
 // StreamConfigs returns a copy of the JetStream stream configurations.

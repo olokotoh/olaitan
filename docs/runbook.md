@@ -601,8 +601,10 @@ deterministic FSM consumer) handles. `mode` is the configured chain
 boundary: `full` (L1->L2->Senior), `l1_l2` (Senior ablated off), or
 `l1_only` (L2 + Senior ablated off). `outcome` is `not_triggered` (the
 FR19 gate declined: no rule severity >= 50 and no baseline sigma >= 3.0),
-`assessed` (an assessment was produced and published to
-`AUDIT.assessments`), `no_citable` (the chain aborted on empty citable
+`assessed` (the chain PRODUCED an assessment; the `AUDIT.assessments`
+publish is best-effort and a publish failure is logged separately, so the
+metric does not over-claim persistence), `no_citable` (the chain aborted
+on empty citable
 evidence -- the Story 3.6 chain-level concern, no retry; Story 3.10 owns
 retries), or `error`. A high `not_triggered` ratio is expected and
 healthy (the gate controls LLM cost). A sustained `error` rate is a
