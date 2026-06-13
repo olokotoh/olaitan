@@ -1211,7 +1211,7 @@ func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, n
 			// the score. A nil chain folds 0 (deterministic-only, Epic 2).
 			llmCapped := 0
 			if chain != nil {
-				llmCapped, _ = processChainPackage(ctx, pkg, chain, chainMode, auditPub, chainRuns, log)
+				llmCapped = safeChainConfidence(ctx, pkg, chain, chainMode, auditPub, chainRuns, log)
 			}
 
 			sc, serr := scoreCalc.Score(&pkg, llmCapped)

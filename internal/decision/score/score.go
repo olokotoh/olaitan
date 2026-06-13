@@ -347,7 +347,16 @@ func (c *Calculator) Score(pkg *schema.EvidencePackage, llmCappedConfidence int)
 	if cappedLLM < 0 {
 		cappedLLM = 0
 	}
-	if capLimit := int(cfg.LLMCap); capLimit > 0 && cappedLLM > capLimit {
+	// The cap is ALWAYS applied (Story 3.11 round-1 fix): a non-positive
+	// LLMCap is clamped to 0, so an operator who sets llm_cap: 0 (disable the
+	// LLM contribution) gets a zero term -- NOT an un-clamped fold. The bound
+	// LLMWeight * LLMCap therefore holds for any caller AND any cap, including
+	// 0 and a (config-rejected but defensively-handled) negative.
+	capLimit := int(cfg.LLMCap)
+	if capLimit < 0 {
+		capLimit = 0
+	}
+	if cappedLLM > capLimit {
 		cappedLLM = capLimit
 	}
 	rules := cfg.RuleWeight * float64(maxSeverity)

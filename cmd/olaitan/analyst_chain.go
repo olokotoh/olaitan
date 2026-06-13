@@ -308,3 +308,20 @@ func processChainPackage(ctx context.Context, pkg schema.EvidencePackage, chain 
 	// so a degraded assessment folds a zero LLM term -> deterministic-only.
 	return res.Assessment.LLMCappedConfidence, analyst.ChainOutcomeAssessed
 }
+
+// safeChainConfidence runs processChainPackage inside a recover so a panic in
+// the LLM tier (a provider SDK, JSON handling, etc.) degrades to a zero LLM
+// contribution rather than tearing down the single FSM-driver goroutine the
+// merge (Story 3.11) put it on. The Trust-Bound's promise is that the LLM tier
+// can never break containment; that must include a crashing LLM tier. On a
+// panic the deterministic rules+baselines score still drives the FSM (NFR27).
+func safeChainConfidence(ctx context.Context, pkg schema.EvidencePackage, chain *analyst.Chain, mode string, auditPub responseaudit.AssessmentAuditPublisher, runs *prometheus.CounterVec, log *slog.Logger) (capped int) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error("aggregator: investigation chain panicked; folding zero LLM confidence (deterministic-only)", "panic", r, "package_id", pkg.PackageID)
+			capped = 0
+		}
+	}()
+	capped, _ = processChainPackage(ctx, pkg, chain, mode, auditPub, runs, log)
+	return capped
+}

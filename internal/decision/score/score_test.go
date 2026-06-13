@@ -235,6 +235,25 @@ func TestScore_LLMOverCapClamped(t *testing.T) {
 	}
 }
 
+// TestScore_LLMCapZeroContributesNothing is the round-1 fix for the clamp
+// hole: an operator who sets llm_cap: 0 (disable the LLM contribution) gets a
+// ZERO LLM term, not an un-clamped fold of the raw confidence. Without the
+// always-apply clamp a capped=90 would fold 0.3*90 = 27, escalating past
+// SUSPICIOUS on the LLM tier alone.
+func TestScore_LLMCapZeroContributesNothing(t *testing.T) {
+	c := newCalcForTest(t, staticGetter(scoreCfg(DefaultRuleWeight, DefaultBaselineWeight, DefaultLLMWeight, 0)))
+	got, err := c.Score(&schema.EvidencePackage{}, 90)
+	if err != nil {
+		t.Fatalf("Score: %v", err)
+	}
+	if got.LLM != 0 {
+		t.Errorf("llm_cap=0 must fold a zero LLM term, got %v", got.LLM)
+	}
+	if got.Total != 0 {
+		t.Errorf("llm_cap=0 with no rule/baseline must yield Total 0, got %v", got.Total)
+	}
+}
+
 // TestScore_LLMTermFolded proves the LLM term is folded into the Total
 // alongside rule + baseline (FR30 fully wired): llm_capped_confidence 20
 // yields 0.3*20 = 6.
