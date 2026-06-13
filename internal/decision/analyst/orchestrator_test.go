@@ -79,6 +79,9 @@ func TestCapConfidenceTable(t *testing.T) {
 	cases := []struct{ raw, cap, want int }{
 		{0, 35, 0}, {35, 35, 35}, {36, 35, 35}, {100, 35, 35},
 		{100, 30, 30}, {100, 25, 25}, {10, 25, 10}, {-5, 35, 0},
+		// Defence-in-depth: a misconfigured non-positive cap clamps to 0
+		// (Story 3.7 round-1 review); never a negative capped confidence.
+		{50, 0, 0}, {50, -5, 0}, {0, -5, 0},
 	}
 	for _, tc := range cases {
 		if got := CapConfidence(tc.raw, tc.cap); got != tc.want {

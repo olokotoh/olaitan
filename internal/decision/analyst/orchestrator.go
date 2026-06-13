@@ -40,8 +40,16 @@ func RegisterCapViolationMetric(reg *metrics.Registry) (*prometheus.CounterVec, 
 	return registerCounterVec(reg, CapViolationMetricName, capViolationMetricHelp, nil)
 }
 
-// CapConfidence is the AC2 arithmetic: min(raw, cap), floored at 0.
+// CapConfidence is the AC2 arithmetic: min(raw, cap), floored at 0. The
+// floor is defence-in-depth: shipped providers floor their ScoreCap() to
+// a positive default, but the Provider.ScoreCap() contract makes no such
+// promise, so a negative cap is clamped to 0 here rather than silently
+// producing a negative capped confidence that GuardCappedConfidence's
+// `>` check would wave through (Story 3.7 round-1 review).
 func CapConfidence(raw, scoreCap int) int {
+	if scoreCap < 0 {
+		scoreCap = 0
+	}
 	if raw < 0 {
 		return 0
 	}

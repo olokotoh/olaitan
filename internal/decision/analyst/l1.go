@@ -104,8 +104,9 @@ const (
 	// StatusSchemaViolation: the response failed its role schema
 	// contract (see ErrSchemaViolation).
 	StatusSchemaViolation = "schema_violation"
-	// StatusSuccessLowConfidence is RESERVED for the Story 3.7 Senior
-	// (a validated assessment whose confidence falls below the acting
+	// StatusSuccessLowConfidence is RESERVED for Story 3.11 (a validated
+	// assessment whose confidence falls below the score-fold acting
+	// threshold; the reservation moved from 3.7 to 3.11 with the
 	// threshold). Defined here so the bounded enum is complete from day
 	// one; no 3.5 path emits it.
 	StatusSuccessLowConfidence = "success_low_confidence"
