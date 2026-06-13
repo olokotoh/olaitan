@@ -3,6 +3,7 @@ package analyst
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/olokotoh/olaitan/internal/agent/provider"
@@ -187,6 +188,15 @@ func TestChainCheckpointSaveL2FailureNonFatal(t *testing.T) {
 	}
 	if res.Assessment.ThreatType != "cryptomining" {
 		t.Errorf("assessment not produced despite L2 save failure: %+v", res.Assessment)
+	}
+	// Teeth: a SaveL2 error must be swallowed INSIDE l2Step, not propagated as
+	// an l2 error. If it propagated, runFull would degrade to hypothesis-only
+	// (ver==nil) and drop "l2" from AgentsAvailable. So the save failure being
+	// non-fatal is observable as "l2" surviving in the available set. (Full
+	// mode swallows genuine l2 errors too, so asserting ThreatType alone is
+	// toothless — round-2 Regression Hunter finding.)
+	if !slices.Contains(res.Assessment.AgentsAvailable, "l2") {
+		t.Errorf("SaveL2 error degraded L2 (agents_available=%v); the save must be non-fatal, not propagated", res.Assessment.AgentsAvailable)
 	}
 }
 

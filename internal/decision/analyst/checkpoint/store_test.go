@@ -181,6 +181,37 @@ func TestResumeAcrossRestart(t *testing.T) {
 	}
 }
 
+// TestLoadMissesWhenStreamAbsent proves the BI-4 cold-start contract (the
+// loadInto ErrStreamNotFound branch): a Load issued before EnsureStreams has
+// created the INVESTIGATIONS stream (cold start, or a pruned env) is a clean
+// miss, NOT a hard error, so the step re-runs and re-checkpoints. The other
+// tests all run EnsureStreams via startNATS, so this is the only one that
+// exercises the absent-stream path.
+func TestLoadMissesWhenStreamAbsent(t *testing.T) {
+	srv, err := natsserver.NewServer(&natsserver.Options{Host: "127.0.0.1", Port: -1, JetStream: true, StoreDir: t.TempDir(), NoLog: true, NoSigs: true})
+	if err != nil {
+		t.Fatalf("nats server: %v", err)
+	}
+	srv.Start()
+	if !srv.ReadyForConnections(5 * time.Second) {
+		t.Fatal("nats not ready")
+	}
+	t.Cleanup(srv.Shutdown)
+	c, err := natsclient.NewClient(natsclient.ClientConfig{URL: srv.ClientURL(), Name: "checkpoint-nostream", ReconnectWait: time.Second, ReconnectBufSize: 1 << 20})
+	if err != nil {
+		t.Fatalf("nats client: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+	// Deliberately do NOT EnsureStreams: the INVESTIGATIONS stream is absent.
+	store, _ := checkpoint.New(c)
+	if h, ok, err := store.LoadL1(context.Background(), "pkg-cold"); err != nil || ok {
+		t.Errorf("LoadL1 with no stream: got=%+v ok=%v err=%v, want zero/false/nil (clean miss)", h, ok, err)
+	}
+	if v, ok, err := store.LoadL2(context.Background(), "pkg-cold"); err != nil || ok {
+		t.Errorf("LoadL2 with no stream: got=%+v ok=%v err=%v, want zero/false/nil (clean miss)", v, ok, err)
+	}
+}
+
 // TestResumeFromL1Checkpoint is the BI-8 boundary (b) over REAL NATS: a
 // post-L1 crash leaves only the L1 checkpoint, so a restart resumes L1 from
 // the checkpoint (call count 0, marked resumed) but re-runs L2 (call count 1)
