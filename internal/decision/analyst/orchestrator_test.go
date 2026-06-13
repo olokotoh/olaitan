@@ -5,10 +5,12 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/olokotoh/olaitan/internal/agent/provider"
 	"github.com/olokotoh/olaitan/internal/decision/score"
 	"github.com/olokotoh/olaitan/internal/metrics"
+	"github.com/olokotoh/olaitan/internal/retry"
 	"github.com/olokotoh/olaitan/internal/schema"
 )
 
@@ -33,7 +35,22 @@ func newTestChain(t *testing.T, l1fp, l2fp, srfp *fakeProvider) (*Chain, *metric
 	if err != nil {
 		t.Fatalf("NewChain: %v", err)
 	}
+	// Story 3.10: keep the 3-strike count but collapse the back-off so the
+	// retry-path tests don't sleep 1s/4s of real time.
+	chain.retry = fastTestRetry()
 	return chain, reg
+}
+
+// fastTestRetry mirrors the production 3-strike policy (MaxAttempts 3) with
+// negligible deterministic delays so retry-path tests stay fast.
+func fastTestRetry() retry.Strategy {
+	return retry.Strategy{
+		Min:         time.Microsecond,
+		Max:         time.Millisecond,
+		Multiplier:  2,
+		Jitter:      0,
+		MaxAttempts: 3,
+	}
 }
 
 func skipCounter(t *testing.T, reg *metrics.Registry, reason string) float64 {
@@ -292,21 +309,38 @@ func TestChainRunL2FailureHypothesisOnly(t *testing.T) {
 	}
 }
 
-func TestChainRunSeniorFailureAborts(t *testing.T) {
+// TestChainRunSeniorUnavailableDegrades pins the Story 3.10 BI-4 (AC4) change:
+// a Senior whose primary (and, here, absent fallback) exhausts the 3-strike
+// retry no longer ABORTS the chain (the Story 3.7 behaviour). It degrades to a
+// zero-LLM-confidence assessment marked llm_unavailable so the FSM proceeds on
+// the deterministic ThreatScore only. The retry exercises all 3 strikes.
+func TestChainRunSeniorUnavailableDegrades(t *testing.T) {
 	l1fp := &fakeProvider{name: "fake", model: "m", resp: provider.Response{Raw: validVerdict}}
 	l2fp := &fakeProvider{name: "fake", model: "m", resp: provider.Response{Raw: validL2Verdict}}
 	srfp := &fakeProvider{name: "fake", model: "m", err: errors.New("senior down")}
 	chain, _ := newTestChain(t, l1fp, l2fp, srfp)
 
 	res, err := chain.Run(context.Background(), testPackage())
-	if !errors.Is(err, ErrProviderUnavailable) {
-		t.Fatalf("err = %v, want ErrProviderUnavailable through the chain", err)
+	if err != nil {
+		t.Fatalf("Run: %v (Senior unavailability must degrade, not abort, per AC4)", err)
+	}
+	if !res.Assessment.LLMUnavailable {
+		t.Error("degraded assessment not marked llm_unavailable")
+	}
+	if res.Assessment.LLMCappedConfidence != 0 || res.Assessment.RawConfidence != 0 {
+		t.Errorf("degraded assessment must carry zero confidence, got raw=%d capped=%d", res.Assessment.RawConfidence, res.Assessment.LLMCappedConfidence)
 	}
 	if res.Assessment.ThreatType != "" {
-		t.Error("aborted chain returned a non-zero assessment")
+		t.Errorf("degraded assessment must carry no verdict, got threat_type=%q", res.Assessment.ThreatType)
+	}
+	if strings.Join(res.Assessment.AgentsAvailable, ",") != "l1,l2" {
+		t.Errorf("agents_available = %v, want l1,l2 (senior unavailable)", res.Assessment.AgentsAvailable)
 	}
 	if res.L1 == nil || res.L2 == nil {
-		t.Error("audit trail of completed stages lost on abort")
+		t.Error("audit trail of completed stages lost on Senior degrade")
+	}
+	if srfp.calls != 3 {
+		t.Errorf("Senior provider called %d times, want 3 (the 3-strike retry)", srfp.calls)
 	}
 }
 

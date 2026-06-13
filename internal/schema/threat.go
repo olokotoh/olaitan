@@ -51,4 +51,11 @@ type ThreatAssessment struct {
 	RawConfidence       int              `json:"raw_confidence,omitempty"`
 	LLMCappedConfidence int              `json:"llm_capped_confidence,omitempty"`
 	AgentsAvailable     []string         `json:"agents_available,omitempty"`
+	// LLMUnavailable records that the investigation chain could not obtain
+	// a usable verdict for the boundary role after the Story 3.10 retry +
+	// Ollama-fallback ladder exhausted (FR26/FR28): the role's
+	// llm_capped_confidence is forced to 0 and the FSM proceeds on the
+	// deterministic ThreatScore only. Additive omitempty: the pre-3.10 wire
+	// form is byte-identical for the false zero value.
+	LLMUnavailable bool `json:"llm_unavailable,omitempty"`
 }

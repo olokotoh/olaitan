@@ -127,6 +127,10 @@ type L2 struct {
 // boundary role's cap (Story 3.8 BI-5; mirrors Senior.ScoreCap).
 func (a *L2) ScoreCap() int { return a.provider.ScoreCap() }
 
+// ProviderName exposes the L2 provider's metric label for the Story 3.10
+// fallback counter.
+func (a *L2) ProviderName() string { return a.provider.Name() }
+
 // NewL2 builds an L2 runner on top of an already-constructed provider
 // (per-role provider selection is Story 3.8). It registers (or re-uses)
 // the shared decision-outcome metric family on reg.

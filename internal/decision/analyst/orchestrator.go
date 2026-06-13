@@ -9,6 +9,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/olokotoh/olaitan/internal/metrics"
+	"github.com/olokotoh/olaitan/internal/retry"
 	"github.com/olokotoh/olaitan/internal/schema"
 )
 
@@ -120,11 +121,21 @@ type ChainResult struct {
 // at construction: a nil senior runner = L1+L2 ablation, a nil l2 AND
 // nil senior = L1-only ablation.
 type Chain struct {
-	l1            *L1
-	l2            *L2
-	senior        *Senior
-	mode          string
-	checkpoints   CheckpointStore
+	l1          *L1
+	l2          *L2
+	senior      *Senior
+	mode        string
+	checkpoints CheckpointStore
+	// Per-role Ollama fallback runners (Story 3.10 BI-3). Nil = no
+	// fallback for that role = Story 3.9-identical behaviour.
+	l1Fallback     *L1
+	l2Fallback     *L2
+	seniorFallback *Senior
+	// retry is the 3-strike policy each role's provider call runs under
+	// (Story 3.10 BI-2). Defaulted in NewChain; package-internal tests
+	// override it with a fast strategy to avoid real back-off sleeps.
+	retry         retry.Strategy
+	fallbacks     *prometheus.CounterVec
 	skips         *prometheus.CounterVec
 	capViolations *prometheus.CounterVec
 	log           *slog.Logger
@@ -157,7 +168,7 @@ func (c *Chain) l1Step(ctx context.Context, pkg schema.EvidencePackage) (L1Resul
 			return L1Result{Hypothesis: hyp, Status: StatusSuccess, Resumed: true}, nil
 		}
 	}
-	res, err := c.l1.Run(ctx, pkg)
+	res, err := c.l1WithRetryFallback(ctx, pkg)
 	if err == nil && c.checkpoints != nil {
 		if serr := c.checkpoints.SaveL1(ctx, pkg.PackageID, res.Hypothesis); serr != nil {
 			c.log.Warn("checkpoint SaveL1 failed; chain continues", "err", serr, "package_id", pkg.PackageID)
@@ -176,7 +187,7 @@ func (c *Chain) l2Step(ctx context.Context, pkg schema.EvidencePackage, hyp sche
 			return L2Result{Verification: ver, Status: StatusSuccess, Resumed: true}, nil
 		}
 	}
-	res, err := c.l2.Run(ctx, pkg, hyp)
+	res, err := c.l2WithRetryFallback(ctx, pkg, hyp)
 	if err == nil && c.checkpoints != nil {
 		if serr := c.checkpoints.SaveL2(ctx, pkg.PackageID, res.Verification); serr != nil {
 			c.log.Warn("checkpoint SaveL2 failed; chain continues", "err", serr, "package_id", pkg.PackageID)
@@ -215,7 +226,23 @@ func NewChain(l1 *L1, l2 *L2, senior *Senior, reg *metrics.Registry, log *slog.L
 	if err != nil {
 		return nil, err
 	}
-	return &Chain{l1: l1, l2: l2, senior: senior, mode: mode, skips: skips, capViolations: capViolations, log: log}, nil
+	fallbacks, err := registerCounterVec(reg, FallbackMetricName, fallbackMetricHelp, []string{"from_provider", "to_provider", "role"})
+	if err != nil {
+		return nil, err
+	}
+	return &Chain{l1: l1, l2: l2, senior: senior, mode: mode, retry: defaultRetryStrategy(), fallbacks: fallbacks, skips: skips, capViolations: capViolations, log: log}, nil
+}
+
+// WithFallbacks attaches per-role Ollama fallback runners so a role whose
+// primary provider exhausts its 3-strike retry falls through to Ollama for
+// that single call (Story 3.10 BI-3/FR28). Any runner may be nil (no fallback
+// for that role); all-nil keeps the Story 3.9 behaviour byte-identical.
+// Returns the chain for fluent wiring.
+func (c *Chain) WithFallbacks(l1Fallback *L1, l2Fallback *L2, seniorFallback *Senior) *Chain {
+	c.l1Fallback = l1Fallback
+	c.l2Fallback = l2Fallback
+	c.seniorFallback = seniorFallback
+	return c
 }
 
 // Run executes the configured investigation chain for pkg, dispatching
@@ -370,10 +397,41 @@ func (c *Chain) runFull(ctx context.Context, pkg schema.EvidencePackage) (ChainR
 		// attempted, so no skip metric and no SkipReason.
 	}
 
-	seniorRes, seniorErr := c.senior.Run(ctx, pkg, hyp, ver)
+	seniorRes, seniorErr := c.seniorWithRetryFallback(ctx, pkg, hyp, ver)
 	result.Senior = seniorRes
 	if seniorErr != nil {
-		return result, fmt.Errorf("chain aborted at Senior: %w", seniorErr)
+		// A deterministic precondition (no citable events) still aborts:
+		// there is nothing to assess.
+		if isPrecondition(seniorErr) {
+			return result, fmt.Errorf("chain aborted at Senior: %w", seniorErr)
+		}
+		// Story 3.10 BI-4 (AC4): the Senior's primary+fallback exhausted
+		// (provider unavailable or schema violation after retries). Rather
+		// than abort the chain, emit a degraded assessment marked
+		// llm_unavailable with llm_capped_confidence 0 so the FSM proceeds
+		// on the deterministic ThreatScore only (the LLM term folds to 0 in
+		// Story 3.11). GuardCappedConfidence still holds (0 <= cap).
+		available := []string{}
+		if l1err == nil {
+			available = append(available, "l1")
+		}
+		if result.L2 != nil && ver != nil {
+			available = append(available, "l2")
+		}
+		degraded := schema.ThreatAssessment{
+			Mode:                schema.ModeLLM,
+			LLMUnavailable:      true,
+			RawConfidence:       0,
+			LLMCappedConfidence: 0,
+			AgentsAvailable:     available,
+		}
+		if err := GuardCappedConfidence(&degraded, c.senior.ScoreCap(), c.capViolations); err != nil {
+			return result, err
+		}
+		result.Assessment = degraded
+		c.log.Warn("investigation chain: Senior unavailable after retry+fallback; degraded to deterministic-only assessment",
+			"package_id", pkg.PackageID, "err", seniorErr)
+		return result, nil
 	}
 
 	scoreCap := c.senior.ScoreCap()

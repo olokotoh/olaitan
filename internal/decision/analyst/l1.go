@@ -199,6 +199,10 @@ type L1 struct {
 // boundary role's cap (Story 3.8 BI-5; mirrors Senior.ScoreCap).
 func (a *L1) ScoreCap() int { return a.provider.ScoreCap() }
 
+// ProviderName exposes the L1 provider's metric label (e.g. "claude") for
+// the Story 3.10 olaitan_llm_fallback_total{from_provider,to_provider}.
+func (a *L1) ProviderName() string { return a.provider.Name() }
+
 // NewL1 builds an L1 runner on top of an already-constructed provider
 // (per-role provider selection is Story 3.8). It registers (or re-uses)
 // the decision-outcome metric family on reg.

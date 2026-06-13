@@ -56,9 +56,22 @@ func TestThreatAssessmentPre37WireFormUnchanged(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 	got := string(data)
-	for _, absent := range []string{"noted_disagreements", "raw_confidence", "llm_capped_confidence", "agents_available"} {
+	for _, absent := range []string{"noted_disagreements", "raw_confidence", "llm_capped_confidence", "agents_available", "llm_unavailable"} {
 		if strings.Contains(got, absent) {
-			t.Errorf("zero-value Story 3.7 field %s rendered into JSON: %s", absent, got)
+			t.Errorf("zero-value additive field %s rendered into JSON: %s", absent, got)
 		}
+	}
+}
+
+// TestThreatAssessmentLLMUnavailableWireForm pins the Story 3.10 BI-4
+// additive field: false omits the key (byte-compat), true renders it.
+func TestThreatAssessmentLLMUnavailableWireForm(t *testing.T) {
+	off, _ := json.Marshal(ThreatAssessment{Mode: ModeLLM})
+	if strings.Contains(string(off), "llm_unavailable") {
+		t.Errorf("false LLMUnavailable must omit the key, got %s", off)
+	}
+	on, _ := json.Marshal(ThreatAssessment{Mode: ModeLLM, LLMUnavailable: true})
+	if !strings.Contains(string(on), "\"llm_unavailable\":true") {
+		t.Errorf("true LLMUnavailable must render, got %s", on)
 	}
 }
