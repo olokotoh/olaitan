@@ -66,9 +66,19 @@ func CapConfidence(raw, scoreCap int) int {
 // and refuses with ErrCapViolation. The orchestrator calls it as the
 // final gate before returning an assessment; on the normal path it
 // passes by construction.
+//
+// A non-positive scoreCap is clamped to 0 so the guard agrees with
+// CapConfidence on the effective cap (Story 3.7 round-2 review): without
+// this, a negative cap would make a legitimately-capped (>=0) confidence
+// trip a spurious violation, misattributing a provider misconfiguration
+// to "a code path bypassed the cap arithmetic" (capViolationMetricHelp).
+// Real violations on positive caps are unaffected.
 func GuardCappedConfidence(a *schema.ThreatAssessment, scoreCap int, vec *prometheus.CounterVec) error {
 	if a == nil {
 		return errors.New("analyst: nil assessment")
+	}
+	if scoreCap < 0 {
+		scoreCap = 0
 	}
 	if a.LLMCappedConfidence > scoreCap {
 		if vec != nil {

@@ -136,6 +136,16 @@ func TestGuardCappedConfidence(t *testing.T) {
 	if got := capViolations(t, reg); got != 1 {
 		t.Errorf("violations = %v, want 1", got)
 	}
+	// A non-positive cap clamps to 0 (mirrors CapConfidence): a
+	// compliant capped=0 assessment must not trip a spurious violation
+	// (Story 3.7 round-2). Without the clamp, 0 > -5 would fire.
+	zeroCapped := &schema.ThreatAssessment{LLMCappedConfidence: 0}
+	if err := GuardCappedConfidence(zeroCapped, -5, vec); err != nil {
+		t.Fatalf("negative cap with capped=0 should pass: %v", err)
+	}
+	if got := capViolations(t, reg); got != 1 {
+		t.Errorf("violations = %v, want 1 (negative cap must not increment)", got)
+	}
 	if err := GuardCappedConfidence(nil, 35, vec); err == nil {
 		t.Error("nil assessment: err = nil, want error")
 	}
