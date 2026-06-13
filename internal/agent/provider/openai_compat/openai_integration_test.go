@@ -197,6 +197,35 @@ func TestAnalyseSuccessSingleAttempt(t *testing.T) {
 	if v, _ := counterValue(t, reg, "openai", "l1", provider.StatusSuccess); v != 1 {
 		t.Errorf("metric {openai,l1,success} = %v, want 1", v)
 	}
+	// Story 3.15 (FR50): the call observed one latency sample.
+	if n := durationSampleCount(t, reg, "openai", "l1"); n != 1 {
+		t.Errorf("olaitan_llm_call_duration_seconds{openai,l1} count = %d, want 1", n)
+	}
+}
+
+// durationSampleCount returns the olaitan_llm_call_duration_seconds histogram
+// observation count for {provider,role} (Story 3.15).
+func durationSampleCount(t *testing.T, reg *metrics.Registry, prov, role string) uint64 {
+	t.Helper()
+	mfs, err := reg.Gatherer().Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != provider.CallDurationMetricName {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			if labels["provider"] == prov && labels["role"] == role {
+				return m.GetHistogram().GetSampleCount()
+			}
+		}
+	}
+	return 0
 }
 
 func TestAnalyseWirePayloadContract(t *testing.T) {

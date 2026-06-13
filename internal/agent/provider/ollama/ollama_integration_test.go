@@ -383,6 +383,12 @@ func TestAnalyseRoleTimeoutRecordsTimeoutStatus(t *testing.T) {
 	if v, _ := counterValue(t, reg, "ollama", "l1", provider.StatusTransient); v != 0 {
 		t.Errorf("role-deadline expiry recorded transient, want timeout only")
 	}
+	// Story 3.15 (FR50): the latency histogram counts FAILED calls too -- a
+	// timed-out call still observes its duration (the defer fires on every
+	// reached-defer path, not just success).
+	if n := durationSampleCount(t, reg, "ollama", "l1"); n != 1 {
+		t.Errorf("timed-out call must still observe a duration sample, got count %d", n)
+	}
 }
 
 func TestAnalyseParentCancellationIsNotTimeout(t *testing.T) {
