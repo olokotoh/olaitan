@@ -88,6 +88,37 @@ func TestEvidence(t *testing.T) {
 	}
 }
 
+func TestInvestigationSubjects(t *testing.T) {
+	l1, err := subjects.InvestigationL1("pkg-42")
+	if err != nil {
+		t.Fatalf("InvestigationL1: %v", err)
+	}
+	if l1 != "INVESTIGATIONS.pkg-42.l1" {
+		t.Errorf("InvestigationL1 = %q", l1)
+	}
+	l2, err := subjects.InvestigationL2("pkg-42")
+	if err != nil {
+		t.Fatalf("InvestigationL2: %v", err)
+	}
+	if l2 != "INVESTIGATIONS.pkg-42.l2" {
+		t.Errorf("InvestigationL2 = %q", l2)
+	}
+	// Both fall under INVESTIGATIONS.> (the stream filter).
+	if !strings.HasPrefix(l1, subjects.InvestigationPrefix) || !strings.HasPrefix(l2, subjects.InvestigationPrefix) {
+		t.Errorf("subjects not under %q", subjects.InvestigationPrefix)
+	}
+	// A hostile package_id (dot, wildcard, whitespace, empty) is rejected
+	// so it cannot inject extra subject tokens.
+	for _, bad := range []string{"", "a.b", "a*", "a>", "a b", "a\t"} {
+		if _, err := subjects.InvestigationL1(bad); err == nil {
+			t.Errorf("InvestigationL1(%q): expected error", bad)
+		}
+		if _, err := subjects.InvestigationL2(bad); err == nil {
+			t.Errorf("InvestigationL2(%q): expected error", bad)
+		}
+	}
+}
+
 func TestEvidencePackagesConstant(t *testing.T) {
 	got, err := subjects.Evidence("packages")
 	if err != nil {

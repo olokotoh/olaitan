@@ -55,3 +55,6 @@ spikes/sigma-parser/custom/custom
 # Root build binary — `go build ./cmd/olaitan` from the repo root drops an
 # `olaitan` ELF here. The binary is never committed; the source is cmd/olaitan/.
 /olaitan
+
+# Claude Code transient agent worktrees
+.claude/worktrees/

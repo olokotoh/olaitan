@@ -748,6 +748,42 @@ func TestStreamConfigsWithAuditOverridesMaxAge(t *testing.T) {
 	}
 }
 
+// TestInvestigationsStream pins Story 3.9 (AC4): the INVESTIGATIONS stream
+// covers the l1/l2 checkpoint subjects, defaults to 6h retention, is
+// LimitsPolicy/FileStorage, and honours the operator retention override.
+func TestInvestigationsStream(t *testing.T) {
+	// The stream binds the wildcard filter INVESTIGATIONS.> which captures
+	// every INVESTIGATIONS.{id}.{l1,l2} checkpoint subject.
+	wildcard := subjects.InvestigationPrefix + ">"
+	cfg := findStreamFor(t, natsclient.StreamConfigs(), wildcard)
+	if cfg.Name != "INVESTIGATIONS" {
+		t.Errorf("%s covered by %q, want INVESTIGATIONS", wildcard, cfg.Name)
+	}
+	if cfg.MaxAge != 6*time.Hour {
+		t.Errorf("INVESTIGATIONS MaxAge = %s, want 6h default", cfg.MaxAge)
+	}
+	if cfg.Retention != jetstream.LimitsPolicy || cfg.Storage != jetstream.FileStorage {
+		t.Errorf("INVESTIGATIONS retention/storage = %v/%v, want Limits/File", cfg.Retention, cfg.Storage)
+	}
+	// One checkpoint per subject: GetLastMsgForSubject is the canonical
+	// last-value read and a post-dedup-window re-publish cannot accumulate.
+	if cfg.MaxMsgsPerSubject != 1 {
+		t.Errorf("INVESTIGATIONS MaxMsgsPerSubject = %d, want 1", cfg.MaxMsgsPerSubject)
+	}
+	// Sanity: real checkpoint subjects fall under the wildcard.
+	l1, _ := subjects.InvestigationL1("pkg-x")
+	if !strings.HasPrefix(l1, subjects.InvestigationPrefix) {
+		t.Errorf("%s not under %q", l1, subjects.InvestigationPrefix)
+	}
+	// The operator retention override applies; a zero keeps the 6h default.
+	if got := findStreamFor(t, natsclient.StreamConfigsWithRetention(natsclient.AuditRetention{}, 2*time.Hour), wildcard).MaxAge; got != 2*time.Hour {
+		t.Errorf("override MaxAge = %s, want 2h", got)
+	}
+	if got := findStreamFor(t, natsclient.StreamConfigsWithRetention(natsclient.AuditRetention{}, 0), wildcard).MaxAge; got != 6*time.Hour {
+		t.Errorf("zero override MaxAge = %s, want 6h default", got)
+	}
+}
+
 func TestStreamConfigsDeepCopy(t *testing.T) {
 	a := natsclient.StreamConfigs()
 	b := natsclient.StreamConfigs()

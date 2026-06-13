@@ -124,6 +124,7 @@ type Chain struct {
 	l2            *L2
 	senior        *Senior
 	mode          string
+	checkpoints   CheckpointStore
 	skips         *prometheus.CounterVec
 	capViolations *prometheus.CounterVec
 	log           *slog.Logger
@@ -133,6 +134,56 @@ type Chain struct {
 // ChainModeFull / ChainModeL1L2 / ChainModeL1Only). The consumer uses it
 // as the metric label and the audit mode (Story 3.8 BI-5/BI-8).
 func (c *Chain) Mode() string { return c.mode }
+
+// WithCheckpoints attaches a CheckpointStore so the chain checkpoints L1/L2
+// outputs and resumes from them on a controller restart (Story 3.9). A nil
+// store (the default) keeps the Story 3.8 behaviour byte-identical: no
+// Save/Load calls. Returns the chain for fluent wiring.
+func (c *Chain) WithCheckpoints(store CheckpointStore) *Chain {
+	c.checkpoints = store
+	return c
+}
+
+// l1Step runs L1, or resumes it from a checkpoint when one exists (Story
+// 3.9 BI-4/BI-5). On a checkpoint hit the L1 runner is NOT invoked and a
+// minimal success L1Result is reconstructed; on a miss L1 runs and a
+// success is checkpointed. A Load error or a Save failure is logged and
+// the step proceeds (best-effort durability, never a correctness gate).
+func (c *Chain) l1Step(ctx context.Context, pkg schema.EvidencePackage) (L1Result, error) {
+	if c.checkpoints != nil {
+		if hyp, ok, err := c.checkpoints.LoadL1(ctx, pkg.PackageID); err != nil {
+			c.log.Warn("checkpoint LoadL1 failed; re-running L1", "err", err, "package_id", pkg.PackageID)
+		} else if ok {
+			return L1Result{Hypothesis: hyp, Status: StatusSuccess, Resumed: true}, nil
+		}
+	}
+	res, err := c.l1.Run(ctx, pkg)
+	if err == nil && c.checkpoints != nil {
+		if serr := c.checkpoints.SaveL1(ctx, pkg.PackageID, res.Hypothesis); serr != nil {
+			c.log.Warn("checkpoint SaveL1 failed; chain continues", "err", serr, "package_id", pkg.PackageID)
+		}
+	}
+	return res, err
+}
+
+// l2Step runs L2, or resumes it from a checkpoint when one exists (Story
+// 3.9). Same best-effort semantics as l1Step.
+func (c *Chain) l2Step(ctx context.Context, pkg schema.EvidencePackage, hyp schema.L1Hypothesis) (L2Result, error) {
+	if c.checkpoints != nil {
+		if ver, ok, err := c.checkpoints.LoadL2(ctx, pkg.PackageID); err != nil {
+			c.log.Warn("checkpoint LoadL2 failed; re-running L2", "err", err, "package_id", pkg.PackageID)
+		} else if ok {
+			return L2Result{Verification: ver, Status: StatusSuccess, Resumed: true}, nil
+		}
+	}
+	res, err := c.l2.Run(ctx, pkg, hyp)
+	if err == nil && c.checkpoints != nil {
+		if serr := c.checkpoints.SaveL2(ctx, pkg.PackageID, res.Verification); serr != nil {
+			c.log.Warn("checkpoint SaveL2 failed; chain continues", "err", serr, "package_id", pkg.PackageID)
+		}
+	}
+	return res, err
+}
 
 // NewChain builds the chain orchestrator from the role runners. l1 is
 // always required. Deliberate ablation (Story 3.8 AC4) is expressed by
@@ -186,7 +237,7 @@ func (c *Chain) Run(ctx context.Context, pkg schema.EvidencePackage) (ChainResul
 func (c *Chain) runL1Only(ctx context.Context, pkg schema.EvidencePackage) (ChainResult, error) {
 	result := ChainResult{Mode: ChainModeL1Only}
 
-	l1res, l1err := c.l1.Run(ctx, pkg)
+	l1res, l1err := c.l1Step(ctx, pkg)
 	if l1err != nil {
 		if errors.Is(l1err, ErrNoCitableEvents) {
 			return result, fmt.Errorf("chain aborted before L1: %w", l1err)
@@ -221,7 +272,7 @@ func (c *Chain) runL1Only(ctx context.Context, pkg schema.EvidencePackage) (Chai
 func (c *Chain) runL1L2(ctx context.Context, pkg schema.EvidencePackage) (ChainResult, error) {
 	result := ChainResult{Mode: ChainModeL1L2}
 
-	l1res, l1err := c.l1.Run(ctx, pkg)
+	l1res, l1err := c.l1Step(ctx, pkg)
 	if l1err != nil {
 		if errors.Is(l1err, ErrNoCitableEvents) {
 			return result, fmt.Errorf("chain aborted before L1: %w", l1err)
@@ -231,7 +282,7 @@ func (c *Chain) runL1L2(ctx context.Context, pkg schema.EvidencePackage) (ChainR
 	}
 	result.L1 = &l1res
 
-	l2res, l2err := c.l2.Run(ctx, pkg, l1res.Hypothesis)
+	l2res, l2err := c.l2Step(ctx, pkg, l1res.Hypothesis)
 	result.L2 = &l2res
 
 	var (
@@ -286,7 +337,7 @@ func (c *Chain) runFull(ctx context.Context, pkg schema.EvidencePackage) (ChainR
 	var result ChainResult
 	result.Mode = ChainModeFull
 
-	l1res, l1err := c.l1.Run(ctx, pkg)
+	l1res, l1err := c.l1Step(ctx, pkg)
 	result.L1 = &l1res
 
 	var hyp *schema.L1Hypothesis
@@ -310,7 +361,7 @@ func (c *Chain) runFull(ctx context.Context, pkg schema.EvidencePackage) (ChainR
 		}
 	} else {
 		hyp = &l1res.Hypothesis
-		l2res, l2err := c.l2.Run(ctx, pkg, l1res.Hypothesis)
+		l2res, l2err := c.l2Step(ctx, pkg, l1res.Hypothesis)
 		result.L2 = &l2res
 		if l2err == nil {
 			ver = &l2res.Verification

@@ -163,3 +163,30 @@ func Evidence(kind string) (string, error) {
 	}
 	return EvidencePrefix + kind, nil
 }
+
+// InvestigationPrefix is the dotted-UPPER published-contract prefix for the
+// per-investigation checkpoint subjects (architecture.md:235/447/618). The
+// L1Hypothesis and L2Verification of an in-flight chain are checkpointed
+// under INVESTIGATIONS.{package_id}.{l1,l2} so a controller restart can
+// resume from the last completed step (Story 3.9 FR29).
+const InvestigationPrefix = "INVESTIGATIONS."
+
+// InvestigationL1 returns the checkpoint subject for a package's L1
+// hypothesis: INVESTIGATIONS.{packageID}.l1 (architecture.md:618). packageID
+// is a subject TOKEN, so it is validated (no dots, wildcards, or whitespace)
+// to prevent a hostile package_id from injecting extra subject tokens.
+func InvestigationL1(packageID string) (string, error) {
+	if err := validateToken(packageID); err != nil {
+		return "", fmt.Errorf("subjects: investigation l1 package_id: %w", err)
+	}
+	return InvestigationPrefix + packageID + ".l1", nil
+}
+
+// InvestigationL2 returns the checkpoint subject for a package's L2
+// verification: INVESTIGATIONS.{packageID}.l2.
+func InvestigationL2(packageID string) (string, error) {
+	if err := validateToken(packageID); err != nil {
+		return "", fmt.Errorf("subjects: investigation l2 package_id: %w", err)
+	}
+	return InvestigationPrefix + packageID + ".l2", nil
+}

@@ -175,6 +175,13 @@ type L1Result struct {
 	// path (ErrNoCitableEvents), where no provider call was made and
 	// nothing was recorded.
 	Status string
+	// Resumed marks a step reconstructed from a Story 3.9 checkpoint
+	// rather than a fresh provider call: on a checkpoint hit l1Step
+	// returns a minimal success record (Hypothesis + StatusSuccess) with
+	// Resumed=true, so the ChainResult audit trail can distinguish a
+	// resumed step from a re-run one (BI-4). No provider call was made,
+	// so Provider/Model/Latency are zero.
+	Resumed bool
 }
 
 // L1 is the first-pass triage analyst runner (FR20/FR21). Construct

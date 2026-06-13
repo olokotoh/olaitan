@@ -911,6 +911,11 @@ analyst:
   l2_enabled: true
   senior_enabled: true
 
+  # Story 3.9 (FR29): INVESTIGATIONS checkpoint-stream retention (a Go
+  # duration like "6h"). Empty keeps the file-side 6h default; a non-empty
+  # value is bridged into the rendered config.
+  checkpoint_retention: ""
+
   # Story 3.4 (FR48): the local (Ollama) provider's endpoint and model.
   # Empty values keep the file-side defaults from config/olaitan.yaml
   # (endpoint http://ollama:11434, model gemma:2b); non-empty values are

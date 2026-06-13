@@ -676,6 +676,14 @@ data:
     {{- $cfg = regexReplaceAll $pAbl $cfg (printf "${1}%s" (toString $v)) }}
     {{- end }}
     {{- end }}
+    {{- /* Story 3.9 (FR29): bridge analyst.checkpoint_retention (a Go
+           duration string) over the file-side 6h default. `with` skips an
+           empty value; the anchor is the unique 2-space-indented key. */ -}}
+    {{- with $analystVals.checkpoint_retention }}
+    {{- $pCkRet := "(\\n  )checkpoint_retention:[^\\n]*" -}}
+    {{- if not (mustRegexFind $pCkRet $cfg) }}{{- fail (printf "helm bridge: overlay anchor for analyst.checkpoint_retention not found (pattern %q)" $pCkRet) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pCkRet $cfg (printf "${1}checkpoint_retention: %s" (replace "$" "$$" (printf "%q" (toString .)))) }}
+    {{- end }}
     {{- /* AC2: under evaluation.config=F the rendered config must keep
            only the Falco sensor adapter active. Disable audit /
            containerd / calico source adapters and the posture
