@@ -163,16 +163,20 @@ jobs:
           # ghcr.io/olokotoh/olaitan would resolve to a registry path that
           # is not present on the node and `pullPolicy: Never` would then
           # fail with ErrImageNeverPull.
-          # nats.streamMaxBytesOverride=1073741824 (1 GiB per stream)
+          # nats.streamMaxBytesOverride=536870912 (512 MiB per stream)
           # caps the streamConfigs MaxBytes for the CI kind cluster,
           # whose NATS PVC backing (10Gi) is smaller than the
           # production streamConfigs sum (160 GiB across EVENTS /
           # EVENTS_RAW / EVIDENCE). Story 1.19 D6: this replaces the
           # earlier `nats.config.jetstream.fileStore.maxSize=200GB`
           # band-aid which lied to JetStream about actual disk
-          # capacity. Actual on-disk usage during the smoke test stays
-          # well under 1 GiB per stream. Production deployments leave
-          # this empty and size nats.persistence to the configured sum.
+          # capacity. The cap MUST keep (stream count x cap) under the
+          # 10Gi PVC: Story 3.9 added the 11th stream (INVESTIGATIONS),
+          # so the per-stream cap dropped 1 GiB -> 512 MiB (11 x 512 MiB
+          # = 5.5 GiB, comfortably under 10Gi with headroom for further
+          # streams). Actual on-disk usage during the smoke test stays
+          # well under the cap. Production deployments leave this empty
+          # and size nats.persistence to the configured sum.
           # endpoints.falco overridden to a tcp:// target: with the
           # default unix:///run/falco/falco.sock the collector DaemonSet
           # mounts /run/falco from the host as a `type: Directory`
@@ -193,7 +197,7 @@ jobs:
             --set secrets.redisPassword=ci-test \
             --set falco.enabled=false \
             --set endpoints.falco=tcp://127.0.0.1:0 \
-            --set nats.streamMaxBytesOverride=1073741824 \
+            --set nats.streamMaxBytesOverride=536870912 \
             --wait --timeout 5m
 
       - name: Run smoke test
