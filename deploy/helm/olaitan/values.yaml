@@ -943,6 +943,21 @@ analyst:
     enabled: true
     mountPath: /etc/olaitan/prompts
 
+  # Story 3.16: the external LLM API endpoint + model for the "api" provider
+  # (claude / openai_compat). Empty endpoint/model keep the file-side defaults
+  # (the provider's vendor default); a non-empty value is bridged into the
+  # rendered olaitan.yaml. Set analyst.api.endpoint to point the openai_compat
+  # provider at a custom or in-cluster OpenAI-compatible endpoint (e.g. the
+  # RSLT-full e2e fake-LLM fixture, http://fake-llm:8080/v1) -- without this
+  # the provider would dial the public vendor endpoint. apiKeySecret NAMES the
+  # environment variable the projected llm-api-key Secret value lands in (the
+  # analyst reads the key from that env var); it must match the config's
+  # analyst.api.api_key_secret (default olaitan-llm).
+  api:
+    endpoint: ""
+    model: ""
+    apiKeySecret: olaitan-llm
+
   # Story 3.4 (FR48): the local (Ollama) provider's endpoint and model.
   # Empty values keep the file-side defaults from config/olaitan.yaml
   # (endpoint http://ollama:11434, model gemma:2b); non-empty values are

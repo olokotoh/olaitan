@@ -642,6 +642,26 @@ data:
     {{- if not (mustRegexFind $pLocalModel $cfg) }}{{- fail (printf "helm bridge: overlay anchor for analyst.local.model not found (pattern %q)" $pLocalModel) }}{{- end }}
     {{- $cfg = regexReplaceAll $pLocalModel $cfg (printf "${1}model: %s" (replace "$" "$$" (printf "%q" (toString .)))) }}
     {{- end }}
+    {{- /* Story 3.16: bridge analyst.api.{endpoint,model} for the "api"
+           provider (claude / openai_compat). Mirrors the local.* bridge; the
+           openai_compat provider reads endpoint as its BaseURL, so a Helm-set
+           endpoint (e.g. the in-cluster fake-LLM) is never a silent no-op. */ -}}
+    {{- $apiVals := default (dict) $analystVals.api -}}
+    {{- with $apiVals.endpoint }}
+    {{- $pAPIEndpoint := "(\\n  api:[[:space:]]*\\n    )endpoint:[^\\n]*" -}}
+    {{- if not (mustRegexFind $pAPIEndpoint $cfg) }}{{- fail (printf "helm bridge: overlay anchor for analyst.api.endpoint not found (pattern %q)" $pAPIEndpoint) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pAPIEndpoint $cfg (printf "${1}endpoint: %s" (replace "$" "$$" (printf "%q" (toString .)))) }}
+    {{- end }}
+    {{- with $apiVals.model }}
+    {{- $pAPIModel := "(\\n  api:[[:space:]]*\\n    endpoint:[^\\n]*\\n    )model:[^\\n]*" -}}
+    {{- if not (mustRegexFind $pAPIModel $cfg) }}{{- fail (printf "helm bridge: overlay anchor for analyst.api.model not found (pattern %q)" $pAPIModel) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pAPIModel $cfg (printf "${1}model: %s" (replace "$" "$$" (printf "%q" (toString .)))) }}
+    {{- end }}
+    {{- with $apiVals.apiKeySecret }}
+    {{- $pAPIKeySecret := "(\\n    )api_key_secret:[^\\n]*" -}}
+    {{- if not (mustRegexFind $pAPIKeySecret $cfg) }}{{- fail (printf "helm bridge: overlay anchor for analyst.api.api_key_secret not found (pattern %q)" $pAPIKeySecret) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pAPIKeySecret $cfg (printf "${1}api_key_secret: %s" (replace "$" "$$" (printf "%q" (toString .)))) }}
+    {{- end }}
     {{- /* `with` would skip a literal 0 (falsy), silently rendering
            the file-side 35 where the operator configured zero trust
            (round-2 review); an explicit nil check honours 0, and a

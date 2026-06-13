@@ -3589,6 +3589,48 @@ func TestOllamaModeRoutesLocalWithNetworkPolicy(t *testing.T) {
 	}
 }
 
+// loadEmbedded renders, extracts, and config.Loads the embedded config in
+// one step (Story 3.16 helper).
+func loadEmbedded(t *testing.T, sets []string) *config.Config {
+	t.Helper()
+	tmp := filepath.Join(t.TempDir(), "olaitan.yaml")
+	if err := os.WriteFile(tmp, []byte(extractEmbeddedConfigYAML(t, helmTemplate(t, sets))), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := configLoad(t, tmp)
+	if err != nil {
+		t.Fatalf("config.Load rejected the render: %v", err)
+	}
+	return cfg
+}
+
+// TestAnalystAPIEndpointAndKeyWiring (Story 3.16) pins the LLM-tier
+// deployability gap round-1 review caught: the api provider must get both its
+// endpoint (so it dials the configured server, not the vendor default) and
+// its API key (projected from the Secret into the env var the analyst reads).
+func TestAnalystAPIEndpointAndKeyWiring(t *testing.T) {
+	rendered := helmTemplate(t, []string{"secrets.llmApiKey=k"})
+	if !strings.Contains(rendered, "name: olaitan-llm") || !strings.Contains(rendered, "key: llm-api-key") {
+		t.Errorf("aggregator must project the LLM key Secret into the olaitan-llm env var\n%s", snippet(rendered, "llm-api-key"))
+	}
+	cfg := loadEmbedded(t, []string{"analyst.api.endpoint=http://fake-llm:8080/v1", "analyst.api.model=fake"})
+	if cfg.Analyst.API.Endpoint != "http://fake-llm:8080/v1" {
+		t.Errorf("analyst.api.endpoint = %q, want the bridged value", cfg.Analyst.API.Endpoint)
+	}
+	if cfg.Analyst.API.Model != "fake" {
+		t.Errorf("analyst.api.model = %q, want fake", cfg.Analyst.API.Model)
+	}
+	// A custom apiKeySecret renames the env var AND the config key in lockstep.
+	renamed := helmTemplate(t, []string{"analyst.api.apiKeySecret=MY_LLM_KEY", "secrets.llmApiKey=k"})
+	if !strings.Contains(renamed, "name: MY_LLM_KEY") {
+		t.Errorf("custom apiKeySecret must rename the env var\n%s", snippet(renamed, "llm-api-key"))
+	}
+	cfg2 := loadEmbedded(t, []string{"analyst.api.apiKeySecret=MY_LLM_KEY"})
+	if cfg2.Analyst.API.APIKeySecret != "MY_LLM_KEY" {
+		t.Errorf("analyst.api.api_key_secret = %q, want MY_LLM_KEY (env name + config must agree)", cfg2.Analyst.API.APIKeySecret)
+	}
+}
+
 // TestAnalystPerRoleBridge (Story 3.8) pins the per-role routing +
 // ablation toggle bridges: each Helm value reaches the rendered config
 // and round-trips through config.Load, an explicit l2_enabled: false is
