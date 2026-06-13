@@ -64,9 +64,11 @@ const OverridesApplied = "OVERRIDES.applied"
 // (docs/schemas/audit/) and rides a dedicated LimitsPolicy JetStream stream
 // (append-only by retention: transitions 90d, overrides/policies 365d). They
 // follow the architecture's literal dotted UPPER published-contract naming,
-// matching the OverridesApplied precedent above. The remaining sibling SIEM
-// subject AUDIT.assessments (the LLM-verdict audit subject, a separate Epic 3
-// story) is NOT defined here.
+// matching the OverridesApplied precedent above. The sibling SIEM subject
+// AUDIT.assessments (the LLM-verdict audit subject) is defined below: Story
+// 3.8 ships a minimal audit.assessments.v1 payload so the investigation
+// chain's ablation is auditable (AC4); the broader audit pipeline is Story
+// 3.14, which may extend the payload.
 //
 // Story 3.1: AuditRedactions is the fifth append-only SIEM audit subject
 // (FR41), carrying one event per redacted field (field_path + reason +
@@ -80,6 +82,10 @@ const (
 	AuditOverrides   = "AUDIT.overrides"
 	AuditPolicies    = "AUDIT.policies"
 	AuditRedactions  = "AUDIT.redactions"
+	// AuditAssessments is the LLM-verdict audit subject (Story 3.8 AC4):
+	// one event per investigation-chain run, carrying which roles ran so
+	// the ablation is auditable. Story 3.14 owns the broader pipeline.
+	AuditAssessments = "AUDIT.assessments"
 )
 
 // EvidencePackages is the Ring-2 EvidencePackage subject.

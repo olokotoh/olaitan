@@ -3447,6 +3447,74 @@ func TestAnalystLocalBridge(t *testing.T) {
 		"unset analyst.local.model must keep the file-side default")
 }
 
+// TestAnalystPerRoleBridge (Story 3.8) pins the per-role routing +
+// ablation toggle bridges: each Helm value reaches the rendered config
+// and round-trips through config.Load, an explicit l2_enabled: false is
+// not swallowed, and the unset defaults stay byte-stable.
+func TestAnalystPerRoleBridge(t *testing.T) {
+	overridden := helmTemplate(t, []string{
+		"analyst.provider=api",
+		"analyst.l1_provider=openai",
+		"analyst.l1_model=gpt-4o-mini",
+		"analyst.l2_provider=claude",
+		"analyst.l2_model=claude-haiku-4-5",
+		"analyst.senior_provider=claude",
+		"analyst.senior_model=claude-opus-4-8",
+		"analyst.senior_enabled=false",
+	})
+	embedded := extractEmbeddedConfigYAML(t, overridden)
+	tmp := filepath.Join(t.TempDir(), "olaitan.yaml")
+	if err := os.WriteFile(tmp, []byte(embedded), 0o600); err != nil {
+		t.Fatalf("write tmp config: %v", err)
+	}
+	cfg, err := configLoad(t, tmp)
+	if err != nil {
+		t.Fatalf("bridged per-role config rejected by config.Load: %v", err)
+	}
+	if cfg.Analyst.L1Provider != "openai" || cfg.Analyst.L1Model != "gpt-4o-mini" {
+		t.Errorf("l1 = %q/%q, want openai/gpt-4o-mini", cfg.Analyst.L1Provider, cfg.Analyst.L1Model)
+	}
+	if cfg.Analyst.L2Provider != "claude" || cfg.Analyst.SeniorModel != "claude-opus-4-8" {
+		t.Errorf("l2.provider/senior.model = %q/%q", cfg.Analyst.L2Provider, cfg.Analyst.SeniorModel)
+	}
+	if cfg.Analyst.SeniorEnabled == nil || *cfg.Analyst.SeniorEnabled {
+		t.Errorf("senior_enabled: false must round-trip to a non-nil false, got %v", cfg.Analyst.SeniorEnabled)
+	}
+	// L1+L2 ablation: senior off, L2 on.
+	if !cfg.Analyst.L2EnabledOrDefault() || cfg.Analyst.SeniorEnabledOrDefault() {
+		t.Error("expected L1+L2 ablation (L2 on, Senior off)")
+	}
+
+	// L1-only ablation toggle.
+	l1Only := helmTemplate(t, []string{"analyst.provider=api", "analyst.l2_enabled=false"})
+	embL1 := extractEmbeddedConfigYAML(t, l1Only)
+	tmp2 := filepath.Join(t.TempDir(), "olaitan.yaml")
+	if err := os.WriteFile(tmp2, []byte(embL1), 0o600); err != nil {
+		t.Fatalf("write tmp config: %v", err)
+	}
+	cfg2, err := configLoad(t, tmp2)
+	if err != nil {
+		t.Fatalf("l2_enabled=false config rejected: %v", err)
+	}
+	if cfg2.Analyst.L2EnabledOrDefault() || cfg2.Analyst.SeniorEnabledOrDefault() {
+		t.Error("l2_enabled=false must be L1-only (both L2 and Senior off)")
+	}
+
+	// Unset per-role keys keep the file-side defaults and load cleanly.
+	embDefaults := extractEmbeddedConfigYAML(t, helmTemplate(t, nil))
+	tmp3 := filepath.Join(t.TempDir(), "olaitan.yaml")
+	if err := os.WriteFile(tmp3, []byte(embDefaults), 0o600); err != nil {
+		t.Fatalf("write tmp config: %v", err)
+	}
+	cfgD, err := configLoad(t, tmp3)
+	if err != nil {
+		t.Fatalf("default config rejected: %v", err)
+	}
+	if cfgD.Analyst.L1Provider != "" || !cfgD.Analyst.L2EnabledOrDefault() || !cfgD.Analyst.SeniorEnabledOrDefault() {
+		t.Errorf("defaults drifted: l1_provider=%q l2=%v senior=%v", cfgD.Analyst.L1Provider, cfgD.Analyst.L2EnabledOrDefault(), cfgD.Analyst.SeniorEnabledOrDefault())
+	}
+}
+
 // TestValuesAirgappedOverlay renders with the FR48 reference overlay
 // and asserts the complete air-gapped posture: ollama surface present,
 // provider local with the overlay's endpoint/model bridged, and no

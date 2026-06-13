@@ -890,6 +890,27 @@ evaluation:
 analyst:
   provider: "none"
 
+  # Story 3.8 (FR25): per-role provider routing. Each *_provider is a
+  # concrete family {claude, openai, ollama} or "" to inherit the
+  # top-level provider mapping (api -> claude, local -> ollama). Per-role
+  # *_model lets a chain mix models (e.g. Haiku for L1/L2, Opus for
+  # Senior). Empty values keep the file-side defaults. The per-provider
+  # trust-ladder caps are enforced in code (claude 35 / openai 30 /
+  # ollama 25, DW3.7-1): an openai-routed role caps at 30, never the
+  # claude-tier 35, regardless of analyst.score_cap.
+  l1_provider: ""
+  l1_model: ""
+  l2_provider: ""
+  l2_model: ""
+  senior_provider: ""
+  senior_model: ""
+
+  # Story 3.8 (FR53): RSLT ablation toggles. l2_enabled: false = L1-only
+  # (Senior also off); senior_enabled: false = L1+L2. Both default true.
+  # Story 3.16 sets these for the RSL / RSLT-full / ablation mode presets.
+  l2_enabled: true
+  senior_enabled: true
+
   # Story 3.4 (FR48): the local (Ollama) provider's endpoint and model.
   # Empty values keep the file-side defaults from config/olaitan.yaml
   # (endpoint http://ollama:11434, model gemma:2b); non-empty values are

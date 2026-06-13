@@ -164,6 +164,15 @@ error rather than silent runtime trap).
 {{- if not (has $ap $validProviders) -}}
 {{- fail (printf "analyst.provider must be one of [\"none\", \"api\", \"local\"] (got %q, normalised to %q). \"api\" / \"local\" are reserved for Epic 3 Story 3.x; use \"none\" for the Epic 1/2 RS evaluation arm." (default "none" $analyst.provider) $ap) -}}
 {{- end -}}
+{{- /* Story 3.8 (FR25): per-role providers are a concrete family or "" to
+       inherit. Validate each, agreeing with the Go-side config.validate. */ -}}
+{{- $validRole := list "" "claude" "openai" "ollama" "none" -}}
+{{- range $field := list "l1_provider" "l2_provider" "senior_provider" -}}
+{{- $rp := lower (default "" (index $analyst $field)) -}}
+{{- if not (has $rp $validRole) -}}
+{{- fail (printf "analyst.%s must be one of [\"\", \"claude\", \"openai\", \"ollama\", \"none\"] (got %q)" $field $rp) -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 
 {{/*

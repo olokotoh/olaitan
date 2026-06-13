@@ -686,6 +686,8 @@ func TestStreamConfigsCoversAuditSubjects(t *testing.T) {
 		{subjects.AuditPolicies, "AUDIT_POLICIES", 365 * 24 * time.Hour},
 		// Story 3.1: the fifth SIEM audit subject, 365 d default (BI-3.2).
 		{subjects.AuditRedactions, "AUDIT_REDACTIONS", 365 * 24 * time.Hour},
+		// Story 3.8: the LLM-verdict audit subject, 365 d default.
+		{subjects.AuditAssessments, "AUDIT_ASSESSMENTS", 365 * 24 * time.Hour},
 	}
 	for _, c := range cases {
 		cfg := findStreamFor(t, configs, c.subject)
@@ -706,7 +708,7 @@ func TestStreamConfigsCoversAuditSubjects(t *testing.T) {
 // Interest/WorkQueue (which delete on consumer ack and would let a consumer
 // effectively delete audit events). A future regression here fails CI.
 func TestAuditStreamsAreLimitsPolicy(t *testing.T) {
-	for _, subj := range []string{subjects.AuditTransitions, subjects.AuditOverrides, subjects.AuditPolicies, subjects.AuditRedactions} {
+	for _, subj := range []string{subjects.AuditTransitions, subjects.AuditOverrides, subjects.AuditPolicies, subjects.AuditRedactions, subjects.AuditAssessments} {
 		cfg := findStreamFor(t, natsclient.StreamConfigs(), subj)
 		if cfg.Retention != jetstream.LimitsPolicy {
 			t.Errorf("%s: Retention = %v, want LimitsPolicy (NFR16 append-only)", cfg.Name, cfg.Retention)

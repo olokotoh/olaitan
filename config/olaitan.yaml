@@ -271,6 +271,20 @@ analyst:
     endpoint: "http://ollama:11434"
     model: "gemma:2b"
   score_cap: 35
+  # Story 3.8 (FR25/FR53): per-role provider routing + ablation toggles.
+  # Each *_provider is a concrete family {claude, openai, ollama, none} or
+  # "" to inherit the top-level provider mapping (api -> claude, local ->
+  # ollama). *_enabled flags drive the RSLT ablation cells. Empty/default
+  # values keep the full claude chain; configmap.yaml bridges Helm values
+  # over these (the same C11 overlay analyst.provider uses).
+  l1_provider: ""
+  l1_model: ""
+  l2_provider: ""
+  l2_model: ""
+  l2_enabled: true
+  senior_provider: ""
+  senior_model: ""
+  senior_enabled: true
   timeout: 10s
   chain:
     enabled: false

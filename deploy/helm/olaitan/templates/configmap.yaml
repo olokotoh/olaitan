@@ -653,6 +653,29 @@ data:
     {{- if not (mustRegexFind $pScoreCap $cfg) }}{{- fail (printf "helm bridge: overlay anchor for analyst.score_cap not found (pattern %q)" $pScoreCap) }}{{- end }}
     {{- $cfg = regexReplaceAll $pScoreCap $cfg (printf "${1}%d" (int $analystVals.score_cap)) }}
     {{- end }}
+    {{- /* Story 3.8 (FR25/FR53): bridge per-role routing + ablation
+           toggles. String families/models use `with` (empty keeps the
+           file-side default); the *_enabled bools use the score_cap
+           kindIs-"invalid" nil-check so a literal false is not swallowed.
+           Each anchor is the unique 2-space-indented key in
+           config/olaitan.yaml; $-doubling + toString match the local.*
+           bridges above. */ -}}
+    {{- range $field := list "l1_provider" "l1_model" "l2_provider" "l2_model" "senior_provider" "senior_model" }}
+    {{- with index $analystVals $field }}
+    {{- $pRole := printf "(\\n  )%s:[^\\n]*" $field -}}
+    {{- if not (mustRegexFind $pRole $cfg) }}{{- fail (printf "helm bridge: overlay anchor for analyst.%s not found (pattern %q)" $field $pRole) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pRole $cfg (printf "${1}%s: %s" $field (replace "$" "$$" (printf "%q" (toString .)))) }}
+    {{- end }}
+    {{- end }}
+    {{- range $field := list "l2_enabled" "senior_enabled" }}
+    {{- $v := index $analystVals $field }}
+    {{- if not (kindIs "invalid" $v) }}
+    {{- if not (regexMatch "^(?:true|false)$" (toString $v)) }}{{- fail (printf "analyst.%s must be a boolean (got %q)" $field (toString $v)) }}{{- end }}
+    {{- $pAbl := printf "(\\n  %s:[[:space:]]+)(?:true|false)" $field -}}
+    {{- if not (mustRegexFind $pAbl $cfg) }}{{- fail (printf "helm bridge: overlay anchor for analyst.%s not found (pattern %q)" $field $pAbl) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pAbl $cfg (printf "${1}%s" (toString $v)) }}
+    {{- end }}
+    {{- end }}
     {{- /* AC2: under evaluation.config=F the rendered config must keep
            only the Falco sensor adapter active. Disable audit /
            containerd / calico source adapters and the posture
