@@ -29,6 +29,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -188,11 +189,28 @@ type L1Result struct {
 // with NewL1; issue calls with Run.
 type L1 struct {
 	provider provider.Provider
-	spec     PromptSpec
-	calls    *prometheus.CounterVec
-	log      *slog.Logger
-	schema   *jsonschema.Schema
+	// spec is hot-swappable (Story 3.13): the prompt-store reload
+	// callback calls SetPrompt to swap the ConfigMap-loaded system
+	// prompt and its content-hash Version without rebuilding the chain.
+	// Run loads the current spec at call time, so a reload is picked up
+	// on the NEXT call (AC2).
+	spec   atomic.Pointer[PromptSpec]
+	calls  *prometheus.CounterVec
+	log    *slog.Logger
+	schema *jsonschema.Schema
 }
+
+// currentSpec returns the active prompt spec (never nil after NewL1).
+func (a *L1) currentSpec() PromptSpec {
+	if sp := a.spec.Load(); sp != nil {
+		return *sp
+	}
+	return PromptSpec{}
+}
+
+// SetPrompt atomically swaps the L1 system prompt and its version (Story
+// 3.13 hot-reload). Safe for concurrent callers against Run.
+func (a *L1) SetPrompt(spec PromptSpec) { a.spec.Store(&spec) }
 
 // ScoreCap exposes the L1 provider's per-provider anti-hallucination cap
 // so the orchestrator can cap an L1-only ablation assessment at the
@@ -221,7 +239,9 @@ func NewL1(p provider.Provider, spec PromptSpec, reg *metrics.Registry, log *slo
 	if err != nil {
 		return nil, err
 	}
-	return &L1{provider: p, spec: spec, calls: calls, log: log, schema: sch}, nil
+	l := &L1{provider: p, calls: calls, log: log, schema: sch}
+	l.spec.Store(&spec)
+	return l, nil
 }
 
 // schemaCompiler compiles one embedded role schema exactly once per
@@ -272,9 +292,10 @@ func compiledL1Schema() (*jsonschema.Schema, error) { return l1Schema.compiled()
 // provider attempt (the Story 3.10 three-strike policy sits above
 // this, transport-level retries below).
 func (a *L1) Run(ctx context.Context, pkg schema.EvidencePackage) (L1Result, error) {
+	spec := a.currentSpec()
 	res := L1Result{
-		PromptVersion: a.spec.Version,
-		System:        a.spec.System,
+		PromptVersion: spec.Version,
+		System:        spec.System,
 		User:          l1UserInstruction,
 		Provider:      a.provider.Name(),
 		Model:         a.provider.Model(),
@@ -292,7 +313,7 @@ func (a *L1) Run(ctx context.Context, pkg schema.EvidencePackage) (L1Result, err
 	req := provider.Request{
 		Role:    provider.RoleL1,
 		Package: pkg,
-		Prompt:  provider.Prompt{System: a.spec.System, User: l1UserInstruction},
+		Prompt:  provider.Prompt{System: spec.System, User: l1UserInstruction},
 		// Defensive copy: the embedded backing array is shared with the
 		// compiled validator; a misbehaving Provider mutating req.Schema
 		// in place must not corrupt every later Run.

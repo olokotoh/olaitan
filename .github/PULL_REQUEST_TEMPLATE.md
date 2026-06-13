@@ -10,6 +10,8 @@
 
 traceability_updated: <!-- yes | no. yes if docs/traceability.md is updated in this PR; no if this PR adds no claim -->
 
+prompt_changelog_updated: <!-- yes | n/a. yes if this PR changes any internal/agent/prompts/defaults/*.txt and docs/prompt-changelog.md records the new content hash(es) (NFR41); n/a if this PR changes no prompt files. CI (prompt-changelog job) enforces this. -->
+
 ### Traceability rationale
 
 <!-- One or more lines explaining the claim added (when yes) or why this
@@ -31,3 +33,4 @@ traceability_updated: <!-- yes | no. yes if docs/traceability.md is updated in t
 - [ ] Acceptance criteria from the story are met
 - [ ] No secrets or credentials committed
 - [ ] traceability_updated field is set and matrix-or-rationale is correct (NFR42)
+- [ ] prompt_changelog_updated field is set; any prompt-file change has a docs/prompt-changelog.md entry with the new hash (NFR41)

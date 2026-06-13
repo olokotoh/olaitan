@@ -146,6 +146,30 @@ type Chain struct {
 // as the metric label and the audit mode (Story 3.8 BI-5/BI-8).
 func (c *Chain) Mode() string { return c.mode }
 
+// SetPrompts atomically swaps the per-role system prompts on every runner
+// the chain owns -- the primary L1/L2/Senior AND their Ollama-fallback
+// twins (Story 3.13 hot-reload), so a ConfigMap edit is picked up on the
+// next call without rebuilding the chain. A nil runner (an ablation-
+// truncated or fallback-absent role) is skipped. The fallback for a role
+// tracks the same prompt as its primary.
+func (c *Chain) SetPrompts(l1, l2, senior PromptSpec) {
+	for _, r := range []*L1{c.l1, c.l1Fallback} {
+		if r != nil {
+			r.SetPrompt(l1)
+		}
+	}
+	for _, r := range []*L2{c.l2, c.l2Fallback} {
+		if r != nil {
+			r.SetPrompt(l2)
+		}
+	}
+	for _, r := range []*Senior{c.senior, c.seniorFallback} {
+		if r != nil {
+			r.SetPrompt(senior)
+		}
+	}
+}
+
 // WithCheckpoints attaches a CheckpointStore so the chain checkpoints L1/L2
 // outputs and resumes from them on a controller restart (Story 3.9). A nil
 // store (the default) keeps the Story 3.8 behaviour byte-identical: no

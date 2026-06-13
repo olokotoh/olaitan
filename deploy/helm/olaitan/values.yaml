@@ -923,6 +923,18 @@ analyst:
     rate_per_min: ""
     cooling_seconds: ""
 
+  # Story 3.13 (NFR41, FR49 prompt half): the per-role system prompts
+  # ConfigMap. When enabled, deploy/helm/olaitan/files/prompts/<role>.txt is
+  # rendered into the {fullname}-prompts ConfigMap and mounted read-only at
+  # mountPath; analyst.prompts_dir in the rendered config is set to mountPath
+  # so the controller loads from the mount (a role absent from the mount uses
+  # its binary-embedded default). Disable to run purely on embedded defaults
+  # with no ConfigMap (the controller still works; prompts become image-baked
+  # and operators lose hot-reload).
+  prompts:
+    enabled: true
+    mountPath: /etc/olaitan/prompts
+
   # Story 3.4 (FR48): the local (Ollama) provider's endpoint and model.
   # Empty values keep the file-side defaults from config/olaitan.yaml
   # (endpoint http://ollama:11434, model gemma:2b); non-empty values are

@@ -30,6 +30,21 @@ jobs:
       - name: Lint
         run: golangci-lint run
 
+  # Story 3.13 (NFR41): a PR that changes any per-role default prompt must
+  # record the new content hash in docs/prompt-changelog.md. Only runs on
+  # pull_request (needs a base ref to diff against); fetch-depth 0 so the
+  # merge-base diff resolves.
+  prompt-changelog:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check prompt changelog
+        run: hack/check-prompt-changelog.sh "origin/${{ github.base_ref }}"
+
   # Helm chart validation — lint + template + kubeconform schema check
   # + tagged Go test harness. Template-only: no live cluster. Story 7.1
   # owns the full-stack cluster-based integration test.

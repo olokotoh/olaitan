@@ -701,6 +701,18 @@ data:
     {{- $cfg = regexReplaceAll $pCool $cfg (printf "${1}cooling_seconds: %s" (toString .)) }}
     {{- end }}
     {{- end }}
+    {{- /* Story 3.13 (NFR41, FR49 prompt half): bridge analyst.prompts_dir
+           over the file-side /etc/olaitan/prompts default so the rendered
+           path always tracks the actual mountPath. Only applied when the
+           prompts ConfigMap is enabled (a disabled prompts mount leaves the
+           file-side default, under which the controller still loads embedded
+           defaults). Anchor is the unique 2-space-indented key. */ -}}
+    {{- $promptVals := default (dict) $analystVals.prompts -}}
+    {{- if and $promptVals.enabled $promptVals.mountPath }}
+    {{- $pPromptsDir := "(\\n  )prompts_dir:[^\\n]*" -}}
+    {{- if not (mustRegexFind $pPromptsDir $cfg) }}{{- fail (printf "helm bridge: overlay anchor for analyst.prompts_dir not found (pattern %q)" $pPromptsDir) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pPromptsDir $cfg (printf "${1}prompts_dir: %s" (replace "$" "$$" (printf "%q" (toString $promptVals.mountPath)))) }}
+    {{- end }}
     {{- /* AC2: under evaluation.config=F the rendered config must keep
            only the Falco sensor adapter active. Disable audit /
            containerd / calico source adapters and the posture

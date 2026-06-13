@@ -1,0 +1,30 @@
+{{- if .Values.analyst.prompts.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "olaitan.fullname" . }}-prompts
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+# Story 3.13 (NFR41, FR49 prompt half): the per-role analyst system prompts.
+# Every <role>.txt under deploy/helm/olaitan/files/prompts/ is enumerated
+# via .Files.Glob and emitted as a ConfigMap key. The controller mounts
+# this at analyst.prompts.mountPath (default /etc/olaitan/prompts) and loads
+# "<role>.txt" per role; a role absent here falls back to the controller's
+# binary-embedded default, so operators may override a subset. The files/
+# tree is staged by `make helm-prepare-prompts` from the canonical
+# internal/agent/prompts/defaults/ source (Helm's .Files.Glob cannot
+# traverse into parent directories). The else branch renders an empty data
+# map so a freshly-cloned chart (before staging) still produces a valid
+# ConfigMap; the controller then runs on embedded defaults for every role.
+{{- $prompts := .Files.Glob "files/prompts/*.txt" }}
+{{- if $prompts }}
+data:
+{{- range $path, $bytes := $prompts }}
+  {{ base $path }}: |
+    {{- $.Files.Get $path | nindent 4 }}
+{{- end }}
+{{- else }}
+data: {}
+{{- end }}
+{{- end }}
