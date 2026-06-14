@@ -31,12 +31,18 @@ const maxLogBytes = 1 << 20
 //   - logs/<container>.previous.log : the terminated container's last-state
 //     logs (kubectl logs --previous), best-effort (absent if the container has
 //     not restarted).
-//   - fs/<container>.tar (best-effort): a debug-pod filesystem tar of the
-//     writable layers. Story 4.2 ships this as a best-effort, optional artefact
-//     (see captureFilesystem); a failure to capture it never fails the bundle,
-//     because the logs + spec/status + events are the load-bearing forensic
-//     record and the fs-tar requires elevated debug-pod rights that may be
-//     denied (BI-1 documents this).
+//
+// The debug-pod filesystem-tar artefact named by AC3 ("a debug-pod
+// filesystem-tar snapshot of the pod's writable layers") is DEFERRED and
+// UNIMPLEMENTED in Story 4.2. There is no captureFilesystem helper: the bundle
+// intentionally ships logs + spec/status + events ONLY. Capturing the writable
+// layers requires an ephemeral/debug pod created with `pods create` plus a
+// hostPath kubelet mount, a material privilege escalation beyond the already-
+// flagged `pods delete` RBAC widening. The fs-tar is reserved for a dedicated
+// future privileged-debug-pod story (awaiting PO ratification; see the Story
+// 4.2 Dev Agent Record AC3 deviation note and docs/runbook.md). The load-
+// bearing forensic record (previous logs + pod spec/status + events) ships
+// without it.
 //
 // The returned bytes are the complete forensic-bundle.tar.gz; the caller
 // content-addresses them via bundleKey. A capture error means no durable

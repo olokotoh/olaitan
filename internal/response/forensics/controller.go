@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/minio/minio-go/v7"
 	"github.com/prometheus/client_golang/prometheus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,6 +32,11 @@ const (
 	// first failure before the write is deferred (AC5). The full retry/deferred
 	// queue is Story 4.7; 4.2 does a small in-line retry then defers.
 	defaultUploadRetries = 1
+	// defaultNFR7Budget is the aggregate ceiling for one capture->upload->delete
+	// cycle (NFR7 p99 <= 10s). The per-leg timeouts above are sub-deadlines; this
+	// caps their SUM so the aggregate can never exceed the NFR7 ceiling even if
+	// the per-leg budgets are retuned upward (LOW, round-1 review).
+	defaultNFR7Budget = 10 * time.Second
 )
 
 // errNilClientset is returned by New when cs is nil.
@@ -66,6 +72,10 @@ type Config struct {
 	// UploadRetries is the number of additional upload attempts after the first
 	// failure before deferring; zero -> default (1).
 	UploadRetries int
+	// NFR7Budget is the aggregate ceiling for one capture->upload->delete cycle
+	// (NFR7 p99 <= 10s). The per-leg timeouts are sub-deadlines of this; zero ->
+	// default (10s).
+	NFR7Budget time.Duration
 }
 
 // Controller is the forensic capture sink + background drainer (BI-3/BI-4). It
@@ -86,6 +96,7 @@ type Controller struct {
 	uploadTimeout  time.Duration
 	deleteTimeout  time.Duration
 	uploadRetries  int
+	nfr7Budget     time.Duration
 
 	// oracle is the optional PRESERVED_KILLED confirmation seam (BI-5). Set once
 	// via SetStateOracle before Run; read-only for the worker thereafter.
@@ -134,6 +145,10 @@ func New(cfg Config, cs kubernetes.Interface, uploader Uploader, registry *metri
 	} else if cfg.UploadRetries == 0 {
 		uploadRetries = defaultUploadRetries
 	}
+	nfr7Budget := cfg.NFR7Budget
+	if nfr7Budget <= 0 {
+		nfr7Budget = defaultNFR7Budget
+	}
 
 	c := &Controller{
 		cs:             cs,
@@ -147,6 +162,7 @@ func New(cfg Config, cs kubernetes.Interface, uploader Uploader, registry *metri
 		uploadTimeout:  uploadTimeout,
 		deleteTimeout:  deleteTimeout,
 		uploadRetries:  uploadRetries,
+		nfr7Budget:     nfr7Budget,
 	}
 	if registry != nil {
 		if err := c.registerMetrics(registry); err != nil {
@@ -181,14 +197,14 @@ func (c *Controller) registerMetrics(r *metrics.Registry) error {
 
 	cv, err := r.RegisterCounterVec(
 		"olaitan_forensic_capture_total",
-		"Cumulative forensic capture outcomes labelled by result: captured (full success: capture+upload+delete), deferred (upload failed after retry; pod NOT deleted), skipped (excluded namespace, no pods, or no longer PRESERVED_KILLED), error (capture or delete failure), dropped (Publish queue full) (Story 4.2, FR36/AC5).",
+		"Cumulative forensic capture outcomes labelled by result: captured (full success: capture+upload+delete), deferred (upload failed after retry; pod NOT deleted), skipped (excluded namespace, no pods, or no longer PRESERVED_KILLED), error (capture failure or workload-id parse error), delete_failed (upload acked but the pod delete failed; pod alive + QUARANTINED, deferred to Story 4.7 delete-retry), dropped (Publish queue full) (Story 4.2, FR36/AC5).",
 		[]string{"result"},
 	)
 	if err != nil {
 		return err
 	}
 	c.captureTotal = cv
-	for _, result := range []string{"captured", "deferred", "skipped", "error", "dropped"} {
+	for _, result := range []string{"captured", "deferred", "skipped", "error", "delete_failed", "dropped"} {
 		cv.WithLabelValues(result).Add(0)
 	}
 
@@ -224,8 +240,20 @@ func (c *Controller) Publish(st schema.StateTransition) {
 	select {
 	case c.queue <- st:
 	default:
-		c.log.Warn("forensics: capture queue full; dropping kill transition", "workload_id", st.WorkloadID)
+		// MED (round-1): a dropped PRESERVED_KILLED transition leaves the pod
+		// undeleted (it was never captured), so the workload remains alive and
+		// QUARANTINED with no capture. That is the same contract as a deferred
+		// write, so we ALSO increment the deferred counter: Story 4.7's
+		// deferred-replay mechanism owns recovering both dropped and deferred
+		// captures, and without this a drop would be invisible to 4.7 (the pod
+		// would stay alive with no replay signal). The queue is sized for the
+		// expected PK rate (defaultQueueSize), so a drop indicates either a PK
+		// burst beyond that sizing or a stalled worker.
+		c.log.Warn("forensics: capture queue full; dropping kill transition (pod remains QUARANTINED, deferred to Story 4.7 replay)", "workload_id", st.WorkloadID)
 		c.count("dropped")
+		if c.writesDeferred != nil {
+			c.writesDeferred.Inc()
+		}
 	}
 }
 
@@ -236,6 +264,11 @@ func (c *Controller) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			// NIT (round-1): on shutdown any captures still buffered in c.queue are
+			// ABANDONED (not drained): their pods stay QUARANTINED (Story 4.1
+			// retains the deny-all) with no capture this run. Story 4.7's deferred-
+			// replay re-drives them after restart; we do not block shutdown to drain
+			// (forensic preservation is safe because the pod is left alive+isolated).
 			return nil
 		case st := <-c.queue:
 			c.handle(ctx, st)
@@ -267,6 +300,12 @@ func (c *Controller) handle(ctx context.Context, st schema.StateTransition) {
 	// longer tracks as terminal) must not trigger a delete. A nil oracle skips
 	// the check (the Publish ToState filter already gated entry).
 	if c.oracle != nil {
+		// NIT (round-1): ok==false (the FSM no longer tracks this workload) is a
+		// deliberate FAIL-OPEN-TO-PROCEED: we still capture+delete. The Publish
+		// ToState filter already gated entry on a genuine PRESERVED_KILLED edge,
+		// and a workload the FSM has forgotten is most likely already terminal/
+		// evicted; refusing to capture there would silently drop evidence. We only
+		// veto on an explicit, currently-tracked non-PK state (an operator release).
 		if state, ok := c.oracle.CurrentState(st.WorkloadID); ok && state != schema.StatePreservedKilled {
 			c.log.Info("forensics: workload no longer PRESERVED_KILLED; skipping capture",
 				"workload_id", st.WorkloadID, "current_state", state)
@@ -298,6 +337,15 @@ func (c *Controller) handle(ctx context.Context, st schema.StateTransition) {
 // out so each pod in a multi-pod workload is independently captured and deleted,
 // and one pod's deferral does not block another's capture.
 func (c *Controller) captureUploadDelete(ctx context.Context, st schema.StateTransition, namespace, podName string) {
+	// NFR7 (LOW, round-1 review): wrap the WHOLE capture->upload->delete cycle in
+	// a single aggregate-budget deadline so the sum of the per-leg timeouts can
+	// never exceed the NFR7 ceiling (p99 <= 10s), even if a future retune pushes
+	// the per-leg budgets higher. context.WithTimeout takes the earlier of the
+	// parent and child deadline, so each per-leg WithTimeout below stays a
+	// sub-deadline of this aggregate budget.
+	ctx, budgetCancel := context.WithTimeout(ctx, c.nfr7Budget)
+	defer budgetCancel()
+
 	// Leg 1: capture (bounded).
 	capCtx, capCancel := context.WithTimeout(ctx, c.captureTimeout)
 	bundle, err := captureFallback(capCtx, c.cs, namespace, podName)
@@ -321,7 +369,20 @@ func (c *Controller) captureUploadDelete(ctx context.Context, st schema.StateTra
 	// Leg 2: upload with a small in-line retry. AFTER the final failure the
 	// write is DEFERRED (AC5): the pod is NOT deleted, the deferred counter
 	// increments, and the pod stays QUARANTINED (Story 4.1 retains the deny-all).
-	if !c.uploadWithRetry(ctx, key, bundle) {
+	switch c.uploadWithRetry(ctx, key, bundle) {
+	case uploadOK:
+		// fall through to the delete leg below.
+	case uploadAborted:
+		// LOW (round-1 review): the context was cancelled (shutdown/abort) rather
+		// than a genuine S3 failure. The pod is left in place (it stays
+		// QUARANTINED), but this is NOT a real deferred write: do NOT increment
+		// writes_deferred_total / count "deferred" (that metric must reflect only
+		// real S3 failures, else a clean shutdown would inflate the alert series).
+		// Story 4.7 re-drives buffered/abandoned captures on restart.
+		c.log.Info("forensics: upload aborted on context cancellation; pod left QUARANTINED (not a deferred write)",
+			"namespace", namespace, "pod", podName, "key", key, "sha256", sum)
+		return
+	case uploadFailed:
 		c.log.Warn("forensics: S3 upload failed after retry; deferring write and retaining pod",
 			"namespace", namespace, "pod", podName, "key", key, "sha256", sum)
 		if c.writesDeferred != nil {
@@ -337,13 +398,21 @@ func (c *Controller) captureUploadDelete(ctx context.Context, st schema.StateTra
 	delErr := c.cs.CoreV1().Pods(namespace).Delete(delCtx, podName, metav1.DeleteOptions{})
 	delCancel()
 	if delErr != nil && !apierrors.IsNotFound(delErr) {
-		// The forensic record is durably preserved (upload acked), but the pod
-		// delete failed. The evidence is safe; the undeleted pod stays
-		// QUARANTINED. Count as error so the alert fires; do NOT double-count as
-		// deferred (the write succeeded).
-		c.log.Warn("forensics: pod delete failed after successful forensic upload",
+		// MED (round-1): the forensic record is durably preserved (upload acked),
+		// but the pod delete failed. The undeleted pod is alive and QUARANTINED,
+		// i.e. a DEFERRED kill: increment olaitan_forensic_writes_deferred_total
+		// so Story 4.7 has a replay signal to retry the delete (without this the
+		// pod stays alive with no recovery hook). Emit the distinct
+		// result="delete_failed" label (not the generic "error") so the
+		// upload-succeeded-but-delete-failed case is observable on its own and an
+		// operator can act on it (see docs/runbook.md). The write itself
+		// succeeded, so this is a delete-side deferral, not an upload deferral.
+		c.log.Warn("forensics: pod delete failed after successful forensic upload (pod alive + QUARANTINED, deferred to Story 4.7 delete-retry)",
 			"namespace", namespace, "pod", podName, "key", key, "err", delErr)
-		c.count("error")
+		c.count("delete_failed")
+		if c.writesDeferred != nil {
+			c.writesDeferred.Inc()
+		}
 		return
 	}
 
@@ -358,27 +427,72 @@ func (c *Controller) captureUploadDelete(ctx context.Context, st schema.StateTra
 		"namespace", namespace, "pod", podName, "key", key, "sha256", sum, "bytes", len(bundle))
 }
 
+// uploadOutcome is the result of uploadWithRetry. It distinguishes a genuine
+// S3 failure (uploadFailed, which defers the write) from a context cancellation
+// (uploadAborted, a shutdown/abort that must NOT inflate the deferred metric).
+type uploadOutcome int
+
+const (
+	uploadOK uploadOutcome = iota
+	uploadFailed
+	uploadAborted
+)
+
 // uploadWithRetry attempts the upload up to 1 + uploadRetries times, each with a
-// fresh per-attempt deadline. It returns true on the first acknowledged write.
-// Each attempt re-reads the bundle from a fresh bytes.Reader so a retried PUT
-// starts from the bundle head.
-func (c *Controller) uploadWithRetry(ctx context.Context, key string, bundle []byte) bool {
+// fresh per-attempt deadline. It returns uploadOK on the first acknowledged
+// write. Each attempt re-reads the bundle from a fresh bytes.Reader so a retried
+// PUT starts from the bundle head.
+//
+// LOW (round-1 review): on context cancellation (shutdown/abort) it returns
+// uploadAborted rather than uploadFailed, so the caller skips the deferred
+// metric (which must reflect only real S3 failures). It also fast-fails clearly
+// TERMINAL S3 errors (AccessDenied, NoSuchBucket, InvalidArgument incl. KMS
+// directive errors): retrying those cannot succeed, so the write is deferred
+// immediately rather than burning the retry budget and the per-leg timeouts.
+func (c *Controller) uploadWithRetry(ctx context.Context, key string, bundle []byte) uploadOutcome {
 	attempts := 1 + c.uploadRetries
 	opts := UploadOptions{KMSKeyAlias: c.kmsKeyAlias}
 	for i := 0; i < attempts; i++ {
 		if ctx.Err() != nil {
-			return false
+			return uploadAborted
 		}
 		upCtx, upCancel := context.WithTimeout(ctx, c.uploadTimeout)
 		_, err := c.uploader.Upload(upCtx, key, newBundleReader(bundle), int64(len(bundle)), opts)
 		upCancel()
 		if err == nil {
-			return true
+			return uploadOK
+		}
+		// Distinguish a cancellation of the parent ctx (shutdown/abort) from a
+		// real upload error: a per-attempt deadline expiry leaves ctx.Err() nil
+		// (only upCtx expired) and is a genuine transient failure worth retrying.
+		if ctx.Err() != nil {
+			return uploadAborted
+		}
+		if isTerminalUploadError(err) {
+			c.log.Warn("forensics: S3 upload failed with a terminal error; deferring without retry",
+				"key", key, "attempt", i+1, "attempts", attempts, "err", err)
+			return uploadFailed
 		}
 		c.log.Warn("forensics: S3 upload attempt failed",
 			"key", key, "attempt", i+1, "attempts", attempts, "err", err)
 	}
-	return false
+	return uploadFailed
+}
+
+// isTerminalUploadError reports whether err is a clearly non-retryable S3 error
+// (the request can never succeed by retrying): access denied, a missing bucket,
+// or an invalid argument (which covers a malformed/denied SSE-KMS directive).
+// Transient errors (timeouts, 5xx, connection refused) are NOT terminal and are
+// retried. minio.ToErrorResponse extracts the S3 error code from a minio-go
+// error; a non-S3 error (e.g. a dial failure) has an empty Code and is treated
+// as transient.
+func isTerminalUploadError(err error) bool {
+	switch minio.ToErrorResponse(err).Code {
+	case "AccessDenied", "NoSuchBucket", "InvalidArgument", "KMS.NotFoundException", "KMSKeyNotFoundException":
+		return true
+	default:
+		return false
+	}
 }
 
 // workloadRef is the parsed canonical workload identity (mirror netpol).

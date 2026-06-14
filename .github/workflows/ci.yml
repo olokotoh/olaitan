@@ -267,26 +267,46 @@ jobs:
   # while developers without MinIO locally fall back to the default skip (exit 0).
   forensics-integration:
     runs-on: ubuntu-latest
-    services:
-      minio:
-        image: bitnami/minio:latest
-        ports:
-          - 9000:9000
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-          MINIO_DEFAULT_BUCKETS: olaitan-forensics-it
-        options: >-
-          --health-cmd "mc ready local || curl -f http://localhost:9000/minio/health/live"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26'
+
+      # MinIO is started as an explicit `docker run` step rather than a
+      # `services:` container because GitHub Actions `services:` cannot
+      # override an image's command, and the official `minio/minio` image
+      # needs an explicit `server /data ...` command (it has no default
+      # server entrypoint). The previously-used `bitnami/minio:latest` tag
+      # was pruned by Bitnami (manifest unknown), so we pin the official
+      # image to a specific, verified-pullable RELEASE tag for
+      # reproducibility (never `latest`).
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 -p 9001:9001 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:RELEASE.2025-04-22T22-12-26Z \
+            server /data --console-address :9001
+
+      # Bounded wait-for-ready loop (~30s) polling the MinIO liveness
+      # endpoint before the integration step, so a slow image pull / start
+      # does not race the test (which would otherwise fail-loud under
+      # FORENSICS_INTEGRATION_REQUIRED=1).
+      - name: Wait for MinIO ready
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:9000/minio/health/live >/dev/null 2>&1; then
+              echo "MinIO ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become ready within 30s" >&2
+          docker logs minio || true
+          exit 1
 
       - name: Forensics MinIO integration suite
         env:

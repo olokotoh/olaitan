@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/minio/minio-go/v7"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
@@ -64,6 +65,28 @@ func (f *fakeUploader) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls
+}
+
+// errUploader returns a fixed error on every Upload call (used to inject a
+// terminal S3 error or to count attempts under a cancelled context).
+type errUploader struct {
+	mu    sync.Mutex
+	calls int
+	err   error
+}
+
+func (e *errUploader) Upload(ctx context.Context, key string, r io.Reader, size int64, opts UploadOptions) (Ack, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.calls++
+	_, _ = io.ReadAll(r)
+	return Ack{}, e.err
+}
+
+func (e *errUploader) callCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.calls
 }
 
 func deployment(ns, name string, sel map[string]string) *appsv1.Deployment {
@@ -447,10 +470,12 @@ func TestRun_DrainsAndStops(t *testing.T) {
 	}
 }
 
-// TestHandle_DeleteErrorAfterUpload covers the leg-3 error branch: the upload
-// succeeds (evidence preserved) but the pod delete fails with a non-NotFound
-// error; the outcome is counted as error and the write is NOT double-counted as
-// deferred.
+// TestHandle_DeleteErrorAfterUpload covers the leg-3 delete-failure branch
+// (round-1 review MED): the upload succeeds (evidence preserved) but the pod
+// delete fails with a non-NotFound error. The pod is alive + QUARANTINED, i.e. a
+// deferred kill: the outcome is counted under the distinct delete_failed label
+// AND increments writes_deferred_total (so Story 4.7 retries the delete). It is
+// NOT counted as the generic "error" outcome.
 func TestHandle_DeleteErrorAfterUpload(t *testing.T) {
 	reg := metrics.NewRegistry()
 	cs := fake.NewSimpleClientset(runtime.Object(pod("ns", "p", map[string]string{"x": "y"})))
@@ -465,11 +490,41 @@ func TestHandle_DeleteErrorAfterUpload(t *testing.T) {
 	if up.callCount() != 1 {
 		t.Fatalf("upload calls = %d, want 1", up.callCount())
 	}
-	if got := testutil.ToFloat64(c.captureTotal.WithLabelValues("error")); got != 1 {
-		t.Fatalf("error = %v, want 1", got)
+	if got := testutil.ToFloat64(c.captureTotal.WithLabelValues("delete_failed")); got != 1 {
+		t.Fatalf("delete_failed = %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(c.writesDeferred); got != 0 {
-		t.Fatalf("writes_deferred = %v, want 0 (upload succeeded)", got)
+	if got := testutil.ToFloat64(c.captureTotal.WithLabelValues("error")); got != 0 {
+		t.Fatalf("error = %v, want 0 (delete failure is delete_failed, not error)", got)
+	}
+	// Pod stays alive (delete failed): the deferred signal must fire so 4.7 retries.
+	if got := testutil.ToFloat64(c.writesDeferred); got != 1 {
+		t.Fatalf("writes_deferred = %v, want 1 (pod alive + QUARANTINED, deferred kill)", got)
+	}
+}
+
+// TestPublish_DropIncrementsDeferred covers the round-1 review MED finding: a
+// PRESERVED_KILLED transition dropped on a full Publish queue increments BOTH
+// the dropped result label AND writes_deferred_total, so the undeleted-and-
+// QUARANTINED pod is visible to Story 4.7's replay (a drop was previously
+// invisible to 4.7). Mutation-check: removing the writesDeferred.Inc() on the
+// drop path fails the writes_deferred assertion below.
+func TestPublish_DropIncrementsDeferred(t *testing.T) {
+	reg := metrics.NewRegistry()
+	cs := fake.NewSimpleClientset()
+	c, err := New(Config{QueueSize: 1}, cs, &fakeUploader{}, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Fill the size-1 queue, then a second kill is dropped.
+	c.Publish(killTransition("ns/Deployment/web"))
+	c.Publish(killTransition("ns/Deployment/web2"))
+
+	if got := testutil.ToFloat64(c.captureTotal.WithLabelValues("dropped")); got != 1 {
+		t.Fatalf("dropped = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(c.writesDeferred); got != 1 {
+		t.Fatalf("writes_deferred = %v, want 1 (a drop leaves the pod undeleted = deferred)", got)
 	}
 }
 
@@ -517,6 +572,66 @@ func TestGetPodEvents(t *testing.T) {
 	// returns the event (the capture path is best-effort either way).
 	if len(got) == 0 {
 		t.Fatal("expected at least one event")
+	}
+}
+
+// TestHandle_TerminalUploadErrorFastFails covers the round-1 review LOW finding:
+// a terminal S3 error (AccessDenied) is NOT retried; the write is deferred after
+// a single attempt. Mutation-check: removing the isTerminalUploadError fast-fail
+// makes the attempt count 2 (1 + retry) instead of 1.
+func TestHandle_TerminalUploadErrorFastFails(t *testing.T) {
+	reg := metrics.NewRegistry()
+	cs := fake.NewSimpleClientset(runtime.Object(pod("ns", "p", map[string]string{"x": "y"})))
+	up := &errUploader{err: minio.ErrorResponse{Code: "AccessDenied", Message: "denied"}}
+	c := newController(t, cs, up, reg)
+
+	c.handle(context.Background(), killTransition("ns/Pod/p"))
+
+	if up.callCount() != 1 {
+		t.Fatalf("upload attempts = %d, want 1 (terminal error must not retry)", up.callCount())
+	}
+	// Terminal error still defers (pod retained, deferred counter advances).
+	if got := testutil.ToFloat64(c.writesDeferred); got != 1 {
+		t.Fatalf("writes_deferred = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(c.captureTotal.WithLabelValues("deferred")); got != 1 {
+		t.Fatalf("deferred = %v, want 1", got)
+	}
+	if _, err := cs.CoreV1().Pods("ns").Get(context.Background(), "p", metav1.GetOptions{}); err != nil {
+		t.Fatalf("pod deleted despite terminal upload error: %v", err)
+	}
+}
+
+// TestHandle_AbortOnContextCancellation covers the round-1 review LOW finding:
+// when the context is already cancelled (shutdown/abort), the upload is aborted
+// and the write is NOT counted as deferred (the deferred metric must reflect
+// only real S3 failures). Mutation-check: returning uploadFailed instead of
+// uploadAborted on ctx.Err() makes the writes_deferred assertion fail.
+func TestHandle_AbortOnContextCancellation(t *testing.T) {
+	reg := metrics.NewRegistry()
+	cs := fake.NewSimpleClientset(runtime.Object(pod("ns", "p", map[string]string{"x": "y"})))
+	up := &errUploader{err: errors.New("should not be called")}
+	c := newController(t, cs, up, reg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancelled before handle runs
+
+	c.handle(ctx, killTransition("ns/Pod/p"))
+
+	// Capture succeeds (Get on the fake clientset ignores ctx cancellation), but
+	// the upload leg sees ctx.Err() != nil and aborts without attempting.
+	if up.callCount() != 0 {
+		t.Fatalf("upload attempted under cancelled ctx: %d", up.callCount())
+	}
+	if got := testutil.ToFloat64(c.writesDeferred); got != 0 {
+		t.Fatalf("writes_deferred = %v, want 0 (abort is not a deferred write)", got)
+	}
+	if got := testutil.ToFloat64(c.captureTotal.WithLabelValues("deferred")); got != 0 {
+		t.Fatalf("deferred = %v, want 0 on abort", got)
+	}
+	// Pod is left in place (still QUARANTINED).
+	if _, err := cs.CoreV1().Pods("ns").Get(context.Background(), "p", metav1.GetOptions{}); err != nil {
+		t.Fatalf("pod deleted on abort: %v", err)
 	}
 }
 

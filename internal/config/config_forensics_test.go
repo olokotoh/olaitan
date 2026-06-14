@@ -41,9 +41,13 @@ func TestForensicsConfig_Validate(t *testing.T) {
 	}{
 		{"omitted block ok", ForensicsConfig{}, false},
 		{"disabled with empty fields ok", ForensicsConfig{Enabled: &disabled}, false},
-		{"enabled missing endpoint", ForensicsConfig{Enabled: &enabled, S3Bucket: "b"}, true},
-		{"enabled missing bucket", ForensicsConfig{Enabled: &enabled, S3Endpoint: "e"}, true},
-		{"enabled complete", ForensicsConfig{Enabled: &enabled, S3Endpoint: "e", S3Bucket: "b"}, false},
+		// HIGH-1: an enabled block with an empty kms_key_alias FAILS (the agent
+		// would persist unredacted forensic logs with no agent-applied SSE-KMS).
+		{"disabled with empty alias ok", ForensicsConfig{Enabled: &disabled, S3Endpoint: "e", S3Bucket: "b"}, false},
+		{"enabled missing endpoint", ForensicsConfig{Enabled: &enabled, S3Bucket: "b", KMSKeyAlias: "alias/k"}, true},
+		{"enabled missing bucket", ForensicsConfig{Enabled: &enabled, S3Endpoint: "e", KMSKeyAlias: "alias/k"}, true},
+		{"enabled missing kms alias", ForensicsConfig{Enabled: &enabled, S3Endpoint: "e", S3Bucket: "b"}, true},
+		{"enabled complete", ForensicsConfig{Enabled: &enabled, S3Endpoint: "e", S3Bucket: "b", KMSKeyAlias: "alias/k"}, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

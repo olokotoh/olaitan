@@ -273,6 +273,9 @@ response:
     s3_bucket: ""
     s3_region: ""
     s3_use_ssl: true
+    # kms_key_alias is REQUIRED when enabled=true: the agent applies SSE-KMS
+    # per PUT, so an empty alias would persist unredacted forensic logs with no
+    # agent-applied encryption (config load fails fast in that case).
     kms_key_alias: ""
 
 # Story 3.1: the Ring-5 report layer. The redact sub-block gates the

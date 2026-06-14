@@ -1116,9 +1116,19 @@ func (f ForensicsConfig) S3UseSSLOrDefault() bool {
 }
 
 // validate enforces ForensicsConfig invariants: when the controller is
-// explicitly enabled, the S3 endpoint and bucket are required (the access and
-// secret keys are validated at wiring time against the environment). A
-// fully-omitted block skips validation so in-memory fixtures can leave it zero.
+// explicitly enabled, the S3 endpoint, bucket, and SSE-KMS key alias are all
+// required (the access and secret keys are validated at wiring time against the
+// environment). A fully-omitted block skips validation so in-memory fixtures
+// can leave it zero.
+//
+// kms_key_alias is required-when-enabled (HIGH-1, round-1 review): the
+// MinioUploader skips the SSE-KMS PUT directive when the alias is empty, so an
+// enabled-forensics deployment without an alias would persist UNREDACTED
+// forensic logs with no agent-applied SSE-KMS (relying only on a bucket-default
+// SSE that may not exist). Fail-fast at config load rather than silently
+// shipping plaintext-at-the-agent forensic bundles. This guard is at the config
+// boundary only; the MinioUploader itself still accepts an empty alias so the
+// no-KES MinIO integration test can construct it directly with an empty alias.
 func (f ForensicsConfig) validate() error {
 	if f.Enabled != nil && *f.Enabled {
 		if f.S3Endpoint == "" {
@@ -1126,6 +1136,9 @@ func (f ForensicsConfig) validate() error {
 		}
 		if f.S3Bucket == "" {
 			return errors.New("response.forensics.s3_bucket: required when forensics.enabled=true")
+		}
+		if f.KMSKeyAlias == "" {
+			return errors.New("response.forensics.kms_key_alias: required when forensics.enabled=true (the agent applies SSE-KMS per PUT; an empty alias would persist unredacted forensic logs with no agent-applied encryption)")
 		}
 	}
 	return nil

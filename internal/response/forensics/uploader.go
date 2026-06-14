@@ -148,19 +148,13 @@ func NewMinioUploader(cfg MinioConfig) (*MinioUploader, error) {
 // deployment without a configured KMS key still stores the (bucket-encrypted)
 // forensic bundle.
 func (u *MinioUploader) Upload(ctx context.Context, key string, r io.Reader, size int64, opts UploadOptions) (Ack, error) {
-	putOpts := minio.PutObjectOptions{
-		ContentType: "application/gzip",
-	}
 	alias := opts.KMSKeyAlias
 	if alias == "" {
 		alias = u.kmsKeyAlias
 	}
-	if alias != "" {
-		sse, err := encrypt.NewSSEKMS(alias, nil)
-		if err != nil {
-			return Ack{}, fmt.Errorf("forensics: build SSE-KMS directive for key alias %q: %w", alias, err)
-		}
-		putOpts.ServerSideEncryption = sse
+	putOpts, err := buildPutOptions(alias)
+	if err != nil {
+		return Ack{}, err
 	}
 	info, err := u.client.PutObject(ctx, u.bucket, key, r, size, putOpts)
 	if err != nil {
@@ -173,4 +167,26 @@ func (u *MinioUploader) Upload(ctx context.Context, key string, r io.Reader, siz
 		ETag:      info.ETag,
 		VersionID: info.VersionID,
 	}, nil
+}
+
+// buildPutOptions constructs the PutObject options for a forensic bundle PUT,
+// attaching the SSE-KMS server-side-encryption directive when alias is
+// non-empty (NFR17). An empty alias yields NO SSE directive: SSE then falls to
+// the bucket default (the no-KES MinIO integration path). Extracted from Upload
+// so the encryption directive has direct unit coverage (round-1 review:
+// MED+LOW). A non-empty alias MUST set putOpts.ServerSideEncryption to a
+// non-nil SSE-KMS directive carrying the alias; removing that assignment is
+// caught by TestBuildPutOptions.
+func buildPutOptions(alias string) (minio.PutObjectOptions, error) {
+	putOpts := minio.PutObjectOptions{
+		ContentType: "application/gzip",
+	}
+	if alias != "" {
+		sse, err := encrypt.NewSSEKMS(alias, nil)
+		if err != nil {
+			return minio.PutObjectOptions{}, fmt.Errorf("forensics: build SSE-KMS directive for key alias %q: %w", alias, err)
+		}
+		putOpts.ServerSideEncryption = sse
+	}
+	return putOpts, nil
 }

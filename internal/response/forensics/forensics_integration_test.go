@@ -14,6 +14,7 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -223,5 +224,14 @@ func TestIntegration_S3Outage(t *testing.T) {
 	// AC5: pod NOT deleted (forensic preservation priority).
 	if _, gerr := cs.CoreV1().Pods(ns).Get(context.Background(), "web-abc", metav1.GetOptions{}); gerr != nil {
 		t.Fatalf("pod was deleted during S3 outage: %v", gerr)
+	}
+	// AC6 (round-1 review MED): assert the deferred contract at the real-S3
+	// boundary, mirroring the unit test: the deferred counter increments and the
+	// deferred result-label advances.
+	if got := testutil.ToFloat64(c.writesDeferred); got != 1 {
+		t.Fatalf("writes_deferred = %v, want 1 after S3 outage", got)
+	}
+	if got := testutil.ToFloat64(c.captureTotal.WithLabelValues("deferred")); got != 1 {
+		t.Fatalf("deferred result label = %v, want 1 after S3 outage", got)
 	}
 }
