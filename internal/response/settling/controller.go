@@ -65,12 +65,17 @@ type pending struct {
 	threatScore float64
 	packageID   string
 	workloadID  string
-	// gen is the per-workload timer generation. It is incremented on EVERY
-	// arm/re-arm/cancel in onTransition and captured in the AfterFunc closure.
-	// onFire ignores any expiry signal whose gen does not match the current
-	// pending gen, so a stale expiry from a superseded (already-Stop()ed but
-	// already-fired) timer becomes a no-op (HIGH round-1: stale AfterFunc signal
-	// caused premature/double IncidentFinalised).
+	// gen is the timer generation stamped on this pending when its timer was last
+	// armed/re-armed. It is drawn from the controller's LIFETIME-MONOTONIC counter
+	// (Controller.nextGen), so it is unique across the whole controller lifetime
+	// and is NEVER reset or reused, even across CLEAN cycles or new pending
+	// instances. onFire ignores any expiry signal whose gen does not match the
+	// current pending gen, so a stale expiry from a superseded (already-Stop()ed
+	// but already-fired) timer becomes a no-op. A lifetime-monotonic gen closes
+	// BOTH the round-1 re-arm race AND the round-2 aliasing-across-CLEAN race: a
+	// stale fire's gen can never equal any FUTURE pending's gen, because nextGen
+	// strictly increases and is never reset (the round-1 per-pending gen reset to
+	// 0 on a new pending re-opened that race across a CLEAN cycle).
 	gen uint64
 	// observed accumulates the transitions seen in-process for this incident,
 	// used as the history source when no persisted HistoryReader is wired (Open
@@ -120,6 +125,16 @@ type Controller struct {
 	// actual publish (and the finalised check-and-set) happens single-threaded
 	// on Run. The generation lets Run reject a stale expiry (HIGH round-1).
 	fired chan firedSignal
+
+	// nextGen is the LIFETIME-MONOTONIC timer-generation counter. It is owned by
+	// the Run goroutine (all arming happens on Run, so it needs no lock) and is
+	// incremented on EVERY arm/re-arm; the post-increment value is stamped onto
+	// the pending and captured in the AfterFunc closure. Because it strictly
+	// increases and is NEVER reset or reused, a stale fire's captured gen can
+	// never equal any future pending's gen, across CLEAN cycles, re-arms, or new
+	// pending instances. This closes both the round-1 re-arm race and the round-2
+	// aliasing-across-CLEAN race (round-2 HIGH).
+	nextGen uint64
 }
 
 // New constructs a Controller. pub must be non-nil. history may be nil to fall
@@ -265,15 +280,16 @@ func (c *Controller) onTransition(st schema.StateTransition, timers map[string]*
 	wid := st.WorkloadID
 	if st.ToState == schema.StateClean {
 		// AC4: de-escalation to CLEAN cancels the timer and clears the finalised
-		// marker so a LATER new incident for the same workload re-finalises. The
-		// gen on any surviving pending is bumped so a stale in-flight expiry from
-		// the just-Stop()ed timer cannot fire onFire (HIGH round-1).
+		// marker so a LATER new incident for the same workload re-finalises. A
+		// stale in-flight expiry from the just-Stop()ed timer is rejected by onFire
+		// on the lifetime-monotonic gen mismatch alone: the pending (and its gen)
+		// is deleted here, and any future re-armed pending will carry a STRICTLY
+		// GREATER gen drawn from c.nextGen, so the stale fire can never match it
+		// (round-2 HIGH: a per-pending gen reset on a fresh pending re-opened this
+		// race across a CLEAN cycle; the monotonic counter closes it).
 		if t, ok := timers[wid]; ok {
 			t.Stop()
 			delete(timers, wid)
-		}
-		if p, ok := pendings[wid]; ok {
-			p.gen++
 		}
 		delete(pendings, wid)
 		// CLEAN is the ONLY edge that clears the once-only finalised marker: a
@@ -318,11 +334,16 @@ func (c *Controller) onTransition(st schema.StateTransition, timers map[string]*
 		p = &pending{workloadID: wid}
 		pendings[wid] = p
 	}
-	// HIGH (round-1): bump the generation on EVERY re-arm. The previous timer was
-	// just Stop()ed, but Stop returns false if its AfterFunc had already begun;
-	// such a stale expiry will carry the OLD gen and be rejected by onFire. The
-	// captured gen below is the only one onFire will honour.
-	p.gen++
+	// HIGH (round-1 + round-2): stamp a LIFETIME-MONOTONIC generation on EVERY
+	// re-arm. The previous timer was just Stop()ed, but Stop returns false if its
+	// AfterFunc had already begun; such a stale expiry carries the OLD gen and is
+	// rejected by onFire. Drawing from c.nextGen (never reset, never reused, owned
+	// by this single Run goroutine) means the stamped gen is unique for the whole
+	// controller lifetime, so a stale fire can never alias a FUTURE pending's gen
+	// even across a CLEAN cycle (round-2 HIGH). The captured gen below is the only
+	// one onFire will honour.
+	c.nextGen++
+	p.gen = c.nextGen
 	p.finalState = st.ToState
 	// MED (round-1): override-triggered finalisation can carry an empty PackageID
 	// and zero Confidence (an operator pin need not re-run an evaluation). Prefer
@@ -368,11 +389,14 @@ func (c *Controller) onFire(ctx context.Context, sig firedSignal, timers map[str
 		// have re-armed a live timer we must not orphan.
 		return
 	}
-	// HIGH (round-1): reject a STALE expiry. The signal carries the gen captured
-	// when its timer was armed; if the current pending gen has moved on, this
-	// expiry belongs to a superseded (Stop()ed-but-already-fired) timer. Treat it
-	// as a no-op so we neither publish for the NEW candidate (whose window has
-	// NOT elapsed) nor delete the live re-armed timer entry.
+	// HIGH (round-1 + round-2): reject a STALE expiry. The signal carries the gen
+	// captured when its timer was armed; if the current pending gen has moved on,
+	// this expiry belongs to a superseded (Stop()ed-but-already-fired) timer. Treat
+	// it as a no-op so we neither publish for the NEW candidate (whose window has
+	// NOT elapsed) nor delete the live re-armed timer entry. Because the gen is
+	// LIFETIME-MONOTONIC (Controller.nextGen, never reset), this also rejects a
+	// stale fire buffered across a CLEAN cycle: incident A's stale gen can never
+	// equal a later incident B's gen for the same workload (round-2 HIGH).
 	if sig.gen != p.gen {
 		return
 	}
@@ -393,9 +417,11 @@ func (c *Controller) onFire(ctx context.Context, sig firedSignal, timers map[str
 	// finalisation: a pinned QUARANTINED/PRESERVED_KILLED workload stable past the
 	// window is a real incident worth a DFIR report (Open Assumption 3). The
 	// committed JSON schema does not require package_id to be non-empty, and
-	// FinalisedMsgID stays unique via finalised_at_ns even when package_id is "",
-	// so dedup is not weakened. We log the empty-package_id case so operators can
-	// correlate the pinned finalisation.
+	// FinalisedMsgID stays unique even when package_id is "" because it leads with
+	// the always-present workload_id (round-2 LOW: two distinct empty-package_id
+	// workloads finalising at the same nanosecond no longer collide), so dedup is
+	// not weakened. We log the empty-package_id case so operators can correlate the
+	// pinned finalisation.
 	if p.packageID == "" {
 		c.log.Info("settling: finalising a pinned incident with empty package_id (no automated evaluation ran; valid-for-pinned, dedup falls to finalised_at)",
 			"workload_id", wid, "final_state", string(p.finalState))
@@ -476,14 +502,23 @@ func (c *Controller) publish(ctx context.Context, evt IncidentFinalised) error {
 }
 
 // FinalisedMsgID derives the JetStream WithMsgID dedup id for an IncidentFinalised
-// event (BI-8, Open Assumption 5): package_id + ":" + the finalising-transition
-// timestamp (FinalisedAt, nanoseconds). The package_id makes the dedup
-// per-incident; the timestamp discriminator means a legitimately NEW incident
-// for the same workload after a CLEAN cycle (a distinct finalisation) is NOT
-// suppressed by the 2-minute dedup window, while a drainer re-publish / restart-
-// replay of the SAME finalisation (same package_id + same FinalisedAt) IS
-// server-side deduplicated. It is exported so the NATS-backed Publisher derives
-// the same id the controller intends.
+// event (BI-8, Open Assumption 5): workload_id + ":" + package_id + ":" + the
+// finalising-transition timestamp (FinalisedAt, nanoseconds). The workload_id +
+// package_id make the dedup per-incident; the timestamp discriminator means a
+// legitimately NEW incident for the same workload after a CLEAN cycle (a distinct
+// finalisation) is NOT suppressed by the 2-minute dedup window, while a drainer
+// re-publish / restart-replay of the SAME finalisation (same workload_id +
+// package_id + same FinalisedAt) IS server-side deduplicated. It is exported so
+// the NATS-backed Publisher derives the same id the controller intends.
+//
+// LOW (round-2): workload_id is folded in as the leading discriminator because a
+// pinned-from-the-start incident carries an EMPTY package_id (the override-
+// retention change in round-1 made empty-package_id a fully supported path). With
+// only "package_id:nanos", two DISTINCT pinned workloads finalising at the same
+// nanosecond would collide on ":<nanos>" and JetStream WithMsgID would suppress
+// the second, silently dropping a real incident. workload_id is always present
+// and is the natural per-incident disambiguator, and same-incident replay dedup
+// stays intact (same workload_id + package_id + FinalisedAt).
 func FinalisedMsgID(evt IncidentFinalised) string {
-	return evt.PackageID + ":" + strconv.FormatInt(evt.FinalisedAt.UnixNano(), 10)
+	return evt.WorkloadID + ":" + evt.PackageID + ":" + strconv.FormatInt(evt.FinalisedAt.UnixNano(), 10)
 }

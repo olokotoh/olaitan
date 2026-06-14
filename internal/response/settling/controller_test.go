@@ -265,6 +265,26 @@ func TestRestartReplayDeduped(t *testing.T) {
 	}
 }
 
+// TestMsgIDDistinctForEmptyPackageWorkloads (LOW round-2): two DISTINCT workloads
+// pinned from the start (both empty package_id) finalising at the SAME nanosecond
+// must yield DISTINCT dedup msg ids, otherwise JetStream WithMsgID would suppress
+// the second and silently drop a real incident. The override-retention change made
+// empty-package_id a fully supported path, so this collision is now reachable; the
+// always-present workload_id is the disambiguator.
+func TestMsgIDDistinctForEmptyPackageWorkloads(t *testing.T) {
+	now := time.Date(2026, 6, 14, 12, 0, 0, 0, time.UTC)
+	a := IncidentFinalised{PackageID: "", WorkloadID: "ns/Deployment/web", FinalisedAt: now}
+	b := IncidentFinalised{PackageID: "", WorkloadID: "ns/Deployment/api", FinalisedAt: now}
+	if FinalisedMsgID(a) == FinalisedMsgID(b) {
+		t.Fatalf("two distinct empty-package_id workloads at the same nanosecond collide on msg id %q (workload_id must disambiguate)", FinalisedMsgID(a))
+	}
+	// Same-incident replay (same workload_id + package_id + FinalisedAt) still dedups.
+	aReplay := IncidentFinalised{PackageID: "", WorkloadID: "ns/Deployment/web", FinalisedAt: now}
+	if FinalisedMsgID(a) != FinalisedMsgID(aReplay) {
+		t.Fatalf("same-incident replay must dedup to the same msg id: %q vs %q", FinalisedMsgID(a), FinalisedMsgID(aReplay))
+	}
+}
+
 // TestDropNeverBlocks: Publish on a full queue does not block the caller (the
 // FSM hot path). We fill the queue (no Run draining) and assert Publish returns
 // promptly.
@@ -444,6 +464,73 @@ func TestStaleFireAfterReArmIsNoOp(t *testing.T) {
 	}
 	if evt := pub.snapshot()[0]; evt.FinalState != string(schema.StateQuarantined) {
 		t.Errorf("finalised candidate = %q, want QUARANTINED (the surviving re-armed candidate)", evt.FinalState)
+	}
+}
+
+// TestStaleFireAfterCleanCycleIsNoOp drives the round-2 HIGH interleave: the
+// round-1 per-pending generation counter was reset to 0 on each fresh pending and
+// the CLEAN path's bump was discarded by the immediate delete, so a stale fire
+// buffered from incident A (gen 1) aliased a NEW incident B's gen 1 across a CLEAN
+// cycle and finalised B BEFORE its window elapsed. Sequence: arm A (captures genA)
+// -> CLEAN -> arm B with a large window (captures genB) -> deliver a stale fire
+// carrying genA -> it MUST be a no-op (pub.count()==0) and B's live timer entry
+// MUST NOT be orphaned.
+//
+// Mutation check: reverting to a per-pending gen reset on a new pending (i.e.
+// `p.gen` allocated at 0 then ++ to 1 for B, instead of the lifetime-monotonic
+// c.nextGen) makes genA == genB == 1, so the stale genA fire matches B and
+// finalises it prematurely, failing the pub.count()==0 assertion.
+func TestStaleFireAfterCleanCycleIsNoOp(t *testing.T) {
+	pub := &fakePublisher{}
+	c := newWhiteBox(t, pub)
+
+	timers := make(map[string]*time.Timer)
+	pendings := make(map[string]*pending)
+	finalised := make(map[string]struct{})
+
+	// Incident A: arm a timer (its AfterFunc captures genA). The signal is NOT yet
+	// drained (timer "fired" but the firedSignal is still buffered in c.fired).
+	c.onTransition(nonClean("w1", schema.StateRestricted, 55), timers, pendings, finalised)
+	genA := pendings["w1"].gen
+
+	// CLEAN cycle: cancels A's timer, clears all per-workload state. (The stale
+	// genA fire is still buffered.)
+	clean := nonClean("w1", schema.StateClean, 0)
+	clean.FromState = schema.StateRestricted
+	c.onTransition(clean, timers, pendings, finalised)
+	if _, ok := pendings["w1"]; ok {
+		t.Fatal("CLEAN did not clear the pending")
+	}
+
+	// Incident B: a NEW non-CLEAN incident for the SAME workload arms a fresh timer
+	// (captures genB). With a per-pending gen reset (the round-1 bug) genB would be
+	// 1, aliasing genA; with the lifetime-monotonic counter genB is strictly > genA.
+	c.onTransition(nonClean("w1", schema.StateQuarantined, 91), timers, pendings, finalised)
+	genB := pendings["w1"].gen
+	if genB == genA {
+		t.Fatalf("genB (%d) aliases genA (%d): generation is not lifetime-monotonic across a CLEAN cycle", genB, genA)
+	}
+	if _, ok := timers["w1"]; !ok {
+		t.Fatal("incident B did not arm a timer")
+	}
+
+	// Deliver the STALE genA fire buffered from incident A. It must be a no-op:
+	// B's window (1h) has NOT elapsed, so finalising now would be premature.
+	c.onFire(context.Background(), firedSignal{wid: "w1", gen: genA}, timers, pendings, finalised)
+	if got := pub.count(); got != 0 {
+		t.Fatalf("stale gen-A fire published %d events across a CLEAN cycle, want 0 (premature finalisation of incident B)", got)
+	}
+	if _, ok := timers["w1"]; !ok {
+		t.Fatal("stale fire orphaned incident B's live timer (must not delete timers[wid] on a stale fire)")
+	}
+
+	// B's own (live genB) fire finalises exactly once, for B's candidate.
+	c.onFire(context.Background(), firedSignal{wid: "w1", gen: genB}, timers, pendings, finalised)
+	if got := pub.count(); got != 1 {
+		t.Fatalf("live gen-B fire published %d events, want exactly 1", got)
+	}
+	if evt := pub.snapshot()[0]; evt.FinalState != string(schema.StateQuarantined) {
+		t.Errorf("finalised candidate = %q, want QUARANTINED (incident B's candidate)", evt.FinalState)
 	}
 }
 
