@@ -90,20 +90,27 @@ type listClient interface {
 //   - Dropped counts entries dropped to honour the bounded-queue cap
 //     (olaitan_report_writes_dropped_total{reason}).
 //   - Writes is the shared olaitan_report_writes_total{result} counter; the drain
-//     records result=drained on a successful re-PUT, deduped on a HEAD-dedup, and
-//     error on a dead-lettered permanent failure.
+//     records deduped on a HEAD-dedup and error on a dead-lettered permanent
+//     failure. (Story 4.9 BI-5: result="drained" is RETIRED here; a successful
+//     re-PUT now increments the dedicated Drained counter instead.)
+//   - Drained is the dedicated olaitan_report_writes_deferred_drained_total
+//     counter (Story 4.9 AC2/BI-5): the SINGLE source of truth for a successfully
+//     re-PUT deferred report. A confirmed (non-deduped) drain increments this and
+//     no longer touches the shared writes counter, so a drain is never
+//     double-counted.
 type Metrics struct {
 	Deferred prometheus.Gauge
 	Dropped  *prometheus.CounterVec
 	Writes   *prometheus.CounterVec
+	Drained  prometheus.Counter
 }
 
 // Write-outcome label values the drain worker records on the shared
-// olaitan_report_writes_total{result} counter (BI-5). drained marks a deferred
-// report successfully re-PUT; deduped a HEAD-dedup no-op; error a dead-lettered
-// permanent failure.
+// olaitan_report_writes_total{result} counter. deduped marks a HEAD-dedup no-op;
+// error a dead-lettered permanent failure. (Story 4.9 BI-5: the "drained" value
+// is RETIRED from the shared counter; a confirmed re-PUT increments the dedicated
+// Drained counter instead, so a drain is counted in exactly one place.)
 const (
-	writeResultDrained = "drained"
 	writeResultDeduped = "deduped"
 	writeResultError   = "error"
 )
@@ -356,11 +363,18 @@ func (d *DeferredDrainer) drain(ctx context.Context) {
 				"key", env.Key, "incident_id", env.IncidentID, "err", cerr)
 			return
 		}
-		result := writeResultDrained
+		// Story 4.9 (AC2, BI-5): a confirmed (non-deduped) re-PUT increments the
+		// dedicated Drained counter (the single source of truth for drains); the
+		// retired result="drained" value is NO LONGER recorded on the shared writes
+		// counter. A HEAD-deduped drain stays result="deduped" on the shared counter
+		// (a distinct outcome, not a drain).
+		result := "drained"
 		if receipt.Deduped {
 			result = writeResultDeduped
+			d.queue.metric.Writes.WithLabelValues(writeResultDeduped).Inc()
+		} else {
+			d.queue.metric.Drained.Inc()
 		}
-		d.queue.metric.Writes.WithLabelValues(result).Inc()
 		d.queue.metric.Deferred.Dec()
 		d.log.Info("deferq: deferred report drained to durable archive",
 			"key", receipt.Key, "incident_id", env.IncidentID, "result", result)

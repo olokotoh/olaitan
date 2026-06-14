@@ -132,8 +132,13 @@ func TestWriteReport_DefersBeyondBudget(t *testing.T) {
 	// decrements the gauge to zero.
 	flaky.SetFailFor(0)
 	dr.DrainOnce(ctx)
-	if got := writeCount(t, a, "drained"); got != 1 {
-		t.Errorf("the drain must count drained, got %v", got)
+	// Story 4.9 (BI-5): a confirmed drain Inc's the dedicated drained counter; the
+	// shared writes counter no longer carries a result="drained" value.
+	if got := drainedCount(t, a); got != 1 {
+		t.Errorf("the drain must count the dedicated drained counter, got %v", got)
+	}
+	if got := writeCount(t, a, "drained"); got != 0 {
+		t.Errorf("the shared writes{result=drained} value is retired, got %v", got)
 	}
 	if got := testutilGauge(t, a); got != 0 {
 		t.Errorf("deferred-depth gauge after drain = %v, want 0", got)
