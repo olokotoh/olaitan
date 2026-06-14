@@ -105,7 +105,7 @@ func TestNewNATSReportPublisher_NilClient(t *testing.T) {
 
 // TestNewDFIR_NilProvider covers the nil-provider construction guard.
 func TestNewDFIR_NilProvider(t *testing.T) {
-	if _, err := NewDFIR(nil, PromptSpec{}, nil, nil, nil, nil, nil); err == nil {
+	if _, err := NewDFIR(nil, PromptSpec{}, nil, nil, nil, nil, nil, nil); err == nil {
 		t.Fatal("a nil provider must be a construction error")
 	}
 }

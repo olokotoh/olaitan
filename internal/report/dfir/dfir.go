@@ -17,6 +17,7 @@ import (
 
 	"github.com/olokotoh/olaitan/internal/agent/provider"
 	"github.com/olokotoh/olaitan/internal/metrics"
+	"github.com/olokotoh/olaitan/internal/report/archive"
 	"github.com/olokotoh/olaitan/internal/report/redact"
 	"github.com/olokotoh/olaitan/internal/response/settling"
 	"github.com/olokotoh/olaitan/internal/schema"
@@ -43,6 +44,18 @@ const (
 	statusSuccess         = "success"
 	statusUnavailable     = "unavailable"
 	statusSchemaViolation = "schema_violation"
+)
+
+// Write-outcome label values for the Story 4.6 durable-report-write metric
+// (olaitan_report_writes_total{result}). The names align with the Story 4.7 AC4
+// metric set so 4.7 extends rather than renames them (BI-8). A durable write is
+// success; a HEAD-detected dedup no-op is deduped; a fail-loud durable-write
+// error is error (PO ratification 6: fail loud + audit + metric, no inline
+// retry, no deferred queue -- that is Story 4.7).
+const (
+	writeResultSuccess = "success"
+	writeResultDeduped = "deduped"
+	writeResultError   = "error"
 )
 
 // dfirSchemaAttempts is the TOTAL number of provider attempts on a schema
@@ -144,11 +157,25 @@ type Agent struct {
 	// off-by-default audit path or a degraded wiring); the redaction itself still
 	// runs and the redacted bytes are still what gets SHA'd/announced (BI-8).
 	redactSink *redact.RedactionAuditSink
-	schema     *jsonschema.Schema
-	gen        *prometheus.CounterVec
-	genSecs    prometheus.Histogram
-	log        *slog.Logger
-	now        func() time.Time
+	// archive is the Story 4.6 durable report writer (FR45): the backend-neutral
+	// ReportArchive the agent PUTs the redacted, content-addressed report bytes
+	// to INLINE in Generate, after redaction + the SHA (BI-3). It MAY be nil (the
+	// off-by-default report-archive path or a degraded wiring): a nil archive
+	// leaves the agent generating + announcing without the durable write, exactly
+	// the 4.4/4.5 behaviour. The agent depends on the INTERFACE, not on minio-go
+	// (BI-1).
+	archive archive.ReportArchive
+	schema  *jsonschema.Schema
+	gen     *prometheus.CounterVec
+	genSecs prometheus.Histogram
+	// writes counts durable-report-write outcomes (Story 4.6, result
+	// success/deduped/error) and writeSecs observes the write tail against NFR7's
+	// 10s end-to-end p99 (BI-8). Both are nil only when no registry was supplied
+	// (the constructor surfaces a registration error otherwise).
+	writes    *prometheus.CounterVec
+	writeSecs prometheus.Histogram
+	log       *slog.Logger
+	now       func() time.Time
 	// seen tracks finalisations already reported this process, keyed on
 	// settling.FinalisedMsgID, so a JetStream redelivery does not emit a second
 	// report (BI-10 consumer-side idempotency; the LimitsPolicy stream can
@@ -206,8 +233,11 @@ func (a *Agent) currentSpec() PromptSpec {
 // provider selection is the wiring layer's job, mirroring NewL1/NewSenior). The
 // reports publisher and audit recorder are the AC5 emission seams; either may be
 // nil in a degraded wiring (the agent still generates and renders, just does not
-// announce/audit). It registers (or re-uses) the DFIR generation metric family.
-func NewDFIR(p provider.Provider, spec PromptSpec, reports ReportPublisher, audit AuditRecorder, redactSink *redact.RedactionAuditSink, reg *metrics.Registry, log *slog.Logger) (*Agent, error) {
+// announce/audit). The reportArchive is the Story 4.6 durable writer (FR45): a
+// nil archive leaves the agent generating + announcing without the durable write
+// (the off-by-default report-archive path; BI-3). It registers (or re-uses) the
+// DFIR generation metric family plus the Story 4.6 report-write metrics.
+func NewDFIR(p provider.Provider, spec PromptSpec, reports ReportPublisher, audit AuditRecorder, redactSink *redact.RedactionAuditSink, reportArchive archive.ReportArchive, reg *metrics.Registry, log *slog.Logger) (*Agent, error) {
 	if p == nil {
 		return nil, errors.New("dfir: nil provider")
 	}
@@ -233,14 +263,34 @@ func NewDFIR(p provider.Provider, spec PromptSpec, reports ReportPublisher, audi
 	if err != nil {
 		return nil, fmt.Errorf("dfir: generation-latency metric: %w", err)
 	}
+	// Story 4.6 durable-report-write metrics (AC5, BI-8). The result-labelled
+	// counter and the duration histogram instrument the S3 PUT tail on the same
+	// synchronous span as the generation metric, so the end-to-end
+	// generation-to-S3 latency is observable against NFR7's 10s p99. The names
+	// align with the Story 4.7 AC4 set (4.7 extends, not renames).
+	writes, err := reg.RegisterCounterVec("olaitan_report_writes_total",
+		"DFIR durable report-write outcomes by result {success, deduped, error} (Story 4.6 FR45).",
+		[]string{"result"})
+	if err != nil {
+		return nil, fmt.Errorf("dfir: report-write metric: %w", err)
+	}
+	writeSecs, err := reg.RegisterHistogram("olaitan_report_write_duration_seconds", "",
+		"DFIR durable report-write latency in seconds, from PUT start to confirmed write (Story 4.6, the NFR7 p99 <= 10s end-to-end write tail).",
+		nil, prometheus.DefBuckets)
+	if err != nil {
+		return nil, fmt.Errorf("dfir: report-write-latency metric: %w", err)
+	}
 	a := &Agent{
 		provider:   p,
 		reports:    reports,
 		audit:      audit,
 		redactSink: redactSink,
+		archive:    reportArchive,
 		schema:     sch,
 		gen:        gen,
 		genSecs:    genSecs,
+		writes:     writes,
+		writeSecs:  writeSecs,
 		log:        log,
 		now:        func() time.Time { return time.Now().UTC() },
 		seen:       make(map[string]struct{}),
@@ -305,20 +355,30 @@ func (a *Agent) Generate(ctx context.Context, inc Incident) (rendered string, re
 	a.markSeen(msgID)
 	a.record(statusSuccess, inc, spec, latency)
 
-	// Announce on REPORTS.generated (AC5). The URL is the COMPUTED
-	// content-addressed key (OA4); the durable write is Story 4.6. SHA-OF-
-	// REDACTED-BYTES (Story 4.5 BI-4, PO OA1 RATIFIED): rendered is now the
+	// SHA-OF-REDACTED-BYTES (Story 4.5 BI-4, PO OA1 RATIFIED): rendered is now the
 	// redacted artifact, so reportSHA256 and the content-addressed key
 	// content-address the REDACTED bytes actually persisted (identical to the 4.4
-	// render when the model surfaced no secret).
+	// render when the model surfaced no secret). The key is computed ONCE here and
+	// is the SAME value the durable PUT writes under and the REPORTS.generated
+	// announce references (BI-2): 4.6 NEVER recomputes or re-partitions it.
+	sha := reportSHA256(rendered)
+	key := contentAddressedKey(report.ReportGeneratedAt, sha)
+
+	// Story 4.6 durable write (AC1, BI-3): PUT the REDACTED rendered bytes to the
+	// report archive INLINE on the synchronous NFR7 span, after redaction + the
+	// SHA, under the content-addressed key. A nil archive (off-by-default) is a
+	// no-op write; the agent still announces (the 4.4/4.5 behaviour).
+	a.writeReport(ctx, key, rendered, report.IncidentID)
+
+	// Announce on REPORTS.generated (AC5). The URL is the COMPUTED
+	// content-addressed key (OA4) the durable write used above.
 	if a.reports != nil {
-		sha := reportSHA256(rendered)
 		evt := ReportGenerated{
 			SchemaVersion: SchemaVersionReportGenerated,
 			IncidentID:    report.IncidentID,
 			WorkloadID:    inc.Event.WorkloadID,
 			ReportSHA256:  sha,
-			ReportURL:     contentAddressedKey(report.ReportGeneratedAt, sha),
+			ReportURL:     key,
 			FinalFSMState: report.FinalFSMState,
 			GeneratedAt:   report.ReportGeneratedAt,
 		}
@@ -330,6 +390,53 @@ func (a *Agent) Generate(ctx context.Context, inc Incident) (rendered string, re
 		}
 	}
 	return rendered, true, nil
+}
+
+// writeReport PUTs the redacted, content-addressed report bytes to the durable
+// report archive (Story 4.6 AC1, FR45) and instruments the write outcome +
+// latency (AC5, BI-8). It is the INLINE write seam on the synchronous NFR7 span:
+// the redacted bytes only exist in-process here (BI-3), so the write is
+// synchronous, not a decoupled REPORTS.generated consumer.
+//
+// FAIL LOUD + AUDIT + METRIC, NO RETRY (PO ratification 6, BI-9): on a
+// durable-write error the agent logs LOUDLY, increments
+// olaitan_report_writes_total{result="error"}, and continues (the report was
+// already generated and is announced on REPORTS.generated). It does NOT crash
+// the agent, does NOT enqueue a deferred write, and does NOT retry inline -- the
+// Redis-backed deferred queue + retry is Story 4.7. A 4.6-only deployment
+// accepts a known data-loss window on a hard S3 outage, closed by 4.7 (Open
+// Assumption 4). A HEAD-detected dedup no-op (AC2) is the deduped result.
+//
+// A nil archive is a no-op (the off-by-default report-archive path): no write,
+// no metric, the agent still announces.
+func (a *Agent) writeReport(ctx context.Context, key, rendered, incidentID string) {
+	if a.archive == nil {
+		return
+	}
+	start := time.Now()
+	receipt, werr := a.archive.Put(ctx, key, []byte(rendered), archive.PutOptions{})
+	a.writeSecs.Observe(time.Since(start).Seconds())
+	if werr != nil {
+		// Fail loud: log + count the error. The report is NOT durably stored
+		// until Story 4.7's deferred queue catches up; do not crash, do not retry.
+		a.writes.WithLabelValues(writeResultError).Inc()
+		a.log.Error("dfir: durable report write failed (fail-loud, no retry; Story 4.7 owns the deferred queue)",
+			"incident_id", incidentID, "key", key, "err", werr)
+		return
+	}
+	result := writeResultSuccess
+	if receipt.Deduped {
+		result = writeResultDeduped
+	}
+	a.writes.WithLabelValues(result).Inc()
+	a.log.Info("dfir: durable report write",
+		"incident_id", incidentID,
+		"key", receipt.Key,
+		"bucket", receipt.Bucket,
+		"result", result,
+		"size", receipt.Size,
+		"retain_until", receipt.RetainUntil.Format(time.RFC3339),
+	)
 }
 
 // redactReport runs the Story 4.5 persistence-side redaction over the report's

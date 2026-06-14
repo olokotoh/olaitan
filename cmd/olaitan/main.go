@@ -59,6 +59,7 @@ import (
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
 	"github.com/olokotoh/olaitan/internal/ratelimit"
 	redisclient "github.com/olokotoh/olaitan/internal/redis"
+	"github.com/olokotoh/olaitan/internal/report/archive"
 	"github.com/olokotoh/olaitan/internal/report/dfir"
 	reportredact "github.com/olokotoh/olaitan/internal/report/redact"
 	responseaudit "github.com/olokotoh/olaitan/internal/response/audit"
@@ -1393,11 +1394,62 @@ func wireDFIRAgent(cfg *config.Config, apiKey string, promptSet *prompts.Set, nc
 	// the SAME sink the pre-LLM RedactAndAudit path uses. A nil sink (audit
 	// off-by-default) leaves the persistence redaction running with no audit
 	// emission, exactly as the LLM-bound nil-sink path.
-	agent, aerr := dfir.NewDFIR(p, dfirPromptSpec(promptSet), reportPub, recorder, sink, reg, log)
+	// Story 4.6: construct the durable report archive (FR45) when
+	// response.report_archive.enabled=true and inject it INLINE into the DFIR
+	// agent (BI-3). A nil archive (off-by-default, or a degraded wiring) leaves
+	// the agent generating + announcing without the durable write, exactly the
+	// 4.4/4.5 behaviour.
+	reportArchive, rarErr := wireReportArchive(cfg, log)
+	if rarErr != nil {
+		return nil, fmt.Errorf("dfir report archive: %w", rarErr)
+	}
+	agent, aerr := dfir.NewDFIR(p, dfirPromptSpec(promptSet), reportPub, recorder, sink, reportArchive, reg, log)
 	if aerr != nil {
 		return nil, fmt.Errorf("dfir agent: %w", aerr)
 	}
 	return agent, nil
+}
+
+// wireReportArchive constructs the Story 4.6 durable report writer (FR45) from
+// response.report_archive when it is enabled. It returns (nil, nil) when the
+// archive is disabled (off-by-default), so wireDFIRAgent injects a nil archive
+// and the DFIR agent generates + announces without the durable write (the
+// 4.4/4.5 behaviour). The S3 access/secret keys are the NFR8 secret-via-env
+// pattern (S3_ACCESS_KEY / S3_SECRET_KEY, the REDIS_PASSWORD precedent;
+// TrimRight guards the trailing-newline secretKeyRef pitfall), shared with the
+// Story 4.2 forensics path, so credentials never sit in a ConfigMap. The writer
+// is the backend-neutral archive.ReportArchive interface; the S3-compatible
+// archive.S3Archive applies SSE-KMS + per-object object-lock retention in the
+// configured mode (GOVERNANCE default, Helm-tunable to COMPLIANCE; default 90-day
+// retention). The bucket (object-lock-enabled + versioned) is an operator/Helm
+// precondition; the writer never creates it.
+func wireReportArchive(cfg *config.Config, log *slog.Logger) (archive.ReportArchive, error) {
+	ra := cfg.Response.ReportArchive
+	if !ra.EnabledOrDefault() {
+		return nil, nil
+	}
+	accessKey := strings.TrimRight(os.Getenv("S3_ACCESS_KEY"), "\r\n")
+	secretKey := strings.TrimRight(os.Getenv("S3_SECRET_KEY"), "\r\n")
+	if accessKey == "" || secretKey == "" {
+		return nil, fmt.Errorf("NFR8: S3_ACCESS_KEY and S3_SECRET_KEY env vars are required when response.report_archive.enabled=true")
+	}
+	arch, err := archive.NewS3Archive(archive.S3Config{
+		Endpoint:      ra.S3Endpoint,
+		AccessKey:     accessKey,
+		SecretKey:     secretKey,
+		Bucket:        ra.S3Bucket,
+		Region:        ra.S3Region,
+		UseSSL:        ra.S3UseSSLOrDefault(),
+		KMSKeyAlias:   ra.KMSKeyAlias,
+		RetentionDays: ra.RetentionDaysOrDefault(),
+		Mode:          archive.RetentionMode(ra.ObjectLockModeOrDefault()),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("s3 report archive: %w", err)
+	}
+	log.Info("report archive enabled (Story 4.6, FR45)",
+		"bucket", ra.S3Bucket, "object_lock_mode", ra.ObjectLockModeOrDefault(), "retention_days", ra.RetentionDaysOrDefault())
+	return arch, nil
 }
 
 // dfirPromptSpec builds the DFIR PromptSpec from the loaded prompt set: the

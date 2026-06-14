@@ -881,6 +881,30 @@ response:
   # analyst.dfir_model. Off by default (opt-in).
   dfir:
     enabled: false
+  # Story 4.6: durable report writer (FR45). When enabled, the DFIR agent PUTs
+  # every redacted ForensicReport to an S3-compatible object store under the
+  # content-addressed key, KMS-encrypted, with S3 object lock applied per object
+  # for retentionDays (default 90) in objectLockMode (GOVERNANCE default;
+  # COMPLIANCE for stricter immutable retention). A SEPARATE block from forensics
+  # (different bucket; the report bucket MUST be object-lock-enabled + versioned,
+  # an operator precondition the writer never creates). On a durable-write
+  # failure the writer fails LOUD (a metric) without an inline retry (Story 4.7
+  # owns the deferred queue). Off by default. S3 credentials are NFR8 secrets read
+  # from S3_ACCESS_KEY / S3_SECRET_KEY env vars (wire via secrets.s3AccessKey /
+  # secrets.s3SecretKey), never YAML.
+  #
+  # Least-privilege IAM (AC4): the writer identity gets ONLY s3:PutObject,
+  # s3:PutObjectLegalHold, s3:HeadObject on the report bucket; read access goes to
+  # a SEPARATE olaitan-reporter identity. See docs/iam.md.
+  reportArchive:
+    enabled: false
+    s3Endpoint: ""
+    s3Bucket: ""
+    s3Region: ""
+    s3UseSsl: true
+    kmsKeyAlias: ""
+    retentionDays: 90
+    objectLockMode: GOVERNANCE
 
 # Story 1.19: Evaluation matrix configuration (FR53). One-flag switch
 # that places the chart into one of the canonical evaluation arms (F,
