@@ -630,6 +630,43 @@ data:
     {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.dfir.enabled anchor not found (pattern %q)" $p) }}{{- end }}
     {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $de.enabled) }}
     {{- end }}
+    {{- /*
+    Story 4.6: durable report writer overlay (FR45). Bridges
+    response.reportArchive.{enabled,s3Endpoint,s3Bucket,s3Region,s3UseSsl,
+    kmsKeyAlias,retentionDays,objectLockMode} onto the config/olaitan.yaml
+    response.report_archive block. The enable anchor is disambiguated by the
+    trailing s3_endpoint key so it cannot match another `enabled: false`. The
+    string keys are overlaid with quoted scalars; retention_days is an unquoted
+    integer; object_lock_mode is an unquoted bareword enum (GOVERNANCE/COMPLIANCE).
+    */ -}}
+    {{- $ra := $rsp.reportArchive | default dict }}
+    {{- if hasKey $ra "enabled" }}
+    {{- $p := "(\\n  report_archive:\\n    enabled: )(?:true|false)(\\n    s3_endpoint:)" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.report_archive.enabled anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v${2}" $ra.enabled) }}
+    {{- end }}
+    {{- if hasKey $ra "s3UseSsl" }}
+    {{- $p := "(\\n  report_archive:(?:.|\\n)*?\\n    s3_use_ssl: )(?:true|false)" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.report_archive.s3_use_ssl anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $ra.s3UseSsl) }}
+    {{- end }}
+    {{- range $k, $cfgKey := dict "s3Endpoint" "s3_endpoint" "s3Bucket" "s3_bucket" "s3Region" "s3_region" "kmsKeyAlias" "kms_key_alias" }}
+    {{- if hasKey $ra $k }}
+    {{- $p := printf "(\\n  report_archive:(?:.|\\n)*?\\n    %s: )\"[^\"]*\"" $cfgKey -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.report_archive.%s anchor not found (pattern %q)" $cfgKey $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%q" (index $ra $k)) }}
+    {{- end }}
+    {{- end }}
+    {{- if hasKey $ra "retentionDays" }}
+    {{- $p := "(\\n    retention_days: )[0-9]+" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.report_archive.retention_days anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $ra.retentionDays) }}
+    {{- end }}
+    {{- if hasKey $ra "objectLockMode" }}
+    {{- $p := "(\\n    object_lock_mode: )(?:GOVERNANCE|COMPLIANCE)" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.report_archive.object_lock_mode anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $ra.objectLockMode) }}
+    {{- end }}
     {{- end }}
     {{- /*
     Story 1.19: Evaluation-matrix overlay (FR53). Replace the file-side

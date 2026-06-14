@@ -316,3 +316,63 @@ jobs:
           S3_SECRET_KEY: minioadmin
           S3_BUCKET: olaitan-forensics-it
         run: go test -tags=integration -race -count=1 ./internal/response/forensics/...
+
+  # Story 4.6 (Open Assumption 2): the durable report writer's S3 path is
+  # exercised against a real MinIO (S3-compatible) endpoint via the
+  # //go:build integration suite, on an OBJECT-LOCK-ENABLED, versioned bucket
+  # (the report-archive requirement the forensics bucket does not satisfy), so
+  # the content-addressed PUT / HEAD-dedup-no-op / object-lock-retention / KMS
+  # path is NOT left CI-unexercised. A SIBLING job to forensics-integration with
+  # a distinct bucket (olaitan-reports-it) keeps the two integration boundaries
+  # independent. The suite is env-gated: REPORT_ARCHIVE_INTEGRATION_REQUIRED=1
+  # makes a missing MinIO a hard failure here, while developers without MinIO
+  # locally fall back to the default skip (exit 0).
+  report-archive-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      # MinIO is started as an explicit `docker run` step (see the
+      # forensics-integration job rationale): the official minio/minio image
+      # needs an explicit `server /data ...` command, pinned to a verified
+      # RELEASE tag (never `latest`). MinIO supports object lock + SSE-KMS, so a
+      # single MinIO instance backs the object-lock-enabled report bucket the
+      # suite creates in its TestMain setup.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 -p 9001:9001 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:RELEASE.2025-04-22T22-12-26Z \
+            server /data --console-address :9001
+
+      # Bounded wait-for-ready loop (~30s) polling the MinIO liveness endpoint
+      # before the integration step, so a slow image pull / start does not race
+      # the test (which would otherwise fail-loud under
+      # REPORT_ARCHIVE_INTEGRATION_REQUIRED=1).
+      - name: Wait for MinIO ready
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:9000/minio/health/live >/dev/null 2>&1; then
+              echo "MinIO ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become ready within 30s" >&2
+          docker logs minio || true
+          exit 1
+
+      - name: Report-archive MinIO integration suite
+        env:
+          REPORT_ARCHIVE_INTEGRATION_REQUIRED: "1"
+          S3_ENDPOINT: "127.0.0.1:9000"
+          S3_ACCESS_KEY: minioadmin
+          S3_SECRET_KEY: minioadmin
+          S3_BUCKET: olaitan-reports-it
+        run: go test -tags=integration -race -count=1 ./internal/report/archive/...

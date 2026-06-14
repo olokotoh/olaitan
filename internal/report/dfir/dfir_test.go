@@ -8,8 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/olokotoh/olaitan/internal/agent/provider"
 	"github.com/olokotoh/olaitan/internal/metrics"
+	"github.com/olokotoh/olaitan/internal/report/archive"
 	"github.com/olokotoh/olaitan/internal/response/settling"
 	"github.com/olokotoh/olaitan/internal/schema"
 )
@@ -111,8 +114,16 @@ func testIncident() Incident {
 
 func newAgent(t *testing.T, fp *fakeProvider, rp ReportPublisher, ar AuditRecorder) *Agent {
 	t.Helper()
+	return newAgentWithArchive(t, fp, rp, ar, nil)
+}
+
+// newAgentWithArchive is newAgent plus a Story 4.6 ReportArchive injection (the
+// inline durable-write seam). A nil archive yields the 4.4/4.5 no-write
+// behaviour; a fakeArchive exercises the PUT / HEAD-dedup / write-metric paths.
+func newAgentWithArchive(t *testing.T, fp *fakeProvider, rp ReportPublisher, ar AuditRecorder, arch archive.ReportArchive) *Agent {
+	t.Helper()
 	reg := metrics.NewRegistry()
-	a, err := NewDFIR(fp, PromptSpec{System: "you are the DFIR analyst", Version: "dfir.test.v1"}, rp, ar, nil, reg, nil)
+	a, err := NewDFIR(fp, PromptSpec{System: "you are the DFIR analyst", Version: "dfir.test.v1"}, rp, ar, nil, arch, reg, nil)
 	if err != nil {
 		t.Fatalf("NewDFIR: %v", err)
 	}
@@ -771,6 +782,129 @@ func TestGenerate_ModelPostureFindingsDiscarded(t *testing.T) {
 	}
 	if !strings.Contains(rendered, "No contributing posture finding was recorded for this incident.") {
 		t.Errorf("a nil package posture must render the honest not-recorded posture line\n%s", rendered)
+	}
+}
+
+// writeCount reads the olaitan_report_writes_total{result} counter for a result
+// label off the agent's CounterVec (the Story 4.6 write-outcome metric).
+func writeCount(t *testing.T, a *Agent, result string) float64 {
+	t.Helper()
+	return testutil.ToFloat64(a.writes.WithLabelValues(result))
+}
+
+// TestGenerate_DurableWritePutsRedactedBytes is the Story 4.6 AC1 proof: a
+// generated + redacted report is PUT to the archive INLINE in Generate, under
+// the content-addressed key the REPORTS.generated announce references, carrying
+// the redacted rendered bytes; the write-outcome metric counts success.
+func TestGenerate_DurableWritePutsRedactedBytes(t *testing.T) {
+	fp := &fakeProvider{name: "claude", model: "claude-opus-4-8", resp: provider.Response{Raw: validReportJSON, StopReason: "end_turn", Model: "claude-opus-4-8"}}
+	rp := &fakeReportPublisher{}
+	fa := archive.NewFakeArchive()
+	a := newAgentWithArchive(t, fp, rp, nil, fa)
+
+	rendered, reported, err := a.Generate(context.Background(), testIncident())
+	if err != nil || !reported {
+		t.Fatalf("Generate: reported=%v err=%v", reported, err)
+	}
+	if len(rp.events) != 1 {
+		t.Fatalf("want 1 announce, got %d", len(rp.events))
+	}
+	key := rp.events[0].ReportURL
+	// The archive holds exactly the redacted rendered bytes under the announced
+	// content-addressed key (the PUT and the announce reference the same key).
+	body, ok := fa.Body(key)
+	if !ok {
+		t.Fatalf("no object PUT under the announced key %q (keys=%v)", key, fa.Keys())
+	}
+	if string(body) != rendered {
+		t.Error("the PUT bytes must be the redacted rendered report bytes the announce SHA'd")
+	}
+	if got := writeCount(t, a, writeResultSuccess); got != 1 {
+		t.Errorf("write success counter = %v, want 1", got)
+	}
+}
+
+// TestGenerate_DurableWriteDedup is the Story 4.6 AC2 proof: a second identical
+// report (same content -> same content-addressed key) is a HEAD-detected dedup
+// no-op, counted as deduped, with only ONE durable object written.
+func TestGenerate_DurableWriteDedup(t *testing.T) {
+	fa := archive.NewFakeArchive()
+
+	// Two distinct finalisations that render to byte-identical reports (same
+	// package id / state / time -> same content -> same key). A second agent with
+	// the SHARED archive simulates a redelivery that slipped the per-process
+	// idempotency guard but still content-addresses to the same key.
+	fp1 := &fakeProvider{name: "claude", model: "claude-opus-4-8", resp: provider.Response{Raw: validReportJSON, StopReason: "end_turn", Model: "claude-opus-4-8"}}
+	a1 := newAgentWithArchive(t, fp1, &fakeReportPublisher{}, nil, fa)
+	if _, reported, err := a1.Generate(context.Background(), testIncident()); err != nil || !reported {
+		t.Fatalf("first generate: reported=%v err=%v", reported, err)
+	}
+	if got := writeCount(t, a1, writeResultSuccess); got != 1 {
+		t.Errorf("first write must be a success, got success=%v", got)
+	}
+
+	fp2 := &fakeProvider{name: "claude", model: "claude-opus-4-8", resp: provider.Response{Raw: validReportJSON, StopReason: "end_turn", Model: "claude-opus-4-8"}}
+	a2 := newAgentWithArchive(t, fp2, &fakeReportPublisher{}, nil, fa)
+	if _, reported, err := a2.Generate(context.Background(), testIncident()); err != nil || !reported {
+		t.Fatalf("second generate: reported=%v err=%v", reported, err)
+	}
+	if got := writeCount(t, a2, writeResultDeduped); got != 1 {
+		t.Errorf("the second identical write must be deduped, got deduped=%v", got)
+	}
+	if n := fa.PutCount(); n != 1 {
+		t.Errorf("only ONE durable object must be written for identical content, got %d", n)
+	}
+}
+
+// TestGenerate_DurableWriteErrorIsCountedNonFatal is the Story 4.6 PO
+// ratification 6 proof: a durable-write error is logged + counted (result=error)
+// but does NOT fail Generate (the report was already generated + announced) and
+// does NOT crash the agent. There is NO inline retry (Story 4.7 owns the
+// deferred queue).
+func TestGenerate_DurableWriteErrorIsCountedNonFatal(t *testing.T) {
+	fp := &fakeProvider{name: "claude", model: "claude-opus-4-8", resp: provider.Response{Raw: validReportJSON, StopReason: "end_turn", Model: "claude-opus-4-8"}}
+	rp := &fakeReportPublisher{}
+	fa := archive.NewFakeArchive()
+	fa.PutErr = errors.New("s3 outage")
+	a := newAgentWithArchive(t, fp, rp, nil, fa)
+
+	rendered, reported, err := a.Generate(context.Background(), testIncident())
+	if err != nil {
+		t.Fatalf("a durable-write failure must NOT fail Generate (fail-loud, no crash): %v", err)
+	}
+	if !reported || rendered == "" {
+		t.Fatal("the report was generated; a write failure must not suppress the report/announce")
+	}
+	if len(rp.events) != 1 {
+		t.Errorf("the announce must still fire on a write failure, got %d", len(rp.events))
+	}
+	if got := writeCount(t, a, writeResultError); got != 1 {
+		t.Errorf("the write-error counter must increment, got error=%v", got)
+	}
+	if got := writeCount(t, a, writeResultSuccess); got != 0 {
+		t.Errorf("a failed write must not count success, got success=%v", got)
+	}
+}
+
+// TestGenerate_NilArchiveIsNoOpWrite is the Story 4.6 BI-3 proof: a nil archive
+// (off-by-default) leaves the agent generating + announcing with NO durable
+// write and NO write metric, exactly the 4.4/4.5 behaviour.
+func TestGenerate_NilArchiveIsNoOpWrite(t *testing.T) {
+	fp := &fakeProvider{name: "claude", model: "claude-opus-4-8", resp: provider.Response{Raw: validReportJSON, StopReason: "end_turn", Model: "claude-opus-4-8"}}
+	rp := &fakeReportPublisher{}
+	a := newAgent(t, fp, rp, nil) // nil archive
+
+	_, reported, err := a.Generate(context.Background(), testIncident())
+	if err != nil || !reported {
+		t.Fatalf("Generate: reported=%v err=%v", reported, err)
+	}
+	if len(rp.events) != 1 {
+		t.Errorf("a nil archive must still announce, got %d", len(rp.events))
+	}
+	for _, result := range []string{writeResultSuccess, writeResultDeduped, writeResultError} {
+		if got := writeCount(t, a, result); got != 0 {
+			t.Errorf("a nil archive must record no write metric, got %s=%v", result, got)
+		}
 	}
 }
 

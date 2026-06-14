@@ -1078,6 +1078,16 @@ type ResponseConfig struct {
 	// analyst.dfir_model (the per-role routing convention); this gate only
 	// turns the consumer on or off.
 	DFIR DFIRConfig `yaml:"dfir,omitempty"`
+	// Story 4.6: report_archive sub-block gates the durable report writer
+	// (FR45). When enabled, the DFIR agent PUTs every redacted ForensicReport to
+	// an S3-compatible object store under the content-addressed key, KMS-encrypted,
+	// with S3 object lock for retention_days (default 90) in object_lock_mode
+	// (GOVERNANCE default). A SEPARATE block from forensics (PO Open Assumption 3):
+	// the report and forensic-bundle buckets have different object-lock
+	// requirements. Enabled is pointer-tagged so an explicit `false` survives the
+	// loader; the writer is opt-in and defaults off. The S3 access/secret keys are
+	// NFR8 secrets read from S3_ACCESS_KEY / S3_SECRET_KEY env vars (not YAML).
+	ReportArchive ReportArchiveConfig `yaml:"report_archive,omitempty"`
 }
 
 // DFIRConfig gates the Story 4.4 DFIR forensic-report agent (FR43). It mirrors
@@ -1268,6 +1278,131 @@ func (f ForensicsConfig) validate() error {
 		}
 		if f.KMSKeyAlias == "" {
 			return errors.New("response.forensics.kms_key_alias: required when forensics.enabled=true (the agent applies SSE-KMS per PUT; an empty alias would persist unredacted forensic logs with no agent-applied encryption)")
+		}
+	}
+	return nil
+}
+
+// ReportArchiveConfig configures the Story 4.6 durable report writer (FR45).
+// When enabled, the DFIR agent PUTs every redacted ForensicReport to an
+// S3-compatible object store under the content-addressed key Story 4.4 computed,
+// KMS-encrypted, with S3 object lock applied per object for RetentionDays (the
+// Helm-tunable retention period, default 90) in ObjectLockMode (GOVERNANCE
+// default, Helm-tunable to COMPLIANCE; PO ratification 5).
+//
+// This is a SEPARATE block from ForensicsConfig (PO Open Assumption 3): the
+// report archive and the forensic-bundle uploader are different buckets with
+// different object-lock requirements (the report bucket MUST be
+// object-lock-enabled; the forensic bucket is not). Enabled is pointer-tagged so
+// an explicit `false` survives the loader (the ForensicsConfig.Enabled
+// precedent); the default is OFF (opt-in). The S3 access/secret keys are NOT in
+// this struct: they are read from the S3_ACCESS_KEY / S3_SECRET_KEY environment
+// variables at wiring time (the REDIS_PASSWORD secret-via-env precedent, NFR8),
+// shared with the forensics path, so credentials never sit in a YAML file or
+// ConfigMap.
+type ReportArchiveConfig struct {
+	Enabled        *bool  `yaml:"enabled,omitempty"`
+	S3Endpoint     string `yaml:"s3_endpoint,omitempty"`
+	S3Bucket       string `yaml:"s3_bucket,omitempty"`
+	S3Region       string `yaml:"s3_region,omitempty"`
+	S3UseSSL       *bool  `yaml:"s3_use_ssl,omitempty"`
+	KMSKeyAlias    string `yaml:"kms_key_alias,omitempty"`
+	RetentionDays  *int   `yaml:"retention_days,omitempty"`
+	ObjectLockMode string `yaml:"object_lock_mode,omitempty"`
+}
+
+// DefaultReportArchiveRetentionDays is the Story 4.6 object-lock retention
+// default (FR45, PO ratification 5): 90 days.
+const DefaultReportArchiveRetentionDays = 90
+
+// DefaultReportArchiveObjectLockMode is the Story 4.6 object-lock mode default
+// (PO ratification 5): GOVERNANCE, so an operator with the audited
+// BypassGovernanceRetention permission can correct a mis-write while a normal
+// delete is defeated. COMPLIANCE is the stricter posture for regulated
+// deployments.
+const DefaultReportArchiveObjectLockMode = "GOVERNANCE"
+
+// DefaultReportArchive returns the Story 4.6 defaults: disabled, TLS on for the
+// S3 endpoint (production object stores are TLS; a local MinIO sets s3_use_ssl
+// false explicitly), 90-day retention, GOVERNANCE object-lock mode.
+func DefaultReportArchive() ReportArchiveConfig {
+	enabled := false
+	useSSL := true
+	days := DefaultReportArchiveRetentionDays
+	return ReportArchiveConfig{
+		Enabled:        &enabled,
+		S3UseSSL:       &useSSL,
+		RetentionDays:  &days,
+		ObjectLockMode: DefaultReportArchiveObjectLockMode,
+	}
+}
+
+// EnabledOrDefault reports whether the report archive is enabled, treating a nil
+// pointer as the default (false).
+func (r ReportArchiveConfig) EnabledOrDefault() bool {
+	if r.Enabled == nil {
+		return false
+	}
+	return *r.Enabled
+}
+
+// S3UseSSLOrDefault reports whether the S3 endpoint is reached over TLS,
+// defaulting to true (production) when omitted.
+func (r ReportArchiveConfig) S3UseSSLOrDefault() bool {
+	if r.S3UseSSL == nil {
+		return true
+	}
+	return *r.S3UseSSL
+}
+
+// RetentionDaysOrDefault returns the configured object-lock retention period in
+// days, defaulting to 90 when omitted or non-positive.
+func (r ReportArchiveConfig) RetentionDaysOrDefault() int {
+	if r.RetentionDays == nil || *r.RetentionDays <= 0 {
+		return DefaultReportArchiveRetentionDays
+	}
+	return *r.RetentionDays
+}
+
+// ObjectLockModeOrDefault returns the configured object-lock mode, defaulting to
+// GOVERNANCE when omitted.
+func (r ReportArchiveConfig) ObjectLockModeOrDefault() string {
+	if r.ObjectLockMode == "" {
+		return DefaultReportArchiveObjectLockMode
+	}
+	return r.ObjectLockMode
+}
+
+// validate enforces ReportArchiveConfig invariants: when the archive is
+// explicitly enabled, the S3 endpoint, bucket, and SSE-KMS key alias are all
+// required, retention_days (when set) must be positive, and object_lock_mode
+// (when set) must be GOVERNANCE or COMPLIANCE. A fully-omitted block skips
+// validation so in-memory fixtures can leave it zero.
+//
+// kms_key_alias is required-when-enabled (the ForensicsConfig precedent): the
+// writer skips the SSE-KMS PUT directive when the alias is empty, so an
+// enabled-archive deployment without an alias would persist reports with no
+// agent-applied SSE-KMS (relying only on a bucket-default SSE that may not
+// exist). Fail-fast at config load rather than silently shipping
+// plaintext-at-the-agent reports. The guard is at the config boundary only; the
+// S3Archive itself still accepts an empty alias so the no-KES MinIO integration
+// test can construct it directly.
+func (r ReportArchiveConfig) validate() error {
+	if r.RetentionDays != nil && *r.RetentionDays < 1 {
+		return fmt.Errorf("response.report_archive.retention_days: must be >= 1 (got %d)", *r.RetentionDays)
+	}
+	if r.ObjectLockMode != "" && r.ObjectLockMode != "GOVERNANCE" && r.ObjectLockMode != "COMPLIANCE" {
+		return fmt.Errorf("response.report_archive.object_lock_mode: must be GOVERNANCE or COMPLIANCE (got %q)", r.ObjectLockMode)
+	}
+	if r.Enabled != nil && *r.Enabled {
+		if r.S3Endpoint == "" {
+			return errors.New("response.report_archive.s3_endpoint: required when report_archive.enabled=true")
+		}
+		if r.S3Bucket == "" {
+			return errors.New("response.report_archive.s3_bucket: required when report_archive.enabled=true")
+		}
+		if r.KMSKeyAlias == "" {
+			return errors.New("response.report_archive.kms_key_alias: required when report_archive.enabled=true (the writer applies SSE-KMS per PUT; an empty alias would persist reports with no agent-applied encryption)")
 		}
 	}
 	return nil
@@ -2070,6 +2205,26 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
+	// Story 4.6: substitute the report-archive defaults so an omitted Enabled
+	// stays off, an omitted s3_use_ssl defaults to TLS-on (production), an omitted
+	// retention defaults to 90 days, and an omitted object-lock mode defaults to
+	// GOVERNANCE.
+	{
+		defArchive := DefaultReportArchive()
+		if cfg.Response.ReportArchive.Enabled == nil {
+			cfg.Response.ReportArchive.Enabled = defArchive.Enabled
+		}
+		if cfg.Response.ReportArchive.S3UseSSL == nil {
+			cfg.Response.ReportArchive.S3UseSSL = defArchive.S3UseSSL
+		}
+		if cfg.Response.ReportArchive.RetentionDays == nil {
+			cfg.Response.ReportArchive.RetentionDays = defArchive.RetentionDays
+		}
+		if cfg.Response.ReportArchive.ObjectLockMode == "" {
+			cfg.Response.ReportArchive.ObjectLockMode = defArchive.ObjectLockMode
+		}
+	}
+
 	// Story 3.1: substitute the redact defaults so an enabled redact block with
 	// an omitted retention inherits the 365 d default, and an omitted
 	// AuditEnabled stays off (redaction itself is always on, BI-7).
@@ -2291,6 +2446,9 @@ func (r ResponseConfig) validate() error {
 		return err
 	}
 	if err := r.DFIR.validate(); err != nil {
+		return err
+	}
+	if err := r.ReportArchive.validate(); err != nil {
 		return err
 	}
 	return nil

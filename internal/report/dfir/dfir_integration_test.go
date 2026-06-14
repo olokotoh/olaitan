@@ -149,7 +149,7 @@ func drainReports(t *testing.T, c *natsclient.Client, want int, within time.Dura
 func runAgent(t *testing.T, c *natsclient.Client, fp provider.Provider, reports ReportPublisher, audit AuditRecorder) func() {
 	t.Helper()
 	reg := metrics.NewRegistry()
-	a, err := NewDFIR(fp, PromptSpec{System: "dfir", Version: "dfir.it.v1"}, reports, audit, nil, reg, discardLog())
+	a, err := NewDFIR(fp, PromptSpec{System: "dfir", Version: "dfir.it.v1"}, reports, audit, nil, nil, reg, discardLog())
 	if err != nil {
 		t.Fatalf("NewDFIR: %v", err)
 	}
@@ -257,7 +257,7 @@ func TestIntegration_ScenarioTechniques(t *testing.T) {
 		t.Run(scen, func(t *testing.T) {
 			fp := &fakeProvider{name: "claude", model: "claude-opus-4-8", resp: provider.Response{Raw: validReportJSON, StopReason: "end_turn"}}
 			reg := metrics.NewRegistry()
-			a, err := NewDFIR(fp, PromptSpec{System: "dfir", Version: "dfir.it.v1"}, &fakeReportPublisher{}, nil, nil, reg, discardLog())
+			a, err := NewDFIR(fp, PromptSpec{System: "dfir", Version: "dfir.it.v1"}, &fakeReportPublisher{}, nil, nil, nil, reg, discardLog())
 			if err != nil {
 				t.Fatalf("NewDFIR: %v", err)
 			}
