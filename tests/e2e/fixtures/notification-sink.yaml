@@ -1,0 +1,71 @@
+# Story 4.10 (AC4, BI-6): the in-cluster notification SINK fixture for the
+# forensics RSLT-full + forensics kind e2e smoke. The webhook deliverer
+# (Story 4.8) POSTs one operator-facing JSON alert per confirmed-incident
+# report announcement; this sink receives it so the e2e can assert the POST
+# landed. It runs a minimal request-echo HTTP server that logs every received
+# request body to stdout, so the smoke test verifies delivery by polling the
+# sink pod's logs for the expected workload_id / report_url payload.
+#
+# Applied by `make e2e-local-forensics` BEFORE the chart install; the chart's
+# notifications.webhook_url facade is pointed at http://notification-sink:8080
+# so the deliverer's POST is captured in-cluster with no external egress.
+#
+# NOTE (honest gating, PO Ratification 4): this fixture + the
+# forensics_smoke_test.go that drives it are the AC4 TEST CODE. The live kind
+# RUN is folded into the carry-forward Epic-3-retro A1 RSLT-full-kind gate
+# before Epic 5 (there is no e2e-rslt CI job yet). The default CI e2e job is
+# RS-arm only and does NOT apply this fixture.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-sink
+  labels:
+    app: notification-sink
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: notification-sink
+  template:
+    metadata:
+      labels:
+        app: notification-sink
+    spec:
+      containers:
+        - name: notification-sink
+          # mendhak/http-https-echo echoes every request (method, headers,
+          # body) to stdout as JSON; the smoke test reads the pod logs to
+          # confirm the webhook POST arrived with the expected payload.
+          image: mendhak/http-https-echo:31
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: HTTP_PORT
+              value: "8080"
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 1
+            periodSeconds: 2
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notification-sink
+  labels:
+    app: notification-sink
+spec:
+  selector:
+    app: notification-sink
+  ports:
+    - port: 8080
+      targetPort: 8080

@@ -206,6 +206,12 @@ stringData:
   # Story 4.8 (NFR8): the OPTIONAL incident notification webhook URL (a
   # Slack/PagerDuty URL embeds a token). Consumed by internal/report/notify when
   # response.notifications.enabled=true. Empty -> the webhook is not wired.
+  #
+  # Story 4.10 (BI-3): the operator-facing facade notifications.webhook_url
+  # OVERLAYS secrets.notificationsWebhookUrl here (facade WINS when set), so
+  # the secret -> NOTIFICATIONS_WEBHOOK_URL env projection (deployment.yaml)
+  # carries the facade value. A non-empty facade value takes precedence; an
+  # empty facade value falls back to the secrets.* value (and empty -> "").
   notifications-webhook-url: ""
 ---
 apiVersion: v1
@@ -900,7 +906,7 @@ data:
       settling:
         enabled: false
         window_seconds: 60
-        retention_days: 90
+        retention_days: 365
       # Story 4.4: DFIR forensic-report agent (FR43). When enabled, a durable
       # JetStream consumer on INCIDENTS.finalised produces an analyst-grade
       # ForensicReport (Markdown with YAML front-matter) via the LLM provider and

@@ -178,6 +178,30 @@ error rather than silent runtime trap).
 {{- end -}}
 
 {{/*
+olaitan.forensics.validatePath -- Story 4.10 (BI-2) fail-fast guard for the
+forensics.path facade knob. Invoked once from configmap.yaml. Returns the
+empty string on success; calls fail with a clear message on an unimplemented
+or unknown path.
+
+Story 1.4 REJECTED CRIU (ADR-2026-05-02-01: containerd 1.7 lacks the
+CheckpointContainer CRI RPC; the kernel vDSO blocker) and Story 4.2 shipped
+ONLY the documented kubectl-logs fallback. "fallback" (and an empty value)
+pass; "criu" fails with the rejection message; any other value fails with the
+valid-values message. A hard template-time reject is the honest, fail-fast
+posture: a silent no-op (or a warn-but-proceed) would let an operator believe
+a CRIU capture is wired when only the fallback runs.
+*/}}
+{{- define "olaitan.forensics.validatePath" -}}
+{{- $fac := default (dict) .Values.forensics -}}
+{{- $path := default "fallback" $fac.path -}}
+{{- if eq $path "criu" -}}
+{{- fail "CRIU forensic path is not implemented (Story 1.4 rejected it per ADR-2026-05-02-01: containerd 1.7 lacks CheckpointContainer; substrate bump required). Use forensics.path=fallback." -}}
+{{- else if not (or (eq $path "fallback") (eq $path "")) -}}
+{{- fail (printf "forensics.path must be one of [\"fallback\", \"criu\"] (got %q). Only \"fallback\" is implemented; \"criu\" is rejected per ADR-2026-05-02-01." $path) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 olaitan.evaluation.effectiveRulesEnabled -- returns the literal string
 "true" or "false" for the rendered olaitan.yaml. Receiver is the regex
 bridge which compares against the literal text, not a Go bool.

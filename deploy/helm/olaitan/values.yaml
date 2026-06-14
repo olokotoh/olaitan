@@ -948,6 +948,71 @@ response:
     retryMaxSeconds: 30
     timeoutSeconds: 5
 
+# Story 4.10 (FR47): the operator-facing forensic-mode VALUES FACADE.
+#
+# Epic 4 shipped its config incrementally as four scattered blocks under
+# response.* above (response.forensics, response.settling,
+# response.reportArchive, response.notifications) plus the
+# secrets.notificationsWebhookUrl secret. The facade below is a THIN,
+# CONSOLIDATED convenience surface carrying the seven AC2 knobs an operator
+# touches most: it OVERLAYS the underlying response.* render LAST in
+# configmap.yaml, so a facade value WINS over its response.* counterpart when
+# both are set. The response.* blocks are KEPT as the advanced escape hatch
+# (an operator needing DISTINCT bundle/report buckets, the deferred-queue
+# knobs, or object_lock_mode drops to them directly).
+#
+# IMPORTANT: the facade sets PARAMETERS only; it carries NO master enable for
+# forensic capture. The four capture/settling/dfir/report controllers are
+# still enabled via the response.* gates (response.forensics.enabled,
+# response.settling.enabled, response.dfir.enabled,
+# response.reportArchive.enabled). notifications.enabled below is the one
+# facade-level gate (it maps to response.notifications.enabled). See
+# deploy/helm/README.md for the full "enable the four gates + set the facade
+# params" recipe.
+forensics:
+  # FR47 forensic capture path. Story 1.4 REJECTED CRIU (ADR-2026-05-02-01:
+  # containerd 1.7 lacks the CheckpointContainer CRI RPC, and CRIU fails on the
+  # kernel vDSO layout) and Story 4.2 shipped ONLY the documented kubectl-logs
+  # fallback (logs incl. --previous, pod spec/status/events). "fallback" is the
+  # ONLY implemented path: the chart REJECTS forensics.path=criu at template
+  # time with a helpful message rather than silently running the fallback under
+  # a criu label. Forward-compat declaration only: it bridges to NO config
+  # field (ForensicsConfig has no Path; the controller runs the fallback
+  # unconditionally when response.forensics.enabled=true). Empty -> fallback.
+  path: fallback
+  s3:
+    # The S3 bucket name. FANS OUT to BOTH the forensic-BUNDLE bucket
+    # (response.forensics.s3Bucket) AND the durable-REPORT bucket
+    # (response.report_archive.s3Bucket) -- the common single-bucket operator
+    # case. An operator needing distinct buckets sets the two response.* keys
+    # directly. Empty -> the response.* defaults stand.
+    bucket: ""
+    # The SSE-KMS key alias. FANS OUT to BOTH response.forensics.kmsKeyAlias
+    # AND response.report_archive.kmsKeyAlias. Empty -> the response.* defaults
+    # stand (each is REQUIRED at runtime when its controller is enabled).
+    kms_key_alias: ""
+    # Per-object S3 object-lock retention (days). Maps ONLY to the durable
+    # REPORT bucket (response.report_archive.retentionDays); object lock lives
+    # on the report bucket alone (the bundle bucket has no retention knob).
+    retention_days: 90
+  # The settling-window length (seconds) before an incident finalises into a
+  # DFIR post-mortem (FR42/NFR7). Maps to response.settling.windowSeconds.
+  settling_window_seconds: 60
+
+# Story 4.10 (FR47): the operator-facing notification facade (the
+# REPORTS.generated webhook half of the forensic slice).
+notifications:
+  # The one facade-level gate. Maps to response.notifications.enabled. A
+  # no-op without a webhook_url (per Story 4.8: an enabled webhook with no URL
+  # leaves the controller unwired rather than failing fast).
+  enabled: false
+  # The OPTIONAL incident webhook URL. This is a SECRET (a Slack/PagerDuty URL
+  # embeds a token): when set, it OVERLAYS secrets.notificationsWebhookUrl and
+  # is projected as the NOTIFICATIONS_WEBHOOK_URL env var (secretKeyRef) when
+  # notifications is enabled -- NEVER the plain ConfigMap value (the S3
+  # credential precedent). Empty -> secrets.notificationsWebhookUrl stands.
+  webhook_url: ""
+
 # Story 1.19: Evaluation matrix configuration (FR53). One-flag switch
 # that places the chart into one of the canonical evaluation arms (F,
 # RS, RSL, RSLT-full). Empty default means "no override; individual

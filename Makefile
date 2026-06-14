@@ -9,7 +9,7 @@ CONFIG_SRC       := config/olaitan.yaml
 AUDIT_POLICY_SRC := config/audit-policy-default.yaml
 CHART_FILES      := $(CHART_DIR)/files/olaitan.yaml $(CHART_DIR)/files/audit-policy-default.yaml
 
-.PHONY: build test lint docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-down
+.PHONY: build test lint docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics e2e-local-down
 
 # envtest-bin downloads the kube-apiserver and etcd binaries that the
 # Story 1.11 posture-client integration tests (and any future
@@ -220,6 +220,68 @@ e2e-local-rslt: helm-prepare helm-deps docker-build
 		--set nats.streamMaxBytesOverride=1073741824 \
 		--wait --timeout 5m
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) OLT_E2E_RSLT=1 go test -tags=e2e -v -count=1 ./tests/e2e/...
+
+# Story 4.10 (AC4, BI-6): the RSLT-full + forensics smoke. Same cluster bring-up
+# as e2e-local-rslt, but it ALSO applies the in-cluster MinIO + notification-sink
+# fixtures, provisions an object-lock-enabled report bucket, installs the chart
+# with the four Epic-4 gates on (response.{forensics,settling,dfir,reportArchive}.
+# enabled) + the forensics facade pointed at the in-cluster MinIO + the
+# notifications facade pointed at the in-cluster sink, then runs the OLT_E2E_
+# FORENSICS-gated forensics smoke. FR47 forensic params, FR42/NFR7 settling.
+#
+# HONEST GATING (PO Ratification 4): this target + tests/e2e/forensics_smoke_
+# test.go are the AC4 TEST CODE. The live cluster RUN is the carry-forward
+# Epic-3-retro A1 RSLT-full-kind gate before Epic 5; there is no e2e-rslt /
+# e2e-forensics CI job yet, so this does NOT run in the default CI e2e job.
+e2e-local-forensics: helm-prepare helm-deps docker-build
+	kind get clusters | grep -q '^$(KIND_CLUSTER_NAME)$$' || \
+		kind create cluster --name $(KIND_CLUSTER_NAME) --config hack/kind-config.yaml
+	kind load docker-image $(IMAGE):$(TAG) --name $(KIND_CLUSTER_NAME)
+	kubectl apply -f tests/e2e/fixtures/fake-llm.yaml
+	kubectl apply -f tests/e2e/fixtures/minio.yaml
+	kubectl apply -f tests/e2e/fixtures/notification-sink.yaml
+	kubectl wait --for=condition=available --timeout=120s deploy/fake-llm deploy/minio deploy/notification-sink
+	# Provision the mc alias + the object-lock-enabled, versioned report bucket
+	# + the forensic-bundle bucket (the writer never creates them; the report
+	# bucket MUST be object-lock-enabled + versioned, a Story 4.6 precondition).
+	kubectl exec deploy/minio -- sh -c '\
+		mc alias set local http://localhost:9000 olaitan-e2e olaitan-e2e-secret && \
+		mc mb --ignore-existing --with-lock local/olaitan-reports && \
+		mc mb --ignore-existing local/olaitan-forensics'
+	helm install olaitan $(CHART_DIR) \
+		--set image.repository=$(IMAGE) \
+		--set-string image.tag=$(TAG) \
+		--set image.pullPolicy=Never \
+		--set evaluation.config=RSLT-full \
+		--set analyst.l1_provider=openai \
+		--set analyst.l2_provider=openai \
+		--set analyst.senior_provider=openai \
+		--set analyst.dfir_provider=openai \
+		--set analyst.l1_model=fake --set analyst.l2_model=fake --set analyst.senior_model=fake --set analyst.dfir_model=fake \
+		--set analyst.api.endpoint=http://fake-llm:8080/v1 \
+		--set secrets.llmApiKey=fake-key \
+		--set response.forensics.enabled=true \
+		--set response.settling.enabled=true \
+		--set response.dfir.enabled=true \
+		--set response.reportArchive.enabled=true \
+		--set response.forensics.s3Endpoint=minio:9000 \
+		--set response.forensics.s3UseSsl=false \
+		--set response.reportArchive.s3Endpoint=minio:9000 \
+		--set response.reportArchive.s3UseSsl=false \
+		--set 'forensics.s3.bucket=olaitan-reports' \
+		--set 'forensics.s3.kms_key_alias=alias/olaitan-e2e' \
+		--set forensics.settling_window_seconds=10 \
+		--set notifications.enabled=true \
+		--set notifications.webhook_url=http://notification-sink:8080/ \
+		--set secrets.s3AccessKey=olaitan-e2e \
+		--set secrets.s3SecretKey=olaitan-e2e-secret \
+		--set baselines.warmupDuration=5s \
+		--set secrets.redisPassword=ci-test \
+		--set falco.enabled=false \
+		--set endpoints.falco=tcp://127.0.0.1:0 \
+		--set nats.streamMaxBytesOverride=1073741824 \
+		--wait --timeout 5m
+	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) OLT_E2E_FORENSICS=1 go test -tags=e2e -v -count=1 -run TestKindSmoke_Forensics_FullSlice ./tests/e2e/...
 
 e2e-local-down:
 	kind delete cluster --name $(KIND_CLUSTER_NAME)

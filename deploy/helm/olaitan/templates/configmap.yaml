@@ -658,7 +658,12 @@ data:
     {{- end }}
     {{- end }}
     {{- if hasKey $ra "retentionDays" }}
-    {{- $p := "(\\n    retention_days: )[0-9]+" -}}
+    {{- /* Parent-scoped under report_archive: the bare `retention_days:` anchor
+       also matches response.settling.retention_days (which appears first in the
+       config), so a non-scoped pattern silently clobbered the settling /
+       INCIDENTS-stream retention with the report-bucket value (Story 4.6 bridge
+       defect, fixed in Story 4.10). Mirror the parent-scoped s3_* bridges above. */ -}}
+    {{- $p := "(\\n  report_archive:(?:.|\\n)*?\\n    retention_days: )[0-9]+" -}}
     {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.report_archive.retention_days anchor not found (pattern %q)" $p) }}{{- end }}
     {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $ra.retentionDays) }}
     {{- end }}
@@ -947,6 +952,85 @@ data:
     {{- if mustRegexFind $pFCalico $cfg }}{{- $cfg = regexReplaceAll $pFCalico $cfg "${1}enabled: false" }}{{- end }}
     {{- $pFPosture := "(\\n  posture:[[:space:]]*\\n    )enabled:[[:space:]]+(?:true|false)" -}}
     {{- if mustRegexFind $pFPosture $cfg }}{{- $cfg = regexReplaceAll $pFPosture $cfg "${1}enabled: false" }}{{- end }}
+    {{- end }}
+    {{- /*
+    Story 4.10 (FR47, BI-1/BI-2/BI-3): the operator-facing forensic-mode
+    VALUES FACADE overlay. The seven AC2 knobs (forensics.path,
+    forensics.s3.{bucket,kms_key_alias,retention_days},
+    forensics.settling_window_seconds, notifications.enabled,
+    notifications.webhook_url) overlay the underlying response.* render. This
+    block runs LAST (after the 4.2/4.3/4.6/4.7/4.8 response.* bridges + the
+    evaluation-arm overlay above), so a facade value WINS over its response.*
+    counterpart when both are set (BI-1). The bridges reuse the existing
+    anchored-regex convention (mustRegexFind anchor + regexReplaceAll,
+    fail-fast on a missing anchor); $-doubling guards operator values that
+    embed $1-style sequences.
+
+    notifications.webhook_url is deliberately NOT bridged here: it is a SECRET
+    (a Slack/PagerDuty URL embeds a token), overlaid onto
+    secrets.notificationsWebhookUrl and projected as the
+    NOTIFICATIONS_WEBHOOK_URL env var (secretKeyRef) in secret.yaml, never the
+    ConfigMap (BI-3, the S3-credential precedent).
+    */ -}}
+    {{- $forFac := default (dict) .Values.forensics -}}
+    {{- $forS3 := default (dict) $forFac.s3 -}}
+    {{- /* BI-2: validate forensics.path (fallback-ok, criu-reject,
+           other-reject). path bridges to NO config field -- fallback is the
+           only runtime path and runs unconditionally when forensics is
+           enabled. */ -}}
+    {{- include "olaitan.forensics.validatePath" . -}}
+    {{- /* forensics.s3.bucket FANS OUT to BOTH the forensic-bundle bucket
+           (response.forensics.s3_bucket) AND the durable-report bucket
+           (response.report_archive.s3_bucket). Each anchor is parent-scoped
+           so the bare s3_bucket key cannot cross-match the other block. */ -}}
+    {{- with $forS3.bucket }}
+    {{- $pForBundleBucket := "(\\n  forensics:(?:.|\\n)*?\\n    s3_bucket: )\"[^\"]*\"" -}}
+    {{- if not (mustRegexFind $pForBundleBucket $cfg) }}{{- fail (printf "helm bridge: facade forensics.s3.bucket -> response.forensics.s3_bucket anchor not found (pattern %q)" $pForBundleBucket) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pForBundleBucket $cfg (printf "${1}%s" (replace "$" "$$" (printf "%q" (toString .)))) }}
+    {{- $pForReportBucket := "(\\n  report_archive:(?:.|\\n)*?\\n    s3_bucket: )\"[^\"]*\"" -}}
+    {{- if not (mustRegexFind $pForReportBucket $cfg) }}{{- fail (printf "helm bridge: facade forensics.s3.bucket -> response.report_archive.s3_bucket anchor not found (pattern %q)" $pForReportBucket) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pForReportBucket $cfg (printf "${1}%s" (replace "$" "$$" (printf "%q" (toString .)))) }}
+    {{- end }}
+    {{- /* forensics.s3.kms_key_alias FANS OUT to BOTH buckets, same
+           parent-scoped anchoring. */ -}}
+    {{- with $forS3.kms_key_alias }}
+    {{- $pForBundleKms := "(\\n  forensics:(?:.|\\n)*?\\n    kms_key_alias: )\"[^\"]*\"" -}}
+    {{- if not (mustRegexFind $pForBundleKms $cfg) }}{{- fail (printf "helm bridge: facade forensics.s3.kms_key_alias -> response.forensics.kms_key_alias anchor not found (pattern %q)" $pForBundleKms) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pForBundleKms $cfg (printf "${1}%s" (replace "$" "$$" (printf "%q" (toString .)))) }}
+    {{- $pForReportKms := "(\\n  report_archive:(?:.|\\n)*?\\n    kms_key_alias: )\"[^\"]*\"" -}}
+    {{- if not (mustRegexFind $pForReportKms $cfg) }}{{- fail (printf "helm bridge: facade forensics.s3.kms_key_alias -> response.report_archive.kms_key_alias anchor not found (pattern %q)" $pForReportKms) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pForReportKms $cfg (printf "${1}%s" (replace "$" "$$" (printf "%q" (toString .)))) }}
+    {{- end }}
+    {{- /* forensics.s3.retention_days maps ONLY to the object-lock REPORT
+           bucket (response.report_archive.retention_days); the bundle bucket
+           has no retention knob. Parent-scoped so it cannot match the
+           settling.retention_days key. Unquoted integer. kindIs "invalid"
+           nil-check so a literal 0 is honoured (with would swallow it). */ -}}
+    {{- if not (kindIs "invalid" $forS3.retention_days) }}
+    {{- if not (regexMatch "^[0-9]+$" (toString $forS3.retention_days)) }}{{- fail (printf "forensics.s3.retention_days must be a non-negative integer (got %q)" (toString $forS3.retention_days)) }}{{- end }}
+    {{- $pForRetention := "(\\n  report_archive:(?:.|\\n)*?\\n    retention_days: )[0-9]+" -}}
+    {{- if not (mustRegexFind $pForRetention $cfg) }}{{- fail (printf "helm bridge: facade forensics.s3.retention_days -> response.report_archive.retention_days anchor not found (pattern %q)" $pForRetention) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pForRetention $cfg (printf "${1}%d" (int $forS3.retention_days)) }}
+    {{- end }}
+    {{- /* forensics.settling_window_seconds maps to
+           response.settling.window_seconds. Parent-scoped under settling:.
+           Unquoted integer; kindIs nil-check honours a literal 0. */ -}}
+    {{- if not (kindIs "invalid" $forFac.settling_window_seconds) }}
+    {{- if not (regexMatch "^[0-9]+$" (toString $forFac.settling_window_seconds)) }}{{- fail (printf "forensics.settling_window_seconds must be a non-negative integer (got %q)" (toString $forFac.settling_window_seconds)) }}{{- end }}
+    {{- $pForWindow := "(\\n  settling:(?:.|\\n)*?\\n    window_seconds: )[0-9]+" -}}
+    {{- if not (mustRegexFind $pForWindow $cfg) }}{{- fail (printf "helm bridge: facade forensics.settling_window_seconds -> response.settling.window_seconds anchor not found (pattern %q)" $pForWindow) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pForWindow $cfg (printf "${1}%d" (int $forFac.settling_window_seconds)) }}
+    {{- end }}
+    {{- /* notifications.enabled maps to response.notifications.enabled. The
+           enable anchor is disambiguated by the trailing webhook_url key so
+           it cannot match another `enabled: false`. kindIs nil-check honours a
+           literal false (with would swallow it). */ -}}
+    {{- $notifFac := default (dict) .Values.notifications -}}
+    {{- if not (kindIs "invalid" $notifFac.enabled) }}
+    {{- if not (regexMatch "^(?:true|false)$" (toString $notifFac.enabled)) }}{{- fail (printf "notifications.enabled must be a boolean (got %q)" (toString $notifFac.enabled)) }}{{- end }}
+    {{- $pNotifEnabled := "(\\n  notifications:\\n    enabled: )(?:true|false)(\\n    webhook_url:)" -}}
+    {{- if not (mustRegexFind $pNotifEnabled $cfg) }}{{- fail (printf "helm bridge: facade notifications.enabled -> response.notifications.enabled anchor not found (pattern %q)" $pNotifEnabled) }}{{- end }}
+    {{- $cfg = regexReplaceAll $pNotifEnabled $cfg (printf "${1}%s${2}" (toString $notifFac.enabled)) }}
     {{- end }}
     {{- $cfg | nindent 4 }}
 ---
