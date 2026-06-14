@@ -2,6 +2,7 @@ package fsm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -102,6 +103,36 @@ func (s *Store) Save(ctx context.Context, workloadID, expectedPrior string, st p
 		return false, fmt.Errorf("fsm: store save: %w", err)
 	}
 	return swapped, nil
+}
+
+// LoadHistory reads the persisted FSM transition history for a workload from
+// the Redis fsm:{workload_id}:history list, oldest-to-newest (Story 4.3). Each
+// list entry is a JSON-marshalled schema.StateTransition (the same encoding the
+// RedisSink.persist path appends). It is restart-safe: the settling controller
+// reads the durable history at finalisation rather than relying on transitions
+// observed in-process, so a controller restart mid-incident still publishes the
+// full history. A malformed entry is skipped (best-effort) rather than failing
+// the whole read, mirroring LoadAll's per-key skip discipline; a missing key
+// yields an empty slice with no error.
+func (s *Store) LoadHistory(ctx context.Context, workloadID string) ([]schema.StateTransition, error) {
+	histKey, err := keys.FSMHistory(workloadID)
+	if err != nil {
+		return nil, fmt.Errorf("fsm: store load-history key: %w", err)
+	}
+	raw, err := s.client.GetFSMHistory(ctx, histKey)
+	if err != nil {
+		return nil, fmt.Errorf("fsm: store load-history: %w", err)
+	}
+	out := make([]schema.StateTransition, 0, len(raw))
+	for _, b := range raw {
+		var st schema.StateTransition
+		if uerr := json.Unmarshal(b, &st); uerr != nil {
+			// A malformed history entry must not poison the whole read; skip it.
+			continue
+		}
+		out = append(out, st)
+	}
+	return out, nil
 }
 
 // LoadAll scans every durable FSM-state key and parses it into a

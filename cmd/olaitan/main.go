@@ -65,6 +65,7 @@ import (
 	"github.com/olokotoh/olaitan/internal/response/fsm"
 	"github.com/olokotoh/olaitan/internal/response/netpol"
 	"github.com/olokotoh/olaitan/internal/response/override"
+	"github.com/olokotoh/olaitan/internal/response/settling"
 	"github.com/olokotoh/olaitan/internal/retry"
 	"github.com/olokotoh/olaitan/internal/schema"
 	"github.com/olokotoh/olaitan/internal/subjects"
@@ -451,7 +452,7 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		// Helm-tunable via response.audit.retention_assessments_days).
 		Assessments: time.Duration(cfg.Response.Audit.RetentionAssessmentsDaysOrDefault()) * 24 * time.Hour,
 	}
-	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigsWithRetention(auditRetention, cfg.Analyst.CheckpointRetention.Duration())); err != nil {
+	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigsWithRetention(auditRetention, cfg.Analyst.CheckpointRetention.Duration(), cfg.Response.Settling.RetentionOrZero())); err != nil {
 		closeNATS()
 		if ctx.Err() != nil {
 			return nil
@@ -985,6 +986,27 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		// c.oracle concurrently with the setter write (the netpol SetStateOracle
 		// ordering precedent).
 	}
+	// Story 4.3 (BI-1/BI-2): the settling-window controller is a further
+	// MultiSink member, appended BEFORE fsm.New so the FSM fans every actual
+	// transition out to it. Publish is non-blocking (enqueues); its single Run
+	// drainer arms/resets a per-workload timer off the transition edge and, when
+	// a workload stays stable in a non-CLEAN state past the settling window
+	// (default 60s), publishes one IncidentFinalised to INCIDENTS.finalised. The
+	// Story 4.4 DFIR agent consumes that event; 4.3 only produces it (BI-10).
+	// Gated by response.settling.enabled (off by default). It needs no FSM
+	// oracle (it is purely transition-driven), so its Run is launched below for
+	// uniformity once fsmStore (the restart-safe history reader) is available.
+	settlingEnabled := cfg.Response.Settling.EnabledOrDefault()
+	var settlingCtrl *settling.Controller
+	if settlingEnabled {
+		var serr error
+		settlingCtrl, serr = wireSettlingController(cfg, nc, fsmStore, metricsReg, log)
+		if serr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: settling controller: %w", serr)
+		}
+		sinks = append(sinks, settlingCtrl)
+	}
 	var fsmSink fsm.TransitionSink = fsm.NopSink{}
 	if len(sinks) > 0 {
 		fsmSink = sinks
@@ -1025,6 +1047,12 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	if forensicCtrl != nil {
 		forensicCtrl.SetStateOracle(stateMachine)
 		g.Go(func() error { return forensicCtrl.Run(ctx) })
+	}
+	// Story 4.3: launch the settling-window controller's background drainer on
+	// the errgroup. It owns its per-workload timers + once-only finalised set on
+	// this single goroutine and returns nil on ctx cancellation.
+	if settlingCtrl != nil {
+		g.Go(func() error { return settlingCtrl.Run(ctx) })
 	}
 	if fsmStore != nil {
 		recovered, skipped, rerr := stateMachine.Restore(ctx, fsmStore)
@@ -1256,6 +1284,46 @@ func wireForensicsController(cfg *config.Config, cs kubernetes.Interface, log *s
 		KMSKeyAlias:        fc.KMSKeyAlias,
 		ExcludedNamespaces: cfg.Response.ExcludedNamespaces,
 	}, cs, uploader, metricsReg, log)
+}
+
+// wireSettlingController constructs the Story 4.3 settling-window controller
+// (FR42/NFR7). It rides the shared NATS client for the IncidentFinalised
+// publish on INCIDENTS.finalised, and uses the FSM Store (when persistence is
+// enabled) as the restart-safe FSM-history reader so a controller restart
+// mid-incident still publishes the full history (Open Assumption 2). A nil
+// store leaves the history reader nil, which falls back to the transitions the
+// controller observed in-process. The returned controller is a
+// fsm.TransitionSink whose Run is the timer/publish drainer, wired into the
+// errgroup by the caller. No new RBAC: the publish rides the existing NATS
+// connection. New JetStream stream INCIDENTS is provisioned via EnsureStreams.
+func wireSettlingController(cfg *config.Config, nc *natsclient.Client, fsmStore *fsm.Store, metricsReg *metrics.Registry, log *slog.Logger) (*settling.Controller, error) {
+	pub, err := settling.NewNATSPublisher(nc)
+	if err != nil {
+		return nil, fmt.Errorf("settling publisher: %w", err)
+	}
+	// *fsm.Store satisfies settling.HistoryReader via LoadHistory; a nil store
+	// (persistence disabled) yields a typed-nil interface pitfall, so pass an
+	// explicit nil interface when the store is absent.
+	var history settling.HistoryReader
+	if fsmStore != nil {
+		history = fsmStore
+	}
+	ctrl, err := settling.New(settling.Config{
+		Window: cfg.Response.Settling.WindowOrDefault(),
+	}, pub, history, log)
+	if err != nil {
+		return nil, err
+	}
+	// Register the dropped-edge observability metric (round-1 follow-up). A nil
+	// registry would be a programming error here (the aggregator always builds
+	// one), so surface a registration failure rather than silently dropping the
+	// alert series for the dangerous dropped-CLEAN condition.
+	if metricsReg != nil {
+		if err := ctrl.RegisterMetrics(metricsReg); err != nil {
+			return nil, fmt.Errorf("settling metrics: %w", err)
+		}
+	}
+	return ctrl, nil
 }
 
 // wireOverrideController constructs the Story 2.7 operator-override controller
@@ -1572,7 +1640,7 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 		// Helm-tunable via response.audit.retention_assessments_days).
 		Assessments: time.Duration(cfg.Response.Audit.RetentionAssessmentsDaysOrDefault()) * 24 * time.Hour,
 	}
-	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigsWithRetention(auditRetention, cfg.Analyst.CheckpointRetention.Duration())); err != nil {
+	if err := natsclient.EnsureStreams(streamsCtx, nc.JetStream(), natsclient.StreamConfigsWithRetention(auditRetention, cfg.Analyst.CheckpointRetention.Duration(), cfg.Response.Settling.RetentionOrZero())); err != nil {
 		closeNATS()
 		return fmt.Errorf("collector: ensure streams: %w", err)
 	}

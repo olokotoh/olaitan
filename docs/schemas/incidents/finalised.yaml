@@ -1,0 +1,62 @@
+# Human-readable mirror of the INCIDENTS.finalised wire event.
+#
+# AUTHORITATIVE validation source: docs/schemas/incidents/finalised.json
+# (draft 2020-12). This YAML is the documentation mirror; the .json is what
+# the tests validate against (BI-6). Source of truth for the Go shape:
+# internal/response/settling/events.go (type IncidentFinalised).
+#
+# Story 4.3 (FR42/NFR7). Published by the settling-window controller when a
+# workload's FSM has been stable in a non-CLEAN state for the full settling
+# window (default 60s). Carried on INCIDENTS.finalised (365d LimitsPolicy
+# retention, the 12th JetStream stream). The Story 4.4 DFIR agent consumes
+# this event as its invocation trigger; Story 4.3 only produces it (BI-10).
+schema: incidents.finalised.v1
+subject: INCIDENTS.finalised
+fields:
+  schema_version:
+    type: string
+    required: true
+    description: Always "incidents.finalised.v1".
+  package_id:
+    type: string
+    required: true
+    description: >
+      The EvidencePackage idempotency key on the transition that established
+      the final state (schema.StateTransition.PackageID). The first half of
+      the JetStream WithMsgID dedup discriminator.
+  workload_id:
+    type: string
+    required: true
+    description: The WorkloadIdentity canonical string the FSM keyed the incident on.
+  final_state:
+    type: string
+    required: true
+    enum: [SUSPICIOUS, RESTRICTED, QUARANTINED, PRESERVED_KILLED]
+    description: >
+      The surviving candidate ToState the workload settled in. One of the four
+      non-CLEAN states: CLEAN by definition never finalises (AC4).
+  threat_score:
+    type: number
+    required: true
+    description: >
+      The Confidence (ConfidenceScore.Total) on the transition that established
+      the final state, captured at the moment the final state was entered and
+      NOT re-sampled at expiry (BI-7).
+  finalised_at:
+    type: string
+    format: date-time
+    required: true
+    description: >
+      The controller clock at settling-window expiry. The second half of the
+      JetStream WithMsgID dedup discriminator (package_id + finalised-transition
+      timestamp), so a NEW incident for the same workload after a CLEAN cycle is
+      not suppressed by the dedup window (BI-8).
+  history:
+    type: array
+    required: true
+    description: >
+      The full FSM transition history for the workload (array of
+      schema.StateTransition; nullable). The durable carrier is the Redis
+      fsm:{workload_id}:history list (cap 1000). May be empty/null when the
+      persisted history could not be read and no transitions were observed
+      in-process: the controller never blocks finalisation on history.

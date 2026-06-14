@@ -865,6 +865,15 @@ response:
     s3Region: ""
     s3UseSsl: true
     kmsKeyAlias: ""
+  # Story 4.3: settling-window controller (FR42/NFR7). When enabled, a workload
+  # that stays stable in a non-CLEAN FSM state for windowSeconds (default 60)
+  # finalises into an IncidentFinalised event on INCIDENTS.finalised, which the
+  # Story 4.4 DFIR agent consumes. retentionDays drives the INCIDENTS JetStream
+  # stream MaxAge (365 d, append-only LimitsPolicy, audit-grade). Off by default.
+  settling:
+    enabled: false
+    windowSeconds: 60
+    retentionDays: 365
 
 # Story 1.19: Evaluation matrix configuration (FR53). One-flag switch
 # that places the chart into one of the canonical evaluation arms (F,

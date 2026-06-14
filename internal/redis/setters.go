@@ -319,6 +319,32 @@ func (c *Client) AppendFSMHistory(ctx context.Context, key string, entry []byte,
 	return nil
 }
 
+// GetFSMHistory reads the workload's fsm:{workload_id}:history list in oldest-
+// to-newest order (Story 4.3). The list is append-only via AppendFSMHistory /
+// SetFSMStateCAS (RPush + LTrim), so an LRANGE 0 -1 returns the full bounded
+// history with the entries in the order the FSM produced them. A missing key
+// returns an empty slice with no error (a workload with no persisted history is
+// not an error; the settling controller treats it as "no history available").
+// Key must be in the fsm family (keys.FSMHistory output), never a raw string.
+func (c *Client) GetFSMHistory(ctx context.Context, key string) ([][]byte, error) {
+	rdb := c.conn()
+	if rdb == nil {
+		return nil, ErrClientClosed
+	}
+	if keys.FamilyOf(key) != keys.FamilyFSM {
+		return nil, fmt.Errorf("redis: get-fsm-history %q: key is not in fsm family", key)
+	}
+	vals, err := rdb.LRange(ctx, key, 0, -1).Result()
+	if err != nil {
+		return nil, fmt.Errorf("redis: get-fsm-history %q: %w", key, err)
+	}
+	out := make([][]byte, len(vals))
+	for i, v := range vals {
+		out[i] = []byte(v)
+	}
+	return out, nil
+}
+
 // SetOverride writes an operator-override hash for a workload with a
 // NATIVE Redis TTL equal to the caller-supplied override duration (Story
 // 2.7 BI-3). Unlike SetState (a fixed 1h family constant), the override
