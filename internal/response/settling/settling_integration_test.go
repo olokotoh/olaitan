@@ -196,7 +196,13 @@ func TestIntegration_OscillatingResetsThenOne(t *testing.T) {
 }
 
 // TestIntegration_DeescalationToCleanPublishesNone (AC5): de-escalation to
-// CLEAN before the window completes publishes zero IncidentFinalised.
+// CLEAN before the window completes publishes zero IncidentFinalised for the
+// de-escalating workload. The "zero events" assertion is made NON-VACUOUS
+// (round-1 NIT) by running a CONTROL workload in the SAME test that DOES stay
+// non-CLEAN past the window: we wait for the control's finalisation as a
+// deterministic signal that the window has fully elapsed, then assert the
+// de-escalating workload produced none (it is not merely that we gave up
+// waiting).
 func TestIntegration_DeescalationToCleanPublishesNone(t *testing.T) {
 	srv := startTestServer(t)
 	c := newTestClient(t, srv)
@@ -204,12 +210,21 @@ func TestIntegration_DeescalationToCleanPublishesNone(t *testing.T) {
 	ctrl, stop := runIT(t, c, 60*time.Millisecond)
 	defer stop()
 
+	// The workload that de-escalates to CLEAN: must NOT finalise.
 	ctrl.Publish(itTransition("w-clean", schema.StateQuarantined, schema.StateRestricted, 90))
 	time.Sleep(20 * time.Millisecond)
 	ctrl.Publish(itTransition("w-clean", schema.StateClean, schema.StateQuarantined, 0))
 
-	evts := drainFinalised(t, c, 1, 1500*time.Millisecond)
-	if len(evts) != 0 {
-		t.Fatalf("got %d events, want 0 (CLEAN cancels finalisation, AC4)", len(evts))
+	// A CONTROL workload that stays non-CLEAN: MUST finalise. Its event is the
+	// deterministic signal that the settling window has elapsed.
+	ctrl.Publish(itTransition("w-control", schema.StateQuarantined, schema.StateRestricted, 77))
+
+	evts := drainFinalised(t, c, 2, 3*time.Second)
+	// Exactly one event, and it must be the control workload (not w-clean).
+	if len(evts) != 1 {
+		t.Fatalf("got %d events, want exactly 1 (only the control finalises; CLEAN cancels w-clean, AC4)", len(evts))
+	}
+	if evts[0].WorkloadID != "w-control" {
+		t.Fatalf("finalised workload = %q, want w-control (the de-escalated w-clean must not finalise)", evts[0].WorkloadID)
 	}
 }

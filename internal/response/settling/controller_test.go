@@ -9,8 +9,27 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/olokotoh/olaitan/internal/metrics"
 	"github.com/olokotoh/olaitan/internal/schema"
 )
+
+// metricsRegistry returns an isolated metrics registry for a metric assertion.
+func metricsRegistry(t *testing.T) *metrics.Registry {
+	t.Helper()
+	return metrics.NewRegistry()
+}
+
+// counterValue reads the current value of a labelled counter series.
+func counterValue(t *testing.T, cv *prometheus.CounterVec, label string) float64 {
+	t.Helper()
+	if cv == nil {
+		t.Fatal("counter vec is nil")
+	}
+	return testutil.ToFloat64(cv.WithLabelValues(label))
+}
 
 func discardLog() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -277,7 +296,11 @@ func TestPinnedWorkloadFinalises(t *testing.T) {
 	c, stop := runController(t, Config{Window: 25 * time.Millisecond}, pub, nil)
 	defer stop()
 
-	pinned := nonClean("w-pinned", schema.StateQuarantined, 50)
+	// Non-vacuous (MED round-1): a from-the-start override carries an EMPTY
+	// PackageID and ZERO Confidence (no automated evaluation ran). It must still
+	// finalise (valid-for-pinned).
+	pinned := nonClean("w-pinned", schema.StateQuarantined, 0)
+	pinned.PackageID = ""
 	pinned.TriggerType = "override"
 	pinned.Reason = schema.ReasonOperatorOverride
 	pinned.OperatorID = "alice"
@@ -287,8 +310,12 @@ func TestPinnedWorkloadFinalises(t *testing.T) {
 	if got := pub.count(); got != 1 {
 		t.Fatalf("pinned workload finalisation count = %d, want 1", got)
 	}
-	if evt := pub.snapshot()[0]; evt.FinalState != string(schema.StateQuarantined) {
+	evt := pub.snapshot()[0]
+	if evt.FinalState != string(schema.StateQuarantined) {
 		t.Errorf("pinned final_state = %q, want QUARANTINED", evt.FinalState)
+	}
+	if evt.PackageID != "" {
+		t.Errorf("pinned package_id = %q, want empty (valid-for-pinned)", evt.PackageID)
 	}
 }
 
@@ -349,6 +376,271 @@ func TestPublishFailureDoesNotMarkFinalised(t *testing.T) {
 	waitForCount(t, pub, 1, time.Second)
 	if got := pub.count(); got != 1 {
 		t.Fatalf("event count = %d after retry, want 1", got)
+	}
+}
+
+// newWhiteBox builds a controller with deterministic clock for white-box tests
+// that drive onTransition/onFire directly with their internal maps, so the
+// exact interleave can be sequenced without timer-expiry races.
+func newWhiteBox(t *testing.T, pub Publisher) *Controller {
+	t.Helper()
+	c, err := New(Config{Window: time.Hour}, pub, nil, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return c
+}
+
+// TestStaleFireAfterReArmIsNoOp drives the EXACT HIGH-severity round-1
+// interleave deterministically: timer1 fires (posts gen 1); BEFORE that stale
+// signal is drained, a NEW non-CLEAN edge for the same workload is processed,
+// which Stop()s the (already-fired) timer1, re-arms timer2, and replaces the
+// candidate with a NEW state whose window has NOT elapsed. We then deliver the
+// STALE gen-1 fire: it must be a NO-OP (no premature publish for the new
+// candidate, and the live timer2 entry must NOT be orphaned). Finally the gen-2
+// fire publishes EXACTLY ONE event, for the new candidate.
+//
+// Mutation check: reverting onFire's `if sig.gen != p.gen { return }` guard
+// makes the stale gen-1 fire publish the NEW candidate prematurely, so the
+// first count-after-stale assertion (want 0) fails; and reverting onTransition's
+// `p.gen++` makes gen-1 == gen-2 so the same premature publish occurs.
+func TestStaleFireAfterReArmIsNoOp(t *testing.T) {
+	pub := &fakePublisher{}
+	c := newWhiteBox(t, pub)
+
+	timers := make(map[string]*time.Timer)
+	pendings := make(map[string]*pending)
+	finalised := make(map[string]struct{})
+
+	// First non-CLEAN edge arms timer1 (gen 1) with candidate RESTRICTED.
+	c.onTransition(nonClean("w1", schema.StateRestricted, 55), timers, pendings, finalised)
+	if got := pendings["w1"].gen; got != 1 {
+		t.Fatalf("gen after first arm = %d, want 1", got)
+	}
+	staleGen := pendings["w1"].gen // gen captured by timer1's AfterFunc.
+
+	// timer1 "fires" but its signal has NOT yet been drained. Before draining,
+	// a new non-CLEAN edge is processed: it Stop()s timer1, re-arms timer2
+	// (gen 2), and replaces the candidate with QUARANTINED whose window has not
+	// elapsed.
+	c.onTransition(nonClean("w1", schema.StateQuarantined, 91), timers, pendings, finalised)
+	if got := pendings["w1"].gen; got != 2 {
+		t.Fatalf("gen after re-arm = %d, want 2 (every re-arm bumps gen)", got)
+	}
+
+	// Drain the STALE timer1 fire (gen 1). It must be a no-op.
+	c.onFire(context.Background(), firedSignal{wid: "w1", gen: staleGen}, timers, pendings, finalised)
+	if got := pub.count(); got != 0 {
+		t.Fatalf("stale fire published %d events, want 0 (no premature finalisation, AC2/AC3)", got)
+	}
+	if _, ok := timers["w1"]; !ok {
+		t.Fatal("stale fire orphaned the live re-armed timer2 (must not delete timers[wid] on a stale fire)")
+	}
+
+	// The LIVE gen-2 fire publishes exactly one event, for the NEW candidate.
+	c.onFire(context.Background(), firedSignal{wid: "w1", gen: 2}, timers, pendings, finalised)
+	if got := pub.count(); got != 1 {
+		t.Fatalf("live fire published %d events, want exactly 1", got)
+	}
+	if evt := pub.snapshot()[0]; evt.FinalState != string(schema.StateQuarantined) {
+		t.Errorf("finalised candidate = %q, want QUARANTINED (the surviving re-armed candidate)", evt.FinalState)
+	}
+}
+
+// TestEscalationAfterFinalisationNoSecondEvent (MED round-1, once-only across
+// escalation-after-finalisation): finalise at QUARANTINED, then escalate to
+// PRESERVED_KILLED with NO intervening CLEAN. The same ongoing incident must
+// NOT re-finalise; only a CLEAN cycle resets finalisation.
+//
+// Mutation check: re-adding `delete(finalised, wid)` to the non-CLEAN branch of
+// onTransition (the old behaviour) re-arms a timer for the killed escalation and
+// the subsequent fire publishes a SECOND event, failing the want-1 assertion.
+func TestEscalationAfterFinalisationNoSecondEvent(t *testing.T) {
+	pub := &fakePublisher{}
+	c := newWhiteBox(t, pub)
+
+	timers := make(map[string]*time.Timer)
+	pendings := make(map[string]*pending)
+	finalised := make(map[string]struct{})
+
+	// Escalate to QUARANTINED and finalise it.
+	c.onTransition(nonClean("w1", schema.StateQuarantined, 91), timers, pendings, finalised)
+	gen := pendings["w1"].gen
+	c.onFire(context.Background(), firedSignal{wid: "w1", gen: gen}, timers, pendings, finalised)
+	if got := pub.count(); got != 1 {
+		t.Fatalf("first finalisation count = %d, want 1", got)
+	}
+	if _, ok := finalised["w1"]; !ok {
+		t.Fatal("workload not marked finalised after first event")
+	}
+
+	// Escalate to PRESERVED_KILLED with NO intervening CLEAN. This must NOT
+	// re-arm a timer (the incident is already finalised).
+	c.onTransition(nonClean("w1", schema.StatePreservedKilled, 99), timers, pendings, finalised)
+	if _, ok := timers["w1"]; ok {
+		t.Fatal("escalation-after-finalisation re-armed a timer (must not, once-only)")
+	}
+	// Even if a stray fire were delivered for this workload, no pending exists,
+	// so onFire is a no-op; assert no second event.
+	c.onFire(context.Background(), firedSignal{wid: "w1", gen: gen + 1}, timers, pendings, finalised)
+	if got := pub.count(); got != 1 {
+		t.Fatalf("event count after escalation-after-finalisation = %d, want still 1 (once-only)", got)
+	}
+}
+
+// TestCleanAfterFinalisationReFinalisesOnEscalation confirms the once-only guard
+// is scoped to the ONGOING incident: a CLEAN cycle resets finalisation so a
+// genuinely new non-CLEAN incident re-arms and finalises again.
+func TestCleanAfterFinalisationReFinalisesOnEscalation(t *testing.T) {
+	pub := &fakePublisher{}
+	c := newWhiteBox(t, pub)
+
+	timers := make(map[string]*time.Timer)
+	pendings := make(map[string]*pending)
+	finalised := make(map[string]struct{})
+
+	c.onTransition(nonClean("w1", schema.StateQuarantined, 91), timers, pendings, finalised)
+	c.onFire(context.Background(), firedSignal{wid: "w1", gen: pendings["w1"].gen}, timers, pendings, finalised)
+	if pub.count() != 1 {
+		t.Fatalf("first finalisation count = %d, want 1", pub.count())
+	}
+
+	// CLEAN cycle clears the finalised marker.
+	clean := nonClean("w1", schema.StateClean, 0)
+	clean.FromState = schema.StateQuarantined
+	c.onTransition(clean, timers, pendings, finalised)
+	if _, ok := finalised["w1"]; ok {
+		t.Fatal("CLEAN did not clear the finalised marker (AC4)")
+	}
+
+	// A new incident re-arms and finalises.
+	c.onTransition(nonClean("w1", schema.StateRestricted, 60), timers, pendings, finalised)
+	c.onFire(context.Background(), firedSignal{wid: "w1", gen: pendings["w1"].gen}, timers, pendings, finalised)
+	if got := pub.count(); got != 2 {
+		t.Fatalf("event count after CLEAN-then-new-incident = %d, want 2", got)
+	}
+}
+
+// TestOverrideFieldsPopulatedFromPriorEscalation (MED round-1): an override edge
+// carrying an EMPTY PackageID and ZERO Confidence must not clobber the
+// package_id/threat_score already established by a prior automated escalation
+// for the same ongoing incident.
+func TestOverrideFieldsPopulatedFromPriorEscalation(t *testing.T) {
+	pub := &fakePublisher{}
+	c := newWhiteBox(t, pub)
+
+	timers := make(map[string]*time.Timer)
+	pendings := make(map[string]*pending)
+	finalised := make(map[string]struct{})
+
+	// Automated escalation carries a real package_id + score.
+	auto := nonClean("w1", schema.StateQuarantined, 88.5)
+	auto.PackageID = "pkg-real"
+	c.onTransition(auto, timers, pendings, finalised)
+
+	// Operator override edge to a higher state with EMPTY package_id + ZERO score.
+	override := nonClean("w1", schema.StatePreservedKilled, 0)
+	override.PackageID = ""
+	override.TriggerType = "override"
+	override.Reason = schema.ReasonOperatorOverride
+	c.onTransition(override, timers, pendings, finalised)
+
+	c.onFire(context.Background(), firedSignal{wid: "w1", gen: pendings["w1"].gen}, timers, pendings, finalised)
+	if pub.count() != 1 {
+		t.Fatalf("finalisation count = %d, want 1", pub.count())
+	}
+	evt := pub.snapshot()[0]
+	if evt.PackageID != "pkg-real" {
+		t.Errorf("package_id = %q, want pkg-real (retained from prior escalation, not clobbered by empty override)", evt.PackageID)
+	}
+	if evt.ThreatScore != 88.5 {
+		t.Errorf("threat_score = %v, want 88.5 (retained from prior escalation)", evt.ThreatScore)
+	}
+	if evt.FinalState != string(schema.StatePreservedKilled) {
+		t.Errorf("final_state = %q, want PRESERVED_KILLED (the surviving override candidate)", evt.FinalState)
+	}
+}
+
+// TestPinnedFromStartEmptyPackageIDFinalises (MED round-1): an incident pinned
+// from the start by an override (no prior automated evaluation) carries an empty
+// package_id and zero threat_score. It still finalises (valid-for-pinned), and
+// FinalisedMsgID stays unique via finalised_at_ns even with an empty package_id.
+func TestPinnedFromStartEmptyPackageIDFinalises(t *testing.T) {
+	pub := &fakePublisher{}
+	c := newWhiteBox(t, pub)
+
+	timers := make(map[string]*time.Timer)
+	pendings := make(map[string]*pending)
+	finalised := make(map[string]struct{})
+
+	pinned := nonClean("w-pinned", schema.StateQuarantined, 0)
+	pinned.PackageID = ""
+	pinned.TriggerType = "override"
+	pinned.Reason = schema.ReasonOperatorOverride
+	pinned.OperatorID = "alice"
+	c.onTransition(pinned, timers, pendings, finalised)
+	c.onFire(context.Background(), firedSignal{wid: "w-pinned", gen: pendings["w-pinned"].gen}, timers, pendings, finalised)
+
+	if pub.count() != 1 {
+		t.Fatalf("pinned-from-start finalisation count = %d, want 1 (valid-for-pinned)", pub.count())
+	}
+	evt := pub.snapshot()[0]
+	if evt.PackageID != "" {
+		t.Errorf("package_id = %q, want empty (genuinely pinned-from-start)", evt.PackageID)
+	}
+	// FinalisedMsgID must still be unique by finalised_at even with empty pkg.
+	other := evt
+	other.FinalisedAt = evt.FinalisedAt.Add(time.Second)
+	if FinalisedMsgID(evt) == FinalisedMsgID(other) {
+		t.Fatal("FinalisedMsgID collides for empty package_id; finalised_at must discriminate")
+	}
+}
+
+// TestPendingDroppedAfterPublish (LOW round-1, map-leak): a successful
+// finalisation drops the pending candidate (the once-only marker lives in the
+// finalised set, not the pending), bounding the pendings map.
+func TestPendingDroppedAfterPublish(t *testing.T) {
+	pub := &fakePublisher{}
+	c := newWhiteBox(t, pub)
+
+	timers := make(map[string]*time.Timer)
+	pendings := make(map[string]*pending)
+	finalised := make(map[string]struct{})
+
+	c.onTransition(nonClean("w1", schema.StateQuarantined, 91), timers, pendings, finalised)
+	c.onFire(context.Background(), firedSignal{wid: "w1", gen: pendings["w1"].gen}, timers, pendings, finalised)
+	if _, ok := pendings["w1"]; ok {
+		t.Fatal("pending not dropped after successful publish (map leak)")
+	}
+	if _, ok := finalised["w1"]; !ok {
+		t.Fatal("finalised marker must be retained as the once-only guard")
+	}
+}
+
+// TestDroppedCleanMetricAndAlert (MED round-1): a dropped CLEAN edge increments
+// the clean-labelled drop counter (so operators can alert on a possible false
+// finalisation); a dropped non-CLEAN edge increments the non_clean label.
+func TestDroppedCleanMetricAndAlert(t *testing.T) {
+	reg := metricsRegistry(t)
+	c, err := New(Config{Window: time.Second, QueueSize: 1}, &fakePublisher{}, nil, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := c.RegisterMetrics(reg); err != nil {
+		t.Fatalf("RegisterMetrics: %v", err)
+	}
+	// No Run goroutine: fill the queue (size 1), then both further Publishes drop.
+	c.Publish(nonClean("w1", schema.StateQuarantined, 50)) // enqueued (fills queue).
+	dropClean := nonClean("w1", schema.StateClean, 0)
+	dropClean.FromState = schema.StateQuarantined
+	c.Publish(dropClean)                                  // dropped CLEAN.
+	c.Publish(nonClean("w1", schema.StateRestricted, 60)) // dropped non-CLEAN.
+
+	if got := counterValue(t, c.dropped, "clean"); got != 1 {
+		t.Errorf("dropped_total{edge=clean} = %v, want 1", got)
+	}
+	if got := counterValue(t, c.dropped, "non_clean"); got != 1 {
+		t.Errorf("dropped_total{edge=non_clean} = %v, want 1", got)
 	}
 }
 

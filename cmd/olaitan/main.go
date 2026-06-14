@@ -1000,7 +1000,7 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	var settlingCtrl *settling.Controller
 	if settlingEnabled {
 		var serr error
-		settlingCtrl, serr = wireSettlingController(cfg, nc, fsmStore, log)
+		settlingCtrl, serr = wireSettlingController(cfg, nc, fsmStore, metricsReg, log)
 		if serr != nil {
 			closeNATS()
 			return fmt.Errorf("aggregator: settling controller: %w", serr)
@@ -1296,7 +1296,7 @@ func wireForensicsController(cfg *config.Config, cs kubernetes.Interface, log *s
 // fsm.TransitionSink whose Run is the timer/publish drainer, wired into the
 // errgroup by the caller. No new RBAC: the publish rides the existing NATS
 // connection. New JetStream stream INCIDENTS is provisioned via EnsureStreams.
-func wireSettlingController(cfg *config.Config, nc *natsclient.Client, fsmStore *fsm.Store, log *slog.Logger) (*settling.Controller, error) {
+func wireSettlingController(cfg *config.Config, nc *natsclient.Client, fsmStore *fsm.Store, metricsReg *metrics.Registry, log *slog.Logger) (*settling.Controller, error) {
 	pub, err := settling.NewNATSPublisher(nc)
 	if err != nil {
 		return nil, fmt.Errorf("settling publisher: %w", err)
@@ -1308,9 +1308,22 @@ func wireSettlingController(cfg *config.Config, nc *natsclient.Client, fsmStore 
 	if fsmStore != nil {
 		history = fsmStore
 	}
-	return settling.New(settling.Config{
+	ctrl, err := settling.New(settling.Config{
 		Window: cfg.Response.Settling.WindowOrDefault(),
 	}, pub, history, log)
+	if err != nil {
+		return nil, err
+	}
+	// Register the dropped-edge observability metric (round-1 follow-up). A nil
+	// registry would be a programming error here (the aggregator always builds
+	// one), so surface a registration failure rather than silently dropping the
+	// alert series for the dangerous dropped-CLEAN condition.
+	if metricsReg != nil {
+		if err := ctrl.RegisterMetrics(metricsReg); err != nil {
+			return nil, fmt.Errorf("settling metrics: %w", err)
+		}
+	}
+	return ctrl, nil
 }
 
 // wireOverrideController constructs the Story 2.7 operator-override controller
