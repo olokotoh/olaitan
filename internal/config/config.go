@@ -1055,6 +1055,93 @@ type ResponseConfig struct {
 	// opt-in and defaults off. The per-subject retention days drive the
 	// AUDIT_* JetStream stream MaxAge (AC4 Helm-tunability).
 	Audit AuditConfig `yaml:"audit,omitempty"`
+	// Story 4.2: forensics sub-block gates the PRESERVED_KILLED forensic
+	// capture controller (FR36). Enabled is pointer-tagged so an explicit
+	// `false` survives the loader; the controller is opt-in and defaults off.
+	// The S3 endpoint/bucket/region/SSL/KMS-key are config; the access and
+	// secret keys are NFR8 secrets read from the environment (not YAML), the
+	// REDIS_PASSWORD precedent.
+	Forensics ForensicsConfig `yaml:"forensics,omitempty"`
+}
+
+// ForensicsConfig configures the Story 4.2 forensic capture controller (FR36).
+// When the FSM transitions a workload into PRESERVED_KILLED, the controller
+// captures a forensic bundle of the doomed pod(s), uploads it KMS-encrypted to
+// an S3-compatible object store under a content-addressed key, and only after a
+// confirmed upload-ack deletes the pod(s).
+//
+// Enabled is pointer-tagged so an explicit `false` survives the loader (the
+// NetworkPolicyConfig.Enabled precedent); the default is OFF (opt-in). The S3
+// access/secret keys are NOT in this struct: they are read from the
+// S3_ACCESS_KEY / S3_SECRET_KEY environment variables at wiring time (the
+// REDIS_PASSWORD secret-via-env precedent, NFR8), so credentials never sit in a
+// YAML file or ConfigMap.
+type ForensicsConfig struct {
+	Enabled     *bool  `yaml:"enabled,omitempty"`
+	S3Endpoint  string `yaml:"s3_endpoint,omitempty"`
+	S3Bucket    string `yaml:"s3_bucket,omitempty"`
+	S3Region    string `yaml:"s3_region,omitempty"`
+	S3UseSSL    *bool  `yaml:"s3_use_ssl,omitempty"`
+	KMSKeyAlias string `yaml:"kms_key_alias,omitempty"`
+}
+
+// DefaultForensics returns the Story 4.2 defaults: disabled, TLS on for the S3
+// endpoint (production object stores are TLS; a local MinIO sets s3_use_ssl
+// false explicitly).
+func DefaultForensics() ForensicsConfig {
+	enabled := false
+	useSSL := true
+	return ForensicsConfig{
+		Enabled:  &enabled,
+		S3UseSSL: &useSSL,
+	}
+}
+
+// EnabledOrDefault reports whether the forensic controller is enabled, treating
+// a nil pointer as the default (false).
+func (f ForensicsConfig) EnabledOrDefault() bool {
+	if f.Enabled == nil {
+		return false
+	}
+	return *f.Enabled
+}
+
+// S3UseSSLOrDefault reports whether the S3 endpoint is reached over TLS,
+// defaulting to true (production) when omitted.
+func (f ForensicsConfig) S3UseSSLOrDefault() bool {
+	if f.S3UseSSL == nil {
+		return true
+	}
+	return *f.S3UseSSL
+}
+
+// validate enforces ForensicsConfig invariants: when the controller is
+// explicitly enabled, the S3 endpoint, bucket, and SSE-KMS key alias are all
+// required (the access and secret keys are validated at wiring time against the
+// environment). A fully-omitted block skips validation so in-memory fixtures
+// can leave it zero.
+//
+// kms_key_alias is required-when-enabled (HIGH-1, round-1 review): the
+// MinioUploader skips the SSE-KMS PUT directive when the alias is empty, so an
+// enabled-forensics deployment without an alias would persist UNREDACTED
+// forensic logs with no agent-applied SSE-KMS (relying only on a bucket-default
+// SSE that may not exist). Fail-fast at config load rather than silently
+// shipping plaintext-at-the-agent forensic bundles. This guard is at the config
+// boundary only; the MinioUploader itself still accepts an empty alias so the
+// no-KES MinIO integration test can construct it directly with an empty alias.
+func (f ForensicsConfig) validate() error {
+	if f.Enabled != nil && *f.Enabled {
+		if f.S3Endpoint == "" {
+			return errors.New("response.forensics.s3_endpoint: required when forensics.enabled=true")
+		}
+		if f.S3Bucket == "" {
+			return errors.New("response.forensics.s3_bucket: required when forensics.enabled=true")
+		}
+		if f.KMSKeyAlias == "" {
+			return errors.New("response.forensics.kms_key_alias: required when forensics.enabled=true (the agent applies SSE-KMS per PUT; an empty alias would persist unredacted forensic logs with no agent-applied encryption)")
+		}
+	}
+	return nil
 }
 
 // NetworkPolicyConfig configures the Story 2.4 RESTRICTED-state
@@ -1805,6 +1892,18 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
+	// Story 4.2: substitute the forensics defaults so an omitted Enabled stays
+	// off and an omitted s3_use_ssl defaults to TLS-on (production).
+	{
+		defForensics := DefaultForensics()
+		if cfg.Response.Forensics.Enabled == nil {
+			cfg.Response.Forensics.Enabled = defForensics.Enabled
+		}
+		if cfg.Response.Forensics.S3UseSSL == nil {
+			cfg.Response.Forensics.S3UseSSL = defForensics.S3UseSSL
+		}
+	}
+
 	// Story 3.1: substitute the redact defaults so an enabled redact block with
 	// an omitted retention inherits the 365 d default, and an omitted
 	// AuditEnabled stays off (redaction itself is always on, BI-7).
@@ -2017,6 +2116,9 @@ func (r ResponseConfig) validate() error {
 		return err
 	}
 	if err := r.Audit.validate(); err != nil {
+		return err
+	}
+	if err := r.Forensics.validate(); err != nil {
 		return err
 	}
 	return nil

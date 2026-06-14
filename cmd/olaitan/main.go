@@ -61,6 +61,7 @@ import (
 	redisclient "github.com/olokotoh/olaitan/internal/redis"
 	reportredact "github.com/olokotoh/olaitan/internal/report/redact"
 	responseaudit "github.com/olokotoh/olaitan/internal/response/audit"
+	"github.com/olokotoh/olaitan/internal/response/forensics"
 	"github.com/olokotoh/olaitan/internal/response/fsm"
 	"github.com/olokotoh/olaitan/internal/response/netpol"
 	"github.com/olokotoh/olaitan/internal/response/override"
@@ -964,6 +965,26 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		sinks = append(sinks, auditTransitionSink)
 		g.Go(func() error { return auditTransitionSink.Run(ctx) })
 	}
+	// Story 4.2 (BI-3/BI-4): the forensic capture controller is a further
+	// MultiSink member, appended BEFORE fsm.New so the FSM fans the
+	// PRESERVED_KILLED kill transition out to it. Publish is non-blocking and
+	// filters to PRESERVED_KILLED; its background Run drainer (launched below,
+	// after SetStateOracle) performs capture -> S3 upload -> pod delete off the
+	// FSM hot path. Gated by response.forensics.enabled (off by default).
+	forensicsEnabled := cfg.Response.Forensics.EnabledOrDefault()
+	var forensicCtrl *forensics.Controller
+	if forensicsEnabled {
+		var ferr error
+		forensicCtrl, ferr = wireForensicsController(cfg, cs, log, metricsReg)
+		if ferr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: forensics: %w", ferr)
+		}
+		sinks = append(sinks, forensicCtrl)
+		// Run is launched below, AFTER SetStateOracle, so the worker never reads
+		// c.oracle concurrently with the setter write (the netpol SetStateOracle
+		// ordering precedent).
+	}
 	var fsmSink fsm.TransitionSink = fsm.NopSink{}
 	if len(sinks) > 0 {
 		fsmSink = sinks
@@ -994,6 +1015,16 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		// installed. Starting the goroutine here establishes a happens-before edge
 		// for the setter writes above, so the reconcile loop never races on them.
 		g.Go(func() error { return npMgr.Run(ctx) })
+	}
+	// Story 4.2 (BI-5): install the FSM as the forensic controller's
+	// PRESERVED_KILLED confirmation oracle, then launch its background drainer.
+	// Like the netpol setter, this happens AFTER fsm.New (the controller is a
+	// sink fanned into this very Machine) and BEFORE Run, so the worker reads
+	// c.oracle only after the single-threaded setter write. *fsm.Machine
+	// satisfies forensics.StateOracle via CurrentState.
+	if forensicCtrl != nil {
+		forensicCtrl.SetStateOracle(stateMachine)
+		g.Go(func() error { return forensicCtrl.Run(ctx) })
 	}
 	if fsmStore != nil {
 		recovered, skipped, rerr := stateMachine.Restore(ctx, fsmStore)
@@ -1183,6 +1214,48 @@ func wireNetworkPolicyManager(cfg *config.Config, cs kubernetes.Interface, log *
 		ExcludedNamespaces: cfg.Response.ExcludedNamespaces,
 		ReconcileInterval:  time.Duration(np.ReconcileIntervalSecondsOrDefault()) * time.Second,
 	}, cs, metricsReg, log)
+}
+
+// wireForensicsController constructs the Story 4.2 forensic capture controller
+// (FR36). It reuses the clientset already built for the posture/netpol path
+// when present (cs != nil), or acquires its own via kubeClientFactory. The S3
+// access and secret keys are NFR8 secrets read from the S3_ACCESS_KEY /
+// S3_SECRET_KEY environment variables (the REDIS_PASSWORD secret-via-env
+// precedent; TrimRight guards the trailing-newline secretKeyRef pitfall), so
+// credentials never sit in a ConfigMap. The returned controller is a
+// fsm.TransitionSink whose Run is the async capture+upload+delete worker, wired
+// into the errgroup by the caller. New RBAC (pods get/list/delete + pods/log)
+// is granted in deploy/helm/olaitan/templates/rbac.yaml under a forensics gate.
+func wireForensicsController(cfg *config.Config, cs kubernetes.Interface, log *slog.Logger, metricsReg *metrics.Registry) (*forensics.Controller, error) {
+	if cs == nil {
+		var err error
+		cs, err = kubeClientFactory(log)
+		if err != nil {
+			return nil, fmt.Errorf("kube client: %w", err)
+		}
+	}
+	fc := cfg.Response.Forensics
+	accessKey := strings.TrimRight(os.Getenv("S3_ACCESS_KEY"), "\r\n")
+	secretKey := strings.TrimRight(os.Getenv("S3_SECRET_KEY"), "\r\n")
+	if accessKey == "" || secretKey == "" {
+		return nil, fmt.Errorf("NFR8: S3_ACCESS_KEY and S3_SECRET_KEY env vars are required when response.forensics.enabled=true")
+	}
+	uploader, err := forensics.NewMinioUploader(forensics.MinioConfig{
+		Endpoint:    fc.S3Endpoint,
+		AccessKey:   accessKey,
+		SecretKey:   secretKey,
+		Bucket:      fc.S3Bucket,
+		Region:      fc.S3Region,
+		UseSSL:      fc.S3UseSSLOrDefault(),
+		KMSKeyAlias: fc.KMSKeyAlias,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("s3 uploader: %w", err)
+	}
+	return forensics.New(forensics.Config{
+		KMSKeyAlias:        fc.KMSKeyAlias,
+		ExcludedNamespaces: cfg.Response.ExcludedNamespaces,
+	}, cs, uploader, metricsReg, log)
 }
 
 // wireOverrideController constructs the Story 2.7 operator-override controller

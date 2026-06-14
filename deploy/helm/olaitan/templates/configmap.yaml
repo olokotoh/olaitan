@@ -572,6 +572,32 @@ data:
     {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" (index $au $k)) }}
     {{- end }}
     {{- end }}
+    {{- /*
+    Story 4.2: forensic capture controller overlay (FR36). Bridges
+    response.forensics.{enabled,s3Endpoint,s3Bucket,s3Region,s3UseSsl,kmsKeyAlias}
+    onto the config/olaitan.yaml response.forensics block. The enable anchor is
+    disambiguated by the trailing s3_endpoint key so it cannot match another
+    `enabled: false`. The string keys are overlaid with quoted scalars so an
+    empty value renders as `""` rather than a bare key.
+    */ -}}
+    {{- $fo := $rsp.forensics | default dict }}
+    {{- if hasKey $fo "enabled" }}
+    {{- $p := "(\\n  forensics:\\n    enabled: )(?:true|false)(\\n    s3_endpoint:)" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.forensics.enabled anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v${2}" $fo.enabled) }}
+    {{- end }}
+    {{- if hasKey $fo "s3UseSsl" }}
+    {{- $p := "(\\n    s3_use_ssl: )(?:true|false)" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.forensics.s3_use_ssl anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $fo.s3UseSsl) }}
+    {{- end }}
+    {{- range $k, $cfgKey := dict "s3Endpoint" "s3_endpoint" "s3Bucket" "s3_bucket" "s3Region" "s3_region" "kmsKeyAlias" "kms_key_alias" }}
+    {{- if hasKey $fo $k }}
+    {{- $p := printf "(\\n    %s: )\"[^\"]*\"" $cfgKey -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.forensics.%s anchor not found (pattern %q)" $cfgKey $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%q" (index $fo $k)) }}
+    {{- end }}
+    {{- end }}
     {{- end }}
     {{- /*
     Story 1.19: Evaluation-matrix overlay (FR53). Replace the file-side
