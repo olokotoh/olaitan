@@ -368,11 +368,17 @@ jobs:
           docker logs minio || true
           exit 1
 
-      - name: Report-archive MinIO integration suite
+      # Story 4.7 (AC5): the simulated-outage retry / defer / drain-on-recovery
+      # suite extends this job. The S3 outage is simulated by an in-package
+      # FlakyArchive decorator (no MinIO restart needed); the Redis-backed deferred
+      # queue (internal/report/deferq) runs an in-process miniredis, so NO Redis
+      # container is added to this job. The deferq integration package shares the
+      # SAME REPORT_ARCHIVE_INTEGRATION_* env-gating + pinned MinIO image.
+      - name: Report-archive + deferred-queue MinIO integration suite
         env:
           REPORT_ARCHIVE_INTEGRATION_REQUIRED: "1"
           S3_ENDPOINT: "127.0.0.1:9000"
           S3_ACCESS_KEY: minioadmin
           S3_SECRET_KEY: minioadmin
           S3_BUCKET: olaitan-reports-it
-        run: go test -tags=integration -race -count=1 ./internal/report/archive/...
+        run: go test -tags=integration -race -count=1 ./internal/report/archive/... ./internal/report/deferq/...

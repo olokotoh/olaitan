@@ -927,6 +927,21 @@ data:
         kms_key_alias: ""
         retention_days: 90
         object_lock_mode: GOVERNANCE
+        # Story 4.7: deferred-write queue (FR45 resilience, NFR28). When a durable
+        # write fails transiently beyond the short inline retry budget (sub-NFR7), the
+        # DFIR agent enqueues the report to a Redis-backed FIFO LIST (reports:deferred)
+        # that a background worker drains when S3 recovers, so a 60s S3 outage does not
+        # lose a forensic record. The inline retry budget is a fixed code constant; only
+        # the queue knobs are config. deferred_enabled gates the queue + drain worker
+        # (off by default). deferred_redis_addr is the Redis the queue lives on (the
+        # REDIS_PASSWORD env var supplies the password; required when deferred_enabled=
+        # true). deferred_max_len bounds the queue (default 1000; drop-oldest on
+        # overflow, keeping the freshest reports). deferred_drain_seconds is the drain
+        # worker tick cadence (default 5).
+        deferred_enabled: false
+        deferred_redis_addr: ""
+        deferred_max_len: 1000
+        deferred_drain_seconds: 5
     
     # Story 3.1: the Ring-5 report layer. The redact sub-block gates the
     # AUDIT.redactions SIEM emission (FR41); redaction itself is ALWAYS applied at

@@ -18,8 +18,10 @@ import (
 	"github.com/olokotoh/olaitan/internal/agent/provider"
 	"github.com/olokotoh/olaitan/internal/metrics"
 	"github.com/olokotoh/olaitan/internal/report/archive"
+	"github.com/olokotoh/olaitan/internal/report/deferq"
 	"github.com/olokotoh/olaitan/internal/report/redact"
 	"github.com/olokotoh/olaitan/internal/response/settling"
+	"github.com/olokotoh/olaitan/internal/retry"
 	"github.com/olokotoh/olaitan/internal/schema"
 )
 
@@ -56,7 +58,32 @@ const (
 	writeResultSuccess = "success"
 	writeResultDeduped = "deduped"
 	writeResultError   = "error"
+	// writeResultRetried marks an inline write that succeeded only AFTER at least
+	// one short inline retry (Story 4.7 AC1, BI-1): S3 was briefly unavailable and
+	// the bounded retry absorbed it on the synchronous span.
+	writeResultRetried = "retried"
+	// writeResultDeferred marks an inline write that failed transiently beyond the
+	// short inline budget and was ENQUEUED to the Redis-backed reports:deferred
+	// queue (Story 4.7 AC2, BI-1): the report is durably re-PUT by the background
+	// drain worker when S3 recovers, off the synchronous span (NFR7 preserved).
+	writeResultDeferred = "deferred"
 )
+
+// Inline retry strategy on the synchronous writeReport span (Story 4.7 AC1, BI-1,
+// PO ratification 1 / Open Assumption 1). It is DELIBERATELY SHORT (sub-NFR7): a
+// worst-case 250ms + 500ms inter-attempt backoff across three attempts is a ~1s
+// inline bound (a few seconds with jitter), well under NFR7's 10s p99. A
+// transient failure beyond this short budget DEFERS to the queue and returns
+// fast; the full 60s NFR28 outage window is the drain worker's, NOT a 60s inline
+// block. The values mirror the claude provider's retry.Strategy shape but are
+// shorter and S3-error-classed.
+var inlineWriteRetry = retry.Strategy{
+	Min:         250 * time.Millisecond,
+	Max:         2 * time.Second,
+	Multiplier:  2,
+	Jitter:      1,
+	MaxAttempts: 3,
+}
 
 // dfirSchemaAttempts is the TOTAL number of provider attempts on a schema
 // violation (AC6 bounded retry, round-1 review follow-up R1-MED-1): the first
@@ -174,8 +201,27 @@ type Agent struct {
 	// (the constructor surfaces a registration error otherwise).
 	writes    *prometheus.CounterVec
 	writeSecs prometheus.Histogram
-	log       *slog.Logger
-	now       func() time.Time
+	// deferredGauge is the Story 4.7 live deferred-queue-depth gauge
+	// (olaitan_report_writes_deferred_count, AC4): incremented on enqueue,
+	// decremented on a drained/dead-lettered head. deferredDropped counts entries
+	// dropped to honour the bounded-queue cap (PO ratification 7). Both are
+	// registered by NewDFIR (one family) and injected into the deferred queue +
+	// drainer via WriteMetrics().
+	deferredGauge   prometheus.Gauge
+	deferredDropped *prometheus.CounterVec
+	// deferred is the Story 4.7 enqueue seam (BI-3): on a transient inline-write
+	// failure beyond the short inline retry budget, the agent ENQUEUES the
+	// redacted bytes here and returns fast (NFR7 preserved). It MAY be nil (the
+	// off-by-default deferred-queue path, or a degraded wiring with no Redis): a
+	// nil queue keeps the Story 4.6 fail-loud behaviour (BI-7).
+	deferred *deferq.DeferredQueue
+	// deferredWriteTimeout bounds the single RPUSH enqueue so a slow Redis is
+	// treated like a Redis failure (the 4.6 fail-loud fallback) rather than
+	// blocking the synchronous Generate span (BI-8). Defaults to 3s (the redis
+	// WriteTimeout default).
+	deferredWriteTimeout time.Duration
+	log                  *slog.Logger
+	now                  func() time.Time
 	// seen tracks finalisations already reported this process, keyed on
 	// settling.FinalisedMsgID, so a JetStream redelivery does not emit a second
 	// report (BI-10 consumer-side idempotency; the LimitsPolicy stream can
@@ -280,24 +326,74 @@ func NewDFIR(p provider.Provider, spec PromptSpec, reports ReportPublisher, audi
 	if err != nil {
 		return nil, fmt.Errorf("dfir: report-write-latency metric: %w", err)
 	}
+	// Story 4.7 (AC4, BI-5): EXTEND the Story 4.6 write metric family. The
+	// olaitan_report_writes_total{result} counter and the duration histogram are
+	// registered above (4.7 only ADDS the result label values "retried" /
+	// "deferred" / "drained" on the SAME counter, no re-registration). 4.7
+	// registers ONE new gauge (the live deferred-queue depth, AC4) and ONE new
+	// counter (entries dropped to honour the bounded-queue cap, PO ratification 7).
+	// The handles are owned by the agent (one family) and injected into the
+	// deferred queue + drain worker via WriteMetrics() so there is no duplicate
+	// registration.
+	deferredGaugeVec, err := reg.RegisterGaugeVec("olaitan_report_writes_deferred_count",
+		"Live depth of the Story 4.7 Redis-backed deferred-report queue (NFR28 deferred-write visibility): incremented on enqueue, decremented on a successful drain.",
+		nil)
+	if err != nil {
+		return nil, fmt.Errorf("dfir: deferred-depth gauge: %w", err)
+	}
+	droppedCounter, err := reg.RegisterCounterVec("olaitan_report_writes_dropped_total",
+		"Deferred reports dropped to honour the bounded-queue cap by reason {queue_full} (Story 4.7 PO ratification 7: drop-oldest on a very long S3 outage).",
+		[]string{"reason"})
+	if err != nil {
+		return nil, fmt.Errorf("dfir: dropped-write metric: %w", err)
+	}
 	a := &Agent{
-		provider:   p,
-		reports:    reports,
-		audit:      audit,
-		redactSink: redactSink,
-		archive:    reportArchive,
-		schema:     sch,
-		gen:        gen,
-		genSecs:    genSecs,
-		writes:     writes,
-		writeSecs:  writeSecs,
-		log:        log,
-		now:        func() time.Time { return time.Now().UTC() },
-		seen:       make(map[string]struct{}),
+		provider:             p,
+		reports:              reports,
+		audit:                audit,
+		redactSink:           redactSink,
+		archive:              reportArchive,
+		schema:               sch,
+		gen:                  gen,
+		genSecs:              genSecs,
+		writes:               writes,
+		writeSecs:            writeSecs,
+		deferredGauge:        deferredGaugeVec.WithLabelValues(),
+		deferredDropped:      droppedCounter,
+		deferredWriteTimeout: defaultDeferredWriteTimeout,
+		log:                  log,
+		now:                  func() time.Time { return time.Now().UTC() },
+		seen:                 make(map[string]struct{}),
 	}
 	a.spec.Store(&spec)
 	return a, nil
 }
+
+// defaultDeferredWriteTimeout bounds the single deferred-queue RPUSH so a slow
+// Redis is treated like a Redis failure (the 4.6 fail-loud fallback) rather than
+// blocking the synchronous Generate span (BI-8). It matches the redis client's
+// WriteTimeout default (3s).
+const defaultDeferredWriteTimeout = 3 * time.Second
+
+// WriteMetrics returns the report-write metric handles the agent registered, so
+// the wiring layer can construct the deferred queue + drain worker over the SAME
+// family (one family, no duplicate registration, BI-5). The Writes counter is the
+// shared olaitan_report_writes_total{result}; Deferred is the deferred-depth
+// gauge; Dropped is the bounded-queue drop counter.
+func (a *Agent) WriteMetrics() deferq.Metrics {
+	return deferq.Metrics{
+		Deferred: a.deferredGauge,
+		Dropped:  a.deferredDropped,
+		Writes:   a.writes,
+	}
+}
+
+// SetDeferredQueue injects the Story 4.7 enqueue seam after construction (the
+// wiring layer builds the queue from WriteMetrics() + a Redis client, then the
+// drain worker over the same queue). A nil queue keeps the 4.6 fail-loud
+// behaviour. Called once at wiring time, before Run, so no concurrency guard is
+// needed.
+func (a *Agent) SetDeferredQueue(q *deferq.DeferredQueue) { a.deferred = q }
 
 // ProviderName exposes the DFIR provider's metric label.
 func (a *Agent) ProviderName() string { return a.provider.Name() }
@@ -394,18 +490,30 @@ func (a *Agent) Generate(ctx context.Context, inc Incident) (rendered string, re
 
 // writeReport PUTs the redacted, content-addressed report bytes to the durable
 // report archive (Story 4.6 AC1, FR45) and instruments the write outcome +
-// latency (AC5, BI-8). It is the INLINE write seam on the synchronous NFR7 span:
-// the redacted bytes only exist in-process here (BI-3), so the write is
+// latency (AC5). It is the INLINE write seam on the synchronous NFR7 span: the
+// redacted bytes only exist in-process here (BI-3/BI-4), so the write is
 // synchronous, not a decoupled REPORTS.generated consumer.
 //
-// FAIL LOUD + AUDIT + METRIC, NO RETRY (PO ratification 6, BI-9): on a
-// durable-write error the agent logs LOUDLY, increments
-// olaitan_report_writes_total{result="error"}, and continues (the report was
-// already generated and is announced on REPORTS.generated). It does NOT crash
-// the agent, does NOT enqueue a deferred write, and does NOT retry inline -- the
-// Redis-backed deferred queue + retry is Story 4.7. A 4.6-only deployment
-// accepts a known data-loss window on a hard S3 outage, closed by 4.7 (Open
-// Assumption 4). A HEAD-detected dedup no-op (AC2) is the deduped result.
+// RETRY-THEN-DEFER (Story 4.7 AC1/AC2, BI-1/BI-2, PO ratification 1):
+//
+//   - A transient S3 error (5xx/408/429/timeout/connection, archive.IsTransientS3)
+//     is RETRIED inline with a SHORT bounded retry.Strategy (inlineWriteRetry:
+//     ~1s worst case, well under NFR7's 10s p99). A write that succeeds after >= 1
+//     retry counts result="retried".
+//   - A PERMANENT S3 error (4xx misconfiguration) is wrapped retry.Permanent so
+//     the retry bails immediately; it is NOT deferred (deferring a misconfig just
+//     fills Redis). It keeps the 4.6 fail-loud behaviour (result="error", logged
+//     loudly so it alerts).
+//   - A transient error that SURVIVES the short inline budget is ENQUEUED to the
+//     Redis-backed reports:deferred queue (result="deferred") and writeReport
+//     RETURNS FAST, so the synchronous Generate goroutine (and the
+//     INCIDENTS.finalised consumer behind it) is NEVER blocked for the full 60s
+//     window (NFR7 preserved). The drain worker re-PUTs it when S3 recovers.
+//   - REDIS-DOWN-ON-ENQUEUE fallback (BI-7): if the enqueue itself fails (Redis
+//     down / slow) or no deferred queue is wired (off-by-default), writeReport
+//     falls back to the 4.6 fail-loud (result="error", logged). This is the
+//     irreducible double-outage (S3 AND Redis down) data-loss window; Generate is
+//     never blocked or crashed by it.
 //
 // A nil archive is a no-op (the off-by-default report-archive path): no write,
 // no metric, the agent still announces.
@@ -413,20 +521,35 @@ func (a *Agent) writeReport(ctx context.Context, key, rendered, incidentID strin
 	if a.archive == nil {
 		return
 	}
+	body := []byte(rendered)
 	start := time.Now()
-	receipt, werr := a.archive.Put(ctx, key, []byte(rendered), archive.PutOptions{})
+	receipt, attempts, werr := a.putWithInlineRetry(ctx, key, body)
 	a.writeSecs.Observe(time.Since(start).Seconds())
+
 	if werr != nil {
-		// Fail loud: log + count the error. The report is NOT durably stored
-		// until Story 4.7's deferred queue catches up; do not crash, do not retry.
-		a.writes.WithLabelValues(writeResultError).Inc()
-		a.log.Error("dfir: durable report write failed (fail-loud, no retry; Story 4.7 owns the deferred queue)",
-			"incident_id", incidentID, "key", key, "err", werr)
+		// The inline retry exhausted (transient) or bailed (permanent). Classify
+		// the underlying error: a PERMANENT 4xx misconfiguration is NOT deferred
+		// (it would never succeed; fail loud so it alerts). A transient error
+		// beyond the short budget is DEFERRED so the 60s window is honoured off the
+		// synchronous span.
+		if !archive.IsTransientS3(werr) {
+			a.writes.WithLabelValues(writeResultError).Inc()
+			a.log.Error("dfir: durable report write failed permanently (4xx misconfiguration; not deferred, alert)",
+				"incident_id", incidentID, "key", key, "err", werr)
+			return
+		}
+		a.deferWrite(ctx, key, body, incidentID, werr)
 		return
 	}
+
 	result := writeResultSuccess
-	if receipt.Deduped {
+	switch {
+	case receipt.Deduped:
 		result = writeResultDeduped
+	case attempts > 1:
+		// The write succeeded only after at least one short inline retry: a brief
+		// S3 outage was absorbed on the synchronous span (AC1).
+		result = writeResultRetried
 	}
 	a.writes.WithLabelValues(result).Inc()
 	a.log.Info("dfir: durable report write",
@@ -434,9 +557,70 @@ func (a *Agent) writeReport(ctx context.Context, key, rendered, incidentID strin
 		"key", receipt.Key,
 		"bucket", receipt.Bucket,
 		"result", result,
+		"attempts", attempts,
 		"size", receipt.Size,
 		"retain_until", receipt.RetainUntil.Format(time.RFC3339),
 	)
+}
+
+// putWithInlineRetry runs the SHORT bounded inline retry around archive.Put
+// (Story 4.7 AC1, BI-1/BI-2). A transient S3 error is retried with
+// inlineWriteRetry's backoff; a permanent 4xx misconfiguration is wrapped
+// retry.Permanent so retry.Strategy.Do bails immediately. It returns the receipt
+// on success, the number of Put attempts made (1 = first-try success; > 1 =
+// succeeded after a retry), and the final error (the underlying S3 error,
+// unwrapped by retry.Do, on exhaustion/permanent-bail). The worst-case inline
+// bound (three attempts + two short backoffs) stays well under NFR7's 10s p99.
+func (a *Agent) putWithInlineRetry(ctx context.Context, key string, body []byte) (archive.Receipt, int, error) {
+	var receipt archive.Receipt
+	attempts := 0
+	err := inlineWriteRetry.Do(ctx, func(ctx context.Context) error {
+		attempts++
+		r, perr := a.archive.Put(ctx, key, body, archive.PutOptions{})
+		if perr == nil {
+			receipt = r
+			return nil
+		}
+		if !archive.IsTransientS3(perr) {
+			// Permanent 4xx misconfiguration: bail immediately, no backoff.
+			return retry.Permanent(perr)
+		}
+		return perr
+	})
+	return receipt, attempts, err
+}
+
+// deferWrite enqueues the redacted report bytes to the Redis-backed
+// reports:deferred queue after the inline retry exhausted on a transient outage
+// (Story 4.7 AC2, BI-1/BI-3/BI-8). The enqueue runs on a SHORT deadline (the
+// deferred write timeout) so a slow Redis is treated like a Redis failure rather
+// than blocking the synchronous Generate span. On a successful enqueue it counts
+// result="deferred" (the gauge is incremented inside the queue). On a failed
+// enqueue, or when no deferred queue is wired, it falls back to the 4.6 fail-loud
+// (result="error", logged) and returns fast (BI-7). It NEVER blocks or crashes
+// Generate.
+func (a *Agent) deferWrite(ctx context.Context, key string, body []byte, incidentID string, cause error) {
+	if a.deferred == nil {
+		// No deferred queue wired (off-by-default): keep the 4.6 fail-loud.
+		a.writes.WithLabelValues(writeResultError).Inc()
+		a.log.Error("dfir: durable report write failed transiently and no deferred queue is wired (fail-loud; data-loss window)",
+			"incident_id", incidentID, "key", key, "err", cause)
+		return
+	}
+	enqCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), a.deferredWriteTimeout)
+	defer cancel()
+	if eerr := a.deferred.Enqueue(enqCtx, key, body, archive.PutOptions{}, incidentID); eerr != nil {
+		// Redis down / slow on enqueue: the irreducible S3-AND-Redis double-outage
+		// data-loss window (BI-7). Fall back to the 4.6 fail-loud; never block or
+		// crash Generate.
+		a.writes.WithLabelValues(writeResultError).Inc()
+		a.log.Error("dfir: durable report write failed transiently and the deferred-queue enqueue failed (Redis down; fail-loud, double-outage data-loss window)",
+			"incident_id", incidentID, "key", key, "write_err", cause, "enqueue_err", eerr)
+		return
+	}
+	a.writes.WithLabelValues(writeResultDeferred).Inc()
+	a.log.Warn("dfir: durable report write deferred to the Redis-backed queue after a transient S3 outage (drain worker will re-PUT on recovery; NFR7 preserved)",
+		"incident_id", incidentID, "key", key, "write_err", cause)
 }
 
 // redactReport runs the Story 4.5 persistence-side redaction over the report's

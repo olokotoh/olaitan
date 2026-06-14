@@ -60,6 +60,7 @@ import (
 	"github.com/olokotoh/olaitan/internal/ratelimit"
 	redisclient "github.com/olokotoh/olaitan/internal/redis"
 	"github.com/olokotoh/olaitan/internal/report/archive"
+	"github.com/olokotoh/olaitan/internal/report/deferq"
 	"github.com/olokotoh/olaitan/internal/report/dfir"
 	reportredact "github.com/olokotoh/olaitan/internal/report/redact"
 	responseaudit "github.com/olokotoh/olaitan/internal/response/audit"
@@ -1068,7 +1069,7 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	// (rules-and-baselines plus settling still run). The agent is a leaf
 	// downstream of the FSM (the trust-bound fence, BI-12).
 	if cfg.Response.DFIR.EnabledOrDefault() {
-		dfirAgent, derr := wireDFIRAgent(cfg, apiKey, promptStore.Get(), nc, assessmentPub, metricsReg, redactionAuditSink, log)
+		dfirAgent, dfirDrainer, dfirCloser, derr := wireDFIRAgent(cfg, apiKey, promptStore.Get(), nc, assessmentPub, metricsReg, redactionAuditSink, log)
 		if derr != nil {
 			closeNATS()
 			return fmt.Errorf("aggregator: dfir agent: %w", derr)
@@ -1081,7 +1082,23 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 				dfirAgent.SetPrompt(dfirPromptSpec(set))
 			})
 			g.Go(func() error { return dfirAgent.Run(ctx, nc) })
+			// Story 4.7 (AC3): launch the deferred-report drain worker on the
+			// errgroup adjacent to the DFIR agent. It re-PUTs reports that the inline
+			// write deferred (transient S3 outage) when S3 recovers, FIFO, idempotent
+			// via the content-addressed key. A nil drainer (deferred queue
+			// off-by-default, or a degraded wiring) is skipped; its Redis client is
+			// closed on Run return.
+			if dfirDrainer != nil {
+				g.Go(func() error {
+					err := dfirDrainer.Run(ctx)
+					dfirCloser()
+					return err
+				})
+				log.Info("aggregator: DFIR deferred-report drain worker wired (Story 4.7, NFR28)")
+			}
 			log.Info("aggregator: DFIR forensic-report agent wired (FR43)", "durable", "olaitan-dfir-agent")
+		} else {
+			dfirCloser()
 		}
 	}
 	if fsmStore != nil {
@@ -1369,18 +1386,19 @@ func wireSettlingController(cfg *config.Config, nc *natsclient.Client, fsmStore 
 // aggregator runs without DFIR reports (the chain-degrade precedent). The agent
 // is a leaf downstream of the FSM: it makes NO GuardCappedConfidence call and
 // imports no score/FSM package (the TRUST-BOUND FENCE, BI-12).
-func wireDFIRAgent(cfg *config.Config, apiKey string, promptSet *prompts.Set, nc *natsclient.Client, assessmentPub responseaudit.AssessmentAuditPublisher, reg *metrics.Registry, sink *reportredact.RedactionAuditSink, log *slog.Logger) (*dfir.Agent, error) {
+func wireDFIRAgent(cfg *config.Config, apiKey string, promptSet *prompts.Set, nc *natsclient.Client, assessmentPub responseaudit.AssessmentAuditPublisher, reg *metrics.Registry, sink *reportredact.RedactionAuditSink, log *slog.Logger) (*dfir.Agent, *deferq.DeferredDrainer, func(), error) {
+	noopCloser := func() {}
 	p, perr := buildDFIRProvider(cfg, apiKey, reg, sink, log)
 	if perr != nil {
-		return nil, fmt.Errorf("dfir provider: %w", perr)
+		return nil, nil, noopCloser, fmt.Errorf("dfir provider: %w", perr)
 	}
 	if p == nil {
 		// Degraded resolution (no key/model/provider:none); skip wiring.
-		return nil, nil
+		return nil, nil, noopCloser, nil
 	}
 	reportPub, rerr := dfir.NewNATSReportPublisher(nc)
 	if rerr != nil {
-		return nil, fmt.Errorf("dfir report publisher: %w", rerr)
+		return nil, nil, noopCloser, fmt.Errorf("dfir report publisher: %w", rerr)
 	}
 	// The audit recorder reuses the AUDIT.assessments publisher (nil when the
 	// analyst ring did not wire one, e.g. provider:none); a nil recorder leaves
@@ -1401,13 +1419,70 @@ func wireDFIRAgent(cfg *config.Config, apiKey string, promptSet *prompts.Set, nc
 	// 4.4/4.5 behaviour.
 	reportArchive, rarErr := wireReportArchive(cfg, log)
 	if rarErr != nil {
-		return nil, fmt.Errorf("dfir report archive: %w", rarErr)
+		return nil, nil, noopCloser, fmt.Errorf("dfir report archive: %w", rarErr)
 	}
 	agent, aerr := dfir.NewDFIR(p, dfirPromptSpec(promptSet), reportPub, recorder, sink, reportArchive, reg, log)
 	if aerr != nil {
-		return nil, fmt.Errorf("dfir agent: %w", aerr)
+		return nil, nil, noopCloser, fmt.Errorf("dfir agent: %w", aerr)
 	}
-	return agent, nil
+	// Story 4.7 (AC2/AC3): construct the Redis-backed deferred-write queue + drain
+	// worker when response.report_archive.deferred_enabled=true AND an archive was
+	// wired. The queue shares the agent's write-metric family (one family, no
+	// duplicate registration) via WriteMetrics(). A nil archive (off-by-default)
+	// or deferred_enabled=false leaves the agent on the 4.6 fail-loud path.
+	drainer, dCloser, derr := wireDeferredQueue(cfg, agent, reportArchive, log)
+	if derr != nil {
+		return nil, nil, noopCloser, fmt.Errorf("dfir deferred queue: %w", derr)
+	}
+	return agent, drainer, dCloser, nil
+}
+
+// wireDeferredQueue constructs the Story 4.7 Redis-backed deferred-write queue +
+// drain worker (AC2/AC3) when the report archive is enabled and
+// response.report_archive.deferred_enabled=true. It returns (nil, noop-closer,
+// nil) when the deferred queue is off-by-default or no archive was wired, so the
+// DFIR agent keeps the 4.6 fail-loud path. The Redis password is the NFR8
+// secret-via-env REDIS_PASSWORD precedent (TrimRight guards the trailing-newline
+// secretKeyRef pitfall). The returned closer shuts the dedicated Redis client
+// after the drain worker's Run returns (the FSM-sink ordering precedent).
+func wireDeferredQueue(cfg *config.Config, agent *dfir.Agent, reportArchive archive.ReportArchive, log *slog.Logger) (*deferq.DeferredDrainer, func(), error) {
+	noopCloser := func() {}
+	ra := cfg.Response.ReportArchive
+	if reportArchive == nil || !ra.DeferredEnabledOrDefault() {
+		return nil, noopCloser, nil
+	}
+	rcfg := redisclient.DefaultConfig()
+	rcfg.Addr = ra.DeferredRedisAddr
+	pwd := strings.TrimRight(os.Getenv("REDIS_PASSWORD"), "\r\n")
+	if pwd == "" {
+		return nil, noopCloser, fmt.Errorf("NFR8: REDIS_PASSWORD env var is required when response.report_archive.deferred_enabled=true (set --set secrets.redisPassword or wire a secretKeyRef)")
+	}
+	rcfg.Password = pwd
+	rc, err := redisclient.NewClient(rcfg)
+	if err != nil {
+		return nil, noopCloser, fmt.Errorf("deferred-queue redis: %w", err)
+	}
+	closer := func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if cerr := rc.Close(closeCtx); cerr != nil {
+			log.Warn("aggregator: deferred-queue redis close", "err", cerr)
+		}
+	}
+	queue, qerr := deferq.NewDeferredQueue(rc, ra.DeferredMaxLenOrDefault(), agent.WriteMetrics(), log)
+	if qerr != nil {
+		closer()
+		return nil, noopCloser, fmt.Errorf("deferred queue: %w", qerr)
+	}
+	drainer, drErr := deferq.NewDeferredDrainer(queue, reportArchive, time.Duration(ra.DeferredDrainSecondsOrDefault())*time.Second, log)
+	if drErr != nil {
+		closer()
+		return nil, noopCloser, fmt.Errorf("deferred drainer: %w", drErr)
+	}
+	agent.SetDeferredQueue(queue)
+	log.Info("deferred report queue enabled (Story 4.7, NFR28)",
+		"redis_addr", ra.DeferredRedisAddr, "max_len", ra.DeferredMaxLenOrDefault(), "drain_seconds", ra.DeferredDrainSecondsOrDefault())
+	return drainer, closer, nil
 }
 
 // wireReportArchive constructs the Story 4.6 durable report writer (FR45) from

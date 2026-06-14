@@ -667,6 +667,34 @@ data:
     {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.report_archive.object_lock_mode anchor not found (pattern %q)" $p) }}{{- end }}
     {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $ra.objectLockMode) }}
     {{- end }}
+    {{- /*
+    Story 4.7: deferred-write queue overlay (FR45 resilience, NFR28). Bridges
+    response.reportArchive.{deferredEnabled,deferredRedisAddr,deferredMaxLen,
+    deferredDrainSeconds} onto the report_archive block. deferred_enabled is a
+    bool disambiguated by the trailing deferred_redis_addr key; deferred_redis_addr
+    is a quoted string; deferred_max_len and deferred_drain_seconds are unquoted
+    integers.
+    */ -}}
+    {{- if hasKey $ra "deferredEnabled" }}
+    {{- $p := "(\\n    deferred_enabled: )(?:true|false)(\\n    deferred_redis_addr:)" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.report_archive.deferred_enabled anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v${2}" $ra.deferredEnabled) }}
+    {{- end }}
+    {{- if hasKey $ra "deferredRedisAddr" }}
+    {{- $p := "(\\n    deferred_redis_addr: )\"[^\"]*\"" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.report_archive.deferred_redis_addr anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%q" $ra.deferredRedisAddr) }}
+    {{- end }}
+    {{- if hasKey $ra "deferredMaxLen" }}
+    {{- $p := "(\\n    deferred_max_len: )[0-9]+" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.report_archive.deferred_max_len anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $ra.deferredMaxLen) }}
+    {{- end }}
+    {{- if hasKey $ra "deferredDrainSeconds" }}
+    {{- $p := "(\\n    deferred_drain_seconds: )[0-9]+" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.report_archive.deferred_drain_seconds anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $ra.deferredDrainSeconds) }}
+    {{- end }}
     {{- end }}
     {{- /*
     Story 1.19: Evaluation-matrix overlay (FR53). Replace the file-side

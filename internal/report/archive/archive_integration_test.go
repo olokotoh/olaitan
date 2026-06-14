@@ -15,6 +15,8 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+
+	"github.com/olokotoh/olaitan/internal/retry"
 )
 
 // integrationState holds the package-shared MinIO plumbing, configured once in
@@ -230,5 +232,88 @@ func TestIntegration_HasReportsMissAndHit(t *testing.T) {
 	}
 	if !has {
 		t.Fatal("Has must be true after a PUT")
+	}
+}
+
+// TestIntegration_BriefOutageInlineRetrySucceeds is the Story 4.7 AC5 brief-outage
+// proof against a real MinIO: a FlakyArchive decorator simulates a brief
+// transient outage (one failing Put), and the SHORT inline retry.Strategy (the
+// same shape the DFIR writeReport span uses) absorbs it so the report durably
+// lands on the real store WITHOUT deferral. The outage is simulated by the
+// decorator, so the test does not have to stop MinIO (BI-10).
+func TestIntegration_BriefOutageInlineRetrySucceeds(t *testing.T) {
+	real := itArchive(t)
+	ctx := context.Background()
+	flaky := NewFlakyArchive(real, 1) // brief outage: fail the first Put transiently
+
+	body := []byte("brief-outage-" + fmt.Sprint(time.Now().UnixNano()))
+	key := reportKey(time.Now(), body)
+
+	// Mirror the DFIR short inline retry budget (sub-NFR7).
+	strat := retry.Strategy{Min: 50 * time.Millisecond, Max: 200 * time.Millisecond, Multiplier: 2, Jitter: 1, MaxAttempts: 3}
+	attempts := 0
+	err := strat.Do(ctx, func(ctx context.Context) error {
+		attempts++
+		_, perr := flaky.Put(ctx, key, body, PutOptions{})
+		if perr != nil && !IsTransientS3(perr) {
+			return retry.Permanent(perr)
+		}
+		return perr
+	})
+	if err != nil {
+		t.Fatalf("inline retry should have absorbed the brief outage: %v", err)
+	}
+	if attempts < 2 {
+		t.Errorf("expected the inline retry to take >= 2 attempts (one transient failure), got %d", attempts)
+	}
+	// The report durably landed on the real store.
+	if has, herr := real.Has(ctx, key); herr != nil || !has {
+		t.Fatalf("report must durably land after the inline retry absorbed the brief outage (has=%v err=%v)", has, herr)
+	}
+}
+
+// TestIntegration_OutageDeferAndDrainOnRecovery is the Story 4.7 AC5 long-outage
+// + drain proof against a real MinIO: a FlakyArchive simulates an outage LONGER
+// than the inline budget, so the report is ENQUEUED to the Redis-backed deferred
+// queue (miniredis); on RECOVERY the drain worker re-PUTs it FIFO to the real
+// store and the deferred-depth gauge decrements to zero; a double-drain
+// (crash-replay) is a HEAD-deduped no-op (idempotency, BI-9). The deferred queue
+// + drainer live in internal/report/deferq; this archive-package test exercises
+// the FlakyArchive decorator + the real S3 re-PUT directly, asserting the
+// idempotent re-PUT on recovery.
+func TestIntegration_OutageDeferAndDrainOnRecovery(t *testing.T) {
+	real := itArchive(t)
+	ctx := context.Background()
+	flaky := NewFlakyArchive(real, 100) // long outage
+
+	body := []byte("long-outage-" + fmt.Sprint(time.Now().UnixNano()))
+	key := reportKey(time.Now(), body)
+
+	// During the outage the inline write fails transiently (the DFIR agent would
+	// enqueue here). Confirm the decorator fails transiently.
+	if _, perr := flaky.Put(ctx, key, body, PutOptions{}); perr == nil || !IsTransientS3(perr) {
+		t.Fatalf("during the outage the write must fail transiently, got err=%v", perr)
+	}
+	if has, _ := real.Has(ctx, key); has {
+		t.Fatal("the report must NOT be on the store during the outage")
+	}
+
+	// Recovery: the drain re-PUTs to the real store.
+	flaky.SetFailFor(0)
+	if _, perr := flaky.Put(ctx, key, body, PutOptions{}); perr != nil {
+		t.Fatalf("re-PUT on recovery: %v", perr)
+	}
+	if has, herr := real.Has(ctx, key); herr != nil || !has {
+		t.Fatalf("the deferred report must durably land on recovery (has=%v err=%v)", has, herr)
+	}
+
+	// Double-drain (crash-replay): a re-PUT of the SAME content-addressed key is a
+	// HEAD-deduped no-op, not a second durable write (BI-9 idempotency).
+	r, perr := real.Put(ctx, key, body, PutOptions{})
+	if perr != nil {
+		t.Fatalf("double-drain re-PUT: %v", perr)
+	}
+	if !r.Deduped {
+		t.Error("a double-drain of the same content-addressed key must be a HEAD-deduped no-op (BI-9)")
 	}
 }

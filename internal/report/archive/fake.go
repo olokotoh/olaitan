@@ -2,6 +2,7 @@ package archive
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 )
@@ -103,4 +104,66 @@ func (f *FakeArchive) Keys() []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// FlakyArchive is a ReportArchive decorator that simulates a transient S3 outage
+// (Story 4.7 AC5, BI-10): for the first FailFor Put calls it returns the
+// configured FailWith error (a transient 5xx/connection-shaped error by default),
+// then delegates every subsequent Put to the wrapped archive. It is the
+// simulated-outage seam the inline-retry / defer / drain-on-recovery tests drive
+// deterministically WITHOUT stopping a real MinIO. It is exported (not _test.go)
+// so both the archive integration tests and the deferq unit tests can use it
+// across package boundaries.
+//
+// FailFor is decremented per failing Put. With FailFor=0 the decorator is a
+// transparent pass-through. SetFailFor / Outage adjust the remaining failure
+// budget at test time (e.g. to simulate recovery).
+type FlakyArchive struct {
+	inner ReportArchive
+
+	mu      sync.Mutex
+	failFor int
+	// FailWith is the error returned while the outage is active. When nil a
+	// default transient error (errTransientOutage) is used.
+	FailWith error
+}
+
+// errTransientOutage is the default transient-shaped error FlakyArchive returns
+// while an outage is active. It is classified transient by IsTransientS3 (no
+// recognised HTTP status => transport fault).
+var errTransientOutage = errors.New("archive: simulated transient S3 outage (connection refused)")
+
+// NewFlakyArchive wraps inner with an initial outage budget of failFor Put calls.
+func NewFlakyArchive(inner ReportArchive, failFor int) *FlakyArchive {
+	return &FlakyArchive{inner: inner, failFor: failFor}
+}
+
+// SetFailFor sets the remaining number of Put calls that will fail (simulating
+// the start or end of an outage). Pass 0 to simulate immediate recovery.
+func (f *FlakyArchive) SetFailFor(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failFor = n
+}
+
+// Put fails (decrementing the outage budget) while the outage is active, else
+// delegates to the wrapped archive.
+func (f *FlakyArchive) Put(ctx context.Context, key string, body []byte, opts PutOptions) (Receipt, error) {
+	f.mu.Lock()
+	if f.failFor > 0 {
+		f.failFor--
+		err := f.FailWith
+		f.mu.Unlock()
+		if err == nil {
+			err = errTransientOutage
+		}
+		return Receipt{}, err
+	}
+	f.mu.Unlock()
+	return f.inner.Put(ctx, key, body, opts)
+}
+
+// Has delegates to the wrapped archive.
+func (f *FlakyArchive) Has(ctx context.Context, key string) (bool, error) {
+	return f.inner.Has(ctx, key)
 }
