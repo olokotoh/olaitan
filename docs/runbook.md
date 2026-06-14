@@ -938,6 +938,64 @@ Sample PromQL (one per panel):
 
 Note: `olaitan_decision_llm_calls_total{provider,role,status}` (the analyst DECISION-outcome counter) and `olaitan_decision_llm_l2_skipped_total` are additional internal metrics distinct from the FR50 transport surface above; they keep their `decision_` names.
 
+### 1.4e Evaluation-matrix arms and LLM chain shape (Story 3.16, FR53)
+
+The chart selects a canonical Epic-5 evaluation arm with the single switch
+`evaluation.config`. Each arm overlays the effective `rules.enabled`,
+`baselines.enabled`, `analyst.provider`, `analyst.l2_enabled`, and
+`analyst.senior_enabled` values (computed by the `olaitan.evaluation.effective*`
+templates in `_helpers.tpl:181-289`), so an operator cannot silently invalidate
+the across-arm comparison by setting the individual knobs. `evaluation.config`
+is restart-required; roll the aggregator after a change.
+
+| Arm | rules | baselines | provider | l2 | senior | Effective analyst chain |
+|---|---|---|---|---|---|---|
+| `F` | false | false | none | n/a | n/a | Falco-only; no deterministic layer, LLM tier bypassed |
+| `RS` | true | true | none | n/a | n/a | Rules + statistics; LLM tier bypassed |
+| `RSL` | true | true | api | false | true | Single-LLM analyst, L1 only (`senior` precedence collapses to L1-as-senior) |
+| `RSLT-full` (alias `RSLT`) | true | true | api | true | true | Full chain L1 -> L2 -> Senior |
+| `RSLT-L1-only` | true | true | api | false | true | L1-only ablation (L2 off => Senior off by Go-side `SeniorEnabledOrDefault` precedence) |
+| `RSLT-L1+L2` | true | true | api | true | false | L1 + L2 ablation; no Senior |
+| `""` | operator | operator | operator | operator | operator | No overlay; operator-supplied knobs flow through verbatim |
+
+`olaitan.evaluation.validate` (`_helpers.tpl:153-160`) fails render with a clear
+enum message when `evaluation.config` is outside this set. **Trust-bound holds in
+every arm:** enabling more analyst stages never lets the LLM escalate the FSM past
+SUSPICIOUS; the LLM contribution stays capped (`0.3 x 35 = 10.5 < 20`), enforced
+at the provider cap, the `GuardCappedConfidence` chokepoint, and the `score.go`
+re-clamp regardless of which arm is deployed.
+
+**Upgrading an Epic-2 RS-with-isolation deployment to LLM-enriched verdicts.** An
+existing RS (rules + graduated-isolation, no LLM) install gains the multi-agent
+analyst by switching to an LLM-bearing arm and supplying the API-key Secret the
+provider dials:
+
+```bash
+helm upgrade olaitan deploy/helm/olaitan \
+  --reuse-values \
+  --set evaluation.config=RSLT-full \
+  --set analyst.api.endpoint=https://<vendor-or-gateway>/v1 \
+  --set analyst.api.apiKeySecret=olaitan-llm-api-key
+kubectl rollout restart deploy/olaitan-aggregator
+```
+
+The `analyst.api.apiKeySecret` Secret is projected into the aggregator env by
+`deployment.yaml:124-134`; without it the provider degrades to rules-only with an
+`api_key_set=false` log (NFR18), so the chart never silently dials a public
+endpoint with no key. The graduated-isolation response layer from Epic 2 is
+unaffected; the LLM only enriches the verdict the FSM already bounds.
+
+**Air-gapped routing (Ollama, FR48).** To run an LLM-bearing arm without egress to
+a public vendor, route the analyst to the in-cluster Ollama instead of the `api`
+provider: set `analyst.provider=local` and `ollama.enabled=true` (or apply the
+`values-airgapped.yaml` overlay). That renders the `ollama` Deployment/Service plus
+its NetworkPolicy (egress declared-empty, ingress only from the aggregator
+selector), and the provider dials `http://ollama.olaitan.svc.cluster.local:11434`.
+The NetworkPolicy **is** the authentication boundary here: the Ollama provider
+takes no API key (`analyst.local.{endpoint,model}` is its only config). The local
+ScoreCap defaults to 25, so the trust-bound is, if anything, tighter on the
+air-gapped path.
+
 ### 1.5 Naming-convention reconciliation
 
 The Story 1.18 acceptance criteria text uses a mix of singular-ring and plural-ring metric names (e.g. AC2 says `olaitan_decision_rule_matches_total` singular; AC3 says `olaitan_decision_baseline_deviations_total{metric, sigma_bucket}` plural). The actual registrations follow `architecture.md:472-475` which mandates the `olaitan_<ring>_<metric>` pattern with the engine subfamily conventionally plural (`rules`, `baseline`) because the engine evaluates a corpus, not a single rule. The AC singular spellings are documentation aliases, not parallel families.
