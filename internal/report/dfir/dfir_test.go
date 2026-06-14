@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -190,6 +191,16 @@ func TestGenerate_SchemaConformingRender(t *testing.T) {
 	wantKey := "reports/2026/06/14/" + ev.ReportSHA256 + ".md"
 	if ev.ReportURL != wantKey {
 		t.Errorf("content-addressed key = %q, want %q", ev.ReportURL, wantKey)
+	}
+	// Story 4.8 (AC1, BI-1/BI-2): the producer populates the two additive
+	// fields from the just-rendered report so the optional-webhook payload is
+	// complete. ThreatScore <- ForensicReport.ThreatScoreAtDecision (42.5);
+	// AttackTechniques <- the force-stamped assessment techniques (T1611).
+	if ev.ThreatScore != 42.5 {
+		t.Errorf("ReportGenerated.ThreatScore = %v, want 42.5", ev.ThreatScore)
+	}
+	if len(ev.AttackTechniques) != 1 || ev.AttackTechniques[0] != "T1611" {
+		t.Errorf("ReportGenerated.AttackTechniques = %v, want [T1611]", ev.AttackTechniques)
 	}
 	// AUDIT.assessments DFIR row recorded with the prompt hash.
 	if len(ar.records) != 1 {
@@ -485,7 +496,10 @@ func TestReportGenerated_WireRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(b, &back); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if back != evt {
+	// reflect.DeepEqual rather than != : Story 4.8 added an additive
+	// []string field (attack_techniques), so the struct is no longer
+	// comparable with the equality operator.
+	if !reflect.DeepEqual(back, evt) {
 		t.Errorf("round-trip mismatch: %+v vs %+v", back, evt)
 	}
 }
@@ -925,5 +939,75 @@ func TestGenerate_PosturePresentForceStamped(t *testing.T) {
 	}
 	if !strings.Contains(rendered, "cluster-role binding grants cluster-admin") {
 		t.Errorf("a present posture must render its force-stamped finding\n%s", rendered)
+	}
+}
+
+// TestReportGenerated_AdditiveFieldsRoundTrip is the Story 4.8 BI-2/BI-9 proof:
+// the two additive-optional fields (threat_score, attack_techniques) marshal and
+// round-trip on the reports.generated.v1 wire, carrying the values the producer
+// populates. The wire JSON uses the snake_case keys the optional notification
+// webhook consumer decodes.
+func TestReportGenerated_AdditiveFieldsRoundTrip(t *testing.T) {
+	evt := ReportGenerated{
+		SchemaVersion:    SchemaVersionReportGenerated,
+		IncidentID:       "pkg-1",
+		WorkloadID:       "ns/Deployment/web",
+		ReportSHA256:     "deadbeef",
+		ReportURL:        "reports/2026/06/14/deadbeef.md",
+		FinalFSMState:    "QUARANTINED",
+		GeneratedAt:      time.Date(2026, 6, 14, 10, 0, 0, 0, time.UTC),
+		ThreatScore:      77.5,
+		AttackTechniques: []string{"T1611", "T1610"},
+	}
+	raw, err := json.Marshal(evt)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, want := range []string{`"threat_score":77.5`, `"attack_techniques":["T1611","T1610"]`} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("wire JSON missing %q\n%s", want, raw)
+		}
+	}
+	var got ReportGenerated
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.ThreatScore != 77.5 {
+		t.Errorf("ThreatScore round-trip = %v, want 77.5", got.ThreatScore)
+	}
+	if len(got.AttackTechniques) != 2 || got.AttackTechniques[0] != "T1611" {
+		t.Errorf("AttackTechniques round-trip = %v, want [T1611 T1610]", got.AttackTechniques)
+	}
+}
+
+// TestReportGenerated_OldShapeDecodes is the Story 4.8 BI-2 additive-optional
+// (forward/backward compat) proof: a 4.4-era REPORTS.generated event with the
+// two new fields ABSENT still decodes cleanly, leaving the zero values. NO
+// reports.generated.v1 version bump (the 4.5/4.7 additive-wire discipline): an
+// omitempty addition keeps the old wire shape valid.
+func TestReportGenerated_OldShapeDecodes(t *testing.T) {
+	// The pre-4.8 (Story 4.4) wire shape, with no threat_score / attack_techniques.
+	old := `{"schema_version":"reports.generated.v1","incident_id":"pkg-1","workload_id":"ns/Deployment/web","report_sha256":"deadbeef","report_url":"reports/2026/06/14/deadbeef.md","final_fsm_state":"QUARANTINED","generated_at":"2026-06-14T10:00:00Z"}`
+	var got ReportGenerated
+	if err := json.Unmarshal([]byte(old), &got); err != nil {
+		t.Fatalf("an old-shape event must still decode: %v", err)
+	}
+	if got.IncidentID != "pkg-1" || got.ReportURL != "reports/2026/06/14/deadbeef.md" {
+		t.Errorf("old-shape decode lost a v1 field: %+v", got)
+	}
+	if got.ThreatScore != 0 {
+		t.Errorf("absent threat_score must decode to the zero value, got %v", got.ThreatScore)
+	}
+	if got.AttackTechniques != nil {
+		t.Errorf("absent attack_techniques must decode to nil, got %v", got.AttackTechniques)
+	}
+	// Re-marshalling an old-shape event omits the two omitempty fields, so the
+	// wire bytes stay byte-compatible for a producer that does not set them.
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("re-marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "threat_score") || strings.Contains(string(raw), "attack_techniques") {
+		t.Errorf("zero-value additive fields must be omitted from the wire, got %s", raw)
 	}
 }
