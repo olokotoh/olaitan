@@ -2,6 +2,7 @@ package override
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -188,7 +189,7 @@ func (c *Controller) auditOverride(ctx context.Context, evt OverrideApplied) {
 func (c *Controller) registerMetrics(r *metrics.Registry) error {
 	cv, err := r.RegisterCounterVec(
 		"olaitan_response_override_rejected_total",
-		"Cumulative number of operator-override requests refused, labelled by reason: state_unavailable (a real-but-unimplemented state such as PRESERVED_KILLED) or invalid_state (an unknown/typo'd state). Story 2.7, FR38/FR39, AC5.",
+		"Cumulative number of operator-override requests refused, labelled by reason: invalid_state (an unknown/typo'd state). The state_unavailable label is retained for series stability but no longer increments: Story 4.1 admits PRESERVED_KILLED as an override target (its only-from-QUARANTINED legality is enforced inside the FSM), so it is no longer a state_unavailable rejection. Story 2.7, FR38/FR39, AC5.",
 		[]string{"reason"},
 	)
 	if err != nil {
@@ -278,15 +279,22 @@ func (c *Controller) reconcile(ctx context.Context) {
 		return
 	}
 
-	// A workload that became VALID (now desired) clears any stale rejected
-	// marker, so a later regression to the same invalid value re-counts (FIX 5).
-	for wl := range desiredSet {
-		delete(c.lastRejected, wl)
-	}
-
-	// Emit rejections (no pin, no Redis write; BI-5). Counted/emitted only on a
-	// NEW or CHANGED rejection signature per workload (FIX 5) so a standing
-	// invalid annotation counts once, consistent with the deduped NATS event.
+	// Emit pre-filter rejections (no pin, no Redis write; BI-5). Counted/emitted
+	// only on a NEW or CHANGED rejection signature per workload (FIX 5) so a
+	// standing invalid annotation counts once, consistent with the deduped NATS
+	// event.
+	//
+	// Story 4.1 (round-2 Finding): the stale-marker clear was previously done
+	// here UNCONDITIONALLY for every workload in desiredSet, on the assumption
+	// that "in desiredSet" == "now valid". That assumption is false for a
+	// PRESERVED_KILLED skip-into: it PASSES the pre-filter (so it is in
+	// desiredSet) but is rejected later inside Pin (applyDesired). The
+	// unconditional clear wiped its lastRejected entry every tick, so
+	// emitRejection's dedup gate re-counted + re-emitted the Pin-error rejection
+	// on EVERY poll for one standing misconfig. The clear is therefore moved into
+	// the apply-SUCCESS path (clearRejectedMarker, called only when a workload
+	// genuinely pins this tick), so a later regression to the same invalid value
+	// still re-counts, but a never-pinning skip-into stays deduped to ONCE.
 	for _, rej := range rejections {
 		c.emitRejection(ctx, rej)
 	}
@@ -432,17 +440,23 @@ func (c *Controller) computeDesired(ctx context.Context) (desiredSet map[string]
 			continue
 		}
 
-		state := schema.PodSecurityState(stateRaw)
+		// Story 4.1 (BI-1): normalise the operator annotation value
+		// PRESERVED+KILLED (plus-form, the one plus-form input, AC2/epics.md)
+		// to the enum string PRESERVED_KILLED (underscore) before it reaches
+		// validOverrideTarget/Pin, so the annotation value matches the code
+		// token. Other state values contain no '+', so this is a no-op for them.
+		state := schema.PodSecurityState(normaliseOverrideState(stateRaw))
 		if !validOverrideTarget(state) {
-			reason := ReasonInvalidState
-			if state == schema.StatePreservedKilled {
-				reason = ReasonStateUnavailable
-			}
+			// Story 4.1 (BI-6): PRESERVED_KILLED is no longer rejected here as a
+			// "state_unavailable" target; it is an accepted override target whose
+			// only-from-QUARANTINED legality is enforced inside Machine.Pin. The
+			// pre-filter now rejects only genuinely-unknown states, all under the
+			// invalid_state reason.
 			rejections = append(rejections, desired{
 				workloadID:   workloadID,
 				state:        state,
 				source:       source,
-				rejectReason: reason,
+				rejectReason: ReasonInvalidState,
 				requestedRaw: stateRaw,
 			})
 			continue
@@ -542,8 +556,12 @@ func (c *Controller) applyDesired(ctx context.Context, workloadID string, d desi
 		if s, pinned := c.machine.IsPinned(workloadID); !pinned || s != d.state {
 			if err := c.machine.Pin(workloadID, d.state, d.operatorID); err != nil {
 				c.log.Warn("override: re-pin (rehydrate) failed", "workload_id", workloadID, "state", d.state, "err", err)
+				return
 			}
 		}
+		// A genuinely-valid, active override: clear any stale rejected marker so a
+		// later regression to an invalid value re-counts (round-2 Finding).
+		c.clearRejectedMarker(workloadID)
 		return
 	}
 
@@ -566,10 +584,36 @@ func (c *Controller) applyDesired(ctx context.Context, workloadID string, d desi
 	alreadyPinnedSame := wasPinned && prevPinned == d.state
 
 	if err := c.machine.Pin(workloadID, d.state, d.operatorID); err != nil {
+		// Story 4.1 (Finding 1): a PRESERVED_KILLED override that passed the
+		// pre-filter but is an illegal skip-into (current != QUARANTINED) is
+		// rejected inside Pin with ErrInvalidOverrideState. The SAFETY behaviour
+		// is unchanged (no Redis write, no pin, no state change), but the rejected
+		// operator action must be AUDITABLE rather than warn-log-only: emit the
+		// same rejected event + increment the rejection counter the pre-filter
+		// path uses, reusing the existing invalid_state reason (no new schema).
+		// Scope is narrow: only ErrInvalidOverrideState routes here; any other
+		// Pin error stays a defensive warn-log.
+		if errors.Is(err, fsm.ErrInvalidOverrideState) {
+			c.emitRejection(ctx, desired{
+				workloadID:   workloadID,
+				state:        d.state,
+				source:       d.source,
+				rejectReason: ReasonInvalidState,
+				requestedRaw: string(d.state),
+			})
+			return
+		}
 		// A validated state should never be rejected here; log defensively.
 		c.log.Warn("override: pin failed", "workload_id", workloadID, "state", d.state, "err", err)
 		return
 	}
+
+	// The Pin succeeded: this workload is genuinely valid this tick. Clear any
+	// stale rejected marker so a later regression to the same invalid value
+	// re-counts (round-2 Finding: the clear moved out of reconcile's
+	// unconditional desiredSet loop, which wrongly cleared never-pinning
+	// PRESERVED_KILLED skip-intos every tick).
+	c.clearRejectedMarker(workloadID)
 
 	appliedAt := c.now().UTC()
 	rec := OverrideRecord{
@@ -725,6 +769,18 @@ func (c *Controller) detectManualRemovals(ctx context.Context, desiredSet map[st
 		delete(c.consumed, wl)
 		c.log.Info("override: released (annotation removed)", "workload_id", wl, "resumed_from", resumed, "was_pinned", ok)
 	}
+}
+
+// clearRejectedMarker drops a workload's lastRejected dedup entry once it has
+// successfully pinned this tick (the apply-SUCCESS path). It replaces the old
+// unconditional clear over all of desiredSet in reconcile, which wrongly wiped
+// the marker for a PRESERVED_KILLED skip-into that passes the pre-filter (so it
+// is desired) yet is rejected inside Pin and never actually pins (round-2
+// Finding). Clearing only on a genuine pin keeps the "regression to an invalid
+// value re-counts" semantics while leaving a never-pinning standing skip-into
+// deduped to a single rejection, exactly like the pre-filter rejection path.
+func (c *Controller) clearRejectedMarker(workloadID string) {
+	delete(c.lastRejected, workloadID)
 }
 
 // emitRejection publishes a rejected OVERRIDES.applied event and increments the

@@ -225,6 +225,121 @@ func TestEscalation_SingleStepAtBoundaries(t *testing.T) {
 	}
 }
 
+// climbToQuarantinedForKill drives "w" to QUARANTINED with all dwell guards 0
+// (so the three escalation steps land at the same clock instant, fixing
+// stateEnteredAt to now) and returns the machine + sink. The default kill
+// knobs (90 / 300 s) apply via testConfig leaving them nil.
+func climbToQuarantinedForKill(t *testing.T, clock *fakeClock) (*Machine, *RecordingSink) {
+	t.Helper()
+	m, sink := newMachineForTest(t, testConfig(0, 0, 0, 600), clock)
+	for i := 0; i < 3; i++ {
+		m.Evaluate("w", 100, "pkg")
+	}
+	if s := m.State("w"); s != schema.StateQuarantined {
+		t.Fatalf("setup: state = %s, want QUARANTINED", s)
+	}
+	return m, sink
+}
+
+// TestKill_FiresAfterSustainedFromQuarantined pins Story 4.1 AC1/BI-5: a
+// QUARANTINED workload whose score holds at or above the kill threshold (90)
+// for the kill-sustain window (300 s), with at least that long since the
+// QUARANTINED apply, escalates to PRESERVED_KILLED with reason kill_condition_met.
+func TestKill_FiresAfterSustainedFromQuarantined(t *testing.T) {
+	clock := newFakeClock()
+	m, sink := climbToQuarantinedForKill(t, clock)
+	before := sink.count()
+
+	// Start the at-or-above-kill window with a kill-level sample, then advance
+	// past both the sustain window AND the QUARANTINED dwell-since-apply.
+	m.Evaluate("w", 95, "pkg") // no kill yet (window just opened)
+	clock.advance(time.Duration(config.DefaultKillSustainSeconds+1) * time.Second)
+	st := m.Evaluate("w", 95, "pkg")
+
+	if st.FromState != schema.StateQuarantined || st.ToState != schema.StatePreservedKilled {
+		t.Fatalf("kill: got %s->%s, want QUARANTINED->PRESERVED_KILLED", st.FromState, st.ToState)
+	}
+	if st.Reason != schema.ReasonKillConditionMet {
+		t.Errorf("kill reason = %q, want kill_condition_met", st.Reason)
+	}
+	if st.TriggerType != "automated" {
+		t.Errorf("kill trigger = %q, want automated", st.TriggerType)
+	}
+	if sink.count() != before+1 {
+		t.Errorf("kill emitted %d transitions, want 1", sink.count()-before)
+	}
+}
+
+// TestKill_DoesNotFireBeforeSustainElapsed pins BI-5: a QUARANTINED workload
+// whose score is at kill level but for LESS than the sustain window is not
+// killed (neither the at-or-above-kill window nor the QUARANTINED dwell has
+// elapsed).
+func TestKill_DoesNotFireBeforeSustainElapsed(t *testing.T) {
+	clock := newFakeClock()
+	m, _ := climbToQuarantinedForKill(t, clock)
+
+	m.Evaluate("w", 95, "pkg")
+	clock.advance(time.Duration(config.DefaultKillSustainSeconds-10) * time.Second) // just short
+	st := m.Evaluate("w", 95, "pkg")
+	if st.ToState == schema.StatePreservedKilled {
+		t.Fatalf("kill fired before the sustain window elapsed: %s->%s", st.FromState, st.ToState)
+	}
+	if st.FromState != schema.StateQuarantined || st.ToState != schema.StateQuarantined {
+		t.Fatalf("expected no transition (stay QUARANTINED), got %s->%s", st.FromState, st.ToState)
+	}
+}
+
+// TestKill_ScoreDipResetsSustainWindow pins BI-5: a dip below the kill
+// threshold resets the at-or-above-kill window, so the kill clock restarts even
+// though the QUARANTINED dwell continues to accrue.
+func TestKill_ScoreDipResetsSustainWindow(t *testing.T) {
+	clock := newFakeClock()
+	m, _ := climbToQuarantinedForKill(t, clock)
+
+	// Hold kill-level for almost the whole window, then dip below 90 (but stay
+	// at or above the QUARANTINED entry threshold 70 so we do not de-escalate).
+	m.Evaluate("w", 95, "pkg")
+	clock.advance(time.Duration(config.DefaultKillSustainSeconds-5) * time.Second)
+	dip := m.Evaluate("w", 80, "pkg") // resets the at-or-above-kill window
+	if dip.ToState != schema.StateQuarantined {
+		t.Fatalf("dip should not change state, got %s->%s", dip.FromState, dip.ToState)
+	}
+
+	// Advance just past where the kill WOULD have fired without the dip; it must
+	// NOT fire because the dip reset the window.
+	clock.advance(10 * time.Second)
+	st := m.Evaluate("w", 95, "pkg")
+	if st.ToState == schema.StatePreservedKilled {
+		t.Fatal("kill fired even though a sub-90 dip reset the sustain window (BI-5)")
+	}
+
+	// Now hold kill-level for a full fresh window: the kill fires.
+	clock.advance(time.Duration(config.DefaultKillSustainSeconds+1) * time.Second)
+	st = m.Evaluate("w", 95, "pkg")
+	if st.ToState != schema.StatePreservedKilled {
+		t.Fatalf("kill did not fire after a fresh full sustain window, got %s->%s", st.FromState, st.ToState)
+	}
+}
+
+// TestKill_DwellSinceQuarantineRequired pins BI-5.1: a QUARANTINED workload fed
+// a kill-level score (>= 90) at the SAME instant QUARANTINED was applied is NOT
+// killed on the first post-quarantine evaluation, because the dwell-since the
+// QUARANTINED apply is zero and the kill condition requires it to be >= the
+// kill-sustain window. The QUARANTINED-dwell clock, not just the at-or-above-kill
+// window, must be satisfied.
+func TestKill_DwellSinceQuarantineRequired(t *testing.T) {
+	clock := newFakeClock()
+	m, _ := climbToQuarantinedForKill(t, clock)
+
+	// Immediately feed kill-level scores at the SAME instant QUARANTINED was
+	// applied: the QUARANTINED dwell-since-apply is zero, so even a high score
+	// cannot kill on the first post-quarantine evaluation.
+	st := m.Evaluate("w", 100, "pkg")
+	if st.ToState == schema.StatePreservedKilled {
+		t.Fatal("kill fired with zero dwell since the QUARANTINED apply (BI-5.1)")
+	}
+}
+
 // TestEscalation_BoundaryScores pins the band edges: a score exactly at a
 // threshold is inclusive (>=). 19 stays CLEAN, 20 reaches SUSPICIOUS.
 func TestEscalation_BoundaryScores(t *testing.T) {
@@ -543,13 +658,17 @@ func TestPin_EmitsOverrideTransition(t *testing.T) {
 	}
 }
 
-// TestPin_RejectsInvalidTarget pins BI-5: a pin to PRESERVED_KILLED or an
-// unknown state returns ErrInvalidOverrideState and mutates nothing.
+// TestPin_RejectsInvalidTarget pins the Story 4.1 reframing of Story 2.7 BI-5:
+// an unknown state returns ErrInvalidOverrideState and mutates nothing.
+// PRESERVED_KILLED is no longer unconditionally rejected (Story 4.1 admits it
+// as an override target from QUARANTINED, BI-6); from a non-QUARANTINED current
+// state it is still rejected, but that is exercised in
+// TestPin_RejectsPreservedKilledFromNonQuarantined below.
 func TestPin_RejectsInvalidTarget(t *testing.T) {
 	clock := newFakeClock()
 	m, sink := newMachineForTest(t, testConfig(0, 0, 0, 600), clock)
 
-	for _, bad := range []schema.PodSecurityState{schema.StatePreservedKilled, "BOGUS"} {
+	for _, bad := range []schema.PodSecurityState{"BOGUS", "preserved_killed", ""} {
 		if err := m.Pin("w", bad, ""); !errors.Is(err, ErrInvalidOverrideState) {
 			t.Errorf("Pin(%q) = %v, want ErrInvalidOverrideState", bad, err)
 		}
@@ -559,6 +678,67 @@ func TestPin_RejectsInvalidTarget(t *testing.T) {
 	}
 	if _, pinned := m.IsPinned("w"); pinned {
 		t.Error("invalid pin left the workload pinned")
+	}
+}
+
+// TestPin_AcceptsPreservedKilledFromQuarantined pins Story 4.1 AC2/BI-6: an
+// operator may pin a QUARANTINED workload to PRESERVED_KILLED; the override
+// emits one transition with TriggerType "override" and Reason operator_override.
+func TestPin_AcceptsPreservedKilledFromQuarantined(t *testing.T) {
+	clock := newFakeClock()
+	m, sink := newMachineForTest(t, testConfig(0, 0, 0, 600), clock)
+
+	// Pin to QUARANTINED first (an operator may multi-step pin), then to PK.
+	if err := m.Pin("w", schema.StateQuarantined, "alice"); err != nil {
+		t.Fatalf("Pin QUARANTINED: %v", err)
+	}
+	if err := m.Pin("w", schema.StatePreservedKilled, "alice"); err != nil {
+		t.Fatalf("Pin PRESERVED_KILLED from QUARANTINED: %v, want nil", err)
+	}
+	if s := m.State("w"); s != schema.StatePreservedKilled {
+		t.Fatalf("after pin, state = %s, want PRESERVED_KILLED", s)
+	}
+	// Two pins => two transitions; the second is the kill override.
+	if sink.count() != 2 {
+		t.Fatalf("emitted %d transitions, want 2 (QUARANTINED then PRESERVED_KILLED)", sink.count())
+	}
+	last := sink.transitions[1]
+	if last.FromState != schema.StateQuarantined || last.ToState != schema.StatePreservedKilled {
+		t.Errorf("kill override = %s->%s, want QUARANTINED->PRESERVED_KILLED", last.FromState, last.ToState)
+	}
+	if last.TriggerType != "override" || last.Reason != schema.ReasonOperatorOverride {
+		t.Errorf("kill override trigger=%q reason=%q, want override/operator_override", last.TriggerType, last.Reason)
+	}
+	if last.OperatorID != "alice" {
+		t.Errorf("kill override OperatorID = %q, want alice", last.OperatorID)
+	}
+}
+
+// TestPin_RejectsPreservedKilledFromNonQuarantined pins the BI-6.3 only-from-
+// QUARANTINED guard: an operator may NOT skip a RESTRICTED (or any non-
+// QUARANTINED) workload straight to PRESERVED_KILLED via Pin's multi-step
+// latitude. The reject mutates nothing.
+func TestPin_RejectsPreservedKilledFromNonQuarantined(t *testing.T) {
+	clock := newFakeClock()
+	for _, from := range []schema.PodSecurityState{
+		schema.StateClean, schema.StateSuspicious, schema.StateRestricted,
+	} {
+		m, sink := newMachineForTest(t, testConfig(0, 0, 0, 600), clock)
+		if from != schema.StateClean {
+			if err := m.Pin("w", from, "alice"); err != nil {
+				t.Fatalf("setup pin to %s: %v", from, err)
+			}
+		}
+		baseline := sink.count()
+		if err := m.Pin("w", schema.StatePreservedKilled, "mallory"); !errors.Is(err, ErrInvalidOverrideState) {
+			t.Errorf("Pin PRESERVED_KILLED from %s = %v, want ErrInvalidOverrideState", from, err)
+		}
+		if s := m.State("w"); s == schema.StatePreservedKilled {
+			t.Errorf("rejected skip-into left workload at PRESERVED_KILLED (from %s)", from)
+		}
+		if sink.count() != baseline {
+			t.Errorf("rejected skip-into emitted a transition (from %s)", from)
+		}
 	}
 }
 

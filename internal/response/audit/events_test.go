@@ -86,6 +86,36 @@ func TestAuditTransition_ValidatesAgainstSchema(t *testing.T) {
 	}
 }
 
+// TestAuditTransition_KillReasonValidatesAndDriftFails pins Story 4.1 Task 1.4
+// (BI-9): a QUARANTINED -> PRESERVED_KILLED transition carrying the new
+// reason=kill_condition_met validates against the closed transitions.json enum,
+// while a deliberately out-of-enum reason FAILS, so the enum extension is not a
+// vacuous drift trap.
+func TestAuditTransition_KillReasonValidatesAndDriftFails(t *testing.T) {
+	now := time.Date(2026, 6, 14, 12, 0, 0, 0, time.UTC)
+	kill := schema.StateTransition{
+		FromState:   schema.StateQuarantined,
+		ToState:     schema.StatePreservedKilled,
+		Confidence:  95,
+		PackageID:   "pkg-1",
+		WorkloadID:  "ns/Deployment/web",
+		TriggerType: "automated",
+		Reason:      schema.ReasonKillConditionMet,
+		Timestamp:   now,
+	}
+	evt := transitionFromState(kill, now.Add(time.Second))
+	if err := validateAgainstSchema(t, filepath.Join(schemaDir, "transitions.json"), mustMarshal(t, evt)); err != nil {
+		t.Fatalf("kill transition (reason=kill_condition_met) failed schema validation: %v", err)
+	}
+
+	// Non-vacuous negative case: a reason outside the closed enum must FAIL, so
+	// the enum extension is a genuine drift trap rather than a permissive any-string.
+	drifted := []byte(`{"schema_version":"audit.transitions.v1","before_state":"QUARANTINED","after_state":"PRESERVED_KILLED","triggering_threat_score":95,"package_id":"pkg-1","workload_id":"w","trigger_type":"automated","reason":"kill_condition_NOT_a_reason","decided_at":"2026-06-14T12:00:00Z","published_at":"2026-06-14T12:00:01Z"}`)
+	if err := validateAgainstSchema(t, filepath.Join(schemaDir, "transitions.json"), drifted); err == nil {
+		t.Fatal("expected schema validation to FAIL on an out-of-enum reason, but it passed (the kill-reason enum trap would be vacuous)")
+	}
+}
+
 func TestAuditPolicy_ValidatesAgainstSchema(t *testing.T) {
 	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
 	cases := []netpol.PolicyAuditEvent{

@@ -48,8 +48,8 @@ fields:
   reason:
     type: string
     required: true
-    enum: [escalation_threshold_crossed, dwell_guard_elapsed, de_escalation_cooldown_expired, no_transition, operator_override]
-    description: Closed enum of schema.Reason* constants plus operator_override.
+    enum: [escalation_threshold_crossed, dwell_guard_elapsed, de_escalation_cooldown_expired, no_transition, operator_override, kill_condition_met]
+    description: Closed enum of schema.Reason* constants plus operator_override and the Story 4.1 kill_condition_met (QUARANTINED -> PRESERVED_KILLED).
   operator_id:
     type: string
     required: false

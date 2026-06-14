@@ -1258,3 +1258,89 @@ func TestFSMConfig_OrDefaultOnZeroValue(t *testing.T) {
 		t.Errorf("DeescalationCooldownSecondsOrDefault zero-value: got %d, want 600", got)
 	}
 }
+
+// TestFSMConfig_KillKnobsDefaultOnOmitted pins Story 4.1 Task 2.4 (BI-11): the
+// kill knobs default to 90 / 300 when omitted, honour explicit values, and the
+// validator rejects out-of-range or below-QUARANTINED-band thresholds.
+func TestFSMConfig_KillKnobsDefaultOnOmitted(t *testing.T) {
+	// Omitted -> defaults via the OrDefault accessors (in-memory zero value).
+	var z config.FSMConfig
+	if got := z.KillThreatScoreOrDefault(); got != 90.0 {
+		t.Errorf("KillThreatScoreOrDefault zero-value: got %v, want 90", got)
+	}
+	if got := z.KillSustainSecondsOrDefault(); got != 300 {
+		t.Errorf("KillSustainSecondsOrDefault zero-value: got %d, want 300", got)
+	}
+
+	// Explicit values honoured through Load.
+	body := `
+detection:
+  confidence_bands:
+    watch: 20
+    alert: 40
+    act: 70
+  baseline_window: 24h
+  fsm:
+    kill_threat_score: 95
+    kill_sustain_seconds: 120
+response:
+  excluded_namespaces: []
+analyst:
+  provider: api
+  score_cap: 35
+  timeout: 10s
+`
+	cfg, err := config.Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	f := cfg.Detection.FSM
+	if got := f.KillThreatScoreOrDefault(); got != 95 {
+		t.Errorf("KillThreatScore: got %v, want 95", got)
+	}
+	if got := f.KillSustainSecondsOrDefault(); got != 120 {
+		t.Errorf("KillSustainSeconds: got %d, want 120", got)
+	}
+}
+
+// TestFSMConfig_RejectsBadKillThreshold pins the BI-11 kill-threshold range
+// invariant: out-of-[0,100] and at-or-below-the-QUARANTINED-band thresholds are
+// rejected, and a negative kill-sustain is rejected.
+func TestFSMConfig_RejectsBadKillThreshold(t *testing.T) {
+	cases := []struct {
+		name     string
+		fsmBlock string
+		wantSub  string
+	}{
+		{"above 100", "kill_threat_score: 150", "kill_threat_score"},
+		{"below quarantined band", "kill_threat_score: 50", "kill_threat_score"},
+		{"negative sustain", "kill_sustain_seconds: -1", "kill_sustain_seconds"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `
+detection:
+  confidence_bands:
+    watch: 20
+    alert: 40
+    act: 70
+  baseline_window: 24h
+  fsm:
+    ` + tc.fsmBlock + `
+response:
+  excluded_namespaces: []
+analyst:
+  provider: api
+  score_cap: 35
+  timeout: 10s
+`
+			_, err := config.Load(writeConfig(t, body))
+			if err == nil {
+				t.Fatalf("Load: got nil, want rejection for %s", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("error does not mention %q: %v", tc.wantSub, err)
+			}
+		})
+	}
+}

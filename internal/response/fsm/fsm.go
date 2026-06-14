@@ -96,6 +96,11 @@ type thresholds struct {
 	restrictedDwell  time.Duration
 	quarantinedDwell time.Duration
 	cooldown         time.Duration
+	// Story 4.1 kill condition (BI-11). killThreshold is the ThreatScore the
+	// score must hold; killSustain is how long it must hold it AND how long the
+	// workload must have been QUARANTINED before the kill edge fires.
+	killThreshold float64
+	killSustain   time.Duration
 }
 
 // workloadState is the per-workload FSM state held in memory (BI-6).
@@ -109,6 +114,16 @@ type workloadState struct {
 	// cooldown measures the continuous sub-threshold window from here so
 	// a single low sample does not de-escalate (AC3).
 	lastAtOrAboveThresholdAt time.Time
+	// lastBelowKillThresholdAt is the most recent time the score fell BELOW
+	// the Story 4.1 kill threshold (default 90). The kill condition measures
+	// the continuous at-or-above-kill-threshold window as now - this anchor, so
+	// any dip below the kill threshold resets the sustain clock (BI-5). It is
+	// distinct from lastAtOrAboveThresholdAt, which tracks the 70-band entry
+	// threshold of QUARANTINED, not the 90 kill band. Refreshed to now on each
+	// Evaluate whenever the score is below the kill threshold; on state entry it
+	// is seeded to now so a freshly-quarantined workload must accrue a fresh
+	// sustain window before the kill edge can fire.
+	lastBelowKillThresholdAt time.Time
 	// overridden is the Story 2.7 operator-override pin flag (FR38). While
 	// true, Evaluate early-returns a no_transition without advancing the
 	// dwell/cooldown timers, freezing the workload at overrideState. It is
@@ -270,6 +285,8 @@ func (m *Machine) resolve() thresholds {
 		restrictedDwell:  time.Duration(config.DefaultRestrictedDwellSeconds) * time.Second,
 		quarantinedDwell: time.Duration(config.DefaultQuarantinedDwellSeconds) * time.Second,
 		cooldown:         time.Duration(config.DefaultDeescalationCooldownSeconds) * time.Second,
+		killThreshold:    config.DefaultKillThreatScore,
+		killSustain:      time.Duration(config.DefaultKillSustainSeconds) * time.Second,
 	}
 	cur := m.snapshot()
 	if cur == nil {
@@ -284,6 +301,8 @@ func (m *Machine) resolve() thresholds {
 	t.restrictedDwell = time.Duration(f.RestrictedDwellSecondsOrDefault()) * time.Second
 	t.quarantinedDwell = time.Duration(f.QuarantinedDwellSecondsOrDefault()) * time.Second
 	t.cooldown = time.Duration(f.DeescalationCooldownSecondsOrDefault()) * time.Second
+	t.killThreshold = f.KillThreatScoreOrDefault()
+	t.killSustain = time.Duration(f.KillSustainSecondsOrDefault()) * time.Second
 	return t
 }
 
@@ -336,8 +355,13 @@ func (t thresholds) dwell(s PodState) time.Duration {
 	}
 }
 
-// stateOrder returns the ordinal of a state on the CLEAN..QUARANTINED
-// chain. PRESERVED_KILLED is never produced by Evaluate (BI-7).
+// stateOrder returns the ordinal of a state on the
+// CLEAN..QUARANTINED..PRESERVED_KILLED chain, matching schema.stateOrderMap.
+// PRESERVED_KILLED is ordinal 4 (Story 4.1, BI-10): the "no skip into PK"
+// guarantee the property tests rely on rides on this ordinal, so that a
+// RESTRICTED(2) -> PRESERVED_KILLED(4) attempt computes a 2-step diff and is
+// rejected by the one-step bound, while QUARANTINED(3) -> PRESERVED_KILLED(4)
+// is the single legal step up.
 func stateOrder(s PodState) int {
 	switch s {
 	case schema.StateClean:
@@ -348,13 +372,17 @@ func stateOrder(s PodState) int {
 		return 2
 	case schema.StateQuarantined:
 		return 3
+	case schema.StatePreservedKilled:
+		return 4
 	default:
 		return 0
 	}
 }
 
-// nextUp returns the state one step above s on the escalation chain, or s
-// itself when s is already QUARANTINED (the terminal escalation, BI-7).
+// nextUp returns the state one step above s on the escalation chain. From
+// QUARANTINED it steps to PRESERVED_KILLED (the Story 4.1 kill edge, BI-3);
+// PRESERVED_KILLED is the new terminal escalation (no state above ordinal 4),
+// so it returns itself.
 func nextUp(s PodState) PodState {
 	switch s {
 	case schema.StateClean:
@@ -363,9 +391,53 @@ func nextUp(s PodState) PodState {
 		return schema.StateRestricted
 	case schema.StateRestricted:
 		return schema.StateQuarantined
+	case schema.StateQuarantined:
+		return schema.StatePreservedKilled
 	default:
 		return s
 	}
+}
+
+// killConditionMet reports whether the Story 4.1 kill condition is satisfied
+// for a QUARANTINED workload (BI-3/BI-4/BI-5). It is the dwell-gated,
+// QUARANTINED-anchored gate above ValidTransition that decides WHEN the
+// structurally-legal QUARANTINED -> PRESERVED_KILLED edge is actually taken.
+// It is called with m.mu held; it reads ws/t/now only and mutates nothing.
+//
+// All three clocks must be satisfied:
+//  1. the score is currently at or above the kill threshold (default 90);
+//  2. the score has been continuously at or above the kill threshold for at
+//     least the kill-sustain window (now - lastBelowKillThresholdAt >= sustain),
+//     so a freshly-spiking score does not kill until the window has elapsed;
+//  3. the workload has dwelled in QUARANTINED for at least the sustain window
+//     (now - stateEnteredAt >= sustain), the "300 s after the QUARANTINED
+//     apply" anchor (BI-5.1).
+//
+// Clock 3 (now - stateEnteredAt >= killSustain) is, in steady-state operation,
+// a defensive redundancy: while the process runs, stateEnteredAt is set to the
+// QUARANTINED apply instant and lastBelowKillThresholdAt is reseeded on every
+// sub-kill score, so clock 2 dominates and clock 3 rarely binds independently.
+// It becomes INDEPENDENTLY binding only after Restore (Story 2.3): Restore seeds
+// stateEnteredAt from the persisted Redis hash (which can be far in the past for
+// a long-quarantined workload) while reseeding lastBelowKillThresholdAt to
+// restart-now (the kill anchor is in-memory only, so it cannot be recovered).
+// Without clock 2's reseed dominating after restart, clock 3 alone would
+// otherwise let a freshly-restarted controller kill a long-quarantined workload
+// on the first sustained kill score; clock 2's restart-now reseed is what
+// actually defers the kill until a fresh post-restart sustain window elapses.
+//
+// The caller has already established ws.current == QUARANTINED.
+func (m *Machine) killConditionMet(t thresholds, ws *workloadState, score float64, now time.Time) bool {
+	if score < t.killThreshold {
+		return false
+	}
+	if now.Sub(ws.lastBelowKillThresholdAt) < t.killSustain {
+		return false
+	}
+	if now.Sub(ws.stateEnteredAt) < t.killSustain {
+		return false
+	}
+	return true
 }
 
 // nextDown returns the state one step below s on the escalation chain, or
@@ -425,6 +497,7 @@ func (m *Machine) Evaluate(workloadID string, score float64, packageID string) s
 			current:                  schema.StateClean,
 			stateEnteredAt:           now,
 			lastAtOrAboveThresholdAt: now,
+			lastBelowKillThresholdAt: now,
 		}
 		m.states[workloadID] = ws
 	}
@@ -461,11 +534,30 @@ func (m *Machine) Evaluate(workloadID string, score float64, packageID string) s
 		ws.lastAtOrAboveThresholdAt = now
 	}
 
+	// Refresh the Story 4.1 kill-sustain anchor: whenever the score is BELOW
+	// the kill threshold, the at-or-above-kill window restarts from now, so any
+	// dip below the kill threshold resets the sustain clock (BI-5). The
+	// at-or-above case deliberately does NOT touch the anchor, letting the
+	// continuous window grow as now - lastBelowKillThresholdAt.
+	if score < t.killThreshold {
+		ws.lastBelowKillThresholdAt = now
+	}
+
 	target := t.targetState(score)
 	reason := schema.ReasonNoTransition
 	to := ws.current
 
 	switch {
+	case ws.current == schema.StateQuarantined && m.killConditionMet(t, ws, score, now):
+		// Story 4.1 kill edge (BI-3/BI-4/BI-5): a QUARANTINED workload whose
+		// score has been continuously at or above the kill threshold for the
+		// sustain window, AND which has dwelled in QUARANTINED for at least the
+		// sustain window, escalates one step to PRESERVED_KILLED. This is NOT a
+		// targetState band (BI-4); it is a dwell-gated, QUARANTINED-anchored
+		// check. The mutation still passes through ValidTransition below
+		// (QUARANTINED -> PRESERVED_KILLED is the single legal step up).
+		to = schema.StatePreservedKilled
+		reason = schema.ReasonKillConditionMet
 	case stateOrder(target) > stateOrder(ws.current):
 		// Escalation candidate. Gate on the current state's dwell guard
 		// (AC2). CLEAN has a zero dwell guard so it escalates immediately.
@@ -512,6 +604,12 @@ func (m *Machine) Evaluate(workloadID string, score float64, packageID string) s
 			// de-escalation requires a fresh full sub-threshold window and
 			// an escalation does not carry a stale anchor.
 			ws.lastAtOrAboveThresholdAt = now
+			// Reset the kill-sustain anchor on every actual change so a
+			// workload that newly enters QUARANTINED must accrue a fresh
+			// at-or-above-kill window before it can be killed (BI-5); a stale
+			// anchor inherited from an earlier QUARANTINED spell must not
+			// shortcut the sustain requirement.
+			ws.lastBelowKillThresholdAt = now
 		}
 	}
 
@@ -535,12 +633,17 @@ func (m *Machine) Evaluate(workloadID string, score float64, packageID string) s
 	return st
 }
 
-// validOverrideTarget reports whether s is one of the four reachable Epic-2
-// states an operator may pin a workload to (Story 2.7 BI-5). PRESERVED_KILLED
-// (Epic 4) and any unknown value are rejected.
+// validOverrideTarget reports whether s is a state an operator may pin a
+// workload to. Story 2.7 admitted the four CLEAN/SUSPICIOUS/RESTRICTED/
+// QUARANTINED states; Story 4.1 ADDS PRESERVED_KILLED (BI-6.2), since the
+// operator-override path is now the second legal entry into PRESERVED_KILLED
+// (AC1/AC2). The skip-into-PRESERVED_KILLED hole is closed separately by Pin's
+// only-from-QUARANTINED guard (BI-6.3), not here: this allow-list answers "is
+// the target a real pinnable state", and Pin answers "is this pin legal from
+// the workload's current state". Any unknown value is still rejected.
 func validOverrideTarget(s PodState) bool {
 	switch s {
-	case schema.StateClean, schema.StateSuspicious, schema.StateRestricted, schema.StateQuarantined:
+	case schema.StateClean, schema.StateSuspicious, schema.StateRestricted, schema.StateQuarantined, schema.StatePreservedKilled:
 		return true
 	default:
 		return false
@@ -581,8 +684,21 @@ func (m *Machine) Pin(workloadID string, state PodState, operatorID string) erro
 			current:                  schema.StateClean,
 			stateEnteredAt:           now,
 			lastAtOrAboveThresholdAt: now,
+			lastBelowKillThresholdAt: now,
 		}
 		m.states[workloadID] = ws
+	}
+	// Story 4.1 only-from-QUARANTINED guard (BI-6.3). Pin deliberately does NOT
+	// gate on the one-step escalation rule (an operator may pin CLEAN straight
+	// to QUARANTINED), so merely allow-listing PRESERVED_KILLED would let an
+	// operator pin RESTRICTED -> PRESERVED_KILLED, a skip-into that AC2/AC4
+	// forbid. Constrain ONLY the PRESERVED_KILLED target to from-QUARANTINED;
+	// every other target keeps its multi-step pin latitude. The mutation does
+	// nothing under the lock before this point, so returning here is a clean
+	// no-op reject.
+	if state == schema.StatePreservedKilled && ws.current != schema.StateQuarantined {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: PRESERVED_KILLED may only be pinned from QUARANTINED (current %q)", ErrInvalidOverrideState, ws.current)
 	}
 	from := ws.current
 	changed := state != ws.current
@@ -600,6 +716,7 @@ func (m *Machine) Pin(workloadID string, state PodState, operatorID string) erro
 		ws.current = state
 		ws.stateEnteredAt = now
 		ws.lastAtOrAboveThresholdAt = now
+		ws.lastBelowKillThresholdAt = now
 		st = schema.StateTransition{
 			Timestamp:   now,
 			FromState:   from,
@@ -646,6 +763,7 @@ func (m *Machine) ReleasePin(workloadID string) (resumedFrom PodState, ok bool) 
 	ws.overrideState = ""
 	ws.stateEnteredAt = now
 	ws.lastAtOrAboveThresholdAt = now
+	ws.lastBelowKillThresholdAt = now
 	return resumedFrom, true
 }
 
@@ -709,10 +827,11 @@ func (m *Machine) recordMetrics(st schema.StateTransition) {
 // evaluation cadence.
 func (m *Machine) refreshActiveGaugeLocked() {
 	counts := map[PodState]int{
-		schema.StateClean:       0,
-		schema.StateSuspicious:  0,
-		schema.StateRestricted:  0,
-		schema.StateQuarantined: 0,
+		schema.StateClean:           0,
+		schema.StateSuspicious:      0,
+		schema.StateRestricted:      0,
+		schema.StateQuarantined:     0,
+		schema.StatePreservedKilled: 0,
 	}
 	for _, ws := range m.states {
 		counts[ws.current]++
@@ -789,6 +908,11 @@ func (m *Machine) Restore(ctx context.Context, store *Store) (recovered int, ski
 			current:                  rw.state.current,
 			stateEnteredAt:           entered,
 			lastAtOrAboveThresholdAt: now,
+			// Seed the kill-sustain anchor to now so a recovered QUARANTINED
+			// workload must accrue a fresh at-or-above-kill window after
+			// restart before it can be killed (Story 4.1, BI-5); the persisted
+			// Redis hash carries no kill anchor (it is in-memory only).
+			lastBelowKillThresholdAt: now,
 		}
 	}
 	recovered = len(loaded)

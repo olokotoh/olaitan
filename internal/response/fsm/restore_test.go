@@ -77,6 +77,60 @@ func TestRestore_ClockClampOnFutureTimestamp(t *testing.T) {
 	}
 }
 
+// TestKill_RestorePreventsImmediateKill pins Story 4.1 round-1 Finding 3 and the
+// dev-handoff risk #2 (the Restore kill-anchor reseed): a workload restored as
+// QUARANTINED with a FAR-PAST stateEnteredAt (clock 3 / the QUARANTINED-dwell
+// clock is already satisfied) is NOT killed on the first post-restart sustained
+// kill score. Restore reseeds lastBelowKillThresholdAt to restart-now (the kill
+// anchor is in-memory only and cannot be recovered), so clock 2 (the
+// at-or-above-kill window) restarts from zero and dominates: the kill defers
+// until a fresh post-restart sustain window elapses, then fires. This isolates
+// clock 3's independent binding after Restore (which steady-state operation
+// masks) and exercises clock 2's restart-now reseed dominance.
+func TestKill_RestorePreventsImmediateKill(t *testing.T) {
+	ctx := context.Background()
+	mr := startMiniredis(t)
+	store, _ := NewStore(newRedisClient(t, mr.Addr()))
+	clock := newFakeClock()
+	// Seed QUARANTINED with stateEnteredAt far in the past: the QUARANTINED-dwell
+	// clock (clock 3) is already satisfied at restore-now.
+	farPast := clock.Now().Add(-time.Duration(config.DefaultKillSustainSeconds+1_000) * time.Second)
+	seedState(t, store, testWorkloadID, schema.StateQuarantined, farPast)
+
+	m, _ := newMachineForTest(t, testConfig(0, 0, 0, 600), clock)
+	if _, _, err := m.Restore(ctx, store); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if got := m.State(testWorkloadID); got != schema.StateQuarantined {
+		t.Fatalf("State after restore = %q, want QUARANTINED", got)
+	}
+
+	// Open the at-or-above-kill window at restart-now with a kill-level score.
+	// Despite clock 3 already being satisfied (far-past stateEnteredAt), no kill:
+	// clock 2 (lastBelowKillThresholdAt) was reseeded to restart-now.
+	st := m.Evaluate(testWorkloadID, 95, "pkg")
+	if st.ToState == schema.StatePreservedKilled {
+		t.Fatal("kill fired immediately after restore despite the in-memory kill anchor reseed (Finding 3)")
+	}
+
+	// Just short of a fresh post-restart sustain window: still no kill.
+	clock.advance(time.Duration(config.DefaultKillSustainSeconds-10) * time.Second)
+	st = m.Evaluate(testWorkloadID, 95, "pkg")
+	if st.ToState == schema.StatePreservedKilled {
+		t.Fatalf("kill fired before a fresh post-restart sustain window elapsed: %s->%s", st.FromState, st.ToState)
+	}
+
+	// A fresh full post-restart sustain window has now elapsed: the kill fires.
+	clock.advance(20 * time.Second)
+	st = m.Evaluate(testWorkloadID, 95, "pkg")
+	if st.FromState != schema.StateQuarantined || st.ToState != schema.StatePreservedKilled {
+		t.Fatalf("kill did not fire after a fresh post-restart sustain window, got %s->%s", st.FromState, st.ToState)
+	}
+	if st.Reason != schema.ReasonKillConditionMet {
+		t.Errorf("kill reason = %q, want kill_condition_met", st.Reason)
+	}
+}
+
 // TestRestore_RecoveredMetric pins AC5: state_recovered_total counts the
 // workloads rehydrated from Redis.
 func TestRestore_RecoveredMetric(t *testing.T) {

@@ -488,6 +488,22 @@ data:
     {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: detection.fsm.deescalation_cooldown_seconds anchor not found (pattern %q)" $p) }}{{- end }}
     {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $fsm.deescalationCooldownSeconds) }}
     {{- end }}
+    {{- /*
+    Story 4.1: FSM kill-condition overlay (FR31/FR49). kill_threat_score and
+    kill_sustain_seconds are unique keys under detection.fsm so simple anchors
+    are safe; each carries a mustRegexFind guard so a renamed config key fails
+    the render rather than silently dropping the --set value.
+    */ -}}
+    {{- if not (kindIs "invalid" $fsm.killThreatScore) }}
+    {{- $p := "(\\n    kill_threat_score: )[0-9]+" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: detection.fsm.kill_threat_score anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $fsm.killThreatScore) }}
+    {{- end }}
+    {{- if not (kindIs "invalid" $fsm.killSustainSeconds) }}
+    {{- $p := "(\\n    kill_sustain_seconds: )[0-9]+" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: detection.fsm.kill_sustain_seconds anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $fsm.killSustainSeconds) }}
+    {{- end }}
     {{- end }}
     {{- /*
     Story 2.10: response-ring graduated-isolation overlay (FR47/FR49). Bridges

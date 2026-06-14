@@ -392,9 +392,20 @@ When you have manually investigated an alert and want Olaitan to stand a workloa
 
 **Precedence and conflicts (BI-9, Open Assumption 4).** A pod-level annotation wins over the same annotation on the owner; both key on the canonical owner-resolved `workload_id`, so an owner-level annotation pins the whole workload (the common "stand this Deployment down" case). Conflicting per-pod annotations of the SAME owner (pod A says RESTRICTED, pod B says QUARANTINED) resolve to the HIGHEST requested state (most-isolating wins, the safe security default) with a WARN log naming the conflict. Annotate the owner for a whole-workload override and avoid conflicting per-pod annotations.
 
-**Rejected overrides.** An override into `PRESERVED_KILLED` (Epic 4, not yet implemented) is REFUSED: no pin, no Redis key, an `OVERRIDES.applied` event with `rejected: true, reason: state_unavailable`, and the metric below increments with `reason="state_unavailable"`. A typo'd or non-enum state value is refused the same way with `reason="invalid_state"` so you can tell "you asked for a real-but-not-yet-implemented state" from "you mistyped the state".
+**Rejected overrides.** A typo'd or non-enum state value is refused: no pin, no Redis key, an `OVERRIDES.applied` event with `rejected: true, reason: invalid_state`, and the metric below increments with `reason="invalid_state"`, so you can tell "you mistyped the state" from a legal pin. **Story 4.1 update:** `PRESERVED_KILLED` is now a LEGAL override target (it is no longer refused with `state_unavailable`); see the PRESERVED_KILLED section below. An operator may pin `olaitan.io/state-override: PRESERVED+KILLED` (the plus-form is accepted and normalised to the underscore code token), but ONLY when the workload is currently QUARANTINED: a pin attempt from any lower state is rejected inside the FSM (no pin, no Redis key) to close the skip-into hole.
 
 The `OVERRIDES.applied` NATS subject (365-day JetStream retention) carries one event per applied AND per rejected override; its append-only `AUDIT.overrides` SIEM mirror ships in Story 2.8 (see "Append-only SIEM audit subjects" below).
+
+### PRESERVED_KILLED, the fifth FSM state (Story 4.1, FR31)
+
+`PRESERVED_KILLED` is the fifth and terminal FSM state, one step above QUARANTINED on the `CLEAN -> SUSPICIOUS -> RESTRICTED -> QUARANTINED -> PRESERVED_KILLED` chain. There are exactly TWO legal ways in, BOTH only from QUARANTINED:
+
+- **Automated kill condition (default).** A QUARANTINED workload escalates to PRESERVED_KILLED when the Helm-tunable kill condition is met: the ThreatScore has been continuously at or above `kill_threat_score` (default 90) for at least `kill_sustain_seconds` (default 300 s), AND the workload has been QUARANTINED for at least that long. A freshly-spiking score does NOT kill immediately: both the at-or-above-90 window and the dwell-since-QUARANTINED clock must elapse, and any dip below 90 resets the at-or-above window. The transition publishes to `AUDIT.transitions` with `reason=kill_condition_met`, `trigger_type=automated`.
+- **Operator override.** An operator may pin `olaitan.io/state-override: PRESERVED+KILLED` (plus-form accepted; normalised to the underscore code token), but ONLY when the workload is currently QUARANTINED. A pin attempt from any lower state is rejected inside the FSM (no skip-into). The transition carries `trigger_type=override`, `reason=operator_override`, `operator_id` set.
+
+**Kill tunables (hot-reloadable, FR47/FR49).** `kill_threat_score` and `kill_sustain_seconds` live in the `detection.fsm` block of `config/olaitan.yaml`; in Helm they are `fsm.killThreatScore` / `fsm.killSustainSeconds` (empty -> config defaults 90 / 300). `kill_threat_score` must be in `[0,100]` and strictly above the QUARANTINED band (70); `kill_sustain_seconds` must be `>= 0`.
+
+**Scope (Story 4.1 only transitions state).** The QUARANTINED NetworkPolicy STAYS in place on a kill (the workload remains isolated): the inline path applies/removes nothing, and the reconcile backstop retains the QUARANTINED deny-all. Story 4.1 does NOT delete the pod, does NOT run CRIU/forensic capture, and does NOT invoke the DFIR agent; those are Stories 4.2/4.3/4.4. A workload in PRESERVED_KILLED is visible in `olaitan_response_fsm_active_workloads{state="PRESERVED_KILLED"}`.
 
 ### Append-only SIEM audit subjects (Story 2.8, FR40/NFR16)
 
@@ -402,7 +413,7 @@ When `response.audit.enabled=true` (off by default; one flag gates all three), t
 
 | Subject | Stream | Default retention | Records |
 |---|---|---|---|
-| `AUDIT.transitions` | `AUDIT_TRANSITIONS` | 90 d (`response.audit.retention_transitions_days`) | every actual FSM state change (`before_state`/`after_state`/`triggering_threat_score`/...), automated AND operator-pin |
+| `AUDIT.transitions` | `AUDIT_TRANSITIONS` | 90 d (`response.audit.retention_transitions_days`) | every actual FSM state change (`before_state`/`after_state`/`triggering_threat_score`/...), automated AND operator-pin (including the Story 4.1 QUARANTINED -> PRESERVED_KILLED kill, `reason=kill_condition_met`) |
 | `AUDIT.overrides` | `AUDIT_OVERRIDES` | 365 d (`response.audit.retention_overrides_days`) | every override application AND rejection, with full FR40 attribution |
 | `AUDIT.policies` | `AUDIT_POLICIES` | 365 d (`response.audit.retention_policies_days`) | every real NetworkPolicy mutation (apply/supersede_delete/deescalation_remove/gc_delete) |
 
@@ -445,8 +456,8 @@ Operational notes:
 #### `olaitan_response_override_rejected_total` (Story 2.7, FR38/FR39)
 
 - **Type:** Counter vector, labelled `reason`.
-- **Labels:** `reason` is `state_unavailable` (a real-but-unimplemented target such as `PRESERVED_KILLED`) or `invalid_state` (an unknown/typo'd state value). Both label series are pre-initialised to 0 at startup so alert PromQL has a stable zero baseline.
-- **Meaning:** cumulative count of operator-override requests the controller refused. A non-zero `state_unavailable` is expected if operators try to pin `PRESERVED_KILLED` before Epic 4; a rising `invalid_state` indicates operators are mistyping the annotation value.
+- **Labels:** `reason` is `invalid_state` (an unknown/typo'd state value) or `state_unavailable` (retained for series stability). Both label series are pre-initialised to 0 at startup so alert PromQL has a stable zero baseline.
+- **Meaning:** cumulative count of operator-override requests the controller refused. **Story 4.1 update:** `state_unavailable` no longer increments. It used to count `PRESERVED_KILLED` override attempts (rejected as not-yet-implemented); Story 4.1 admits `PRESERVED_KILLED` as a legal override target (its only-from-QUARANTINED legality is enforced inside the FSM, not as a pre-filter rejection), so the label stays flat at 0. A rising `invalid_state` indicates operators are mistyping the annotation value. (A `PRESERVED_KILLED` pin from a non-QUARANTINED workload is rejected inside the FSM and logged, but does NOT increment this counter.)
 - **Counting semantics (one per DISTINCT rejection, not per poll).** A standing invalid annotation is counted ONCE, not once per poll. The controller tracks the last-rejected signature (`reason|requested-value`) per workload and increments the counter (and emits the `OVERRIDES.applied` rejection event) only on a NEW or CHANGED rejection for that workload, so the counter stays consistent with the server-side-deduped NATS event (one event, one increment). If the operator edits the annotation to a DIFFERENT still-invalid value the counter ticks once more (a new distinct rejection); when the workload stops being rejected (the value is corrected, or the annotation is removed) the marker is cleared, so a later regression to the same bad value re-counts. Read a flat `invalid_state` as "one standing misconfiguration", and a STEP increase as "a new or changed bad annotation", rather than as a per-scrape rate.
 - **No `workload_id` label** (forbidden as a Prometheus label per architecture.md:472-476); the rejected workload is in the `OVERRIDES.applied` event and the controller WARN log.
 

@@ -357,8 +357,12 @@ func TestIntegration_ManualRemoval(t *testing.T) {
 	}
 }
 
-// TestIntegration_RejectedOverride exercises AC5: a PRESERVED_KILLED annotation
-// is rejected with the event + metric and leaves the FSM/Redis untouched.
+// TestIntegration_RejectedOverride exercises the Story 4.1 reframing of Story
+// 2.7 AC5: a PRESERVED_KILLED annotation on a NON-QUARANTINED workload (the FSM
+// defaults to CLEAN here) is rejected by the FSM's only-from-QUARANTINED Pin
+// guard (BI-6.3) and leaves the FSM/Redis untouched. It no longer bumps the
+// state_unavailable rejection metric: Story 4.1 removed that special-case (a
+// QUARANTINED workload would instead be pinned to PRESERVED_KILLED, AC2).
 func TestIntegration_RejectedOverride(t *testing.T) {
 	ns := freshNamespaceIT(t)
 	realObjects(t, ns, map[string]string{AnnotationState: "PRESERVED_KILLED"})
@@ -372,17 +376,13 @@ func TestIntegration_RejectedOverride(t *testing.T) {
 
 	wl := ns + "/Deployment/web"
 	if _, pinned := machine.IsPinned(wl); pinned {
-		t.Fatal("PRESERVED_KILLED must not pin (AC5)")
+		t.Fatal("PRESERVED_KILLED must not pin from a non-QUARANTINED workload (BI-6.3)")
 	}
 	if _, ok, _ := store.Get(ctx, wl); ok {
-		t.Fatal("rejected override must not write Redis (AC5)")
+		t.Fatal("a Pin-rejected override must not write Redis")
 	}
-	evts := eventsForWorkload(pub.all(), wl)
-	if len(evts) != 1 || !evts[0].Rejected || evts[0].Reason != ReasonStateUnavailable {
-		t.Fatalf("events = %+v, want one rejected state_unavailable event (AC5)", evts)
-	}
-	if got := counterValue(t, reg, "olaitan_response_override_rejected_total", "state_unavailable"); got < 1 {
-		t.Errorf("rejected counter = %v, want >= 1 (AC5)", got)
+	if got := counterValue(t, reg, "olaitan_response_override_rejected_total", "state_unavailable"); got != 0 {
+		t.Errorf("rejected counter{state_unavailable} = %v, want 0 (no longer used for PRESERVED_KILLED)", got)
 	}
 }
 

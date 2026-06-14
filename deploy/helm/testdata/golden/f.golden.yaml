@@ -774,6 +774,16 @@ data:
         deescalation_cooldown_seconds: 600
         persistence_enabled: true
         redis_addr: "olaitan-redis-master:6379"
+        # Story 4.1 (FR31): the Helm-tunable kill condition that drives the
+        # QUARANTINED -> PRESERVED_KILLED transition. kill_threat_score is the
+        # ThreatScore (a fourth band above the QUARANTINED band 70) the score must
+        # hold; kill_sustain_seconds is how long it must hold it AND how long the
+        # workload must have been QUARANTINED before the kill edge fires. Both are
+        # hot-reloadable. These keys sit AFTER redis_addr so they do not break the
+        # deescalation_cooldown_seconds -> persistence_enabled -> redis_addr regex
+        # anchors the configmap.yaml bridge relies on.
+        kill_threat_score: 90
+        kill_sustain_seconds: 300
     
     # Story 1.12: Prometheus metrics surface (FR8, FR50). Every Olaitan
     # process exposes Prometheus metrics on :9090/metrics from a dedicated
