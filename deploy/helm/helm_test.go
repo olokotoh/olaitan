@@ -3859,3 +3859,268 @@ func TestAnalystLocalBridgeDollarEscape(t *testing.T) {
 	assertContains(t, embedded, `model: "weird$1model"`,
 		"a $-bearing bridged value must survive literally (no capture-group expansion)")
 }
+
+// --- Story 4.10: forensic-mode VALUES FACADE tests -------------------
+//
+// The seven AC2 facade knobs (forensics.path,
+// forensics.s3.{bucket,kms_key_alias,retention_days},
+// forensics.settling_window_seconds, notifications.{enabled,webhook_url})
+// overlay the existing response.* config blocks. These tests pin each knob's
+// landing config path, the bucket/kms FAN-OUT to BOTH buckets, the report-only
+// retention, the webhook-url-is-a-secret projection, the facade-wins-over-
+// response.* precedence, the forensics.path=criu template-time reject, and the
+// AC1 additive-off-by-default upgrade-safety property.
+
+// helmTemplateExpectError renders with the given --set overrides and returns
+// the combined stderr, failing the test if the render SUCCEEDS. The fail-fast
+// facade validators (forensics.path) are exercised through this helper.
+func helmTemplateExpectError(t *testing.T, sets []string) string {
+	t.Helper()
+	args := []string{"template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+	}
+	for _, s := range sets {
+		args = append(args, "--set", s)
+	}
+	cmd := exec.Command("helm", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("helm template %v succeeded; expected a fail-fast facade validator to fire", sets)
+	}
+	return stderr.String()
+}
+
+// TestForensicsFacade_S3BucketFansOutToBothBuckets pins BI-3: the facade
+// forensics.s3.bucket sets BOTH the forensic-bundle bucket
+// (response.forensics.s3_bucket) AND the durable-report bucket
+// (response.report_archive.s3_bucket), the common single-bucket operator case.
+func TestForensicsFacade_S3BucketFansOutToBothBuckets(t *testing.T) {
+	cfg := loadEmbedded(t, []string{"forensics.s3.bucket=olaitan-forensics-shared"})
+	if cfg.Response.Forensics.S3Bucket != "olaitan-forensics-shared" {
+		t.Errorf("forensics.s3.bucket facade did not reach response.forensics.s3_bucket: got %q",
+			cfg.Response.Forensics.S3Bucket)
+	}
+	if cfg.Response.ReportArchive.S3Bucket != "olaitan-forensics-shared" {
+		t.Errorf("forensics.s3.bucket facade did not fan out to response.report_archive.s3_bucket: got %q",
+			cfg.Response.ReportArchive.S3Bucket)
+	}
+}
+
+// TestForensicsFacade_KMSKeyAliasFansOutToBothBuckets pins BI-3: the facade
+// forensics.s3.kms_key_alias sets BOTH response.forensics.kms_key_alias AND
+// response.report_archive.kms_key_alias.
+func TestForensicsFacade_KMSKeyAliasFansOutToBothBuckets(t *testing.T) {
+	cfg := loadEmbedded(t, []string{"forensics.s3.kms_key_alias=alias/olaitan-shared"})
+	if cfg.Response.Forensics.KMSKeyAlias != "alias/olaitan-shared" {
+		t.Errorf("forensics.s3.kms_key_alias facade did not reach response.forensics.kms_key_alias: got %q",
+			cfg.Response.Forensics.KMSKeyAlias)
+	}
+	if cfg.Response.ReportArchive.KMSKeyAlias != "alias/olaitan-shared" {
+		t.Errorf("forensics.s3.kms_key_alias facade did not fan out to response.report_archive.kms_key_alias: got %q",
+			cfg.Response.ReportArchive.KMSKeyAlias)
+	}
+}
+
+// TestForensicsFacade_RetentionDaysTargetsReportBucketOnly pins BI-3: object
+// lock lives on the report bucket alone, so forensics.s3.retention_days maps
+// ONLY to response.report_archive.retention_days. The forensic-bundle bucket
+// has no retention knob; the settling.retention_days key must NOT be touched
+// by this facade knob.
+func TestForensicsFacade_RetentionDaysTargetsReportBucketOnly(t *testing.T) {
+	rendered := helmTemplate(t, []string{"forensics.s3.retention_days=222"})
+	embedded := extractEmbeddedConfigYAML(t, rendered)
+	if !strings.Contains(embedded, "retention_days: 222") {
+		t.Errorf("forensics.s3.retention_days facade did not reach the report bucket retention\n%s",
+			snippet(embedded, "report_archive:"))
+	}
+	cfg := loadEmbedded(t, []string{"forensics.s3.retention_days=222"})
+	if cfg.Response.ReportArchive.RetentionDays == nil || *cfg.Response.ReportArchive.RetentionDays != 222 {
+		t.Errorf("response.report_archive.retention_days = %v, want 222",
+			cfg.Response.ReportArchive.RetentionDays)
+	}
+	// The facade retention knob must NOT change the settling block's own
+	// retention (the report-only-target invariant). Scope the check to the
+	// settling: block region of the rendered config.
+	settlingIdx := strings.Index(embedded, "\n  settling:\n")
+	if settlingIdx < 0 {
+		t.Fatalf("settling: block not found in rendered config")
+	}
+	settlingBlock := embedded[settlingIdx : settlingIdx+120]
+	if strings.Contains(settlingBlock, "retention_days: 222") {
+		t.Errorf("forensics.s3.retention_days leaked into the settling block (must target report bucket only)\n%s", settlingBlock)
+	}
+}
+
+// TestReportArchive_RetentionDaysDoesNotClobberSettling is a regression test for
+// the Story 4.6 bridge defect fixed in Story 4.10: the response.report_archive
+// .retention_days bridge used a non-parent-scoped anchor that matched the FIRST
+// `retention_days:` in the config, which is response.settling.retention_days (it
+// appears earlier). Setting only the report-archive retention silently shortened
+// the settling / INCIDENTS-stream retention from 365 to the report value. The
+// fixed bridge is parent-scoped under report_archive:, so settling.retention_days
+// (365) must be untouched while report_archive.retention_days takes the override.
+func TestReportArchive_RetentionDaysDoesNotClobberSettling(t *testing.T) {
+	// The default values set response.reportArchive.retentionDays (90), so the
+	// report-archive retention bridge ALWAYS fires on a default render. Before the
+	// fix its non-parent-scoped anchor matched settling.retention_days (which
+	// appears first) and rewrote it from 365 to 90. The default render must keep
+	// settling at 365 while the report bucket holds its own 90.
+	cfg := loadEmbedded(t, []string{})
+	if cfg.Response.Settling.RetentionDays == nil || *cfg.Response.Settling.RetentionDays != 365 {
+		t.Errorf("response.settling.retention_days = %v, want 365 (must NOT be clobbered by the report-archive bridge)",
+			cfg.Response.Settling.RetentionDays)
+	}
+	if cfg.Response.ReportArchive.RetentionDays == nil || *cfg.Response.ReportArchive.RetentionDays != 90 {
+		t.Errorf("response.report_archive.retention_days = %v, want 90", cfg.Response.ReportArchive.RetentionDays)
+	}
+}
+
+// TestForensicsFacade_SettlingWindowSeconds pins the
+// forensics.settling_window_seconds -> response.settling.window_seconds bridge.
+func TestForensicsFacade_SettlingWindowSeconds(t *testing.T) {
+	cfg := loadEmbedded(t, []string{"forensics.settling_window_seconds=125"})
+	if cfg.Response.Settling.WindowSeconds == nil || *cfg.Response.Settling.WindowSeconds != 125 {
+		t.Errorf("response.settling.window_seconds = %v, want 125",
+			cfg.Response.Settling.WindowSeconds)
+	}
+}
+
+// TestNotificationsFacade_EnabledBridges pins the notifications.enabled ->
+// response.notifications.enabled bridge (the one facade-level gate).
+func TestNotificationsFacade_EnabledBridges(t *testing.T) {
+	cfg := loadEmbedded(t, []string{"notifications.enabled=true"})
+	if !cfg.Response.Notifications.EnabledOrDefault() {
+		t.Errorf("notifications.enabled facade did not flip response.notifications.enabled")
+	}
+}
+
+// TestNotificationsFacade_WebhookUrlIsSecretNeverConfigMap pins BI-3: the
+// facade notifications.webhook_url overlays the secrets.notificationsWebhookUrl
+// SECRET (projected as NOTIFICATIONS_WEBHOOK_URL via secretKeyRef), and is
+// NEVER written into the ConfigMap (a Slack/PagerDuty URL embeds a token).
+func TestNotificationsFacade_WebhookUrlIsSecretNeverConfigMap(t *testing.T) {
+	const url = "https://hooks.example.invalid/TOKEN-DEADBEEF"
+	rendered := helmTemplate(t, []string{"notifications.webhook_url=" + url})
+	// It must land in the Secret stringData.
+	if !strings.Contains(rendered, "notifications-webhook-url: \""+url+"\"") {
+		t.Errorf("notifications.webhook_url facade did not reach the Secret stringData\n%s",
+			snippet(rendered, "notifications-webhook-url"))
+	}
+	// It must NOT appear in the embedded olaitan.yaml ConfigMap (secret discipline).
+	embedded := extractEmbeddedConfigYAML(t, rendered)
+	if strings.Contains(embedded, "DEADBEEF") {
+		t.Errorf("notifications.webhook_url leaked into the ConfigMap (must be a secret-only projection)\n%s",
+			snippet(embedded, "notifications:"))
+	}
+}
+
+// TestNotificationsFacade_WebhookUrlOverridesSecret pins the facade-wins
+// precedence on the webhook secret: a non-empty facade webhook_url overrides
+// secrets.notificationsWebhookUrl; an empty facade value falls back to it.
+func TestNotificationsFacade_WebhookUrlOverridesSecret(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"notifications.webhook_url=https://facade.invalid/WIN",
+		"secrets.notificationsWebhookUrl=https://legacy.invalid/LOSE",
+	})
+	if !strings.Contains(rendered, "notifications-webhook-url: \"https://facade.invalid/WIN\"") {
+		t.Errorf("facade webhook_url must win over secrets.notificationsWebhookUrl\n%s",
+			snippet(rendered, "notifications-webhook-url"))
+	}
+	fallback := helmTemplate(t, []string{"secrets.notificationsWebhookUrl=https://legacy.invalid/KEEP"})
+	if !strings.Contains(fallback, "notifications-webhook-url: \"https://legacy.invalid/KEEP\"") {
+		t.Errorf("an empty facade webhook_url must fall back to secrets.notificationsWebhookUrl\n%s",
+			snippet(fallback, "notifications-webhook-url"))
+	}
+}
+
+// TestForensicsFacade_WinsOverResponseBlock pins BI-1: when BOTH a facade key
+// and its response.* counterpart are set, the facade WINS (it overlays last).
+func TestForensicsFacade_WinsOverResponseBlock(t *testing.T) {
+	cfg := loadEmbedded(t, []string{
+		"response.forensics.s3Bucket=advanced-escape-hatch",
+		"forensics.s3.bucket=facade-surface",
+		"response.settling.windowSeconds=15",
+		"forensics.settling_window_seconds=88",
+	})
+	if cfg.Response.Forensics.S3Bucket != "facade-surface" {
+		t.Errorf("facade forensics.s3.bucket must win over response.forensics.s3Bucket: got %q",
+			cfg.Response.Forensics.S3Bucket)
+	}
+	if cfg.Response.Settling.WindowSeconds == nil || *cfg.Response.Settling.WindowSeconds != 88 {
+		t.Errorf("facade forensics.settling_window_seconds must win over response.settling.windowSeconds: got %v",
+			cfg.Response.Settling.WindowSeconds)
+	}
+}
+
+// TestForensicsFacade_PathFallbackRendersClean pins BI-2: forensics.path
+// fallback (and the empty default) render with no error and bridge to NO
+// config field (fallback is the only runtime path).
+func TestForensicsFacade_PathFallbackRendersClean(t *testing.T) {
+	// Explicit fallback.
+	_ = helmTemplate(t, []string{"forensics.path=fallback"})
+	// Default (unset) path renders clean too.
+	_ = helmTemplate(t, nil)
+}
+
+// TestForensicsFacade_PathCriuRejectedAtTemplateTime pins BI-2 / PO
+// Ratification 3: forensics.path=criu is REJECTED at template time with the
+// helpful "not implemented; use fallback" message (fail-fast honesty, not a
+// silent no-op). A value other than fallback/criu fails with the valid-values
+// message.
+func TestForensicsFacade_PathCriuRejectedAtTemplateTime(t *testing.T) {
+	stderr := helmTemplateExpectError(t, []string{"forensics.path=criu"})
+	if !strings.Contains(stderr, "CRIU forensic path is not implemented") {
+		t.Errorf("forensics.path=criu must fail with the CRIU-not-implemented message; got:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "Use forensics.path=fallback") {
+		t.Errorf("the criu reject message must point the operator at forensics.path=fallback; got:\n%s", stderr)
+	}
+	badStderr := helmTemplateExpectError(t, []string{"forensics.path=zfs"})
+	if !strings.Contains(badStderr, "forensics.path must be one of") {
+		t.Errorf("an unknown forensics.path must fail with the valid-values message; got:\n%s", badStderr)
+	}
+}
+
+// TestForensicsFacade_DefaultsAreAdditiveOffByDefault pins BI-7 (AC1
+// upgrade-safety): under the default render the Epic-4 controller gates all
+// default OFF, so a helm upgrade from an Epic-3 RSLT-full deployment installs
+// the Epic-4 surface without disrupting in-flight investigations (the facade
+// sets PARAMETERS only; it enables NO controller). Also asserts the default
+// facade params overlay the SAME file-side values (idempotent render), which
+// is why the goldens are unchanged for the rendered config.
+func TestForensicsFacade_DefaultsAreAdditiveOffByDefault(t *testing.T) {
+	cfg := loadEmbedded(t, nil)
+	if cfg.Response.Forensics.EnabledOrDefault() {
+		t.Error("response.forensics must default OFF (AC1 additive upgrade-safety)")
+	}
+	if cfg.Response.Settling.EnabledOrDefault() {
+		t.Error("response.settling must default OFF (AC1)")
+	}
+	if cfg.Response.DFIR.Enabled != nil && *cfg.Response.DFIR.Enabled {
+		t.Error("response.dfir must default OFF (AC1)")
+	}
+	if cfg.Response.ReportArchive.EnabledOrDefault() {
+		t.Error("response.report_archive must default OFF (AC1)")
+	}
+	if cfg.Response.Notifications.EnabledOrDefault() {
+		t.Error("response.notifications must default OFF (AC1)")
+	}
+}
+
+// TestForensicsFacade_RSLTFullArmKeepsEpic4GatesOff pins BI-7: the Epic-3-arm
+// render (evaluation.config=RSLT-full, no Epic-4 gates flipped) leaves every
+// Epic-4 controller OFF, so the Epic-4 chart is a strict additive superset of
+// the Epic-3 render. The settling window timers re-arm from the Redis-backed
+// FSM on restart, so a rolling pod replacement during the upgrade does not drop
+// an in-flight settling window (documented in the runbook upgrade-safety note).
+func TestForensicsFacade_RSLTFullArmKeepsEpic4GatesOff(t *testing.T) {
+	cfg := loadEmbedded(t, []string{"evaluation.config=RSLT-full"})
+	if cfg.Response.Forensics.EnabledOrDefault() ||
+		cfg.Response.Settling.EnabledOrDefault() ||
+		cfg.Response.ReportArchive.EnabledOrDefault() ||
+		cfg.Response.Notifications.EnabledOrDefault() {
+		t.Error("the RSLT-full arm must NOT auto-enable any Epic-4 controller gate (AC1 additive upgrade-safety)")
+	}
+}

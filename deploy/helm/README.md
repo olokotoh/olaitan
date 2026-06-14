@@ -114,6 +114,91 @@ The `Source:` helm metadata comments and `helm.sh/chart` /
 chart-version bumps do not force a churn. See
 `deploy/helm/helm_test.go:normaliseGolden` for the redaction list.
 
+## Forensic mode (Epic 4)
+
+Epic 4 adds DFIR forensic reporting: forensic capture on a kill, a
+settling window before a post-mortem, a DFIR report agent, a durable
+content-addressed + KMS-encrypted report write to an S3-compatible
+store, an optional incident webhook, and the supporting RBAC + Secret
+slots. Every controller is ADDITIVE and OFF by default, so a default
+`helm upgrade` from an Epic 3 deployment changes nothing until an
+operator opts in (see "Upgrade safety" below).
+
+### The `forensics.*` / `notifications.*` values facade
+
+The seven knobs an operator touches most live in a consolidated facade
+that overlays the underlying `response.*` config (the facade WINS when
+both a facade key and its `response.*` counterpart are set). The
+`response.*` blocks remain the advanced escape hatch (distinct
+bundle/report buckets, the deferred-queue knobs, `object_lock_mode`).
+
+| Facade knob | Bridges to | Notes |
+| --- | --- | --- |
+| `forensics.path` | (none) | `fallback` only; `criu` is rejected at template time (Story 1.4 / ADR-2026-05-02-01). |
+| `forensics.s3.bucket` | `response.forensics.s3_bucket` AND `response.report_archive.s3_bucket` | fans out to BOTH buckets (the common single-bucket case). |
+| `forensics.s3.kms_key_alias` | `response.forensics.kms_key_alias` AND `response.report_archive.kms_key_alias` | fans out to BOTH. |
+| `forensics.s3.retention_days` | `response.report_archive.retention_days` | report (object-lock) bucket ONLY; the bundle bucket has no retention. |
+| `forensics.settling_window_seconds` | `response.settling.window_seconds` | the FR42/NFR7 settling window. |
+| `notifications.enabled` | `response.notifications.enabled` | the one facade-level gate (a no-op without a `webhook_url`). |
+| `notifications.webhook_url` | `secrets.notificationsWebhookUrl` -> `NOTIFICATIONS_WEBHOOK_URL` | a SECRET projected as an env var (a Slack/PagerDuty URL embeds a token), NEVER the ConfigMap. |
+
+`forensics.path` is forward-compat only. Story 1.4 rejected CRIU
+(containerd 1.7 lacks the `CheckpointContainer` CRI RPC, plus the kernel
+vDSO blocker, per ADR-2026-05-02-01) and Story 4.2 shipped only the
+documented kubectl-logs fallback. The chart `{{ fail }}`s a
+`forensics.path=criu` selection at template time with a "not implemented;
+use fallback" message rather than silently running the fallback under a
+`criu` label.
+
+### Enable recipe
+
+The facade sets PARAMETERS only; it does NOT enable any capture
+controller (collapsing the four gates into one would risk enabling a
+write with no settling). Flip the four `response.*` gates AND set the
+facade params:
+
+```bash
+helm upgrade olaitan deploy/helm/olaitan \
+  --set response.forensics.enabled=true \
+  --set response.settling.enabled=true \
+  --set response.dfir.enabled=true \
+  --set response.reportArchive.enabled=true \
+  --set forensics.s3.bucket=olaitan-reports \
+  --set forensics.s3.kms_key_alias=alias/olaitan \
+  --set forensics.s3.retention_days=90 \
+  --set forensics.settling_window_seconds=60 \
+  --set notifications.enabled=true \
+  --set-file secrets.notificationsWebhookUrl=./webhook-url.txt \
+  --set-file secrets.s3AccessKey=./s3-access.txt \
+  --set-file secrets.s3SecretKey=./s3-secret.txt
+```
+
+The report bucket MUST be object-lock-enabled + versioned (an operator
+precondition the writer never creates). `notifications.enabled` is a
+no-op without a `webhook_url` (an enabled webhook with no URL stages the
+gate ahead of the secret rather than failing fast).
+
+### Upgrade safety (Epic 3 -> Epic 4)
+
+A `helm upgrade olaitan deploy/helm/olaitan/` from an Epic 3 RSLT-full
+deployment installs the Epic 4 surface without disrupting in-flight
+investigations:
+
+- Every Epic-4 controller gate
+  (`response.{forensics,settling,dfir,reportArchive,notifications}.enabled`)
+  defaults `false`, so the default upgrade renders an exact superset of
+  the Epic-3 manifests (no behaviour change unless an operator opts in).
+- There is NO FSM-persistence-key rename (`fsm:{workload_id}`, Redis, no
+  TTL, restart-recovered) and NO JetStream stream rename; the new
+  INCIDENTS / REPORTS streams are new append-only streams.
+- The settling-window timers re-arm from the rehydrated FSM on a pod
+  restart (FR37/NFR24), so a rolling pod replacement during the upgrade
+  does NOT silently de-escalate a QUARANTINED workload or drop an
+  in-flight settling window.
+
+The aggregator stays `replicas: 1` + `strategy: Recreate` (Ring-2
+checkpoint correctness), the same singleton invariant Epic 3 carried.
+
 ## Uninstall
 
 ```bash

@@ -1,0 +1,80 @@
+# Story 4.10 (AC4, BI-6): the in-cluster MinIO fixture for the forensics
+# RSLT-full + forensics kind e2e smoke. MinIO is an S3-compatible object store;
+# the durable report writer (Story 4.6) and the forensic-bundle uploader
+# (Story 4.2) PUT to it under content-addressed, KMS-directive keys. The smoke
+# test points the forensics facade (forensics.s3.bucket / kms_key_alias) at this
+# in-cluster endpoint so the report PUT is captured with no external egress.
+#
+# The bucket is created + object-lock-enabled by an init step in
+# `make e2e-local-forensics` (mc mb --with-lock); the report bucket MUST be
+# object-lock-enabled + versioned (an operator precondition the writer never
+# creates, per Story 4.6). s3_use_ssl is set false for this plaintext local
+# MinIO via the chart's response.*.s3UseSsl knobs.
+#
+# NOTE (honest gating, PO Ratification 4): this fixture + the
+# forensics_smoke_test.go that drives it are the AC4 TEST CODE. The live kind
+# RUN is folded into the carry-forward Epic-3-retro A1 RSLT-full-kind gate
+# before Epic 5. The default CI e2e job is RS-arm only and does NOT apply this
+# fixture.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  labels:
+    app: minio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+        - name: minio
+          # Pinned to a specific verified-pullable RELEASE tag (never latest),
+          # mirroring the forensics-integration CI job's image-pinning
+          # discipline. The official minio image has no default server
+          # entrypoint, so the server command is explicit.
+          image: minio/minio:RELEASE.2024-10-13T13-34-11Z
+          imagePullPolicy: IfNotPresent
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              value: "olaitan-e2e"
+            - name: MINIO_ROOT_PASSWORD
+              value: "olaitan-e2e-secret"
+          ports:
+            - containerPort: 9000
+            - containerPort: 9001
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+            initialDelaySeconds: 2
+            periodSeconds: 3
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  labels:
+    app: minio
+spec:
+  selector:
+    app: minio
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: 9000
+    - name: console
+      port: 9001
+      targetPort: 9001
