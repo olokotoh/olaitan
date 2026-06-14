@@ -299,7 +299,7 @@ func (a *Agent) Generate(ctx context.Context, inc Incident) (rendered string, re
 	// is set from the region the redaction fired in (narrative -> llm_response,
 	// posture findings -> posture, audit-metadata -> audit, evidence-derived
 	// lines -> evidence). 4.5 performs NO durable write (Story 4.6 owns the PUT).
-	report = a.redactReport(report)
+	report = a.redactReport(report, inc.Event.WorkloadID)
 
 	rendered = report.Render(inc.Event)
 	a.markSeen(msgID)
@@ -347,7 +347,12 @@ func (a *Agent) Generate(ctx context.Context, inc Incident) (rendered string, re
 // evidence. The deterministic timeline/state scalars are control-plane facts the
 // renderer already strips of pod names and event ids (report.go), and are not
 // model- or tenant-influenced, so they are not re-scanned here.
-func (a *Agent) redactReport(r ForensicReport) ForensicReport {
+//
+// workloadID is the finalised incident's workload_id (settling.IncidentFinalised
+// .WorkloadID); it is carried on each audit event for SIEM correlation. It is a
+// DISTINCT value from the report's incident_id (= the package_id), so it must be
+// threaded in separately (the ForensicReport carries only incident_id).
+func (a *Agent) redactReport(r ForensicReport, workloadID string) ForensicReport {
 	out := r
 	var all []redact.RedactionEvent
 
@@ -367,12 +372,13 @@ func (a *Agent) redactReport(r ForensicReport) ForensicReport {
 	out.DFIRModel, all = redactScalar(r.DFIRModel, redact.SourceAudit, "dfir_model", all)
 
 	if len(all) > 0 {
-		// Carry the workload id for SIEM correlation and enqueue with the report
-		// incident_id (= the finalised package_id). Best-effort, never blocks: the
-		// redacted bytes are already produced (BI-8/BI-6.2). A nil sink is the
-		// off-by-default path and enqueues nothing.
+		// Carry the workload_id (NOT the package_id) for SIEM correlation and
+		// enqueue with the report incident_id (= the finalised package_id).
+		// Best-effort, never blocks: the redacted bytes are already produced
+		// (BI-8/BI-6.2). A nil sink is the off-by-default path and enqueues nothing
+		// (EnqueueRedactions guards the nil receiver).
 		for i := range all {
-			all[i].WorkloadID = r.IncidentID
+			all[i].WorkloadID = workloadID
 		}
 		a.redactSink.EnqueueRedactions(all, r.IncidentID, r.IncidentID)
 	}

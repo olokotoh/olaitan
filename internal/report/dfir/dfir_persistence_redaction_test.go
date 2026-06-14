@@ -170,7 +170,7 @@ func TestProperty_NoSecretReachesPersistedReport(t *testing.T) {
 	props.Property("no injected secret survives persistence-side redaction", prop.ForAll(
 		func(sr seededReport) bool {
 			a := persistenceAgent(t)
-			redacted := a.redactReport(sr.report)
+			redacted := a.redactReport(sr.report, "wl-prop")
 			persisted := redacted.Render(sr.event)
 			for _, secret := range sr.secrets {
 				if secret != "" && strings.Contains(persisted, secret) {
@@ -246,7 +246,7 @@ func TestRedactReport_AdversarialSyntheticNarrative(t *testing.T) {
 	a := newAgent(t, fp, &fakeReportPublisher{}, &fakeAuditRecorder{})
 	a.redactSink = sink
 
-	redacted := a.redactReport(report)
+	redacted := a.redactReport(report, "wl-test")
 	persisted := redacted.Render(event)
 
 	// No unredacted secret reaches the in-memory S3 fixture.
@@ -317,7 +317,7 @@ func TestRedactReport_PerRegionSource(t *testing.T) {
 	a := newAgent(t, fp, &fakeReportPublisher{}, &fakeAuditRecorder{})
 	a.redactSink = sink
 
-	_ = a.redactReport(report)
+	_ = a.redactReport(report, "wl-region-1")
 
 	deadline := time.After(2 * time.Second)
 	for len(cap.events()) < 4 {
@@ -335,6 +335,12 @@ func TestRedactReport_PerRegionSource(t *testing.T) {
 		bySource[e.Source] = append(bySource[e.Source], e.FieldPath)
 		if e.IncidentID != "pkg-region-1" {
 			t.Errorf("incident_id = %q, want pkg-region-1", e.IncidentID)
+		}
+		// Round-1 review fix: workload_id must be the real workload_id, NOT the
+		// package_id (the report struct carries only incident_id, so the call
+		// site threads the workload_id in separately).
+		if e.WorkloadID != "wl-region-1" {
+			t.Errorf("workload_id = %q, want wl-region-1 (must not be the package_id)", e.WorkloadID)
 		}
 	}
 	for _, src := range []string{redact.SourceLLMResponse, redact.SourcePosture, redact.SourceEvidence, redact.SourceAudit} {
@@ -369,7 +375,7 @@ func TestRedactReport_CleanReportUnchanged(t *testing.T) {
 	a := newAgent(t, fp, &fakeReportPublisher{}, &fakeAuditRecorder{})
 
 	before := report.Render(event)
-	redacted := a.redactReport(report)
+	redacted := a.redactReport(report, "wl-test")
 	after := redacted.Render(event)
 	if before != after {
 		t.Errorf("a clean report must render byte-identically after redaction\nbefore:\n%s\nafter:\n%s", before, after)
