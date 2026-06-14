@@ -209,6 +209,13 @@ type Agent struct {
 	// drainer via WriteMetrics().
 	deferredGauge   prometheus.Gauge
 	deferredDropped *prometheus.CounterVec
+	// deferredDrained is the Story 4.9 dedicated drained counter
+	// (olaitan_report_writes_deferred_drained_total, AC2/BI-5): the SINGLE source
+	// of truth for a successfully re-PUT deferred report. The Story 4.7
+	// result="drained" value on the shared writes counter is retired in favour of
+	// this counter, so a drain is never double-counted. Injected into the drain
+	// worker via WriteMetrics().
+	deferredDrained prometheus.Counter
 	// deferred is the Story 4.7 enqueue seam (BI-3): on a transient inline-write
 	// failure beyond the short inline retry budget, the agent ENQUEUES the
 	// redacted bytes here and returns fast (NFR7 preserved). It MAY be nil (the
@@ -294,17 +301,23 @@ func NewDFIR(p provider.Provider, spec PromptSpec, reports ReportPublisher, audi
 	if err != nil {
 		return nil, err
 	}
-	gen, err := reg.RegisterCounterVec("olaitan_dfir_reports_total",
-		"DFIR forensic-report generation outcomes by status {success, unavailable, schema_violation} (Story 4.4 FR43).",
-		[]string{"status"})
+	// Story 4.9 (AC1, BI-1/BI-3): the canonical DFIR generation-call counter
+	// olaitan_report_dfir_calls_total, labelled {provider, status}. The provider
+	// label mirrors the Epic-3 analyst olaitan_llm_calls_total{provider,...}
+	// precedent, sourced from the DFIR provider Name(). (Renamed from the
+	// unreleased Story 4.4 olaitan_dfir_reports_total{status}.)
+	gen, err := reg.RegisterCounterVec("olaitan_report_dfir_calls_total",
+		"DFIR forensic-report generation outcomes by provider and status {success, unavailable, schema_violation} (Story 4.9 AC1 FR50; renamed from olaitan_dfir_reports_total + provider label).",
+		[]string{"provider", "status"})
 	if err != nil {
 		return nil, fmt.Errorf("dfir: generation metric: %w", err)
 	}
 	// NFR7 observability seam (BI-11): the FSM-finalisation -> report-generated
 	// latency against the 10s p99 end-to-end target. The S3 persist tail is
-	// Story 4.6; 4.4 owns the dominant generation share.
-	genSecs, err := reg.RegisterHistogram("olaitan_dfir_report_generation_seconds", "",
-		"DFIR forensic-report generation latency in seconds, from agent invocation to rendered report (Story 4.4, NFR7 p99 <= 10s end-to-end).",
+	// Story 4.6; 4.4 owns the dominant generation share. Story 4.9 (AC1, BI-1)
+	// renames this to the canonical olaitan_report_dfir_duration_seconds.
+	genSecs, err := reg.RegisterHistogram("olaitan_report_dfir_duration_seconds", "",
+		"DFIR forensic-report generation latency in seconds, from agent invocation to rendered report (Story 4.9 AC1, NFR7 p99 <= 10s end-to-end; renamed from olaitan_dfir_report_generation_seconds).",
 		nil, prometheus.DefBuckets)
 	if err != nil {
 		return nil, fmt.Errorf("dfir: generation-latency metric: %w", err)
@@ -347,6 +360,18 @@ func NewDFIR(p provider.Provider, spec PromptSpec, reports ReportPublisher, audi
 	if err != nil {
 		return nil, fmt.Errorf("dfir: dropped-write metric: %w", err)
 	}
+	// Story 4.9 (AC2, BI-5): the dedicated drained counter is the SINGLE source of
+	// truth for a successfully re-PUT deferred report. The Story 4.7
+	// result="drained" value on the shared olaitan_report_writes_total counter is
+	// RETIRED in favour of this counter, so a drain is counted in exactly one place
+	// (no double-count). Unlabelled (a pure drained-count; a HEAD-deduped drain
+	// stays result="deduped" on the shared counter, OA4).
+	drainedCounterVec, err := reg.RegisterCounterVec("olaitan_report_writes_deferred_drained_total",
+		"Deferred reports successfully re-PUT to the durable archive by the Story 4.7 drain worker when S3 recovered (Story 4.9 AC2 FR50; single source of truth for drains, replaces the retired olaitan_report_writes_total{result=\"drained\"}).",
+		nil)
+	if err != nil {
+		return nil, fmt.Errorf("dfir: drained-write metric: %w", err)
+	}
 	a := &Agent{
 		provider:             p,
 		reports:              reports,
@@ -360,6 +385,7 @@ func NewDFIR(p provider.Provider, spec PromptSpec, reports ReportPublisher, audi
 		writeSecs:            writeSecs,
 		deferredGauge:        deferredGaugeVec.WithLabelValues(),
 		deferredDropped:      droppedCounter,
+		deferredDrained:      drainedCounterVec.WithLabelValues(),
 		deferredWriteTimeout: defaultDeferredWriteTimeout,
 		log:                  log,
 		now:                  func() time.Time { return time.Now().UTC() },
@@ -385,6 +411,7 @@ func (a *Agent) WriteMetrics() deferq.Metrics {
 		Deferred: a.deferredGauge,
 		Dropped:  a.deferredDropped,
 		Writes:   a.writes,
+		Drained:  a.deferredDrained,
 	}
 }
 
@@ -874,7 +901,14 @@ func historySummary(evt settling.IncidentFinalised) string {
 // histogram, projects the AUDIT.assessments "dfir" row, and emits one structured
 // log line. Failure outcomes log at Warn so operators can filter on level.
 func (a *Agent) record(status string, inc Incident, spec PromptSpec, latency time.Duration) {
-	a.gen.WithLabelValues(status).Inc()
+	// Story 4.9 (AC1, BI-3, OA1): the provider label is the DFIR provider Name(),
+	// falling back to "unknown" so the bounded label is never the empty string.
+	// The label ORDER (provider, status) matches the registration order.
+	providerLabel := a.provider.Name()
+	if providerLabel == "" {
+		providerLabel = "unknown"
+	}
+	a.gen.WithLabelValues(providerLabel, status).Inc()
 	a.genSecs.Observe(latency.Seconds())
 	level := slog.LevelInfo
 	if status != statusSuccess {

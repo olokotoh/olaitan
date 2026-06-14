@@ -15,6 +15,7 @@ import (
 
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 
 	"github.com/olokotoh/olaitan/internal/metrics"
 	"github.com/olokotoh/olaitan/internal/report/dfir"
@@ -285,6 +286,43 @@ func TestScrubURL(t *testing.T) {
 func TestNewWebhook_RejectsEmptyURL(t *testing.T) {
 	if _, err := NewWebhook(Config{URL: ""}, metrics.NewRegistry(), nil); err == nil {
 		t.Fatal("an empty webhook url must be a construction error")
+	}
+}
+
+// TestForensicMetrics_WebhookDeliveredCanonical is the Story 4.9 AC3 confirm-only
+// assertion (BI-7): the Story 4.8 delivery counter already carries the canonical
+// name olaitan_notification_webhook_delivered_total, the {result} label, and the
+// COUNTER type; 4.9 makes NO registration change.
+func TestForensicMetrics_WebhookDeliveredCanonical(t *testing.T) {
+	reg := metrics.NewRegistry()
+	w, err := NewWebhook(fastConfig("https://example.test/hook"), reg, nil)
+	if err != nil {
+		t.Fatalf("NewWebhook: %v", err)
+	}
+	// Touch both label combinations so the family surfaces in Gather.
+	w.delivered.WithLabelValues("delivered").Add(0)
+	w.delivered.WithLabelValues("failed").Add(0)
+
+	mfs, err := reg.Gatherer().Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	var mf *dto.MetricFamily
+	for _, m := range mfs {
+		if m.GetName() == "olaitan_notification_webhook_delivered_total" {
+			mf = m
+		}
+	}
+	if mf == nil {
+		t.Fatalf("olaitan_notification_webhook_delivered_total not registered")
+	}
+	if mf.GetType() != dto.MetricType_COUNTER {
+		t.Fatalf("type = %v, want COUNTER", mf.GetType())
+	}
+	for _, m := range mf.GetMetric() {
+		if len(m.GetLabel()) != 1 || m.GetLabel()[0].GetName() != "result" {
+			t.Fatalf("label set = %v, want a single {result} label", m.GetLabel())
+		}
 	}
 }
 

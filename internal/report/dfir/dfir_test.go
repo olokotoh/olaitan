@@ -806,6 +806,13 @@ func writeCount(t *testing.T, a *Agent, result string) float64 {
 	return testutil.ToFloat64(a.writes.WithLabelValues(result))
 }
 
+// drainedCount reads the Story 4.9 dedicated drained counter
+// (olaitan_report_writes_deferred_drained_total) off the agent (BI-5).
+func drainedCount(t *testing.T, a *Agent) float64 {
+	t.Helper()
+	return testutil.ToFloat64(a.deferredDrained)
+}
+
 // TestGenerate_DurableWritePutsRedactedBytes is the Story 4.6 AC1 proof: a
 // generated + redacted report is PUT to the archive INLINE in Generate, under
 // the content-addressed key the REPORTS.generated announce references, carrying

@@ -23,13 +23,28 @@ func testMetrics(t *testing.T) Metrics {
 	gauge := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "test_report_writes_deferred_count"}, nil)
 	dropped := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "test_report_writes_dropped_total"}, []string{"reason"})
 	writes := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "test_report_writes_total"}, []string{"result"})
+	// Story 4.9 (BI-5): the dedicated drained counter is the single source of truth
+	// for a confirmed (non-deduped) re-PUT; the shared writes counter no longer
+	// carries a result="drained" value.
+	drained := prometheus.NewCounter(prometheus.CounterOpts{Name: "test_report_writes_deferred_drained_total"})
 	reg := prometheus.NewRegistry()
-	for _, c := range []prometheus.Collector{gauge, dropped, writes} {
+	for _, c := range []prometheus.Collector{gauge, dropped, writes, drained} {
 		if err := reg.Register(c); err != nil {
 			t.Fatalf("register: %v", err)
 		}
 	}
-	return Metrics{Deferred: gauge.WithLabelValues(), Dropped: dropped, Writes: writes}
+	return Metrics{Deferred: gauge.WithLabelValues(), Dropped: dropped, Writes: writes, Drained: drained}
+}
+
+// plainCounterValue reads a non-vector prometheus.Counter (the Story 4.9 drained
+// counter).
+func plainCounterValue(t *testing.T, c prometheus.Counter) float64 {
+	t.Helper()
+	var m dto.Metric
+	if err := c.Write(&m); err != nil {
+		t.Fatalf("counter write: %v", err)
+	}
+	return m.GetCounter().GetValue()
 }
 
 func gaugeValue(t *testing.T, g prometheus.Gauge) float64 {
@@ -102,8 +117,14 @@ func TestEnqueue_DrainFIFO_DecrementsToZero(t *testing.T) {
 	if got := gaugeValue(t, m.Deferred); got != 0 {
 		t.Fatalf("gauge after drain = %v, want 0", got)
 	}
-	if got := counterValue(t, m.Writes, "drained"); got != 3 {
+	// Story 4.9 (BI-5): a confirmed drain Inc's the dedicated drained counter and
+	// does NOT record result="drained" on the shared writes counter (no
+	// double-count; the value is retired).
+	if got := plainCounterValue(t, m.Drained); got != 3 {
 		t.Fatalf("drained count = %v, want 3", got)
+	}
+	if got := counterValue(t, m.Writes, "drained"); got != 0 {
+		t.Fatalf("shared writes{result=drained} = %v, want 0 (the drained value is retired)", got)
 	}
 	// FIFO: the bodies landed under the right keys.
 	for _, k := range keys {

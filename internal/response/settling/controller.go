@@ -65,6 +65,15 @@ type pending struct {
 	threatScore float64
 	packageID   string
 	workloadID  string
+	// counted reports whether this pending currently contributes one count to the
+	// olaitan_report_settling_window_active gauge, and countedState is the gauge
+	// state label value (string(finalState)) it was counted under (Story 4.9
+	// BI-4/OA2). When a re-arm changes finalState, onTransition moves the count
+	// from countedState to the new state (Dec old, Inc new); finalisation/CLEAR
+	// Dec's exactly the countedState series, so the per-state depth stays accurate
+	// and a re-arm never double-counts the same active window.
+	counted      bool
+	countedState schema.PodSecurityState
 	// gen is the timer generation stamped on this pending when its timer was last
 	// armed/re-armed. It is drawn from the controller's LIFETIME-MONOTONIC counter
 	// (Controller.nextGen), so it is unique across the whole controller lifetime
@@ -115,6 +124,17 @@ type Controller struct {
 	// timer), so operators alert on edge="clean" (MED round-1). Nil when no
 	// metrics registry was wired (e.g. unit tests).
 	dropped *prometheus.CounterVec
+
+	// windowActive is the Story 4.9 forensic-observability gauge
+	// (olaitan_report_settling_window_active{state}, AC1/BI-4/FR50): the number of
+	// currently-armed (not-yet-finalised, not-yet-cleared) settling windows by
+	// candidate final_state. Inc on the FIRST arm of a window for a workload in a
+	// non-CLEAN state, Dec on finalisation (onFire) or a CLEAN cancel (onTransition
+	// CLEAN branch); a re-arm that changes the candidate state moves the count from
+	// the old state label to the new. Mutated ONLY on the single-threaded Run
+	// goroutine (no locks). Nil when no metrics registry was wired (e.g. unit
+	// tests), nil-guarded exactly like dropped.
+	windowActive *prometheus.GaugeVec
 
 	// queue carries observed transitions from Publish to Run. Run is the SOLE
 	// owner of all mutable state below, so there are no locks: the timer map,
@@ -194,7 +214,71 @@ func (c *Controller) RegisterMetrics(r *metrics.Registry) error {
 	for _, edge := range []string{"clean", "non_clean"} {
 		dc.WithLabelValues(edge).Add(0)
 	}
+	// Story 4.9 (AC1, BI-4, FR50): the per-state active-window-depth gauge. A
+	// window is armed for a workload stable in a non-CLEAN state and is counted
+	// here from its first arm until finalisation or a CLEAN cancel; the state
+	// label is the candidate final_state (OA2). Pre-init the bounded non-CLEAN
+	// state series to 0 so alert PromQL has a stable zero series from startup (the
+	// dropped-counter precedent). CLEAN never arms a window, so it is not seeded.
+	wa, err := r.RegisterGaugeVec(
+		"olaitan_report_settling_window_active",
+		"Number of currently-armed settling windows (stable in a non-CLEAN state, not yet finalised or cleared) by candidate final_state (Story 4.9 AC1 FR50): incremented on the first arm of a window, decremented on finalisation or a CLEAN cancel.",
+		[]string{"state"},
+	)
+	if err != nil {
+		return err
+	}
+	c.windowActive = wa
+	for _, st := range []schema.PodSecurityState{
+		schema.StateSuspicious, schema.StateRestricted,
+		schema.StateQuarantined, schema.StatePreservedKilled,
+	} {
+		wa.WithLabelValues(string(st)).Add(0)
+	}
 	return nil
+}
+
+// windowInc records a newly-counted active settling window at state st (the
+// first arm for a workload). Nil-guarded for the no-registry (unit-test)
+// controller, exactly like the dropped counter.
+func (c *Controller) windowInc(p *pending, st schema.PodSecurityState) {
+	p.counted = true
+	p.countedState = st
+	if c.windowActive != nil {
+		c.windowActive.WithLabelValues(string(st)).Inc()
+	}
+}
+
+// windowDec removes p's contribution to the active-window gauge (finalisation or
+// a CLEAN cancel), Dec'ing exactly the state series it was counted under. A
+// no-op when p was never counted. Nil-guarded.
+func (c *Controller) windowDec(p *pending) {
+	if p == nil || !p.counted {
+		return
+	}
+	p.counted = false
+	if c.windowActive != nil {
+		c.windowActive.WithLabelValues(string(p.countedState)).Dec()
+	}
+}
+
+// windowMove handles a re-arm that changes the candidate final_state: it Dec's
+// the old state series and Inc's the new so the per-state depth stays accurate
+// without double-counting the same active window. A re-arm at the SAME state is
+// a no-op. Nil-guarded.
+func (c *Controller) windowMove(p *pending, st schema.PodSecurityState) {
+	if !p.counted {
+		c.windowInc(p, st)
+		return
+	}
+	if p.countedState == st {
+		return
+	}
+	if c.windowActive != nil {
+		c.windowActive.WithLabelValues(string(p.countedState)).Dec()
+		c.windowActive.WithLabelValues(string(st)).Inc()
+	}
+	p.countedState = st
 }
 
 // Publish is the fsm.TransitionSink seam (BI-2). It is NON-BLOCKING: it only
@@ -291,6 +375,12 @@ func (c *Controller) onTransition(st schema.StateTransition, timers map[string]*
 			t.Stop()
 			delete(timers, wid)
 		}
+		// Story 4.9 (BI-4): a CLEAN cancel that removed a live pending Dec's the
+		// active-window gauge by that pending's counted state. windowDec is a no-op
+		// for a workload that had no live pending.
+		if p, ok := pendings[wid]; ok {
+			c.windowDec(p)
+		}
 		delete(pendings, wid)
 		// CLEAN is the ONLY edge that clears the once-only finalised marker: a
 		// CLEAN cycle ends the incident, so a later new non-CLEAN incident for the
@@ -345,6 +435,12 @@ func (c *Controller) onTransition(st schema.StateTransition, timers map[string]*
 	c.nextGen++
 	p.gen = c.nextGen
 	p.finalState = st.ToState
+	// Story 4.9 (BI-4, OA2): account the active-window gauge. A NEW pending (first
+	// arm) Inc's at the candidate state; a re-arm of an already-counted pending
+	// does NOT double-Inc, but a re-arm that CHANGES the candidate state moves the
+	// count from the old state series to the new (Dec old, Inc new). windowMove
+	// handles all three cases.
+	c.windowMove(p, st.ToState)
 	// MED (round-1): override-triggered finalisation can carry an empty PackageID
 	// and zero Confidence (an operator pin need not re-run an evaluation). Prefer
 	// the values from THIS transition, but if a field is unpopulated on an
@@ -447,6 +543,9 @@ func (c *Controller) onFire(ctx context.Context, sig firedSignal, timers map[str
 		return
 	}
 	finalised[wid] = struct{}{}
+	// Story 4.9 (BI-4): a finalised window is no longer active; Dec the gauge by
+	// this pending's counted state exactly once before the pending is dropped.
+	c.windowDec(p)
 	// LOW (round-1): drop the pending candidate now that it is published. The
 	// in-process history accumulation is no longer needed (it was a fallback for
 	// THIS finalisation, now done), and the once-only marker is carried by the
