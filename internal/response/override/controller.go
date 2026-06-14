@@ -279,15 +279,22 @@ func (c *Controller) reconcile(ctx context.Context) {
 		return
 	}
 
-	// A workload that became VALID (now desired) clears any stale rejected
-	// marker, so a later regression to the same invalid value re-counts (FIX 5).
-	for wl := range desiredSet {
-		delete(c.lastRejected, wl)
-	}
-
-	// Emit rejections (no pin, no Redis write; BI-5). Counted/emitted only on a
-	// NEW or CHANGED rejection signature per workload (FIX 5) so a standing
-	// invalid annotation counts once, consistent with the deduped NATS event.
+	// Emit pre-filter rejections (no pin, no Redis write; BI-5). Counted/emitted
+	// only on a NEW or CHANGED rejection signature per workload (FIX 5) so a
+	// standing invalid annotation counts once, consistent with the deduped NATS
+	// event.
+	//
+	// Story 4.1 (round-2 Finding): the stale-marker clear was previously done
+	// here UNCONDITIONALLY for every workload in desiredSet, on the assumption
+	// that "in desiredSet" == "now valid". That assumption is false for a
+	// PRESERVED_KILLED skip-into: it PASSES the pre-filter (so it is in
+	// desiredSet) but is rejected later inside Pin (applyDesired). The
+	// unconditional clear wiped its lastRejected entry every tick, so
+	// emitRejection's dedup gate re-counted + re-emitted the Pin-error rejection
+	// on EVERY poll for one standing misconfig. The clear is therefore moved into
+	// the apply-SUCCESS path (clearRejectedMarker, called only when a workload
+	// genuinely pins this tick), so a later regression to the same invalid value
+	// still re-counts, but a never-pinning skip-into stays deduped to ONCE.
 	for _, rej := range rejections {
 		c.emitRejection(ctx, rej)
 	}
@@ -549,8 +556,12 @@ func (c *Controller) applyDesired(ctx context.Context, workloadID string, d desi
 		if s, pinned := c.machine.IsPinned(workloadID); !pinned || s != d.state {
 			if err := c.machine.Pin(workloadID, d.state, d.operatorID); err != nil {
 				c.log.Warn("override: re-pin (rehydrate) failed", "workload_id", workloadID, "state", d.state, "err", err)
+				return
 			}
 		}
+		// A genuinely-valid, active override: clear any stale rejected marker so a
+		// later regression to an invalid value re-counts (round-2 Finding).
+		c.clearRejectedMarker(workloadID)
 		return
 	}
 
@@ -596,6 +607,13 @@ func (c *Controller) applyDesired(ctx context.Context, workloadID string, d desi
 		c.log.Warn("override: pin failed", "workload_id", workloadID, "state", d.state, "err", err)
 		return
 	}
+
+	// The Pin succeeded: this workload is genuinely valid this tick. Clear any
+	// stale rejected marker so a later regression to the same invalid value
+	// re-counts (round-2 Finding: the clear moved out of reconcile's
+	// unconditional desiredSet loop, which wrongly cleared never-pinning
+	// PRESERVED_KILLED skip-intos every tick).
+	c.clearRejectedMarker(workloadID)
 
 	appliedAt := c.now().UTC()
 	rec := OverrideRecord{
@@ -751,6 +769,18 @@ func (c *Controller) detectManualRemovals(ctx context.Context, desiredSet map[st
 		delete(c.consumed, wl)
 		c.log.Info("override: released (annotation removed)", "workload_id", wl, "resumed_from", resumed, "was_pinned", ok)
 	}
+}
+
+// clearRejectedMarker drops a workload's lastRejected dedup entry once it has
+// successfully pinned this tick (the apply-SUCCESS path). It replaces the old
+// unconditional clear over all of desiredSet in reconcile, which wrongly wiped
+// the marker for a PRESERVED_KILLED skip-into that passes the pre-filter (so it
+// is desired) yet is rejected inside Pin and never actually pins (round-2
+// Finding). Clearing only on a genuine pin keeps the "regression to an invalid
+// value re-counts" semantics while leaving a never-pinning standing skip-into
+// deduped to a single rejection, exactly like the pre-filter rejection path.
+func (c *Controller) clearRejectedMarker(workloadID string) {
+	delete(c.lastRejected, workloadID)
 }
 
 // emitRejection publishes a rejected OVERRIDES.applied event and increments the

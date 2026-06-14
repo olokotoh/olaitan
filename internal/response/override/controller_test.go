@@ -382,6 +382,16 @@ func TestReconcile_RejectsPreservedKilledFromNonQuarantined(t *testing.T) {
 		AnnotationState: "PRESERVED_KILLED",
 	})
 	c := newController(t, objs, store, machine, pub, reg)
+
+	// Round-2 Finding: drive the poll loop SEVERAL times. A PRESERVED_KILLED
+	// skip-into is a VALID override target, so computeDesired keeps it in
+	// desiredSet every tick; the Pin-error rejection must nonetheless be
+	// emitted/counted exactly ONCE for a standing (unchanged) annotation,
+	// mirroring the pre-filter rejection dedup contract. Before the fix, the
+	// unconditional lastRejected clear over desiredSet wiped the dedup entry each
+	// tick and the counter + event grew once per poll (~5,760/day at 15s).
+	c.reconcile(ctx)
+	c.reconcile(ctx)
 	c.reconcile(ctx)
 
 	if _, pinned := machine.IsPinned(depWorkloadID); pinned {
@@ -394,14 +404,60 @@ func TestReconcile_RejectsPreservedKilledFromNonQuarantined(t *testing.T) {
 		t.Errorf("rejected counter{state_unavailable} = %v, want 0 (state_unavailable no longer used for PRESERVED_KILLED)", got)
 	}
 	// Finding 1: the illegal skip-into is now auditable (invalid_state) rather
-	// than silently warn-logged. A mutation removing the emitRejection call in
-	// the Pin-error path fails BOTH the counter and the event assertions below.
+	// than silently warn-logged. Round-2 Finding: it must dedup to ONE across
+	// repeated ticks. A mutation reverting the apply-success clearRejectedMarker
+	// move (i.e. restoring the unconditional desiredSet clear in reconcile) makes
+	// the counter climb to 3 and the event slice grow to 3, failing here.
 	if got := counterValue(t, reg, "olaitan_response_override_rejected_total", "invalid_state"); got != 1 {
-		t.Errorf("rejected counter{invalid_state} = %v, want 1 (Pin skip-into rejection must be auditable)", got)
+		t.Errorf("rejected counter{invalid_state} = %v, want 1 (standing Pin skip-into rejection must dedup once across ticks)", got)
 	}
 	evts := pub.all()
 	if len(evts) != 1 || !evts[0].Rejected || evts[0].Reason != ReasonInvalidState {
-		t.Fatalf("events = %+v, want one rejected event reason=invalid_state (Finding 1)", evts)
+		t.Fatalf("events = %+v, want exactly one rejected event reason=invalid_state across repeated ticks (round-2 dedup)", evts)
+	}
+}
+
+// TestReconcile_PreservedKilledSkipIntoReEmitsOnChangedValue proves the round-2
+// dedup fix does NOT over-dedup: when the operator EDITS the (still-invalid)
+// override annotation to a different value, the rejection re-emits + re-counts,
+// exactly like the pre-filter rejection contract (a CHANGED reason/value
+// re-emits). This guards against a fix that silently swallows all repeats.
+func TestReconcile_PreservedKilledSkipIntoReEmitsOnChangedValue(t *testing.T) {
+	ctx := context.Background()
+	mr := startMiniredis(t)
+	store, _ := newRedisStore(t, mr)
+	machine := newMachine(t) // default CLEAN, not QUARANTINED
+	pub := &fakePublisher{}
+	reg := metrics.NewRegistry()
+
+	pod, objs := deploymentPod("default", "web", map[string]string{
+		AnnotationState: "PRESERVED_KILLED",
+	})
+	c := newController(t, objs, store, machine, pub, reg)
+
+	// First standing rejection: emit once across two ticks.
+	c.reconcile(ctx)
+	c.reconcile(ctx)
+	if got := counterValue(t, reg, "olaitan_response_override_rejected_total", "invalid_state"); got != 1 {
+		t.Fatalf("after standing PRESERVED_KILLED: invalid_state = %v, want 1", got)
+	}
+
+	// Operator EDITS the annotation to a different (still-invalid) value: the
+	// rejection signature changes, so it must re-emit + re-count.
+	pod.Annotations[AnnotationState] = "BOGUS"
+	if _, err := c.cs.CoreV1().Pods("default").Update(ctx, pod, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update pod annotation: %v", err)
+	}
+	c.reconcile(ctx)
+	c.reconcile(ctx)
+
+	// BOGUS is an UNKNOWN target rejected by the pre-filter with invalid_state.
+	if got := counterValue(t, reg, "olaitan_response_override_rejected_total", "invalid_state"); got != 2 {
+		t.Errorf("after CHANGED invalid value: invalid_state = %v, want 2 (changed reason/value must re-emit; do not over-dedup)", got)
+	}
+	evts := pub.all()
+	if len(evts) != 2 {
+		t.Fatalf("events = %+v, want 2 (one per distinct invalid value)", evts)
 	}
 }
 
