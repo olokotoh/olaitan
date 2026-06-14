@@ -171,6 +171,8 @@ func (r ForensicReport) Render(evt settling.IncidentFinalised) string {
 	b.WriteString("\n")
 	b.WriteString(renderATTACKSection(r.AttackTechniques))
 	b.WriteString("\n")
+	b.WriteString(renderPostureSection(r.ContributingPostureFindings))
+	b.WriteString("\n")
 
 	// The model's interpretive narrative section.
 	b.WriteString("## Analyst narrative\n\n")
@@ -249,6 +251,25 @@ func renderATTACKSection(techniques []string) string {
 	}
 	for _, tech := range techniques {
 		fmt.Fprintf(&b, "- %s\n", tech)
+	}
+	return b.String()
+}
+
+// renderPostureSection renders the contributing-posture-findings section (AC3)
+// deterministically from the force-stamped contributing_posture_findings
+// front-matter (sourced from the package WorkloadPosture, NEVER from model
+// output: round-2 review follow-up). An empty list renders the honest "not
+// recorded" line rather than letting the model fabricate a posture finding it
+// has no data for (PO Option A).
+func renderPostureSection(findings []string) string {
+	var b strings.Builder
+	b.WriteString("## Contributing posture findings\n\n")
+	if len(findings) == 0 {
+		b.WriteString("No contributing posture finding was recorded for this incident.\n")
+		return b.String()
+	}
+	for _, f := range findings {
+		fmt.Fprintf(&b, "- %s\n", f)
 	}
 	return b.String()
 }

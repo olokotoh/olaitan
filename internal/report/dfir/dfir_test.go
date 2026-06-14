@@ -71,22 +71,15 @@ func (r *fakeAuditRecorder) RecordDFIRAssessment(_ context.Context, rec DFIRAudi
 	return nil
 }
 
-// validReportJSON is a schema-conforming model reply. The deterministic
-// front-matter fields are present (the schema requires them) but the runner
-// overwrites them from the incident; only the narrative and posture findings are
-// the model output the runner keeps. The factual sections (timeline, containment,
-// ATT&CK) are rendered deterministically by the runner, NOT from the model.
+// validReportJSON is a schema-conforming model reply. Per the round-2 review
+// follow-up the model contract requires ONLY the narrative, so this mirrors what
+// a real model returns under the DFIR prompt ("return a single JSON document
+// carrying ONLY the narrative field"): a narrative-only document. The
+// controller force-stamps EVERY other field (the deterministic front-matter +
+// the posture findings) after validation; the factual sections (timeline,
+// containment, ATT&CK, posture) are rendered deterministically by the runner,
+// NOT from the model.
 const validReportJSON = `{
-  "incident_id": "model-supplied-id",
-  "final_fsm_state": "QUARANTINED",
-  "threat_score_at_decision": 12,
-  "attack_techniques": ["T9999"],
-  "contributing_posture_findings": ["overly-broad RBAC binding cluster-admin"],
-  "containment_actions": ["model action"],
-  "report_generated_at": "2026-01-01T00:00:00Z",
-  "prompt_hash": "model-hash",
-  "dfir_provider": "model-provider",
-  "dfir_model": "model-model",
   "narrative": "The miner ran."
 }`
 
@@ -159,11 +152,14 @@ func TestGenerate_SchemaConformingRender(t *testing.T) {
 			t.Errorf("rendered report missing %q\n---\n%s", want, rendered)
 		}
 	}
-	if strings.Contains(rendered, "T9999") {
-		t.Error("rendered report leaked the model-supplied technique T9999 (must source from the assessment)")
+	// With a narrative-only model reply and no package posture, the posture
+	// front-matter is empty and the section prints the honest "not recorded" line
+	// (posture is force-stamped from the package, never modelled).
+	if !strings.Contains(rendered, "contributing_posture_findings: []") {
+		t.Errorf("posture front-matter must be empty for a nil package posture\n%s", rendered)
 	}
-	if strings.Contains(rendered, "model-supplied-id") {
-		t.Error("rendered report leaked the model-supplied incident_id (must source from the event)")
+	if !strings.Contains(rendered, "No contributing posture finding was recorded for this incident.") {
+		t.Errorf("posture section must print the honest not-recorded line\n%s", rendered)
 	}
 	// The narrative (model output) is preserved under the narrative section.
 	if !strings.Contains(rendered, "## Analyst narrative") || !strings.Contains(rendered, "The miner ran.") {
@@ -432,12 +428,22 @@ func TestRender_YAMLEscaping(t *testing.T) {
 		Narrative:                   "narrative",
 	}
 	rendered := r.Render(settling.IncidentFinalised{})
+	// The escaping contract guards the YAML FRONT-MATTER block (between the two
+	// --- fences), where a breakout would inject a live YAML key. The Markdown
+	// body sections legitimately render multi-line content as bullets, so the
+	// assertion is scoped to the front-matter.
+	frontMatter := rendered
+	if _, after, ok := strings.Cut(rendered, "---\n"); ok {
+		if fm, _, ok2 := strings.Cut(after, "\n---\n"); ok2 {
+			frontMatter = fm
+		}
+	}
 	// The injected key must be escaped, not a live YAML key.
-	if strings.Contains(rendered, "\ninjected: true") {
+	if strings.Contains(frontMatter, "\ninjected: true") {
 		t.Errorf("model string broke out of the quoted scalar\n%s", rendered)
 	}
-	if strings.Contains(rendered, "finding with\nnewline") {
-		t.Errorf("a newline in a posture finding was not escaped\n%s", rendered)
+	if strings.Contains(frontMatter, "finding with\nnewline") {
+		t.Errorf("a newline in a posture finding was not escaped in the front-matter\n%s", rendered)
 	}
 }
 
@@ -691,8 +697,99 @@ func TestParseForensicReport_FenceStripped(t *testing.T) {
 	if _, perr := parseForensicReport(sch, fenced); perr != nil {
 		t.Errorf("fenced valid report must parse: %v", perr)
 	}
-	blank := `{"incident_id":"i","final_fsm_state":"RESTRICTED","threat_score_at_decision":1,"report_generated_at":"2026-01-01T00:00:00Z","prompt_hash":"h","dfir_provider":"claude","dfir_model":"m","narrative":"   "}`
+	blank := `{"narrative":"   "}`
 	if _, perr := parseForensicReport(sch, blank); perr == nil {
 		t.Error("a whitespace-only narrative must be rejected")
+	}
+}
+
+// TestGenerate_NarrativeOnlyResponseValidatesAndRenders is the round-2 review
+// follow-up FIX 1 proof: a real model returns a document carrying ONLY the
+// narrative (the schema requires only narrative), and the runner produces a
+// fully-rendered report with the front-matter force-stamped from the incident.
+// This is the assertion prod works: before the fix, a narrative-only reply
+// failed validation on the 7 then-required fields and fail-closed produced zero
+// reports.
+func TestGenerate_NarrativeOnlyResponseValidatesAndRenders(t *testing.T) {
+	const narrativeOnly = `{"narrative":"A cryptominer executed inside the workload."}`
+	fp := &fakeProvider{name: "claude", model: "claude-opus-4-8", resp: provider.Response{Raw: narrativeOnly, StopReason: "end_turn", Model: "claude-opus-4-8"}}
+	rp := &fakeReportPublisher{}
+	a := newAgent(t, fp, rp, nil)
+
+	rendered, reported, err := a.Generate(context.Background(), testIncident())
+	if err != nil {
+		t.Fatalf("a narrative-only reply must validate and render: %v", err)
+	}
+	if !reported {
+		t.Fatal("a narrative-only reply must produce a report")
+	}
+	// The controller force-stamps the entire front-matter even though the model
+	// supplied none of it.
+	for _, want := range []string{
+		"schema_version: \"report.v1\"",
+		"incident_id: \"pkg-dfir-1\"",
+		"final_fsm_state: \"QUARANTINED\"",
+		"threat_score_at_decision: 42.5",
+		"prompt_hash: \"dfir.test.v1\"",
+		"dfir_provider: \"claude\"",
+		"dfir_model: \"claude-opus-4-8\"",
+		"- \"T1611\"", // technique force-stamped from the assessment
+		"## Kill-chain timeline",
+		"## Containment actions",
+		"## MITRE ATT&CK for Containers",
+		"## Contributing posture findings",
+		"A cryptominer executed inside the workload.",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("rendered report missing %q\n---\n%s", want, rendered)
+		}
+	}
+	if len(rp.events) != 1 {
+		t.Fatalf("want 1 REPORTS.generated event, got %d", len(rp.events))
+	}
+}
+
+// TestGenerate_ModelPostureFindingsDiscarded is the round-2 review follow-up FIX
+// 2 proof: posture is force-stamped from the package WorkloadPosture and the
+// model never controls it. With a nil package posture (the 4.4 prod case) the
+// contributing_posture_findings front-matter is empty and the posture section
+// prints the honest "not recorded" line, regardless of model output (the schema
+// now forbids unknown fields via additionalProperties:false and the fixture is
+// narrative-only, so the model cannot even smuggle posture findings in).
+func TestGenerate_ModelPostureFindingsDiscarded(t *testing.T) {
+	fp := &fakeProvider{name: "claude", model: "claude-opus-4-8", resp: provider.Response{Raw: validReportJSON, StopReason: "end_turn"}}
+	a := newAgent(t, fp, &fakeReportPublisher{}, nil)
+	inc := testIncident()
+	inc.Package.WorkloadPosture = nil // the 4.4 prod case: no posture snapshot
+
+	rendered, reported, err := a.Generate(context.Background(), inc)
+	if err != nil || !reported {
+		t.Fatalf("reported=%v err=%v", reported, err)
+	}
+	if !strings.Contains(rendered, "contributing_posture_findings: []") {
+		t.Errorf("a nil package posture must render an empty posture front-matter list\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "No contributing posture finding was recorded for this incident.") {
+		t.Errorf("a nil package posture must render the honest not-recorded posture line\n%s", rendered)
+	}
+}
+
+// TestGenerate_PosturePresentForceStamped exercises the populated posture path:
+// when the package DOES carry a WorkloadPosture, the runner derives the finding
+// strings from it (force-stamped), and they render in the posture section.
+func TestGenerate_PosturePresentForceStamped(t *testing.T) {
+	fp := &fakeProvider{name: "claude", model: "claude-opus-4-8", resp: provider.Response{Raw: validReportJSON, StopReason: "end_turn"}}
+	a := newAgent(t, fp, &fakeReportPublisher{}, nil)
+	inc := testIncident()
+	inc.Package.WorkloadPosture = &schema.WorkloadPosture{
+		ClusterRoleBindings: []schema.ClusterRoleBindingRef{{Name: "crb-1", RoleName: "cluster-admin"}},
+	}
+
+	rendered, reported, err := a.Generate(context.Background(), inc)
+	if err != nil || !reported {
+		t.Fatalf("reported=%v err=%v", reported, err)
+	}
+	if !strings.Contains(rendered, "cluster-role binding grants cluster-admin") {
+		t.Errorf("a present posture must render its force-stamped finding\n%s", rendered)
 	}
 }

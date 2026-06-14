@@ -27,7 +27,12 @@
 # attack_techniques items use the established ATT&CK string form, pinned
 # to MITRE ATT&CK for Containers v18. final_fsm_state excludes CLEAN
 # (CLEAN never finalises, AC4). narrative is the analyst interpretive
-# prose only (the factual sections are rendered, not modelled).
+# prose only (the factual sections are rendered, not modelled). The
+# model contract REQUIRES ONLY narrative (round-2 review follow-up): a
+# compliant model returns {"narrative": "..."} and the runner
+# force-stamps every other (controller-owned) field after validation, so
+# the deterministic front-matter fields stay required:false here even
+# though they are always present in the rendered report.
 schema: report.v1
 fields:
   schema_version:
@@ -38,20 +43,20 @@ fields:
       model. maxLength 64.
   incident_id:
     type: string
-    required: true
+    required: false
     description: >
       Identifier of the finalised incident (the IncidentFinalised
       package_id). Non-empty, maxLength 256.
   final_fsm_state:
     type: string
-    required: true
+    required: false
     description: >
       The non-CLEAN FSM state the workload settled in, one of SUSPICIOUS,
       RESTRICTED, QUARANTINED, PRESERVED_KILLED (CLEAN never finalises,
       AC4).
   threat_score_at_decision:
     type: number
-    required: true
+    required: false
     description: >
       The ThreatScore on the transition that established the final state,
       captured at entry, not re-sampled.
@@ -78,24 +83,24 @@ fields:
       entries, each maxLength 256.
   report_generated_at:
     type: string
-    required: true
+    required: false
     description: >
       The report generation time (the DFIR runner clock), RFC 3339.
   prompt_hash:
     type: string
-    required: true
+    required: false
     description: >
       The DFIR prompt content hash (PromptSpec.Version). Non-empty,
       maxLength 128.
   dfir_provider:
     type: string
-    required: true
+    required: false
     description: >
       The provider that served the DFIR call (e.g. claude). Non-empty,
       maxLength 64.
   dfir_model:
     type: string
-    required: true
+    required: false
     description: >
       The model id that served the DFIR call. Non-empty, maxLength 128.
   narrative:

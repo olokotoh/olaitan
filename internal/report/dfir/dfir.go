@@ -380,15 +380,23 @@ func (a *Agent) callAndValidate(ctx context.Context, inc Incident, spec PromptSp
 	// Force-stamp the deterministic front-matter from the authoritative incident
 	// (AC2): these fields are SOURCED, not whatever the model returned, so a
 	// model that hallucinates a final_state or a technique cannot influence the
-	// report header. The narrative and any model-supplied posture findings remain
-	// the validated model output. Techniques source off the SAME chosen
-	// grounding assessment (real -> populated; synthesized -> empty -> the
-	// renderer prints "not recorded").
+	// report header. Only the narrative remains the validated model output:
+	// the posture findings are ALSO force-stamped from the package
+	// WorkloadPosture (round-2 review follow-up: posture is unsourceable by the
+	// model, so a model finding would be a hallucination), discarding any model
+	// value. Techniques source off the SAME chosen grounding assessment (real ->
+	// populated; synthesized -> empty -> the renderer prints "not recorded").
 	report.SchemaVersion = SchemaVersionForensicReport
 	report.IncidentID = inc.Event.PackageID
 	report.FinalFSMState = inc.Event.FinalState
 	report.ThreatScoreAtDecision = inc.Event.ThreatScore
 	report.AttackTechniques = techniquesFromAssessment(grounding)
+	// Force-stamp the posture findings from the package WorkloadPosture,
+	// DISCARDING any model-supplied value (round-2 review follow-up: posture is
+	// unsourceable by the model, so a model finding would be a hallucination, PO
+	// Option A). In the 4.4 prod case the package carries no posture, so this is
+	// nil and the renderer prints the honest "not recorded" line.
+	report.ContributingPostureFindings = postureFindings(inc.Package)
 	report.ContainmentActions = containmentFromHistory(inc.Event)
 	report.ReportGeneratedAt = a.now()
 	report.PromptHash = spec.Version
@@ -517,6 +525,49 @@ func techniquesFromAssessment(a *schema.ThreatAssessment) []string {
 	for _, t := range a.MitreTechniques {
 		if strings.TrimSpace(t) != "" {
 			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// postureFindings derives the contributing-posture finding strings from the
+// package WorkloadPosture (round-2 review follow-up: force-stamped, NEVER
+// model-supplied, so the model cannot fabricate posture it has no data for, PO
+// Option A). A nil WorkloadPosture (the 4.4 prod case: the finalisation carries
+// no posture snapshot) yields nil, and the renderer prints the honest "not
+// recorded" line. This is deliberately MINIMAL: it surfaces the unambiguous,
+// directly-readable posture facts (cluster-role bindings, over-broad RBAC verbs,
+// privileged container contexts) and does NOT attempt a full posture analysis
+// (the enrichment is the deferred follow-up). When posture is present but
+// unavailable, the honest unavailable class is surfaced rather than a finding.
+func postureFindings(pkg schema.EvidencePackage) []string {
+	p := pkg.WorkloadPosture
+	if p == nil {
+		return nil
+	}
+	if p.Unavailable {
+		reason := firstNonEmpty(strings.TrimSpace(p.UnavailableReason), "unknown")
+		return []string{"posture unavailable (" + reason + ")"}
+	}
+	var out []string
+	for _, crb := range p.ClusterRoleBindings {
+		name := firstNonEmpty(strings.TrimSpace(crb.RoleName), strings.TrimSpace(crb.Name))
+		if name == "" {
+			continue
+		}
+		out = append(out, "cluster-role binding grants "+name)
+	}
+	for _, rb := range p.RoleBindings {
+		name := firstNonEmpty(strings.TrimSpace(rb.RoleName), strings.TrimSpace(rb.Name))
+		if name == "" {
+			continue
+		}
+		out = append(out, "role binding grants "+name)
+	}
+	for _, csc := range p.ContainerSecurityContexts {
+		if csc.Privileged != nil && *csc.Privileged {
+			name := firstNonEmpty(strings.TrimSpace(csc.ContainerName), "(unnamed container)")
+			out = append(out, "privileged container security context on "+name)
 		}
 	}
 	return out
