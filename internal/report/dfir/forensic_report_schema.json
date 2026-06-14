@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/olokotoh/olaitan/docs/schemas/forensic_report.json",
   "title": "ForensicReport (report.v1)",
-  "description": "Story 4.4 DFIR forensic report (FR43). AUTHORITATIVE validation source for the DFIR sub-agent response contract; forensic_report.yaml is the human-readable mirror and internal/report/dfir/forensic_report_schema.json is the byte-identical embedded runtime copy. This is the MODEL-facing report schema: the LLM returns a single JSON document conforming to it, which the DFIR runner validates and then RENDERS deterministically to YAML-front-matter + Markdown (BI-6 JSON->render hybrid; the LLM never controls raw Markdown). The deterministic front-matter fields (incident_id, final_fsm_state, threat_score_at_decision, attack_techniques, contributing_posture_findings, containment_actions, report_generated_at, prompt_hash, dfir_provider, dfir_model) are sourced from the IncidentFinalised event and the persisted ThreatAssessment/WorkloadPosture, not invented by the model (AC2): the runner force-stamps the authoritative values after validation. attack_techniques items use the established ATT&CK string form (threat_assessment.json mitre_techniques regex), pinned to MITRE ATT&CK for Containers v18. final_fsm_state EXCLUDES CLEAN (CLEAN never finalises, AC4). body is the analyst Markdown carrying the five FR43 sections. Source of truth for the Go shape: internal/report/dfir/report.go (type ForensicReport).",
+  "description": "Story 4.4 DFIR forensic report (FR43). AUTHORITATIVE validation source for the DFIR sub-agent response contract; forensic_report.yaml is the human-readable mirror and internal/report/dfir/forensic_report_schema.json is the byte-identical embedded runtime copy. This is the MODEL-facing report schema: the LLM returns a single JSON document conforming to it, which the DFIR runner validates and then RENDERS deterministically to YAML-front-matter + Markdown (BI-6 JSON->render hybrid; the LLM never controls raw Markdown). The factual report sections (kill-chain timeline, containment actions, MITRE ATT&CK annotations) are built DETERMINISTICALLY in Go from the IncidentFinalised event history and the persisted ThreatAssessment; the model supplies ONLY the interpretive narrative (round-1 review follow-up: anti-hallucination). The deterministic front-matter fields (incident_id, final_fsm_state, threat_score_at_decision, attack_techniques, contributing_posture_findings, containment_actions, report_generated_at, prompt_hash, dfir_provider, dfir_model) are sourced from the IncidentFinalised event and the persisted ThreatAssessment/WorkloadPosture, not invented by the model (AC2): the runner force-stamps the authoritative values after validation. attack_techniques items use the established ATT&CK string form (threat_assessment.json mitre_techniques regex), pinned to MITRE ATT&CK for Containers v18. final_fsm_state EXCLUDES CLEAN (CLEAN never finalises, AC4). narrative is the analyst interpretive prose only (NOT the factual sections, which the renderer assembles). Source of truth for the Go shape: internal/report/dfir/report.go (type ForensicReport).",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -13,7 +13,7 @@
     "prompt_hash",
     "dfir_provider",
     "dfir_model",
-    "body"
+    "narrative"
   ],
   "properties": {
     "schema_version": {
@@ -96,11 +96,11 @@
       "maxLength": 128,
       "description": "The model id that served the DFIR call."
     },
-    "body": {
+    "narrative": {
       "type": "string",
       "minLength": 1,
       "maxLength": 65536,
-      "description": "The analyst Markdown body carrying the five FR43 sections (kill-chain timeline, ATT&CK annotations, contributing posture findings, containment actions, narrative)."
+      "description": "The interpretive analyst narrative prose ONLY: a plain-language account of how the activity proceeded, grounded strictly in the supplied evidence and the control-plane prior_assessment record. The factual sections (kill-chain timeline, containment actions, MITRE ATT&CK annotations) are assembled deterministically by the Go renderer, NOT by the model (round-1 review follow-up: anti-hallucination). Where data is absent the narrative states the gap rather than fabricating a value."
     }
   }
 }

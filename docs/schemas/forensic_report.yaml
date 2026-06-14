@@ -12,17 +12,22 @@
 # Per the BI-6 JSON->render hybrid the LLM returns a single JSON document
 # conforming to this schema; the runner validates it, then RENDERS it
 # deterministically to YAML-front-matter + Markdown (the LLM never
-# controls raw Markdown). The deterministic front-matter fields
-# (incident_id, final_fsm_state, threat_score_at_decision,
-# attack_techniques, contributing_posture_findings, containment_actions,
+# controls raw Markdown). Round-1 review follow-up (anti-hallucination):
+# the factual sections (kill-chain timeline, containment actions, MITRE
+# ATT&CK annotations) are built DETERMINISTICALLY in Go from the
+# IncidentFinalised event history and the persisted ThreatAssessment; the
+# model supplies ONLY the interpretive narrative. The deterministic
+# front-matter fields (incident_id, final_fsm_state,
+# threat_score_at_decision, attack_techniques,
+# contributing_posture_findings, containment_actions,
 # report_generated_at, prompt_hash, dfir_provider, dfir_model) are
 # sourced from the IncidentFinalised event and the persisted
 # ThreatAssessment / WorkloadPosture, not invented by the model (AC2):
 # the runner force-stamps the authoritative values after validation.
 # attack_techniques items use the established ATT&CK string form, pinned
 # to MITRE ATT&CK for Containers v18. final_fsm_state excludes CLEAN
-# (CLEAN never finalises, AC4). body is the analyst Markdown carrying the
-# five FR43 sections.
+# (CLEAN never finalises, AC4). narrative is the analyst interpretive
+# prose only (the factual sections are rendered, not modelled).
 schema: report.v1
 fields:
   schema_version:
@@ -93,11 +98,15 @@ fields:
     required: true
     description: >
       The model id that served the DFIR call. Non-empty, maxLength 128.
-  body:
+  narrative:
     type: string
     required: true
     description: >
-      The analyst Markdown body carrying the five FR43 sections
-      (kill-chain timeline, ATT&CK annotations, contributing posture
-      findings, containment actions, narrative). Non-empty, maxLength
-      65536.
+      The interpretive analyst narrative prose ONLY: a plain-language
+      account of how the activity proceeded, grounded strictly in the
+      supplied evidence and the control-plane prior_assessment record.
+      The factual sections (kill-chain timeline, containment actions,
+      MITRE ATT&CK annotations) are assembled deterministically by the Go
+      renderer, NOT by the model (round-1 review follow-up:
+      anti-hallucination). Where data is absent the narrative states the
+      gap rather than fabricating a value. Non-empty, maxLength 65536.

@@ -25,7 +25,7 @@ import (
 // caller (and the fail-closed audit path) can branch with errors.Is.
 var (
 	// ErrSchemaViolation marks a report that failed the report.v1 schema
-	// contract: empty body, undecodable JSON, or a JSON-schema validation
+	// contract: empty narrative, undecodable JSON, or a JSON-schema validation
 	// failure, after the bounded retry.
 	ErrSchemaViolation = errors.New("dfir: response violates the forensic_report schema contract")
 	// ErrProviderUnavailable marks a provider.Analyse failure of any kind,
@@ -43,17 +43,27 @@ const (
 	statusSchemaViolation = "schema_violation"
 )
 
+// dfirSchemaAttempts is the TOTAL number of provider attempts on a schema
+// violation (AC6 bounded retry, round-1 review follow-up R1-MED-1): the first
+// call plus one retry. A provider-unavailable result or a truncation is NOT
+// retried here (the transport already retries transient transport errors within
+// the per-role budget, and a truncation is a hard fail, BI-7). After the bounded
+// attempts are exhausted on a schema violation the runner fails closed.
+const dfirSchemaAttempts = 2
+
 // dfirUserInstruction is the fixed user-turn task statement. The per-provider
 // SYSTEM prompt is the Story 3.13 ConfigMap-mounted dfir.txt; the user turn is
 // code-owned and stable. The provider appends the redacted evidence package and
 // the output-contract (schema) instruction after this text. Per the REDACTION
 // CONTRACT this text NEVER carries raw evidence: the incident evidence travels
 // exclusively on Request.Package.
-const dfirUserInstruction = "Produce the analyst-grade forensic post-mortem for the finalised incident " +
-	"described by the redacted runtime evidence package. Return a single JSON document conforming " +
-	"to the supplied schema: the body must carry the five FR43 sections (kill-chain timeline, MITRE " +
-	"ATT&CK for Containers technique annotations, contributing posture findings, the containment " +
-	"actions taken, and a narrative account of how the activity proceeded)."
+const dfirUserInstruction = "Produce the interpretive analyst narrative for the finalised incident " +
+	"described by the redacted runtime evidence package and the control-plane prior_assessment record. " +
+	"Return a single JSON document conforming to the supplied schema, carrying ONLY the narrative field. " +
+	"The factual sections (kill-chain timeline, containment actions, MITRE ATT&CK annotations) are " +
+	"assembled deterministically by the controller, not by you. Base every claim strictly on the supplied " +
+	"evidence and prior_assessment; never invent events, addresses, timestamps, techniques, or actors, and " +
+	"where data is absent state the gap rather than fill it."
 
 // PromptSpec is the DFIR prompt seam (mirroring analyst.PromptSpec, Story 3.13):
 // the caller supplies the system prompt text and its content-hash version. The
@@ -272,7 +282,7 @@ func (a *Agent) Generate(ctx context.Context, inc Incident) (rendered string, re
 		return "", false, gerr
 	}
 
-	rendered = report.Render()
+	rendered = report.Render(inc.Event)
 	a.markSeen(msgID)
 	a.record(statusSuccess, inc, spec, latency)
 
@@ -299,13 +309,28 @@ func (a *Agent) Generate(ctx context.Context, inc Incident) (rendered string, re
 	return rendered, true, nil
 }
 
-// callAndValidate issues the provider call (transport owns redaction, retry, and
-// the per-role 120s budget), checks for truncation, validates the JSON against
-// the embedded schema, and stamps the deterministic front-matter from the
-// incident (AC2: sourced, not invented). It returns the assembled ForensicReport
-// or a wrapped sentinel.
+// callAndValidate issues the provider call (transport owns redaction, transport
+// retry, and the per-role 120s budget), checks for truncation, validates the
+// JSON against the embedded schema, and stamps the deterministic front-matter
+// from the incident (AC2: sourced, not invented). It returns the assembled
+// ForensicReport or a wrapped sentinel.
+//
+// Grounding (round-1 review follow-up R1-HIGH-1): the narrative is grounded via
+// the contract-safe Request.PriorAssessment channel (Olaitan's own verdict,
+// angle-escaped by the transport), chosen by groundingAssessment. The evidence
+// still travels exclusively on Request.Package; the fixed Prompt carries no
+// incident specifics, so the redaction contract stays intact.
+//
+// AC6 bounded retry (round-1 review follow-up R1-MED-1): a SCHEMA violation
+// retries the provider call up to dfirSchemaAttempts total times before failing
+// closed. A provider-unavailable result or a truncation is NOT retried here.
 func (a *Agent) callAndValidate(ctx context.Context, inc Incident, spec PromptSpec) (ForensicReport, error) {
 	var zero ForensicReport
+
+	// Choose the grounding assessment ONCE (its Reasoning carries the
+	// pod-name-free, event-id-free transition summary; techniques source off it).
+	grounding := groundingAssessment(inc)
+
 	req := provider.Request{
 		Role:    provider.RoleDFIR,
 		Package: inc.Package,
@@ -313,43 +338,112 @@ func (a *Agent) callAndValidate(ctx context.Context, inc Incident, spec PromptSp
 		// Defensive copy: the embedded backing array is shared with the
 		// compiled validator; a misbehaving provider mutating req.Schema in
 		// place must not corrupt every later call.
-		Schema:          provider.JSONSchema(bytes.Clone(forensicSchemaJSON)),
-		PriorAssessment: inc.Assessment,
+		Schema: provider.JSONSchema(bytes.Clone(forensicSchemaJSON)),
+		// PriorAssessment is the contract-safe grounding channel: Olaitan's own
+		// verdict (NOT raw runtime evidence), framing-escaped by the transport.
+		PriorAssessment: grounding,
 	}
 
-	resp, err := a.provider.Analyse(ctx, req)
-	if err != nil {
-		return zero, fmt.Errorf("%w: %w", ErrProviderUnavailable, err)
-	}
-	// A reply cut off by the output-token ceiling is a FAILURE: a truncated
-	// report (incomplete body / missing section) must never be persisted (BI-7).
-	if isTruncated(resp.StopReason) {
-		return zero, fmt.Errorf("%w: report truncated by the output-token ceiling (stop_reason=%q)", ErrProviderUnavailable, resp.StopReason)
-	}
+	var report ForensicReport
+	var lastErr error
+	for attempt := 1; attempt <= dfirSchemaAttempts; attempt++ {
+		resp, err := a.provider.Analyse(ctx, req)
+		if err != nil {
+			// Provider failures are NOT retried here (the transport already
+			// retried transient transport errors within the budget).
+			return zero, fmt.Errorf("%w: %w", ErrProviderUnavailable, err)
+		}
+		// A reply cut off by the output-token ceiling is a hard FAILURE: a
+		// truncated report must never be persisted, and it is NOT retried (BI-7).
+		if isTruncated(resp.StopReason) {
+			return zero, fmt.Errorf("%w: report truncated by the output-token ceiling (stop_reason=%q)", ErrProviderUnavailable, resp.StopReason)
+		}
 
-	report, perr := parseForensicReport(a.schema, resp.Raw)
-	if perr != nil {
-		return zero, fmt.Errorf("%w: %w", ErrSchemaViolation, perr)
+		rep, perr := parseForensicReport(a.schema, resp.Raw)
+		if perr != nil {
+			lastErr = fmt.Errorf("%w: %w", ErrSchemaViolation, perr)
+			a.log.Warn("dfir: schema violation, retrying within bounded budget",
+				"incident_id", inc.Event.PackageID, "attempt", attempt, "max_attempts", dfirSchemaAttempts, "err", perr)
+			continue
+		}
+		report = rep
+		// Capture the response-derived model id off the successful attempt.
+		report.DFIRModel = firstNonEmpty(resp.Model, a.provider.Model())
+		lastErr = nil
+		break
+	}
+	if lastErr != nil {
+		// Bounded retries exhausted on a schema violation: fail closed.
+		return zero, lastErr
 	}
 
 	// Force-stamp the deterministic front-matter from the authoritative incident
 	// (AC2): these fields are SOURCED, not whatever the model returned, so a
 	// model that hallucinates a final_state or a technique cannot influence the
-	// report header. The body and any model-supplied posture findings remain the
-	// validated model output.
+	// report header. The narrative and any model-supplied posture findings remain
+	// the validated model output. Techniques source off the SAME chosen
+	// grounding assessment (real -> populated; synthesized -> empty -> the
+	// renderer prints "not recorded").
 	report.SchemaVersion = SchemaVersionForensicReport
 	report.IncidentID = inc.Event.PackageID
 	report.FinalFSMState = inc.Event.FinalState
 	report.ThreatScoreAtDecision = inc.Event.ThreatScore
-	report.AttackTechniques = techniquesFromAssessment(inc.Assessment)
+	report.AttackTechniques = techniquesFromAssessment(grounding)
 	report.ContainmentActions = containmentFromHistory(inc.Event)
 	report.ReportGeneratedAt = a.now()
 	report.PromptHash = spec.Version
 	report.DFIRProvider = a.provider.Name()
-	// Model is the model id that served the call: Response.Model when the
-	// provider echoed one, else the pinned constructor model.
-	report.DFIRModel = firstNonEmpty(resp.Model, a.provider.Model())
 	return report, nil
+}
+
+// groundingAssessment chooses the ThreatAssessment that grounds the DFIR
+// narrative (round-1 review follow-up R1-HIGH-1). If the incident carries a
+// persisted assessment (the real/test enrichment path, carrying real
+// MitreTechniques) it is used as-is. Otherwise it synthesises a MINIMAL
+// assessment from the event: the recommended state is the final state, the total
+// confidence is the threat score, and the reasoning is a deterministic,
+// pod-name-free and event-id-free chronological summary of the FSM history (the
+// same control-plane facts the timeline renders). MitreTechniques is nil and the
+// kill-chain stage is empty, so techniques render as the honest "not recorded"
+// gap (PO Option A). This is contract-safe: PriorAssessment is Olaitan's own
+// verdict, NOT raw runtime evidence, and the transport angle-escapes it.
+func groundingAssessment(inc Incident) *schema.ThreatAssessment {
+	if inc.Assessment != nil {
+		return inc.Assessment
+	}
+	return &schema.ThreatAssessment{
+		RecommendedState: schema.PodSecurityState(inc.Event.FinalState),
+		Confidence:       schema.ConfidenceScore{Total: inc.Event.ThreatScore},
+		Reasoning:        historySummary(inc.Event),
+	}
+}
+
+// historySummary renders the FSM transition history as a deterministic,
+// pod-name-free, event-id-free chronological prose summary (the same control-
+// plane facts as the rendered timeline). It NEVER includes pod names or raw
+// event ids, so it is safe to carry on the PriorAssessment grounding channel.
+func historySummary(evt settling.IncidentFinalised) string {
+	if len(evt.History) == 0 {
+		return "No FSM transition history was recorded for this incident; the workload settled in " +
+			firstNonEmpty(evt.FinalState, "an unrecorded final state") + "."
+	}
+	var b strings.Builder
+	b.WriteString("FSM transition history (control-plane facts only): ")
+	for i, tr := range evt.History {
+		if i > 0 {
+			b.WriteString("; ")
+		}
+		ts := "unknown-time"
+		if !tr.Timestamp.IsZero() {
+			ts = tr.Timestamp.UTC().Format(time.RFC3339)
+		}
+		from := firstNonEmpty(strings.TrimSpace(string(tr.FromState)), "(none)")
+		to := firstNonEmpty(strings.TrimSpace(string(tr.ToState)), "(none)")
+		reason := firstNonEmpty(strings.TrimSpace(tr.Reason), "(no reason recorded)")
+		fmt.Fprintf(&b, "at %s %s -> %s (reason: %s, confidence: %g)", ts, from, to, reason, tr.Confidence)
+	}
+	b.WriteString(".")
+	return b.String()
 }
 
 // record increments the generation outcome counter, observes the latency

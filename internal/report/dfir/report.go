@@ -1,8 +1,9 @@
 // Package dfir hosts the Story 4.4 DFIR forensic-report agent (FR43), the
 // Ring-5 (report) component that consumes the Story 4.3 INCIDENTS.finalised
-// event and produces an analyst-grade ForensicReport: a Markdown body with
-// YAML front-matter (kill-chain timeline, MITRE ATT&CK for Containers
-// annotations, contributing posture findings, containment narrative).
+// event and produces an analyst-grade ForensicReport: a Markdown report with
+// YAML front-matter (deterministically rendered kill-chain timeline, containment
+// actions, and MITRE ATT&CK for Containers annotations, plus the model's
+// interpretive narrative).
 //
 // # Architecture and trust boundary (BI-1, BI-12)
 //
@@ -59,6 +60,9 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/olokotoh/olaitan/internal/response/settling"
+	"github.com/olokotoh/olaitan/internal/schema"
 )
 
 // forensicSchemaJSON is the embedded runtime copy of the authoritative
@@ -86,8 +90,15 @@ const SchemaVersionReportGenerated = "reports.generated.v1"
 // schema) AND the rendered-report carrier: the deterministic front-matter
 // fields are force-stamped by the runner from the IncidentFinalised event and
 // the persisted ThreatAssessment / WorkloadPosture (AC2, not invented by the
-// model), and Body is the analyst Markdown the LLM supplies. The rendered
-// Markdown artifact (YAML front-matter + Body) is produced by Render.
+// model), and Narrative is the interpretive analyst prose the LLM supplies.
+//
+// Round-1 review follow-up (anti-hallucination): the model supplies ONLY the
+// Narrative. The factual report sections (kill-chain timeline, containment
+// actions, MITRE ATT&CK annotations) are assembled DETERMINISTICALLY in Go by
+// Render from the IncidentFinalised event history and the chosen
+// ThreatAssessment, so the model never prints a fact it could fabricate. The
+// rendered Markdown artifact (YAML front-matter + deterministic factual
+// sections + the model's narrative) is produced by Render.
 type ForensicReport struct {
 	// SchemaVersion is stamped to report.v1 by the runner after validation;
 	// optional (or null) from the model.
@@ -115,17 +126,26 @@ type ForensicReport struct {
 	DFIRProvider string `json:"dfir_provider"`
 	// DFIRModel is the model id that served the DFIR call.
 	DFIRModel string `json:"dfir_model"`
-	// Body is the analyst Markdown carrying the five FR43 sections.
-	Body string `json:"body"`
+	// Narrative is the interpretive analyst prose the LLM supplies (the
+	// factual sections are rendered deterministically, NOT modelled).
+	Narrative string `json:"narrative"`
 }
 
 // Render produces the deterministic YAML-front-matter + Markdown artifact from
 // the schema-validated report (BI-6). The LLM never controls this rendering: it
-// is pure Go, so the front-matter structure and the section ordering cannot be
-// influenced by model output beyond the Body string and the already-validated
-// front-matter values. Front-matter list/string values are YAML-escaped so a
-// model-controlled posture-finding string cannot break out of the block.
-func (r ForensicReport) Render() string {
+// is pure Go.
+//
+// Round-1 review follow-up (anti-hallucination): the factual sections are
+// assembled here from the IncidentFinalised event history and the validated
+// front-matter values, NOT from model output. The renderer assembles, in order:
+// the YAML front-matter, the deterministic kill-chain timeline section (from
+// evt.History), the deterministic containment-actions section, the deterministic
+// MITRE ATT&CK section, and finally the model's interpretive narrative section.
+// The model never prints a fact it could fabricate (a timestamp, a from->to
+// state, a technique); it only supplies the narrative prose. Front-matter
+// list/string values are YAML-escaped so a model-controlled posture-finding
+// string cannot break out of the block.
+func (r ForensicReport) Render(evt settling.IncidentFinalised) string {
 	var b strings.Builder
 	b.WriteString("---\n")
 	writeYAMLScalar(&b, "schema_version", SchemaVersionForensicReport)
@@ -142,9 +162,93 @@ func (r ForensicReport) Render() string {
 	writeYAMLScalar(&b, "dfir_provider", r.DFIRProvider)
 	writeYAMLScalar(&b, "dfir_model", r.DFIRModel)
 	b.WriteString("---\n\n")
-	b.WriteString(r.Body)
-	if !strings.HasSuffix(r.Body, "\n") {
+
+	// Deterministic factual sections (the anti-hallucination core). These are
+	// assembled in Go; the model cannot influence them.
+	b.WriteString(renderTimelineSection(evt.History))
+	b.WriteString("\n")
+	b.WriteString(renderContainmentSection(r.ContainmentActions))
+	b.WriteString("\n")
+	b.WriteString(renderATTACKSection(r.AttackTechniques))
+	b.WriteString("\n")
+
+	// The model's interpretive narrative section.
+	b.WriteString("## Analyst narrative\n\n")
+	b.WriteString(r.Narrative)
+	if !strings.HasSuffix(r.Narrative, "\n") {
 		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// renderTimelineSection renders the kill-chain timeline (AC3 section 1)
+// deterministically from the FSM transition history: one chronological line per
+// transition carrying the RFC3339 timestamp, the from->to state move, the
+// reason, and the confidence. Pod names and raw event ids are STRIPPED
+// (control-plane facts only): the per-pod identity and the trigger-event ids are
+// runtime evidence that must not leak into the rendered report front-matter or
+// body (the redaction discipline). An empty history renders an explicit honest
+// line rather than inviting the model to invent one (BI-9: the controller never
+// blocks finalisation on history).
+func renderTimelineSection(history []schema.StateTransition) string {
+	var b strings.Builder
+	b.WriteString("## Kill-chain timeline\n\n")
+	if len(history) == 0 {
+		b.WriteString("No FSM transition history was recorded for this incident.\n")
+		return b.String()
+	}
+	for _, tr := range history {
+		ts := "unknown-time"
+		if !tr.Timestamp.IsZero() {
+			ts = tr.Timestamp.UTC().Format(time.RFC3339)
+		}
+		from := strings.TrimSpace(string(tr.FromState))
+		if from == "" {
+			from = "(none)"
+		}
+		to := strings.TrimSpace(string(tr.ToState))
+		if to == "" {
+			to = "(none)"
+		}
+		reason := strings.TrimSpace(tr.Reason)
+		if reason == "" {
+			reason = "(no reason recorded)"
+		}
+		fmt.Fprintf(&b, "- %s: %s -> %s (reason: %s, confidence: %g)\n", ts, from, to, reason, tr.Confidence)
+	}
+	return b.String()
+}
+
+// renderContainmentSection renders the containment-actions section (AC3)
+// deterministically from the already-derived containment_actions front-matter
+// (sourced from the FSM history). An empty list renders an honest line.
+func renderContainmentSection(actions []string) string {
+	var b strings.Builder
+	b.WriteString("## Containment actions\n\n")
+	if len(actions) == 0 {
+		b.WriteString("No containment action was recorded for this incident.\n")
+		return b.String()
+	}
+	for _, a := range actions {
+		fmt.Fprintf(&b, "- %s\n", a)
+	}
+	return b.String()
+}
+
+// renderATTACKSection renders the MITRE ATT&CK for Containers section (AC3)
+// deterministically from the techniques sourced off the persisted
+// ThreatAssessment. When no technique is available the section renders the
+// explicit honest line rather than letting the model fabricate a technique
+// (round-1 review follow-up: PO Option A, the gap is stated, not filled).
+func renderATTACKSection(techniques []string) string {
+	var b strings.Builder
+	b.WriteString("## MITRE ATT&CK for Containers\n\n")
+	if len(techniques) == 0 {
+		b.WriteString("No MITRE ATT&CK for Containers technique was recorded for this incident.\n")
+		return b.String()
+	}
+	for _, tech := range techniques {
+		fmt.Fprintf(&b, "- %s\n", tech)
 	}
 	return b.String()
 }

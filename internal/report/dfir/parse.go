@@ -16,12 +16,14 @@ import (
 // classes JSON Schema cannot express (a whitespace-only body is rejected so a
 // blank report never renders as a success).
 //
-// Only the model-supplied fields (body and any model-supplied posture findings)
-// are read off the decode here; the deterministic front-matter is force-stamped
-// by callAndValidate from the authoritative incident (AC2), so a model that
-// returns a hallucinated incident_id / final_state cannot influence the report
-// header even though those fields are schema-required (the model must still
-// PRODUCE them for the schema to pass, which keeps the contract honest).
+// Only the model-supplied fields (narrative and any model-supplied posture
+// findings) are read off the decode here; the deterministic front-matter and
+// the factual sections are force-stamped / rendered from the authoritative
+// incident (AC2, round-1 review follow-up), so a model that returns a
+// hallucinated incident_id / final_state / technique cannot influence the
+// report header or the factual sections even though those fields are
+// schema-required (the model must still PRODUCE them for the schema to pass,
+// which keeps the contract honest).
 func parseForensicReport(sch *jsonschema.Schema, raw string) (ForensicReport, error) {
 	var zero ForensicReport
 	body := strings.TrimSpace(raw)
@@ -46,10 +48,10 @@ func parseForensicReport(sch *jsonschema.Schema, raw string) (ForensicReport, er
 		return zero, fmt.Errorf("decode into ForensicReport: %w", err)
 	}
 
-	// minLength counts code points, so a whitespace-only body passes the schema;
-	// reject it here so a blank report never renders as a success.
-	if strings.TrimSpace(report.Body) == "" {
-		return zero, errors.New("report body is whitespace-only")
+	// minLength counts code points, so a whitespace-only narrative passes the
+	// schema; reject it here so a blank report never renders as a success.
+	if strings.TrimSpace(report.Narrative) == "" {
+		return zero, errors.New("report narrative is whitespace-only")
 	}
 	return report, nil
 }

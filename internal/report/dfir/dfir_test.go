@@ -73,8 +73,9 @@ func (r *fakeAuditRecorder) RecordDFIRAssessment(_ context.Context, rec DFIRAudi
 
 // validReportJSON is a schema-conforming model reply. The deterministic
 // front-matter fields are present (the schema requires them) but the runner
-// overwrites them from the incident; the body and posture findings are the
-// model output the runner keeps.
+// overwrites them from the incident; only the narrative and posture findings are
+// the model output the runner keeps. The factual sections (timeline, containment,
+// ATT&CK) are rendered deterministically by the runner, NOT from the model.
 const validReportJSON = `{
   "incident_id": "model-supplied-id",
   "final_fsm_state": "QUARANTINED",
@@ -86,7 +87,7 @@ const validReportJSON = `{
   "prompt_hash": "model-hash",
   "dfir_provider": "model-provider",
   "dfir_model": "model-model",
-  "body": "## Kill-chain timeline\nexecve xmrig\n\n## MITRE ATT&CK\nT1611\n\n## Posture\nRBAC\n\n## Containment\nQUARANTINED applied\n\n## Narrative\nThe miner ran."
+  "narrative": "The miner ran."
 }`
 
 func testIncident() Incident {
@@ -164,9 +165,9 @@ func TestGenerate_SchemaConformingRender(t *testing.T) {
 	if strings.Contains(rendered, "model-supplied-id") {
 		t.Error("rendered report leaked the model-supplied incident_id (must source from the event)")
 	}
-	// Body (model output) is preserved.
-	if !strings.Contains(rendered, "The miner ran.") {
-		t.Error("rendered report dropped the model body")
+	// The narrative (model output) is preserved under the narrative section.
+	if !strings.Contains(rendered, "## Analyst narrative") || !strings.Contains(rendered, "The miner ran.") {
+		t.Error("rendered report dropped the model narrative")
 	}
 	// REPORTS.generated emitted with SHA + content-addressed key.
 	if len(rp.events) != 1 {
@@ -428,9 +429,9 @@ func TestRender_YAMLEscaping(t *testing.T) {
 		PromptHash:                  "h",
 		DFIRProvider:                "claude",
 		DFIRModel:                   "claude-opus-4-8",
-		Body:                        "body",
+		Narrative:                   "narrative",
 	}
-	rendered := r.Render()
+	rendered := r.Render(settling.IncidentFinalised{})
 	// The injected key must be escaped, not a live YAML key.
 	if strings.Contains(rendered, "\ninjected: true") {
 		t.Errorf("model string broke out of the quoted scalar\n%s", rendered)
@@ -493,8 +494,194 @@ func TestDecodeIncident(t *testing.T) {
 	}
 }
 
+// TestGenerate_NarrativeGroundedViaPriorAssessment: the provider receives a
+// PriorAssessment whose Reasoning carries the FSM transition summary, AND no pod
+// name or raw event id leaks into the prompt or the PriorAssessment (round-1
+// review follow-up R1-HIGH-1). This exercises the SYNTHESISED path (no persisted
+// assessment), the production case.
+func TestGenerate_NarrativeGroundedViaPriorAssessment(t *testing.T) {
+	fp := &fakeProvider{name: "claude", model: "claude-opus-4-8", resp: provider.Response{Raw: validReportJSON, StopReason: "end_turn"}}
+	a := newAgent(t, fp, &fakeReportPublisher{}, nil)
+
+	inc := testIncident()
+	inc.Assessment = nil // synthesised grounding path
+	// History carrying control-plane facts plus a pod name + raw event ids that
+	// must NOT leak into the grounding channel.
+	const podName = "web-7c9b-pod-leak"
+	const eventID = "evt-raw-id-leak-123"
+	inc.Event.History = []schema.StateTransition{
+		{
+			Timestamp:     time.Date(2026, 6, 14, 9, 59, 0, 0, time.UTC),
+			FromState:     schema.PodSecurityState("SUSPICIOUS"),
+			ToState:       schema.PodSecurityState("RESTRICTED"),
+			Reason:        "escalation_threshold_crossed",
+			Confidence:    55,
+			Pod:           schema.PodRef{Name: podName},
+			TriggerEvents: []string{eventID},
+		},
+	}
+
+	if _, _, err := a.Generate(context.Background(), inc); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+
+	pa := fp.got.PriorAssessment
+	if pa == nil {
+		t.Fatal("the provider must receive a grounding PriorAssessment")
+	}
+	// (a) The Reasoning carries the transition summary.
+	if !strings.Contains(pa.Reasoning, "SUSPICIOUS -> RESTRICTED") {
+		t.Errorf("PriorAssessment.Reasoning must carry the transition summary, got %q", pa.Reasoning)
+	}
+	if !strings.Contains(pa.Reasoning, "escalation_threshold_crossed") {
+		t.Errorf("PriorAssessment.Reasoning must carry the transition reason, got %q", pa.Reasoning)
+	}
+	if string(pa.RecommendedState) != inc.Event.FinalState || pa.Confidence.Total != inc.Event.ThreatScore {
+		t.Errorf("synthesised assessment must mirror the event final state/score, got state=%q total=%v", pa.RecommendedState, pa.Confidence.Total)
+	}
+	// (b) NO pod name / raw event id leaks into the prompt or the PriorAssessment.
+	for _, leak := range []string{podName, eventID} {
+		if strings.Contains(pa.Reasoning, leak) {
+			t.Errorf("PriorAssessment.Reasoning leaked %q (pod name / raw event id)", leak)
+		}
+		if strings.Contains(fp.got.Prompt.User, leak) || strings.Contains(fp.got.Prompt.System, leak) {
+			t.Errorf("the prompt leaked %q (pod name / raw event id)", leak)
+		}
+	}
+}
+
+// TestGenerate_SchemaViolationRetriesThenFailsClosed: a provider returning
+// malformed JSON every time is retried the bounded number of times, then fails
+// closed with ErrSchemaViolation (AC6 round-1 review follow-up R1-MED-1).
+func TestGenerate_SchemaViolationRetriesThenFailsClosed(t *testing.T) {
+	// failTimes large enough that every attempt returns the malformed reply.
+	fp := &fakeProvider{
+		name: "claude", model: "claude-opus-4-8",
+		failTimes: 99,
+		failResp:  provider.Response{Raw: `{"narrative": 123}`, StopReason: "end_turn"},
+		// Unreached fall-through (would be valid); proves the retry never
+		// "succeeds" past the malformed replies.
+		resp: provider.Response{Raw: validReportJSON, StopReason: "end_turn"},
+	}
+	ar := &fakeAuditRecorder{}
+	a := newAgent(t, fp, &fakeReportPublisher{}, ar)
+
+	_, reported, err := a.Generate(context.Background(), testIncident())
+	if !errors.Is(err, ErrSchemaViolation) {
+		t.Fatalf("want ErrSchemaViolation after bounded retry, got %v", err)
+	}
+	if reported {
+		t.Fatal("a persistent schema violation must fail closed")
+	}
+	if fp.calls != dfirSchemaAttempts {
+		t.Errorf("want %d bounded attempts, got %d", dfirSchemaAttempts, fp.calls)
+	}
+	if len(ar.records) != 1 || ar.records[0].Status != statusSchemaViolation {
+		t.Errorf("the exhausted retry must audit schema_violation, got %+v", ar.records)
+	}
+}
+
+// TestGenerate_SchemaViolationThenSucceeds: a provider that violates once then
+// returns a valid reply succeeds within the bounded retry budget (AC6).
+func TestGenerate_SchemaViolationThenSucceeds(t *testing.T) {
+	fp := &fakeProvider{
+		name: "claude", model: "claude-opus-4-8",
+		failTimes: 1,
+		failResp:  provider.Response{Raw: `{"narrative": 123}`, StopReason: "end_turn"},
+		resp:      provider.Response{Raw: validReportJSON, StopReason: "end_turn", Model: "claude-opus-4-8"},
+	}
+	a := newAgent(t, fp, &fakeReportPublisher{}, nil)
+	_, reported, err := a.Generate(context.Background(), testIncident())
+	if err != nil || !reported {
+		t.Fatalf("a retry-then-success must report: reported=%v err=%v", reported, err)
+	}
+	if fp.calls != 2 {
+		t.Errorf("want 2 attempts (1 violation + 1 success), got %d", fp.calls)
+	}
+}
+
+// TestRender_DeterministicSections: the rendered report carries the
+// deterministic kill-chain timeline assembled from the event history (timestamp,
+// from->to, reason, confidence) with pod names / raw event ids STRIPPED, and the
+// model never controls those facts (round-1 review follow-up item 1).
+func TestRender_DeterministicSections(t *testing.T) {
+	fp := &fakeProvider{name: "claude", model: "claude-opus-4-8", resp: provider.Response{Raw: validReportJSON, StopReason: "end_turn"}}
+	a := newAgent(t, fp, &fakeReportPublisher{}, nil)
+
+	inc := testIncident()
+	inc.Event.History = []schema.StateTransition{
+		{
+			Timestamp:     time.Date(2026, 6, 14, 9, 58, 0, 0, time.UTC),
+			FromState:     schema.PodSecurityState("CLEAN"),
+			ToState:       schema.PodSecurityState("SUSPICIOUS"),
+			Reason:        "escalation_threshold_crossed",
+			Confidence:    40,
+			Pod:           schema.PodRef{Name: "leaky-pod-name"},
+			TriggerEvents: []string{"leaky-event-id"},
+		},
+	}
+	rendered, _, err := a.Generate(context.Background(), inc)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	for _, want := range []string{
+		"## Kill-chain timeline",
+		"2026-06-14T09:58:00Z: CLEAN -> SUSPICIOUS (reason: escalation_threshold_crossed, confidence: 40)",
+		"## Containment actions",
+		"## MITRE ATT&CK for Containers",
+		"## Analyst narrative",
+		"The miner ran.",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("rendered report missing %q\n---\n%s", want, rendered)
+		}
+	}
+	// Pod name / raw event id must NOT leak into the rendered report.
+	for _, leak := range []string{"leaky-pod-name", "leaky-event-id"} {
+		if strings.Contains(rendered, leak) {
+			t.Errorf("rendered report leaked %q (control-plane facts only)", leak)
+		}
+	}
+}
+
+// TestRender_EmptyHistoryTimeline: an empty history renders the honest
+// "no history recorded" timeline line (round-1 review follow-up item 1).
+func TestRender_EmptyHistoryTimeline(t *testing.T) {
+	fp := &fakeProvider{name: "claude", model: "claude-opus-4-8", resp: provider.Response{Raw: validReportJSON, StopReason: "end_turn"}}
+	a := newAgent(t, fp, &fakeReportPublisher{}, nil)
+	inc := testIncident()
+	inc.Event.History = nil
+	rendered, _, err := a.Generate(context.Background(), inc)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if !strings.Contains(rendered, "No FSM transition history was recorded for this incident.") {
+		t.Errorf("empty history must render the honest gap line\n%s", rendered)
+	}
+}
+
+// TestRender_NoTechniqueRecorded: a synthesised grounding (no persisted
+// assessment) renders the honest "no MITRE technique recorded" line rather than
+// a fabricated technique (round-1 review follow-up PO Option A).
+func TestRender_NoTechniqueRecorded(t *testing.T) {
+	fp := &fakeProvider{name: "claude", model: "claude-opus-4-8", resp: provider.Response{Raw: validReportJSON, StopReason: "end_turn"}}
+	a := newAgent(t, fp, &fakeReportPublisher{}, nil)
+	inc := testIncident()
+	inc.Assessment = nil
+	rendered, _, err := a.Generate(context.Background(), inc)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if !strings.Contains(rendered, "No MITRE ATT&CK for Containers technique was recorded for this incident.") {
+		t.Errorf("a synthesised grounding must render the honest ATT&CK gap line\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "attack_techniques: []") {
+		t.Errorf("front-matter techniques must stay empty for a synthesised grounding\n%s", rendered)
+	}
+}
+
 // TestParseForensicReport_FenceStripped: a fenced reply is fence-stripped and
-// parses; a whitespace-only body is rejected.
+// parses; a whitespace-only narrative is rejected.
 func TestParseForensicReport_FenceStripped(t *testing.T) {
 	sch, err := reportSchema.compiled()
 	if err != nil {
@@ -504,8 +691,8 @@ func TestParseForensicReport_FenceStripped(t *testing.T) {
 	if _, perr := parseForensicReport(sch, fenced); perr != nil {
 		t.Errorf("fenced valid report must parse: %v", perr)
 	}
-	blank := `{"incident_id":"i","final_fsm_state":"RESTRICTED","threat_score_at_decision":1,"report_generated_at":"2026-01-01T00:00:00Z","prompt_hash":"h","dfir_provider":"claude","dfir_model":"m","body":"   "}`
+	blank := `{"incident_id":"i","final_fsm_state":"RESTRICTED","threat_score_at_decision":1,"report_generated_at":"2026-01-01T00:00:00Z","prompt_hash":"h","dfir_provider":"claude","dfir_model":"m","narrative":"   "}`
 	if _, perr := parseForensicReport(sch, blank); perr == nil {
-		t.Error("a whitespace-only body must be rejected")
+		t.Error("a whitespace-only narrative must be rejected")
 	}
 }
