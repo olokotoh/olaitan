@@ -343,6 +343,14 @@ func (c *Controller) captureUploadDelete(ctx context.Context, st schema.StateTra
 	// the per-leg budgets higher. context.WithTimeout takes the earlier of the
 	// parent and child deadline, so each per-leg WithTimeout below stays a
 	// sub-deadline of this aggregate budget.
+	//
+	// MED (round-2 review): we keep BOTH handles so the upload leg can tell the
+	// two cancellation causes apart. A parent-ctx cancellation (shutdown) is
+	// context.Canceled and is an ABORT (no deferred write); the budget context
+	// firing (context.DeadlineExceeded) is a real-failure timeout (a genuine
+	// slow-S3 outage that exhausted the NFR7 budget) and MUST defer the write so
+	// the pod stays alive + QUARANTINED with a Story 4.7 replay signal (AC5).
+	parentCtx := ctx
 	ctx, budgetCancel := context.WithTimeout(ctx, c.nfr7Budget)
 	defer budgetCancel()
 
@@ -369,17 +377,25 @@ func (c *Controller) captureUploadDelete(ctx context.Context, st schema.StateTra
 	// Leg 2: upload with a small in-line retry. AFTER the final failure the
 	// write is DEFERRED (AC5): the pod is NOT deleted, the deferred counter
 	// increments, and the pod stays QUARANTINED (Story 4.1 retains the deny-all).
-	switch c.uploadWithRetry(ctx, key, bundle) {
+	switch c.uploadWithRetry(parentCtx, ctx, key, bundle) {
 	case uploadOK:
-		// fall through to the delete leg below.
+		// fall through to the delete leg below. NIT (round-2): if the NFR7 budget
+		// has already expired by ack time, the delete leg's WithTimeout(ctx, ...)
+		// inherits the already-expired budget deadline and the delete fails, which
+		// the leg-3 delete_failed branch below intentionally catches (pod alive +
+		// deferred signal). So the delete-leg error handling MUST remain the
+		// catch-all for this post-ack budget-expiry path; do not short-circuit it.
 	case uploadAborted:
-		// LOW (round-1 review): the context was cancelled (shutdown/abort) rather
-		// than a genuine S3 failure. The pod is left in place (it stays
+		// LOW (round-1 review): the PARENT context was cancelled (shutdown/abort)
+		// rather than a genuine S3 failure. The pod is left in place (it stays
 		// QUARANTINED), but this is NOT a real deferred write: do NOT increment
 		// writes_deferred_total / count "deferred" (that metric must reflect only
 		// real S3 failures, else a clean shutdown would inflate the alert series).
-		// Story 4.7 re-drives buffered/abandoned captures on restart.
-		c.log.Info("forensics: upload aborted on context cancellation; pod left QUARANTINED (not a deferred write)",
+		// Story 4.7 re-drives buffered/abandoned captures on restart. NOTE this is
+		// ONLY parent (context.Canceled) cancellation; an NFR7 budget expiry
+		// (context.DeadlineExceeded) falls through to uploadFailed below (MED,
+		// round-2).
+		c.log.Info("forensics: upload aborted on parent context cancellation; pod left QUARANTINED (not a deferred write)",
 			"namespace", namespace, "pod", podName, "key", key, "sha256", sum)
 		return
 	case uploadFailed:
@@ -441,32 +457,44 @@ const (
 // uploadWithRetry attempts the upload up to 1 + uploadRetries times, each with a
 // fresh per-attempt deadline. It returns uploadOK on the first acknowledged
 // write. Each attempt re-reads the bundle from a fresh bytes.Reader so a retried
-// PUT starts from the bundle head.
+// PUT starts from the bundle head. budgetCtx is the NFR7-budget-bounded context
+// the upload legs run under; parentCtx is the un-budgeted shutdown context.
 //
-// LOW (round-1 review): on context cancellation (shutdown/abort) it returns
+// LOW (round-1 review): on a PARENT (shutdown) cancellation it returns
 // uploadAborted rather than uploadFailed, so the caller skips the deferred
-// metric (which must reflect only real S3 failures). It also fast-fails clearly
-// TERMINAL S3 errors (AccessDenied, NoSuchBucket, InvalidArgument incl. KMS
-// directive errors): retrying those cannot succeed, so the write is deferred
-// immediately rather than burning the retry budget and the per-leg timeouts.
-func (c *Controller) uploadWithRetry(ctx context.Context, key string, bundle []byte) uploadOutcome {
+// metric (which must reflect only real S3 failures / deferrals).
+//
+// MED (round-2 review): a NFR7-budget expiry (the budgetCtx hitting its
+// DeadlineExceeded during a genuine slow-S3 outage) is a REAL failure, not a
+// clean abort, so it returns uploadFailed => the write is deferred
+// (writes_deferred_total++, pod stays alive + QUARANTINED for Story 4.7). We
+// disambiguate by cause: parentCtx.Err()==context.Canceled is a shutdown abort;
+// otherwise the budget context expiring is treated as a deferred failure.
+// It also fast-fails clearly TERMINAL S3 errors (AccessDenied, NoSuchBucket,
+// InvalidArgument incl. KMS directive errors): retrying those cannot succeed, so
+// the write is deferred immediately rather than burning the retry budget and the
+// per-leg timeouts.
+func (c *Controller) uploadWithRetry(parentCtx, budgetCtx context.Context, key string, bundle []byte) uploadOutcome {
 	attempts := 1 + c.uploadRetries
 	opts := UploadOptions{KMSKeyAlias: c.kmsKeyAlias}
 	for i := 0; i < attempts; i++ {
-		if ctx.Err() != nil {
-			return uploadAborted
+		if o, done := c.classifyCancellation(parentCtx, budgetCtx); done {
+			return o
 		}
-		upCtx, upCancel := context.WithTimeout(ctx, c.uploadTimeout)
+		upCtx, upCancel := context.WithTimeout(budgetCtx, c.uploadTimeout)
 		_, err := c.uploader.Upload(upCtx, key, newBundleReader(bundle), int64(len(bundle)), opts)
 		upCancel()
 		if err == nil {
 			return uploadOK
 		}
-		// Distinguish a cancellation of the parent ctx (shutdown/abort) from a
-		// real upload error: a per-attempt deadline expiry leaves ctx.Err() nil
-		// (only upCtx expired) and is a genuine transient failure worth retrying.
-		if ctx.Err() != nil {
-			return uploadAborted
+		// Distinguish a context-level cancellation from a real upload error: a
+		// per-attempt deadline expiry leaves both parentCtx.Err() and
+		// budgetCtx.Err() nil (only upCtx expired) and is a genuine transient
+		// failure worth retrying. classifyCancellation maps a parent (shutdown)
+		// cancel to uploadAborted and a budget (NFR7) deadline expiry to
+		// uploadFailed (deferred).
+		if o, done := c.classifyCancellation(parentCtx, budgetCtx); done {
+			return o
 		}
 		if isTerminalUploadError(err) {
 			c.log.Warn("forensics: S3 upload failed with a terminal error; deferring without retry",
@@ -477,6 +505,33 @@ func (c *Controller) uploadWithRetry(ctx context.Context, key string, bundle []b
 			"key", key, "attempt", i+1, "attempts", attempts, "err", err)
 	}
 	return uploadFailed
+}
+
+// classifyCancellation disambiguates the two cancellation causes that can stop an
+// upload (MED, round-2 review). A parent (shutdown) cancellation -- detected as
+// context.Canceled on the un-budgeted parentCtx -- is an ABORT (uploadAborted,
+// no deferred write). A NFR7-budget expiry -- the budgetCtx reaching its
+// DeadlineExceeded while the parent is still live -- is a REAL slow-S3 failure
+// and is deferred (uploadFailed). The bool reports whether a context cause
+// fired; when false the caller proceeds/retries.
+func (c *Controller) classifyCancellation(parentCtx, budgetCtx context.Context) (uploadOutcome, bool) {
+	if errors.Is(parentCtx.Err(), context.Canceled) {
+		return uploadAborted, true
+	}
+	if budgetCtx.Err() != nil {
+		// The budget context fired (DeadlineExceeded) but the parent was not
+		// cancelled: the NFR7 aggregate budget expired during a genuine slow
+		// upload. Treat it as a deferred failure so the pod stays alive +
+		// QUARANTINED with a Story 4.7 replay signal (AC5).
+		return uploadFailed, true
+	}
+	if parentCtx.Err() != nil {
+		// Defensive: a non-Canceled parent error (e.g. a deadline on the parent
+		// itself, should the caller ever pass a deadlined ctx) is treated as an
+		// abort, matching the pre-round-2 behaviour for parent-level cancellation.
+		return uploadAborted, true
+	}
+	return uploadOK, false
 }
 
 // isTerminalUploadError reports whether err is a clearly non-retryable S3 error

@@ -635,6 +635,78 @@ func TestHandle_AbortOnContextCancellation(t *testing.T) {
 	}
 }
 
+// slowUploader blocks each Upload until its per-attempt context is done, then
+// returns a real (non-terminal, non-context) S3 error. It models a genuine slow
+// upstream during an S3 outage: the request never acks and is killed by a
+// deadline rather than failing fast. Used to exercise the NFR7 aggregate-budget
+// expiry path (MED, round-2).
+type slowUploader struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (s *slowUploader) Upload(ctx context.Context, key string, r io.Reader, size int64, opts UploadOptions) (Ack, error) {
+	s.mu.Lock()
+	s.calls++
+	s.mu.Unlock()
+	_, _ = io.ReadAll(r)
+	<-ctx.Done()
+	// Return a generic (non-terminal) error so retry/defer logic, not the
+	// terminal-error fast-fail, decides the outcome.
+	return Ack{}, errors.New("simulated slow-S3 outage: deadline exceeded")
+}
+
+func (s *slowUploader) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+// TestHandle_NFR7BudgetDefersOnSlowUpload covers the round-2 review MED finding:
+// when a genuine slow-S3 outage exhausts the NFR7 aggregate budget (the budget
+// context hits DeadlineExceeded while the parent ctx is still live), the write
+// MUST be DEFERRED (writes_deferred_total++, result="deferred", pod left alive +
+// QUARANTINED for Story 4.7) -- NOT treated as a clean abort. Mutation-check:
+// reverting the budget-DeadlineExceeded -> uploadFailed mapping back to
+// uploadAborted makes the writes_deferred / "deferred" assertions fail (the
+// abort path increments neither).
+func TestHandle_NFR7BudgetDefersOnSlowUpload(t *testing.T) {
+	reg := metrics.NewRegistry()
+	cs := fake.NewSimpleClientset(runtime.Object(pod("ns", "p", map[string]string{"x": "y"})))
+	up := &slowUploader{}
+	// Tiny aggregate NFR7 budget with much larger per-leg upload timeout, so the
+	// aggregate budget context expires first (a real slow-S3 deadline) while the
+	// parent context is never cancelled.
+	c, err := New(Config{
+		KMSKeyAlias:    "alias/forensics",
+		NFR7Budget:     80 * time.Millisecond,
+		UploadTimeout:  5 * time.Second,
+		CaptureTimeout: 5 * time.Second,
+		DeleteTimeout:  5 * time.Second,
+	}, cs, up, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	c.handle(context.Background(), killTransition("ns/Pod/p"))
+
+	// The slow uploader was attempted (the budget killed it mid-flight).
+	if up.callCount() == 0 {
+		t.Fatal("slow uploader was never attempted")
+	}
+	// A budget expiry during a real slow upload is a DEFERRED write, not an abort.
+	if got := testutil.ToFloat64(c.writesDeferred); got != 1 {
+		t.Fatalf("writes_deferred = %v, want 1 (NFR7 budget expiry must defer)", got)
+	}
+	if got := testutil.ToFloat64(c.captureTotal.WithLabelValues("deferred")); got != 1 {
+		t.Fatalf("deferred = %v, want 1 (budget expiry => deferred, not aborted)", got)
+	}
+	// The pod is left alive + QUARANTINED (forensic preservation over the kill).
+	if _, err := cs.CoreV1().Pods("ns").Get(context.Background(), "p", metav1.GetOptions{}); err != nil {
+		t.Fatalf("pod deleted despite deferred write on budget expiry: %v", err)
+	}
+}
+
 // oracleFunc adapts a func to the StateOracle interface.
 type oracleFunc func(string) (respschema.PodSecurityState, bool)
 
