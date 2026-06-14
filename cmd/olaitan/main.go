@@ -1388,7 +1388,12 @@ func wireDFIRAgent(cfg *config.Config, apiKey string, promptSet *prompts.Set, nc
 	if assessmentPub != nil {
 		recorder = dfirAuditRecorder{pub: assessmentPub, log: log}
 	}
-	agent, aerr := dfir.NewDFIR(p, dfirPromptSpec(promptSet), reportPub, recorder, reg, log)
+	// Thread the RedactionAuditSink (Story 4.5): the DFIR agent redacts the
+	// rendered report before persistence and emits per-region AUDIT.redactions on
+	// the SAME sink the pre-LLM RedactAndAudit path uses. A nil sink (audit
+	// off-by-default) leaves the persistence redaction running with no audit
+	// emission, exactly as the LLM-bound nil-sink path.
+	agent, aerr := dfir.NewDFIR(p, dfirPromptSpec(promptSet), reportPub, recorder, sink, reg, log)
 	if aerr != nil {
 		return nil, fmt.Errorf("dfir agent: %w", aerr)
 	}

@@ -32,6 +32,22 @@ fields:
     required: true
     enum: [secret_pattern, jwt_body, raw_payload, file_contents]
     description: Why the field was redacted; one closed value per AC1/AC2 rule (BI-4.3).
+  source:
+    type: string
+    required: false
+    enum: [evidence, llm_response, posture, audit]
+    description: >-
+      Story 4.5 (AC4): the report region a persistence-bound redaction fired in.
+      Additive-optional (omitempty); empty on the Story 3.1 LLM-bound path and
+      treated as evidence by the consumer, so the pre-4.5 wire form is
+      byte-identical (BI-7/BI-8).
+  incident_id:
+    type: string
+    required: false
+    description: >-
+      Story 4.5 (AC4): the finalised incident's package_id, carried on
+      persistence-bound redaction events for SIEM correlation. Additive-optional;
+      empty on the LLM-bound path.
   workload_id:
     type: string
     required: false

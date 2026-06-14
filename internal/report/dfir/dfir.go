@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/olokotoh/olaitan/internal/agent/provider"
 	"github.com/olokotoh/olaitan/internal/metrics"
+	"github.com/olokotoh/olaitan/internal/report/redact"
 	"github.com/olokotoh/olaitan/internal/response/settling"
 	"github.com/olokotoh/olaitan/internal/schema"
 )
@@ -136,11 +138,17 @@ type Agent struct {
 	spec    atomic.Pointer[PromptSpec]
 	reports ReportPublisher
 	audit   AuditRecorder
-	schema  *jsonschema.Schema
-	gen     *prometheus.CounterVec
-	genSecs prometheus.Histogram
-	log     *slog.Logger
-	now     func() time.Time
+	// redactSink is the Story 4.5 persistence-bound AUDIT.redactions sink: the
+	// per-region redaction events from the pre-persistence report redaction are
+	// enqueued here (best-effort, never blocks the report). It MAY be nil (the
+	// off-by-default audit path or a degraded wiring); the redaction itself still
+	// runs and the redacted bytes are still what gets SHA'd/announced (BI-8).
+	redactSink *redact.RedactionAuditSink
+	schema     *jsonschema.Schema
+	gen        *prometheus.CounterVec
+	genSecs    prometheus.Histogram
+	log        *slog.Logger
+	now        func() time.Time
 	// seen tracks finalisations already reported this process, keyed on
 	// settling.FinalisedMsgID, so a JetStream redelivery does not emit a second
 	// report (BI-10 consumer-side idempotency; the LimitsPolicy stream can
@@ -199,7 +207,7 @@ func (a *Agent) currentSpec() PromptSpec {
 // reports publisher and audit recorder are the AC5 emission seams; either may be
 // nil in a degraded wiring (the agent still generates and renders, just does not
 // announce/audit). It registers (or re-uses) the DFIR generation metric family.
-func NewDFIR(p provider.Provider, spec PromptSpec, reports ReportPublisher, audit AuditRecorder, reg *metrics.Registry, log *slog.Logger) (*Agent, error) {
+func NewDFIR(p provider.Provider, spec PromptSpec, reports ReportPublisher, audit AuditRecorder, redactSink *redact.RedactionAuditSink, reg *metrics.Registry, log *slog.Logger) (*Agent, error) {
 	if p == nil {
 		return nil, errors.New("dfir: nil provider")
 	}
@@ -226,15 +234,16 @@ func NewDFIR(p provider.Provider, spec PromptSpec, reports ReportPublisher, audi
 		return nil, fmt.Errorf("dfir: generation-latency metric: %w", err)
 	}
 	a := &Agent{
-		provider: p,
-		reports:  reports,
-		audit:    audit,
-		schema:   sch,
-		gen:      gen,
-		genSecs:  genSecs,
-		log:      log,
-		now:      func() time.Time { return time.Now().UTC() },
-		seen:     make(map[string]struct{}),
+		provider:   p,
+		reports:    reports,
+		audit:      audit,
+		redactSink: redactSink,
+		schema:     sch,
+		gen:        gen,
+		genSecs:    genSecs,
+		log:        log,
+		now:        func() time.Time { return time.Now().UTC() },
+		seen:       make(map[string]struct{}),
 	}
 	a.spec.Store(&spec)
 	return a, nil
@@ -282,12 +291,26 @@ func (a *Agent) Generate(ctx context.Context, inc Incident) (rendered string, re
 		return "", false, gerr
 	}
 
+	// Story 4.5 persistence-side redaction (AC1/AC4, BI-3/BI-4/BI-8): redact the
+	// report's structured regions through the SAME redact.RedactText pattern
+	// engine BEFORE it is rendered, so the rendered bytes are the REDACTED bytes
+	// that the Story 4.6 writer will persist, and no secret reaches S3 even if the
+	// DFIR model surfaced one in its narrative. The per-region source discriminator
+	// is set from the region the redaction fired in (narrative -> llm_response,
+	// posture findings -> posture, audit-metadata -> audit, evidence-derived
+	// lines -> evidence). 4.5 performs NO durable write (Story 4.6 owns the PUT).
+	report = a.redactReport(report)
+
 	rendered = report.Render(inc.Event)
 	a.markSeen(msgID)
 	a.record(statusSuccess, inc, spec, latency)
 
 	// Announce on REPORTS.generated (AC5). The URL is the COMPUTED
-	// content-addressed key (OA4); the durable write is Story 4.6.
+	// content-addressed key (OA4); the durable write is Story 4.6. SHA-OF-
+	// REDACTED-BYTES (Story 4.5 BI-4, PO OA1 RATIFIED): rendered is now the
+	// redacted artifact, so reportSHA256 and the content-addressed key
+	// content-address the REDACTED bytes actually persisted (identical to the 4.4
+	// render when the model surfaced no secret).
 	if a.reports != nil {
 		sha := reportSHA256(rendered)
 		evt := ReportGenerated{
@@ -307,6 +330,95 @@ func (a *Agent) Generate(ctx context.Context, inc Incident) (rendered string, re
 		}
 	}
 	return rendered, true, nil
+}
+
+// redactReport runs the Story 4.5 persistence-side redaction over the report's
+// structured regions, returning a redacted COPY (the source report is never
+// mutated) and enqueuing one AUDIT.redactions event per redaction with the
+// per-region source and the report incident_id (AC4). It is the persistence-bound
+// reuse of the ONE pattern engine (redact.RedactText, BI-1): each region's text
+// runs through the SAME scrubbers the LLM-bound Redact() uses, so there is no
+// second redaction code path.
+//
+// Per-region source derivation (Open Assumption 4, BI-8): the model-supplied
+// Narrative is llm_response; the force-stamped posture findings are posture; the
+// audit-metadata fields (prompt hash, provider, model) are audit; the
+// evidence-derived factual lists (attack techniques, containment actions) are
+// evidence. The deterministic timeline/state scalars are control-plane facts the
+// renderer already strips of pod names and event ids (report.go), and are not
+// model- or tenant-influenced, so they are not re-scanned here.
+func (a *Agent) redactReport(r ForensicReport) ForensicReport {
+	out := r
+	var all []redact.RedactionEvent
+
+	// Narrative (the ONLY model-supplied field): llm_response.
+	if red, evts := redact.RedactText(r.Narrative); len(evts) > 0 {
+		out.Narrative = red
+		all = append(all, stampEvents(evts, redact.SourceLLMResponse, "narrative")...)
+	}
+	// Contributing posture findings (force-stamped from WorkloadPosture): posture.
+	out.ContributingPostureFindings, all = redactList(r.ContributingPostureFindings, redact.SourcePosture, "contributing_posture_findings", all)
+	// Evidence-derived factual lists: evidence.
+	out.AttackTechniques, all = redactList(r.AttackTechniques, redact.SourceEvidence, "attack_techniques", all)
+	out.ContainmentActions, all = redactList(r.ContainmentActions, redact.SourceEvidence, "containment_actions", all)
+	// Audit-metadata fields (prompt hash, provider, model id): audit.
+	out.PromptHash, all = redactScalar(r.PromptHash, redact.SourceAudit, "prompt_hash", all)
+	out.DFIRProvider, all = redactScalar(r.DFIRProvider, redact.SourceAudit, "dfir_provider", all)
+	out.DFIRModel, all = redactScalar(r.DFIRModel, redact.SourceAudit, "dfir_model", all)
+
+	if len(all) > 0 {
+		// Carry the workload id for SIEM correlation and enqueue with the report
+		// incident_id (= the finalised package_id). Best-effort, never blocks: the
+		// redacted bytes are already produced (BI-8/BI-6.2). A nil sink is the
+		// off-by-default path and enqueues nothing.
+		for i := range all {
+			all[i].WorkloadID = r.IncidentID
+		}
+		a.redactSink.EnqueueRedactions(all, r.IncidentID, r.IncidentID)
+	}
+	return out
+}
+
+// redactList redacts each string in items through redact.RedactText, returning
+// the redacted slice (a fresh copy, never sharing the caller's backing array)
+// and the accumulated events stamped with source and an indexed field path. A
+// nil/empty list yields the same nil and no events.
+func redactList(items []string, source, field string, acc []redact.RedactionEvent) ([]string, []redact.RedactionEvent) {
+	if len(items) == 0 {
+		return items, acc
+	}
+	out := make([]string, len(items))
+	copy(out, items)
+	for i, it := range items {
+		if red, evts := redact.RedactText(it); len(evts) > 0 {
+			out[i] = red
+			acc = append(acc, stampEvents(evts, source, field+"["+strconv.Itoa(i)+"]")...)
+		}
+	}
+	return out, acc
+}
+
+// redactScalar redacts a single string field through redact.RedactText.
+func redactScalar(s, source, field string, acc []redact.RedactionEvent) (string, []redact.RedactionEvent) {
+	if s == "" {
+		return s, acc
+	}
+	red, evts := redact.RedactText(s)
+	if len(evts) == 0 {
+		return s, acc
+	}
+	return red, append(acc, stampEvents(evts, source, field)...)
+}
+
+// stampEvents stamps the per-region source and the report-rooted field path onto
+// each redaction event produced by redact.RedactText (which leaves them to the
+// caller, BI-1).
+func stampEvents(evts []redact.RedactionEvent, source, field string) []redact.RedactionEvent {
+	for i := range evts {
+		evts[i].Source = source
+		evts[i].FieldPath = field
+	}
+	return evts
 }
 
 // callAndValidate issues the provider call (transport owns redaction, transport
