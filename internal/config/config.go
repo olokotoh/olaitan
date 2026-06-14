@@ -1069,7 +1069,46 @@ type ResponseConfig struct {
 	// so an explicit `false` survives the loader; the controller is opt-in and
 	// defaults off.
 	Settling SettlingConfig `yaml:"settling,omitempty"`
+	// Story 4.4: dfir sub-block gates the DFIR forensic-report agent (FR43).
+	// When enabled, a durable JetStream consumer attaches to the INCIDENTS
+	// stream, consumes each IncidentFinalised event, and produces an
+	// analyst-grade ForensicReport. Enabled is pointer-tagged so an explicit
+	// `false` survives the loader; the agent is opt-in and defaults off. The
+	// per-role LLM provider/model are config under analyst.dfir_provider /
+	// analyst.dfir_model (the per-role routing convention); this gate only
+	// turns the consumer on or off.
+	DFIR DFIRConfig `yaml:"dfir,omitempty"`
 }
+
+// DFIRConfig gates the Story 4.4 DFIR forensic-report agent (FR43). It mirrors
+// SettlingConfig: Enabled is pointer-tagged so an explicit `false` survives the
+// loader (the NetworkPolicyConfig.Enabled precedent); the default is OFF
+// (opt-in). The LLM provider/model are config under analyst.dfir_provider /
+// analyst.dfir_model, not here, because they follow the per-role routing
+// convention shared with the L1/L2/Senior chain tiers.
+type DFIRConfig struct {
+	Enabled *bool `yaml:"enabled,omitempty"`
+}
+
+// DefaultDFIR returns the Story 4.4 defaults: disabled (opt-in).
+func DefaultDFIR() DFIRConfig {
+	enabled := false
+	return DFIRConfig{Enabled: &enabled}
+}
+
+// EnabledOrDefault reports whether the DFIR agent is enabled, treating a nil
+// pointer as the default (false).
+func (d DFIRConfig) EnabledOrDefault() bool {
+	if d.Enabled == nil {
+		return false
+	}
+	return *d.Enabled
+}
+
+// validate enforces DFIRConfig invariants. There are no numeric fields to
+// bound today; the method exists so the gate participates in the
+// response.validate() chain consistently with its siblings.
+func (d DFIRConfig) validate() error { return nil }
 
 // SettlingConfig configures the Story 4.3 settling-window controller (FR42).
 // When the FSM has held a workload in a non-CLEAN state for the full settling
@@ -1632,6 +1671,18 @@ type AnalystConfig struct {
 	SeniorModel    string `yaml:"senior_model"`
 	SeniorEnabled  *bool  `yaml:"senior_enabled"`
 
+	// DFIRProvider / DFIRModel route the Story 4.4 DFIR forensic-report
+	// agent's own LLM call, mirroring the per-role L1/L2/Senior knobs above
+	// (FR43). DFIRProvider names a CONCRETE family {claude, openai, ollama,
+	// none} or "" to inherit the top-level Provider mapping (api -> claude,
+	// local -> ollama). The DFIR agent is NOT a chain tier: it is a separate
+	// JetStream consumer of INCIDENTS.finalised, so these knobs are
+	// independent of the chain ablation flags. An empty/none resolution
+	// degrades the DFIR agent (no report generated), the chain-degrade
+	// precedent.
+	DFIRProvider string `yaml:"dfir_provider"`
+	DFIRModel    string `yaml:"dfir_model"`
+
 	// CheckpointRetention is the INVESTIGATIONS stream MaxAge (Story 3.9
 	// FR29/AC4): how long L1/L2 checkpoints survive for controller-restart
 	// resume. Zero/unset selects the architecture's 6h default at the
@@ -2010,6 +2061,15 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
+	// Story 4.4: substitute the DFIR-agent gate default so an omitted Enabled
+	// stays off (opt-in).
+	{
+		defDFIR := DefaultDFIR()
+		if cfg.Response.DFIR.Enabled == nil {
+			cfg.Response.DFIR.Enabled = defDFIR.Enabled
+		}
+	}
+
 	// Story 3.1: substitute the redact defaults so an enabled redact block with
 	// an omitted retention inherits the 365 d default, and an omitted
 	// AuditEnabled stays off (redaction itself is always on, BI-7).
@@ -2230,6 +2290,9 @@ func (r ResponseConfig) validate() error {
 	if err := r.Settling.validate(); err != nil {
 		return err
 	}
+	if err := r.DFIR.validate(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -2262,6 +2325,7 @@ func (a AnalystConfig) validate() error {
 		{"l1_provider", a.L1Provider},
 		{"l2_provider", a.L2Provider},
 		{"senior_provider", a.SeniorProvider},
+		{"dfir_provider", a.DFIRProvider},
 	} {
 		if !validRoleProvider(rp.val) {
 			return fmt.Errorf("analyst.%s: must be one of [claude openai ollama none] or empty to inherit (got %q)", rp.field, rp.val)

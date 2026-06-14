@@ -1,0 +1,103 @@
+# Canonical on-wire shape of the DFIR ForensicReport.
+#
+# AUTHORITATIVE validation source: docs/schemas/forensic_report.json
+# (draft 2020-12). This YAML is the documentation mirror in the
+# docs/schemas/l1_hypothesis.yaml style; the .json is what the Story 4.4
+# DFIR runner validates model responses against, via the byte-identical
+# embedded copy at internal/report/dfir/forensic_report_schema.json.
+# Source of truth for the Go shape: internal/report/dfir/report.go
+# (type ForensicReport).
+#
+# Story 4.4 (FR43). The structured forensic report of the DFIR agent.
+# Per the BI-6 JSON->render hybrid the LLM returns a single JSON document
+# conforming to this schema; the runner validates it, then RENDERS it
+# deterministically to YAML-front-matter + Markdown (the LLM never
+# controls raw Markdown). The deterministic front-matter fields
+# (incident_id, final_fsm_state, threat_score_at_decision,
+# attack_techniques, contributing_posture_findings, containment_actions,
+# report_generated_at, prompt_hash, dfir_provider, dfir_model) are
+# sourced from the IncidentFinalised event and the persisted
+# ThreatAssessment / WorkloadPosture, not invented by the model (AC2):
+# the runner force-stamps the authoritative values after validation.
+# attack_techniques items use the established ATT&CK string form, pinned
+# to MITRE ATT&CK for Containers v18. final_fsm_state excludes CLEAN
+# (CLEAN never finalises, AC4). body is the analyst Markdown carrying the
+# five FR43 sections.
+schema: report.v1
+fields:
+  schema_version:
+    type: string
+    required: false
+    description: >
+      Stamped to "report.v1" by the runner; optional (or null) from the
+      model. maxLength 64.
+  incident_id:
+    type: string
+    required: true
+    description: >
+      Identifier of the finalised incident (the IncidentFinalised
+      package_id). Non-empty, maxLength 256.
+  final_fsm_state:
+    type: string
+    required: true
+    description: >
+      The non-CLEAN FSM state the workload settled in, one of SUSPICIOUS,
+      RESTRICTED, QUARANTINED, PRESERVED_KILLED (CLEAN never finalises,
+      AC4).
+  threat_score_at_decision:
+    type: number
+    required: true
+    description: >
+      The ThreatScore on the transition that established the final state,
+      captured at entry, not re-sampled.
+  attack_techniques:
+    type: array
+    required: false
+    description: >
+      MITRE ATT&CK for Containers technique annotations (FR43), sourced
+      from the persisted ThreatAssessment.MitreTechniques. Up to 20
+      entries, each matching ^T[0-9]{4}(\.[0-9]{3})?$.
+  contributing_posture_findings:
+    type: array
+    required: false
+    description: >
+      Contributing posture findings (RBAC bindings, NetworkPolicies,
+      PodSecurityContext) at the time of the incident. Up to 50 entries,
+      each maxLength 500.
+  containment_actions:
+    type: array
+    required: false
+    description: >
+      The containment actions Olaitan took (the non-CLEAN states reached,
+      optional checkpoint), derived from the FSM history. Up to 20
+      entries, each maxLength 256.
+  report_generated_at:
+    type: string
+    required: true
+    description: >
+      The report generation time (the DFIR runner clock), RFC 3339.
+  prompt_hash:
+    type: string
+    required: true
+    description: >
+      The DFIR prompt content hash (PromptSpec.Version). Non-empty,
+      maxLength 128.
+  dfir_provider:
+    type: string
+    required: true
+    description: >
+      The provider that served the DFIR call (e.g. claude). Non-empty,
+      maxLength 64.
+  dfir_model:
+    type: string
+    required: true
+    description: >
+      The model id that served the DFIR call. Non-empty, maxLength 128.
+  body:
+    type: string
+    required: true
+    description: >
+      The analyst Markdown body carrying the five FR43 sections
+      (kill-chain timeline, ATT&CK annotations, contributing posture
+      findings, containment actions, narrative). Non-empty, maxLength
+      65536.

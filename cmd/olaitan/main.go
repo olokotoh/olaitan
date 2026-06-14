@@ -59,6 +59,7 @@ import (
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
 	"github.com/olokotoh/olaitan/internal/ratelimit"
 	redisclient "github.com/olokotoh/olaitan/internal/redis"
+	"github.com/olokotoh/olaitan/internal/report/dfir"
 	reportredact "github.com/olokotoh/olaitan/internal/report/redact"
 	responseaudit "github.com/olokotoh/olaitan/internal/response/audit"
 	"github.com/olokotoh/olaitan/internal/response/forensics"
@@ -871,11 +872,14 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		// runner (primary + Ollama fallback) so the change is picked up on the
 		// next call without rebuilding the chain. prevPrompts holds the
 		// last-applied set so the diff has an old hash to report against.
-		// Only the L1/L2/Senior roles are reported here: the DFIR prompt is
-		// carried in the ConfigMap for Epic 4 but no Epic-3 assessment
-		// references it, so emitting a version-changed signal for it would be
-		// a misleading reproducibility trail (round-1 edge-case review).
-		chainRoles := []prompts.Role{prompts.RoleL1, prompts.RoleL2, prompts.RoleSenior}
+		// gaugeRoles seed and maintain the olaitan_llm_prompt_version info gauge.
+		// Story 4.4 lights up the DFIR series too (retro A4 reversal): now that
+		// the Epic-4 DFIR agent consumes dfir.txt, a {role="dfir",hash=...}
+		// series IS a meaningful reproducibility trail, so gaugeRoles adds
+		// RoleDFIR. The chain.SetPrompts swap below stays L1/L2/Senior (the chain
+		// has exactly those three tiers; the DFIR prompt feeds the DFIR agent,
+		// which swaps it via its own SetPrompt subscriber).
+		gaugeRoles := []prompts.Role{prompts.RoleL1, prompts.RoleL2, prompts.RoleSenior, prompts.RoleDFIR}
 		prevPrompts := promptStore.Get()
 		// Story 3.15 (FR50): the prompt-version "info" gauge — a value of 1 for
 		// the CURRENT {role,hash} of each chain role, so a SIEM/Grafana query
@@ -884,17 +888,17 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		// deleted, so exactly one series per role is live (cardinality bound:
 		// 3 roles x 1 live hash).
 		promptVersionGauge, pverr := metricsReg.RegisterGaugeVec("olaitan_llm_prompt_version",
-			"Active analyst prompt version: 1 for the current {role,hash} of each chain role (Story 3.15 FR50, prompt-drift observability). Exactly one series per role is live at a time.",
+			"Active analyst prompt version: 1 for the current {role,hash} of each role (Story 3.15 FR50, prompt-drift observability; Story 4.4 adds the dfir role). Exactly one series per role is live at a time.",
 			[]string{"role", "hash"})
 		if pverr != nil {
 			closeNATS()
 			return fmt.Errorf("aggregator: prompt-version gauge: %w", pverr)
 		}
-		for _, role := range chainRoles {
+		for _, role := range gaugeRoles {
 			applyPromptVersionGauge(promptVersionGauge, string(role), "", prevPrompts.Hash(role))
 		}
 		promptStore.Subscribe(func(set *prompts.Set) {
-			for _, role := range chainRoles {
+			for _, role := range gaugeRoles {
 				if oldH, newH := prevPrompts.Hash(role), set.Hash(role); oldH != newH {
 					log.Info("prompt_version_changed", "role", string(role), "old_hash", oldH, "new_hash", newH)
 					// Retire the old series and light the new one so only the
@@ -1053,6 +1057,31 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	// this single goroutine and returns nil on ctx cancellation.
 	if settlingCtrl != nil {
 		g.Go(func() error { return settlingCtrl.Run(ctx) })
+	}
+	// Story 4.4 (BI-1/BI-2): the DFIR forensic-report agent is a durable
+	// JetStream CONSUMER of INCIDENTS.finalised (the subject the settling sink
+	// writes to), wired adjacent to the settling block but as a consumer, not a
+	// sink. It rides the shared nc (closed at closeNATS). Gated by
+	// response.dfir.enabled (off by default). A degraded DFIR provider (no
+	// key/model/provider:none) leaves the agent nil and the launch is skipped
+	// (rules-and-baselines plus settling still run). The agent is a leaf
+	// downstream of the FSM (the trust-bound fence, BI-12).
+	if cfg.Response.DFIR.EnabledOrDefault() {
+		dfirAgent, derr := wireDFIRAgent(cfg, apiKey, promptStore.Get(), nc, assessmentPub, metricsReg, redactionAuditSink, log)
+		if derr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: dfir agent: %w", derr)
+		}
+		if dfirAgent != nil {
+			// Hot-reload the DFIR prompt on every successful prompts ConfigMap
+			// reload, mirroring the chain runners' SetPrompt swap. The prompt
+			// store always exists here (the analyst ring built it above).
+			promptStore.Subscribe(func(set *prompts.Set) {
+				dfirAgent.SetPrompt(dfirPromptSpec(set))
+			})
+			g.Go(func() error { return dfirAgent.Run(ctx, nc) })
+			log.Info("aggregator: DFIR forensic-report agent wired (FR43)", "durable", "olaitan-dfir-agent")
+		}
 	}
 	if fsmStore != nil {
 		recovered, skipped, rerr := stateMachine.Restore(ctx, fsmStore)
@@ -1324,6 +1353,55 @@ func wireSettlingController(cfg *config.Config, nc *natsclient.Client, fsmStore 
 		}
 	}
 	return ctrl, nil
+}
+
+// wireDFIRAgent constructs the Story 4.4 DFIR forensic-report agent (FR43): a
+// durable JetStream CONSUMER of the INCIDENTS stream (Durable
+// "olaitan-dfir-agent", AckExplicitPolicy, FilterSubject INCIDENTS.finalised,
+// bounded MaxDeliver) that, on each finalisation, issues a DFIR LLM call through
+// the shared provider abstraction (BI-5), validates the structured ForensicReport
+// JSON against the embedded schema, renders it deterministically to
+// YAML-front-matter + Markdown (BI-6), and announces it on REPORTS.generated +
+// records the DFIR row in AUDIT.assessments (AC5). It rides the shared nc
+// (closed at closeNATS). It returns (nil, nil) when the DFIR provider degrades
+// (no key/model/provider:none), so the caller skips the launch and the
+// aggregator runs without DFIR reports (the chain-degrade precedent). The agent
+// is a leaf downstream of the FSM: it makes NO GuardCappedConfidence call and
+// imports no score/FSM package (the TRUST-BOUND FENCE, BI-12).
+func wireDFIRAgent(cfg *config.Config, apiKey string, promptSet *prompts.Set, nc *natsclient.Client, assessmentPub responseaudit.AssessmentAuditPublisher, reg *metrics.Registry, sink *reportredact.RedactionAuditSink, log *slog.Logger) (*dfir.Agent, error) {
+	p, perr := buildDFIRProvider(cfg, apiKey, reg, sink, log)
+	if perr != nil {
+		return nil, fmt.Errorf("dfir provider: %w", perr)
+	}
+	if p == nil {
+		// Degraded resolution (no key/model/provider:none); skip wiring.
+		return nil, nil
+	}
+	reportPub, rerr := dfir.NewNATSReportPublisher(nc)
+	if rerr != nil {
+		return nil, fmt.Errorf("dfir report publisher: %w", rerr)
+	}
+	// The audit recorder reuses the AUDIT.assessments publisher (nil when the
+	// analyst ring did not wire one, e.g. provider:none); a nil recorder leaves
+	// the agent generating + announcing without the audit row.
+	var recorder dfir.AuditRecorder
+	if assessmentPub != nil {
+		recorder = dfirAuditRecorder{pub: assessmentPub, log: log}
+	}
+	agent, aerr := dfir.NewDFIR(p, dfirPromptSpec(promptSet), reportPub, recorder, reg, log)
+	if aerr != nil {
+		return nil, fmt.Errorf("dfir agent: %w", aerr)
+	}
+	return agent, nil
+}
+
+// dfirPromptSpec builds the DFIR PromptSpec from the loaded prompt set: the
+// ConfigMap-mounted (or binary-embedded default) dfir.txt and its content hash,
+// so every report is traceable to a specific prompt revision (the promptSpecFor
+// precedent for the chain roles).
+func dfirPromptSpec(set *prompts.Set) dfir.PromptSpec {
+	p := set.Prompt(prompts.RoleDFIR)
+	return dfir.PromptSpec{System: p.Text, Version: p.Hash}
 }
 
 // wireOverrideController constructs the Story 2.7 operator-override controller
