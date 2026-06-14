@@ -407,6 +407,25 @@ The `OVERRIDES.applied` NATS subject (365-day JetStream retention) carries one e
 
 **Scope (Story 4.1 only transitions state).** The QUARANTINED NetworkPolicy STAYS in place on a kill (the workload remains isolated): the inline path applies/removes nothing, and the reconcile backstop retains the QUARANTINED deny-all. Story 4.1 does NOT delete the pod, does NOT run CRIU/forensic capture, and does NOT invoke the DFIR agent; those are Stories 4.2/4.3/4.4. A workload in PRESERVED_KILLED is visible in `olaitan_response_fsm_active_workloads{state="PRESERVED_KILLED"}`.
 
+### Forensic capture controller (Story 4.2, FR36)
+
+When a workload reaches `PRESERVED_KILLED`, the forensic capture controller (`internal/response/forensics/`) preserves a forensic record of the doomed pod(s) to S3 BEFORE deleting them. It is a non-blocking FSM `MultiSink` member: `Publish` filters to the kill transition and enqueues, and a background worker runs capture -> upload -> delete off the FSM hot path. It is OFF by default; enable with `response.forensics.enabled=true`.
+
+**Chosen path: documented fallback (Path A), not CRIU.** Per ADR-2026-05-02-01, CRIU is infeasible on the pinned containerd 1.7 substrate (no `CheckpointContainer` CRI RPC) and the kernel substrate (CRIU vDSO init failure), so Story 4.2 ships `kubectl_fallback.go`: per-container logs (current and the terminated container's `--previous`), the pod spec/status, and recent events, assembled into a content-addressed `forensic-bundle.tar.gz`. CRIU (`criu.go`) is a dormant, rejected alternative and is never wired live.
+
+**Capture-before-delete with S3-ack gating (the load-bearing invariant).** The pod is deleted ONLY after the object store acknowledges a durable, SSE-KMS-encrypted PUT of the bundle under `forensic-bundles/<sha256>/forensic-bundle.tar.gz`. If the upload fails after the in-line retry, the pod is NOT deleted (forensic preservation has priority over the kill), `olaitan_forensic_writes_deferred_total` increments, and the pod stays network-isolated by virtue of the retained QUARANTINED deny-all (Story 4.1). The deferred-write retry queue is Story 4.7; Story 4.2 only signals the deferral.
+
+**Configuration.** `response.forensics` in `config/olaitan.yaml` (Helm: `response.forensics.*`): `s3_endpoint`, `s3_bucket`, `s3_region`, `s3_use_ssl` (default true; set false for a plaintext local MinIO), `kms_key_alias` (SSE-KMS key; empty leaves bucket-default SSE). The S3 access and secret keys are NFR8 secrets read from the `S3_ACCESS_KEY` / `S3_SECRET_KEY` environment variables (Helm: `secrets.s3AccessKey` / `secrets.s3SecretKey`), never YAML. Enabling forensics grants the aggregator ServiceAccount `pods` `delete` and `pods/log` `get` (in addition to the default patch/get/list); these are gated on `forensics.enabled` so a deployment that never kills pods keeps the narrower posture.
+
+**Metrics (FR36/NFR7/NFR28).**
+- `olaitan_forensic_capture_seconds` (histogram): capture-to-S3-to-delete latency, observed only on full success; NFR7 budget is `histogram_quantile(0.99, ...) <= 10`.
+- `olaitan_forensic_capture_total{result}`: `captured` (full success), `deferred` (S3 failed after retry, pod retained), `skipped` (excluded namespace / no pods / no longer PRESERVED_KILLED), `error` (capture or delete failure), `dropped` (Publish queue full).
+- `olaitan_forensic_writes_deferred_total`: deferred forensic writes; a non-zero rate means S3 is unreachable and evidence-bearing pods are accumulating undeleted-but-isolated. Alert on it.
+
+**Operator actions on a deferred write.** A rising `olaitan_forensic_writes_deferred_total` indicates S3/MinIO is unreachable or misconfigured. The pods are safe (still QUARANTINED, deny-all). Restore S3 reachability and KMS-key validity; until Story 4.7's retry queue lands, a re-kill is not re-triggered automatically, so verify the bundle landed in the bucket and manually delete the pod only after confirming a durable upload, OR leave the pod isolated pending the Story 4.7 drain.
+
+**Captured logs are KMS-encrypted but UNREDACTED (Story 4.5 follow-up).** The fallback uploads container logs encrypted at rest via SSE-KMS, but Story 4.2 deliberately introduces NO text-redaction code path (that is Story 4.5's `ForensicReport` redaction on the Ring-5 report path). The forensic bundle is a secret-tier artefact relying on KMS + bucket access control until Story 4.5 layers redaction onto the report path.
+
 ### Append-only SIEM audit subjects (Story 2.8, FR40/NFR16)
 
 When `response.audit.enabled=true` (off by default; one flag gates all three), the agent publishes three append-only NATS audit subjects for SIEM consumption (Splunk / Elastic / Datadog). Each rides a dedicated `LimitsPolicy` JetStream stream (append-only by retention: NFR16 means consumers cannot delete events) with Helm-tunable per-subject retention:

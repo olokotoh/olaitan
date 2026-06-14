@@ -123,6 +123,23 @@ rules:
   - apiGroups: [""]
     resources: ["serviceaccounts"]
     verbs: ["get", "list"]
+{{- if and .Values.response .Values.response.forensics .Values.response.forensics.enabled }}
+  # Story 4.2 forensic capture (FR36): when the PRESERVED_KILLED forensic
+  # controller is enabled, the aggregator must read each doomed pod's logs
+  # (including the previous terminated container's logs) and DELETE the pod
+  # strictly AFTER the forensic bundle is durably uploaded to S3. This widens
+  # the Ring-4 pod verb-set beyond the default patch/get/list ONLY when
+  # forensics.enabled=true, so a deployment that never kills pods keeps the
+  # narrower posture (architecture.md RBAC errata: pod delete is a Story 4.2
+  # addition gated on the forensic controller). Kubernetes RBAC unions verbs
+  # per resource, so this composes additively with the patch/get/list rules.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

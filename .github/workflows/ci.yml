@@ -258,3 +258,41 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: bash .github/scripts/check-traceability.sh
+
+  # Story 4.2 (BI-8): the forensic capture controller's S3 path is exercised
+  # against a real MinIO (S3-compatible) endpoint via the //go:build integration
+  # suite, so the critical capture -> upload -> delete + S3-outage-defer path is
+  # NOT left CI-unexercised (Epic 1 retro action A1). The suite is env-gated:
+  # FORENSICS_INTEGRATION_REQUIRED=1 makes a missing MinIO a hard failure here,
+  # while developers without MinIO locally fall back to the default skip (exit 0).
+  forensics-integration:
+    runs-on: ubuntu-latest
+    services:
+      minio:
+        image: bitnami/minio:latest
+        ports:
+          - 9000:9000
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+          MINIO_DEFAULT_BUCKETS: olaitan-forensics-it
+        options: >-
+          --health-cmd "mc ready local || curl -f http://localhost:9000/minio/health/live"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Forensics MinIO integration suite
+        env:
+          FORENSICS_INTEGRATION_REQUIRED: "1"
+          S3_ENDPOINT: "127.0.0.1:9000"
+          S3_ACCESS_KEY: minioadmin
+          S3_SECRET_KEY: minioadmin
+          S3_BUCKET: olaitan-forensics-it
+        run: go test -tags=integration -race -count=1 ./internal/response/forensics/...
