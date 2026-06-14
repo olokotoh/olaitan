@@ -143,3 +143,86 @@ func TestReportArchiveConfig_RetentionDaysPositive(t *testing.T) {
 		t.Errorf("error does not name retention_days: %v", err)
 	}
 }
+
+// TestReportArchiveConfig_DeferredDefaults: the Story 4.7 deferred-queue knobs
+// default to disabled, a 1000-report cap, and a 5s drain cadence.
+func TestReportArchiveConfig_DeferredDefaults(t *testing.T) {
+	cfg, err := config.Load(writeConfig(t, reportArchiveBaseYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	ra := cfg.Response.ReportArchive
+	if ra.DeferredEnabledOrDefault() {
+		t.Error("deferred queue must default to disabled (opt-in)")
+	}
+	if ra.DeferredMaxLenOrDefault() != 1000 {
+		t.Errorf("deferred_max_len must default to 1000, got %d", ra.DeferredMaxLenOrDefault())
+	}
+	if ra.DeferredDrainSecondsOrDefault() != 5 {
+		t.Errorf("deferred_drain_seconds must default to 5, got %d", ra.DeferredDrainSecondsOrDefault())
+	}
+}
+
+// TestReportArchiveConfig_DeferredKnobsParse: the deferred-queue knobs decode
+// through Load with their flat yaml keys.
+func TestReportArchiveConfig_DeferredKnobsParse(t *testing.T) {
+	yaml := reportArchiveBaseYAML + `  report_archive:
+    enabled: true
+    s3_endpoint: "s3.example.com"
+    s3_bucket: "olaitan-reports"
+    kms_key_alias: "alias/olaitan-reports"
+    deferred_enabled: true
+    deferred_redis_addr: "redis:6379"
+    deferred_max_len: 500
+    deferred_drain_seconds: 10
+`
+	cfg, err := config.Load(writeConfig(t, yaml))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	ra := cfg.Response.ReportArchive
+	if !ra.DeferredEnabledOrDefault() {
+		t.Error("deferred_enabled=true must survive the loader")
+	}
+	if ra.DeferredRedisAddr != "redis:6379" {
+		t.Errorf("deferred_redis_addr = %q", ra.DeferredRedisAddr)
+	}
+	if ra.DeferredMaxLenOrDefault() != 500 {
+		t.Errorf("deferred_max_len = %d, want 500", ra.DeferredMaxLenOrDefault())
+	}
+	if ra.DeferredDrainSecondsOrDefault() != 10 {
+		t.Errorf("deferred_drain_seconds = %d, want 10", ra.DeferredDrainSecondsOrDefault())
+	}
+}
+
+// TestReportArchiveConfig_DeferredRedisAddrRequired: enabling the deferred queue
+// without a redis addr is a fail-fast load error.
+func TestReportArchiveConfig_DeferredRedisAddrRequired(t *testing.T) {
+	yaml := reportArchiveBaseYAML + "  report_archive:\n    enabled: true\n    s3_endpoint: e\n    s3_bucket: b\n    kms_key_alias: alias/k\n    deferred_enabled: true\n"
+	_, err := config.Load(writeConfig(t, yaml))
+	if err == nil {
+		t.Fatal("want a required-when-enabled error for deferred_redis_addr")
+	}
+	if !strings.Contains(err.Error(), "deferred_redis_addr") {
+		t.Errorf("error does not name deferred_redis_addr: %v", err)
+	}
+}
+
+// TestReportArchiveConfig_DeferredKnobsPositive: a non-positive deferred_max_len
+// or deferred_drain_seconds is a load-time error.
+func TestReportArchiveConfig_DeferredKnobsPositive(t *testing.T) {
+	for _, tc := range []struct{ name, block, field string }{
+		{"max_len zero", "  report_archive:\n    deferred_max_len: 0\n", "deferred_max_len"},
+		{"drain seconds zero", "  report_archive:\n    deferred_drain_seconds: 0\n", "deferred_drain_seconds"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := config.Load(writeConfig(t, reportArchiveBaseYAML+tc.block))
+			if err == nil {
+				t.Fatalf("want rejection of %s", tc.field)
+			}
+			if !strings.Contains(err.Error(), tc.field) {
+				t.Errorf("error does not name %q: %v", tc.field, err)
+			}
+		})
+	}
+}

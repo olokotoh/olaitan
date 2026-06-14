@@ -1309,6 +1309,24 @@ type ReportArchiveConfig struct {
 	KMSKeyAlias    string `yaml:"kms_key_alias,omitempty"`
 	RetentionDays  *int   `yaml:"retention_days,omitempty"`
 	ObjectLockMode string `yaml:"object_lock_mode,omitempty"`
+	// Story 4.7 (FR45 resilience): the deferred-write queue knobs. When a durable
+	// write fails transiently beyond the short inline retry budget, the DFIR agent
+	// enqueues the report to a Redis-backed FIFO LIST (reports:deferred) that a
+	// background worker drains when S3 recovers (NFR28: tolerate a 60s S3 outage
+	// without losing a forensic record). The inline retry budget itself is a fixed
+	// code constant (sub-NFR7); only the deferred-queue knobs are config.
+	//
+	// DeferredEnabled gates the deferred queue + drain worker. Pointer-tagged so an
+	// explicit `false` survives the loader; default OFF (the writer keeps the 4.6
+	// fail-loud behaviour until the operator opts the deferred queue in and supplies
+	// a Redis address). DeferredRedisAddr is the Redis the queue lives on (the
+	// REDIS_PASSWORD secret-via-env precedent supplies the password). DeferredMaxLen
+	// bounds the queue (default 1000; drop-oldest on overflow, PO ratification 7).
+	// DeferredDrainSeconds is the drain worker's tick cadence (default 5s).
+	DeferredEnabled      *bool  `yaml:"deferred_enabled,omitempty"`
+	DeferredRedisAddr    string `yaml:"deferred_redis_addr,omitempty"`
+	DeferredMaxLen       *int   `yaml:"deferred_max_len,omitempty"`
+	DeferredDrainSeconds *int   `yaml:"deferred_drain_seconds,omitempty"`
 }
 
 // DefaultReportArchiveRetentionDays is the Story 4.6 object-lock retention
@@ -1322,18 +1340,36 @@ const DefaultReportArchiveRetentionDays = 90
 // deployments.
 const DefaultReportArchiveObjectLockMode = "GOVERNANCE"
 
-// DefaultReportArchive returns the Story 4.6 defaults: disabled, TLS on for the
-// S3 endpoint (production object stores are TLS; a local MinIO sets s3_use_ssl
-// false explicitly), 90-day retention, GOVERNANCE object-lock mode.
+// DefaultReportArchiveDeferredMaxLen is the Story 4.7 bounded deferred-queue cap
+// (PO ratification 7 / Open Assumption 3): 1000 reports. On overflow the oldest
+// is dropped (keeping the freshest forensic records). A 1000-report backlog is a
+// very long S3 outage.
+const DefaultReportArchiveDeferredMaxLen = 1000
+
+// DefaultReportArchiveDeferredDrainSeconds is the Story 4.7 drain worker tick
+// cadence (Open Assumption 5): 5s, the RedactionAuditSink.DrainEvery default,
+// with a wake-on-enqueue channel for prompt recovery drains.
+const DefaultReportArchiveDeferredDrainSeconds = 5
+
+// DefaultReportArchive returns the Story 4.6/4.7 defaults: disabled, TLS on for
+// the S3 endpoint (production object stores are TLS; a local MinIO sets
+// s3_use_ssl false explicitly), 90-day retention, GOVERNANCE object-lock mode,
+// the deferred queue OFF with a 1000-report cap and a 5s drain cadence.
 func DefaultReportArchive() ReportArchiveConfig {
 	enabled := false
 	useSSL := true
 	days := DefaultReportArchiveRetentionDays
+	deferredEnabled := false
+	maxLen := DefaultReportArchiveDeferredMaxLen
+	drainSecs := DefaultReportArchiveDeferredDrainSeconds
 	return ReportArchiveConfig{
-		Enabled:        &enabled,
-		S3UseSSL:       &useSSL,
-		RetentionDays:  &days,
-		ObjectLockMode: DefaultReportArchiveObjectLockMode,
+		Enabled:              &enabled,
+		S3UseSSL:             &useSSL,
+		RetentionDays:        &days,
+		ObjectLockMode:       DefaultReportArchiveObjectLockMode,
+		DeferredEnabled:      &deferredEnabled,
+		DeferredMaxLen:       &maxLen,
+		DeferredDrainSeconds: &drainSecs,
 	}
 }
 
@@ -1373,6 +1409,35 @@ func (r ReportArchiveConfig) ObjectLockModeOrDefault() string {
 	return r.ObjectLockMode
 }
 
+// DeferredEnabledOrDefault reports whether the Story 4.7 deferred-write queue +
+// drain worker are enabled, treating a nil pointer as the default (false). The
+// deferred queue is only wired when the report archive itself is enabled; this
+// gate is additive on top of EnabledOrDefault.
+func (r ReportArchiveConfig) DeferredEnabledOrDefault() bool {
+	if r.DeferredEnabled == nil {
+		return false
+	}
+	return *r.DeferredEnabled
+}
+
+// DeferredMaxLenOrDefault returns the bounded deferred-queue cap, defaulting to
+// 1000 when omitted or non-positive (PO ratification 7).
+func (r ReportArchiveConfig) DeferredMaxLenOrDefault() int {
+	if r.DeferredMaxLen == nil || *r.DeferredMaxLen <= 0 {
+		return DefaultReportArchiveDeferredMaxLen
+	}
+	return *r.DeferredMaxLen
+}
+
+// DeferredDrainSecondsOrDefault returns the drain worker tick cadence in seconds,
+// defaulting to 5 when omitted or non-positive (Open Assumption 5).
+func (r ReportArchiveConfig) DeferredDrainSecondsOrDefault() int {
+	if r.DeferredDrainSeconds == nil || *r.DeferredDrainSeconds <= 0 {
+		return DefaultReportArchiveDeferredDrainSeconds
+	}
+	return *r.DeferredDrainSeconds
+}
+
 // validate enforces ReportArchiveConfig invariants: when the archive is
 // explicitly enabled, the S3 endpoint, bucket, and SSE-KMS key alias are all
 // required, retention_days (when set) must be positive, and object_lock_mode
@@ -1394,6 +1459,13 @@ func (r ReportArchiveConfig) validate() error {
 	if r.ObjectLockMode != "" && r.ObjectLockMode != "GOVERNANCE" && r.ObjectLockMode != "COMPLIANCE" {
 		return fmt.Errorf("response.report_archive.object_lock_mode: must be GOVERNANCE or COMPLIANCE (got %q)", r.ObjectLockMode)
 	}
+	// Story 4.7 deferred-queue knobs: when explicitly set they must be positive.
+	if r.DeferredMaxLen != nil && *r.DeferredMaxLen < 1 {
+		return fmt.Errorf("response.report_archive.deferred_max_len: must be >= 1 (got %d)", *r.DeferredMaxLen)
+	}
+	if r.DeferredDrainSeconds != nil && *r.DeferredDrainSeconds < 1 {
+		return fmt.Errorf("response.report_archive.deferred_drain_seconds: must be >= 1 (got %d)", *r.DeferredDrainSeconds)
+	}
 	if r.Enabled != nil && *r.Enabled {
 		if r.S3Endpoint == "" {
 			return errors.New("response.report_archive.s3_endpoint: required when report_archive.enabled=true")
@@ -1403,6 +1475,10 @@ func (r ReportArchiveConfig) validate() error {
 		}
 		if r.KMSKeyAlias == "" {
 			return errors.New("response.report_archive.kms_key_alias: required when report_archive.enabled=true (the writer applies SSE-KMS per PUT; an empty alias would persist reports with no agent-applied encryption)")
+		}
+		// The deferred queue, when enabled, needs a Redis address to enqueue to.
+		if r.DeferredEnabledOrDefault() && r.DeferredRedisAddr == "" {
+			return errors.New("response.report_archive.deferred_redis_addr: required when report_archive.deferred_enabled=true (the deferred-write queue is a Redis LIST; the REDIS_PASSWORD env var supplies the password)")
 		}
 	}
 	return nil

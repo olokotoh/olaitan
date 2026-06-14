@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"time"
 
@@ -265,4 +266,73 @@ func isAlreadyExistsOrLocked(err error) bool {
 		return true
 	}
 	return false
+}
+
+// IsTransientS3 classifies a durable-write error as a TRANSIENT S3 fault that is
+// worth retrying / deferring (Story 4.7 AC1, BI-2), as opposed to a PERMANENT
+// 4xx misconfiguration that retrying will never fix. It mirrors (a) the claude
+// provider's isPermanent 4xx-minus-408/429 status-class split and (b) the
+// existing minio ToErrorResponse classification used by isNotFound /
+// isAlreadyExistsOrLocked, the established home for S3-error classification in
+// this package.
+//
+// TRANSIENT (returns true): any 5xx server error, 408 request timeout, 429
+// rate-limit/slow-down, a net.Error reporting Timeout(), and any non-API
+// connection / transport error (the minio ToErrorResponse maps a bare transport
+// error to StatusCode 0, so an error with no recognised 4xx status is treated as
+// a transient transport fault). Such an error is retried inline and, beyond the
+// short inline budget, deferred to the Redis-backed queue.
+//
+// PERMANENT (returns false): the 4xx misconfiguration family (403 AccessDenied,
+// 404 NoSuchBucket, 400 InvalidRequest, 413 EntityTooLarge, and any other 4xx
+// minus 408/429). A 4xx misconfiguration will never succeed on retry, so the
+// inline path wraps it via retry.Permanent (fail loud, no defer) and the drain
+// worker dead-letters it rather than looping forever (BI-6).
+//
+// A nil error is not transient (there is nothing to retry).
+func IsTransientS3(err error) bool {
+	if err == nil {
+		return false
+	}
+	// A net timeout (dial / read / write deadline) is always transient.
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	// Resolve the minio status via errors.As, NOT minio.ToErrorResponse: the
+	// archive Put wraps the minio error with fmt.Errorf("%w"), and
+	// ToErrorResponse does a top-level type assertion that does NOT reach through
+	// %w wrapping (it would mis-classify a wrapped 403 as a no-status transport
+	// fault). errors.As reaches through the wrap chain to the minio.ErrorResponse
+	// value/pointer, so the 4xx-vs-5xx split is correct on the wrapped error the
+	// caller actually sees.
+	var resp minio.ErrorResponse
+	if !errors.As(err, &resp) {
+		// Not a minio API error: a bare connection / transport error (dial
+		// refused, EOF, reset) with no recognised HTTP status. Treat it as a
+		// transient transport fault, mirroring the claude provider's "any non-API
+		// transport error is transient" rule.
+		return true
+	}
+	sc := resp.StatusCode
+	switch {
+	case sc >= 500:
+		// Every 5xx server error is transient (the store is unhealthy, not
+		// misconfigured).
+		return true
+	case sc == http.StatusRequestTimeout, sc == http.StatusTooManyRequests:
+		// 408 request timeout and 429 rate-limit / SlowDown are transient.
+		return true
+	case sc >= 400 && sc < 500:
+		// The 4xx misconfiguration family (minus 408/429 handled above) is
+		// PERMANENT: a misconfigured bucket, denied credentials, or a malformed
+		// request will never succeed on retry.
+		return false
+	default:
+		// No recognised HTTP status (StatusCode 0): a bare connection / transport
+		// error (dial refused, EOF, reset). Treat it as a transient transport
+		// fault, mirroring the claude provider's "any non-API transport error is
+		// transient" rule.
+		return true
+	}
 }
