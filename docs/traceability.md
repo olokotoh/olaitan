@@ -457,7 +457,7 @@ NFR42 while the auditable chain is preserved row-for-row. New PRs from Story
 ### `c3.7.5-forensic-capture` (Story 4.2)
 
 - **Story:** 4.2 (CRIU forensic checkpoint controller, documented fallback path).
-- **Merge SHA:** _backfilled post-merge._
+- **Merge SHA:** `9c04adf` (PR #57, squash-merged to `epic-4-staging` on 2026-06-14 by `olokotoh`). Branch `epic-4/story-4-2-criu-forensic-checkpoint-controller-or-documented-fallback` carried the implementation plus two bmad-code-review follow-up commits (round-1 `ac48aee`: CI MinIO image fix + mandatory KMS + deferred-signal wiring + fs-tar deferral; round-2 `a696125`: NFR7 budget-deadline defers + helm goldens). Post-merge backfill commit `chore: backfill Story 4.2 merge SHA in traceability matrix` updates this row.
 - **FRs/NFRs:** FR36 (satisfied; PRESERVED_KILLED forensic capture-upload-delete via the documented fallback Path A), NFR7 (capture-to-S3-to-delete <= 10 s p99 measured by `olaitan_forensic_capture_seconds`), NFR17 (SSE-KMS encryption on the forensic bundle), NFR28 (S3-failure defers the delete and increments `olaitan_forensic_writes_deferred_total`), NFR35 (>= 80 percent line coverage on `internal/response/forensics/`).
 - **ADRs:** ADR-2026-05-02-01 (Path A documented fallback chosen; CRIU Path B is the rejected, dormant alternative gated on unapproved containerd 2.0+/CRIU substrate bumps).
 - **ch3_section reconciliation:** §3.7.5 succeeds the §3.7.4 CRIU spike (`c3.7.4-criu-checkpoint-spike`, ADR-2026-05-02-01): the spike found CRIU infeasible on the pinned substrate, so §3.7.5 is the live forensic-capture deliverable built on the documented fallback the spike recommended.
