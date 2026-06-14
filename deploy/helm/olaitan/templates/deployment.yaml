@@ -149,6 +149,19 @@ spec:
                   name: {{ include "olaitan.fullname" . }}-secrets
                   key: s3-secret-key
             {{- end }}
+            {{- if and .Values.response .Values.response.notifications .Values.response.notifications.enabled }}
+            # Story 4.8 (NFR8): project the OPTIONAL incident notification webhook
+            # URL secret into NOTIFICATIONS_WEBHOOK_URL. Only mounted when
+            # notifications is enabled so a deployment without the webhook carries
+            # no token-bearing URL. The env var overrides the plain
+            # response.notifications.webhookUrl value; an empty value leaves the
+            # webhook unwired (AC2). The URL is scrubbed (host only) in all logs.
+            - name: NOTIFICATIONS_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "olaitan.fullname" . }}-secrets
+                  key: notifications-webhook-url
+            {{- end }}
             {{- with .Values.nats.streamMaxBytesOverride }}
             # Story 1.19 D6: caps every JetStream stream's MaxBytes at
             # the given int64 byte count. Set this in CI/kind where the

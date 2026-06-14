@@ -62,6 +62,7 @@ import (
 	"github.com/olokotoh/olaitan/internal/report/archive"
 	"github.com/olokotoh/olaitan/internal/report/deferq"
 	"github.com/olokotoh/olaitan/internal/report/dfir"
+	"github.com/olokotoh/olaitan/internal/report/notify"
 	reportredact "github.com/olokotoh/olaitan/internal/report/redact"
 	responseaudit "github.com/olokotoh/olaitan/internal/response/audit"
 	"github.com/olokotoh/olaitan/internal/response/forensics"
@@ -1101,6 +1102,27 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 			dfirCloser()
 		}
 	}
+	// Story 4.8 (AC1/AC2/AC3, BI-3): the OPTIONAL incident notification webhook is
+	// a SEPARATE durable JetStream CONSUMER of REPORTS.generated, launched on the
+	// errgroup adjacent to the DFIR agent but on its OWN cursor
+	// (olaitan-notification-webhook), structurally decoupled so a delivery failure
+	// NEVER blocks the synchronous report write or the response-side FSM. Gated by
+	// response.notifications.enabled AND a non-empty webhook URL (off by default,
+	// AC2); a nil controller skips the launch. The URL is a secret supplied via the
+	// NOTIFICATIONS_WEBHOOK_URL env var (the S3_*/REDIS_PASSWORD secret-via-env
+	// precedent), scrubbed (host only) in logs (BI-5).
+	if cfg.Response.Notifications.EnabledOrDefault() {
+		webhookCtrl, werr := wireNotificationWebhook(cfg, metricsReg, log)
+		if werr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: notification webhook: %w", werr)
+		}
+		if webhookCtrl != nil {
+			g.Go(func() error { return webhookCtrl.Run(ctx, nc) })
+			log.Info("aggregator: incident notification webhook wired (Story 4.8)",
+				"durable", "olaitan-notification-webhook", "webhook_host", webhookCtrl.Host())
+		}
+	}
 	if fsmStore != nil {
 		recovered, skipped, rerr := stateMachine.Restore(ctx, fsmStore)
 		if rerr != nil {
@@ -1483,6 +1505,48 @@ func wireDeferredQueue(cfg *config.Config, agent *dfir.Agent, reportArchive arch
 	log.Info("deferred report queue enabled (Story 4.7, NFR28)",
 		"redis_addr", ra.DeferredRedisAddr, "max_len", ra.DeferredMaxLenOrDefault(), "drain_seconds", ra.DeferredDrainSecondsOrDefault())
 	return drainer, closer, nil
+}
+
+// wireNotificationWebhook constructs the Story 4.8 OPTIONAL incident notification
+// webhook controller (AC1/AC2/AC3) when response.notifications.enabled=true AND a
+// non-empty webhook URL is resolved. It returns (nil, nil) when no URL is present
+// (the gate is on but the operator supplied no URL: skip wiring, AC2), so the
+// caller skips the launch. The webhook URL is a SECRET (a Slack/PagerDuty URL
+// embeds a token): the NOTIFICATIONS_WEBHOOK_URL env var (the S3_*/REDIS_PASSWORD
+// secret-via-env precedent, TrimRight guards the trailing-newline secretKeyRef
+// pitfall) OVERRIDES the plain config value, and the controller scrubs it to the
+// host only in every structured log (BI-5). The retry/timeout knobs map onto the
+// controller's retry.Strategy + HTTP client (BI-7).
+func wireNotificationWebhook(cfg *config.Config, reg *metrics.Registry, log *slog.Logger) (*notify.Webhook, error) {
+	n := cfg.Response.Notifications
+	// The env var override is the secret path; the plain config value is the
+	// fallback for a non-secret relay (the env-var-overrides-value precedent).
+	webhookURL := strings.TrimRight(os.Getenv("NOTIFICATIONS_WEBHOOK_URL"), "\r\n")
+	if webhookURL == "" {
+		webhookURL = n.WebhookURL
+	}
+	if webhookURL == "" {
+		// Gate on but no URL: AC2 (no webhook fired). Skip wiring rather than
+		// fail-fast, so an operator can stage the gate ahead of the secret.
+		log.Info("notification webhook enabled but no NOTIFICATIONS_WEBHOOK_URL / webhook_url supplied; webhook not wired (Story 4.8, AC2)")
+		return nil, nil
+	}
+	w, err := notify.NewWebhook(notify.Config{
+		URL:              webhookURL,
+		RetryMaxAttempts: n.RetryMaxAttemptsOrDefault(),
+		RetryMin:         time.Duration(n.RetryMinSecondsOrDefault()) * time.Second,
+		RetryMax:         time.Duration(n.RetryMaxSecondsOrDefault()) * time.Second,
+		Timeout:          time.Duration(n.TimeoutSecondsOrDefault()) * time.Second,
+	}, reg, log)
+	if err != nil {
+		return nil, fmt.Errorf("notification webhook controller: %w", err)
+	}
+	// NFR18 construction log: record webhook_configured + the SCRUBBED host, NOT
+	// the token-bearing URL (BI-5).
+	log.Info("notification webhook constructed (Story 4.8)",
+		"webhook_configured", true, "webhook_host", w.Host(),
+		"retry_max_attempts", n.RetryMaxAttemptsOrDefault(), "timeout_seconds", n.TimeoutSecondsOrDefault())
+	return w, nil
 }
 
 // wireReportArchive constructs the Story 4.6 durable report writer (FR45) from

@@ -695,6 +695,43 @@ data:
     {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.report_archive.deferred_drain_seconds anchor not found (pattern %q)" $p) }}{{- end }}
     {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $ra.deferredDrainSeconds) }}
     {{- end }}
+    {{- /*
+    Story 4.8: OPTIONAL incident notification webhook overlay. Bridges
+    response.notifications.{enabled,retryMaxAttempts,retryMinSeconds,
+    retryMaxSeconds,timeoutSeconds} onto the config/olaitan.yaml
+    response.notifications block. The enable anchor is disambiguated by the
+    trailing webhook_url key so it cannot match another `enabled: false`. The
+    retry/timeout knobs are unquoted integers. webhook_url is deliberately NOT
+    bridged here: it is a SECRET (a Slack/PagerDuty URL embeds a token), supplied
+    via the NOTIFICATIONS_WEBHOOK_URL env var (secretKeyRef), never the ConfigMap
+    (the S3 credential precedent).
+    */ -}}
+    {{- $notif := $rsp.notifications | default dict }}
+    {{- if hasKey $notif "enabled" }}
+    {{- $p := "(\\n  notifications:\\n    enabled: )(?:true|false)(\\n    webhook_url:)" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.notifications.enabled anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v${2}" $notif.enabled) }}
+    {{- end }}
+    {{- if hasKey $notif "retryMaxAttempts" }}
+    {{- $p := "(\\n    retry_max_attempts: )[0-9]+" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.notifications.retry_max_attempts anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $notif.retryMaxAttempts) }}
+    {{- end }}
+    {{- if hasKey $notif "retryMinSeconds" }}
+    {{- $p := "(\\n    retry_min_seconds: )[0-9]+" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.notifications.retry_min_seconds anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $notif.retryMinSeconds) }}
+    {{- end }}
+    {{- if hasKey $notif "retryMaxSeconds" }}
+    {{- $p := "(\\n    retry_max_seconds: )[0-9]+" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.notifications.retry_max_seconds anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $notif.retryMaxSeconds) }}
+    {{- end }}
+    {{- if hasKey $notif "timeoutSeconds" }}
+    {{- $p := "(\\n    timeout_seconds: )[0-9]+" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.notifications.timeout_seconds anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $notif.timeoutSeconds) }}
+    {{- end }}
     {{- end }}
     {{- /*
     Story 1.19: Evaluation-matrix overlay (FR53). Replace the file-side

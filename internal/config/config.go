@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1088,6 +1089,149 @@ type ResponseConfig struct {
 	// loader; the writer is opt-in and defaults off. The S3 access/secret keys are
 	// NFR8 secrets read from S3_ACCESS_KEY / S3_SECRET_KEY env vars (not YAML).
 	ReportArchive ReportArchiveConfig `yaml:"report_archive,omitempty"`
+	// Story 4.8: notifications sub-block gates the OPTIONAL outbound incident
+	// notification webhook (FR-adjacent). When enabled AND a webhook_url is
+	// supplied, a SEPARATE durable JetStream consumer of REPORTS.generated fires
+	// one generic JSON HTTP POST per confirmed-incident report announcement to the
+	// configured URL (Slack/email/PagerDuty are just the URL). Enabled is
+	// pointer-tagged so an explicit `false` survives the loader; the webhook is
+	// opt-in and defaults OFF. The webhook URL is a SECRET (a Slack/PagerDuty URL
+	// embeds a token): it is supplied via the NOTIFICATIONS_WEBHOOK_URL env var
+	// (the S3_*/REDIS_PASSWORD secret-via-env precedent) overriding any plain
+	// value, and is scrubbed (host only) in all logs.
+	Notifications NotificationsConfig `yaml:"notifications,omitempty"`
+}
+
+// NotificationsConfig gates the Story 4.8 OPTIONAL incident notification webhook.
+// It mirrors the DFIRConfig / ReportArchiveConfig gate: Enabled is pointer-tagged
+// so an explicit `false` survives the loader (the NetworkPolicyConfig.Enabled
+// precedent); the default is OFF (opt-in). The webhook is wired ONLY when
+// EnabledOrDefault() AND a non-empty WebhookURL are both present.
+//
+// WebhookURL is the target the POST goes to. It is a SECRET (a Slack/PagerDuty
+// incoming-webhook URL embeds a token) so it is supplied via the
+// NOTIFICATIONS_WEBHOOK_URL env var (the secret-via-env discipline, NFR8) which
+// overrides this value at wiring time; the plain value is for a non-secret relay.
+// It is scrubbed (host only) in every structured log.
+//
+// The retry knobs map onto the existing retry.Strategy: RetryMaxAttempts ->
+// MaxAttempts (default 5), RetryMinSeconds -> Min (default 1s), RetryMaxSeconds ->
+// Max (default 30s). TimeoutSeconds bounds the per-attempt HTTP client (default
+// 5s). All are pointer-tagged with positive-when-set validation.
+type NotificationsConfig struct {
+	Enabled          *bool  `yaml:"enabled,omitempty"`
+	WebhookURL       string `yaml:"webhook_url,omitempty"`
+	RetryMaxAttempts *int   `yaml:"retry_max_attempts,omitempty"`
+	RetryMinSeconds  *int   `yaml:"retry_min_seconds,omitempty"`
+	RetryMaxSeconds  *int   `yaml:"retry_max_seconds,omitempty"`
+	TimeoutSeconds   *int   `yaml:"timeout_seconds,omitempty"`
+}
+
+// Story 4.8 notification-webhook defaults (PO ratification 4 / Open Assumption 5):
+// the ollama-style retry shape, configurable, with a 5s HTTP client timeout.
+const (
+	DefaultNotificationsRetryMaxAttempts = 5
+	DefaultNotificationsRetryMinSeconds  = 1
+	DefaultNotificationsRetryMaxSeconds  = 30
+	DefaultNotificationsTimeoutSeconds   = 5
+)
+
+// DefaultNotifications returns the Story 4.8 defaults: disabled (opt-in), an
+// empty webhook URL, and the configurable retry/timeout knobs at their defaults.
+func DefaultNotifications() NotificationsConfig {
+	enabled := false
+	maxAttempts := DefaultNotificationsRetryMaxAttempts
+	minSecs := DefaultNotificationsRetryMinSeconds
+	maxSecs := DefaultNotificationsRetryMaxSeconds
+	timeoutSecs := DefaultNotificationsTimeoutSeconds
+	return NotificationsConfig{
+		Enabled:          &enabled,
+		RetryMaxAttempts: &maxAttempts,
+		RetryMinSeconds:  &minSecs,
+		RetryMaxSeconds:  &maxSecs,
+		TimeoutSeconds:   &timeoutSecs,
+	}
+}
+
+// EnabledOrDefault reports whether the notification webhook is enabled, treating
+// a nil pointer as the default (false).
+func (n NotificationsConfig) EnabledOrDefault() bool {
+	if n.Enabled == nil {
+		return false
+	}
+	return *n.Enabled
+}
+
+// RetryMaxAttemptsOrDefault returns the configurable retry limit, defaulting to 5
+// when omitted or non-positive.
+func (n NotificationsConfig) RetryMaxAttemptsOrDefault() int {
+	if n.RetryMaxAttempts == nil || *n.RetryMaxAttempts <= 0 {
+		return DefaultNotificationsRetryMaxAttempts
+	}
+	return *n.RetryMaxAttempts
+}
+
+// RetryMinSecondsOrDefault returns the retry backoff minimum in seconds,
+// defaulting to 1 when omitted or non-positive.
+func (n NotificationsConfig) RetryMinSecondsOrDefault() int {
+	if n.RetryMinSeconds == nil || *n.RetryMinSeconds <= 0 {
+		return DefaultNotificationsRetryMinSeconds
+	}
+	return *n.RetryMinSeconds
+}
+
+// RetryMaxSecondsOrDefault returns the retry backoff maximum in seconds,
+// defaulting to 30 when omitted or non-positive.
+func (n NotificationsConfig) RetryMaxSecondsOrDefault() int {
+	if n.RetryMaxSeconds == nil || *n.RetryMaxSeconds <= 0 {
+		return DefaultNotificationsRetryMaxSeconds
+	}
+	return *n.RetryMaxSeconds
+}
+
+// TimeoutSecondsOrDefault returns the per-attempt HTTP client timeout in seconds,
+// defaulting to 5 when omitted or non-positive.
+func (n NotificationsConfig) TimeoutSecondsOrDefault() int {
+	if n.TimeoutSeconds == nil || *n.TimeoutSeconds <= 0 {
+		return DefaultNotificationsTimeoutSeconds
+	}
+	return *n.TimeoutSeconds
+}
+
+// validate enforces NotificationsConfig invariants: the retry/timeout knobs, when
+// explicitly set, must be positive; retry_max_seconds (when both set) must be >=
+// retry_min_seconds; and when the webhook is explicitly enabled, the webhook_url
+// (taken from this value OR the NOTIFICATIONS_WEBHOOK_URL env var at wiring time)
+// must be a syntactically valid http(s) URL when present. A fully-omitted block
+// skips validation so in-memory fixtures can leave it zero. The URL-required check
+// lives at the wiring layer (the env var may supply it), so an enabled block with
+// an empty value is NOT a config error here (it simply skips wiring, AC2).
+func (n NotificationsConfig) validate() error {
+	if n.RetryMaxAttempts != nil && *n.RetryMaxAttempts < 1 {
+		return fmt.Errorf("response.notifications.retry_max_attempts: must be >= 1 (got %d)", *n.RetryMaxAttempts)
+	}
+	if n.RetryMinSeconds != nil && *n.RetryMinSeconds < 1 {
+		return fmt.Errorf("response.notifications.retry_min_seconds: must be >= 1 (got %d)", *n.RetryMinSeconds)
+	}
+	if n.RetryMaxSeconds != nil && *n.RetryMaxSeconds < 1 {
+		return fmt.Errorf("response.notifications.retry_max_seconds: must be >= 1 (got %d)", *n.RetryMaxSeconds)
+	}
+	if n.RetryMinSeconds != nil && n.RetryMaxSeconds != nil && *n.RetryMaxSeconds < *n.RetryMinSeconds {
+		return fmt.Errorf("response.notifications.retry_max_seconds: must be >= retry_min_seconds (got min=%d, max=%d)", *n.RetryMinSeconds, *n.RetryMaxSeconds)
+	}
+	if n.TimeoutSeconds != nil && *n.TimeoutSeconds < 1 {
+		return fmt.Errorf("response.notifications.timeout_seconds: must be >= 1 (got %d)", *n.TimeoutSeconds)
+	}
+	// A URL-shaped check when one is present (the env var may override at wiring,
+	// but a malformed plain value is a config typo worth catching fast). An empty
+	// value is fine: the gate skips wiring (AC2) and the env var may supply it.
+	if n.WebhookURL != "" {
+		u, err := url.Parse(n.WebhookURL)
+		if err != nil || u.Scheme == "" || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			return fmt.Errorf("response.notifications.webhook_url: must be a valid http(s) URL (got %q)", n.WebhookURL)
+		}
+	}
+	return nil
 }
 
 // DFIRConfig gates the Story 4.4 DFIR forensic-report agent (FR43). It mirrors
@@ -2301,6 +2445,28 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
+	// Story 4.8: substitute the notification-webhook defaults so an omitted
+	// Enabled stays off (opt-in) and the omitted retry/timeout knobs inherit the
+	// ollama-style defaults (5 attempts, 1s..30s backoff, 5s HTTP timeout).
+	{
+		defNotif := DefaultNotifications()
+		if cfg.Response.Notifications.Enabled == nil {
+			cfg.Response.Notifications.Enabled = defNotif.Enabled
+		}
+		if cfg.Response.Notifications.RetryMaxAttempts == nil {
+			cfg.Response.Notifications.RetryMaxAttempts = defNotif.RetryMaxAttempts
+		}
+		if cfg.Response.Notifications.RetryMinSeconds == nil {
+			cfg.Response.Notifications.RetryMinSeconds = defNotif.RetryMinSeconds
+		}
+		if cfg.Response.Notifications.RetryMaxSeconds == nil {
+			cfg.Response.Notifications.RetryMaxSeconds = defNotif.RetryMaxSeconds
+		}
+		if cfg.Response.Notifications.TimeoutSeconds == nil {
+			cfg.Response.Notifications.TimeoutSeconds = defNotif.TimeoutSeconds
+		}
+	}
+
 	// Story 3.1: substitute the redact defaults so an enabled redact block with
 	// an omitted retention inherits the 365 d default, and an omitted
 	// AuditEnabled stays off (redaction itself is always on, BI-7).
@@ -2525,6 +2691,9 @@ func (r ResponseConfig) validate() error {
 		return err
 	}
 	if err := r.ReportArchive.validate(); err != nil {
+		return err
+	}
+	if err := r.Notifications.validate(); err != nil {
 		return err
 	}
 	return nil

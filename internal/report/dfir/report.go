@@ -348,6 +348,21 @@ type ReportGenerated struct {
 	FinalFSMState string `json:"final_fsm_state"`
 	// GeneratedAt is the report generation time.
 	GeneratedAt time.Time `json:"generated_at"`
+	// ThreatScore is the ThreatScore captured at final-state entry, sourced
+	// from ForensicReport.ThreatScoreAtDecision. Story 4.8 ADDITIVE-OPTIONAL
+	// field (omitempty, NO reports.generated.v1 version bump, the 4.5/4.7
+	// additive-wire discipline): a 4.4-era consumer that does not read it is
+	// unaffected, and an old-shape event without it decodes with the zero value.
+	// It is already-decided, already-redacted control-plane metadata (the
+	// trust-bound fence is intact: NO score-fold, NO FSM/decision import); it
+	// completes the optional notification-webhook payload (Story 4.8 AC1).
+	ThreatScore float64 `json:"threat_score,omitempty"`
+	// AttackTechniques are the ATT&CK for Containers technique annotations,
+	// sourced from ForensicReport.AttackTechniques. Story 4.8 ADDITIVE-OPTIONAL
+	// field (omitempty, no version bump). It MAY be empty ("not recorded") per
+	// the Story 4.4 PO Option A enrichment deferral, so the notification webhook
+	// SENDS WHAT IS AVAILABLE and never fabricates a technique (Story 4.8 AC1).
+	AttackTechniques []string `json:"attack_techniques,omitempty"`
 }
 
 // reportSHA256 returns the lowercase-hex SHA256 of the rendered report bytes.

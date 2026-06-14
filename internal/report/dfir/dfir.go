@@ -477,6 +477,13 @@ func (a *Agent) Generate(ctx context.Context, inc Incident) (rendered string, re
 			ReportURL:     key,
 			FinalFSMState: report.FinalFSMState,
 			GeneratedAt:   report.ReportGeneratedAt,
+			// Story 4.8 (AC1, BI-1/BI-2): populate the two additive-optional
+			// fields from the just-rendered report so the REPORTS.generated
+			// announce carries the complete optional-webhook payload. The
+			// techniques may be empty ("not recorded") per the 4.4 PO Option A
+			// deferral; the webhook sends what is available.
+			ThreatScore:      report.ThreatScoreAtDecision,
+			AttackTechniques: report.AttackTechniques,
 		}
 		if perr := a.reports.PublishReportGenerated(ctx, evt); perr != nil {
 			// A failed announce is logged but not fatal: the report was

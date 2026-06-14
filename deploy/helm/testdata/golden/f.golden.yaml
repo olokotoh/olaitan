@@ -203,6 +203,10 @@ stringData:
   # Empty -> the controller refuses to start when forensics is enabled.
   s3-access-key: ""
   s3-secret-key: ""
+  # Story 4.8 (NFR8): the OPTIONAL incident notification webhook URL (a
+  # Slack/PagerDuty URL embeds a token). Consumed by internal/report/notify when
+  # response.notifications.enabled=true. Empty -> the webhook is not wired.
+  notifications-webhook-url: ""
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -942,6 +946,26 @@ data:
         deferred_redis_addr: ""
         deferred_max_len: 1000
         deferred_drain_seconds: 5
+      # Story 4.8: OPTIONAL incident notification webhook. When enabled AND a
+      # webhook_url is supplied, a SEPARATE durable JetStream consumer of
+      # REPORTS.generated fires ONE generic JSON HTTP POST per confirmed-incident
+      # report announcement to the configured URL (Slack/email/PagerDuty are just the
+      # URL; no per-vendor code). The POST carries operator-facing metadata only
+      # (workload_id, attack_techniques, threat_score, report_url, fsm_state,
+      # published_at, idempotency_key) -- NO raw evidence. Retry is exponential-backoff
+      # up to retry_max_attempts (5xx/429/timeout retry; a 4xx target-rejection is
+      # permanent); on exhaust the failure is logged at warn and a delivery metric
+      # counts result="failed", NEVER blocking the report write or the FSM. Off by
+      # default (opt-in). The webhook_url is a SECRET (a Slack/PagerDuty URL embeds a
+      # token): supply it via the NOTIFICATIONS_WEBHOOK_URL env var (which overrides
+      # this value); it is scrubbed (host only) in all logs, never this file.
+      notifications:
+        enabled: false
+        webhook_url: ""
+        retry_max_attempts: 5
+        retry_min_seconds: 1
+        retry_max_seconds: 30
+        timeout_seconds: 5
     
     # Story 3.1: the Ring-5 report layer. The redact sub-block gates the
     # AUDIT.redactions SIEM emission (FR41); redaction itself is ALWAYS applied at
