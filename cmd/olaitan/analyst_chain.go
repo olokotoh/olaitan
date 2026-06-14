@@ -18,6 +18,7 @@ import (
 	"github.com/olokotoh/olaitan/internal/config"
 	"github.com/olokotoh/olaitan/internal/decision/analyst"
 	"github.com/olokotoh/olaitan/internal/metrics"
+	"github.com/olokotoh/olaitan/internal/report/dfir"
 	reportredact "github.com/olokotoh/olaitan/internal/report/redact"
 	responseaudit "github.com/olokotoh/olaitan/internal/response/audit"
 	"github.com/olokotoh/olaitan/internal/schema"
@@ -163,6 +164,101 @@ func buildRoleProvider(family, model string, cfg *config.Config, apiKey string, 
 		}, reg, sink, log)
 	default:
 		return nil, fmt.Errorf("analyst: unknown provider family %q", family)
+	}
+}
+
+// dfirAuditRecorder projects a DFIR generation record onto AUDIT.assessments
+// via the role-keyed "dfir" maps, alongside the existing l1/l2/senior keys
+// (Story 4.4 AC5). It is the cmd-side ring bridge: cmd is the only ring that
+// imports both internal/report/dfir and internal/response/audit (+ redact), so
+// the projection lives here, keeping the dfir package free of an audit/redact
+// import. It satisfies dfir.AuditRecorder.
+type dfirAuditRecorder struct {
+	pub responseaudit.AssessmentAuditPublisher
+	log *slog.Logger
+}
+
+// RecordDFIRAssessment redacts the evidence at the audit boundary (the same pure
+// Redact() the provider ran, reproducing the bytes the LLM saw) and publishes a
+// minimal AUDIT.assessments event carrying the "dfir" prompt-version / provider
+// / model row. The mode is "dfir" so an audit consumer can distinguish the DFIR
+// post-mortem row from the L1/L2/Senior chain rows. No L1/L2/Senior verdict and
+// no LLM-capped confidence is carried (the trust-bound fence: the report never
+// produces a ThreatAssessment or a confidence the FSM could fold).
+func (r dfirAuditRecorder) RecordDFIRAssessment(ctx context.Context, rec dfir.DFIRAuditRecord) error {
+	redacted, _ := reportredact.Redact(rec.RedactedEvidence)
+	evt := responseaudit.AssessmentFromChain(responseaudit.AssessmentInput{
+		PackageID:        rec.PackageID,
+		WorkloadID:       rec.WorkloadID,
+		Mode:             "dfir",
+		AgentsAvailable:  []string{"dfir"},
+		PromptVersions:   nonEmptyRoleMap("dfir", rec.PromptVersion),
+		Providers:        nonEmptyRoleMap("dfir", rec.Provider),
+		Models:           nonEmptyRoleMap("dfir", rec.Model),
+		RedactedEvidence: redacted,
+		RedactionApplied: true,
+		Now:              rec.Now,
+	})
+	return r.pub.PublishAuditAssessment(ctx, evt)
+}
+
+// nonEmptyRoleMap returns a single-entry {role: val} map, or nil when val is
+// empty (a fail-closed degrade may carry no model/version), so omitempty omits
+// the field rather than emitting a "" value.
+func nonEmptyRoleMap(role, val string) map[string]string {
+	if val == "" {
+		return nil
+	}
+	return map[string]string{role: val}
+}
+
+// dfirMaxTokens is the per-construction output ceiling for the DFIR claude
+// provider (BI-7). A forensic report is long-form, so the shared
+// DefaultMaxTokens=4096 is too small; 16000 is the long-form floor well within
+// the SAFE NON-STREAMING band (the provider is hard-wired non-streaming, and the
+// claude-api guidance warns non-streaming requests risk SDK HTTP timeouts above
+// ~16K; Opus 4.8's 128K ceiling would require streaming, which is out of scope).
+// Raised via per-construction Config.MaxTokens WITHOUT mutating the shared
+// default. The runner treats a max_tokens truncation as a fail-closed failure.
+const dfirMaxTokens int64 = 16000
+
+// buildDFIRProvider constructs the DFIR agent's own LLM provider from
+// analyst.dfir_provider / analyst.dfir_model (FR43), mirroring the per-role
+// chain providers but with the raised dfirMaxTokens output ceiling on the claude
+// path. It returns ("", degrade) semantics via roleSpec: a degraded resolution
+// (no key, no model, provider:none) yields (nil, nil) so the caller skips DFIR
+// wiring and the aggregator runs without the DFIR agent (the chain-degrade
+// precedent). A genuine misconfiguration is fatal.
+func buildDFIRProvider(cfg *config.Config, apiKey string, reg *metrics.Registry, sink *reportredact.RedactionAuditSink, log *slog.Logger) (provider.Provider, error) {
+	family, model, degrade := roleSpec(cfg.Analyst.DFIRProvider, cfg.Analyst.DFIRModel, cfg, apiKey)
+	if degrade != "" {
+		log.Info("aggregator: DFIR agent not wired; no forensic reports generated",
+			"role", "dfir", "reason", degrade, "provider", family, "api_key_set", apiKey != "", "model_set", model != "")
+		return nil, nil
+	}
+	scoreCap := roleScoreCap(family, cfg.Analyst.ScoreCap)
+	switch strings.ToLower(family) {
+	case "claude":
+		return claudeprovider.New(claudeprovider.Config{
+			Model:     model,
+			BaseURL:   cfg.Analyst.API.Endpoint,
+			MaxTokens: dfirMaxTokens,
+			ScoreCap:  scoreCap,
+		}, apiKey, reg, sink, log)
+	case "openai":
+		return openaiprovider.New(openaiprovider.Config{
+			Model:    model,
+			BaseURL:  cfg.Analyst.API.Endpoint,
+			ScoreCap: scoreCap,
+		}, apiKey, reg, sink, log)
+	case "ollama":
+		return ollamaprovider.New(ollamaprovider.Config{
+			Model:    model,
+			Endpoint: cfg.Analyst.Local.Endpoint,
+			ScoreCap: scoreCap,
+		}, reg, sink, log)
+	default:
+		return nil, fmt.Errorf("aggregator: unknown DFIR provider family %q", family)
 	}
 }
 

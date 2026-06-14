@@ -874,6 +874,13 @@ response:
     enabled: false
     windowSeconds: 60
     retentionDays: 365
+  # Story 4.4: DFIR forensic-report agent (FR43). When enabled, a durable
+  # JetStream consumer on INCIDENTS.finalised produces an analyst-grade
+  # ForensicReport via the LLM provider and announces it on REPORTS.generated.
+  # The DFIR LLM provider/model are config under analyst.dfir_provider /
+  # analyst.dfir_model. Off by default (opt-in).
+  dfir:
+    enabled: false
 
 # Story 1.19: Evaluation matrix configuration (FR53). One-flag switch
 # that places the chart into one of the canonical evaluation arms (F,
@@ -952,6 +959,14 @@ analyst:
   l2_model: ""
   senior_provider: ""
   senior_model: ""
+
+  # Story 4.4 (FR43): the DFIR forensic-report agent's own LLM provider/model,
+  # mirroring the per-role knobs above. dfir_provider is a concrete family
+  # {claude, openai, ollama, none} or "" to inherit the top-level mapping. The
+  # DFIR agent is gated by response.dfir.enabled (a separate JetStream consumer,
+  # not a chain tier). Empty values keep the file-side defaults.
+  dfir_provider: ""
+  dfir_model: ""
 
   # Story 3.8 (FR53): RSLT ablation toggles. l2_enabled: false = L1-only
   # (Senior also off); senior_enabled: false = L1+L2. Both default true.

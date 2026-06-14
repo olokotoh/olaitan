@@ -148,6 +148,7 @@ func TestConstants(t *testing.T) {
 		"AuditPolicies":     "AUDIT.policies",
 		"AuditRedactions":   "AUDIT.redactions",
 		"IncidentFinalised": "INCIDENTS.finalised",
+		"ReportsGenerated":  "REPORTS.generated",
 	}
 	got := map[string]string{
 		"RawFalco":          subjects.RawFalco,
@@ -167,6 +168,7 @@ func TestConstants(t *testing.T) {
 		"AuditPolicies":     subjects.AuditPolicies,
 		"AuditRedactions":   subjects.AuditRedactions,
 		"IncidentFinalised": subjects.IncidentFinalised,
+		"ReportsGenerated":  subjects.ReportsGenerated,
 	}
 	for k, v := range want {
 		if got[k] != v {

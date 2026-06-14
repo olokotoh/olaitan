@@ -287,6 +287,13 @@ response:
     enabled: false
     window_seconds: 60
     retention_days: 365
+  # Story 4.4: DFIR forensic-report agent (FR43). When enabled, a durable
+  # JetStream consumer on INCIDENTS.finalised produces an analyst-grade
+  # ForensicReport (Markdown with YAML front-matter) via the LLM provider and
+  # announces it on REPORTS.generated. The DFIR LLM provider/model are config
+  # under analyst.dfir_provider / analyst.dfir_model. Off by default (opt-in).
+  dfir:
+    enabled: false
 
 # Story 3.1: the Ring-5 report layer. The redact sub-block gates the
 # AUDIT.redactions SIEM emission (FR41); redaction itself is ALWAYS applied at
@@ -325,6 +332,14 @@ analyst:
   senior_provider: ""
   senior_model: ""
   senior_enabled: true
+  # Story 4.4 (FR43): the DFIR forensic-report agent's own LLM provider/model,
+  # mirroring the per-role knobs above. dfir_provider is a concrete family
+  # {claude, openai, ollama, none} or "" to inherit the top-level mapping
+  # (api -> claude, local -> ollama). The DFIR agent is gated by
+  # response.dfir.enabled and is a separate JetStream consumer, not a chain
+  # tier. configmap.yaml bridges Helm values over these.
+  dfir_provider: ""
+  dfir_model: ""
   # Story 3.9 (FR29): INVESTIGATIONS checkpoint stream retention. 6h is the
   # architecture default (just enough for controller-restart resume); a
   # Helm value bridges over this.

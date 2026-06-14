@@ -618,6 +618,18 @@ data:
     {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" (index $se $k)) }}
     {{- end }}
     {{- end }}
+    {{- /*
+    Story 4.4: DFIR forensic-report agent overlay (FR43). Bridges
+    response.dfir.enabled onto the config/olaitan.yaml response.dfir block. The
+    enable anchor is parent-anchored under `dfir:` (the only `dfir:` block under
+    response:), so it cannot match another `enabled: false`.
+    */ -}}
+    {{- $de := $rsp.dfir | default dict }}
+    {{- if hasKey $de "enabled" }}
+    {{- $p := "(\\n  dfir:\\n    enabled: )(?:true|false)" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.dfir.enabled anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" $de.enabled) }}
+    {{- end }}
     {{- end }}
     {{- /*
     Story 1.19: Evaluation-matrix overlay (FR53). Replace the file-side
@@ -742,7 +754,7 @@ data:
            Each anchor is the unique 2-space-indented key in
            config/olaitan.yaml; $-doubling + toString match the local.*
            bridges above. */ -}}
-    {{- range $field := list "l1_provider" "l1_model" "l2_provider" "l2_model" "senior_provider" "senior_model" }}
+    {{- range $field := list "l1_provider" "l1_model" "l2_provider" "l2_model" "senior_provider" "senior_model" "dfir_provider" "dfir_model" }}
     {{- with index $analystVals $field }}
     {{- $pRole := printf "(\\n  )%s:[^\\n]*" $field -}}
     {{- if not (mustRegexFind $pRole $cfg) }}{{- fail (printf "helm bridge: overlay anchor for analyst.%s not found (pattern %q)" $field $pRole) }}{{- end }}

@@ -105,6 +105,18 @@ const EvidencePackages = EvidencePrefix + "packages"
 // INCIDENTS JetStream stream (internal/nats/streams.go). [Story 4.3 BI-4]
 const IncidentFinalised = "INCIDENTS.finalised"
 
+// ReportsGenerated is the Story 4.4 published subject on which the DFIR
+// forensic-report agent announces a generated ForensicReport (FR43, AC5): one
+// event per finalised incident the agent reports on, carrying the report SHA256
+// and the content-addressed report URL (the durable S3-compatible write itself
+// is Story 4.6). It follows the same literal dotted-UPPER published-contract
+// naming as IncidentFinalised / the AUDIT.* family (distinct from the lower-case
+// olaitan.* per-pod operational subjects). Like IncidentFinalised it is a FIXED
+// (non-templated) contract, so it is a plain const, NOT a token-validated
+// builder, and a NEW subject family: it is deliberately NOT folded under an
+// existing prefix. [Story 4.4 BI-10]
+const ReportsGenerated = "REPORTS.generated"
+
 // Health: per-ring health status.
 const (
 	HealthPrefix    = "olaitan.health."
