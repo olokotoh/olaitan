@@ -363,9 +363,13 @@ func TestReconcile_NormalisesPlusFormPreservedKilled(t *testing.T) {
 	}
 }
 
-// TestReconcile_RejectsPreservedKilledFromNonQuarantined pins BI-6.3: a
-// PRESERVED_KILLED override on a non-QUARANTINED workload is rejected inside the
-// FSM (Pin guard) and never pins; the apply path logs and does not write Redis.
+// TestReconcile_RejectsPreservedKilledFromNonQuarantined pins BI-6.3 + Story 4.1
+// round-1 Finding 1: a PRESERVED_KILLED override on a non-QUARANTINED workload is
+// rejected inside the FSM (Pin guard) and never pins. SAFETY is unchanged (no
+// Redis write, no pin, no state change), AND the rejected operator action is now
+// AUDITABLE: it increments olaitan_response_override_rejected_total{invalid_state}
+// and emits one rejected event, rather than being warn-log-only. The
+// state_unavailable series stays at 0 (it is no longer used for this state).
 func TestReconcile_RejectsPreservedKilledFromNonQuarantined(t *testing.T) {
 	ctx := context.Background()
 	mr := startMiniredis(t)
@@ -388,6 +392,16 @@ func TestReconcile_RejectsPreservedKilledFromNonQuarantined(t *testing.T) {
 	}
 	if got := counterValue(t, reg, "olaitan_response_override_rejected_total", "state_unavailable"); got != 0 {
 		t.Errorf("rejected counter{state_unavailable} = %v, want 0 (state_unavailable no longer used for PRESERVED_KILLED)", got)
+	}
+	// Finding 1: the illegal skip-into is now auditable (invalid_state) rather
+	// than silently warn-logged. A mutation removing the emitRejection call in
+	// the Pin-error path fails BOTH the counter and the event assertions below.
+	if got := counterValue(t, reg, "olaitan_response_override_rejected_total", "invalid_state"); got != 1 {
+		t.Errorf("rejected counter{invalid_state} = %v, want 1 (Pin skip-into rejection must be auditable)", got)
+	}
+	evts := pub.all()
+	if len(evts) != 1 || !evts[0].Rejected || evts[0].Reason != ReasonInvalidState {
+		t.Fatalf("events = %+v, want one rejected event reason=invalid_state (Finding 1)", evts)
 	}
 }
 

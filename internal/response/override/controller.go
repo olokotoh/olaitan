@@ -2,6 +2,7 @@ package override
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -572,6 +573,25 @@ func (c *Controller) applyDesired(ctx context.Context, workloadID string, d desi
 	alreadyPinnedSame := wasPinned && prevPinned == d.state
 
 	if err := c.machine.Pin(workloadID, d.state, d.operatorID); err != nil {
+		// Story 4.1 (Finding 1): a PRESERVED_KILLED override that passed the
+		// pre-filter but is an illegal skip-into (current != QUARANTINED) is
+		// rejected inside Pin with ErrInvalidOverrideState. The SAFETY behaviour
+		// is unchanged (no Redis write, no pin, no state change), but the rejected
+		// operator action must be AUDITABLE rather than warn-log-only: emit the
+		// same rejected event + increment the rejection counter the pre-filter
+		// path uses, reusing the existing invalid_state reason (no new schema).
+		// Scope is narrow: only ErrInvalidOverrideState routes here; any other
+		// Pin error stays a defensive warn-log.
+		if errors.Is(err, fsm.ErrInvalidOverrideState) {
+			c.emitRejection(ctx, desired{
+				workloadID:   workloadID,
+				state:        d.state,
+				source:       d.source,
+				rejectReason: ReasonInvalidState,
+				requestedRaw: string(d.state),
+			})
+			return
+		}
 		// A validated state should never be rejected here; log defensively.
 		c.log.Warn("override: pin failed", "workload_id", workloadID, "state", d.state, "err", err)
 		return

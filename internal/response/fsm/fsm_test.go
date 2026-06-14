@@ -321,9 +321,12 @@ func TestKill_ScoreDipResetsSustainWindow(t *testing.T) {
 	}
 }
 
-// TestKill_BenignNeverKills pins BI-12/FR55 at the unit level: a QUARANTINED
-// workload whose score sits in the benign band can never be killed (and indeed
-// de-escalates), since the kill threshold 90 is far above the benign band.
+// TestKill_DwellSinceQuarantineRequired pins BI-5.1: a QUARANTINED workload fed
+// a kill-level score (>= 90) at the SAME instant QUARANTINED was applied is NOT
+// killed on the first post-quarantine evaluation, because the dwell-since the
+// QUARANTINED apply is zero and the kill condition requires it to be >= the
+// kill-sustain window. The QUARANTINED-dwell clock, not just the at-or-above-kill
+// window, must be satisfied.
 func TestKill_DwellSinceQuarantineRequired(t *testing.T) {
 	clock := newFakeClock()
 	m, _ := climbToQuarantinedForKill(t, clock)

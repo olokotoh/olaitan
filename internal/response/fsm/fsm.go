@@ -413,6 +413,19 @@ func nextUp(s PodState) PodState {
 //     (now - stateEnteredAt >= sustain), the "300 s after the QUARANTINED
 //     apply" anchor (BI-5.1).
 //
+// Clock 3 (now - stateEnteredAt >= killSustain) is, in steady-state operation,
+// a defensive redundancy: while the process runs, stateEnteredAt is set to the
+// QUARANTINED apply instant and lastBelowKillThresholdAt is reseeded on every
+// sub-kill score, so clock 2 dominates and clock 3 rarely binds independently.
+// It becomes INDEPENDENTLY binding only after Restore (Story 2.3): Restore seeds
+// stateEnteredAt from the persisted Redis hash (which can be far in the past for
+// a long-quarantined workload) while reseeding lastBelowKillThresholdAt to
+// restart-now (the kill anchor is in-memory only, so it cannot be recovered).
+// Without clock 2's reseed dominating after restart, clock 3 alone would
+// otherwise let a freshly-restarted controller kill a long-quarantined workload
+// on the first sustained kill score; clock 2's restart-now reseed is what
+// actually defers the kill until a fresh post-restart sustain window elapses.
+//
 // The caller has already established ws.current == QUARANTINED.
 func (m *Machine) killConditionMet(t thresholds, ws *workloadState, score float64, now time.Time) bool {
 	if score < t.killThreshold {
