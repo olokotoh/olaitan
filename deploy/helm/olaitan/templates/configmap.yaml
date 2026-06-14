@@ -598,6 +598,26 @@ data:
     {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%q" (index $fo $k)) }}
     {{- end }}
     {{- end }}
+    {{- /*
+    Story 4.3: settling-window controller overlay (FR42/NFR7). Bridges
+    response.settling.{enabled,windowSeconds,retentionDays} onto the
+    config/olaitan.yaml response.settling block. The enable anchor is
+    disambiguated by the trailing window_seconds key so it cannot match another
+    `enabled: false`. window_seconds / retention_days are unquoted integers.
+    */ -}}
+    {{- $se := $rsp.settling | default dict }}
+    {{- if hasKey $se "enabled" }}
+    {{- $p := "(\\n  settling:\\n    enabled: )(?:true|false)(\\n    window_seconds:)" -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.settling.enabled anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v${2}" $se.enabled) }}
+    {{- end }}
+    {{- range $k, $cfgKey := dict "windowSeconds" "window_seconds" "retentionDays" "retention_days" }}
+    {{- if hasKey $se $k }}
+    {{- $p := printf "(\\n    %s: )[0-9]+" $cfgKey -}}
+    {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.settling.%s anchor not found (pattern %q)" $cfgKey $p) }}{{- end }}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v" (index $se $k)) }}
+    {{- end }}
+    {{- end }}
     {{- end }}
     {{- /*
     Story 1.19: Evaluation-matrix overlay (FR53). Replace the file-side

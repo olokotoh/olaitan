@@ -780,11 +780,47 @@ func TestInvestigationsStream(t *testing.T) {
 		t.Errorf("%s not under %q", l1, subjects.InvestigationPrefix)
 	}
 	// The operator retention override applies; a zero keeps the 6h default.
-	if got := findStreamFor(t, natsclient.StreamConfigsWithRetention(natsclient.AuditRetention{}, 2*time.Hour), wildcard).MaxAge; got != 2*time.Hour {
+	if got := findStreamFor(t, natsclient.StreamConfigsWithRetention(natsclient.AuditRetention{}, 2*time.Hour, 0), wildcard).MaxAge; got != 2*time.Hour {
 		t.Errorf("override MaxAge = %s, want 2h", got)
 	}
-	if got := findStreamFor(t, natsclient.StreamConfigsWithRetention(natsclient.AuditRetention{}, 0), wildcard).MaxAge; got != 6*time.Hour {
+	if got := findStreamFor(t, natsclient.StreamConfigsWithRetention(natsclient.AuditRetention{}, 0, 0), wildcard).MaxAge; got != 6*time.Hour {
 		t.Errorf("zero override MaxAge = %s, want 6h default", got)
+	}
+}
+
+// TestStreamConfigsCoversIncidentsFinalised pins Story 4.3 (BI-5): the new
+// INCIDENTS stream (the 12th) covers subjects.IncidentFinalised with a 365 d
+// audit-grade default retention, LimitsPolicy + FileStorage (NFR16 append-only:
+// the DFIR trigger-of-record must not be deletable by a consumer ack), a >= 2 m
+// dedup window, and MaxBytes 0 so it inherits the per-stream cap. It mirrors
+// TestStreamConfigsCoversOverridesApplied.
+func TestStreamConfigsCoversIncidentsFinalised(t *testing.T) {
+	cfg := findStreamFor(t, natsclient.StreamConfigs(), subjects.IncidentFinalised)
+	if cfg.Name != "INCIDENTS" {
+		t.Errorf("subjects.IncidentFinalised covered by stream %q, want INCIDENTS", cfg.Name)
+	}
+	if want := 365 * 24 * time.Hour; cfg.MaxAge != want {
+		t.Errorf("INCIDENTS MaxAge = %s, want %s (365 d audit-grade default)", cfg.MaxAge, want)
+	}
+	if cfg.Retention != jetstream.LimitsPolicy {
+		t.Errorf("INCIDENTS Retention = %v, want LimitsPolicy (NFR16 append-only trigger-of-record)", cfg.Retention)
+	}
+	if cfg.Storage != jetstream.FileStorage {
+		t.Errorf("INCIDENTS Storage = %v, want FileStorage", cfg.Storage)
+	}
+	if cfg.Duplicates < 2*time.Minute {
+		t.Errorf("INCIDENTS Duplicates = %s, want >= 2m for WithMsgID dedup", cfg.Duplicates)
+	}
+	if cfg.MaxBytes != 0 {
+		t.Errorf("INCIDENTS MaxBytes = %d, want 0 (inherits the per-stream cap)", cfg.MaxBytes)
+	}
+	// The settling-window retention override applies (Open Assumption 4); a
+	// zero keeps the 365 d default.
+	if got := findStreamFor(t, natsclient.StreamConfigsWithRetention(natsclient.AuditRetention{}, 0, 30*24*time.Hour), subjects.IncidentFinalised).MaxAge; got != 30*24*time.Hour {
+		t.Errorf("INCIDENTS override MaxAge = %s, want 30d", got)
+	}
+	if got := findStreamFor(t, natsclient.StreamConfigsWithRetention(natsclient.AuditRetention{}, 0, 0), subjects.IncidentFinalised).MaxAge; got != 365*24*time.Hour {
+		t.Errorf("INCIDENTS zero override MaxAge = %s, want 365d default", got)
 	}
 }
 

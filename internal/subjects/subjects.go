@@ -91,6 +91,20 @@ const (
 // EvidencePackages is the Ring-2 EvidencePackage subject.
 const EvidencePackages = EvidencePrefix + "packages"
 
+// IncidentFinalised is the Story 4.3 published subject on which the settling-
+// window controller emits one event when a workload's FSM has been stable in a
+// non-CLEAN state for the configured settling window (default 60 s, FR42). The
+// event carries package_id, workload_id, the final state, the ThreatScore at
+// finalisation, and the full FSM history; the Story 4.4 DFIR agent consumes it.
+// It follows the architecture's literal dotted-UPPER published-contract naming
+// (the OverridesApplied / AUDIT.* precedent, distinct from the lower-case
+// olaitan.* per-pod operational subjects). It is a FIXED (non-templated)
+// contract, so it is a plain const, NOT a token-validated builder, and it is a
+// NEW subject family: it is deliberately NOT folded under the INVESTIGATIONS.
+// prefix (in-flight L1/L2 checkpoints, a different family). It rides its own
+// INCIDENTS JetStream stream (internal/nats/streams.go). [Story 4.3 BI-4]
+const IncidentFinalised = "INCIDENTS.finalised"
+
 // Health: per-ring health status.
 const (
 	HealthPrefix    = "olaitan.health."

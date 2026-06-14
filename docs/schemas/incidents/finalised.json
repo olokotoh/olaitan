@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/olokotoh/olaitan/docs/schemas/incidents/finalised.json",
+  "title": "INCIDENTS.finalised (incidents.finalised.v1)",
+  "description": "Story 4.3 settling-window finalisation trigger. AUTHORITATIVE validation source for INCIDENTS.finalised; finalised.yaml is the human-readable mirror. Published when a workload's FSM has been stable in a non-CLEAN state for the full settling window (default 60s, FR42); the Story 4.4 DFIR agent consumes it. final_state is one of the four non-CLEAN states (CLEAN never finalises, AC4). threat_score is the Confidence on the transition that established the final state, captured at entry and NOT re-sampled at expiry (BI-7). history is the full FSM transition history. Source of truth for the Go shape: internal/response/settling/events.go (type IncidentFinalised).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "package_id",
+    "workload_id",
+    "final_state",
+    "threat_score",
+    "finalised_at",
+    "history"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "incidents.finalised.v1"},
+    "package_id": {"type": "string"},
+    "workload_id": {"type": "string"},
+    "final_state": {"type": "string", "enum": ["SUSPICIOUS", "RESTRICTED", "QUARANTINED", "PRESERVED_KILLED"]},
+    "threat_score": {"type": "number"},
+    "finalised_at": {"type": "string", "format": "date-time"},
+    "history": {
+      "type": ["array", "null"],
+      "items": {"$ref": "#/$defs/state_transition"}
+    }
+  },
+  "$defs": {
+    "state_transition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["timestamp", "from_state", "to_state", "trigger_type", "confidence"],
+      "properties": {
+        "timestamp": {"type": "string", "format": "date-time"},
+        "pod": {"type": "object"},
+        "from_state": {"type": "string", "enum": ["CLEAN", "SUSPICIOUS", "RESTRICTED", "QUARANTINED", "PRESERVED_KILLED"]},
+        "to_state": {"type": "string", "enum": ["CLEAN", "SUSPICIOUS", "RESTRICTED", "QUARANTINED", "PRESERVED_KILLED"]},
+        "trigger_type": {"type": "string", "enum": ["automated", "override"]},
+        "confidence": {"type": "number"},
+        "trigger_events": {"type": "array", "items": {"type": "string"}},
+        "operator_id": {"type": "string"},
+        "workload_id": {"type": "string"},
+        "package_id": {"type": "string"},
+        "reason": {"type": "string", "enum": ["escalation_threshold_crossed", "dwell_guard_elapsed", "de_escalation_cooldown_expired", "no_transition", "operator_override", "kill_condition_met"]}
+      }
+    }
+  }
+}

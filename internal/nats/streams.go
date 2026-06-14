@@ -196,6 +196,40 @@ var streamConfigs = []jetstream.StreamConfig{
 		// for the full 6 h retention, not just the dedup window).
 		MaxMsgsPerSubject: 1,
 	},
+	{
+		// INCIDENTS carries the Story 4.3 settling-window finalisation events
+		// (subjects.IncidentFinalised, FR42): one IncidentFinalised per workload
+		// that stayed stable in a non-CLEAN FSM state past the settling window
+		// (default 60 s). The event carries package_id, workload_id, the final
+		// state, the ThreatScore at finalisation, and the full FSM history; the
+		// Story 4.4 DFIR agent consumes it as its invocation trigger. This is the
+		// TWELFTH stream and a NEW stream family: it is NOT attached to
+		// INVESTIGATIONS (in-flight L1/L2 checkpoints) or EVIDENCE (BI-4/BI-5).
+		//
+		// 365 d retention by analogy with the AUDIT_* family (the finalisation
+		// event is audit-grade: it carries the full FSM history + final
+		// ThreatScore and is the trigger-of-record for a DFIR report), and
+		// Helm-tunable via StreamConfigsWithRetention's incidents argument so an
+		// operator can lengthen/shorten the DFIR-trigger archive independently.
+		// LimitsPolicy (NOT Interest/WorkQueue): the trigger-of-record must NOT
+		// be deletable by a consumer ack (NFR16 append-only discipline, mirroring
+		// the AUDIT_* streams). FileStorage for durability across restart.
+		// MaxBytes: 0 so the stream participates in the
+		// OLT_NATS_STREAM_MAXBYTES_OVERRIDE per-stream cap like its zero-MaxBytes
+		// siblings (and adds nothing to the production 160 GiB
+		// EVENTS/EVENTS_RAW/EVIDENCE budget). The controller publishes with
+		// jetstream.WithMsgID = package_id + ":" + finalising-transition-timestamp
+		// so a drainer re-publish (or a restart-replay within the 2 m dedup
+		// window) is server-side deduplicated, while a legitimately NEW incident
+		// for the same workload after a CLEAN cycle carries a distinct timestamp
+		// and is NOT suppressed (BI-8, Open Assumption 5).
+		Name:       "INCIDENTS",
+		Subjects:   []string{subjects.IncidentFinalised},
+		MaxAge:     defaultIncidentsFinalisedMaxAge,
+		Storage:    jetstream.FileStorage,
+		Retention:  jetstream.LimitsPolicy,
+		Duplicates: 2 * time.Minute,
+	},
 }
 
 // defaultAudit*MaxAge are the Story 2.8 AC4 retention defaults baked into
@@ -217,6 +251,11 @@ const (
 	// defaultInvestigationsMaxAge is the Story 3.9 checkpoint retention default
 	// (architecture.md:235): just enough for a controller-restart resume.
 	defaultInvestigationsMaxAge = 6 * time.Hour
+	// defaultIncidentsFinalisedMaxAge is the Story 4.3 INCIDENTS stream retention
+	// default: 365 d, audit-grade by analogy with the AUDIT_* family (the
+	// IncidentFinalised event is the trigger-of-record for a DFIR report and
+	// carries the full FSM history). Helm-tunable via StreamConfigsWithRetention.
+	defaultIncidentsFinalisedMaxAge = 365 * 24 * time.Hour
 )
 
 // AuditRetention carries the operator-tuned per-subject MaxAge for the
@@ -261,7 +300,7 @@ var auditStreamNames = map[string]func(AuditRetention) time.Duration{
 // fileStore.maxSize. Production deployments leave the env var unset
 // and size the NATS PVC to accommodate the configured sum.
 func StreamConfigs() []jetstream.StreamConfig {
-	return streamConfigsWith(AuditRetention{}, 0)
+	return streamConfigsWith(AuditRetention{}, 0, 0)
 }
 
 // StreamConfigsWithAudit returns StreamConfigs() with the three Story 2.8
@@ -271,19 +310,21 @@ func StreamConfigs() []jetstream.StreamConfig {
 // AC4's Helm-tunability drives the real stream MaxAge; callers that want the
 // pure architecture defaults use StreamConfigs() (a zero AuditRetention).
 func StreamConfigsWithAudit(ar AuditRetention) []jetstream.StreamConfig {
-	return streamConfigsWith(ar, 0)
+	return streamConfigsWith(ar, 0, 0)
 }
 
 // StreamConfigsWithRetention returns StreamConfigs() with the AUDIT_* MaxAge
-// overridden by ar AND the INVESTIGATIONS MaxAge overridden by investigations
-// (Story 3.9 AC4); a non-positive value leaves the baked-in default (the
-// architecture's 6 h for investigations). The aggregator threads its
-// analyst.checkpoint_retention config in here.
-func StreamConfigsWithRetention(ar AuditRetention, investigations time.Duration) []jetstream.StreamConfig {
-	return streamConfigsWith(ar, investigations)
+// overridden by ar, the INVESTIGATIONS MaxAge overridden by investigations
+// (Story 3.9 AC4), AND the INCIDENTS MaxAge overridden by incidents (Story 4.3
+// Open Assumption 4); a non-positive value leaves the baked-in default (the
+// architecture's 6 h for investigations, 365 d for incidents). The aggregator
+// threads its analyst.checkpoint_retention and response.settling.retention
+// config in here.
+func StreamConfigsWithRetention(ar AuditRetention, investigations, incidents time.Duration) []jetstream.StreamConfig {
+	return streamConfigsWith(ar, investigations, incidents)
 }
 
-func streamConfigsWith(ar AuditRetention, investigations time.Duration) []jetstream.StreamConfig {
+func streamConfigsWith(ar AuditRetention, investigations, incidents time.Duration) []jetstream.StreamConfig {
 	override := streamMaxBytesOverride()
 	out := make([]jetstream.StreamConfig, len(streamConfigs))
 	for i, cfg := range streamConfigs {
@@ -301,6 +342,9 @@ func streamConfigsWith(ar AuditRetention, investigations time.Duration) []jetstr
 		}
 		if c.Name == "INVESTIGATIONS" && investigations > 0 {
 			c.MaxAge = investigations
+		}
+		if c.Name == "INCIDENTS" && incidents > 0 {
+			c.MaxAge = incidents
 		}
 		out[i] = c
 	}

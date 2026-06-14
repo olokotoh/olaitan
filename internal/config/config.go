@@ -1062,6 +1062,96 @@ type ResponseConfig struct {
 	// secret keys are NFR8 secrets read from the environment (not YAML), the
 	// REDIS_PASSWORD precedent.
 	Forensics ForensicsConfig `yaml:"forensics,omitempty"`
+	// Story 4.3: settling sub-block gates the settling-window controller
+	// (FR42/NFR7). When enabled, a workload that stays stable in a non-CLEAN
+	// FSM state for window_seconds (default 60) finalises into an
+	// IncidentFinalised event on INCIDENTS.finalised. Enabled is pointer-tagged
+	// so an explicit `false` survives the loader; the controller is opt-in and
+	// defaults off.
+	Settling SettlingConfig `yaml:"settling,omitempty"`
+}
+
+// SettlingConfig configures the Story 4.3 settling-window controller (FR42).
+// When the FSM has held a workload in a non-CLEAN state for the full settling
+// window, the controller publishes an IncidentFinalised event to
+// INCIDENTS.finalised, which the Story 4.4 DFIR agent consumes. It mirrors
+// ForensicsConfig: Enabled is pointer-tagged so an explicit `false` survives
+// the loader (the NetworkPolicyConfig.Enabled precedent); the default is OFF
+// (opt-in).
+//
+// WindowSeconds is the settling window (default 60, FR42/NFR7); a non-positive
+// explicit value is rejected by validate(). RetentionDays is the INCIDENTS
+// JetStream stream MaxAge (Open Assumption 4): how long the DFIR-trigger archive
+// survives, audit-grade 365 d default by analogy with the AUDIT_* family,
+// Helm-tunable; a zero/unset selects the stream's baked-in 365 d default at the
+// wiring layer.
+type SettlingConfig struct {
+	Enabled       *bool `yaml:"enabled,omitempty"`
+	WindowSeconds *int  `yaml:"window_seconds,omitempty"`
+	RetentionDays *int  `yaml:"retention_days,omitempty"`
+}
+
+// DefaultSettlingWindowSeconds is the FR42/NFR7 settling window default (60s).
+const DefaultSettlingWindowSeconds = 60
+
+// DefaultSettlingRetentionDays is the INCIDENTS stream retention default,
+// audit-grade by analogy with the AUDIT_* family (Open Assumption 4).
+const DefaultSettlingRetentionDays = 365
+
+// DefaultSettling returns the Story 4.3 defaults: disabled, a 60s window, and a
+// 365d INCIDENTS retention.
+func DefaultSettling() SettlingConfig {
+	enabled := false
+	w := DefaultSettlingWindowSeconds
+	r := DefaultSettlingRetentionDays
+	return SettlingConfig{
+		Enabled:       &enabled,
+		WindowSeconds: &w,
+		RetentionDays: &r,
+	}
+}
+
+// EnabledOrDefault reports whether the settling controller is enabled, treating
+// a nil pointer as the default (false).
+func (s SettlingConfig) EnabledOrDefault() bool {
+	if s.Enabled == nil {
+		return false
+	}
+	return *s.Enabled
+}
+
+// WindowOrDefault returns the effective settling window, substituting the 60s
+// default when omitted.
+func (s SettlingConfig) WindowOrDefault() time.Duration {
+	if s.WindowSeconds == nil || *s.WindowSeconds <= 0 {
+		return DefaultSettlingWindowSeconds * time.Second
+	}
+	return time.Duration(*s.WindowSeconds) * time.Second
+}
+
+// RetentionOrZero returns the operator-tuned INCIDENTS stream MaxAge, or zero
+// when unset so the stream's baked-in 365d default applies at the wiring layer
+// (the analyst.checkpoint_retention precedent). A non-positive value yields
+// zero (keep the default).
+func (s SettlingConfig) RetentionOrZero() time.Duration {
+	if s.RetentionDays == nil || *s.RetentionDays <= 0 {
+		return 0
+	}
+	return time.Duration(*s.RetentionDays) * 24 * time.Hour
+}
+
+// validate enforces SettlingConfig invariants: an explicitly-set window and
+// retention must be positive. A fully-omitted block skips validation so
+// in-memory fixtures can leave it zero; Load substitutes DefaultSettling before
+// Validate when settling is enabled.
+func (s SettlingConfig) validate() error {
+	if s.WindowSeconds != nil && *s.WindowSeconds < 1 {
+		return fmt.Errorf("response.settling.window_seconds: must be >= 1 (got %d)", *s.WindowSeconds)
+	}
+	if s.RetentionDays != nil && *s.RetentionDays < 1 {
+		return fmt.Errorf("response.settling.retention_days: must be >= 1 (got %d)", *s.RetentionDays)
+	}
+	return nil
 }
 
 // ForensicsConfig configures the Story 4.2 forensic capture controller (FR36).
@@ -1904,6 +1994,22 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
+	// Story 4.3: substitute the settling defaults so an omitted Enabled stays
+	// off, an omitted window defaults to 60s, and an omitted INCIDENTS retention
+	// defaults to 365d.
+	{
+		defSettling := DefaultSettling()
+		if cfg.Response.Settling.Enabled == nil {
+			cfg.Response.Settling.Enabled = defSettling.Enabled
+		}
+		if cfg.Response.Settling.WindowSeconds == nil {
+			cfg.Response.Settling.WindowSeconds = defSettling.WindowSeconds
+		}
+		if cfg.Response.Settling.RetentionDays == nil {
+			cfg.Response.Settling.RetentionDays = defSettling.RetentionDays
+		}
+	}
+
 	// Story 3.1: substitute the redact defaults so an enabled redact block with
 	// an omitted retention inherits the 365 d default, and an omitted
 	// AuditEnabled stays off (redaction itself is always on, BI-7).
@@ -2119,6 +2225,9 @@ func (r ResponseConfig) validate() error {
 		return err
 	}
 	if err := r.Forensics.validate(); err != nil {
+		return err
+	}
+	if err := r.Settling.validate(); err != nil {
 		return err
 	}
 	return nil

@@ -277,6 +277,16 @@ response:
     # per PUT, so an empty alias would persist unredacted forensic logs with no
     # agent-applied encryption (config load fails fast in that case).
     kms_key_alias: ""
+  # Story 4.3: settling-window controller (FR42/NFR7). When enabled, a workload
+  # that stays stable in a non-CLEAN FSM state for window_seconds (default 60)
+  # finalises into an IncidentFinalised event on INCIDENTS.finalised, which the
+  # Story 4.4 DFIR agent consumes. retention_days drives the INCIDENTS JetStream
+  # stream MaxAge (365 d, append-only via LimitsPolicy, audit-grade like the
+  # AUDIT_* family). Off by default.
+  settling:
+    enabled: false
+    window_seconds: 60
+    retention_days: 365
 
 # Story 3.1: the Ring-5 report layer. The redact sub-block gates the
 # AUDIT.redactions SIEM emission (FR41); redaction itself is ALWAYS applied at
