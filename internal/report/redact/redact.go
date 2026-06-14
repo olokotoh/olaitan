@@ -134,6 +134,25 @@ const (
 	ReasonFileContents  = "file_contents"
 )
 
+// Source* are the closed source discriminators carried on the persistence-bound
+// AUDIT.redactions events (Story 4.5 AC4). They name the report region a
+// redaction fired in so a SIEM consumer can attribute it: an EvidencePackage
+// field (the LLM-bound Redact() default), the model-supplied narrative, a
+// posture finding, or an audit-metadata field. They are the authoritative
+// source for the docs/schemas/audit/redactions.json source enum; keeping them
+// as constants means a call site and the schema cannot drift.
+//
+// SourceEvidence is the natural default for the LLM-bound Redact() path (its
+// events describe redactions inside an EvidencePackage). The pre-4.5 LLM-bound
+// producers leave Source empty (the zero value), which the schema/consumer
+// treats as evidence, so they stay byte-identical on the wire (BI-7/BI-8).
+const (
+	SourceEvidence    = "evidence"
+	SourceLLMResponse = "llm_response"
+	SourcePosture     = "posture"
+	SourceAudit       = "audit"
+)
+
 // redactedToken is the literal replacement for a secret-keyed value (AC1).
 const redactedToken = "<REDACTED>"
 
@@ -242,6 +261,12 @@ type RedactionEvent struct {
 	FieldPath string
 	// Reason is one of the Reason* constants (BI-4.3).
 	Reason string
+	// Source is one of the Source* constants naming the report region the
+	// redaction fired in (Story 4.5 AC4). EMPTY on the LLM-bound Redact() path
+	// (the consumer treats empty as evidence), set per-region on the
+	// persistence-bound path. The empty zero value keeps the Story 3.1 producers
+	// byte-identical (BI-7/BI-8).
+	Source string
 	// WorkloadID is the package's WorkloadID, carried for SIEM correlation.
 	WorkloadID string
 	// RedactedAt is the redaction decision time (distinct from the audit
@@ -524,6 +549,117 @@ func (w *walker) record(path, reason string) {
 		WorkloadID: w.workloadID,
 		RedactedAt: w.now,
 	})
+}
+
+// RedactText is the EXPORTED text-redactor (Story 4.5 AC1/BI-1): it runs the
+// SAME pattern engine the EvidencePackage walk uses (keyValueSecretScan +
+// jwtScan, plus a `key: value` secret-key pass) over an ARBITRARY string,
+// returning the rewritten string and the ordered redaction events. It is the
+// ONE pattern engine reused by BOTH the LLM-bound Redact() (via the shared
+// helpers) AND the persistence-bound path (the DFIR agent calls RedactText on
+// the rendered report regions), so there is NO second redaction code path.
+//
+// The caller stamps Source/WorkloadID/PackageID per region; RedactText leaves
+// Source empty (the caller decides the region) and stamps RedactedAt = now so
+// the persistence-bound AUDIT.redactions events carry a decision time exactly as
+// the EvidencePackage path does. FieldPath is left to the caller's region label
+// (RedactText cannot know the report's field layout); the caller prefixes it.
+//
+// Scan order mirrors the walk's Summary/Tags handling: the key=value secret scan
+// first (it consumes a `key=value` shape's right-hand side), then a `key: value`
+// secret-key pass (the YAML front-matter shape), then the shared JWT scan over
+// the remaining text. The key/value passes are line-oriented so a rendered
+// multi-line region (front-matter or a Markdown body) is scanned line by line.
+func RedactText(s string) (string, []RedactionEvent) {
+	now := time.Now().UTC()
+	rewritten, events := redactTextAt(s, now)
+	return rewritten, events
+}
+
+// redactTextAt is RedactText with an injected decision time so the persistence
+// caller can stamp a single consistent RedactedAt across a report's regions
+// (matching Redact()'s single per-call now), and the unit tests can pin it.
+func redactTextAt(s string, now time.Time) (string, []RedactionEvent) {
+	var events []RedactionEvent
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		// key=value secret scan (the Tags/Summary precedent): splits on the first
+		// `=`, applies isSecretKey to the left side, redacts the right side.
+		if redacted, ok := keyValueSecretScan(line); ok {
+			line = redacted
+			events = append(events, RedactionEvent{Reason: ReasonSecretPattern, RedactedAt: now})
+		}
+		// key: value secret scan (the YAML front-matter shape): splits on the
+		// first `:`, applies isSecretKey to the trimmed (and YAML-unquoted) left
+		// side, redacts the right side. A line with no `:`, or a benign key, is
+		// left intact (no over-redaction).
+		if redacted, ok := colonValueSecretScan(line); ok {
+			line = redacted
+			events = append(events, RedactionEvent{Reason: ReasonSecretPattern, RedactedAt: now})
+		}
+		// Shared JWT scan over every line (one jwt_body event per occurrence),
+		// identical to the walk's per-string-value JWT scan.
+		if redacted, n := jwtScan(line); n > 0 {
+			line = redacted
+			for j := 0; j < n; j++ {
+				events = append(events, RedactionEvent{Reason: ReasonJWTBody, RedactedAt: now})
+			}
+		}
+		lines[i] = line
+	}
+	return strings.Join(lines, "\n"), events
+}
+
+// colonValueSecretScan applies a `key: value` secret scan to a single text line
+// (the YAML front-matter / Markdown shape, the colon analogue of
+// keyValueSecretScan). It splits on the FIRST `:`, trims and YAML-unquotes the
+// left-hand side, applies isSecretKey, and replaces the right-hand side with
+// <REDACTED> when it matches. A list-item dash prefix (`- `) and a leading
+// indent are preserved. A line with no `:`, or a benign key, is returned
+// unchanged with false (no over-redaction). It deliberately does NOT redact a
+// bare URL `scheme://...` (the left side `https` is not a secret key), and a
+// trailing `:` with no value is left intact.
+func colonValueSecretScan(line string) (string, bool) {
+	i := strings.IndexByte(line, ':')
+	if i < 0 {
+		return line, false
+	}
+	left := line[:i]
+	right := line[i+1:]
+	if strings.TrimSpace(right) == "" {
+		return line, false
+	}
+	// Strip a leading indent and a Markdown/YAML list dash so the key is the bare
+	// token (e.g. `  - api_key` or `prompt_hash`).
+	key := strings.TrimSpace(left)
+	key = strings.TrimPrefix(key, "- ")
+	key = strings.TrimSpace(key)
+	key = unquoteYAMLKey(key)
+	// The left side must be a SINGLE structured key token (a `key: value` shape),
+	// NOT arbitrary prose. Without this, a narrative sentence such as
+	// "The session token was Authorization: Bearer ..." would split on the `:` and
+	// match the `token` word inside the prose, redacting the WHOLE right side (and
+	// swallowing an embedded JWT before the JWT scan can tag it). Requiring a
+	// whitespace-free key restricts the colon pass to genuine structured lines and
+	// leaves prose to the key=value and JWT scans (no over-redaction, BI-2 spirit).
+	if key == "" || strings.ContainsAny(key, " \t") {
+		return line, false
+	}
+	if !isSecretKey(key) {
+		return line, false
+	}
+	return left + ": " + redactedToken, true
+}
+
+// unquoteYAMLKey strips a surrounding pair of matching single or double quotes
+// from a YAML key so a quoted secret key is still recognised.
+func unquoteYAMLKey(s string) string {
+	if len(s) >= 2 {
+		if (s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'') {
+			return s[1 : len(s)-1]
+		}
+	}
+	return s
 }
 
 // keyValueSecretScan applies a key=value secret scan to a free-text string

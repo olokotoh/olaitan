@@ -112,7 +112,7 @@ func testIncident() Incident {
 func newAgent(t *testing.T, fp *fakeProvider, rp ReportPublisher, ar AuditRecorder) *Agent {
 	t.Helper()
 	reg := metrics.NewRegistry()
-	a, err := NewDFIR(fp, PromptSpec{System: "you are the DFIR analyst", Version: "dfir.test.v1"}, rp, ar, reg, nil)
+	a, err := NewDFIR(fp, PromptSpec{System: "you are the DFIR analyst", Version: "dfir.test.v1"}, rp, ar, nil, reg, nil)
 	if err != nil {
 		t.Fatalf("NewDFIR: %v", err)
 	}

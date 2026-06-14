@@ -39,6 +39,16 @@ type AuditRedaction struct {
 	FieldPath string `json:"field_path"`
 	// Reason is one of the closed Reason* enum values (BI-4.3).
 	Reason string `json:"reason"`
+	// Source is one of the closed Source* enum values naming the report region a
+	// persistence-bound redaction fired in (Story 4.5 AC4). ADDITIVE OPTIONAL
+	// (omitempty): the Story 3.1 LLM-bound producers leave it empty and stay
+	// byte-identical on the wire, and the consumer treats empty as evidence
+	// (BI-7/BI-8). audit.redactions.v1 is unchanged (additive-optional, OA2).
+	Source string `json:"source,omitempty"`
+	// IncidentID is the finalised incident's package_id, carried on the
+	// persistence-bound events for SIEM correlation (Story 4.5 AC4). ADDITIVE
+	// OPTIONAL (omitempty): empty on the LLM-bound path (BI-7/BI-8).
+	IncidentID string `json:"incident_id,omitempty"`
 	// WorkloadID is carried for SIEM correlation when known (omitempty).
 	WorkloadID string `json:"workload_id,omitempty"`
 	// RedactedAt is the redaction decision time (BI-3.4).
@@ -53,11 +63,23 @@ type AuditRedaction struct {
 // secret value on the wire (NFR18, BI-5.3). published_at is stamped later by the
 // sink at emit time; redacted_at carries the decision time from the event.
 func auditFromEvent(evt RedactionEvent, packageID string, now time.Time) AuditRedaction {
+	return auditFromEventWithIncident(evt, packageID, "", now)
+}
+
+// auditFromEventWithIncident is auditFromEvent threading the persistence-bound
+// incident_id (Story 4.5 AC4). The LLM-bound path passes incidentID == "" (it
+// goes through auditFromEvent), so the source/incident_id stay empty (omitempty)
+// and the Story 3.1 wire form is byte-identical (BI-7/BI-8). evt.Source is
+// carried verbatim: empty for the LLM-bound default (treated as evidence),
+// set per-region by the persistence caller.
+func auditFromEventWithIncident(evt RedactionEvent, packageID, incidentID string, now time.Time) AuditRedaction {
 	return AuditRedaction{
 		SchemaVersion: SchemaVersionRedactions,
 		PackageID:     packageID,
 		FieldPath:     evt.FieldPath,
 		Reason:        evt.Reason,
+		Source:        evt.Source,
+		IncidentID:    incidentID,
 		WorkloadID:    evt.WorkloadID,
 		RedactedAt:    evt.RedactedAt,
 		PublishedAt:   now,
@@ -175,6 +197,20 @@ func NewRedactionAuditSink(pub AuditRedactionPublisher, log *slog.Logger, cfg Re
 // redaction / LLM call (BI-6.2). A nil sink (off-by-default) is handled by the
 // caller, which simply does not invoke Enqueue.
 func (s *RedactionAuditSink) Enqueue(events []RedactionEvent, packageID string) {
+	s.enqueue(events, packageID, "")
+}
+
+// EnqueueRedactions is the persistence-bound enqueue (Story 4.5 AC4): it threads
+// the incident_id (= the report IncidentID = the finalised PackageID) onto each
+// AUDIT.redactions event alongside the per-region Source already stamped on the
+// RedactionEvent. It shares the same best-effort, never-blocking buffer as
+// Enqueue (BI-6.2/BI-8): the persistence redaction has already produced the
+// redacted bytes before the sink is touched.
+func (s *RedactionAuditSink) EnqueueRedactions(events []RedactionEvent, packageID, incidentID string) {
+	s.enqueue(events, packageID, incidentID)
+}
+
+func (s *RedactionAuditSink) enqueue(events []RedactionEvent, packageID, incidentID string) {
 	if s == nil || len(events) == 0 {
 		return
 	}
@@ -185,7 +221,7 @@ func (s *RedactionAuditSink) Enqueue(events []RedactionEvent, packageID string) 
 			s.buffer = s.buffer[1:]
 			s.dropped.Add(1)
 		}
-		s.buffer = append(s.buffer, auditFromEvent(evt, packageID, now))
+		s.buffer = append(s.buffer, auditFromEventWithIncident(evt, packageID, incidentID, now))
 	}
 	s.bufMu.Unlock()
 	select {

@@ -122,3 +122,39 @@ func TestRedactions_DriftFailsValidation(t *testing.T) {
 		t.Fatal("expected schema validation to FAIL on an out-of-enum reason, but it passed")
 	}
 }
+
+// TestRedactions_SourceIncidentIDAdditive proves the Story 4.5 additive change:
+// a persistence-bound event carrying the new source + incident_id fields VALIDATES
+// against audit.redactions.v1 (additive-optional, OA2), and an out-of-enum source
+// is REJECTED (the drift trap is non-vacuous for the new enum).
+func TestRedactions_SourceIncidentIDAdditive(t *testing.T) {
+	schemaPath := filepath.Join(schemaDir, "redactions.json")
+	// A persistence-bound event with the new optional fields must validate.
+	withNew := []byte(`{"schema_version":"audit.redactions.v1","package_id":"p","field_path":"narrative","reason":"jwt_body","source":"llm_response","incident_id":"pkg-1","redacted_at":"2026-06-09T12:00:00Z","published_at":"2026-06-09T12:00:01Z"}`)
+	if err := validateAgainstSchema(t, schemaPath, withNew); err != nil {
+		t.Fatalf("a persistence-bound event with source/incident_id must validate against audit.redactions.v1: %v", err)
+	}
+	// An out-of-enum source must FAIL (non-vacuous drift trap for the new enum).
+	badSource := []byte(`{"schema_version":"audit.redactions.v1","package_id":"p","field_path":"narrative","reason":"jwt_body","source":"sidecar","redacted_at":"2026-06-09T12:00:00Z","published_at":"2026-06-09T12:00:01Z"}`)
+	if err := validateAgainstSchema(t, schemaPath, badSource); err == nil {
+		t.Fatal("expected schema validation to FAIL on an out-of-enum source, but it passed")
+	}
+}
+
+// TestAuditRedaction_LLMBoundWireByteIdentical proves the Story 3.1 LLM-bound
+// producer stays byte-identical after the additive change (BI-7/OA2): an event
+// built via the LLM-bound auditFromEvent (empty source, empty incident_id)
+// marshals WITHOUT the new fields (omitempty), so the pre-4.5 wire bytes are
+// unchanged.
+func TestAuditRedaction_LLMBoundWireByteIdentical(t *testing.T) {
+	now := time.Date(2026, 6, 9, 12, 0, 0, 0, time.UTC)
+	evt := RedactionEvent{FieldPath: "events[0].raw.api_key", Reason: ReasonSecretPattern, WorkloadID: "ns/Deployment/web", RedactedAt: now}
+	b, err := json.Marshal(auditFromEvent(evt, "pkg-1", now.Add(time.Second)))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	want := `{"schema_version":"audit.redactions.v1","package_id":"pkg-1","field_path":"events[0].raw.api_key","reason":"secret_pattern","workload_id":"ns/Deployment/web","redacted_at":"2026-06-09T12:00:00Z","published_at":"2026-06-09T12:00:01Z"}`
+	if string(b) != want {
+		t.Errorf("LLM-bound wire form drifted (source/incident_id must be omitted for the zero value):\n got: %s\nwant: %s", b, want)
+	}
+}
