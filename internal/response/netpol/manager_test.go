@@ -1252,6 +1252,40 @@ func TestReconcileGC_TargetQuarantinedDeletesStaleRestricted(t *testing.T) {
 	}
 }
 
+func TestReconcileGC_TargetPreservedKilledRetainsQuarantine(t *testing.T) {
+	// Story 4.1 (BI-8, AC3): with the oracle reporting PRESERVED_KILLED, the
+	// QUARANTINED deny-all is RETAINED (the workload is still isolated until
+	// Story 4.2 acts), while a lingering RESTRICTED residue is still swept. This
+	// is the load-bearing AC3 guard: without the StatePreservedKilled case the
+	// default branch would delete the QUARANTINED policy within one reconcile
+	// interval.
+	sel := map[string]string{"app": "web"}
+	workloadID := "ns/Deployment/web"
+	restricted := m_buildManagedPolicy("ns", policyNameFor(schema.StateRestricted, workloadID), workloadID)
+	quarantine := m_buildManagedQuarantinePolicy("ns", policyNameFor(schema.StateQuarantined, workloadID), workloadID)
+	reg := metricsRegistryForTest(t)
+	cs := fake.NewSimpleClientset(
+		runtime.Object(deployment("ns", "web", sel)),
+		runtime.Object(restricted),
+		runtime.Object(quarantine),
+	)
+	m, err := New(Config{ClusterCIDRs: []string{"10.96.0.0/12"}}, cs, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	m.SetStateOracle(fakeOracle{states: map[string]schema.PodSecurityState{workloadID: schema.StatePreservedKilled}})
+	ctx := context.Background()
+
+	m.reconcileGC(ctx)
+
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, quarantine.Name, metav1.GetOptions{}); gerr != nil {
+		t.Fatalf("quarantine policy wrongly removed for PRESERVED_KILLED target (AC3 retention): %v", gerr)
+	}
+	if _, gerr := cs.NetworkingV1().NetworkPolicies("ns").Get(ctx, restricted.Name, metav1.GetOptions{}); !apierrors.IsNotFound(gerr) {
+		t.Fatalf("escalation-residue restricted policy not removed for PRESERVED_KILLED target: err=%v", gerr)
+	}
+}
+
 func TestReconcileGC_TargetSuspiciousDeletesBothWhenOwnerExists(t *testing.T) {
 	// FSM-target-aware reconcile (BI-2c/BI-6): with the oracle reporting
 	// SUSPICIOUS and the owner still present, BOTH managed policies are removed

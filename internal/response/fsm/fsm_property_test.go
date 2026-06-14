@@ -55,9 +55,15 @@ func climbTo(m *Machine, clock *fakeClock, target schema.PodSecurityState) {
 	}
 }
 
-// TestProperty_MonotonicEscalation pins AC1: a single Evaluate never moves
-// a workload more than one step in either direction, and never reaches an
-// out-of-chain state.
+// TestProperty_MonotonicEscalation pins AC1/AC4: a single Evaluate never moves
+// a workload more than one state step in either direction, and never reaches an
+// out-of-chain state. Story 4.1 relaxes it (BI-10): PRESERVED_KILLED is now a
+// reachable terminal at ordinal 4, but it may be reached ONLY as a one-step
+// escalation from QUARANTINED. Because stateOrder now returns 4 for
+// PRESERVED_KILLED, the |order(after)-order(before)| <= 1 bound itself rejects
+// a RESTRICTED(2) -> PRESERVED_KILLED(4) skip (diff 2); the explicit
+// before==QUARANTINED check below pins the single-legal-predecessor invariant
+// directly so the property cannot pass on a skip even if stateOrder drifted.
 func TestProperty_MonotonicEscalation(t *testing.T) {
 	m, clock := propMachine()
 	props := gopter.NewProperties(pinnedParams())
@@ -67,7 +73,9 @@ func TestProperty_MonotonicEscalation(t *testing.T) {
 			before := m.State("w")
 			st := m.Evaluate("w", score, "p")
 			after := st.ToState
-			if after == schema.StatePreservedKilled {
+			if after == schema.StatePreservedKilled && st.FromState != st.ToState && before != schema.StateQuarantined {
+				// An ACTUAL entry into PRESERVED_KILLED (from != to) may only
+				// originate from QUARANTINED (AC4); a PK -> PK no-op is fine.
 				return false
 			}
 			diff := order(after) - order(before)
@@ -179,23 +187,38 @@ func TestProperty_Idempotent(t *testing.T) {
 	props.TestingRun(t)
 }
 
-// TestProperty_PreservedKilledUnreachable pins BI-7: no sequence of
-// arbitrary scores and clock advances can ever drive a workload into
-// PRESERVED_KILLED.
-func TestProperty_PreservedKilledUnreachable(t *testing.T) {
+// TestProperty_PreservedKilledOnlyFromQuarantined pins AC4/BI-2 (the
+// reframing of the Story 2.2 "PRESERVED_KILLED unreachable" property): across
+// any sequence of arbitrary scores and clock advances, a workload may enter
+// PRESERVED_KILLED ONLY via the single legal QUARANTINED -> PRESERVED_KILLED
+// edge under the kill condition, and NEVER from any non-QUARANTINED state.
+// Once in PRESERVED_KILLED it never escalates out (there is no state above
+// ordinal 4). The property records the from-state on every actual transition
+// into PRESERVED_KILLED and fails if any such transition originated anywhere
+// but QUARANTINED, or if PRESERVED_KILLED is ever the from-state of a later
+// transition (escalate-out, BI-2.2).
+func TestProperty_PreservedKilledOnlyFromQuarantined(t *testing.T) {
 	props := gopter.NewProperties(pinnedParams())
-	props.Property("PRESERVED_KILLED is never entered", prop.ForAll(
+	props.Property("PRESERVED_KILLED entered only from QUARANTINED, never escaped", prop.ForAll(
 		func(scores []float64, advances []uint16) bool {
 			m, clock := propMachine()
 			for i, s := range scores {
 				if i < len(advances) {
 					clock.advance(time.Duration(advances[i]) * time.Second)
 				}
+				before := m.State("w")
 				st := m.Evaluate("w", s, "p")
-				if st.ToState == schema.StatePreservedKilled {
-					return false
+				// An ACTUAL entry into PRESERVED_KILLED (from != to) must
+				// originate from QUARANTINED on BOTH the recorded transition and
+				// the observed prior state; a PK -> PK no-op is fine.
+				if st.ToState == schema.StatePreservedKilled && st.FromState != st.ToState {
+					if st.FromState != schema.StateQuarantined || before != schema.StateQuarantined {
+						return false
+					}
 				}
-				if m.State("w") == schema.StatePreservedKilled {
+				// Escalate-out: PRESERVED_KILLED must never be the source of an
+				// actual onward transition (no state sits above ordinal 4).
+				if st.FromState == schema.StatePreservedKilled && st.FromState != st.ToState {
 					return false
 				}
 			}
@@ -203,6 +226,34 @@ func TestProperty_PreservedKilledUnreachable(t *testing.T) {
 		},
 		gen.SliceOf(gen.Float64Range(-50, 200)),
 		gen.SliceOf(gen.UInt16()),
+	))
+	props.TestingRun(t)
+}
+
+// TestProperty_PreservedKilledReachableUnderKillCondition complements the
+// only-from-QUARANTINED property with a liveness witness (AC4): a workload held
+// at a kill-scoring level long enough genuinely DOES reach PRESERVED_KILLED, so
+// the only-from-QUARANTINED property above is not vacuously true on a kill edge
+// that can never fire.
+func TestProperty_PreservedKilledReachableUnderKillCondition(t *testing.T) {
+	props := gopter.NewProperties(pinnedParams())
+	props.Property("a sustained kill-level score from QUARANTINED reaches PRESERVED_KILLED", prop.ForAll(
+		func(extraSec uint16) bool {
+			m, clock := propMachine()
+			climbTo(m, clock, schema.StateQuarantined)
+			if m.State("w") != schema.StateQuarantined {
+				return false
+			}
+			// Hold a kill-level score (>= default 90) for the kill-sustain
+			// window plus arbitrary slack; the QUARANTINED dwell also elapses.
+			sustain := config.DefaultKillSustainSeconds
+			// First a kill-level sample to start the at-or-above-kill window.
+			m.Evaluate("w", 95, "p")
+			clock.advance(time.Duration(sustain)*time.Second + time.Duration(extraSec)*time.Second)
+			st := m.Evaluate("w", 95, "p")
+			return st.FromState == schema.StateQuarantined && st.ToState == schema.StatePreservedKilled && st.Reason == schema.ReasonKillConditionMet
+		},
+		gen.UInt16(),
 	))
 	props.TestingRun(t)
 }

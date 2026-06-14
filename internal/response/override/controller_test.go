@@ -294,11 +294,83 @@ func TestReconcile_ManualRemovalReleasesAndClearsRedis(t *testing.T) {
 	}
 }
 
-func TestReconcile_RejectsPreservedKilled(t *testing.T) {
+// TestReconcile_PinsPreservedKilledFromQuarantined pins Story 4.1 AC2/BI-6:
+// a PRESERVED_KILLED override on a QUARANTINED workload is now ACCEPTED (it
+// pins, writes Redis, emits an applied event) and does NOT bump the
+// state_unavailable rejection metric (Story 2.7's rejection is removed).
+func TestReconcile_PinsPreservedKilledFromQuarantined(t *testing.T) {
 	ctx := context.Background()
 	mr := startMiniredis(t)
 	store, _ := newRedisStore(t, mr)
 	machine := newMachine(t)
+	// The FSM must be QUARANTINED for a PRESERVED_KILLED pin to be legal.
+	if err := machine.Pin(depWorkloadID, schema.StateQuarantined, ""); err != nil {
+		t.Fatalf("setup pin QUARANTINED: %v", err)
+	}
+	if _, ok := machine.ReleasePin(depWorkloadID); !ok {
+		t.Fatal("setup release pin: ok=false")
+	}
+	pub := &fakePublisher{}
+	reg := metrics.NewRegistry()
+
+	_, objs := deploymentPod("default", "web", map[string]string{
+		AnnotationState: "PRESERVED_KILLED",
+	})
+	c := newController(t, objs, store, machine, pub, reg)
+	c.reconcile(ctx)
+
+	if s, pinned := machine.IsPinned(depWorkloadID); !pinned || s != schema.StatePreservedKilled {
+		t.Fatalf("PRESERVED_KILLED override must pin from QUARANTINED: pinned=%v state=%s", pinned, s)
+	}
+	if _, ok, _ := store.Get(ctx, depWorkloadID); !ok {
+		t.Fatal("accepted override must write Redis")
+	}
+	if got := counterValue(t, reg, "olaitan_response_override_rejected_total", "state_unavailable"); got != 0 {
+		t.Errorf("rejected counter{state_unavailable} = %v, want 0 (no longer rejected)", got)
+	}
+	evts := pub.all()
+	if len(evts) != 1 || evts[0].Rejected {
+		t.Fatalf("events = %+v, want one APPLIED (not rejected) event", evts)
+	}
+}
+
+// TestReconcile_NormalisesPlusFormPreservedKilled pins Story 4.1 Task 5.4/BI-1:
+// the operator annotation plus-form value "PRESERVED+KILLED" is normalised to
+// the enum string "PRESERVED_KILLED" before validation, so it pins (from
+// QUARANTINED) exactly like the underscore form.
+func TestReconcile_NormalisesPlusFormPreservedKilled(t *testing.T) {
+	ctx := context.Background()
+	mr := startMiniredis(t)
+	store, _ := newRedisStore(t, mr)
+	machine := newMachine(t)
+	if err := machine.Pin(depWorkloadID, schema.StateQuarantined, ""); err != nil {
+		t.Fatalf("setup pin QUARANTINED: %v", err)
+	}
+	if _, ok := machine.ReleasePin(depWorkloadID); !ok {
+		t.Fatal("setup release pin: ok=false")
+	}
+	pub := &fakePublisher{}
+	reg := metrics.NewRegistry()
+
+	_, objs := deploymentPod("default", "web", map[string]string{
+		AnnotationState: "PRESERVED+KILLED", // plus-form
+	})
+	c := newController(t, objs, store, machine, pub, reg)
+	c.reconcile(ctx)
+
+	if s, pinned := machine.IsPinned(depWorkloadID); !pinned || s != schema.StatePreservedKilled {
+		t.Fatalf("plus-form annotation must normalise + pin to PRESERVED_KILLED: pinned=%v state=%s", pinned, s)
+	}
+}
+
+// TestReconcile_RejectsPreservedKilledFromNonQuarantined pins BI-6.3: a
+// PRESERVED_KILLED override on a non-QUARANTINED workload is rejected inside the
+// FSM (Pin guard) and never pins; the apply path logs and does not write Redis.
+func TestReconcile_RejectsPreservedKilledFromNonQuarantined(t *testing.T) {
+	ctx := context.Background()
+	mr := startMiniredis(t)
+	store, _ := newRedisStore(t, mr)
+	machine := newMachine(t) // default CLEAN, not QUARANTINED
 	pub := &fakePublisher{}
 	reg := metrics.NewRegistry()
 
@@ -309,17 +381,13 @@ func TestReconcile_RejectsPreservedKilled(t *testing.T) {
 	c.reconcile(ctx)
 
 	if _, pinned := machine.IsPinned(depWorkloadID); pinned {
-		t.Fatal("PRESERVED_KILLED must NOT pin")
+		t.Fatal("PRESERVED_KILLED must NOT pin from a non-QUARANTINED workload (skip-into, BI-6.3)")
 	}
 	if _, ok, _ := store.Get(ctx, depWorkloadID); ok {
-		t.Fatal("rejected override must NOT write Redis")
+		t.Fatal("a Pin-rejected override must NOT write Redis")
 	}
-	evts := pub.all()
-	if len(evts) != 1 || !evts[0].Rejected || evts[0].Reason != ReasonStateUnavailable {
-		t.Fatalf("events = %+v, want one rejected event reason=state_unavailable", evts)
-	}
-	if got := counterValue(t, reg, "olaitan_response_override_rejected_total", "state_unavailable"); got != 1 {
-		t.Errorf("rejected counter{state_unavailable} = %v, want 1", got)
+	if got := counterValue(t, reg, "olaitan_response_override_rejected_total", "state_unavailable"); got != 0 {
+		t.Errorf("rejected counter{state_unavailable} = %v, want 0 (state_unavailable no longer used for PRESERVED_KILLED)", got)
 	}
 }
 

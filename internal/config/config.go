@@ -677,6 +677,17 @@ type FSMConfig struct {
 	QuarantinedDwellSeconds     *int `yaml:"quarantined_dwell_seconds,omitempty"`
 	DeescalationCooldownSeconds *int `yaml:"deescalation_cooldown_seconds,omitempty"`
 
+	// Story 4.1 (FR31/BI-11): the Helm-tunable kill condition that drives the
+	// QUARANTINED -> PRESERVED_KILLED transition. KillThreatScore is the
+	// ThreatScore (on the same [0,100] scale the FSM consumes) at or above
+	// which the kill timer runs; KillSustainSeconds is how long the score must
+	// stay continuously at or above it (AND how long the workload must have
+	// been QUARANTINED) before the kill edge fires. Both are pointer-tagged so
+	// the loader distinguishes "operator omitted, substitute default" from an
+	// explicit value, and both are hot-reloadable like the dwell/cooldown knobs.
+	KillThreatScore    *float64 `yaml:"kill_threat_score,omitempty"`
+	KillSustainSeconds *int     `yaml:"kill_sustain_seconds,omitempty"`
+
 	// Story 2.3: durable FSM-state persistence (FR37/NFR24). Unlike the
 	// dwell/cooldown knobs above (hot-reloadable), these are
 	// restart-required: toggling persistence or its Redis target rewires
@@ -698,6 +709,14 @@ const (
 	DefaultDeescalationCooldownSeconds = 600
 )
 
+// Story 4.1 kill-condition defaults (BI-11). The kill threshold (90) is a
+// fourth band above the QUARANTINED band (70); the sustain window (300 s) is
+// the "sustained for 300 s after the QUARANTINED apply" requirement (AC1).
+const (
+	DefaultKillThreatScore    = 90.0
+	DefaultKillSustainSeconds = 300
+)
+
 // DefaultFSM returns the Story 2.2 production defaults (AC2/AC3) plus the
 // Story 2.3 persistence defaults (enabled, Redis at the canonical address).
 func DefaultFSM() FSMConfig {
@@ -705,12 +724,16 @@ func DefaultFSM() FSMConfig {
 	rd := DefaultRestrictedDwellSeconds
 	qd := DefaultQuarantinedDwellSeconds
 	cd := DefaultDeescalationCooldownSeconds
+	kts := DefaultKillThreatScore
+	kss := DefaultKillSustainSeconds
 	pe := true
 	return FSMConfig{
 		SuspiciousDwellSeconds:      &sd,
 		RestrictedDwellSeconds:      &rd,
 		QuarantinedDwellSeconds:     &qd,
 		DeescalationCooldownSeconds: &cd,
+		KillThreatScore:             &kts,
+		KillSustainSeconds:          &kss,
 		PersistenceEnabled:          &pe,
 		RedisAddr:                   "redis:6379",
 	}
@@ -770,6 +793,24 @@ func (f FSMConfig) DeescalationCooldownSecondsOrDefault() int {
 	return *f.DeescalationCooldownSeconds
 }
 
+// KillThreatScoreOrDefault returns the effective Story 4.1 kill threshold,
+// substituting the default (90) when omitted (BI-11).
+func (f FSMConfig) KillThreatScoreOrDefault() float64 {
+	if f.KillThreatScore == nil {
+		return DefaultKillThreatScore
+	}
+	return *f.KillThreatScore
+}
+
+// KillSustainSecondsOrDefault returns the effective Story 4.1 kill-sustain
+// window, substituting the default (300) when omitted (BI-11).
+func (f FSMConfig) KillSustainSecondsOrDefault() int {
+	if f.KillSustainSeconds == nil {
+		return DefaultKillSustainSeconds
+	}
+	return *f.KillSustainSeconds
+}
+
 // validate enforces FSMConfig invariants: every duration must be
 // non-negative (BI-4). A fully-omitted block (all four pointers nil)
 // skips validation so in-memory test fixtures can leave it zero; the
@@ -783,7 +824,8 @@ func (f FSMConfig) validate() error {
 		return errors.New("detection.fsm.redis_addr: required when fsm.persistence_enabled=true")
 	}
 	if f.SuspiciousDwellSeconds == nil && f.RestrictedDwellSeconds == nil &&
-		f.QuarantinedDwellSeconds == nil && f.DeescalationCooldownSeconds == nil {
+		f.QuarantinedDwellSeconds == nil && f.DeescalationCooldownSeconds == nil &&
+		f.KillThreatScore == nil && f.KillSustainSeconds == nil {
 		return nil
 	}
 	checks := []struct {
@@ -794,10 +836,25 @@ func (f FSMConfig) validate() error {
 		{"detection.fsm.restricted_dwell_seconds", f.RestrictedDwellSeconds},
 		{"detection.fsm.quarantined_dwell_seconds", f.QuarantinedDwellSeconds},
 		{"detection.fsm.deescalation_cooldown_seconds", f.DeescalationCooldownSeconds},
+		// Story 4.1: the kill-sustain window is a non-negative duration.
+		{"detection.fsm.kill_sustain_seconds", f.KillSustainSeconds},
 	}
 	for _, c := range checks {
 		if c.val != nil && *c.val < 0 {
 			return fmt.Errorf("%s: must be >= 0 (got %d)", c.name, *c.val)
+		}
+	}
+	// Story 4.1 (BI-11): the kill threshold is a ThreatScore on the [0,100]
+	// scale and must sit above the QUARANTINED band (70), since the kill edge
+	// fires only from QUARANTINED. A threshold at or below 70 would let a
+	// freshly-quarantined workload satisfy the kill score the instant it
+	// quarantines, collapsing the "fourth band above QUARANTINED" intent.
+	if f.KillThreatScore != nil {
+		if *f.KillThreatScore < 0 || *f.KillThreatScore > 100 {
+			return fmt.Errorf("detection.fsm.kill_threat_score: must be in [0, 100] (got %v)", *f.KillThreatScore)
+		}
+		if *f.KillThreatScore <= QuarantinedThreshold {
+			return fmt.Errorf("detection.fsm.kill_threat_score: must be > %.0f (the QUARANTINED band; the kill edge fires only from QUARANTINED) (got %v)", QuarantinedThreshold, *f.KillThreatScore)
 		}
 	}
 	return nil

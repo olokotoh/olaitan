@@ -83,7 +83,11 @@ fields:
       - dwell_guard_elapsed
       - de_escalation_cooldown_expired
       - no_transition
+      - operator_override
+      - kill_condition_met
     description: >
       AC4 reason. Why the FSM produced this transition. "no_transition"
       is set on the record returned when state was unchanged and is not
-      emitted to a TransitionSink.
+      emitted to a TransitionSink. "operator_override" labels a Story 2.7
+      operator-driven pin. "kill_condition_met" labels the Story 4.1
+      QUARANTINED -> PRESERVED_KILLED kill transition.

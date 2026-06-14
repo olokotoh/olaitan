@@ -807,6 +807,16 @@ fsm:
   # Hot-reloadable (FR49). null sentinel so an explicit 0 is distinguishable.
   deescalationCooldownSeconds: null
 
+  # Story 4.1: the kill condition that drives the QUARANTINED ->
+  # PRESERVED_KILLED transition (FR31). killThreatScore is the ThreatScore
+  # (a fourth band above the QUARANTINED band 70) the score must hold;
+  # killSustainSeconds is how long it must hold it AND how long the workload
+  # must have been QUARANTINED before the kill edge fires. Empty leaves the
+  # config defaults (90 / 300). Hot-reloadable (FR49). null sentinels so an
+  # explicit 0 is distinguishable from "omitted".
+  killThreatScore: null
+  killSustainSeconds: null
+
 # Story 2.10: response-ring graduated-isolation controllers (Epic 2). All OFF
 # by default; an operator running RS-with-isolation enables them explicitly.
 # A block left empty leaves the config/olaitan.yaml defaults untouched.

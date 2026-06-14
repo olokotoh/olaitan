@@ -25,7 +25,7 @@
     "package_id": {"type": "string"},
     "workload_id": {"type": "string"},
     "trigger_type": {"type": "string", "enum": ["automated", "override"]},
-    "reason": {"type": "string", "enum": ["escalation_threshold_crossed", "dwell_guard_elapsed", "de_escalation_cooldown_expired", "no_transition", "operator_override"]},
+    "reason": {"type": "string", "enum": ["escalation_threshold_crossed", "dwell_guard_elapsed", "de_escalation_cooldown_expired", "no_transition", "operator_override", "kill_condition_met"]},
     "operator_id": {"type": "string"},
     "decided_at": {"type": "string", "format": "date-time"},
     "published_at": {"type": "string", "format": "date-time"}

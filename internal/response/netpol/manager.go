@@ -441,6 +441,11 @@ func removalState(s schema.PodSecurityState) bool {
 // enqueues for the async worker without blocking the FSM goroutine; on a full
 // queue it drops with a metric rather than stalling the hot path (BI-4).
 func (m *Manager) Publish(st schema.StateTransition) {
+	// Story 4.1 (BI-8, AC3): PRESERVED_KILLED is neither an enforced state nor a
+	// removal state, so a kill transition is INTENTIONALLY dropped here: the
+	// inline path applies and removes nothing, leaving the QUARANTINED deny-all
+	// in place. The reconcile backstop retains it too (reconcileDesiredState's
+	// StatePreservedKilled case). Policy removal on kill is Story 4.2, not 4.1.
 	if !enforcedState(st.ToState) && !removalState(st.ToState) {
 		return
 	}
@@ -1040,17 +1045,27 @@ func (m *Manager) reconcileDesiredState(ctx context.Context, np *networkingv1.Ne
 	}
 
 	switch target {
-	case schema.StateQuarantined:
+	case schema.StateQuarantined, schema.StatePreservedKilled:
 		// Escalation residue: a lingering RESTRICTED policy is not in the
 		// QUARANTINED desired set.
+		//
+		// Story 4.1 (BI-8): PRESERVED_KILLED shares this case so the QUARANTINED
+		// deny-all is RETAINED (AC3, "the QUARANTINED NetworkPolicy remains in
+		// place"). PRESERVED_KILLED's desired set is treated as
+		// quarantine-equivalent: a RESTRICTED residue is still swept, but the
+		// QUARANTINED policy is NOT deleted (it is not RESTRICTED, so the guard
+		// below returns false for it). Without this case PRESERVED_KILLED would
+		// fall through to the default branch and the QUARANTINED deny-all would
+		// be deleted within one reconcile interval. Policy REMOVAL on kill is
+		// Story 4.2's job, not 4.1's.
 		if policyState != string(schema.StateRestricted) {
 			return false
 		}
 		if !m.reconcileDelete(ctx, np) {
 			return false
 		}
-		m.log.Info("netpol: reconcile removed superseded RESTRICTED policy (target QUARANTINED)",
-			"workload_id", wid, "namespace", np.Namespace, "policy", np.Name)
+		m.log.Info("netpol: reconcile removed superseded RESTRICTED policy (target QUARANTINED/PRESERVED_KILLED)",
+			"workload_id", wid, "namespace", np.Namespace, "policy", np.Name, "target", string(target))
 		m.count("superseded")
 		m.auditReconcileDelete(np, AuditActionSupersedeDelete, "superseded")
 		return true

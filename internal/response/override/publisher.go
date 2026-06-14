@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
@@ -83,23 +84,38 @@ func (p *natsOverridePublisher) PublishOverride(ctx context.Context, evt Overrid
 	return nil
 }
 
-// validOverrideTarget reports whether s is one of the four reachable Epic-2
-// states an operator may pin a workload to (BI-5). PRESERVED_KILLED (Epic 4)
-// and any unknown value are rejected. Mirrors the fsm package's internal
-// guard; kept local so the override controller can pre-filter rejections and
-// assign the distinct reason label before calling Machine.Pin.
+// normaliseOverrideState normalises an operator-supplied state-override
+// annotation VALUE to the canonical enum string (Story 4.1, BI-1). The one
+// plus-form input is PRESERVED+KILLED (the human-prose spelling in epics.md /
+// AC2); every code token uses the underscore form PRESERVED_KILLED. Mapping
+// '+' -> '_' makes the annotation value match the enum string before it reaches
+// validOverrideTarget / Machine.Pin. Other state values contain no '+', so this
+// is a no-op for them.
+func normaliseOverrideState(raw string) string {
+	return strings.ReplaceAll(raw, "+", "_")
+}
+
+// validOverrideTarget reports whether s is a state an operator may pin a
+// workload to. Story 2.7 admitted CLEAN/SUSPICIOUS/RESTRICTED/QUARANTINED;
+// Story 4.1 (BI-6) ADDS PRESERVED_KILLED, since the override path is now the
+// second legal entry into PRESERVED_KILLED. The only-from-QUARANTINED legality
+// is enforced inside Machine.Pin, not here. Any unknown value is rejected.
+// Mirrors the fsm package's internal guard; kept local so the override
+// controller can pre-filter rejections before calling Machine.Pin.
 func validOverrideTarget(s schema.PodSecurityState) bool {
 	switch s {
-	case schema.StateClean, schema.StateSuspicious, schema.StateRestricted, schema.StateQuarantined:
+	case schema.StateClean, schema.StateSuspicious, schema.StateRestricted, schema.StateQuarantined, schema.StatePreservedKilled:
 		return true
 	default:
 		return false
 	}
 }
 
-// stateOrder ranks the four reachable states for the most-isolating tie-break
-// (BI-9). Higher is more isolating. An unknown state ranks -1 so it never wins
-// a tie-break (it is rejected separately).
+// stateOrder ranks the reachable states for the most-isolating tie-break
+// (BI-9). Higher is more isolating. PRESERVED_KILLED ranks HIGHEST (Story 4.1,
+// BI-6.4) so a PRESERVED_KILLED pin wins the tie-break against a less-isolating
+// QUARANTINED pin when two pods of one workload race annotations. An unknown
+// state ranks -1 so it never wins a tie-break (it is rejected separately).
 func stateOrder(s schema.PodSecurityState) int {
 	switch s {
 	case schema.StateClean:
@@ -110,6 +126,8 @@ func stateOrder(s schema.PodSecurityState) int {
 		return 2
 	case schema.StateQuarantined:
 		return 3
+	case schema.StatePreservedKilled:
+		return 4
 	default:
 		return -1
 	}

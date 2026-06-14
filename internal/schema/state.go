@@ -91,4 +91,12 @@ const (
 	// enforcement consumers can distinguish an operator-driven pin from a
 	// ThreatScore-driven transition.
 	ReasonOperatorOverride = "operator_override"
+	// ReasonKillConditionMet labels the Story 4.1 QUARANTINED -> PRESERVED_KILLED
+	// transition produced when the Helm-tunable kill condition is satisfied
+	// (the ThreatScore has been continuously at or above the kill threshold,
+	// default 90, for at least the kill-sustain window, default 300 s, measured
+	// from the QUARANTINED apply). The automated kill edge carries TriggerType
+	// "automated"; an operator override into PRESERVED_KILLED carries
+	// ReasonOperatorOverride instead (FR31, BI-9).
+	ReasonKillConditionMet = "kill_condition_met"
 )

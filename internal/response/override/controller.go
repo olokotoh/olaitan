@@ -188,7 +188,7 @@ func (c *Controller) auditOverride(ctx context.Context, evt OverrideApplied) {
 func (c *Controller) registerMetrics(r *metrics.Registry) error {
 	cv, err := r.RegisterCounterVec(
 		"olaitan_response_override_rejected_total",
-		"Cumulative number of operator-override requests refused, labelled by reason: state_unavailable (a real-but-unimplemented state such as PRESERVED_KILLED) or invalid_state (an unknown/typo'd state). Story 2.7, FR38/FR39, AC5.",
+		"Cumulative number of operator-override requests refused, labelled by reason: invalid_state (an unknown/typo'd state). The state_unavailable label is retained for series stability but no longer increments: Story 4.1 admits PRESERVED_KILLED as an override target (its only-from-QUARANTINED legality is enforced inside the FSM), so it is no longer a state_unavailable rejection. Story 2.7, FR38/FR39, AC5.",
 		[]string{"reason"},
 	)
 	if err != nil {
@@ -432,17 +432,23 @@ func (c *Controller) computeDesired(ctx context.Context) (desiredSet map[string]
 			continue
 		}
 
-		state := schema.PodSecurityState(stateRaw)
+		// Story 4.1 (BI-1): normalise the operator annotation value
+		// PRESERVED+KILLED (plus-form, the one plus-form input, AC2/epics.md)
+		// to the enum string PRESERVED_KILLED (underscore) before it reaches
+		// validOverrideTarget/Pin, so the annotation value matches the code
+		// token. Other state values contain no '+', so this is a no-op for them.
+		state := schema.PodSecurityState(normaliseOverrideState(stateRaw))
 		if !validOverrideTarget(state) {
-			reason := ReasonInvalidState
-			if state == schema.StatePreservedKilled {
-				reason = ReasonStateUnavailable
-			}
+			// Story 4.1 (BI-6): PRESERVED_KILLED is no longer rejected here as a
+			// "state_unavailable" target; it is an accepted override target whose
+			// only-from-QUARANTINED legality is enforced inside Machine.Pin. The
+			// pre-filter now rejects only genuinely-unknown states, all under the
+			// invalid_state reason.
 			rejections = append(rejections, desired{
 				workloadID:   workloadID,
 				state:        state,
 				source:       source,
-				rejectReason: reason,
+				rejectReason: ReasonInvalidState,
 				requestedRaw: stateRaw,
 			})
 			continue
