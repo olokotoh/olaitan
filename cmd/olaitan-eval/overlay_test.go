@@ -36,6 +36,8 @@ func TestOverlayFileFor_Resolution(t *testing.T) {
 		{"rslt-l1-l2", "values-eval-rslt-l1-l2.yaml"}, // BI-1: + normalised in the filename
 		{"RSLT-Full", "values-eval-rslt-full.yaml"},   // case-insensitive
 		{"RSLT-L1-L2", "values-eval-rslt-l1-l2.yaml"}, // case-insensitive
+		{"RSLT-L1+L2", "values-eval-rslt-l1-l2.yaml"}, // BI-1: canonical chart enum (the "+")
+		{"rslt-l1+l2", "values-eval-rslt-l1-l2.yaml"}, // lower-case "+" form
 	}
 	for _, tc := range cases {
 		got, ok := overlayFileFor(tc.config)
@@ -56,7 +58,10 @@ func TestOverlayFileFor_Resolution(t *testing.T) {
 // validated arm would dispatch into a missing overlay). The legacy "rslt"
 // alias is the only non-filename arm and is covered explicitly above.
 func TestOverlayFilesCoverValidatedArms(t *testing.T) {
-	for _, arm := range []string{"f", "rs", "rsl", "rslt", "rslt-full", "rslt-l1-only", "rslt-l1-l2"} {
+	// Include the canonical chart enum spelling `RSLT-L1+L2` (the "+" form)
+	// to prove every documented arm validateConfig accepts also resolves to
+	// an overlay file after normalisation (BI-1 + BI-4 lock-step).
+	for _, arm := range []string{"f", "rs", "rsl", "rslt", "rslt-full", "rslt-l1-only", "rslt-l1-l2", "RSLT-L1+L2"} {
 		if err := validateConfig(arm); err != nil {
 			t.Fatalf("validateConfig(%q) rejected a real arm: %v", arm, err)
 		}
@@ -230,6 +235,61 @@ func TestHelmOverlayApply_RolloutTimeoutSurfaces(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "olaitan-aggregator") {
 		t.Errorf("error %q does not name the aggregator deployment", err.Error())
+	}
+}
+
+// TestHelmOverlayApply_TimeoutCancelsChild asserts the overlay timeout is
+// wired as a context DEADLINE on the apply phase: a helm child that ignores
+// its own --timeout flag (here a fake that blocks until ctx is cancelled) is
+// still aborted when the budget elapses, and the rollout-status gate is not
+// reached.
+func TestHelmOverlayApply_TimeoutCancelsChild(t *testing.T) {
+	dir := t.TempDir()
+	writeOverlayFixtures(t, dir)
+
+	oc := defaultOverlayConfigWith(dir)
+	oc.timeout = 20 * time.Millisecond // tiny budget so the test is fast
+
+	var sawKubectl bool
+	o := newHelmOverlay(oc, func(ctx context.Context, name string, args ...string) error {
+		if name == "kubectl" {
+			sawKubectl = true
+			return nil
+		}
+		// helm: simulate a hung child that ignores its --timeout flag and
+		// only unblocks when the derived ctx deadline cancels it.
+		<-ctx.Done()
+		return ctx.Err()
+	}, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
+
+	err := o.Apply(context.Background(), "rs")
+	if err == nil {
+		t.Fatalf("expected the apply to abort when the overlay-timeout deadline elapsed, got nil")
+	}
+	if sawKubectl {
+		t.Errorf("rollout-status must NOT run after the helm child was cancelled")
+	}
+}
+
+// TestHelmOverlayApply_ParentCancelAbortsApply asserts a caller-cancelled
+// run also aborts the in-flight overlay apply (the derived ctx inherits the
+// parent's cancellation, threading into the exec.CommandContext children).
+func TestHelmOverlayApply_ParentCancelAbortsApply(t *testing.T) {
+	dir := t.TempDir()
+	writeOverlayFixtures(t, dir)
+
+	o := newHelmOverlay(defaultOverlayConfigWith(dir), func(ctx context.Context, name string, args ...string) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		cancel()
+	}()
+	if err := o.Apply(ctx, "rs"); err == nil {
+		t.Fatalf("expected a parent-cancellation abort, got nil")
 	}
 }
 

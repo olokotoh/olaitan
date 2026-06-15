@@ -122,8 +122,40 @@ The `olaitan-eval` harness (`cmd/olaitan-eval/`) applies these overlays
 behind the `ConfigOverlay` seam: `--config <name>` resolves to the matching
 `values-eval-<name>.yaml`, runs `helm upgrade --install --reuse-values
 --values <overlay> --wait`, then an explicit `kubectl rollout status
-deploy/<release>-aggregator` Ready gate before the scenario fires
+deploy/<fullname>-aggregator` Ready gate before the scenario fires
 (fail-closed). See `cmd/olaitan-eval/README.md`.
+
+The rollout-status target is `deploy/<fullname>-aggregator`, where
+`<fullname>` is the chart's `olaitan.fullname` helper, which DEDUPS the
+chart name: the canonical `--release olaitan` collapses
+`olaitan-olaitan-aggregator` to `olaitan-aggregator`, while a custom
+release (e.g. `--release myrel`) that does not already contain the chart
+name expands to `myrel-olaitan-aggregator`. The harness's
+`aggregatorDeployName` mirrors this dedup so the Ready gate names the
+deployment the chart actually renders. This assumes NO
+`fullnameOverride`/`nameOverride` is set at install: `aggregatorDeployName`
+mirrors only the dedup branch of `olaitan.fullname`, so a custom name
+override would make the rollout-status target diverge from the rendered
+deployment name.
+
+Arm switching and `--reuse-values` (BI-8): the harness reuses the
+install-time values via `--reuse-values`, which is SAFE to do in place
+across arms because ALL arm-distinguishing knobs
+(`rules`/`baselines`/`provider`/`l2`/`senior`) are DERIVED by the chart from
+the single `evaluation.config` value the overlay sets (the canonical-arms
+table above) -- the overlay layers `evaluation.config` (and, for the LLM
+arms, the inert model pin) on top of the install-time values, and the chart
+recomputes every per-arm knob, so switching from one arm to another by
+re-applying its overlay produces the correct derived configuration. For the
+`F` / `RS` arms the lingering `analyst.api.model` string carried over from a
+prior LLM-arm install is INERT (the derived `provider=none` means the model
+is never read). If you want a clean-slate switch with no carried-over
+install-time values, `helm uninstall` first (or omit `--reuse-values`). The
+exercised path is option (a): a pre-install (via `make eval-smoke`)
+followed by the harness's idempotent re-apply of the same/another arm's
+overlay; the first-install-VIA-the-harness path (option (b)) is supported by
+helm's `--reuse-values` no-op-on-fresh-install semantics but is NOT a tested
+path here.
 
 ## Restart semantics
 

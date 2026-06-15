@@ -217,6 +217,15 @@ func parseFlags(args []string, stderr io.Writer) (runConfig, error) {
 	if cfg.config == "" {
 		return runConfig{}, fmt.Errorf("--config is required")
 	}
+	// Normalise the arm name ONCE at parse time (case-insensitive +
+	// the canonical "+" -> "-" rewrite) so every downstream consumer
+	// (validateConfig, the helmOverlay overlayFileFor lookup, the run_id,
+	// and metadata.config) sees the single canonical-lowercase form. A user
+	// is free to pass any of the documented spellings -- the canonical
+	// chart enum `RSLT-L1+L2`, lower `rslt-l1+l2`, the already-normalised
+	// `rslt-l1-l2`, `RSLT-full`, `RS`, ... -- and they all resolve to the
+	// right overlay; genuinely unknown arms still fail fast below.
+	cfg.config = normalizeArm(cfg.config)
 	if err := validateConfig(cfg.config); err != nil {
 		return runConfig{}, err
 	}
@@ -225,6 +234,24 @@ func parseFlags(args []string, stderr io.Writer) (runConfig, error) {
 	}
 	if cfg.overlayTimeout <= 0 {
 		return runConfig{}, fmt.Errorf("--overlay-timeout must be > 0 (got %s)", cfg.overlayTimeout)
+	}
+	// Reject an explicitly-emptied overlay flag (all have safe defaults, so
+	// an empty value means the user blanked it on purpose). Fail fast here
+	// with a readable message rather than shelling out helm/kubectl with an
+	// empty --release / --namespace (which also makes aggregatorDeployName
+	// emit a bogus `-olaitan-aggregator` rollout-status target) or an empty
+	// --chart-root / --overlays-dir (which dials helm at the wrong path).
+	for _, e := range []struct {
+		flag, val string
+	}{
+		{"--release", cfg.release},
+		{"--namespace", cfg.namespace},
+		{"--chart-root", cfg.chartRoot},
+		{"--overlays-dir", cfg.overlaysDir},
+	} {
+		if strings.TrimSpace(e.val) == "" {
+			return runConfig{}, fmt.Errorf("%s must not be empty", e.flag)
+		}
 	}
 	cfg.allowUnverified = []string(allow)
 	return cfg, nil
@@ -258,23 +285,40 @@ func validateScenario(s string) error {
 	return fmt.Errorf("--scenario %q is not a known scenario (want one of s1, s2, s3, s4, s5)", s)
 }
 
+// normalizeArm canonicalises a user-supplied --config arm to the single
+// lowercase, "+"-free form the harness keys everything off (BI-1). The
+// chart's canonical enum for the last ablation arm is `RSLT-L1+L2` (the
+// "+" kept in the IN-FILE evaluation.config so the chart validator +
+// effective-value helpers fire), but the harness's arm keys, overlay
+// filenames, and run_id segment all use the normalised `rslt-l1-l2`. So a
+// user passing the documented canonical/mixed-case spelling
+// ({RSLT-L1+L2, rslt-l1+l2, RSLT-full, RS, ...}) maps to the right arm
+// rather than being rejected. It only lowercases and rewrites "+" -> "-";
+// it never invents an arm, so genuinely unknown arms still fail
+// validateConfig below.
+func normalizeArm(c string) string {
+	return strings.ReplaceAll(strings.ToLower(c), "+", "-")
+}
+
 // validateConfig rejects an unknown --config arm so a typo (e.g. "rls" for
 // "rsl") does not silently no-op into a meaningless run. Story 5.3 (BI-4)
 // tightens this to EXACTLY the six arms that have a committed
 // values-eval-<name>.yaml overlay: the FR53 four-way matrix (f, rs, rsl,
 // rslt/rslt-full -- the legacy "rslt" alias collapses to the same overlay)
-// plus the two RSLT ablation arms (rslt-l1-only, rslt-l1-l2),
-// case-insensitively. The open "rslt-" prefix Story 5.1 accepted as a
+// plus the two RSLT ablation arms (rslt-l1-only, rslt-l1-l2). The input is
+// the already-normalised arm (normalizeArm lowercases + rewrites "+" -> "-"
+// at parse time), so the canonical chart enum `RSLT-L1+L2` resolves here as
+// `rslt-l1-l2`. The open "rslt-" prefix Story 5.1 accepted as a
 // forward-compat placeholder is gone: an unknown arm (e.g. "rslt-bogus")
 // now fails fast at flag-parse rather than dispatching into a missing
 // overlay file. The keys here MUST stay in lock-step with overlayFiles
 // (overlay.go), the config -> overlay-file map the helmOverlay resolves.
 func validateConfig(c string) error {
-	switch strings.ToLower(c) {
+	switch normalizeArm(c) {
 	case "f", "rs", "rsl", "rslt", "rslt-full", "rslt-l1-only", "rslt-l1-l2":
 		return nil
 	}
-	return fmt.Errorf("--config %q is not a known evaluation arm (want one of f, rs, rsl, rslt, rslt-full, rslt-l1-only, rslt-l1-l2)", c)
+	return fmt.Errorf("--config %q is not a known evaluation arm (want one of f, rs, rsl, rslt, rslt-full, rslt-l1-only, rslt-l1+l2)", c)
 }
 
 // errIfRunDirInUse returns an error when runDir already exists and is

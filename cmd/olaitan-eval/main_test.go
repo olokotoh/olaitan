@@ -127,6 +127,30 @@ func TestParseFlags_RequiredAndRange(t *testing.T) {
 	}
 }
 
+// TestParseFlags_RejectsEmptyOverlayFlags asserts an explicitly-emptied
+// overlay flag fails fast at parse with a readable message rather than
+// shelling out helm/kubectl with an empty --release / --namespace (which
+// would also make aggregatorDeployName emit a bogus `-olaitan-aggregator`
+// target) or an empty chart/overlays path.
+func TestParseFlags_RejectsEmptyOverlayFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"empty release", []string{"--scenario", "s1", "--config", "rs", "--release", ""}},
+		{"empty namespace", []string{"--scenario", "s1", "--config", "rs", "--namespace", ""}},
+		{"empty chart-root", []string{"--scenario", "s1", "--config", "rs", "--chart-root", ""}},
+		{"empty overlays-dir", []string{"--scenario", "s1", "--config", "rs", "--overlays-dir", ""}},
+		{"whitespace release", []string{"--scenario", "s1", "--config", "rs", "--release", "   "}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := parseFlags(tc.args, &bytes.Buffer{}); err == nil {
+				t.Fatalf("expected error for %s, got nil", tc.name)
+			}
+		})
+	}
+}
+
 func TestParseFlags_AllowUnverified(t *testing.T) {
 	cfg, err := parseFlags([]string{
 		"--scenario", "s1", "--config", "rs",
@@ -175,11 +199,51 @@ func TestParseFlags_RejectsUnknownArms(t *testing.T) {
 			t.Errorf("expected rejection for %v, got nil", args)
 		}
 	}
-	// The six real arms (plus the legacy "rslt" alias) parse, case-insensitively.
-	accept := []string{"f", "rs", "rsl", "rslt", "rslt-full", "RSLT-full", "rslt-l1-only", "RSLT-L1-only", "rslt-l1-l2", "RSLT-L1-L2"}
-	for _, c := range accept {
-		if _, err := parseFlags([]string{"--scenario", "s1", "--config", c}, &bytes.Buffer{}); err != nil {
-			t.Errorf("expected --config %q to parse, got %v", c, err)
+	// The six real arms (plus the legacy "rslt" alias) parse, case-insensitively,
+	// AND the canonical chart enum spelling for the last ablation arm
+	// (`RSLT-L1+L2`, with the "+") and its mixed-case forms (`RS`,
+	// `rslt-l1+l2`) all resolve via the parse-time normalizeArm rewrite.
+	accept := map[string]string{
+		"f":            "f",
+		"rs":           "rs",
+		"RS":           "rs", // mixed/upper case
+		"rsl":          "rsl",
+		"rslt":         "rslt",
+		"rslt-full":    "rslt-full",
+		"RSLT-full":    "rslt-full",
+		"rslt-l1-only": "rslt-l1-only",
+		"RSLT-L1-only": "rslt-l1-only",
+		"rslt-l1-l2":   "rslt-l1-l2",
+		"RSLT-L1-L2":   "rslt-l1-l2",
+		"RSLT-L1+L2":   "rslt-l1-l2", // BI-1: canonical "+" enum normalised
+		"rslt-l1+l2":   "rslt-l1-l2", // lower-case "+" form
+	}
+	for in, want := range accept {
+		cfg, err := parseFlags([]string{"--scenario", "s1", "--config", in}, &bytes.Buffer{})
+		if err != nil {
+			t.Errorf("expected --config %q to parse, got %v", in, err)
+			continue
+		}
+		if cfg.config != want {
+			t.Errorf("--config %q normalised to %q; want %q", in, cfg.config, want)
+		}
+	}
+}
+
+// TestParseFlags_CanonicalArmNameMapsToOverlay asserts the BI-1 canonical
+// arm name `RSLT-L1+L2` (and a mixed-case spelling) is accepted at flag
+// parse AND resolves to the values-eval-rslt-l1-l2.yaml overlay (the "+"
+// rewrite keeps the documented chart enum working end-to-end, not just the
+// already-normalised slug).
+func TestParseFlags_CanonicalArmNameMapsToOverlay(t *testing.T) {
+	for _, in := range []string{"RSLT-L1+L2", "rslt-l1+l2", "Rslt-L1+l2"} {
+		cfg, err := parseFlags([]string{"--scenario", "s1", "--config", in}, &bytes.Buffer{})
+		if err != nil {
+			t.Fatalf("parseFlags(--config %q): unexpected error %v", in, err)
+		}
+		f, ok := overlayFileFor(cfg.config)
+		if !ok || f != "values-eval-rslt-l1-l2.yaml" {
+			t.Errorf("overlayFileFor(%q->%q) = (%q, %v); want (values-eval-rslt-l1-l2.yaml, true)", in, cfg.config, f, ok)
 		}
 	}
 }

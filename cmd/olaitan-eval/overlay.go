@@ -38,12 +38,15 @@ var overlayFiles = map[string]string{
 }
 
 // overlayFileFor resolves the validated --config arm to its overlay
-// filename (case-insensitive). It returns false for any arm with no
+// filename. It normalises the arm first (case-insensitive + the canonical
+// "+" -> "-" rewrite, normalizeArm) so the canonical chart enum
+// `RSLT-L1+L2` (and any mixed-case spelling) resolves to the same overlay
+// the flag-parse path validated. It returns false for any arm with no
 // committed overlay so helmOverlay.Apply fails closed rather than shelling
 // out with an empty --values path (defence in depth alongside the
 // flag-parse validateConfig tightening, BI-4).
 func overlayFileFor(config string) (string, bool) {
-	f, ok := overlayFiles[strings.ToLower(config)]
+	f, ok := overlayFiles[normalizeArm(config)]
 	return f, ok
 }
 
@@ -146,6 +149,18 @@ func (o *helmOverlay) Apply(ctx context.Context, config string) error {
 		timeout = 5 * time.Minute
 	}
 	aggregatorDeploy := aggregatorDeployName(o.release)
+
+	// Scope the overlay timeout to a context DEADLINE on the apply phase
+	// (the helm-upgrade --wait + the aggregator rollout-status gate), so a
+	// child that ignores its own --timeout flag is still cancelled when the
+	// budget elapses. The deadline is derived from the incoming ctx, so a
+	// caller-cancelled run also aborts the in-flight helm/kubectl child (the
+	// derived ctx threads into the exec.CommandContext children via runCmd).
+	// It bounds ONLY this phase -- the whole-trial budget is the Runner
+	// loop's concern -- which is why the deadline is per-Apply, not on the
+	// whole Run (the frozen ConfigOverlay seam stays Apply(ctx, config)).
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
 	o.logger.Info("config overlay: applying arm",
 		"config", config,
