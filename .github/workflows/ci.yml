@@ -442,3 +442,151 @@ jobs:
             ./internal/collector/posture/... \
             ./internal/response/netpol/... \
             ./internal/response/override/...
+
+  # End-to-end forensics smoke on a real kind cluster (Story 4.10 AC4). The
+  # default `e2e` job installs the RS arm and runs the RS smoke; the RSLT-full +
+  # forensics smoke (TestKindSmoke_Forensics_FullSlice) is OLT_E2E_FORENSICS-gated
+  # and was previously runnable only via `make e2e-local-forensics` (no CI job),
+  # so the full DFIR -> redaction -> MinIO (content-addressed + object-lock + KMS)
+  # -> webhook -> audit-subjects vertical was never proven in CI. This job mirrors
+  # the make target: a kind cluster, in-cluster fake-LLM + MinIO + notification
+  # sink, an object-lock-enabled report bucket, the RSLT-full + forensics chart
+  # arm, then the gated smoke.
+  #
+  # OPT-IN (the carry-forward A1 "RSLT-full kind e2e" hard gate before Epic 5):
+  # this job runs ONLY when a PR carries the `e2e-forensics` label, so it does not
+  # auto-fail every push while the kind NATS JetStream FILE STORE is sized for the
+  # heavier arm. Running it the first time already earned its keep: it caught two
+  # real bugs (the smoke over-specified QUARANTINED where the scenario settles at
+  # RESTRICTED, and the notification-webhook URL was silently un-wired for every
+  # `notifications.*` facade deployment) -- both fixed in this PR. The remaining
+  # blocker is infra-only: the RSLT-full + forensics arm creates ~14 JetStream
+  # streams (vs the RS arm's few), and the kind NATS file store is too small for
+  # them concurrently (err 10047 "insufficient storage" on the first stream, even
+  # with each stream capped at 32 MiB). streamMaxBytesOverride caps per-stream
+  # MaxBytes but the STORE total is the limit; the correct nats-subchart file-store
+  # size key for the pinned chart version still needs to be identified (the
+  # `nats.config.jetstream.fileStore.maxSize` guess did not take). Add the label
+  # to run it once that is sized.
+  e2e-forensics:
+    if: contains(github.event.pull_request.labels.*.name, 'e2e-forensics')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: Build Olaitan image
+        run: make docker-build
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1.12.0
+        with:
+          version: v0.26.0
+          cluster_name: olaitan-e2e
+          config: hack/kind-config.yaml
+
+      - name: Load image into kind
+        run: |
+          tag=$(make -s version-tag)
+          # The fake-llm fixture hardcodes `olaitan:dev` (imagePullPolicy: Never);
+          # the chart uses the version tag. In CI the version tag is a git SHA, so
+          # load BOTH `olaitan:<tag>` (for the app pods) and `olaitan:dev` (for the
+          # fixture) into kind. (Locally VERSION falls back to `dev`, so the make
+          # target only needs one.)
+          docker tag olaitan:"$tag" olaitan:dev
+          kind load docker-image olaitan:"$tag" --name olaitan-e2e
+          kind load docker-image olaitan:dev --name olaitan-e2e
+
+      - name: Prepare chart
+        run: make helm-prepare
+
+      - name: Fetch subchart dependencies
+        run: |
+          helm repo add falcosecurity https://falcosecurity.github.io/charts
+          helm repo add nats https://nats-io.github.io/k8s/helm/charts/
+          helm repo update
+          helm dependency update deploy/helm/olaitan
+
+      - name: Apply in-cluster fixtures (fake-LLM, MinIO, notification sink)
+        run: |
+          kubectl apply -f tests/e2e/fixtures/fake-llm.yaml
+          kubectl apply -f tests/e2e/fixtures/minio.yaml
+          kubectl apply -f tests/e2e/fixtures/notification-sink.yaml
+          kubectl wait --for=condition=available --timeout=180s \
+            deploy/fake-llm deploy/minio deploy/notification-sink
+
+      - name: Provision MinIO buckets (object-lock report bucket + forensic bundle bucket)
+        run: |
+          kubectl exec deploy/minio -- sh -c '\
+            mc alias set local http://localhost:9000 olaitan-e2e olaitan-e2e-secret && \
+            mc mb --ignore-existing --with-lock local/olaitan-reports && \
+            mc mb --ignore-existing local/olaitan-forensics'
+
+      - name: Install chart under RSLT-full + forensics arm
+        run: |
+          tag=$(make -s version-tag)
+          # streamMaxBytesOverride is 32 MiB: the RSLT-full + forensics arm ensures
+          # the most streams (EVENTS / EVENTS_RAW / EVIDENCE / INVESTIGATIONS /
+          # INCIDENTS / REPORTS / AUDIT_TRANSITIONS / AUDIT_ASSESSMENTS /
+          # AUDIT_REDACTIONS / AUDIT_POLICIES / AUDIT_OVERRIDES, ~14), and the SUM
+          # of per-stream MaxBytes must stay under the kind NATS JetStream file
+          # store. At 512 / 256 MiB the sum exceeded it and stream creation failed
+          # with "insufficient storage resources available" (err 10047), so the
+          # collector + aggregator crash-looped and `--wait` hit its deadline. A
+          # smoke test's streams hold only a handful of messages, so 32 MiB x ~14 =
+          # ~0.5 GiB fits comfortably. --wait is 8m for the heavier arm's startup.
+          helm install olaitan ./deploy/helm/olaitan \
+            --set image.repository=olaitan \
+            --set-string image.tag="$tag" \
+            --set image.pullPolicy=Never \
+            --set evaluation.config=RSLT-full \
+            --set analyst.l1_provider=openai \
+            --set analyst.l2_provider=openai \
+            --set analyst.senior_provider=openai \
+            --set analyst.dfir_provider=openai \
+            --set analyst.l1_model=fake --set analyst.l2_model=fake \
+            --set analyst.senior_model=fake --set analyst.dfir_model=fake \
+            --set analyst.api.endpoint=http://fake-llm:8080/v1 \
+            --set secrets.llmApiKey=fake-key \
+            --set response.forensics.enabled=true \
+            --set response.settling.enabled=true \
+            --set response.dfir.enabled=true \
+            --set response.reportArchive.enabled=true \
+            --set response.forensics.s3Endpoint=minio:9000 \
+            --set response.forensics.s3UseSsl=false \
+            --set response.reportArchive.s3Endpoint=minio:9000 \
+            --set response.reportArchive.s3UseSsl=false \
+            --set 'forensics.s3.bucket=olaitan-reports' \
+            --set 'forensics.s3.kms_key_alias=alias/olaitan-e2e' \
+            --set forensics.settling_window_seconds=10 \
+            --set notifications.enabled=true \
+            --set notifications.webhook_url=http://notification-sink:8080/ \
+            --set secrets.s3AccessKey=olaitan-e2e \
+            --set secrets.s3SecretKey=olaitan-e2e-secret \
+            --set baselines.warmupDuration=5s \
+            --set secrets.redisPassword=ci-test \
+            --set falco.enabled=false \
+            --set endpoints.falco=tcp://127.0.0.1:0 \
+            --set nats.streamMaxBytesOverride=33554432 \
+            --set nats.config.jetstream.fileStore.maxSize=8Gi \
+            --wait --timeout 8m
+
+      - name: Run forensics smoke
+        env:
+          OLT_E2E_FORENSICS: "1"
+        run: go test -tags=e2e -v -count=1 -run TestKindSmoke_Forensics_FullSlice ./tests/e2e/...
+
+      - name: Debug logs on failure
+        if: failure()
+        run: |
+          kubectl get pods -A
+          kubectl logs -l app.kubernetes.io/name=olaitan --tail=300 --all-containers || true
+          kubectl logs deploy/minio --tail=100 || true
+          kubectl logs deploy/notification-sink --tail=100 || true
