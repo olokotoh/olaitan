@@ -4016,6 +4016,26 @@ func TestNotificationsFacade_WebhookUrlIsSecretNeverConfigMap(t *testing.T) {
 	}
 }
 
+// TestNotificationsFacade_EnabledProjectsWebhookEnv is a regression test for a
+// real wiring defect the forensics e2e surfaced: the deployment projected the
+// NOTIFICATIONS_WEBHOOK_URL secret env only when .Values.response.notifications
+// .enabled was set, but the Story 4.10 facade sets .Values.notifications.enabled
+// (the facade bridges enabled into the CONFIG, not into the deployment's
+// env-projection condition). So a facade-only deployment enabled the webhook in
+// config yet never projected the URL secret, silently un-wiring the webhook (the
+// running pod logged "no NOTIFICATIONS_WEBHOOK_URL supplied"). With the fix the
+// env must be projected when notifications is enabled via the facade.
+func TestNotificationsFacade_EnabledProjectsWebhookEnv(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"notifications.enabled=true",
+		"notifications.webhook_url=https://hooks.example.invalid/TOKEN",
+	})
+	if !strings.Contains(rendered, "name: NOTIFICATIONS_WEBHOOK_URL") {
+		t.Errorf("facade notifications.enabled did not project the NOTIFICATIONS_WEBHOOK_URL env into the deployment (webhook would be silently un-wired)\n%s",
+			snippet(rendered, "olaitan-aggregator"))
+	}
+}
+
 // TestNotificationsFacade_WebhookUrlOverridesSecret pins the facade-wins
 // precedence on the webhook secret: a non-empty facade webhook_url overrides
 // secrets.notificationsWebhookUrl; an empty facade value falls back to it.
