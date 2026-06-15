@@ -1,0 +1,25 @@
+# values-eval-f.yaml -- the Epic 5 "F" evaluation arm (FR53, Story 5.3).
+#
+#   helm upgrade --install olaitan deploy/helm/olaitan \
+#     --set secrets.redisPassword=<password> \
+#     -f deploy/helm/olaitan/values-eval-f.yaml
+#
+# F = Falco-only baseline. Measures Falco alone, with no deterministic
+# detection layer above it and no LLM tier. This overlay is THIN: it sets
+# ONLY evaluation.config. The chart computes the per-arm canonical values
+# from that one knob (Story 1.19 + Story 3.16) and CLOBBERS any
+# operator-supplied rules/baselines/provider/l2/senior knobs, so restating
+# them here would be dead weight that risks drifting from the chart's
+# computed values (see deploy/helm/olaitan/EVAL.md operator-override
+# semantics).
+#
+# AUTOMATIC F-arm source disabling: the chart's
+# olaitan.evaluation.isFArm gate (templates/_helpers.tpl) disables the
+# four non-Falco source adapters (audit, containerd, calico, posture) for
+# the F arm so the Epic 5 four-way comparison measures Falco alone. This
+# overlay MUST NOT restate that disable (the chart owns it).
+#
+# NO model pin: the F arm runs analyst.provider=none (the LLM tier is
+# bypassed), so analyst.api.model is irrelevant here.
+evaluation:
+  config: F

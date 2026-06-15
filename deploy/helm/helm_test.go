@@ -3199,6 +3199,229 @@ func TestGoldenFile_F(t *testing.T) {
 	runGolden(t, "f", []string{"evaluation.config=F"})
 }
 
+// --- Story 5.3: configuration-matrix overlay golden + knob tests --------
+//
+// AC3: each of the six committed values-eval-<name>.yaml overlays renders
+// to a byte-stable golden, and any drift fails the build. These extend the
+// EXISTING golden harness (runGolden / normaliseGolden / HELM_GOLDEN_UPDATE)
+// with a --values-path render (helmTemplateValues) instead of --set pairs,
+// since the overlays are committed files. AC4 HALF A: the render-cleanly +
+// configmap-knob test per arm asserts the rendered config matches the
+// arm->knob mapping (and the LLM-arm model pin) with NO cluster (BI-7).
+
+// overlayPath resolves the absolute path to a committed values-eval-<slug>.
+// yaml overlay under the chart dir, independent of the caller's working dir.
+func overlayPath(t *testing.T, slug string) string {
+	t.Helper()
+	return filepath.Join(chartDir(t), "values-eval-"+slug+".yaml")
+}
+
+// helmTemplateValues renders the chart with the supplied -f <valuesPath>
+// overlay file (plus the mandatory Redis password). It mirrors helmTemplate
+// but applies a committed values file rather than --set pairs, so the
+// Story-5.3 overlays are rendered exactly as an operator would apply them.
+func helmTemplateValues(t *testing.T, valuesPath string) string {
+	t.Helper()
+	args := []string{"template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+		"--values", valuesPath,
+	}
+	cmd := exec.Command("helm", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("helm template --values %s failed: %v\nstderr:\n%s", valuesPath, err, stderr.String())
+	}
+	return stdout.String()
+}
+
+// runGoldenValues renders the chart with the overlay file for slug,
+// normalises the output, and diffs against deploy/helm/testdata/golden/
+// <goldenSlug>.golden.yaml (regenerate with HELM_GOLDEN_UPDATE=1). It is the
+// --values sibling of runGolden.
+func runGoldenValues(t *testing.T, goldenSlug, overlaySlug string) {
+	t.Helper()
+	rendered := helmTemplateValues(t, overlayPath(t, overlaySlug))
+	got := normaliseGolden(rendered)
+	path := goldenPath(t, goldenSlug)
+	if goldenUpdate() {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir golden dir: %v", err)
+		}
+		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
+			t.Fatalf("write golden file: %v", err)
+		}
+		fmt.Fprintf(os.Stderr, "HELM_GOLDEN_UPDATE=1: wrote golden file %s (run `git diff deploy/helm/testdata/golden/` to inspect)\n", path)
+		t.Logf("regenerated golden file: %s", path)
+		return
+	}
+	wantBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read golden file %s: %v (regenerate with HELM_GOLDEN_UPDATE=1)", path, err)
+	}
+	if got == string(wantBytes) {
+		return
+	}
+	want := string(wantBytes)
+	const ctx = 20
+	gotLines := strings.Split(got, "\n")
+	wantLines := strings.Split(want, "\n")
+	firstDiff := 0
+	for firstDiff < len(gotLines) && firstDiff < len(wantLines) && gotLines[firstDiff] == wantLines[firstDiff] {
+		firstDiff++
+	}
+	lo := firstDiff - ctx
+	if lo < 0 {
+		lo = 0
+	}
+	gotEnd := firstDiff + ctx
+	if gotEnd > len(gotLines) {
+		gotEnd = len(gotLines)
+	}
+	wantEnd := firstDiff + ctx
+	if wantEnd > len(wantLines) {
+		wantEnd = len(wantLines)
+	}
+	t.Errorf("golden mismatch for %s at line %d. Regenerate with HELM_GOLDEN_UPDATE=1.\n--- want (%s:%d-%d)\n%s\n--- got (line %d-%d)\n%s",
+		goldenSlug, firstDiff+1, path, lo+1, wantEnd, strings.Join(wantLines[lo:wantEnd], "\n"),
+		lo+1, gotEnd, strings.Join(gotLines[lo:gotEnd], "\n"))
+}
+
+// The six golden tests (AC3): drift in any overlay's rendered output fails
+// the build. VERIFIED (Story 5.3): RSL and RSLT-L1-only render the SAME
+// analyst provider/l2/senior shape (api / l2 off / senior on) and the chart
+// does NOT echo the evaluation.config arm label into the rendered config, so
+// their goldens are BYTE-IDENTICAL. Both are still committed separately for
+// matrix clarity (each arm is a distinct row in the eval matrix); the
+// byte-identity is pinned by TestGoldenFile_Eval_RSL_RSLTL1Only_Identical so
+// a future chart edit that diverges them is surfaced.
+
+func TestGoldenFile_Eval_F(t *testing.T)        { runGoldenValues(t, "eval-f", "f") }
+func TestGoldenFile_Eval_RS(t *testing.T)       { runGoldenValues(t, "eval-rs", "rs") }
+func TestGoldenFile_Eval_RSL(t *testing.T)      { runGoldenValues(t, "eval-rsl", "rsl") }
+func TestGoldenFile_Eval_RSLTFull(t *testing.T) { runGoldenValues(t, "eval-rslt-full", "rslt-full") }
+func TestGoldenFile_Eval_RSLTL1Only(t *testing.T) {
+	runGoldenValues(t, "eval-rslt-l1-only", "rslt-l1-only")
+}
+func TestGoldenFile_Eval_RSLTL1L2(t *testing.T) { runGoldenValues(t, "eval-rslt-l1-l2", "rslt-l1-l2") }
+
+// TestEvalOverlayRendersCleanlyAndKnobs (AC4 HALF A) asserts each of the six
+// overlays renders without error AND the rendered config carries the
+// expected per-arm knobs (BI-2 mapping). rules/baselines/provider come from
+// findEvalLine; the l2_enabled/senior_enabled ablation toggles come from a
+// config.Load round-trip + L2EnabledOrDefault/SeniorEnabledOrDefault
+// (mirroring TestEvaluationArmAblationToggles); the LLM arms also assert
+// analyst.api.model == claude-opus-4-8 (the BI-3 reproducibility pin). This
+// is the AC4 "reflected in configmaps" clause for all six arms, with no
+// cluster.
+func TestEvalOverlayRendersCleanlyAndKnobs(t *testing.T) {
+	cases := []struct {
+		slug          string
+		wantRules     string
+		wantBaselines string
+		wantProvider  string
+		wantL2        bool
+		wantSenior    bool
+		isLLM         bool
+	}{
+		// F / RS do not drive the ablation toggles (the BI-2 mapping marks
+		// them n/a): l2_enabled / senior_enabled flow through at the chart's
+		// operator default (true). Their LLM tier is bypassed (provider none)
+		// so the toggle values are inert anyway.
+		{"f", "false", "false", "none", true, true, false},
+		{"rs", "true", "true", "none", true, true, false},
+		{"rsl", "true", "true", "api", false, false, true},
+		{"rslt-full", "true", "true", "api", true, true, true},
+		{"rslt-l1-only", "true", "true", "api", false, false, true},
+		{"rslt-l1-l2", "true", "true", "api", true, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.slug, func(t *testing.T) {
+			rendered := helmTemplateValues(t, overlayPath(t, tc.slug))
+			if got := findEvalLine(t, rendered, "rules", "enabled"); got != tc.wantRules {
+				t.Errorf("%s: rules.enabled = %q, want %q", tc.slug, got, tc.wantRules)
+			}
+			if got := findEvalLine(t, rendered, "baselines", "enabled"); got != tc.wantBaselines {
+				t.Errorf("%s: baselines.enabled = %q, want %q", tc.slug, got, tc.wantBaselines)
+			}
+			if got := findEvalLine(t, rendered, "analyst", "provider"); got != tc.wantProvider {
+				t.Errorf("%s: analyst.provider = %q, want %q", tc.slug, got, tc.wantProvider)
+			}
+
+			// Round-trip the embedded config through config.Load so the
+			// ablation toggles are read exactly as the aggregator binary does.
+			embedded := extractEmbeddedConfigYAML(t, rendered)
+			tmp := filepath.Join(t.TempDir(), "olaitan.yaml")
+			if err := os.WriteFile(tmp, []byte(embedded), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg, err := configLoad(t, tmp)
+			if err != nil {
+				t.Fatalf("%s: config.Load rejected the rendered config: %v", tc.slug, err)
+			}
+			if cfg.Analyst.L2EnabledOrDefault() != tc.wantL2 {
+				t.Errorf("%s: L2EnabledOrDefault = %v, want %v", tc.slug, cfg.Analyst.L2EnabledOrDefault(), tc.wantL2)
+			}
+			if cfg.Analyst.SeniorEnabledOrDefault() != tc.wantSenior {
+				t.Errorf("%s: SeniorEnabledOrDefault = %v, want %v", tc.slug, cfg.Analyst.SeniorEnabledOrDefault(), tc.wantSenior)
+			}
+
+			// BI-3: the LLM arms pin analyst.api.model to the manifest model.
+			if tc.isLLM {
+				if got := cfg.Analyst.API.Model; got != evalManifestModel(t) {
+					t.Errorf("%s: analyst.api.model = %q, want %q (the eval/manifest.yaml llm_model_version pin)", tc.slug, got, evalManifestModel(t))
+				}
+			}
+		})
+	}
+}
+
+// TestGoldenFile_Eval_RSL_RSLTL1Only_Identical documents + pins the BI-2
+// finding (Story 5.3): RSL and RSLT-L1-only share the analyst
+// provider/l2/senior shape (api / l2 off / senior on) AND the chart does NOT
+// echo the evaluation.config arm label into the rendered config, so the two
+// arms render BYTE-IDENTICAL. The goldens are committed separately for eval
+// -matrix clarity (each is a distinct arm); this test pins the byte-identity
+// so a future chart edit that diverges them is caught (the two-overlay
+// distinction would then need to surface in the render). The arm DISTINCTION
+// lives in the harness --config name + the run_id, not the rendered config.
+func TestGoldenFile_Eval_RSL_RSLTL1Only_Identical(t *testing.T) {
+	rsl := normaliseGolden(helmTemplateValues(t, overlayPath(t, "rsl")))
+	l1only := normaliseGolden(helmTemplateValues(t, overlayPath(t, "rslt-l1-only")))
+	if rsl != l1only {
+		t.Errorf("RSL and RSLT-L1-only no longer render byte-identical; the arm distinction now surfaces in the config and the matrix-clarity rationale needs revisiting")
+	}
+}
+
+// evalManifestModel reads the llm_model_version pin from eval/manifest.yaml
+// so the overlay-knob test cross-checks the chart model pin against the
+// canonical manifest source (Task 1.8 / BI-3: the manifest is canonical, the
+// overlay mirrors it; they cannot drift).
+func evalManifestModel(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatalf("runtime.Caller(0) failed")
+	}
+	// helm_test.go lives at deploy/helm/; the manifest is at <repo>/eval/.
+	manifestPath := filepath.Join(filepath.Dir(thisFile), "..", "..", "eval", "manifest.yaml")
+	raw, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read eval/manifest.yaml: %v", err)
+	}
+	var m struct {
+		LLMModelVersion string `yaml:"llm_model_version"`
+	}
+	if err := yaml.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("parse eval/manifest.yaml: %v", err)
+	}
+	if m.LLMModelVersion == "" {
+		t.Fatalf("eval/manifest.yaml llm_model_version is empty")
+	}
+	return m.LLMModelVersion
+}
+
 // TestGraduatedIsolationBridgesFromValues (Story 2.10, AC2): the fsm
 // threshold/dwell/cooldown and response.{networkPolicy,override,audit} values
 // are overlaid onto the rendered config by the configmap bridges.

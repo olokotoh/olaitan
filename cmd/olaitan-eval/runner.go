@@ -38,9 +38,12 @@ type ClusterController interface {
 }
 
 // ConfigOverlay applies the evaluation configuration arm (the F / RS / RSL
-// / RSLT-full overlays). OWNED BY STORY 5.3: 5.3 supplies the six
-// values-eval-{config}.yaml overlays behind this seam. The 5.1 minimal
-// impl (rsOverlay) reuses the EXISTING evaluation.config=RS chart wiring.
+// / RSLT-full / ablation overlays). FILLED BY STORY 5.3: 5.3 supplies the
+// six values-eval-{config}.yaml overlays behind this seam (helmOverlay in
+// overlay.go, built by newHelmOverlay). Apply runs `helm upgrade --install
+// --values values-eval-<name>.yaml --wait` plus an explicit `kubectl
+// rollout status deploy/<release>-olaitan-aggregator` Ready gate; the 5.1
+// rsOverlay log-deferral is replaced.
 type ConfigOverlay interface {
 	// Apply selects the named configuration arm (e.g. "rs", "rslt-full")
 	// for the trial.
@@ -198,28 +201,11 @@ func (c *clusterController) Cleanup(ctx context.Context) error {
 	return nil
 }
 
-// rsOverlay is the 5.1 minimal ConfigOverlay. It reuses the EXISTING
-// evaluation.config=RS chart wiring (Story 1.19): the chart is installed
-// under the RS arm by `make eval-smoke`, so Apply only validates the
-// requested arm against what the 5.1 foundation can honestly drive.
-type rsOverlay struct {
-	logger *slog.Logger
-}
-
-func (o *rsOverlay) Apply(ctx context.Context, config string) error {
-	// Story 5.3: the six values-eval-{config}.yaml overlays (F / RS / RSL
-	// / RSLT-full / ablations) land here behind this seam. The 5.1 minimal
-	// impl reuses the chart's evaluation.config=RS wiring, which the
-	// eval-smoke bring-up already installed; the rich F/RSL/RSLT-full
-	// EXECUTION awaits 5.3. Non-RS arms PARSE and dispatch in 5.1 (AC4)
-	// but their rich overlay is not yet wired, so log the deferral rather
-	// than silently pretending.
-	if !strings.EqualFold(config, "rs") {
-		o.logger.Info("config overlay: non-RS arm parsed and dispatched; rich overlay execution awaits Story 5.3",
-			"config", config)
-	}
-	return nil
-}
+// The ConfigOverlay seam (runner.go interface) is filled by the Story-5.3
+// real helmOverlay in overlay.go (built by newHelmOverlay): the Story-5.1
+// rsOverlay log-deferral is replaced by a `helm upgrade --install --values
+// values-eval-<name>.yaml --wait` apply plus an explicit `kubectl rollout
+// status` aggregator Ready gate (fail-closed, BI-5).
 
 // The Scenario seam (runner.go interface) is filled by the Story-5.2 rich
 // per-scenario harness in scenario.go (scenarioHarness, built by

@@ -208,6 +208,24 @@ jobs:
           # streams). Actual on-disk usage during the smoke test stays
           # well under the cap. Production deployments leave this empty
           # and size nats.persistence to the configured sum.
+          # nats.streamMaxBytesOverride is set via --set-STRING (not bare
+          # --set) on purpose (Story 5.3 Review Round 2, CI-caught): the
+          # eval-harness smoke below runs `helm upgrade --reuse-values
+          # --values values-eval-rs.yaml --wait`, and helm reserialises a
+          # bare-int `--set nats.streamMaxBytesOverride=536870912` reused
+          # value into scientific notation ("5.36870912e+08") on the next
+          # revision. That changes the OLT_NATS_STREAM_MAXBYTES_OVERRIDE env
+          # string in the aggregator Deployment AND collector DaemonSet pod
+          # templates, triggering a rollout; the fresh aggregator pod then
+          # hits the documented constrained-single-node-kind NATS-not-ready
+          # startup restart race and never reaches Ready, so the harness's
+          # --wait --timeout 5m hits "context deadline exceeded". Passing the
+          # value as a STRING round-trips byte-identically through
+          # --reuse-values, so the overlay re-apply is a genuine no-change
+          # upgrade (--wait returns immediately) -- the idempotent-re-apply
+          # property AC2 wants. Verified locally with helm v3.16: a string
+          # install + the harness upgrade yields a byte-identical manifest;
+          # the bare-int install drifts both pod templates.
           # endpoints.falco overridden to a tcp:// target: with the
           # default unix:///run/falco/falco.sock the collector DaemonSet
           # mounts /run/falco from the host as a `type: Directory`
@@ -228,7 +246,7 @@ jobs:
             --set secrets.redisPassword=ci-test \
             --set falco.enabled=false \
             --set endpoints.falco=tcp://127.0.0.1:0 \
-            --set nats.streamMaxBytesOverride=536870912 \
+            --set-string nats.streamMaxBytesOverride=536870912 \
             --wait --timeout 5m
 
       - name: Run smoke test

@@ -8,6 +8,17 @@
 // RS arm (Falco-off, NO LLM) reusing the Story-1.19 rs_smoke kind bring-up
 // that already passes in the default CI e2e job.
 //
+// Story 5.3 (AC4 HALF B, BI-8): the harness now drives the REAL RS
+// helmOverlay. `make eval-smoke` pre-installs the chart (release "olaitan",
+// namespace "default", the kind-smoke image/falco overrides); the harness's
+// helmOverlay.Apply("rs") runs an idempotent `helm upgrade --install
+// --reuse-values --values values-eval-rs.yaml --wait` plus an explicit
+// `kubectl rollout status deploy/olaitan-aggregator` Ready gate, proving the
+// ConfigOverlay seam-fill produces a working RS deployment on kind (no
+// silent no-op). The LLM arms' working-deployment half stays opt-in / folded
+// into the carry-forward A1 RSLT-full-kind gate (BI-7); the default CI e2e
+// job does NOT run the full LLM chain.
+//
 // HONEST SCOPE (BI-8): the "all artefacts captured" clause is scoped to
 // the MINIMAL set: the per-run metadata.yaml (carrying manifest_sha256)
 // plus the placeholder capture marker. The six-file rich artefact set
@@ -96,6 +107,17 @@ func TestEvalSmoke_S1_RS_OneTrial(t *testing.T) {
 		"--runs", "1",
 		"--out", outDir,
 		"--allow-unverified", "aggregator",
+		// Story 5.3 (AC4 HALF B, BI-8): the harness now drives the REAL RS
+		// helmOverlay. `make eval-smoke` pre-installs the chart under
+		// release "olaitan" in namespace "default" with the kind-smoke
+		// overrides; the harness runs an idempotent `helm upgrade --install
+		// --reuse-values --values values-eval-rs.yaml --wait` (re-applying
+		// the RS arm + layering the overlay on the install-time values) then
+		// an explicit `kubectl rollout status deploy/olaitan-aggregator`
+		// Ready gate. --namespace default matches the make-target install;
+		// the chart-root / overlays-dir default to deploy/helm/olaitan
+		// (resolved from cmd.Dir = repo root).
+		"--namespace", "default",
 	)
 	cmd.Dir = root
 	out, err := cmd.CombinedOutput()

@@ -70,6 +70,93 @@ helm install olaitan deploy/helm/olaitan \
   --set analyst.provider=none
 ```
 
+## Evaluation overlays (Story 5.3, FR53)
+
+For the Epic 5 evaluation harness, the six arms are committed as THIN Helm
+values overlays alongside this chart, so a run applies an arm via
+`helm upgrade --values <overlay>` with no `--set` fiddling and no code
+change:
+
+| Overlay file | `evaluation.config` | Arm |
+| --- | --- | --- |
+| `values-eval-f.yaml` | `F` | Falco-only baseline |
+| `values-eval-rs.yaml` | `RS` | Rules + Statistics (no LLM) |
+| `values-eval-rsl.yaml` | `RSL` | RS + single-LLM Standard mode |
+| `values-eval-rslt-full.yaml` | `RSLT-full` | RS + full L1 -> L2 -> Senior chain |
+| `values-eval-rslt-l1-only.yaml` | `RSLT-L1-only` | RSLT ablation: L1 only |
+| `values-eval-rslt-l1-l2.yaml` | `RSLT-L1+L2` | RSLT ablation: L1 + L2, no Senior |
+
+Each overlay is THIN: it sets ONLY `evaluation.config` (the per-arm
+rules/baselines/provider/l2/senior values are COMPUTED by the chart from
+that one knob, per the canonical-arms table above) plus, for the LLM arms,
+the reproducibility model pin `analyst.api.model: claude-opus-4-8`
+(mirroring `eval/manifest.yaml`'s `llm_model_version`, NFR37). The overlays
+do NOT restate the per-arm knobs (the chart clobbers them under a named arm
+anyway; restating them is dead weight that risks drift).
+
+Apply an arm:
+
+```bash
+helm upgrade --install olaitan deploy/helm/olaitan \
+  --set secrets.redisPassword=<password> \
+  -f deploy/helm/olaitan/values-eval-rs.yaml
+```
+
+Filename note (BI-1): the canonical chart enum for the last arm is
+`RSLT-L1+L2`; the `+` is normalised to `-` in the FILENAME
+(`values-eval-rslt-l1-l2.yaml`) while the IN-FILE `evaluation.config` stays
+the canonical `RSLT-L1+L2` so the chart validator and helpers fire
+unchanged. RSL and RSLT-L1-only render the same analyst shape (api / l2 off
+/ senior on) and so render byte-identical; both overlays are kept for
+matrix clarity (the arm distinction lives in the harness `--config` name +
+the run id, not the rendered config).
+
+LLM-arm install-time pointers: the LLM-arm overlays keep
+`analyst.api.endpoint` empty (the vendor default) and
+`analyst.api.apiKeySecret` at the chart default (`olaitan-llm`). Supply the
+key via `secrets.llmApiKey` at install; for an in-cluster fake-LLM run set
+`--set analyst.api.endpoint=http://fake-llm:8080/v1` (the
+`make e2e-local-rslt` pattern).
+
+The `olaitan-eval` harness (`cmd/olaitan-eval/`) applies these overlays
+behind the `ConfigOverlay` seam: `--config <name>` resolves to the matching
+`values-eval-<name>.yaml`, runs `helm upgrade --install --reuse-values
+--values <overlay> --wait`, then an explicit `kubectl rollout status
+deploy/<fullname>-aggregator` Ready gate before the scenario fires
+(fail-closed). See `cmd/olaitan-eval/README.md`.
+
+The rollout-status target is `deploy/<fullname>-aggregator`, where
+`<fullname>` is the chart's `olaitan.fullname` helper, which DEDUPS the
+chart name: the canonical `--release olaitan` collapses
+`olaitan-olaitan-aggregator` to `olaitan-aggregator`, while a custom
+release (e.g. `--release myrel`) that does not already contain the chart
+name expands to `myrel-olaitan-aggregator`. The harness's
+`aggregatorDeployName` mirrors this dedup so the Ready gate names the
+deployment the chart actually renders. This assumes NO
+`fullnameOverride`/`nameOverride` is set at install: `aggregatorDeployName`
+mirrors only the dedup branch of `olaitan.fullname`, so a custom name
+override would make the rollout-status target diverge from the rendered
+deployment name.
+
+Arm switching and `--reuse-values` (BI-8): the harness reuses the
+install-time values via `--reuse-values`, which is SAFE to do in place
+across arms because ALL arm-distinguishing knobs
+(`rules`/`baselines`/`provider`/`l2`/`senior`) are DERIVED by the chart from
+the single `evaluation.config` value the overlay sets (the canonical-arms
+table above) -- the overlay layers `evaluation.config` (and, for the LLM
+arms, the inert model pin) on top of the install-time values, and the chart
+recomputes every per-arm knob, so switching from one arm to another by
+re-applying its overlay produces the correct derived configuration. For the
+`F` / `RS` arms the lingering `analyst.api.model` string carried over from a
+prior LLM-arm install is INERT (the derived `provider=none` means the model
+is never read). If you want a clean-slate switch with no carried-over
+install-time values, `helm uninstall` first (or omit `--reuse-values`). The
+exercised path is option (a): a pre-install (via `make eval-smoke`)
+followed by the harness's idempotent re-apply of the same/another arm's
+overlay; the first-install-VIA-the-harness path (option (b)) is supported by
+helm's `--reuse-values` no-op-on-fresh-install semantics but is NOT a tested
+path here.
+
 ## Restart semantics
 
 `evaluation.config` is restart-required. Setting it drives changes to
