@@ -478,7 +478,14 @@ jobs:
       - name: Load image into kind
         run: |
           tag=$(make -s version-tag)
+          # The fake-llm fixture hardcodes `olaitan:dev` (imagePullPolicy: Never);
+          # the chart uses the version tag. In CI the version tag is a git SHA, so
+          # load BOTH `olaitan:<tag>` (for the app pods) and `olaitan:dev` (for the
+          # fixture) into kind. (Locally VERSION falls back to `dev`, so the make
+          # target only needs one.)
+          docker tag olaitan:"$tag" olaitan:dev
           kind load docker-image olaitan:"$tag" --name olaitan-e2e
+          kind load docker-image olaitan:dev --name olaitan-e2e
 
       - name: Prepare chart
         run: make helm-prepare
