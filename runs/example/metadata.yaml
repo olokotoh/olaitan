@@ -1,9 +1,14 @@
 # Example run metadata.yaml (committed skeleton documenting the layout).
 #
-# This is the MINIMAL Story 5.1 schema. Story 5.5 owns and extends it with
-# the full per-trial / statistical / analysis-pipeline fields. The
-# manifest_sha256 field is the BI-5 carrier: it equals
-# `sha256sum eval/manifest.yaml` of the envelope the run used.
+# Story 5.4 EXTENDS the Story-5.1 minimal schema, KEEPING the 5.1 keys (Story
+# 5.5 builds on them) and ADDING the AC3 measured fields. The manifest_sha256
+# field is the BI-5 carrier: it equals `sha256sum eval/manifest.yaml` of the
+# envelope the run used. The measured fields are computed by comparing the
+# captured signal (fsm.jsonl / evidence.jsonl) against the scenario's
+# target.yaml (BI-9). fsm_state_source labels the FSM-state honesty on the
+# constrained env (BI-8); resource_usage is the harness-process snapshot always
+# plus cluster_* when available; size_bytes / size_cap_exceeded are the AC4
+# size bound (BI-10, fail-LOUD not fail-delete).
 run_id: 20260615T093000.000Z-s1-rs-69d1b5f452cd
 manifest_sha256: 69d1b5f452cd0d91eec2bbe94f6047ab68588b7a5faf724bc57dda0d86462a5a
 scenario: s1
@@ -12,3 +17,16 @@ runs: 1
 started_at: "2026-06-15T09:30:00Z"
 finished_at: "2026-06-15T09:31:12Z"
 olaitan_eval_version: dev
+success_criterion_met: true
+measured_time_to_detect: 18
+measured_final_fsm_state: QUARANTINED
+fsm_state_source: observed_transitions
+resource_usage:
+  harness_alloc_bytes: 4194304
+  harness_total_alloc_bytes: 12582912
+  harness_sys_bytes: 25165824
+  harness_num_gc: 3
+  harness_goroutines: 8
+  cluster_metrics_available: false
+size_bytes: 81920
+size_cap_exceeded: false

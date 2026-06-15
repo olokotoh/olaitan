@@ -153,11 +153,19 @@ func TestEvalSmoke_S1_RS_OneTrial(t *testing.T) {
 		t.Errorf("metadata scenario/config = %s/%s; want s1/rs", md.Scenario, md.Config)
 	}
 
-	// The minimal placeholder capture wrote its marker for trial-1 (BI-8;
-	// the six-file rich set is Story 5.4).
-	marker := filepath.Join(runDir, "trial-1", "CAPTURE_PLACEHOLDER.md")
-	if _, err := os.Stat(marker); err != nil {
-		t.Errorf("placeholder capture marker %q missing: %v", marker, err)
+	// Story 5.4: the six FR54 artefacts land at run-level runs/<run_id>/.
+	// This eval-smoke runs the harness WITHOUT --nats-url (the full capture
+	// against a real RS deployment producing real subject traffic is opt-in
+	// / folded into the carry-forward A1 RSLT-full-kind gate per BI-11), so
+	// the four .jsonl files are written empty and report.md takes the honest
+	// no-report path; all six MUST still exist (AC5).
+	for _, name := range []string{
+		"events.jsonl", "evidence.jsonl", "assessments.jsonl",
+		"fsm.jsonl", "report.md", "metadata.yaml",
+	} {
+		if _, err := os.Stat(filepath.Join(runDir, name)); err != nil {
+			t.Errorf("run artefact %q missing: %v", name, err)
+		}
 	}
 }
 

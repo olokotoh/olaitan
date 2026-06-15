@@ -4,9 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 )
 
@@ -212,38 +210,14 @@ func (c *clusterController) Cleanup(ctx context.Context) error {
 // newScenario). The 5.1 rsScenario no-op marker is replaced: --scenario sN
 // now dispatches the matching deploy/demo/scenarios/sN-<slug>/ harness.
 
-// metadataOnlyCapturer is the 5.1 minimal Capturer. It writes the per-run
-// metadata.yaml (the manifest_sha256 carrier, AC3) and a placeholder
-// marker into the trial dir. The six-file rich artefact set
-// (events/evidence/assessments/fsm/report) is Story 5.4.
-type metadataOnlyCapturer struct {
-	logger *slog.Logger
-}
-
-// capturePlaceholderName is the marker file the 5.1 minimal Capturer
-// writes so the AC5 e2e can assert the placeholder capture ran without
-// pretending the six-file rich set exists.
-const capturePlaceholderName = "CAPTURE_PLACEHOLDER.md"
-
-func (c *metadataOnlyCapturer) Capture(ctx context.Context, trialDir string) error {
-	// Story 5.4: the six-file events/evidence/assessments/fsm/report/
-	// metadata capture lands here behind this seam. The 5.1 minimal impl
-	// writes ONLY a placeholder marker into the trial dir; the per-run
-	// metadata.yaml (with manifest_sha256) is written by main.go at the
-	// run level (the minimal AC3 schema, extended by Story 5.5).
-	if err := os.MkdirAll(trialDir, 0o755); err != nil {
-		return fmt.Errorf("create trial dir %q: %w", trialDir, err)
-	}
-	marker := filepath.Join(trialDir, capturePlaceholderName)
-	body := "# Story 5.1 placeholder capture\n\n" +
-		"The rich six-file artefact set (events / evidence / assessments / fsm /\n" +
-		"report / metadata) is Story 5.4. Story 5.1 writes ONLY this placeholder\n" +
-		"plus the per-run metadata.yaml carrying manifest_sha256 (AC3).\n"
-	if err := os.WriteFile(marker, []byte(body), 0o644); err != nil {
-		return fmt.Errorf("write capture placeholder %q: %w", marker, err)
-	}
-	return nil
-}
+// The Capturer seam (runner.go interface) is filled by the Story-5.4 rich
+// richCapturer adapter (capture.go), delegating to the importable
+// internal/eval/capture package (BI-12). The Story-5.1 metadataOnlyCapturer
+// placeholder (which wrote only a CAPTURE_PLACEHOLDER.md marker) is replaced;
+// the rich Capturer drains the run's NATS subjects into the uniform
+// six-artefact set under runs/<run_id>/ (events/evidence/assessments/fsm/
+// report + the harness-finalised metadata.yaml). The Capturer interface
+// signature is UNCHANGED (the 5.1 freeze).
 
 // imageDigestVerifier is the 5.1 minimal DigestVerifier (AC3). It checks
 // the container image digest(s) pinned in the manifest against the actual

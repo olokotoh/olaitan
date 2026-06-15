@@ -1278,6 +1278,40 @@ kind). The LLM arms' working-deployment half folds into the carry-forward A1
 RSLT-full-kind gate (`make e2e-local-rslt`, `OLT_E2E_RSLT`-gated); the
 default CI e2e job does NOT run the full LLM chain.
 
+#### Per-run artefact capture (Story 5.4, FR54)
+
+Every `olaitan-eval` run captures a UNIFORM six-artefact set into
+`runs/<run_id>/` so the analysis pipeline (Story 5.5) reads one shape across
+all runs:
+
+| Artefact | Source subject | Notes |
+|---|---|---|
+| `events.jsonl` | `olaitan.events.raw.>` | the per-source raw event hierarchy |
+| `evidence.jsonl` | `olaitan.evidence.packages` | the Ring-2 EvidencePackage |
+| `assessments.jsonl` | `AUDIT.assessments` | the LLM-verdict audit record (single source; there is NO `ASSESSMENTS.completed` subject) |
+| `fsm.jsonl` | `AUDIT.transitions` | one line per FSM transition |
+| `report.md` | `REPORTS.generated` + S3 fetch | the announcement header + an honest no-report note when no S3 is configured / no report was generated |
+| `metadata.yaml` | harness-written | the run record (below) |
+
+Each `.jsonl` line is a self-describing envelope
+`{schema_version, published_at, subject, payload}` wrapping the verbatim source
+payload. `metadata.yaml` KEEPS the Story-5.1 keys (`run_id`, `manifest_sha256`,
+`scenario`, `config`, `runs`, `started_at`, `finished_at`,
+`olaitan_eval_version`) and ADDS the measured fields `success_criterion_met`,
+`measured_time_to_detect`, `measured_final_fsm_state`, `fsm_state_source`,
+`resource_usage`, `size_bytes`, `size_cap_exceeded` (computed by comparing the
+captured signal against the scenario's `target.yaml`). It is finalised on
+success OR failure, so a detection miss is recorded as
+`success_criterion_met: false` rather than as missing data.
+
+Flags: `--nats-url` is the JetStream endpoint the capturer drains the run's
+subjects from (empty = the no-NATS path; artefacts are written empty so all six
+still exist). `--max-run-size-bytes` is the fail-LOUD per-run size cap (default
+500 MiB): a run over the cap emits a structured alert and records
+`size_cap_exceeded: true`, but the artefacts are NEVER deleted or truncated
+(the cap is a signal, not a quota). `make capture-it` runs the always-on
+embedded-NATS in-process capture suite (no cluster).
+
 ### 1.5 Naming-convention reconciliation
 
 The Story 1.18 acceptance criteria text uses a mix of singular-ring and plural-ring metric names (e.g. AC2 says `olaitan_decision_rule_matches_total` singular; AC3 says `olaitan_decision_baseline_deviations_total{metric, sigma_bucket}` plural). The actual registrations follow `architecture.md:472-475` which mandates the `olaitan_<ring>_<metric>` pattern with the engine subfamily conventionally plural (`rules`, `baseline`) because the engine evaluates a corpus, not a single rule. The AC singular spellings are documentation aliases, not parallel families.

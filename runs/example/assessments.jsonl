@@ -1,0 +1,1 @@
+{"schema_version":"audit.assessments.v1","published_at":"2026-06-15T09:30:16Z","subject":"AUDIT.assessments","payload":{"schema_version":"audit.assessments.v2","package_id":"pkg-example-1","workload_id":"tenant-acme/Deployment/web","mode":"rs","redaction_applied":true}}

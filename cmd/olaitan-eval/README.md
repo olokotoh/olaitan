@@ -31,12 +31,15 @@ olaitan-eval --manifest eval/manifest.yaml --scenario s1 --config rs --runs 1
 | `--namespace` | `olaitan` | Kubernetes namespace the `ConfigOverlay` upgrades into |
 | `--overlays-dir` | `deploy/helm/olaitan` | directory holding the `values-eval-<name>.yaml` configuration overlays |
 | `--overlay-timeout` | `5m` | budget for the `helm --wait` + the aggregator `rollout status` Ready gate |
+| `--nats-url` | (empty) | JetStream endpoint the per-run Capturer drains the run's subjects from (empty = no NATS wired; artefacts captured empty so all six still exist) |
+| `--max-run-size-bytes` | `524288000` | per-run artefact size cap (500 MiB); over it a fail-LOUD alert is emitted and `size_cap_exceeded` is recorded (the artefacts are NOT deleted) |
 
 The harness, in order: loads + validates the manifest, computes its SHA256
 over the committed file bytes, runs the digest-verification gate ONCE
 before the first trial, generates a `run_id`, creates `runs/<run_id>/`,
-runs `--runs` trials through the five-phase `Runner` loop, and writes the
-per-run `metadata.yaml`.
+runs `--runs` trials through the five-phase `Runner` loop (the rich Capturer
+drains the run's subjects into the six-artefact set), and finalises the
+per-run `metadata.yaml` with the measured fields on success OR failure.
 
 ## The manifest contract
 
@@ -59,15 +62,28 @@ comment / whitespace drift never silently changes the hash.
 
 ## The `runs/<run_id>/` layout
 
+Story 5.4 captures the UNIFORM six-artefact set at run-level (FR54):
+
 ```
 runs/
   <run_id>/                  # <UTC-compact-timestamp-with-millis>-<scenario>-<config>-<short-hash>
-    metadata.yaml            # minimal schema; manifest_sha256 carrier (extended by Story 5.5)
-    trial-1/
-      CAPTURE_PLACEHOLDER.md # Story 5.1 placeholder; the six-file rich set is Story 5.4
-    trial-2/
-    ...
+    events.jsonl             # <- olaitan.events.raw.>      (per-source raw events)
+    evidence.jsonl           # <- olaitan.evidence.packages (Ring-2 EvidencePackage)
+    assessments.jsonl        # <- AUDIT.assessments         (the LLM-verdict audit record)
+    fsm.jsonl                # <- AUDIT.transitions          (one line per FSM transition)
+    report.md                # <- REPORTS.generated + S3 fetch (honest no-report note when none)
+    metadata.yaml            # the run record (the 5.1 keys + the measured fields, extended by 5.5)
 ```
+
+Each `.jsonl` line is a self-describing envelope
+`{schema_version, published_at, subject, payload}` wrapping the verbatim
+source payload, so Story 5.5's analysis pipeline reads one shape across every
+run. With no `--nats-url` the four `.jsonl` files are written empty and
+`report.md` carries the honest no-report note, but all six artefacts still
+exist. `metadata.yaml` is finalised on success OR failure with
+`success_criterion_met` / `measured_time_to_detect` / `measured_final_fsm_state`
+/ `fsm_state_source` (computed against the scenario's `target.yaml`),
+`resource_usage`, `size_bytes`, and `size_cap_exceeded`.
 
 `runs/` is git-ignored except for a committed `runs/example/` skeleton.
 
@@ -108,7 +124,7 @@ Reset -> Warm -> ConfigOverlay.Apply -> Scenario.Run -> Capturer.Capture -> Clea
 | `ClusterController` (`Reset`/`Warm`/`Cleanup`) | 5.1 | reuses the rs_smoke kind bring-up; no-op phases at the foundation layer |
 | `ConfigOverlay` (`Apply`) | Story 5.3 | FILLED: `helmOverlay` (overlay.go) resolves `--config <name>` to its committed `deploy/helm/olaitan/values-eval-<name>.yaml` overlay, runs `helm upgrade --install --reuse-values --values <overlay> --wait --timeout <budget>`, then an explicit `kubectl rollout status deploy/<fullname>-aggregator` Ready gate (fail-closed). `<fullname>` is the chart's `olaitan.fullname` helper, which DEDUPS the chart name when the release already contains it (the canonical `olaitan` release collapses `olaitan-olaitan-aggregator` to `olaitan-aggregator`; a custom `myrel` release expands to `myrel-olaitan-aggregator`), mirrored by `aggregatorDeployName`. The six arms (F / RS / RSL / RSLT-full / RSLT-L1-only / RSLT-L1+L2) each select the already-shipped chart matrix; the LLM arms pin `analyst.api.model` |
 | `Scenario` (`Run`) | Story 5.2 | FILLED: `scenarioHarness` (scenario.go) resolves `--scenario sN` to the `deploy/demo/scenarios/sN-<slug>/` harness + its `target.yaml`; the synthetic-event injection lives in `tests/e2e/scenarios_smoke_test.go` on kind (BI-3) |
-| `Capturer` (`Capture`) | Story 5.4 | `metadataOnlyCapturer` writes the placeholder marker only |
+| `Capturer` (`Capture`) | Story 5.4 | FILLED: the thin `richCapturer` adapter (capture.go) delegates to the importable `internal/eval/capture` package, which drains the run's NATS subjects into the six-artefact set (events/evidence/assessments/fsm/report) and assembles `report.md`; the harness finalises `metadata.yaml` with the measured fields. The interface signature is unchanged (the 5.1 freeze) |
 | `DigestVerifier` (`Verify`) | 5.1 | `imageDigestVerifier` checks the image digest; corpus/SHA checks deferred |
 
 Story 5.2-5.5 supply rich implementations behind these interfaces without

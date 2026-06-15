@@ -46,6 +46,21 @@ filled in by later Epic-5 stories (each carries a `// Story 5.x:` TODO in
 `cmd/olaitan-eval/runner.go`) and are allow-listed by default until the
 corpora become harness-reachable.
 
+## Per-run artefacts (Story 5.4, FR54)
+
+Every run captures a UNIFORM six-artefact set into `runs/<run_id>/`:
+`events.jsonl` (`olaitan.events.raw.>`), `evidence.jsonl`
+(`olaitan.evidence.packages`), `assessments.jsonl` (`AUDIT.assessments`),
+`fsm.jsonl` (`AUDIT.transitions`), `report.md` (`REPORTS.generated` + an honest
+no-report note when no S3 / no report), and `metadata.yaml`. Each `.jsonl` line
+is a self-describing envelope `{schema_version, published_at, subject, payload}`
+wrapping the verbatim source payload. `metadata.yaml` keeps the Story-5.1 keys
+and adds `success_criterion_met` / `measured_time_to_detect` /
+`measured_final_fsm_state` / `fsm_state_source` (measured against the scenario's
+`target.yaml`), `resource_usage`, `size_bytes`, and `size_cap_exceeded`. Pass
+`--nats-url` to drain a live run's subjects; `--max-run-size-bytes` is the
+fail-LOUD size cap (default 500 MiB, artefacts retained, not deleted).
+
 ## Note on the committed pins
 
 The `images.aggregator` pin in the committed `eval/manifest.yaml` is a

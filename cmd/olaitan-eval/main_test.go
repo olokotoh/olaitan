@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -13,6 +14,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/olokotoh/olaitan/internal/eval/capture"
 )
 
 // writeCommittedShapeManifest writes a valid manifest into dir and returns
@@ -108,6 +111,82 @@ func TestParseFlags_OverlayFlagsDefaultsAndOverride(t *testing.T) {
 			t.Errorf("expected rejection of --overlay-timeout 0, got nil")
 		}
 	})
+}
+
+// TestParseFlags_CaptureFlagsDefaultsAndOverride asserts the Story-5.4
+// --nats-url + --max-run-size-bytes flags default + override + validate
+// (the BI-10 fail-LOUD size cap surface).
+func TestParseFlags_CaptureFlagsDefaultsAndOverride(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		cfg, err := parseFlags([]string{"--scenario", "s1", "--config", "rs"}, &bytes.Buffer{})
+		if err != nil {
+			t.Fatalf("parseFlags: %v", err)
+		}
+		if cfg.natsURL != "" {
+			t.Errorf("default --nats-url = %q; want empty (the honest no-NATS path)", cfg.natsURL)
+		}
+		if cfg.maxRunSizeBytes != capture.DefaultMaxRunSizeBytes {
+			t.Errorf("default --max-run-size-bytes = %d; want %d", cfg.maxRunSizeBytes, capture.DefaultMaxRunSizeBytes)
+		}
+	})
+
+	t.Run("override", func(t *testing.T) {
+		cfg, err := parseFlags([]string{
+			"--scenario", "s1", "--config", "rs",
+			"--nats-url", "nats://127.0.0.1:4222",
+			"--max-run-size-bytes", "1048576",
+		}, &bytes.Buffer{})
+		if err != nil {
+			t.Fatalf("parseFlags: %v", err)
+		}
+		if cfg.natsURL != "nats://127.0.0.1:4222" {
+			t.Errorf("--nats-url not threaded: %q", cfg.natsURL)
+		}
+		if cfg.maxRunSizeBytes != 1048576 {
+			t.Errorf("--max-run-size-bytes not threaded: %d", cfg.maxRunSizeBytes)
+		}
+	})
+
+	t.Run("non-positive cap rejected", func(t *testing.T) {
+		if _, err := parseFlags([]string{
+			"--scenario", "s1", "--config", "rs", "--max-run-size-bytes", "0",
+		}, &bytes.Buffer{}); err == nil {
+			t.Errorf("expected rejection of --max-run-size-bytes 0, got nil")
+		}
+	})
+}
+
+// TestCaptureFSMOrder_MatchesSchema asserts the capture package's floor-aware
+// FSM ordering (BI-9) stays in lock-step with internal/schema/state.go's
+// canonical state escalation order, so a future schema reorder cannot silently
+// drift the success-criterion comparison.
+func TestCaptureFSMOrder_MatchesSchema(t *testing.T) {
+	// The schema escalation order: CLEAN < SUSPICIOUS < RESTRICTED <
+	// QUARANTINED < PRESERVED_KILLED. A floor target of RESTRICTED is met by
+	// QUARANTINED (higher) and PRESERVED_KILLED (higher) but not by SUSPICIOUS.
+	start := time.Date(2026, 6, 15, 10, 0, 0, 0, time.UTC)
+	tx := func(state string) json.RawMessage {
+		raw, err := json.Marshal(map[string]any{"after_state": state, "decided_at": start.Add(time.Second)})
+		if err != nil {
+			t.Fatalf("marshal transition: %v", err)
+		}
+		return raw
+	}
+	for _, tc := range []struct {
+		observed string
+		floorMet bool
+	}{
+		{"SUSPICIOUS", false},
+		{"RESTRICTED", true},
+		{"QUARANTINED", true},
+		{"PRESERVED_KILLED", true},
+	} {
+		m := capture.Measure([]json.RawMessage{tx(tc.observed)}, nil,
+			capture.Target{FSMState: "RESTRICTED", TimeToDetectSeconds: 60, Floor: true}, start)
+		if m.SuccessCriterionMet != tc.floorMet {
+			t.Errorf("floor RESTRICTED vs observed %s: met = %v; want %v", tc.observed, m.SuccessCriterionMet, tc.floorMet)
+		}
+	}
 }
 
 func TestParseFlags_RequiredAndRange(t *testing.T) {
@@ -347,20 +426,17 @@ func TestRun_LayoutTrialsAndMetadata(t *testing.T) {
 		t.Fatalf("run dir %q missing: %v", runDir, err)
 	}
 
-	// Three trial dirs, each with the placeholder capture.
-	for trial := 1; trial <= 3; trial++ {
-		trialDir := filepath.Join(runDir, fmt.Sprintf("trial-%d", trial))
-		if fi, err := os.Stat(trialDir); err != nil || !fi.IsDir() {
-			t.Errorf("trial dir %q missing: %v", trialDir, err)
+	// Story 5.4: the six FR54 artefacts land at run-level runs/<run_id>/
+	// (OQ2, run-level recommended). With no --nats-url the four .jsonl files
+	// are written EMPTY and report.md takes the honest no-report path, but
+	// all six MUST exist (AC5) so 5.5 reads one shape across every run.
+	for _, name := range []string{
+		"events.jsonl", "evidence.jsonl", "assessments.jsonl",
+		"fsm.jsonl", "report.md", "metadata.yaml",
+	} {
+		if _, err := os.Stat(filepath.Join(runDir, name)); err != nil {
+			t.Errorf("run artefact %q missing: %v", name, err)
 		}
-		marker := filepath.Join(trialDir, capturePlaceholderName)
-		if _, err := os.Stat(marker); err != nil {
-			t.Errorf("placeholder capture %q missing: %v", marker, err)
-		}
-	}
-	// No phantom trial-4.
-	if _, err := os.Stat(filepath.Join(runDir, "trial-4")); err == nil {
-		t.Errorf("unexpected trial-4 dir present; runs=3 must produce exactly 3 trials")
 	}
 
 	// metadata.yaml carries the matching manifest_sha256.
@@ -380,6 +456,25 @@ func TestRun_LayoutTrialsAndMetadata(t *testing.T) {
 	}
 	if md.OlaitanEvalVersion == "" {
 		t.Errorf("metadata olaitan_eval_version must be populated")
+	}
+	// Story 5.4 finalised fields (BI-6/BI-8/BI-9/BI-10): the no-NATS run
+	// drained no subjects, so it is an HONEST detection miss: not detected,
+	// never-sentinel time-to-detect, fsm_state_source "none", and a size
+	// well under the cap. size_bytes is recorded regardless.
+	if md.SuccessCriterionMet {
+		t.Errorf("success_criterion_met = true; a no-traffic run is a detection miss")
+	}
+	if md.MeasuredTimeToDetect != capture.NeverDetectedSentinel {
+		t.Errorf("measured_time_to_detect = %d; want the never-sentinel %d", md.MeasuredTimeToDetect, capture.NeverDetectedSentinel)
+	}
+	if md.FSMStateSource != capture.FSMSourceNone {
+		t.Errorf("fsm_state_source = %q; want %q for a no-signal run", md.FSMStateSource, capture.FSMSourceNone)
+	}
+	if md.SizeCapExceeded {
+		t.Errorf("size_cap_exceeded = true; an empty run is far under the 500 MiB cap")
+	}
+	if md.ResourceUsage.ClusterMetricsAvailable {
+		t.Errorf("cluster_metrics_available = true; the in-process harness has no cluster metrics")
 	}
 }
 

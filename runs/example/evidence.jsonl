@@ -1,0 +1,1 @@
+{"schema_version":"evidence_package.v1","published_at":"2026-06-15T09:30:10Z","subject":"olaitan.evidence.packages","payload":{"schema_version":"evidence.v1","package_id":"pkg-example-1","workload_id":"tenant-acme/Deployment/web","assembled_at":"2026-06-15T09:30:10Z"}}

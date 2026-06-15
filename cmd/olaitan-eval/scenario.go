@@ -11,6 +11,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/olokotoh/olaitan/internal/eval/capture"
 	evalscenario "github.com/olokotoh/olaitan/internal/eval/scenario"
 )
 
@@ -102,6 +103,24 @@ func newScenario(scenarioID, scenariosRoot string, logger *slog.Logger) (Scenari
 		logger = slog.Default()
 	}
 	return &scenarioHarness{id: scenarioID, dir: dir, target: target, logger: logger}, nil
+}
+
+// captureTarget projects the resolved scenarioTarget onto the
+// capture.Target the Story-5.4 metadata measurement scores against (BI-9).
+// 5.2 OWNS the declaration; 5.4 OWNS the measurement, so this is a read-only
+// projection of the already-loaded, already-validated target. A scenario that
+// is not the rich scenarioHarness (no resolved target) yields the zero Target,
+// which the measurement treats as never-met.
+func captureTarget(s Scenario) capture.Target {
+	h, ok := s.(*scenarioHarness)
+	if !ok {
+		return capture.Target{}
+	}
+	return capture.Target{
+		FSMState:            h.target.TargetFSMState,
+		TimeToDetectSeconds: h.target.TargetTimeToDetectSeconds,
+		Floor:               h.target.Floor,
+	}
 }
 
 // knownScenarioIDs returns the sorted s1..s5 ids the factory maps, for error
