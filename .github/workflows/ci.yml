@@ -144,6 +144,19 @@ jobs:
         with:
           version: v3.16.4
 
+      # Free disk on the runner before the kind cluster. The nats subchart leaves
+      # JetStream max_file_store unset, so JetStream uses the ACTUAL free disk on
+      # the PVC volume as its limit; a disk-pressured runner (image + MinIO + many
+      # streams) makes JetStream report err 10047 "insufficient storage" even for a
+      # small stream. Removing the preinstalled toolchains frees ~20-25 GiB.
+      - name: Free up disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h /
+
       - name: Build Olaitan image
         run: make docker-build
 
@@ -481,6 +494,19 @@ jobs:
       - uses: azure/setup-helm@v4
         with:
           version: v3.16.4
+
+      # Free disk on the runner before the kind cluster. The nats subchart leaves
+      # JetStream max_file_store unset, so JetStream uses the ACTUAL free disk on
+      # the PVC volume as its limit; a disk-pressured runner (image + MinIO + many
+      # streams) makes JetStream report err 10047 "insufficient storage" even for a
+      # small stream. Removing the preinstalled toolchains frees ~20-25 GiB.
+      - name: Free up disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h /
 
       - name: Build Olaitan image
         run: make docker-build
