@@ -59,7 +59,13 @@ const (
 	defaultReleaseName    = "olaitan"
 	natsLocalPort         = "4222"
 	metricsLocalPort      = "9090"
-	assertionTimeout      = 30 * time.Second
+	// assertionTimeout is the per-assertion poll budget. 90s (not the NFR7 10s
+	// p99): this is a FUNCTIONAL e2e on a constrained single-node kind cluster
+	// with a fake LLM, where the full RSLT-full + forensics chain (correlation +
+	// L1/L2/Senior + score + FSM + the settling window) takes materially longer
+	// than a tuned production cluster. The forensics smoke confirmed the workload
+	// does escalate + finalise, just past the old 30s budget.
+	assertionTimeout      = 90 * time.Second
 	assertionPollInterval = 500 * time.Millisecond
 	scrapeTimeout         = 5 * time.Second
 	// preseedPrimingCount + 1 spike. Aligned with the baseline

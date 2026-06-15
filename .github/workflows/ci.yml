@@ -144,6 +144,22 @@ jobs:
         with:
           version: v3.16.4
 
+      # Free disk on the runner before the kind cluster. The nats subchart leaves
+      # JetStream max_file_store unset, so JetStream uses the ACTUAL free disk on
+      # the PVC volume as its limit; a disk-pressured runner (image + MinIO + many
+      # streams) makes JetStream report err 10047 "insufficient storage" even for a
+      # small stream. Removing the preinstalled toolchains frees ~20-25 GiB.
+      - name: Free up disk space
+        run: |
+          df -h /
+          # NB: do NOT remove $AGENT_TOOLSDIRECTORY (/opt/hostedtoolcache) -- it
+          # holds the Go and Node.js runtimes that setup-go and the JS-based
+          # kind-action need. Remove only the large unused toolchains.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/lib/jvm || true
+          sudo docker image prune --all --force || true
+          df -h /
+
       - name: Build Olaitan image
         run: make docker-build
 
@@ -482,6 +498,22 @@ jobs:
         with:
           version: v3.16.4
 
+      # Free disk on the runner before the kind cluster. The nats subchart leaves
+      # JetStream max_file_store unset, so JetStream uses the ACTUAL free disk on
+      # the PVC volume as its limit; a disk-pressured runner (image + MinIO + many
+      # streams) makes JetStream report err 10047 "insufficient storage" even for a
+      # small stream. Removing the preinstalled toolchains frees ~20-25 GiB.
+      - name: Free up disk space
+        run: |
+          df -h /
+          # NB: do NOT remove $AGENT_TOOLSDIRECTORY (/opt/hostedtoolcache) -- it
+          # holds the Go and Node.js runtimes that setup-go and the JS-based
+          # kind-action need. Remove only the large unused toolchains.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/lib/jvm || true
+          sudo docker image prune --all --force || true
+          df -h /
+
       - name: Build Olaitan image
         run: make docker-build
 
@@ -576,6 +608,10 @@ jobs:
             --set endpoints.falco=tcp://127.0.0.1:0 \
             --set nats.streamMaxBytesOverride=33554432 \
             --set nats.config.jetstream.fileStore.maxSize=8Gi \
+            --set probes.initialDelaySeconds=30 \
+            --set probes.failureThreshold=12 \
+            --set aggregator.resources.limits.memory=1Gi \
+            --set response.audit.enabled=true \
             --wait --timeout 8m
 
       - name: Run forensics smoke

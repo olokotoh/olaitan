@@ -4036,6 +4036,23 @@ func TestNotificationsFacade_EnabledProjectsWebhookEnv(t *testing.T) {
 	}
 }
 
+// TestStreamMaxBytesOverride_OnBothAggregatorAndCollector is a regression test
+// for a real chart bug the forensics kind e2e surfaced: the JetStream per-stream
+// MaxBytes cap (OLT_NATS_STREAM_MAXBYTES_OVERRIDE) was projected onto the
+// aggregator Deployment but NOT the collector DaemonSet. Both rings ensure
+// streams on startup (the collector owns EVENTS/EVENTS_RAW/EVIDENCE), so an
+// un-capped collector creates them at their full production MaxBytes (10/50/100
+// GiB) and, when it wins the create-stream race against the capped aggregator,
+// JetStream returns err 10047 "insufficient storage" on a constrained PVC. The
+// env MUST appear on BOTH workloads.
+func TestStreamMaxBytesOverride_OnBothAggregatorAndCollector(t *testing.T) {
+	rendered := helmTemplate(t, []string{"nats.streamMaxBytesOverride=33554432"})
+	got := strings.Count(rendered, "name: OLT_NATS_STREAM_MAXBYTES_OVERRIDE")
+	if got != 2 {
+		t.Errorf("OLT_NATS_STREAM_MAXBYTES_OVERRIDE projected %d times, want 2 (aggregator Deployment + collector DaemonSet); an un-capped collector overflows the JetStream store", got)
+	}
+}
+
 // TestNotificationsFacade_WebhookUrlOverridesSecret pins the facade-wins
 // precedence on the webhook secret: a non-empty facade webhook_url overrides
 // secrets.notificationsWebhookUrl; an empty facade value falls back to it.

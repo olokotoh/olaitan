@@ -145,6 +145,18 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            {{- with .Values.nats.streamMaxBytesOverride }}
+            # Story 1.19 D6: the collector ring ALSO ensures streams (EVENTS /
+            # EVENTS_RAW / EVIDENCE) on startup, so it MUST receive the same
+            # per-stream MaxBytes cap as the aggregator (deployment.yaml). Without
+            # it the collector creates those streams at their full production
+            # MaxBytes (10 / 50 / 100 GiB) and, when it wins the create-stream race
+            # against the (capped) aggregator, JetStream returns err 10047
+            # "insufficient storage" on a constrained NATS PVC. This was masked in
+            # lighter arms where the aggregator usually created the streams first.
+            - name: OLT_NATS_STREAM_MAXBYTES_OVERRIDE
+              value: {{ . | quote }}
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /healthz
