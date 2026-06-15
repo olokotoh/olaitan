@@ -230,6 +230,29 @@ var streamConfigs = []jetstream.StreamConfig{
 		Retention:  jetstream.LimitsPolicy,
 		Duplicates: 2 * time.Minute,
 	},
+	{
+		// REPORTS carries the Story 4.4 DFIR-report announcements
+		// (subjects.ReportsGenerated = REPORTS.generated, AC5): one
+		// ReportGenerated per finalised incident the DFIR agent produced a report
+		// for, carrying the report SHA256 + the content-addressed object URL (the
+		// report BODY itself lives in S3, Story 4.6 -- this stream is the
+		// announcement-of-record only). This is the THIRTEENTH stream. The Story
+		// 4.8 notification-webhook controller attaches a durable consumer to THIS
+		// stream, so it MUST be provisioned at startup: Story 4.4 added the
+		// REPORTS.generated subject + the DFIR producer and Story 4.8 added the
+		// consumer, but neither added the backing stream, so every announce
+		// publish failed and the webhook consumer 404'd at startup (the canonical
+		// subject-without-a-backing-stream integration bug, masked by the unit
+		// tests' fake publishers / manually-created embedded-NATS streams).
+		// LimitsPolicy + FileStorage like the AUDIT_*/INCIDENTS family (append-only
+		// announcement record); 365 d retention. MaxBytes: 0 so it participates in
+		// the OLT_NATS_STREAM_MAXBYTES_OVERRIDE per-stream cap.
+		Name:      "REPORTS",
+		Subjects:  []string{subjects.ReportsGenerated},
+		MaxAge:    defaultReportsGeneratedMaxAge,
+		Storage:   jetstream.FileStorage,
+		Retention: jetstream.LimitsPolicy,
+	},
 }
 
 // defaultAudit*MaxAge are the Story 2.8 AC4 retention defaults baked into
@@ -256,6 +279,11 @@ const (
 	// IncidentFinalised event is the trigger-of-record for a DFIR report and
 	// carries the full FSM history). Helm-tunable via StreamConfigsWithRetention.
 	defaultIncidentsFinalisedMaxAge = 365 * 24 * time.Hour
+	// defaultReportsGeneratedMaxAge is the Story 4.4 REPORTS stream retention
+	// default: 365 d, the announcement-of-record for each DFIR report (the report
+	// body lives in S3, Story 4.6); audit-grade by analogy with the AUDIT_* /
+	// INCIDENTS family.
+	defaultReportsGeneratedMaxAge = 365 * 24 * time.Hour
 )
 
 // AuditRetention carries the operator-tuned per-subject MaxAge for the
