@@ -66,6 +66,21 @@ var scenarioSmokeSlugs = map[string]string{
 	"s5": "s5-cryptomining",
 }
 
+// scenarioWorkloadName returns the per-scenario Deployment name in tenant-acme.
+// Each scenario gets its OWN Deployment (Review Round 2, CI-caught): the
+// correlator derives workloadID = `tenant-acme/Deployment/<name>` and keys its
+// rising-edge `fired` flag on it (internal/correlator/window/window.go:171-185),
+// so a distinct Deployment per scenario gives each scenario INDEPENDENT
+// rising-edge state. This makes each scenario's first multi-signal convergence
+// emit a fresh EvidencePackage regardless of rs_smoke (which uses `web`) or the
+// sibling scenarios, instead of being suppressed by a `fired` flag the FIRST
+// converger set on the shared `tenant-acme/Deployment/web` workload within the
+// still-open 60s window. The OLT rules key on namespace + owner_kind, NOT the
+// Deployment name, so every scenario's rule still matches under its own name.
+func scenarioWorkloadName(scenarioID string) string {
+	return "scenario-" + scenarioID
+}
+
 // loadScenarioSmokeTarget reads a harness target.yaml from the committed tree
 // (resolved relative to tests/e2e/).
 func loadScenarioSmokeTarget(t *testing.T, scenarioID string) scenarioSmokeTarget {
@@ -105,7 +120,7 @@ func loadScenarioSmokeTarget(t *testing.T, scenarioID string) scenarioSmokeTarge
 // recipe events share one injection
 // timestamp so the correlator's 60s window cannot straddle a boundary (the
 // rs_smoke precedent).
-func injectScenario(t *testing.T, js jetstream.JetStream, scenarioID, podName string) scenarioCounterSnapshot {
+func injectScenario(t *testing.T, js jetstream.JetStream, scenarioID, podName, deployName string) scenarioCounterSnapshot {
 	t.Helper()
 	if _, ok := scenarioSmokeSlugs[scenarioID]; !ok {
 		t.Fatalf("injectScenario: unknown scenario %q", scenarioID)
@@ -121,7 +136,12 @@ func injectScenario(t *testing.T, js jetstream.JetStream, scenarioID, podName st
 	// baseline so outbound_unique_dst_ips crosses 3 sigma and let the baseline
 	// consumer drain BEFORE the rule-match flow events arrive (BI-4).
 	if evalscenario.BaselinePreseed(scenarioID) {
-		publishSyntheticEvidencePackages(t, js, podName)
+		// The pre-seed Welford history MUST land on the SAME workload key the
+		// scenario's rule-match/trigger packages use, so it carries the
+		// scenario's own Deployment name (owner_name) rather than the rs_smoke
+		// default `web` -- otherwise the primed baseline and the live deviation
+		// would split across two keys and the deviation half would never fire.
+		publishSyntheticEvidencePackagesFor(t, js, podName, deployName)
 		waitForBaselineConsumerDrained(t, js)
 	}
 	events := evalscenario.Events(scenarioID, podName, time.Now().UTC())
@@ -277,18 +297,33 @@ func connectScenarioJS(t *testing.T) jetstream.JetStream {
 func TestKindSmoke_Scenarios_S1toS5_ReachEvidence(t *testing.T) {
 	requireKindCluster(t)
 	waitForPodsReady(t)
-	// One real Deployment-owned pod in tenant-acme so the correlator's
-	// posture resolver returns OwnerKind=Deployment + namespace=tenant-acme
-	// (the workload identity every scenario's rules key on). Reused across
-	// the per-scenario subtests so the warmed baseline is shared.
-	podName := applySyntheticWorkload(t)
+
+	// Each scenario gets its OWN Deployment in tenant-acme so the correlator's
+	// rising-edge `fired` flag (keyed on workloadID = tenant-acme/Deployment/
+	// <name>) is independent of rs_smoke and of the sibling scenarios -- so each
+	// scenario's first multi-signal convergence emits a FRESH EvidencePackage
+	// rather than being coalesced by a `fired` flag an earlier converger set on a
+	// shared workload (Review Round 2, CI-caught). The posture resolver still
+	// returns OwnerKind=Deployment + namespace=tenant-acme, which is all every
+	// scenario's rules key on. All five Deployments are created HERE on the parent
+	// test rather than inside the subtests so a finishing subtest's namespace-
+	// teardown cleanup does not delete a later subtest's workload (the cleanups
+	// fire on the parent `t` after the whole loop completes).
+	scenarioIDs := []string{"s1", "s2", "s3", "s4", "s5"}
+	pods := make(map[string]string, len(scenarioIDs))
+	for _, scenarioID := range scenarioIDs {
+		pods[scenarioID] = applyScenarioWorkload(t, scenarioWorkloadName(scenarioID))
+	}
+
 	js := connectScenarioJS(t)
 
-	for _, scenarioID := range []string{"s1", "s2", "s3", "s4", "s5"} {
+	for _, scenarioID := range scenarioIDs {
 		scenarioID := scenarioID
 		t.Run(scenarioID, func(t *testing.T) {
 			tgt := loadScenarioSmokeTarget(t, scenarioID)
-			before := injectScenario(t, js, scenarioID, podName)
+			deployName := scenarioWorkloadName(scenarioID)
+			podName := pods[scenarioID]
+			before := injectScenario(t, js, scenarioID, podName, deployName)
 			// PRIMARY AC8 pin: a first detection on a freshly-warmed
 			// workload MUST emit a fresh EVIDENCE package (requireFreshPackage
 			// = true). This is the full-signal assertion and must not weaken.
@@ -335,7 +370,13 @@ func TestKindSmoke_Scenarios_S1toS5_ReachEvidence(t *testing.T) {
 func TestKindSmoke_Scenarios_Idempotency(t *testing.T) {
 	requireKindCluster(t)
 	waitForPodsReady(t)
-	podName := applySyntheticWorkload(t)
+	// Its OWN Deployment, distinct from rs_smoke (`web`) and from the S1toS5
+	// test's `scenario-s1` workload, so run 1's fresh-package assertion is not
+	// suppressed by a `fired` flag a prior test set on a shared workload, and so
+	// the deliberate run-2 coalescing (re-detection only) is observed on a
+	// workload THIS test exclusively owns (Review Round 2, CI-caught).
+	deployName := "scenario-idem-s1"
+	podName := applyScenarioWorkload(t, deployName)
 	js := connectScenarioJS(t)
 	tgt := loadScenarioSmokeTarget(t, "s1")
 
@@ -345,7 +386,7 @@ func TestKindSmoke_Scenarios_Idempotency(t *testing.T) {
 		// whose fresh package the correlator legitimately coalesces (see the
 		// REPEAT-RUN SCOPE note above), so it asserts re-detection only.
 		requireFreshPackage := run == 1
-		before := injectScenario(t, js, "s1", podName)
+		before := injectScenario(t, js, "s1", podName, deployName)
 		if err := assertScenarioSignal(t, tgt, before, requireFreshPackage); err != nil {
 			dumpEvidenceStream(t, js)
 			dumpRuleMatchSamples(t)

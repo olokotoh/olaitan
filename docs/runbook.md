@@ -1211,6 +1211,21 @@ A1 RSLT-full-kind gate own the full chain). The six config-matrix overlays
 `success_criterion_met` / `measured_time_to_detect` metadata (Story 5.4/5.5)
 fill the rest of Epic 5.
 
+Each scenario uses its OWN tenant-acme Deployment (`scenario-<id>`) so the
+correlator's per-workload rising edge (`internal/correlator/window/window.go`)
+fires a fresh EvidencePackage per scenario, independent of rs_smoke and the
+sibling scenarios; run it locally with `make scenarios-smoke` any time.
+
+CI gating (opt-in): this smoke is NOT in the always-on CI `e2e` job. It runs in
+the OPT-IN `e2e-scenarios` CI job, gated by the `e2e-scenarios` PR LABEL
+(mirroring `e2e-forensics`), because the 5-scenario multi-workload baseline-
+preseed smoke exercises the documented constrained-single-node-kind aggregator
+event-loss flakiness (the aggregator restarts ~2x on a NATS-not-ready startup
+race, dropping events). Add the `e2e-scenarios` label to a PR to run it; the
+deterministic full run folds into the carry-forward A1 3-node cluster gate.
+Story 5.1's stable gate (the RS smoke + `TestEvalSmoke_S1_RS_OneTrial`) stays
+always-on in the `e2e` job.
+
 ### 1.5 Naming-convention reconciliation
 
 The Story 1.18 acceptance criteria text uses a mix of singular-ring and plural-ring metric names (e.g. AC2 says `olaitan_decision_rule_matches_total` singular; AC3 says `olaitan_decision_baseline_deviations_total{metric, sigma_bucket}` plural). The actual registrations follow `architecture.md:472-475` which mandates the `olaitan_<ring>_<metric>` pattern with the engine subfamily conventionally plural (`rules`, `baseline`) because the engine evaluates a corpus, not a single rule. The AC singular spellings are documentation aliases, not parallel families.

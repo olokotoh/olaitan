@@ -316,11 +316,19 @@ eval-smoke: helm-prepare helm-deps docker-build
 # LLM), then fires each scenario S1-S5's deterministic synthetic-event
 # stimulus and asserts a rule match OR baseline deviation reaches
 # EVIDENCE.packages within the scenario's target.yaml time-to-detect window,
-# plus an idempotency re-run. Like eval-smoke it needs no OLT_E2E gate: the
-# test SKIPS gracefully when the kind cluster is absent and it reuses the RS
-# bring-up the default CI e2e job already runs (OA5 precedent). AC8 asserts
+# plus an idempotency re-run. The test SKIPS gracefully when the kind cluster
+# is absent and reuses the same RS bring-up the CI e2e job runs. AC8 asserts
 # the EVIDENCE-package SIGNAL, NOT the full FSM-state attainment (Story 5.4 +
 # the carry-forward A1 RSLT-full-kind gate own that, BI-8).
+#
+# CI placement (Review Round 2, CI-caught): this smoke is NOT in the always-on
+# CI e2e job. It runs in the OPT-IN `e2e-scenarios` CI job, gated by the
+# `e2e-scenarios` PR label (mirroring `e2e-forensics`), because the 5-scenario
+# multi-workload baseline-preseed smoke exercises the documented constrained-
+# single-node-kind aggregator event-loss flakiness; the deterministic full run
+# folds into the carry-forward A1 cluster gate. Each scenario now uses its OWN
+# tenant-acme Deployment (scenario-<id>) so the correlator's per-workload
+# rising-edge fires cleanly per scenario. Run locally any time with this target.
 scenarios-smoke: helm-prepare helm-deps docker-build
 	kind get clusters | grep -q '^$(KIND_CLUSTER_NAME)$$' || \
 		kind create cluster --name $(KIND_CLUSTER_NAME) --config hack/kind-config.yaml
