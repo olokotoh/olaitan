@@ -24,6 +24,15 @@ jobs:
       - name: Test
         run: make test
 
+      # Story 5.8 (BI-9): the lightest honest structural gate for the
+      # pre-registered analysis plan. Asserts analysis/preregistration.md
+      # carries the eight mandated section headings plus the confirmatory test
+      # registry marker, so a section cannot be silently dropped. Fast grep
+      # step folded into the existing always-on `go` job (no new job, no
+      # cluster).
+      - name: Pre-registration structural gate
+        run: make prereg-check
+
       - name: Install golangci-lint
         run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.1.6
 

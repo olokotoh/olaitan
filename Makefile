@@ -9,7 +9,7 @@ CONFIG_SRC       := config/olaitan.yaml
 AUDIT_POLICY_SRC := config/audit-policy-default.yaml
 CHART_FILES      := $(CHART_DIR)/files/olaitan.yaml $(CHART_DIR)/files/audit-policy-default.yaml
 
-.PHONY: build test lint docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics eval-smoke scenarios-smoke capture-it e2e-local-down
+.PHONY: build test lint prereg-check docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics eval-smoke scenarios-smoke capture-it e2e-local-down
 
 # envtest-bin downloads the kube-apiserver and etcd binaries that the
 # Story 1.11 posture-client integration tests (and any future
@@ -35,6 +35,16 @@ test:
 
 lint:
 	golangci-lint run ./...
+
+# prereg-check (Story 5.8) is the lightest honest structural gate for the
+# pre-registered analysis plan: it asserts analysis/preregistration.md exists
+# and carries the eight mandated section headings plus the confirmatory test
+# registry marker (the grep idiom mirrors hack/check-prompt-changelog.sh). It
+# proves STRUCTURE, not statistical correctness (a human supervisor reviews the
+# numbers), and fails non-zero if any heading or the registry marker is missing.
+# Wired into the always-on `go` CI job so the contract is enforced on every PR.
+prereg-check:
+	hack/check-preregistration.sh
 
 docker-build:
 	docker build -t $(IMAGE):$(TAG) .
