@@ -611,6 +611,7 @@ jobs:
             --set probes.initialDelaySeconds=30 \
             --set probes.failureThreshold=12 \
             --set aggregator.resources.limits.memory=1Gi \
+            --set response.audit.enabled=true \
             --wait --timeout 8m
 
       - name: Run forensics smoke
