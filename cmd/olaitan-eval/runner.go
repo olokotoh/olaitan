@@ -298,11 +298,17 @@ type imageDigestVerifier struct {
 }
 
 func (v *imageDigestVerifier) Verify(ctx context.Context, m *Manifest) error {
+	// usedAllow tracks which --allow-unverified entries actually bypassed an
+	// unverified artefact, so an entry that matched nothing (a typo, the
+	// wrong case, or an artefact whose check is not yet wired) is surfaced
+	// rather than silently ignored (a reproducibility footgun otherwise).
+	usedAllow := make(map[string]bool, len(v.allowUnverified))
 	for name, ref := range m.Images {
 		expected := digestOf(ref)
 		actual, err := v.resolve(ctx, ref)
 		if err != nil {
 			if v.allowUnverified[name] {
+				usedAllow[name] = true
 				v.logger.Warn("digest gate: image unverified but allow-listed; reproducibility guarantee voided for this artefact",
 					"artefact", name, "ref", ref, "reason", err)
 				continue
@@ -311,6 +317,7 @@ func (v *imageDigestVerifier) Verify(ctx context.Context, m *Manifest) error {
 		}
 		if actual != expected {
 			if v.allowUnverified[name] {
+				usedAllow[name] = true
 				v.logger.Warn("digest gate: image mismatch but allow-listed; reproducibility guarantee voided for this artefact",
 					"artefact", name, "expected", expected, "actual", actual)
 				continue
@@ -325,6 +332,15 @@ func (v *imageDigestVerifier) Verify(ctx context.Context, m *Manifest) error {
 	// become harness-reachable. Until then they are allow-listed by
 	// default (the AC5 RS run must not be blocked by an unreachable
 	// corpus, BI-6); each carries its owning-story TODO above.
+
+	// Surface allow-list entries that matched nothing so a fat-fingered
+	// --allow-unverified name does not silently appear to have taken effect.
+	for name := range v.allowUnverified {
+		if !usedAllow[name] {
+			v.logger.Warn("digest gate: --allow-unverified entry matched no unverified artefact (typo, wrong case, or an artefact whose check is not yet wired)",
+				"artefact", name)
+		}
+	}
 	return nil
 }
 
@@ -356,11 +372,14 @@ func digestOf(ref string) string {
 // field and is not unit-tested directly (the gate logic is tested with an
 // injected resolver).
 func dockerResolveDigest(ctx context.Context, ref string) (string, error) {
-	// The manifest pins repo@sha256:<hex>; resolve the repo:tag-or-digest
-	// the kind node loaded. `docker inspect` returns RepoDigests; the 5.1
-	// minimal check compares the pinned digest against the loaded image's
-	// digests. A host with no docker (CI image-load step aside) fails
-	// closed.
+	// The manifest pins repo@sha256:<hex>; resolve the ACTUAL digest the
+	// repo carries so Verify can emit the BI-6 expected-vs-actual message on
+	// a real mismatch. `docker inspect` returns the repo's RepoDigests. A
+	// host with no docker (CI image-load step aside) fails closed.
+	//
+	// Story 5.x (hardening): this inspects the local docker daemon's
+	// RepoDigests for the repo, NOT the digest actually loaded into the kind
+	// node; the kind-node-loaded-image check is a later hardening pass.
 	repo := ref
 	if i := strings.Index(ref, "@"); i >= 0 {
 		repo = ref[:i]
@@ -370,11 +389,32 @@ func dockerResolveDigest(ctx context.Context, ref string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("docker image inspect %q: %w", repo, err)
 	}
-	want := digestOf(ref)
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if d := digestOf(strings.TrimSpace(line)); d == want {
+	return pickRepoDigest(string(out), repo, digestOf(ref))
+}
+
+// pickRepoDigest selects the digest to report from a docker `RepoDigests`
+// listing. It returns an exact match when present (verified); otherwise the
+// first real sha256 digest the repo carries, so Verify reports it as the
+// ACTUAL against the expected pin (a genuine mismatch, not a generic
+// "unresolvable"). Only when no sha256 digest is present at all is it
+// unresolvable (fail-closed). It is a pure function so the selection logic
+// is unit-tested without a container runtime.
+func pickRepoDigest(repoDigestsOutput, repo, want string) (string, error) {
+	var first string
+	for _, line := range strings.Split(strings.TrimSpace(repoDigestsOutput), "\n") {
+		d := digestOf(strings.TrimSpace(line))
+		if !strings.HasPrefix(d, "sha256:") {
+			continue
+		}
+		if d == want {
 			return d, nil
 		}
+		if first == "" {
+			first = d
+		}
 	}
-	return "", fmt.Errorf("image %q has no repo-digest matching the manifest pin %s", repo, want)
+	if first != "" {
+		return first, nil
+	}
+	return "", fmt.Errorf("image %q has no resolvable repo-digest", repo)
 }

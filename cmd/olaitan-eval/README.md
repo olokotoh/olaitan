@@ -21,11 +21,11 @@ olaitan-eval --manifest eval/manifest.yaml --scenario s1 --config rs --runs 1
 | Flag | Default | Meaning |
 |---|---|---|
 | `--manifest` | `eval/manifest.yaml` | path to the reproducibility-envelope manifest |
-| `--scenario` | (required) | scenario id to run (e.g. `s1`) |
-| `--config` | (required) | evaluation configuration arm (e.g. `rs`, `rslt-full`) |
+| `--scenario` | (required) | scenario id to run; one of `s1`..`s5` (an unknown id is rejected) |
+| `--config` | (required) | evaluation arm; one of `f`, `rs`, `rsl`, `rslt`, `rslt-full`, or an `rslt-<ablation>` (an unknown arm is rejected) |
 | `--runs` | `1` | number of trials to run |
 | `--out` | `runs` | output directory for `runs/<run_id>/` |
-| `--allow-unverified` | (empty) | comma-separated artefact names to skip in the digest gate |
+| `--allow-unverified` | (empty) | artefact names to skip in the digest gate; comma-separated or the flag repeated |
 
 The harness, in order: loads + validates the manifest, computes its SHA256
 over the committed file bytes, runs the digest-verification gate ONCE
@@ -56,7 +56,7 @@ comment / whitespace drift never silently changes the hash.
 
 ```
 runs/
-  <run_id>/                  # <UTC-compact-timestamp>-<scenario>-<config>-<short-hash>
+  <run_id>/                  # <UTC-compact-timestamp-with-millis>-<scenario>-<config>-<short-hash>
     metadata.yaml            # minimal schema; manifest_sha256 carrier (extended by Story 5.5)
     trial-1/
       CAPTURE_PLACEHOLDER.md # Story 5.1 placeholder; the six-file rich set is Story 5.4

@@ -21,8 +21,10 @@ var version = "dev"
 
 // runIDTimeFormat is the sortable, compact UTC timestamp prefix of a
 // run_id (OA3): RFC3339 reduced to a lexically-sortable form with no
-// separators that are unsafe in a directory name.
-const runIDTimeFormat = "20060102T150405Z"
+// separators that are unsafe in a directory name. It carries millisecond
+// precision so two runs of the same arm against the same manifest within
+// one second get distinct run_ids rather than colliding on the same dir.
+const runIDTimeFormat = "20060102T150405.000Z"
 
 // runConfig holds the parsed CLI flags for one olaitan-eval invocation.
 type runConfig struct {
@@ -95,6 +97,13 @@ func run(args []string, stdout, stderr io.Writer) error {
 	startedAt := time.Now().UTC()
 	runID := newRunID(startedAt, cfg.scenario, cfg.config, hash)
 	runDir := filepath.Join(cfg.out, runID)
+	// Refuse to clobber: if the run dir already exists and is non-empty, a
+	// prior run collided here (a sub-millisecond double-invocation). Fail
+	// closed rather than overwrite trial-1 and leave stale trial-N dirs from
+	// the earlier run, which would produce an internally-inconsistent run.
+	if err := errIfRunDirInUse(runDir); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		return fmt.Errorf("create run dir %q: %w", runDir, err)
 	}
@@ -145,13 +154,13 @@ func parseFlags(args []string, stderr io.Writer) (runConfig, error) {
 	fs.SetOutput(stderr)
 
 	var cfg runConfig
-	var allowRaw string
+	var allow stringSliceFlag
 	fs.StringVar(&cfg.manifestPath, "manifest", "eval/manifest.yaml", "path to the reproducibility-envelope manifest")
-	fs.StringVar(&cfg.scenario, "scenario", "", "scenario id to run (e.g. s1)")
-	fs.StringVar(&cfg.config, "config", "", "evaluation configuration arm (e.g. rs, rslt-full)")
+	fs.StringVar(&cfg.scenario, "scenario", "", "scenario id to run (s1..s5)")
+	fs.StringVar(&cfg.config, "config", "", "evaluation configuration arm (f, rs, rsl, rslt, rslt-full, or an rslt-<ablation>)")
 	fs.IntVar(&cfg.runs, "runs", 1, "number of trials to run")
 	fs.StringVar(&cfg.out, "out", "runs", "output directory for runs/<run_id>/")
-	fs.StringVar(&allowRaw, "allow-unverified", "", "comma-separated artefact names to skip in the digest gate (voids the reproducibility guarantee for each; off by default)")
+	fs.Var(&allow, "allow-unverified", "artefact names to skip in the digest gate (comma-separated or repeated; voids the reproducibility guarantee for each; off by default)")
 
 	if err := fs.Parse(args); err != nil {
 		return runConfig{}, err
@@ -160,18 +169,77 @@ func parseFlags(args []string, stderr io.Writer) (runConfig, error) {
 	if cfg.scenario == "" {
 		return runConfig{}, fmt.Errorf("--scenario is required")
 	}
+	if err := validateScenario(cfg.scenario); err != nil {
+		return runConfig{}, err
+	}
 	if cfg.config == "" {
 		return runConfig{}, fmt.Errorf("--config is required")
+	}
+	if err := validateConfig(cfg.config); err != nil {
+		return runConfig{}, err
 	}
 	if cfg.runs < 1 {
 		return runConfig{}, fmt.Errorf("--runs must be >= 1 (got %d)", cfg.runs)
 	}
-	for _, name := range strings.Split(allowRaw, ",") {
-		if n := strings.TrimSpace(name); n != "" {
-			cfg.allowUnverified = append(cfg.allowUnverified, n)
+	cfg.allowUnverified = []string(allow)
+	return cfg, nil
+}
+
+// stringSliceFlag is a repeatable, comma-splitting flag.Value. It accepts
+// both `--allow-unverified a,b` and `--allow-unverified a --allow-unverified
+// b`, accumulating the trimmed, non-empty entries (so the documented
+// comma-separated AND repeated-flag forms both work, not just the last one).
+type stringSliceFlag []string
+
+func (s *stringSliceFlag) String() string { return strings.Join(*s, ",") }
+
+func (s *stringSliceFlag) Set(v string) error {
+	for _, part := range strings.Split(v, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			*s = append(*s, p)
 		}
 	}
-	return cfg, nil
+	return nil
+}
+
+// validateScenario rejects an unknown --scenario so a typo does not produce
+// an official-looking but meaningless run (the five MITRE scenarios S1-S5
+// are fixed by FR53/the rule corpus).
+func validateScenario(s string) error {
+	switch s {
+	case "s1", "s2", "s3", "s4", "s5":
+		return nil
+	}
+	return fmt.Errorf("--scenario %q is not a known scenario (want one of s1, s2, s3, s4, s5)", s)
+}
+
+// validateConfig rejects an unknown --config arm so a typo (e.g. "rls" for
+// "rsl") does not silently no-op into a meaningless run. It accepts the
+// FR53 four-way matrix (F, RS, RSL, RSLT-full) plus the RSLT ablation family
+// (rslt-<ablation>, owned by Story 5.3), case-insensitively.
+func validateConfig(c string) error {
+	switch strings.ToLower(c) {
+	case "f", "rs", "rsl", "rslt", "rslt-full":
+		return nil
+	}
+	if strings.HasPrefix(strings.ToLower(c), "rslt-") {
+		return nil
+	}
+	return fmt.Errorf("--config %q is not a known evaluation arm (want one of f, rs, rsl, rslt, rslt-full, or an rslt-<ablation>)", c)
+}
+
+// errIfRunDirInUse returns an error when runDir already exists and is
+// non-empty (a run_id collision), so the harness fails closed rather than
+// clobbering a prior run's trials. A missing or empty dir is free to use.
+func errIfRunDirInUse(runDir string) error {
+	entries, err := os.ReadDir(runDir)
+	if err != nil {
+		return nil // missing dir (or unreadable) is handled by MkdirAll next
+	}
+	if len(entries) > 0 {
+		return fmt.Errorf("run dir %q already exists and is non-empty (run_id collision); refusing to clobber a prior run", runDir)
+	}
+	return nil
 }
 
 // newRunID builds the sortable, collision-resistant run_id (OA3):

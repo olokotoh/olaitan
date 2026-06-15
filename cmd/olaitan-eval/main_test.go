@@ -93,9 +93,9 @@ func TestParseFlags_AllowUnverified(t *testing.T) {
 	}
 }
 
-// runIDPattern matches the OA3 run_id format:
-// <compact-UTC-timestamp>-<scenario>-<config>-<short-hash>.
-var runIDPattern = regexp.MustCompile(`^[0-9]{8}T[0-9]{6}Z-s1-rs-[0-9a-f]{12}$`)
+// runIDPattern matches the OA3 run_id format with millisecond precision:
+// <compact-UTC-timestamp-with-millis>-<scenario>-<config>-<short-hash>.
+var runIDPattern = regexp.MustCompile(`^[0-9]{8}T[0-9]{6}\.[0-9]{3}Z-s1-rs-[0-9a-f]{12}$`)
 
 func TestNewRunID_Format(t *testing.T) {
 	at := time.Date(2026, 6, 15, 9, 30, 0, 0, time.UTC)
@@ -103,8 +103,76 @@ func TestNewRunID_Format(t *testing.T) {
 	if !runIDPattern.MatchString(id) {
 		t.Errorf("run_id %q does not match the OA3 format", id)
 	}
-	if !strings.HasPrefix(id, "20260615T093000Z-s1-rs-69d1b5f452cd") {
+	if !strings.HasPrefix(id, "20260615T093000.000Z-s1-rs-69d1b5f452cd") {
 		t.Errorf("run_id %q has wrong prefix or short-hash", id)
+	}
+}
+
+// TestParseFlags_RejectsUnknownArms asserts a typo'd --scenario or --config
+// is rejected (not silently accepted into an official-looking but
+// meaningless run), while every FR53 arm and the RSLT ablation family parse.
+func TestParseFlags_RejectsUnknownArms(t *testing.T) {
+	reject := [][]string{
+		{"--scenario", "s99", "--config", "rs"},
+		{"--scenario", "s1", "--config", "rls"}, // typo for rsl
+		{"--scenario", "s1", "--config", "bogus-arm"},
+	}
+	for _, args := range reject {
+		if _, err := parseFlags(args, &bytes.Buffer{}); err == nil {
+			t.Errorf("expected rejection for %v, got nil", args)
+		}
+	}
+	accept := []string{"f", "rs", "rsl", "rslt", "rslt-full", "RSLT-full", "rslt-l1", "rslt-l1l2"}
+	for _, c := range accept {
+		if _, err := parseFlags([]string{"--scenario", "s1", "--config", c}, &bytes.Buffer{}); err != nil {
+			t.Errorf("expected --config %q to parse, got %v", c, err)
+		}
+	}
+}
+
+// TestParseFlags_AllowUnverified_Repeatable asserts the documented repeated
+// -flag form (--allow-unverified a --allow-unverified b) accumulates rather
+// than last-wins, alongside the comma-separated form.
+func TestParseFlags_AllowUnverified_Repeatable(t *testing.T) {
+	cfg, err := parseFlags([]string{
+		"--scenario", "s1", "--config", "rs",
+		"--allow-unverified", "aggregator",
+		"--allow-unverified", "falco_rule_corpus, sigma_corpus",
+	}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	want := []string{"aggregator", "falco_rule_corpus", "sigma_corpus"}
+	if strings.Join(cfg.allowUnverified, ",") != strings.Join(want, ",") {
+		t.Errorf("allowUnverified = %v; want %v", cfg.allowUnverified, want)
+	}
+}
+
+// TestErrIfRunDirInUse asserts the run_id collision guard: a missing or
+// empty dir is free, a non-empty dir refuses (so a prior run's trials are
+// never clobbered).
+func TestErrIfRunDirInUse(t *testing.T) {
+	base := t.TempDir()
+
+	missing := filepath.Join(base, "does-not-exist")
+	if err := errIfRunDirInUse(missing); err != nil {
+		t.Errorf("missing dir should be free, got %v", err)
+	}
+
+	empty := filepath.Join(base, "empty")
+	if err := os.MkdirAll(empty, 0o755); err != nil {
+		t.Fatalf("mkdir empty: %v", err)
+	}
+	if err := errIfRunDirInUse(empty); err != nil {
+		t.Errorf("empty dir should be free, got %v", err)
+	}
+
+	used := filepath.Join(base, "used")
+	if err := os.MkdirAll(filepath.Join(used, "trial-1"), 0o755); err != nil {
+		t.Fatalf("mkdir used: %v", err)
+	}
+	if err := errIfRunDirInUse(used); err == nil {
+		t.Errorf("non-empty dir must refuse (collision), got nil")
 	}
 }
 
@@ -254,6 +322,64 @@ func TestImageDigestVerifier_GateBehaviour(t *testing.T) {
 			t.Errorf("expected a nil-resolver REFUSE (fail-closed), got nil")
 		}
 	})
+}
+
+// TestPickRepoDigest covers the docker RepoDigests selection logic without a
+// container runtime: an exact match verifies, a non-matching digest is
+// returned as the actual (so Verify emits expected-vs-actual), and no sha256
+// digest at all is unresolvable (fail-closed).
+func TestPickRepoDigest(t *testing.T) {
+	const want = "sha256:" + "1111111111111111111111111111111111111111111111111111111111111111"
+	const other = "sha256:" + "2222222222222222222222222222222222222222222222222222222222222222"
+
+	t.Run("exact match", func(t *testing.T) {
+		got, err := pickRepoDigest("ghcr.io/x/olaitan@"+want+"\n", "ghcr.io/x/olaitan", want)
+		if err != nil || got != want {
+			t.Errorf("got (%q,%v); want (%q,nil)", got, err, want)
+		}
+	})
+	t.Run("mismatch returns actual", func(t *testing.T) {
+		got, err := pickRepoDigest("ghcr.io/x/olaitan@"+other+"\n", "ghcr.io/x/olaitan", want)
+		if err != nil || got != other {
+			t.Errorf("got (%q,%v); want (%q,nil)", got, err, other)
+		}
+	})
+	t.Run("no digest is unresolvable", func(t *testing.T) {
+		if _, err := pickRepoDigest("   \n", "ghcr.io/x/olaitan", want); err == nil {
+			t.Errorf("expected unresolvable error for empty listing")
+		}
+	})
+}
+
+// TestStringSliceFlag_String covers the flag.Value String() round-trip.
+func TestStringSliceFlag_String(t *testing.T) {
+	var s stringSliceFlag
+	_ = s.Set("a, b")
+	_ = s.Set("c")
+	if s.String() != "a,b,c" {
+		t.Errorf("String() = %q; want a,b,c", s.String())
+	}
+}
+
+// TestVerify_WarnsUnusedAllowEntry asserts an --allow-unverified name that
+// matches no unverified artefact does not block the run (it is surfaced as a
+// warning, not a refusal): the image verifies, the stray allow entry is
+// unused, and Verify returns nil.
+func TestVerify_WarnsUnusedAllowEntry(t *testing.T) {
+	const pinnedHex = "2158bb18545621bc64d93dbeb1999a123bfdce638ea3e50c7fad60c00b711227"
+	m := &Manifest{Images: map[string]string{
+		"aggregator": "ghcr.io/olokotoh/olaitan@sha256:" + pinnedHex,
+	}}
+	v := &imageDigestVerifier{
+		logger:          slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+		allowUnverified: map[string]bool{"typo-not-an-artefact": true},
+		resolveDigest: func(context.Context, string) (string, error) {
+			return "sha256:" + pinnedHex, nil
+		},
+	}
+	if err := v.Verify(context.Background(), m); err != nil {
+		t.Errorf("expected nil (unused allow entry is a warning, not a refusal), got %v", err)
+	}
 }
 
 // TestRunner_PhaseOrderAndDeferredCleanup asserts the Runner drives the
