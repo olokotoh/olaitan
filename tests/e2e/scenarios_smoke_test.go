@@ -99,8 +99,10 @@ func loadScenarioSmokeTarget(t *testing.T, scenarioID string) scenarioSmokeTarge
 // drift. For S4 it ALSO pre-seeds the per-workload baseline with the rs_smoke
 // 10-priming-plus-1-spike EvidencePackage pattern so the outbound_unique_dst_ips
 // deviation half can fire (BI-4) BEFORE the rule-match events are published; the
-// snapshot is taken AFTER the pre-seed/drain so the delta isolates THIS
-// scenario's own deviation + package. All recipe events share one injection
+// snapshot is taken BEFORE the pre-seed so the pre-seed spike's deviation (the
+// one S4 actually relies on per BI-4) lands INSIDE the per-scenario delta rather
+// than being folded into `before` and leaving the deviation half inert. All
+// recipe events share one injection
 // timestamp so the correlator's 60s window cannot straddle a boundary (the
 // rs_smoke precedent).
 func injectScenario(t *testing.T, js jetstream.JetStream, scenarioID, podName string) scenarioCounterSnapshot {
@@ -108,6 +110,13 @@ func injectScenario(t *testing.T, js jetstream.JetStream, scenarioID, podName st
 	if _, ok := scenarioSmokeSlugs[scenarioID]; !ok {
 		t.Fatalf("injectScenario: unknown scenario %q", scenarioID)
 	}
+	// Snapshot the cumulative counters BEFORE any of this scenario's stimuli
+	// (including the S4 baseline pre-seed) so the per-scenario delta captures
+	// every signal THIS scenario produces. For S4 the deviation it relies on
+	// (BI-4) is fired by the pre-seed spike itself, so the snapshot must precede
+	// the pre-seed or that deviation would be folded into `before` and the delta
+	// would be inert.
+	before := snapshotScenarioCounters(t)
 	// S4 rests partly on a baseline deviation: pre-seed the per-workload
 	// baseline so outbound_unique_dst_ips crosses 3 sigma and let the baseline
 	// consumer drain BEFORE the rule-match flow events arrive (BI-4).
@@ -119,7 +128,6 @@ func injectScenario(t *testing.T, js jetstream.JetStream, scenarioID, podName st
 	if len(events) == 0 {
 		t.Fatalf("injectScenario: no recipe events for scenario %q", scenarioID)
 	}
-	before := snapshotScenarioCounters(t)
 	for _, ev := range events {
 		publishJS(t, js, ev.Subject, ev.Payload)
 	}
@@ -131,8 +139,11 @@ func injectScenario(t *testing.T, js jetstream.JetStream, scenarioID, podName st
 // target_time_to_detect_seconds window (up to S4=300s) is the Story-5.4 /
 // A1-gate time-to-detect concern, NOT this smoke. Without the cap a single
 // stuck scenario could burn its whole target window (and the suite ~600s
-// cumulatively). We poll for min(target, ceiling) instead.
-const smokePollCeiling = 60 * time.Second
+// cumulatively). We poll for min(target, ceiling) instead. The ceiling matches
+// the sibling rs_smoke assertionTimeout (90s) since the scenarios drive the same
+// correlator+rules+baseline pipeline on the same kind bring-up; tightening below
+// that proven budget would risk a flake on a loaded CI runner.
+const smokePollCeiling = 90 * time.Second
 
 // scenarioCounterSnapshot is the per-scenario baseline of the cumulative _total
 // counters, captured immediately BEFORE the scenario's inject. assertScenario
@@ -146,7 +157,8 @@ type scenarioCounterSnapshot struct {
 }
 
 // snapshotScenarioCounters captures the cumulative counters the delta-based
-// AC8 assertion is taken against. Call it immediately before injectScenario.
+// AC8 assertion is taken against. injectScenario calls it at the very start,
+// before any of the scenario's stimuli (including the S4 pre-seed).
 // The rule-match half is already scenario-scoped by rule_id (each scenario's
 // triggering rules are distinct), so it does not need a delta; the deviation
 // and evidence-package halves DO, because they are read unlabelled and are
