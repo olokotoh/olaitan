@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
@@ -304,7 +305,15 @@ func (c *Capturer) drainSubject(ctx context.Context, spec jsonlSpec) ([]Envelope
 	defer func() {
 		dctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = stream.DeleteConsumer(dctx, cons.CachedInfo().Name)
+		name := cons.CachedInfo().Name
+		if derr := stream.DeleteConsumer(dctx, name); derr != nil {
+			// The ephemeral consumer self-expires, so a delete failure is not
+			// fatal to the drain, but log it at WARN for leaked-consumer
+			// visibility: a multi-arm run that repeatedly fails this would
+			// otherwise silently accumulate idle consumers on a shared server.
+			c.log.Warn("capture: ephemeral consumer cleanup failed (will self-expire)",
+				"stream", spec.stream, "consumer", name, "err", derr)
+		}
 	}()
 
 	var envs []Envelope
@@ -315,8 +324,18 @@ func (c *Capturer) drainSubject(ctx context.Context, spec jsonlSpec) ([]Envelope
 		}
 		msg, ferr := cons.Next(jetstream.FetchMaxWait(c.drainWindow))
 		if ferr != nil {
-			// No more messages within the idle window: the subject is drained.
-			break
+			// Only the idle/drained signals mean "the subject is fully
+			// drained": jetstream.ErrNoMessages (the no-message status) and
+			// nats.ErrTimeout (Next's FetchMaxWait expiry with no message). Any
+			// OTHER error (ErrConsumerDeleted, ErrNoHeartbeat, a connection drop
+			// mid-drain, ...) means the drain was INTERRUPTED, not completed:
+			// breaking on it would silently TRUNCATE the .jsonl artefact while
+			// reporting a clean complete run, so fail LOUD with a wrapped error
+			// and let the metadata reflect the failure (BI-6).
+			if errors.Is(ferr, jetstream.ErrNoMessages) || errors.Is(ferr, nats.ErrTimeout) {
+				break
+			}
+			return nil, nil, fmt.Errorf("drain %s interrupted: %w", spec.stream, ferr)
 		}
 		env := Envelope{
 			SchemaVersion: spec.schemaVersion,

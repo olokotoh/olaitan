@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"runtime"
 	"time"
+
+	"github.com/olokotoh/olaitan/internal/schema"
 )
 
 // NeverDetectedSentinel is the measured_time_to_detect value recorded when the
@@ -19,30 +21,37 @@ const (
 	// was recorded).
 	FSMSourceObservedTransitions = "observed_transitions"
 	// FSMSourceDetectionSignalOnly: no FSM transition was captured, so
-	// measured_final_fsm_state is the DETECTION-SIGNAL state (the state
-	// attained from the EVIDENCE-package signal actually observed on the
-	// constrained env). The full FSM attainment proof is deferred to the A1
+	// measured_final_fsm_state is the DETECTION-SIGNAL floor (DetectionSignalState
+	// == SUSPICIOUS), NOT a higher state the run cannot prove it reached. A fired
+	// detection (rule match / baseline deviation in an EvidencePackage) honestly
+	// attests only that detection FIRED, i.e. at-least-SUSPICIOUS; it does NOT
+	// attest RESTRICTED/QUARANTINED/PRESERVED_KILLED without an observed
+	// AUDIT.transitions event. The full FSM attainment proof is deferred to the A1
 	// RSLT-full-kind gate; the capture records WHAT IT OBSERVED and labels it
-	// honestly, never claiming a state the run did not reach.
+	// honestly, never claiming a state the run did not reach (BI-8). NEVER copy
+	// the scenario's TARGET state here: that would make the success-criterion FSM
+	// comparison pass by construction and inflate the headline metric Story 5.5
+	// aggregates across all 400 runs.
 	FSMSourceDetectionSignalOnly = "detection_signal_only"
 	// FSMSourceNone: neither a transition nor an evidence signal was observed
 	// (a clean / undetected run).
 	FSMSourceNone = "none"
 )
 
-// fsmOrder is the FSM escalation ordering used for the floor-aware
-// success-criterion comparison (BI-9). It mirrors internal/schema/state.go's
-// stateOrderMap (SUSPICIOUS < RESTRICTED < QUARANTINED < PRESERVED_KILLED);
-// CLEAN is the baseline and is never an attack target. It is duplicated here
-// (a tiny, stable enum) rather than importing internal/schema so the harness
-// capture package carries no decision/response import weight; a drift is caught
-// by TestFSMOrder_MatchesSchema in the cmd adapter test.
-var fsmOrder = map[string]int{
-	"CLEAN":            0,
-	"SUSPICIOUS":       1,
-	"RESTRICTED":       2,
-	"QUARANTINED":      3,
-	"PRESERVED_KILLED": 4,
+// DetectionSignalState is the HONEST floor recorded as measured_final_fsm_state
+// for a detection-signal-only run (no AUDIT.transitions captured, only an
+// EvidencePackage signal). It is the lowest non-CLEAN state: a fired detection
+// attests at-least-SUSPICIOUS and nothing higher (BI-8). It is NEVER the
+// scenario's target state.
+const DetectionSignalState = string(schema.StateSuspicious)
+
+// fsmRank returns the FSM escalation rank of a state name and whether it is a
+// known FSM state. It delegates to internal/schema/state.go's StateRank so the
+// floor-aware success-criterion comparison (BI-9) scores against the SINGLE
+// canonical ordering the FSM enforces (CLEAN < SUSPICIOUS < RESTRICTED <
+// QUARANTINED < PRESERVED_KILLED) with no duplicated ordering map to drift.
+func fsmRank(state string) (int, bool) {
+	return schema.StateRank(schema.PodSecurityState(state))
 }
 
 // Target is the Story-5.2 target.yaml contract the measurement is scored
@@ -114,22 +123,37 @@ func Measure(transitions, evidence []json.RawMessage, target Target, startedAt t
 		m.FSMStateSource = FSMSourceObservedTransitions
 	case !firstEvidenceAt.IsZero():
 		// Detection signal observed but no transition recorded on the
-		// constrained env: report the detection-signal state honestly
-		// (BI-8). The target's state is the SCENARIO's expectation; the
-		// capture labels this as detection_signal_only so a reader knows the
-		// full FSM attainment was not proven here.
-		m.MeasuredFinalFSMState = target.FSMState
+		// constrained env: report the HONEST detection-signal floor
+		// (DetectionSignalState == SUSPICIOUS), NOT the scenario's target
+		// state (BI-8). A fired detection attests at-least-SUSPICIOUS and
+		// nothing higher without an observed AUDIT.transitions event; copying
+		// target.FSMState here would make the success-criterion FSM comparison
+		// pass by construction (target == measured) and inflate the headline
+		// metric. The detection_signal_only label tells a reader the full FSM
+		// attainment was not proven here; success_criterion_met then follows
+		// the floor-aware comparison HONESTLY against SUSPICIOUS, so a
+		// QUARANTINED/RESTRICTED target is NOT satisfied by a detection signal
+		// alone (its higher-state attainment is deferred to the A1 gate).
+		m.MeasuredFinalFSMState = DetectionSignalState
 		m.FSMStateSource = FSMSourceDetectionSignalOnly
 	}
 
-	// Determine the time-to-detect: the earliest detection moment observed.
+	// Determine the time-to-detect: the earliest detection moment observed,
+	// relative to startedAt. INVARIANT: the scenario stimulus clock (which
+	// stamps decided_at / assembled_at on the captured events) and the harness
+	// startedAt MUST share a clock; on the in-process / single-host evaluation
+	// env they do (both are wall-clock UTC on the same node). A NEGATIVE delta
+	// therefore signals clock skew or a mis-anchored startedAt, NOT a real
+	// sub-second detection: clamping it to 0 would fabricate a 0-second detect
+	// that trivially passes the time budget, so we record the never-detected
+	// sentinel (an honest "this run's detection time is not trustworthy")
+	// instead, leaving success_criterion_met to fail on the sentinel.
 	detectAt := earliest(firstTransitionAt, firstEvidenceAt)
 	if !detectAt.IsZero() && !startedAt.IsZero() {
 		ttd := int(detectAt.Sub(startedAt).Seconds())
-		if ttd < 0 {
-			ttd = 0
+		if ttd >= 0 {
+			m.MeasuredTimeToDetect = ttd
 		}
-		m.MeasuredTimeToDetect = ttd
 	}
 
 	m.SuccessCriterionMet = successMet(m, target)
@@ -145,11 +169,11 @@ func successMet(m Measurement, target Target) bool {
 	if m.MeasuredTimeToDetect > target.TimeToDetectSeconds {
 		return false
 	}
-	observedRank, ok := fsmOrder[m.MeasuredFinalFSMState]
+	observedRank, ok := fsmRank(m.MeasuredFinalFSMState)
 	if !ok {
 		return false
 	}
-	targetRank, ok := fsmOrder[target.FSMState]
+	targetRank, ok := fsmRank(target.FSMState)
 	if !ok {
 		return false
 	}
@@ -169,7 +193,7 @@ func highestTransition(transitions []json.RawMessage) (state string, rank int, f
 		if err := json.Unmarshal(raw, &t); err != nil {
 			continue
 		}
-		if r, ok := fsmOrder[t.AfterState]; ok && r > rank {
+		if r, ok := fsmRank(t.AfterState); ok && r > rank {
 			rank = r
 			state = t.AfterState
 		}

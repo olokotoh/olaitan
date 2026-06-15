@@ -147,6 +147,22 @@ func TestMeasure_FloorAndExactCriteria(t *testing.T) {
 		}
 	})
 
+	t.Run("negative ttd (clock skew) records the sentinel, not a fabricated 0", func(t *testing.T) {
+		// A detection stamped BEFORE startedAt signals clock skew / a
+		// mis-anchored startedAt; it must NOT be clamped to a 0-second detect
+		// that trivially passes the budget (BI-8/FIX 6). It records the
+		// never-detected sentinel and fails the criterion honestly.
+		early := start.Add(-5 * time.Second)
+		m := Measure([]json.RawMessage{tx("SUSPICIOUS", early)}, nil,
+			Target{FSMState: "SUSPICIOUS", TimeToDetectSeconds: 30, Floor: false}, start)
+		if m.MeasuredTimeToDetect != NeverDetectedSentinel {
+			t.Errorf("negative-delta ttd = %d; want the never-sentinel %d (no clamp-to-0)", m.MeasuredTimeToDetect, NeverDetectedSentinel)
+		}
+		if m.SuccessCriterionMet {
+			t.Errorf("a clock-skewed detection must not trivially pass the time budget: %+v", m)
+		}
+	})
+
 	t.Run("no signal is a never-detected miss", func(t *testing.T) {
 		m := Measure(nil, nil, Target{FSMState: "SUSPICIOUS", TimeToDetectSeconds: 30}, start)
 		if m.SuccessCriterionMet {
@@ -162,25 +178,74 @@ func TestMeasure_FloorAndExactCriteria(t *testing.T) {
 }
 
 // TestMeasure_DetectionSignalOnly asserts BI-8 honesty: with an EvidencePackage
-// signal but NO FSM transition, the final state is the detection-signal state
-// labelled detection_signal_only (never a fabricated transition state).
+// signal but NO FSM transition, measured_final_fsm_state is the HONEST detection
+// floor (SUSPICIOUS, the lowest non-CLEAN state), labelled detection_signal_only
+// -- NEVER the scenario's target state. A fired detection attests
+// at-least-SUSPICIOUS and nothing higher, so the floor-aware success comparison
+// runs HONESTLY against SUSPICIOUS.
+//
+// THE INVARIANT (the BLOCKER fix): a detection-signal-only run must NEVER report
+// success_criterion_met=true for a QUARANTINED or RESTRICTED target. Higher-state
+// attainment without an observed transition is deferred to the A1 gate.
 func TestMeasure_DetectionSignalOnly(t *testing.T) {
 	start := time.Date(2026, 6, 15, 10, 0, 0, 0, time.UTC)
-	ev, _ := json.Marshal(map[string]any{"assembled_at": start.Add(10 * time.Second)})
-	m := Measure(nil, []json.RawMessage{ev},
-		Target{FSMState: "SUSPICIOUS", TimeToDetectSeconds: 30, Floor: false}, start)
-	if m.FSMStateSource != FSMSourceDetectionSignalOnly {
-		t.Errorf("fsm_state_source = %q; want detection_signal_only", m.FSMStateSource)
+	ev := func() json.RawMessage {
+		b, _ := json.Marshal(map[string]any{"assembled_at": start.Add(10 * time.Second)})
+		return b
 	}
-	if m.MeasuredFinalFSMState != "SUSPICIOUS" {
-		t.Errorf("detection-signal state = %q; want the target SUSPICIOUS", m.MeasuredFinalFSMState)
-	}
-	if m.MeasuredTimeToDetect != 10 {
-		t.Errorf("ttd = %d; want 10 (evidence assembly time)", m.MeasuredTimeToDetect)
-	}
-	if !m.SuccessCriterionMet {
-		t.Errorf("detection-signal SUSPICIOUS within budget should meet the criterion: %+v", m)
-	}
+
+	t.Run("measured is the honest SUSPICIOUS floor, never the target", func(t *testing.T) {
+		// A QUARANTINED target reached only by a detection signal MUST NOT
+		// inherit QUARANTINED as the measured state (that would be claiming an
+		// unreached state, BI-8).
+		m := Measure(nil, []json.RawMessage{ev()},
+			Target{FSMState: "QUARANTINED", TimeToDetectSeconds: 30, Floor: false}, start)
+		if m.FSMStateSource != FSMSourceDetectionSignalOnly {
+			t.Errorf("fsm_state_source = %q; want detection_signal_only", m.FSMStateSource)
+		}
+		if m.MeasuredFinalFSMState != DetectionSignalState {
+			t.Errorf("detection-signal state = %q; want the honest floor %q, NEVER the QUARANTINED target",
+				m.MeasuredFinalFSMState, DetectionSignalState)
+		}
+		if m.MeasuredTimeToDetect != 10 {
+			t.Errorf("ttd = %d; want 10 (evidence assembly time)", m.MeasuredTimeToDetect)
+		}
+	})
+
+	t.Run("SUSPICIOUS floor target within budget is honestly met", func(t *testing.T) {
+		// (i) a SUSPICIOUS floor=true target reached only by a detection signal
+		// IS honestly satisfied: measured SUSPICIOUS >= target SUSPICIOUS.
+		m := Measure(nil, []json.RawMessage{ev()},
+			Target{FSMState: "SUSPICIOUS", TimeToDetectSeconds: 30, Floor: true}, start)
+		if m.MeasuredFinalFSMState != DetectionSignalState {
+			t.Errorf("measured = %q; want %q", m.MeasuredFinalFSMState, DetectionSignalState)
+		}
+		if !m.SuccessCriterionMet {
+			t.Errorf("detection-signal SUSPICIOUS floor within budget should meet the criterion: %+v", m)
+		}
+	})
+
+	t.Run("INVARIANT: QUARANTINED/RESTRICTED target NEVER met by a detection signal alone", func(t *testing.T) {
+		// (ii) the BLOCKER invariant across every higher target, floor true OR
+		// false: a constrained-env run that only fired a detection signal (never
+		// transitioned) must report success_criterion_met=FALSE for any target
+		// above SUSPICIOUS, so the headline metric Story 5.5 aggregates is not
+		// inflated by an unreached state.
+		for _, target := range []string{"RESTRICTED", "QUARANTINED", "PRESERVED_KILLED"} {
+			for _, floor := range []bool{false, true} {
+				m := Measure(nil, []json.RawMessage{ev()},
+					Target{FSMState: target, TimeToDetectSeconds: 30, Floor: floor}, start)
+				if m.SuccessCriterionMet {
+					t.Errorf("detection-signal-only run reported success for target %s (floor=%v): %+v -- BI-8 invariant violated",
+						target, floor, m)
+				}
+				if m.MeasuredFinalFSMState != DetectionSignalState {
+					t.Errorf("target %s (floor=%v): measured = %q; want the honest floor %q, never the target",
+						target, floor, m.MeasuredFinalFSMState, DetectionSignalState)
+				}
+			}
+		}
+	})
 }
 
 // TestCheckSize_UnderAndOver asserts the size cap (AC4/BI-10): under the cap is

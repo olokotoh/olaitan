@@ -197,6 +197,19 @@ func run(args []string, stdout, stderr io.Writer, runCmd overlayRunFunc) error {
 	// error aborts that trial and is recorded; the run continues to the
 	// metadata finalise so a partial/failed run is still a reproducible-from
 	// data point (BI-6).
+	// Under the OQ2 run-level layout all trials drain into the SAME
+	// runs/<run_id>/ with O_TRUNC, so for --runs>1 each trial OVERWRITES the
+	// prior trial's six artefacts and only the LAST trial's artefacts survive.
+	// That is the documented OQ2 resolution ("the last trial's drain is the
+	// run's captured signal"), but it must NOT be silent: warn LOUDLY so an
+	// operator passing --runs>1 knows per-trial artefacts are not retained and
+	// that run-level multi-trial capture + aggregation is a Story 5.5 concern
+	// (run-level statistics over repeated trials), not a Story 5.4 capability.
+	if cfg.runs > 1 {
+		logger.Warn("runs>1: all trials drain into the same run dir (OQ2 run-level layout); only the LAST trial's artefacts are retained -- per-trial artefact retention + multi-trial aggregation is a Story 5.5 concern",
+			"runs", cfg.runs, "run_dir", runDir)
+	}
+
 	var firstErr error
 	for trial := 1; trial <= cfg.runs; trial++ {
 		logger.Info("trial start", "trial", trial, "of", cfg.runs, "dir", runDir)

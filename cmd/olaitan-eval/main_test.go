@@ -16,6 +16,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/olokotoh/olaitan/internal/eval/capture"
+	"github.com/olokotoh/olaitan/internal/schema"
 )
 
 // writeCommittedShapeManifest writes a valid manifest into dir and returns
@@ -159,11 +160,13 @@ func TestParseFlags_CaptureFlagsDefaultsAndOverride(t *testing.T) {
 // TestCaptureFSMOrder_MatchesSchema asserts the capture package's floor-aware
 // FSM ordering (BI-9) stays in lock-step with internal/schema/state.go's
 // canonical state escalation order, so a future schema reorder cannot silently
-// drift the success-criterion comparison.
+// drift the success-criterion comparison. The capture package now derives its
+// ordering FROM internal/schema (schema.StateRank is the single source of
+// truth, no duplicated map), so this test MECHANICALLY exercises the floor
+// comparison against schema.StateRank rather than hard-coding the expected
+// outcomes: for every (target, observed) pair of real FSM states, a floor
+// target is met iff schema rank(observed) >= rank(target).
 func TestCaptureFSMOrder_MatchesSchema(t *testing.T) {
-	// The schema escalation order: CLEAN < SUSPICIOUS < RESTRICTED <
-	// QUARANTINED < PRESERVED_KILLED. A floor target of RESTRICTED is met by
-	// QUARANTINED (higher) and PRESERVED_KILLED (higher) but not by SUSPICIOUS.
 	start := time.Date(2026, 6, 15, 10, 0, 0, 0, time.UTC)
 	tx := func(state string) json.RawMessage {
 		raw, err := json.Marshal(map[string]any{"after_state": state, "decided_at": start.Add(time.Second)})
@@ -172,19 +175,35 @@ func TestCaptureFSMOrder_MatchesSchema(t *testing.T) {
 		}
 		return raw
 	}
-	for _, tc := range []struct {
-		observed string
-		floorMet bool
-	}{
-		{"SUSPICIOUS", false},
-		{"RESTRICTED", true},
-		{"QUARANTINED", true},
-		{"PRESERVED_KILLED", true},
-	} {
-		m := capture.Measure([]json.RawMessage{tx(tc.observed)}, nil,
-			capture.Target{FSMState: "RESTRICTED", TimeToDetectSeconds: 60, Floor: true}, start)
-		if m.SuccessCriterionMet != tc.floorMet {
-			t.Errorf("floor RESTRICTED vs observed %s: met = %v; want %v", tc.observed, m.SuccessCriterionMet, tc.floorMet)
+	// The non-CLEAN attack-target states, in canonical schema order. CLEAN is
+	// the baseline and is never an attack target.
+	states := []schema.PodSecurityState{
+		schema.StateSuspicious, schema.StateRestricted, schema.StateQuarantined, schema.StatePreservedKilled,
+	}
+	for _, target := range states {
+		targetRank, ok := schema.StateRank(target)
+		if !ok {
+			t.Fatalf("schema.StateRank(%s) not found", target)
+		}
+		for _, observed := range states {
+			observedRank, _ := schema.StateRank(observed)
+			// A floor target is met iff the observed state is at least as high
+			// as the target in the canonical schema rank (mechanical, not
+			// hard-coded): rank(observed) >= rank(target).
+			wantFloorMet := observedRank >= targetRank
+			m := capture.Measure([]json.RawMessage{tx(string(observed))}, nil,
+				capture.Target{FSMState: string(target), TimeToDetectSeconds: 60, Floor: true}, start)
+			if m.SuccessCriterionMet != wantFloorMet {
+				t.Errorf("floor target %s vs observed %s: met = %v; want %v (schema ranks %d vs %d)",
+					target, observed, m.SuccessCriterionMet, wantFloorMet, observedRank, targetRank)
+			}
+			// Exact (non-floor) target is met iff observed == target.
+			me := capture.Measure([]json.RawMessage{tx(string(observed))}, nil,
+				capture.Target{FSMState: string(target), TimeToDetectSeconds: 60, Floor: false}, start)
+			if me.SuccessCriterionMet != (observed == target) {
+				t.Errorf("exact target %s vs observed %s: met = %v; want %v",
+					target, observed, me.SuccessCriterionMet, observed == target)
+			}
 		}
 	}
 }
