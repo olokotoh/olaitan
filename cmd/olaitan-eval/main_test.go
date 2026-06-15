@@ -189,6 +189,9 @@ func TestRun_LayoutTrialsAndMetadata(t *testing.T) {
 	err := run([]string{
 		"--manifest", manifestPath,
 		"--scenario", "s1",
+		// Resolve the Story-5.2 harness tree from the cmd/olaitan-eval/
+		// test working dir (the binary normally runs from the repo root).
+		"--scenarios-root", filepath.Join("..", "..", "deploy", "demo", "scenarios"),
 		"--config", "rs",
 		"--runs", "3",
 		"--out", outDir,

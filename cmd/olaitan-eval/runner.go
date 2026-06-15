@@ -47,10 +47,11 @@ type ConfigOverlay interface {
 	Apply(ctx context.Context, config string) error
 }
 
-// Scenario launches the attack-scenario harness for the trial. OWNED BY
+// Scenario launches the attack-scenario harness for the trial. FILLED BY
 // STORY 5.2: 5.2 supplies the five MITRE-annotated S1-S5 harnesses under
-// deploy/demo/scenarios/ behind this seam. The 5.1 minimal impl
-// (rsScenario) reuses the rs_smoke synthetic S1 container-escape event.
+// deploy/demo/scenarios/ behind this seam (scenarioHarness in scenario.go,
+// built by newScenario). The 5.1 rsScenario no-op marker is replaced;
+// --scenario sN now dispatches the matching sN-<slug>/ harness.
 type Scenario interface {
 	// Run drives the scenario's synthetic attack against the warmed
 	// cluster.
@@ -220,24 +221,10 @@ func (o *rsOverlay) Apply(ctx context.Context, config string) error {
 	return nil
 }
 
-// rsScenario is the 5.1 minimal Scenario. It reuses the Story-1.19
-// rs_smoke synthetic S1 container-escape event path: the e2e test drives
-// the synthetic event directly via NATS (the rs_smoke harness), so the
-// in-process scenario at the foundation layer is a no-op marker that the
-// S1 arm was selected.
-type rsScenario struct {
-	logger *slog.Logger
-}
-
-func (s *rsScenario) Run(ctx context.Context) error {
-	// Story 5.2: the five MITRE-annotated S1-S5 harnesses under
-	// deploy/demo/scenarios/ land here behind this seam. The 5.1 minimal
-	// impl reuses the rs_smoke synthetic S1 container-escape event, which
-	// the AC5 e2e drives directly via the kind harness; the in-process
-	// scenario is therefore a no-op at the foundation layer.
-	s.logger.Info("scenario: S1 (RS arm) reuses the rs_smoke synthetic container-escape event; rich S1-S5 harnesses await Story 5.2")
-	return nil
-}
+// The Scenario seam (runner.go interface) is filled by the Story-5.2 rich
+// per-scenario harness in scenario.go (scenarioHarness, built by
+// newScenario). The 5.1 rsScenario no-op marker is replaced: --scenario sN
+// now dispatches the matching deploy/demo/scenarios/sN-<slug>/ harness.
 
 // metadataOnlyCapturer is the 5.1 minimal Capturer. It writes the per-run
 // metadata.yaml (the manifest_sha256 carrier, AC3) and a placeholder

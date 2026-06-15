@@ -30,6 +30,7 @@ const runIDTimeFormat = "20060102T150405.000Z"
 type runConfig struct {
 	manifestPath    string
 	scenario        string
+	scenariosRoot   string
 	config          string
 	runs            int
 	out             string
@@ -110,7 +111,15 @@ func run(args []string, stdout, stderr io.Writer) error {
 	_, _ = fmt.Fprintf(stdout, "run_id: %s\n", runID)
 	_, _ = fmt.Fprintf(stdout, "run_dir: %s\n", runDir)
 
-	r := newRunner(cfg.config, logger)
+	// Build the rich per-scenario harness (Story 5.2) and thread it into
+	// the Runner behind the frozen Scenario seam. A mis-wired scenario
+	// (no harness mapping, missing/invalid target.yaml) fails the run
+	// loudly here rather than silently no-opping (BI-3).
+	scenario, err := newScenario(cfg.scenario, cfg.scenariosRoot, logger)
+	if err != nil {
+		return err
+	}
+	r := newRunner(cfg.config, scenario, logger)
 
 	// The N-trial loop (AC4). Each trial writes runs/<run_id>/trial-<n>/.
 	// A trial error aborts that trial and is recorded; the run continues
@@ -157,6 +166,7 @@ func parseFlags(args []string, stderr io.Writer) (runConfig, error) {
 	var allow stringSliceFlag
 	fs.StringVar(&cfg.manifestPath, "manifest", "eval/manifest.yaml", "path to the reproducibility-envelope manifest")
 	fs.StringVar(&cfg.scenario, "scenario", "", "scenario id to run (s1..s5)")
+	fs.StringVar(&cfg.scenariosRoot, "scenarios-root", defaultScenariosRoot, "root directory holding the sN-<slug>/ attack-scenario harnesses (Story 5.2)")
 	fs.StringVar(&cfg.config, "config", "", "evaluation configuration arm (f, rs, rsl, rslt, rslt-full, or an rslt-<ablation>)")
 	fs.IntVar(&cfg.runs, "runs", 1, "number of trials to run")
 	fs.StringVar(&cfg.out, "out", "runs", "output directory for runs/<run_id>/")
@@ -256,14 +266,17 @@ func newRunID(at time.Time, scenario, config, manifestHash string) string {
 	return fmt.Sprintf("%s-%s-%s-%s", at.Format(runIDTimeFormat), scenario, config, short)
 }
 
-// newRunner wires the Runner with the 5.1 MINIMAL seam impls for the AC5
-// RS path (BI-1). Stories 5.2-5.5 swap in the rich impls behind the same
-// interfaces without touching this wiring shape.
-func newRunner(config string, logger *slog.Logger) *Runner {
+// newRunner wires the Runner with the seam impls for the configured arm. The
+// Scenario seam is now filled by the Story-5.2 rich per-scenario harness
+// (threaded in from run() via newScenario, replacing the 5.1 rsScenario
+// no-op marker); the Cluster / Overlay / Capturer seams keep their 5.1
+// minimal impls (Story 5.3 / 5.4 swap in the rich ones behind the same
+// interfaces). The Runner loop shape is unchanged (the 5.1 freeze).
+func newRunner(config string, scenario Scenario, logger *slog.Logger) *Runner {
 	return &Runner{
 		Cluster:  &clusterController{logger: logger},
 		Overlay:  &rsOverlay{logger: logger},
-		Scenario: &rsScenario{logger: logger},
+		Scenario: scenario,
 		Capturer: &metadataOnlyCapturer{logger: logger},
 		Config:   config,
 		Logger:   logger,

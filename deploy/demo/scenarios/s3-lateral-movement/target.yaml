@@ -1,0 +1,10 @@
+# S3 lateral-movement target contract (Story 5.2, BI-2).
+#
+# floor=false because AC4's success criterion is the EXACT state QUARANTINED.
+scenario_id: s3
+mitre_technique: T1613
+target_fsm_state: QUARANTINED
+target_time_to_detect_seconds: 90
+floor: false
+triggering_rules:
+  - OLT-LATERAL-001

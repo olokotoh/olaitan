@@ -54,11 +54,11 @@ import (
 )
 
 const (
-	defaultKindCluster    = "olaitan-e2e"
-	defaultNamespace      = "default"
-	defaultReleaseName    = "olaitan"
-	natsLocalPort         = "4222"
-	metricsLocalPort      = "9090"
+	defaultKindCluster = "olaitan-e2e"
+	defaultNamespace   = "default"
+	defaultReleaseName = "olaitan"
+	natsLocalPort      = "4222"
+	metricsLocalPort   = "9090"
 	// assertionTimeout is the per-assertion poll budget. 90s (not the NFR7 10s
 	// p99): this is a FUNCTIONAL e2e on a constrained single-node kind cluster
 	// with a fake LLM, where the full RSLT-full + forensics chain (correlation +
@@ -228,6 +228,34 @@ func portForward(t *testing.T, target, localPort, remotePort string) {
 // without an upstream pull.
 func applySyntheticWorkload(t *testing.T) string {
 	t.Helper()
+	return applyScenarioWorkload(t, "web")
+}
+
+// applyScenarioWorkload creates a `tenant-acme/<deployName>` Deployment and
+// returns the actual pod name. It is the per-scenario generalisation of
+// applySyntheticWorkload: the correlator derives a workloadID of the form
+// `tenant-acme/Deployment/<deployName>` (internal/keys/workload.go:36 +
+// internal/correlator/correlator.go:395), and the correlator's rising-edge
+// `fired` flag (internal/correlator/window/window.go:171-185) is keyed on that
+// workloadID. Giving EACH scenario its OWN Deployment name therefore gives it
+// its OWN rising-edge state, so a scenario's first multi-signal convergence
+// fires a fresh EvidencePackage independent of rs_smoke (which uses `web`) and
+// of the sibling scenarios -- without this, every scenario shared
+// `tenant-acme/Deployment/web` and the `fired` flag set by the FIRST converger
+// (rs_smoke or an earlier scenario) suppressed every later fresh package within
+// the still-open window (the Review-Round-2 CI-caught fragility).
+//
+// All OLT rules the scenarios trigger key on `k8s.pod.namespace` (several with
+// `startswith: 'tenant-'`) and `k8s.workload.owner_kind: Deployment`, NOT on the
+// Deployment NAME (verified across rules/{priv,cred,lateral,net,impact}/*.yaml),
+// so a distinct Deployment name in the SAME tenant-acme namespace keeps every
+// scenario's rule matching intact.
+//
+// The namespace is created idempotently (apply is a no-op if it already exists)
+// so multiple per-scenario Deployments can share tenant-acme; the namespace
+// teardown is registered ONCE per process via syntheticNamespaceCleanupOnce.
+func applyScenarioWorkload(t *testing.T, deployName string) string {
+	t.Helper()
 	manifest := `
 apiVersion: v1
 kind: Namespace
@@ -237,20 +265,20 @@ metadata:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: web
+  name: ` + deployName + `
   namespace: tenant-acme
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: web
+      app: ` + deployName + `
   template:
     metadata:
       labels:
-        app: web
+        app: ` + deployName + `
     spec:
       containers:
-        - name: web
+        - name: ` + deployName + `
           image: registry.k8s.io/pause:3.10
 `
 	cmd := exec.Command("kubectl", "apply", "-f", "-")
@@ -263,17 +291,20 @@ spec:
 	}
 	t.Cleanup(func() {
 		// Best-effort cleanup; do not fail the test on teardown errors
-		// (CI tears the kind cluster down on job end anyway).
+		// (CI tears the kind cluster down on job end anyway). The whole
+		// tenant-acme namespace is deleted (cascading every per-scenario
+		// Deployment/ReplicaSet/Pod); registering it on every workload is
+		// harmless because --ignore-not-found makes repeats no-ops.
 		_ = exec.Command("kubectl", "delete", "namespace", "tenant-acme",
 			"--wait=false", "--ignore-not-found").Run()
 	})
 	kubectl(t, "wait", "--for=condition=Ready",
 		"-n", "tenant-acme",
-		"--selector=app=web",
+		"--selector=app="+deployName,
 		"--timeout=60s", "pods")
 	out := kubectl(t, "get", "pods",
 		"-n", "tenant-acme",
-		"-l", "app=web",
+		"-l", "app="+deployName,
 		"-o", "jsonpath={.items[0].metadata.name}")
 	podName := strings.TrimSpace(out)
 	if podName == "" {
@@ -324,6 +355,17 @@ func publishJS(t *testing.T, js jetstream.JetStream, subject string, payload []b
 }
 
 func publishSyntheticEvidencePackages(t *testing.T, js jetstream.JetStream, podName string) {
+	publishSyntheticEvidencePackagesFor(t, js, podName, "web")
+}
+
+// publishSyntheticEvidencePackagesFor is the deployName-parameterised form of
+// publishSyntheticEvidencePackages. The Welford baseline state is keyed by the
+// workload identity (namespace + "OwnerKind-OwnerName"), so the pre-seed packages
+// MUST carry the SAME owner_name as the scenario's Deployment, or the primed
+// history lands on `tenant-acme/Deployment/web` while the scenario's own rule-
+// match/trigger packages land on `tenant-acme/Deployment/<deployName>` and the
+// deviation half never fires. The default `web` preserves the rs_smoke behaviour.
+func publishSyntheticEvidencePackagesFor(t *testing.T, js jetstream.JetStream, podName, deployName string) {
 	t.Helper()
 	now := time.Now().UTC()
 	// PodName is intentionally omitted from both WorkloadIdentity and
@@ -340,13 +382,13 @@ func publishSyntheticEvidencePackages(t *testing.T, js jetstream.JetStream, podN
 		"identity": map[string]any{
 			"namespace":  "tenant-acme",
 			"owner_kind": "Deployment",
-			"owner_name": "web",
+			"owner_name": deployName,
 		},
 	}
 	identity := map[string]any{
 		"namespace":  "tenant-acme",
 		"owner_kind": "Deployment",
-		"owner_name": "web",
+		"owner_name": deployName,
 	}
 	makePkg := func(id string, distinctIPs int) []byte {
 		events := make([]map[string]any, 0, distinctIPs)
@@ -378,7 +420,7 @@ func publishSyntheticEvidencePackages(t *testing.T, js jetstream.JetStream, podN
 		pkg := map[string]any{
 			"schema_version":    "1.0",
 			"package_id":        id,
-			"workload_id":       "tenant-acme/Deployment/web",
+			"workload_id":       "tenant-acme/Deployment/" + deployName,
 			"workload_identity": identity,
 			"assembled_at":      now.Format(time.RFC3339Nano),
 			"window_start":      now.Add(-30 * time.Second).Format(time.RFC3339Nano),

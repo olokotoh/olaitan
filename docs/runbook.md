@@ -1169,6 +1169,63 @@ artefact capture (Story 5.4), and the full metadata schema plus the
 `metadata.yaml` schema here is the minimal set; Story 5.5 owns and extends
 it.
 
+### 1.4g Running an attack scenario (Story 5.2, FR53/the S1-S5 harnesses)
+
+The five MITRE-ATT&CK-annotated attack scenarios live under
+`deploy/demo/scenarios/sN-<slug>/`:
+
+| `--scenario` | Harness directory | MITRE | Triggering rule(s) | Target (FSM / TTD) |
+|---|---|---|---|---|
+| `s1` | `s1-container-escape` | T1611 | OLT-PRIV-001 | QUARANTINED / 30 s |
+| `s2` | `s2-credential-exfil` | T1552 | OLT-CRED-001, OLT-CRED-002 | >= RESTRICTED / 60 s |
+| `s3` | `s3-lateral-movement` | T1613 | OLT-LATERAL-001 | QUARANTINED / 90 s |
+| `s4` | `s4-c2-beaconing` | T1071 | OLT-NET-001, OLT-NET-002 (and/or baseline deviation) | >= SUSPICIOUS / 300 s |
+| `s5` | `s5-cryptomining` | T1496 | OLT-IMPACT-005, OLT-IMPACT-006 | RESTRICTED / 120 s |
+
+Each harness directory carries `manifests/` (the tenant-namespace workload
+the scenario targets), `attack/inject.md` (the real-attacker description plus
+the deterministic synthetic-event field shapes), `README.md` (the MITRE
+technique, the success criterion, and the determinism note), and
+`target.yaml` (the machine-readable `target_fsm_state` /
+`target_time_to_detect_seconds` Story 5.4 measures against).
+
+`olaitan-eval --scenario sN ...` resolves `sN` to its harness via the
+scenario factory (`cmd/olaitan-eval/scenario.go`), loads + validates the
+harness `target.yaml`, and dispatches it through the frozen `Scenario` seam.
+On kind, Falco's eBPF probe cannot load, so the harness stimulus is a
+DETERMINISTIC synthetic-event injection (the rs_smoke precedent): each
+scenario publishes the exact event field shape its OLT rule matches directly
+to `olaitan.events.raw.{falco,network}` (no randomness, no real exploit, no
+external network). The canonical injection lives in
+`tests/e2e/scenarios_smoke_test.go`; the field shapes are the single source
+of truth in `cmd/olaitan-eval/scenario.go` (`scenarioEvents`).
+
+`make scenarios-smoke` brings up the RS-arm kind cluster (the `eval-smoke`
+precedent), fires each scenario's stimulus, and asserts a rule match OR
+baseline deviation reaches `EVIDENCE.packages` within each scenario's
+target-time window (AC8), plus an idempotency re-run (AC7). AC8 asserts the
+EVIDENCE-package SIGNAL, NOT the full FSM-state attainment of the
+QUARANTINED / RESTRICTED / SUSPICIOUS targets (Story 5.4 + the carry-forward
+A1 RSLT-full-kind gate own the full chain). The six config-matrix overlays
+(Story 5.3), the six-file artefact capture (Story 5.4), and the
+`success_criterion_met` / `measured_time_to_detect` metadata (Story 5.4/5.5)
+fill the rest of Epic 5.
+
+Each scenario uses its OWN tenant-acme Deployment (`scenario-<id>`) so the
+correlator's per-workload rising edge (`internal/correlator/window/window.go`)
+fires a fresh EvidencePackage per scenario, independent of rs_smoke and the
+sibling scenarios; run it locally with `make scenarios-smoke` any time.
+
+CI gating (opt-in): this smoke is NOT in the always-on CI `e2e` job. It runs in
+the OPT-IN `e2e-scenarios` CI job, gated by the `e2e-scenarios` PR LABEL
+(mirroring `e2e-forensics`), because the 5-scenario multi-workload baseline-
+preseed smoke exercises the documented constrained-single-node-kind aggregator
+event-loss flakiness (the aggregator restarts ~2x on a NATS-not-ready startup
+race, dropping events). Add the `e2e-scenarios` label to a PR to run it; the
+deterministic full run folds into the carry-forward A1 3-node cluster gate.
+Story 5.1's stable gate (the RS smoke + `TestEvalSmoke_S1_RS_OneTrial`) stays
+always-on in the `e2e` job.
+
 ### 1.5 Naming-convention reconciliation
 
 The Story 1.18 acceptance criteria text uses a mix of singular-ring and plural-ring metric names (e.g. AC2 says `olaitan_decision_rule_matches_total` singular; AC3 says `olaitan_decision_baseline_deviations_total{metric, sigma_bucket}` plural). The actual registrations follow `architecture.md:472-475` which mandates the `olaitan_<ring>_<metric>` pattern with the engine subfamily conventionally plural (`rules`, `baseline`) because the engine evaluates a corpus, not a single rule. The AC singular spellings are documentation aliases, not parallel families.
