@@ -4,7 +4,7 @@
 # the full per-trial / statistical / analysis-pipeline fields. The
 # manifest_sha256 field is the BI-5 carrier: it equals
 # `sha256sum eval/manifest.yaml` of the envelope the run used.
-run_id: 20260615T093000Z-s1-rs-69d1b5f452cd
+run_id: 20260615T093000.000Z-s1-rs-69d1b5f452cd
 manifest_sha256: 69d1b5f452cd0d91eec2bbe94f6047ab68588b7a5faf724bc57dda0d86462a5a
 scenario: s1
 config: rs
