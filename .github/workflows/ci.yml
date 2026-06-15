@@ -515,10 +515,15 @@ jobs:
       - name: Install chart under RSLT-full + forensics arm
         run: |
           tag=$(make -s version-tag)
-          # streamMaxBytesOverride is 512 MiB: the forensics arm adds the
+          # streamMaxBytesOverride is 256 MiB: the forensics arm adds the
           # INCIDENTS / REPORTS / AUDIT_ASSESSMENTS streams on top of the Epic-3
-          # set, so the per-stream cap must keep (stream count x cap) under the
-          # kind NATS PVC (10Gi). 512 MiB matches the proven `e2e` (RS) job.
+          # set (~14 streams total), so the SUM of per-stream MaxBytes must stay
+          # under the JetStream file-store limit. At 512 MiB the sum exceeded it
+          # and stream creation failed with "insufficient storage resources
+          # available" (the collector/aggregator then crash-looped); 256 MiB x ~14
+          # = ~3.5 GiB is comfortably under. --wait is 8m because the heavier
+          # RSLT-full + forensics arm (LLM chain + DFIR consumer + report archive)
+          # takes longer to stabilise through the startup stream-ensure than RS.
           helm install olaitan ./deploy/helm/olaitan \
             --set image.repository=olaitan \
             --set-string image.tag="$tag" \
@@ -551,8 +556,8 @@ jobs:
             --set secrets.redisPassword=ci-test \
             --set falco.enabled=false \
             --set endpoints.falco=tcp://127.0.0.1:0 \
-            --set nats.streamMaxBytesOverride=536870912 \
-            --wait --timeout 5m
+            --set nats.streamMaxBytesOverride=268435456 \
+            --wait --timeout 8m
 
       - name: Run forensics smoke
         env:
