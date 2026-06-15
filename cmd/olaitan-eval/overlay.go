@@ -103,6 +103,12 @@ type helmOverlay struct {
 	runCmd overlayRunFunc
 }
 
+// overlayCtxGrace is the headroom added to each apply-phase context deadline
+// over the helm/kubectl --timeout flag, so the child's own --timeout fires
+// first (a precise error message) and the ctx deadline is only a backstop for
+// a child that ignores its --timeout flag.
+const overlayCtxGrace = 30 * time.Second
+
 // newHelmOverlay builds a helmOverlay from the threaded overlayConfig and
 // the injected command runner (main passes execRunCmd; a unit test passes a
 // fake). A nil logger defaults to slog.Default and a nil runCmd defaults to
@@ -150,17 +156,20 @@ func (o *helmOverlay) Apply(ctx context.Context, config string) error {
 	}
 	aggregatorDeploy := aggregatorDeployName(o.release)
 
-	// Scope the overlay timeout to a context DEADLINE on the apply phase
-	// (the helm-upgrade --wait + the aggregator rollout-status gate), so a
-	// child that ignores its own --timeout flag is still cancelled when the
-	// budget elapses. The deadline is derived from the incoming ctx, so a
-	// caller-cancelled run also aborts the in-flight helm/kubectl child (the
-	// derived ctx threads into the exec.CommandContext children via runCmd).
-	// It bounds ONLY this phase -- the whole-trial budget is the Runner
-	// loop's concern -- which is why the deadline is per-Apply, not on the
-	// whole Run (the frozen ConfigOverlay seam stays Apply(ctx, config)).
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+	// Each child (helm-upgrade --wait, then the aggregator rollout-status
+	// gate) gets its OWN context deadline of timeout+overlayCtxGrace, while
+	// its --timeout FLAG stays at timeout. The grace headroom guarantees the
+	// child's own --timeout fires FIRST (yielding helm/kubectl's precise
+	// timeout message) and the ctx deadline is only a BACKSTOP for a child
+	// that ignores its --timeout flag. The deadline is derived from the
+	// incoming ctx, so a caller-cancelled run also aborts the in-flight child
+	// (the derived ctx threads into the exec.CommandContext children via
+	// runCmd). Each phase is budgeted independently (a slow helm phase does
+	// not starve the rollout-status phase). It bounds ONLY this phase -- the
+	// whole-trial budget is the Runner loop's concern -- so the deadline is
+	// per-Apply, not on the whole Run (the frozen ConfigOverlay seam stays
+	// Apply(ctx, config)).
+	phaseBudget := timeout + overlayCtxGrace
 
 	o.logger.Info("config overlay: applying arm",
 		"config", config,
@@ -190,7 +199,10 @@ func (o *helmOverlay) Apply(ctx context.Context, config string) error {
 		"--wait",
 		"--timeout", timeout.String(),
 	}
-	if err := o.runCmd(ctx, "helm", helmArgs...); err != nil {
+	helmCtx, cancelHelm := context.WithTimeout(ctx, phaseBudget)
+	err := o.runCmd(helmCtx, "helm", helmArgs...)
+	cancelHelm()
+	if err != nil {
 		return fmt.Errorf("config overlay: helm upgrade for arm %q failed: %w", config, err)
 	}
 
@@ -204,7 +216,10 @@ func (o *helmOverlay) Apply(ctx context.Context, config string) error {
 		"--namespace", o.namespace,
 		"--timeout", timeout.String(),
 	}
-	if err := o.runCmd(ctx, "kubectl", rolloutArgs...); err != nil {
+	rolloutCtx, cancelRollout := context.WithTimeout(ctx, phaseBudget)
+	err = o.runCmd(rolloutCtx, "kubectl", rolloutArgs...)
+	cancelRollout()
+	if err != nil {
 		return fmt.Errorf("config overlay: aggregator %q did not reach Ready for arm %q: %w", aggregatorDeploy, config, err)
 	}
 
