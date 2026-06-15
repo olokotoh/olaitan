@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, epic-5-staging]
   pull_request:
-    branches: [main]
+    branches: [main, epic-5-staging]
 
 jobs:
   # Go build/test/lint — the original pipeline, renamed from `build` to
