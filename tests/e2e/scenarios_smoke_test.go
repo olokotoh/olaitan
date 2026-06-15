@@ -18,10 +18,11 @@
 // match / baseline-deviation half), NOT the full FSM-state attainment of
 // AC2-AC6 (the QUARANTINED / RESTRICTED / SUSPICIOUS targets + the measured
 // time-to-detect are Story 5.4 + the carry-forward A1 RSLT-full-kind gate).
-// The synthetic-event field shapes mirror the SINGLE SOURCE OF TRUTH in
-// cmd/olaitan-eval/scenario.go (scenarioEvents); this package cannot import
-// the main package, so the shapes are replicated here exactly as rs_smoke
-// replicates its own event shapes inline.
+// The synthetic-event field shapes come from the SINGLE SOURCE OF TRUTH in the
+// non-main package internal/eval/scenario, which BOTH cmd/olaitan-eval AND this
+// e2e test import directly -- so there is no hand-copy to drift against (the
+// main package itself still cannot be imported here, but the recipe data is no
+// longer in main).
 //
 // CI placement (OQ4): mirrors eval-smoke. `make scenarios-smoke` reuses the
 // SAME RS bring-up; it SKIPS gracefully when the kind cluster is absent so
@@ -34,7 +35,6 @@ package e2e_test
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -44,6 +44,8 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"gopkg.in/yaml.v3"
+
+	evalscenario "github.com/olokotoh/olaitan/internal/eval/scenario"
 )
 
 // scenarioSmokeTarget mirrors the fields the AC8 assertion reads off a
@@ -88,112 +90,90 @@ func loadScenarioSmokeTarget(t *testing.T, scenarioID string) scenarioSmokeTarge
 }
 
 // injectScenario fires scenario scenarioID's deterministic synthetic-event
-// stimulus against the warmed cluster (BI-3). It mirrors the field shapes in
-// cmd/olaitan-eval/scenario.go scenarioEvents: a priming event of a DIFFERENT
-// source than the match event (so the correlator's two-distinct-source
-// rising edge fires and assembles a package), then the rule-matching
-// event(s). For S4 it ALSO pre-seeds the per-workload baseline with the
-// rs_smoke 10-priming-plus-1-spike EvidencePackage pattern so the
-// outbound_unique_dst_ips deviation half can fire (BI-4). All events share
-// one injection timestamp so the correlator's 60s window cannot straddle a
-// boundary (the rs_smoke precedent).
-func injectScenario(t *testing.T, js jetstream.JetStream, scenarioID, podName string) {
+// stimulus against the warmed cluster (BI-3) and returns the counter snapshot
+// captured immediately BEFORE the rule-match events were published, so the
+// caller can assert a per-scenario DELTA (the deviation/evidence counters are
+// cumulative + shared across the sequential subtests). The event recipes come
+// from the SINGLE SOURCE OF TRUTH evalscenario.Events (shared with
+// cmd/olaitan-eval), so the e2e injection and the in-process binary cannot
+// drift. For S4 it ALSO pre-seeds the per-workload baseline with the rs_smoke
+// 10-priming-plus-1-spike EvidencePackage pattern so the outbound_unique_dst_ips
+// deviation half can fire (BI-4) BEFORE the rule-match events are published; the
+// snapshot is taken AFTER the pre-seed/drain so the delta isolates THIS
+// scenario's own deviation + package. All recipe events share one injection
+// timestamp so the correlator's 60s window cannot straddle a boundary (the
+// rs_smoke precedent).
+func injectScenario(t *testing.T, js jetstream.JetStream, scenarioID, podName string) scenarioCounterSnapshot {
 	t.Helper()
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	pod := map[string]any{"name": podName, "namespace": "tenant-acme", "uid": "scenario-" + scenarioID + "-uid-1"}
-
-	primingNetwork := func() {
-		raw, _ := json.Marshal(map[string]any{"dst_ip": "10.0.0.1"})
-		ev, _ := json.Marshal(map[string]any{
-			"id": "scenario-" + scenarioID + "-priming", "timestamp": now,
-			"source": "network", "category": "flow",
-			"summary": "scenario " + scenarioID + " priming flow",
-			"raw":     json.RawMessage(raw), "pod": pod,
-		})
-		publishJS(t, js, "olaitan.events.raw.network", ev)
+	if _, ok := scenarioSmokeSlugs[scenarioID]; !ok {
+		t.Fatalf("injectScenario: unknown scenario %q", scenarioID)
 	}
-	primingFalco := func() {
-		raw, _ := json.Marshal(map[string]any{"process.exe": "/usr/bin/true"})
-		ev, _ := json.Marshal(map[string]any{
-			"id": "scenario-" + scenarioID + "-priming", "timestamp": now,
-			"source": "falco", "category": "process",
-			"summary": "scenario " + scenarioID + " priming process",
-			"raw":     json.RawMessage(raw), "pod": pod,
-		})
-		publishJS(t, js, "olaitan.events.raw.falco", ev)
-	}
-	mk := func(id, subject, source, category, severity string, raw map[string]any) {
-		rawJSON, _ := json.Marshal(raw)
-		fields := map[string]any{
-			"id": id, "timestamp": now, "source": source, "category": category,
-			"raw": json.RawMessage(rawJSON), "pod": pod,
-		}
-		if severity != "" {
-			fields["severity"] = severity
-		}
-		payload, _ := json.Marshal(fields)
-		publishJS(t, js, subject, payload)
-	}
-
-	switch scenarioID {
-	case "s1":
-		primingNetwork()
-		mk("scenario-s1-falco-1", "olaitan.events.raw.falco", "falco", "syscall", "CRITICAL", map[string]any{
-			"process.exe":           "/host/bin/sh",
-			"process.cap_effective": "CAP_NET_BIND_SERVICE CAP_SYS_ADMIN CAP_SETUID",
-		})
-	case "s2":
-		primingNetwork()
-		mk("scenario-s2-falco-1", "olaitan.events.raw.falco", "falco", "file", "WARNING", map[string]any{
-			"file.path":   "/run/secrets/kubernetes.io/serviceaccount/token",
-			"process.exe": "/usr/bin/curl",
-		})
-		mk("scenario-s2-net-1", "olaitan.events.raw.network", "network", "flow", "", map[string]any{
-			"dst_ip":         "169.254.169.254",
-			"network.dst_ip": "169.254.169.254",
-		})
-	case "s3":
-		primingNetwork()
-		mk("scenario-s3-falco-1", "olaitan.events.raw.falco", "falco", "process", "WARNING", map[string]any{
-			"process.exe": "/usr/local/bin/kubectl",
-		})
-	case "s4":
-		// Baseline-deviation half (BI-4): pre-seed the per-workload
-		// baseline so outbound_unique_dst_ips crosses 3 sigma. Then drive
-		// the rule-match half with a benign falco priming + the OLT-NET
-		// flow match (two distinct sources for the rising edge).
+	// S4 rests partly on a baseline deviation: pre-seed the per-workload
+	// baseline so outbound_unique_dst_ips crosses 3 sigma and let the baseline
+	// consumer drain BEFORE the rule-match flow events arrive (BI-4).
+	if evalscenario.BaselinePreseed(scenarioID) {
 		publishSyntheticEvidencePackages(t, js, podName)
 		waitForBaselineConsumerDrained(t, js)
-		primingFalco()
-		mk("scenario-s4-net-1", "olaitan.events.raw.network", "network", "flow", "", map[string]any{
-			"dst_ip":            "203.0.113.10",
-			"network.dst_ip":    "203.0.113.10",
-			"network.bytes_out": "512",
-			"network.dst_port":  8443,
-			"network.protocol":  "TCP",
-		})
-	case "s5":
-		primingNetwork()
-		mk("scenario-s5-falco-1", "olaitan.events.raw.falco", "falco", "process", "WARNING", map[string]any{
-			"process.exe":      "/tmp/xmrig",
-			"network.dst_port": 3333,
-		})
-		mk("scenario-s5-net-1", "olaitan.events.raw.network", "network", "flow", "WARNING", map[string]any{
-			"network.dst_port": 4444,
-		})
-	default:
-		t.Fatalf("injectScenario: unknown scenario %q", scenarioID)
+	}
+	events := evalscenario.Events(scenarioID, podName, time.Now().UTC())
+	if len(events) == 0 {
+		t.Fatalf("injectScenario: no recipe events for scenario %q", scenarioID)
+	}
+	before := snapshotScenarioCounters(t)
+	for _, ev := range events {
+		publishJS(t, js, ev.Subject, ev.Payload)
+	}
+	return before
+}
+
+// smokePollCeiling caps the per-scenario smoke poll budget. The EVIDENCE-
+// package signal arrives near-instantly on kind; a scenario's full
+// target_time_to_detect_seconds window (up to S4=300s) is the Story-5.4 /
+// A1-gate time-to-detect concern, NOT this smoke. Without the cap a single
+// stuck scenario could burn its whole target window (and the suite ~600s
+// cumulatively). We poll for min(target, ceiling) instead.
+const smokePollCeiling = 60 * time.Second
+
+// scenarioCounterSnapshot is the per-scenario baseline of the cumulative _total
+// counters, captured immediately BEFORE the scenario's inject. assertScenario
+// Signal asserts a per-scenario DELTA against it so each scenario proves its
+// OWN signal (the counters are cumulative + shared across the sequential
+// subtests, so an absolute >= 1 check could pass on an EARLIER scenario's
+// residue rather than this scenario's own rule/deviation/package).
+type scenarioCounterSnapshot struct {
+	deviations float64
+	evidence   float64
+}
+
+// snapshotScenarioCounters captures the cumulative counters the delta-based
+// AC8 assertion is taken against. Call it immediately before injectScenario.
+// The rule-match half is already scenario-scoped by rule_id (each scenario's
+// triggering rules are distinct), so it does not need a delta; the deviation
+// and evidence-package halves DO, because they are read unlabelled and are
+// shared across the sequential subtests.
+func snapshotScenarioCounters(t *testing.T) scenarioCounterSnapshot {
+	t.Helper()
+	metrics := scrapeMetrics(t)
+	return scenarioCounterSnapshot{
+		deviations: metrics["olaitan_decision_baseline_deviations_total"].sumWhere(nil),
+		evidence:   metrics["olaitan_correlator_evidence_packages_total"].sumWhere(nil),
 	}
 }
 
 // assertScenarioSignal polls the aggregator's Prometheus surface until AT
-// LEAST ONE of the scenario's triggering rules matches OR a baseline
-// deviation fires, AND a correlator EvidencePackage reaches EVIDENCE.packages
-// -- within the scenario's target_time_to_detect_seconds budget (AC8, BI-8).
+// LEAST ONE of the scenario's triggering rules matches OR a baseline deviation
+// fires, AND a correlator EvidencePackage reaches EVIDENCE.packages -- within
+// a capped poll budget (AC8, BI-8). The rule-match half is scenario-scoped by
+// rule_id; the baseline-deviation and evidence-package halves are asserted as
+// a per-scenario DELTA over `before` (captured at inject time) so each scenario
+// proves its OWN signal rather than passing on an earlier scenario's residue.
 // It returns nil on success and the last error on timeout.
-func assertScenarioSignal(t *testing.T, tgt scenarioSmokeTarget) error {
+func assertScenarioSignal(t *testing.T, tgt scenarioSmokeTarget, before scenarioCounterSnapshot) error {
 	t.Helper()
 	budget := time.Duration(tgt.TargetTimeToDetectSeconds) * time.Second
+	if budget > smokePollCeiling {
+		budget = smokePollCeiling
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	var lastErr error
@@ -204,23 +184,25 @@ func assertScenarioSignal(t *testing.T, tgt scenarioSmokeTarget) error {
 		for _, ruleID := range tgt.TriggeringRules {
 			ruleMatches += metrics["olaitan_decision_rules_matches_by_attribute_total"].sumWhere(map[string]string{"rule_id": ruleID})
 		}
-		deviations := metrics["olaitan_decision_baseline_deviations_total"].sumWhere(nil)
-		evidence := metrics["olaitan_correlator_evidence_packages_total"].sumWhere(nil)
+		// Per-scenario DELTAs over the inject-time baseline (the counters are
+		// cumulative + shared across the sequential subtests).
+		deviations := metrics["olaitan_decision_baseline_deviations_total"].sumWhere(nil) - before.deviations
+		evidence := metrics["olaitan_correlator_evidence_packages_total"].sumWhere(nil) - before.evidence
 		if tick%4 == 0 {
-			t.Logf("scenario %s poll tick=%d: rule_matches(%v)=%v baseline_deviations=%v correlator_packages=%v",
+			t.Logf("scenario %s poll tick=%d: rule_matches(%v)=%v baseline_deviations(delta)=%v correlator_packages(delta)=%v",
 				tgt.ScenarioID, tick, tgt.TriggeringRules, ruleMatches, deviations, evidence)
 		}
 		tick++
-		// AC8: a rule match OR a baseline deviation, AND the EVIDENCE
-		// package reached the bus.
+		// AC8: this scenario's OWN rule match OR baseline-deviation delta,
+		// AND this scenario's OWN EVIDENCE-package delta reached the bus.
 		if (ruleMatches >= 1 || deviations >= 1) && evidence >= 1 {
 			return nil
 		}
 		switch {
 		case ruleMatches < 1 && deviations < 1:
-			lastErr = fmt.Errorf("no rule match for %v and no baseline deviation yet", tgt.TriggeringRules)
+			lastErr = fmt.Errorf("no rule match for %v and no baseline-deviation delta yet", tgt.TriggeringRules)
 		case evidence < 1:
-			lastErr = fmt.Errorf("correlator evidence packages = %v; want >= 1", evidence)
+			lastErr = fmt.Errorf("correlator evidence-package delta = %v; want >= 1", evidence)
 		}
 		select {
 		case <-ctx.Done():
@@ -275,8 +257,8 @@ func TestKindSmoke_Scenarios_S1toS5_ReachEvidence(t *testing.T) {
 		scenarioID := scenarioID
 		t.Run(scenarioID, func(t *testing.T) {
 			tgt := loadScenarioSmokeTarget(t, scenarioID)
-			injectScenario(t, js, scenarioID, podName)
-			if err := assertScenarioSignal(t, tgt); err != nil {
+			before := injectScenario(t, js, scenarioID, podName)
+			if err := assertScenarioSignal(t, tgt, before); err != nil {
 				dumpEvidenceStream(t, js)
 				dumpRuleMatchSamples(t)
 				t.Fatal(err)
@@ -307,8 +289,8 @@ func TestKindSmoke_Scenarios_Idempotency(t *testing.T) {
 	tgt := loadScenarioSmokeTarget(t, "s1")
 
 	for run := 1; run <= 2; run++ {
-		injectScenario(t, js, "s1", podName)
-		if err := assertScenarioSignal(t, tgt); err != nil {
+		before := injectScenario(t, js, "s1", podName)
+		if err := assertScenarioSignal(t, tgt, before); err != nil {
 			dumpEvidenceStream(t, js)
 			dumpRuleMatchSamples(t)
 			t.Fatalf("idempotency run %d: %v", run, err)
