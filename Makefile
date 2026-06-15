@@ -299,6 +299,15 @@ e2e-local-forensics: helm-prepare helm-deps docker-build
 # OLT_E2E gate is not needed: the eval-smoke test SKIPS gracefully when the
 # kind cluster is absent, and it reuses the RS bring-up the default CI e2e
 # job already runs, so it rides alongside the RS smoke (OA5).
+#
+# nats.streamMaxBytesOverride is set with --set-STRING, not bare --set
+# (Story 5.3 Review Round 2, CI-caught): helm reserialises a bare-int reused
+# value into scientific notation on the harness's `helm upgrade
+# --reuse-values --values values-eval-rs.yaml` revision, which drifts the
+# OLT_NATS_STREAM_MAXBYTES_OVERRIDE env in the aggregator/collector pod
+# templates and triggers a rollout (the new aggregator hits the NATS-startup
+# restart race and --wait times out). A string round-trips byte-identically,
+# so the overlay re-apply is a genuine no-change upgrade (AC2 idempotency).
 eval-smoke: helm-prepare helm-deps docker-build
 	kind get clusters | grep -q '^$(KIND_CLUSTER_NAME)$$' || \
 		kind create cluster --name $(KIND_CLUSTER_NAME) --config hack/kind-config.yaml
@@ -312,7 +321,7 @@ eval-smoke: helm-prepare helm-deps docker-build
 		--set secrets.redisPassword=ci-test \
 		--set falco.enabled=false \
 		--set endpoints.falco=tcp://127.0.0.1:0 \
-		--set nats.streamMaxBytesOverride=1073741824 \
+		--set-string nats.streamMaxBytesOverride=1073741824 \
 		--wait --timeout 5m
 	go build $(LDFLAGS) -o bin/olaitan-eval ./cmd/olaitan-eval
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) go test -tags=e2e -v -count=1 -run TestEvalSmoke_S1_RS_OneTrial ./tests/e2e/...
