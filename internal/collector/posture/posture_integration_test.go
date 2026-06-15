@@ -336,8 +336,23 @@ func TestIntegration_PostureHappyPath(t *testing.T) {
 	if len(got.RoleBindings) != 1 || got.RoleBindings[0].Name != "payments-role-binding" {
 		t.Errorf("RoleBindings: got %+v, want only payments-role-binding", got.RoleBindings)
 	}
-	if len(got.ClusterRoleBindings) != 1 {
-		t.Errorf("ClusterRoleBindings: got %+v, want 1", got.ClusterRoleBindings)
+	// A real apiserver (and envtest's) ships default ClusterRoleBindings bound to
+	// the system:authenticated group (system:basic-user, system:discovery, ...),
+	// which the collector DELIBERATELY includes as effective RBAC for the SA
+	// (posture.go subjectsContainServiceAccount case 4, "do not under-report").
+	// So assert the workload's OWN binding is PRESENT rather than asserting it is
+	// the only one (the previous `want 1` was apiserver-version-fragile and never
+	// ran in CI to catch the drift).
+	wantCRB := "payments-cluster-role-binding-" + ns
+	foundCRB := false
+	for _, crb := range got.ClusterRoleBindings {
+		if crb.Name == wantCRB {
+			foundCRB = true
+			break
+		}
+	}
+	if !foundCRB {
+		t.Errorf("ClusterRoleBindings: %q not found in got %+v", wantCRB, got.ClusterRoleBindings)
 	}
 	if len(got.NetworkPolicies) != 1 || got.NetworkPolicies[0].Name != "payments-allow-frontend" {
 		t.Errorf("NetworkPolicies: got %+v, want only payments-allow-frontend", got.NetworkPolicies)

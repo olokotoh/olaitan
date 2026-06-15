@@ -382,3 +382,63 @@ jobs:
           S3_SECRET_KEY: minioadmin
           S3_BUCKET: olaitan-reports-it
         run: go test -tags=integration -race -count=1 ./internal/report/archive/... ./internal/report/deferq/... ./internal/report/notify/...
+
+  # In-process integration suites that need NO external infrastructure (embedded
+  # NATS / in-process / miniredis). These //go:build integration boundaries were
+  # previously CI-unexercised (only forensics / archive / deferq / notify ran),
+  # so the settling, DFIR, collector, correlator, rules, baseline, ratelimit and
+  # admission integration tests were proven only on a developer machine. This job
+  # runs them on the CI runner so a green checkmark actually covers them.
+  integration-inproc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: In-process integration suites
+        run: |
+          go test -tags=integration -race -count=1 \
+            ./internal/admission/applog/... \
+            ./internal/collector/applog/... \
+            ./internal/collector/cni/... \
+            ./internal/collector/cri/... \
+            ./internal/correlator/... \
+            ./internal/decision/baseline/... \
+            ./internal/decision/rules/... \
+            ./internal/metrics/... \
+            ./internal/ratelimit/... \
+            ./internal/report/dfir/... \
+            ./internal/response/settling/...
+
+  # envtest-backed integration suites that need a real kube-apiserver (via
+  # setup-envtest): the posture collector, the NetworkPolicy manager, and the
+  # operator-override controller (the last also runs an in-process miniredis, no
+  # Redis container needed). These were previously CI-unexercised. `make
+  # envtest-bin` downloads the pinned kube-apiserver + etcd into bin/k8s, which
+  # the suites auto-discover; the *_INTEGRATION_REQUIRED flags make a missing
+  # apiserver a hard failure here (developers without envtest still skip cleanly).
+  integration-envtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Provision envtest binaries (kube-apiserver + etcd)
+        run: make envtest-bin
+
+      - name: envtest integration suites
+        env:
+          POSTURE_INTEGRATION_REQUIRED: "1"
+          NETPOL_INTEGRATION_REQUIRED: "1"
+          OVERRIDE_INTEGRATION_REQUIRED: "1"
+        run: |
+          go test -tags=integration -race -count=1 \
+            ./internal/collector/posture/... \
+            ./internal/response/netpol/... \
+            ./internal/response/override/...
