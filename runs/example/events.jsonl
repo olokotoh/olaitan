@@ -1,0 +1,1 @@
+{"schema_version":"event.v1","published_at":"2026-06-15T09:30:05Z","subject":"olaitan.events.raw.falco","payload":{"id":"evt-example-1","source":"falco","summary":"Suspicious privileged exec in tenant workload","timestamp":"2026-06-15T09:30:05Z"}}

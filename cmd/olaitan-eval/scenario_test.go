@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/olokotoh/olaitan/internal/eval/capture"
 )
 
 // scenariosTreeRoot resolves the committed deploy/demo/scenarios/ tree from
@@ -17,6 +19,34 @@ import (
 func scenariosTreeRoot() string {
 	return filepath.Join("..", "..", "deploy", "demo", "scenarios")
 }
+
+// TestCaptureTarget_ProjectsResolvedTarget asserts captureTarget projects the
+// resolved scenarioTarget onto the capture.Target the Story-5.4 metadata
+// measurement consumes (BI-9, the cross-story seam; 5.2 declares, 5.4
+// measures), and that a non-harness Scenario yields the zero Target.
+func TestCaptureTarget_ProjectsResolvedTarget(t *testing.T) {
+	sc, err := newScenario("s2", scenariosTreeRoot(), testLogger())
+	if err != nil {
+		t.Fatalf("newScenario: %v", err)
+	}
+	tgt := captureTarget(sc)
+	if tgt.FSMState != "RESTRICTED" || tgt.TimeToDetectSeconds != 60 || !tgt.Floor {
+		t.Errorf("captureTarget(s2) = %+v; want RESTRICTED/60/floor=true", tgt)
+	}
+
+	// A non-harness Scenario (no resolved target) yields the zero Target,
+	// which the measurement treats as never-met.
+	zero := captureTarget(scenarioFunc(func(context.Context) error { return nil }))
+	if zero != (capture.Target{}) {
+		t.Errorf("captureTarget(non-harness) = %+v; want the zero Target", zero)
+	}
+}
+
+// scenarioFunc adapts a func to the Scenario interface for the non-harness
+// captureTarget case.
+type scenarioFunc func(context.Context) error
+
+func (f scenarioFunc) Run(ctx context.Context) error { return f(ctx) }
 
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))

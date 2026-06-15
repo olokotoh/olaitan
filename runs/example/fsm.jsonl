@@ -1,0 +1,1 @@
+{"schema_version":"audit.transitions.v1","published_at":"2026-06-15T09:30:18Z","subject":"AUDIT.transitions","payload":{"schema_version":"audit.transitions.v1","after_state":"QUARANTINED","decided_at":"2026-06-15T09:30:18Z","package_id":"pkg-example-1","workload_id":"tenant-acme/Deployment/web"}}

@@ -22,6 +22,17 @@ var stateOrderMap = map[PodSecurityState]int{
 	StatePreservedKilled: 4,
 }
 
+// StateRank returns the canonical escalation rank of a security state
+// (CLEAN=0 < SUSPICIOUS=1 < RESTRICTED=2 < QUARANTINED=3 < PRESERVED_KILLED=4)
+// and whether the state is a known FSM state. It is the SINGLE exported source
+// of the state ordering so out-of-package consumers (the Story-5.4 evaluation
+// capture's floor-aware success-criterion comparison) score against the same
+// order the FSM enforces, with no duplicated ordering map to drift.
+func StateRank(s PodSecurityState) (int, bool) {
+	r, ok := stateOrderMap[s]
+	return r, ok
+}
+
 // ValidTransition returns true if moving from one state to the next is allowed.
 // The FSM enforces sequential escalation and allows de-escalation to any lower state.
 func ValidTransition(from, to PodSecurityState) bool {

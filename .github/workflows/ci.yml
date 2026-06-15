@@ -464,6 +464,7 @@ jobs:
             ./internal/correlator/... \
             ./internal/decision/baseline/... \
             ./internal/decision/rules/... \
+            ./internal/eval/capture/... \
             ./internal/metrics/... \
             ./internal/ratelimit/... \
             ./internal/report/dfir/... \

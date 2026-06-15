@@ -9,7 +9,7 @@ CONFIG_SRC       := config/olaitan.yaml
 AUDIT_POLICY_SRC := config/audit-policy-default.yaml
 CHART_FILES      := $(CHART_DIR)/files/olaitan.yaml $(CHART_DIR)/files/audit-policy-default.yaml
 
-.PHONY: build test lint docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics eval-smoke scenarios-smoke e2e-local-down
+.PHONY: build test lint docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics eval-smoke scenarios-smoke capture-it e2e-local-down
 
 # envtest-bin downloads the kube-apiserver and etcd binaries that the
 # Story 1.11 posture-client integration tests (and any future
@@ -361,6 +361,16 @@ scenarios-smoke: helm-prepare helm-deps docker-build
 		--set nats.streamMaxBytesOverride=1073741824 \
 		--wait --timeout 5m
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) go test -tags=e2e -v -count=1 -run 'TestKindSmoke_Scenarios' ./tests/e2e/...
+
+# capture-it runs the Story 5.4 per-run artefact-capture integration suite: an
+# always-on embedded-NATS in-process test (no kind cluster) that publishes a
+# deterministic S5 + RS stimulus to the real subjects, runs the rich Capturer,
+# and asserts the six artefacts exist, every .jsonl parses, metadata.yaml's
+# manifest_sha256 matches sha256sum eval/manifest.yaml, and the size-cap alert
+# trips (AC5/AC4, BI-11). It mirrors the integration-test idiom and runs in the
+# always-on integration-inproc CI job.
+capture-it:
+	go test -tags=integration -race -count=1 ./internal/eval/capture/...
 
 e2e-local-down:
 	kind delete cluster --name $(KIND_CLUSTER_NAME)

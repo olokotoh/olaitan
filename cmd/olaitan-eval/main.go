@@ -12,6 +12,9 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/olokotoh/olaitan/internal/eval/capture"
+	natsclient "github.com/olokotoh/olaitan/internal/nats"
 )
 
 // version is stamped at build time via -ldflags "-X main.version=...". It
@@ -46,6 +49,16 @@ type runConfig struct {
 	namespace      string
 	overlaysDir    string
 	overlayTimeout time.Duration
+	// Story 5.4: the per-run artefact-capture wiring (the Story 5.3
+	// flag-threading idiom). natsURL is the run's JetStream endpoint the
+	// rich Capturer drains the subjects from; an EMPTY natsURL means no
+	// NATS is wired (the local unit-test dispatch), so the Capturer writes
+	// honest empty .jsonl files + a no-report report.md so all six
+	// artefacts still exist (AC5) without fabricating traffic.
+	// maxRunSizeBytes is the fail-LOUD per-run size cap (default 500 MiB,
+	// BI-10).
+	natsURL         string
+	maxRunSizeBytes int64
 }
 
 // metadata is the MINIMAL per-run metadata.yaml schema (BI-5, BI-8). It
@@ -62,8 +75,26 @@ type metadata struct {
 	StartedAt          string `yaml:"started_at"`
 	FinishedAt         string `yaml:"finished_at"`
 	OlaitanEvalVersion string `yaml:"olaitan_eval_version"`
+	// Story 5.4 (AC3, BI-7): the measured fields ADDED atop the Story-5.1
+	// minimal struct, KEEPING the existing yaml keys (Story 5.5 builds on
+	// them). The epic AC3 prose names map onto the kept 5.1 keys: manifest_hash
+	// == manifest_sha256 (re-derivable via sha256sum), config_name == config,
+	// scenario_id == scenario, runs_in_batch == runs, start_at/end_at ==
+	// started_at/finished_at. success_criterion_met / measured_time_to_detect /
+	// measured_final_fsm_state are computed by comparing the captured signal
+	// against Story 5.2's target.yaml (BI-9); fsm_state_source labels the
+	// FSM-state honesty on the constrained env (BI-8); resource_usage is the
+	// harness-process snapshot always + cluster-when-available (BI-8); size_bytes
+	// / size_cap_exceeded are the AC4 size bound (BI-10).
+	SuccessCriterionMet   bool                  `yaml:"success_criterion_met"`
+	MeasuredTimeToDetect  int                   `yaml:"measured_time_to_detect"`
+	MeasuredFinalFSMState string                `yaml:"measured_final_fsm_state"`
+	FSMStateSource        string                `yaml:"fsm_state_source"`
+	ResourceUsage         capture.ResourceUsage `yaml:"resource_usage"`
+	SizeBytes             int64                 `yaml:"size_bytes"`
+	SizeCapExceeded       bool                  `yaml:"size_cap_exceeded"`
 	// Story 5.5: the full metadata schema (per-trial results, statistical
-	// fields, the analysis-pipeline inputs) extends this minimal set.
+	// fields, the analysis-pipeline inputs) extends this set further.
 }
 
 func main() {
@@ -143,16 +174,46 @@ func run(args []string, stdout, stderr io.Writer, runCmd overlayRunFunc) error {
 		overlaysDir: cfg.overlaysDir,
 		timeout:     cfg.overlayTimeout,
 	}
-	r := newRunner(cfg.config, scenario, oc, runCmd, logger)
 
-	// The N-trial loop (AC4). Each trial writes runs/<run_id>/trial-<n>/.
-	// A trial error aborts that trial and is recorded; the run continues
-	// to the metadata write so a partial run is still reproducible-from.
+	// Story 5.4: connect the NATS client the rich Capturer drains the run's
+	// subjects from (BI-3). An empty --nats-url is the honest no-NATS path:
+	// the Capturer writes empty artefacts so all six still exist (AC5)
+	// without fabricating traffic. A configured-but-unreachable endpoint is a
+	// hard error (the run cannot honestly capture its subjects).
+	natsClient, err := connectCaptureNATS(cfg.natsURL, logger)
+	if err != nil {
+		return err
+	}
+	if natsClient != nil {
+		defer func() { _ = natsClient.Close(context.Background()) }()
+	}
+	capturer := newRichCapturer(natsClient, logger)
+	r := newRunner(cfg.config, scenario, oc, runCmd, capturer, logger)
+
+	// The N-trial loop (AC4). The six FR54 artefacts land at run-level
+	// runs/<run_id>/ (OQ2 recommended resolution: run-level for the FR54
+	// artefacts; a 1-trial run is the AC5 case). Each trial drains into the
+	// run dir; the last trial's drain is the run's captured signal. A trial
+	// error aborts that trial and is recorded; the run continues to the
+	// metadata finalise so a partial/failed run is still a reproducible-from
+	// data point (BI-6).
+	// Under the OQ2 run-level layout all trials drain into the SAME
+	// runs/<run_id>/ with O_TRUNC, so for --runs>1 each trial OVERWRITES the
+	// prior trial's six artefacts and only the LAST trial's artefacts survive.
+	// That is the documented OQ2 resolution ("the last trial's drain is the
+	// run's captured signal"), but it must NOT be silent: warn LOUDLY so an
+	// operator passing --runs>1 knows per-trial artefacts are not retained and
+	// that run-level multi-trial capture + aggregation is a Story 5.5 concern
+	// (run-level statistics over repeated trials), not a Story 5.4 capability.
+	if cfg.runs > 1 {
+		logger.Warn("runs>1: all trials drain into the same run dir (OQ2 run-level layout); only the LAST trial's artefacts are retained -- per-trial artefact retention + multi-trial aggregation is a Story 5.5 concern",
+			"runs", cfg.runs, "run_dir", runDir)
+	}
+
 	var firstErr error
 	for trial := 1; trial <= cfg.runs; trial++ {
-		trialDir := filepath.Join(runDir, fmt.Sprintf("trial-%d", trial))
-		logger.Info("trial start", "trial", trial, "of", cfg.runs, "dir", trialDir)
-		if err := r.Run(context.Background(), trialDir); err != nil {
+		logger.Info("trial start", "trial", trial, "of", cfg.runs, "dir", runDir)
+		if err := r.Run(context.Background(), runDir); err != nil {
 			logger.Error("trial failed", "trial", trial, "err", err)
 			if firstErr == nil {
 				firstErr = fmt.Errorf("trial %d: %w", trial, err)
@@ -160,18 +221,21 @@ func run(args []string, stdout, stderr io.Writer, runCmd overlayRunFunc) error {
 		}
 	}
 
+	// Finalise metadata.yaml on success OR failure (BI-6): compute the
+	// measured fields against Story 5.2's target.yaml (BI-9) + the size bound
+	// (BI-10). This runs even when a trial errored above so a detection miss
+	// is recorded as success_criterion_met=false rather than as missing data.
 	finishedAt := time.Now().UTC()
-	md := metadata{
-		RunID:              runID,
-		ManifestSHA256:     hash,
-		Scenario:           cfg.scenario,
-		Config:             cfg.config,
-		Runs:               cfg.runs,
-		StartedAt:          startedAt.Format(time.RFC3339),
-		FinishedAt:         finishedAt.Format(time.RFC3339),
-		OlaitanEvalVersion: version,
-	}
-	if err := writeMetadata(runDir, md); err != nil {
+	if err := writeMetadataFinalised(runDir, finalisedMetadataInput{
+		runID:      runID,
+		hash:       hash,
+		cfg:        cfg,
+		startedAt:  startedAt,
+		finishedAt: finishedAt,
+		target:     captureTarget(scenario),
+		result:     capturer.lastResult,
+		logger:     logger,
+	}); err != nil {
 		return err
 	}
 	logger.Info("run complete", "run_id", runID, "metadata", filepath.Join(runDir, "metadata.yaml"))
@@ -203,6 +267,13 @@ func parseFlags(args []string, stderr io.Writer) (runConfig, error) {
 	fs.StringVar(&cfg.namespace, "namespace", defOverlay.namespace, "Kubernetes namespace the ConfigOverlay upgrades into")
 	fs.StringVar(&cfg.overlaysDir, "overlays-dir", defOverlay.overlaysDir, "directory holding the values-eval-<name>.yaml configuration overlays")
 	fs.DurationVar(&cfg.overlayTimeout, "overlay-timeout", defOverlay.timeout, "budget for the helm --wait + the aggregator rollout-status Ready gate")
+	// Story 5.4: the per-run artefact-capture flags (the Story 5.3
+	// flag-threading idiom). --nats-url defaults to EMPTY: an explicit
+	// JetStream endpoint enables the rich subject drain; an empty value is
+	// the honest no-NATS path (the Capturer writes empty artefacts so all
+	// six still exist, AC5). --max-run-size-bytes defaults to 500 MiB (BI-10).
+	fs.StringVar(&cfg.natsURL, "nats-url", "", "JetStream endpoint the per-run Capturer drains the run's subjects from (empty = no NATS wired; artefacts captured empty)")
+	fs.Int64Var(&cfg.maxRunSizeBytes, "max-run-size-bytes", capture.DefaultMaxRunSizeBytes, "per-run artefact size cap; over it a fail-LOUD alert is emitted and size_cap_exceeded is recorded (the artefacts are NOT deleted)")
 
 	if err := fs.Parse(args); err != nil {
 		return runConfig{}, err
@@ -234,6 +305,9 @@ func parseFlags(args []string, stderr io.Writer) (runConfig, error) {
 	}
 	if cfg.overlayTimeout <= 0 {
 		return runConfig{}, fmt.Errorf("--overlay-timeout must be > 0 (got %s)", cfg.overlayTimeout)
+	}
+	if cfg.maxRunSizeBytes <= 0 {
+		return runConfig{}, fmt.Errorf("--max-run-size-bytes must be > 0 (got %d)", cfg.maxRunSizeBytes)
 	}
 	// Reject an explicitly-emptied overlay flag (all have safe defaults, so
 	// an empty value means the user blanked it on purpose). Fail fast here
@@ -357,12 +431,12 @@ func newRunID(at time.Time, scenario, config, manifestHash string) string {
 // log-deferral); the Cluster / Capturer seams keep their 5.1 minimal impls
 // (Story 5.4 swaps in the rich Capturer behind the same interface). The
 // Runner loop shape is unchanged (the 5.1 freeze).
-func newRunner(config string, scenario Scenario, oc overlayConfig, runCmd overlayRunFunc, logger *slog.Logger) *Runner {
+func newRunner(config string, scenario Scenario, oc overlayConfig, runCmd overlayRunFunc, capturer Capturer, logger *slog.Logger) *Runner {
 	return &Runner{
 		Cluster:  &clusterController{logger: logger},
 		Overlay:  newHelmOverlay(oc, runCmd, logger),
 		Scenario: scenario,
-		Capturer: &metadataOnlyCapturer{logger: logger},
+		Capturer: capturer,
 		Config:   config,
 		Logger:   logger,
 	}
@@ -380,8 +454,89 @@ func newImageDigestVerifier(allow map[string]bool, logger *slog.Logger) *imageDi
 	}
 }
 
-// writeMetadata marshals the minimal metadata.yaml into the run dir (AC3,
-// BI-5). The manifest_sha256 field is the BI-5 carrier Story 5.5 consumes.
+// connectCaptureNATS connects the rich Capturer's NATS client (Story 5.4,
+// BI-3). An empty url is the honest no-NATS path (returns a nil client; the
+// Capturer writes empty artefacts so all six still exist, AC5). A
+// configured-but-unreachable endpoint is a hard error so a run cannot silently
+// capture nothing while claiming a NATS endpoint.
+func connectCaptureNATS(url string, logger *slog.Logger) (*natsclient.Client, error) {
+	if strings.TrimSpace(url) == "" {
+		logger.Info("capture: no --nats-url; artefacts captured empty (no subject traffic drained)")
+		return nil, nil
+	}
+	c, err := natsclient.NewClient(natsclient.ClientConfig{
+		URL:           url,
+		Name:          "olaitan-eval-capture",
+		MaxReconnects: 0,
+		ReconnectWait: time.Second,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("connect capture NATS %q: %w", url, err)
+	}
+	logger.Info("capture: connected NATS for subject drain", "nats_url", url)
+	return c, nil
+}
+
+// finalisedMetadataInput carries everything writeMetadataFinalised needs to
+// compute + write the AC3 metadata.yaml (the measured fields against the 5.2
+// target + the size bound).
+type finalisedMetadataInput struct {
+	runID      string
+	hash       string
+	cfg        runConfig
+	startedAt  time.Time
+	finishedAt time.Time
+	target     capture.Target
+	result     capture.CaptureResult
+	logger     *slog.Logger
+}
+
+// writeMetadataFinalised computes the measured fields against Story 5.2's
+// target.yaml (BI-9), the resource-usage snapshot (BI-8), and the size bound
+// (BI-10), then writes metadata.yaml KEEPING the Story-5.1 yaml keys and
+// ADDING the AC3 fields (BI-7). It is the FINALISE path (BI-6): it runs on
+// success OR failure so a failed run records success_criterion_met=false +
+// whatever measured signal was observed.
+func writeMetadataFinalised(runDir string, in finalisedMetadataInput) error {
+	m := capture.Measure(in.result.Transitions, in.result.Evidence, in.target, in.startedAt)
+
+	md := metadata{
+		RunID:                 in.runID,
+		ManifestSHA256:        in.hash,
+		Scenario:              in.cfg.scenario,
+		Config:                in.cfg.config,
+		Runs:                  in.cfg.runs,
+		StartedAt:             in.startedAt.Format(time.RFC3339),
+		FinishedAt:            in.finishedAt.Format(time.RFC3339),
+		OlaitanEvalVersion:    version,
+		SuccessCriterionMet:   m.SuccessCriterionMet,
+		MeasuredTimeToDetect:  m.MeasuredTimeToDetect,
+		MeasuredFinalFSMState: m.MeasuredFinalFSMState,
+		FSMStateSource:        m.FSMStateSource,
+		ResourceUsage:         capture.SnapshotResourceUsage(),
+	}
+
+	// Size bound (BI-10): sum the run dir AFTER the five artefacts are written
+	// but BEFORE metadata.yaml is added (so the cap reflects the captured
+	// artefacts; metadata.yaml itself is tiny + bounded). Fail-LOUD on the
+	// signal, fail-OPEN on the artefacts (nothing is deleted).
+	sc, err := capture.CheckSize(runDir, in.cfg.maxRunSizeBytes)
+	if err != nil {
+		return err
+	}
+	md.SizeBytes = sc.SizeBytes
+	md.SizeCapExceeded = sc.SizeCapExceeded
+	if sc.SizeCapExceeded {
+		in.logger.Error("run captured artefacts exceeding the size cap; investigate (artefacts retained, not deleted)",
+			"run_id", in.runID, "size_bytes", sc.SizeBytes, "cap_bytes", sc.Cap)
+	}
+
+	return writeMetadata(runDir, md)
+}
+
+// writeMetadata marshals metadata.yaml into the run dir (AC3, BI-5/BI-7). The
+// manifest_sha256 field is the BI-5 carrier Story 5.5 consumes; the Story-5.1
+// keys are KEPT and the AC3 measured fields ADDED (BI-7).
 func writeMetadata(runDir string, md metadata) error {
 	b, err := yaml.Marshal(md)
 	if err != nil {
