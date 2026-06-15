@@ -61,7 +61,15 @@ func TestEvalSmoke_S1_RS_OneTrial(t *testing.T) {
 	waitForPodsReady(t)
 
 	root := repoRoot()
-	manifestPath := filepath.Join(root, "eval", "manifest.yaml")
+	// Resolve the manifest to an ABSOLUTE path. The olaitan-eval binary is
+	// invoked below with cmd.Dir = root, so a path relative to tests/e2e/
+	// (../../eval/manifest.yaml) would be re-anchored against root and point
+	// two levels above the repo. An absolute path resolves correctly both
+	// for the subprocess and for the in-test fileSHA256 read.
+	manifestPath, err := filepath.Abs(filepath.Join(root, "eval", "manifest.yaml"))
+	if err != nil {
+		t.Fatalf("resolve manifest path: %v", err)
+	}
 
 	// Build the olaitan-eval binary into a temp dir so the test does not
 	// depend on a pre-built bin/ (make eval-smoke builds it; this keeps
