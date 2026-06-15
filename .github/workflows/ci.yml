@@ -608,6 +608,9 @@ jobs:
             --set endpoints.falco=tcp://127.0.0.1:0 \
             --set nats.streamMaxBytesOverride=33554432 \
             --set nats.config.jetstream.fileStore.maxSize=8Gi \
+            --set probes.initialDelaySeconds=30 \
+            --set probes.failureThreshold=12 \
+            --set aggregator.resources.limits.memory=1Gi \
             --wait --timeout 8m
 
       - name: Run forensics smoke

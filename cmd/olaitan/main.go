@@ -242,10 +242,19 @@ func runRingCtx(ctx context.Context, ring string, args []string, stderr io.Write
 			// (wireFSMConsumer), so cancellation in the startup window can
 			// surface here as a wrapped context.Canceled.
 			if errors.Is(err, context.Canceled) {
-				log.Info(ring + ": shutting down")
 				ringCancel()
-				_ = g.Wait()
+				// Drain the group and surface the REAL cause. A startup-window
+				// context.Canceled here usually means a ring goroutine already
+				// registered on g returned an error, which cancelled gctx; if we
+				// silently exit 0 the pod CrashLoops with no logged reason. Only
+				// treat it as a clean shutdown when g.Wait yields nothing real.
+				werr := g.Wait()
 				<-watcherDone
+				if werr != nil && !errors.Is(werr, context.Canceled) {
+					log.Error("aggregator: ring exited with error during startup (cancelled the ring group)", "err", werr)
+					return 1
+				}
+				log.Info(ring + ": shutting down")
 				return 0
 			}
 			log.Error("startup: aggregator ring wiring", "err", err)
