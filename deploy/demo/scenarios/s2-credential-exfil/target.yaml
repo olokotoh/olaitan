@@ -1,0 +1,13 @@
+# S2 credential-exfiltration target contract (Story 5.2, BI-2).
+#
+# floor=true because AC3's success criterion is ">=RESTRICTED": the named
+# state RESTRICTED OR any higher state (QUARANTINED, PRESERVED_KILLED)
+# satisfies it (FSM ordering, BI-6).
+scenario_id: s2
+mitre_technique: T1552
+target_fsm_state: RESTRICTED
+target_time_to_detect_seconds: 60
+floor: true
+triggering_rules:
+  - OLT-CRED-001
+  - OLT-CRED-002

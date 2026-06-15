@@ -1,0 +1,51 @@
+# S2 credential-exfiltration target workload (MITRE T1552, triggers
+# OLT-CRED-001 / OLT-CRED-002).
+#
+# A tenant Deployment with a projected ServiceAccount token. OLT-CRED-001
+# fires on a read of /run/secrets/kubernetes.io/serviceaccount/ by a
+# non-system process; OLT-CRED-002 fires on an outbound connection to the
+# cloud instance-metadata IP 169.254.169.254 from a non-system-namespace pod.
+# The workload is a Deployment in a tenant-* namespace so the correlator
+# resolves the namespace the rules' not-system-namespace clause checks.
+#
+# On kind the determinism path injects the synthetic file-read and/or
+# outbound-metadata events directly (see ../attack/inject.md); the projected
+# token mount below is the real-attacker target shape for a future
+# kubeadm-cluster run.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-acme
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: tenant-acme
+  labels:
+    olaitan.scenario: s2-credential-exfil
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      automountServiceAccountToken: true
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.10
+          volumeMounts:
+            - name: kube-api-access
+              mountPath: /run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+      volumes:
+        - name: kube-api-access
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3607

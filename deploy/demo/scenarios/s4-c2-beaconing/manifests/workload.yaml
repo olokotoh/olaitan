@@ -1,0 +1,39 @@
+# S4 C2-beaconing target workload (MITRE T1071, triggers OLT-NET-001 /
+# OLT-NET-002, and/or the outbound_unique_dst_ips baseline deviation).
+#
+# A tenant Deployment. OLT-NET-001 fires on a small (<1000-byte) outbound
+# flow to a non-RFC1918 destination from a tenant pod; OLT-NET-002 fires on
+# outbound TCP to a C2-favoured port (8443/6697/8333) from a tenant pod. The
+# beaconing signature (many small flows to distinct public destinations) also
+# crosses the baseline engine's outbound_unique_dst_ips 3-sigma metric, the
+# second half of AC8's rule-OR-deviation disjunction (BI-4). The workload is
+# a Deployment in a tenant-* namespace so the rules' tenant_namespace clause
+# matches.
+#
+# On kind the determinism path injects the synthetic outbound flow event(s)
+# and pre-seeds the baseline directly (see ../attack/inject.md).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-acme
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: tenant-acme
+  labels:
+    olaitan.scenario: s4-c2-beaconing
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.10

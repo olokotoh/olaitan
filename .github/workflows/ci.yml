@@ -246,6 +246,17 @@ jobs:
       - name: Run eval-harness smoke (Story 5.1 AC5)
         run: go test -tags=e2e -v -count=1 -run TestEvalSmoke_S1_RS_OneTrial ./tests/e2e/...
 
+      # Story 5.2 (AC8, AC7): the five-attack-scenario smoke rides on the
+      # SAME RS-arm bring-up above (Falco-off, NO LLM). For each scenario
+      # S1-S5 it fires the deterministic synthetic-event stimulus and asserts
+      # a rule match OR baseline deviation reaches EVIDENCE.packages within
+      # the scenario's target.yaml window, plus an idempotency re-run. Scoped
+      # by -run to the scenario tests so it does not re-run the RS / eval
+      # smokes above. AC8 asserts the EVIDENCE-package signal, NOT the full
+      # FSM-state attainment (Story 5.4 + the A1 gate, BI-8).
+      - name: Run attack-scenario smoke (Story 5.2 AC8)
+        run: go test -tags=e2e -v -count=1 -run 'TestKindSmoke_Scenarios' ./tests/e2e/...
+
       - name: Debug logs on failure
         if: failure()
         run: kubectl logs -l app.kubernetes.io/name=olaitan --tail=200 --all-containers

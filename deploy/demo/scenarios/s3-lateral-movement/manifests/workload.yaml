@@ -1,0 +1,35 @@
+# S3 lateral-movement target workload (MITRE T1613, triggers OLT-LATERAL-001).
+#
+# A tenant Deployment. OLT-LATERAL-001 fires on a process.exe ending /kubectl
+# inside a pod owned by a Deployment whose namespace begins tenant-. The
+# correlator resolves owner_kind=Deployment + the tenant-* namespace from the
+# apiserver, matching the rule's workload_kind + tenant_namespace clauses.
+#
+# On kind the determinism path injects the synthetic kubectl-exec falco event
+# directly (see ../attack/inject.md); a real-attacker run would exec a
+# kubectl binary smuggled into the pod.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-acme
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: tenant-acme
+  labels:
+    olaitan.scenario: s3-lateral-movement
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.10

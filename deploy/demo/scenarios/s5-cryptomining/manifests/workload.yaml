@@ -1,0 +1,40 @@
+# S5 cryptomining target workload (MITRE T1496, triggers OLT-IMPACT-005 /
+# OLT-IMPACT-006).
+#
+# A tenant Deployment NOT labelled as a crypto workload. OLT-IMPACT-005 fires
+# on an xmrig/minerd/cpuminer-style process launch in a Deployment-owned
+# tenant pod with outbound traffic to a mining-pool port (3333/4444/5555);
+# OLT-IMPACT-006 fires on an outbound TCP flow to a stratum pool port
+# (3333/4444/5555/7777/14444) with WARNING severity from a tenant pod. The
+# workload is a Deployment in a tenant-* namespace so the rules'
+# k8s_context / tenant_namespace clauses match; the absence of an
+# app.kubernetes.io/component=crypto label keeps the false-positive allowlist
+# from suppressing it.
+#
+# On kind the determinism path injects the synthetic process + outbound flow
+# events directly (see ../attack/inject.md).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-acme
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: tenant-acme
+  labels:
+    olaitan.scenario: s5-cryptomining
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.10

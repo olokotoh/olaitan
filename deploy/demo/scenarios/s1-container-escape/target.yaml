@@ -1,0 +1,13 @@
+# S1 container-escape target contract (Story 5.2, BI-2).
+#
+# The machine-readable declaration Story 5.4's metadata writer measures
+# `success_criterion_met` / `measured_time_to_detect` against. 5.2 OWNS this
+# contract; 5.4 CONSUMES it. floor=false because AC2's success criterion is
+# the EXACT state QUARANTINED (not ">=QUARANTINED").
+scenario_id: s1
+mitre_technique: T1611
+target_fsm_state: QUARANTINED
+target_time_to_detect_seconds: 30
+floor: false
+triggering_rules:
+  - OLT-PRIV-001

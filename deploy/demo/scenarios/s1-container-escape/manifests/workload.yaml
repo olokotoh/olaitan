@@ -1,0 +1,48 @@
+# S1 container-escape target workload (MITRE T1611, triggers OLT-PRIV-001).
+#
+# A tenant Deployment whose pod runs privileged so that CAP_SYS_ADMIN /
+# CAP_SYS_PTRACE are present in the container's effective capability set.
+# OLT-PRIV-001 fires on a falco event whose process.cap_effective contains
+# CAP_SYS_ADMIN or CAP_SYS_PTRACE for a Deployment/StatefulSet pod outside
+# the system namespaces, so the workload MUST be a Deployment in a tenant-*
+# namespace (the correlator resolves owner_kind=Deployment + namespace from
+# the apiserver, matching OLT-PRIV-001's workload_kind + not-system-namespace
+# clauses).
+#
+# On kind the determinism path injects the synthetic falco event directly
+# (see ../attack/inject.md and tests/e2e/scenarios_smoke_test.go); the
+# privileged securityContext below is the real-attacker target shape for a
+# future kubeadm-cluster run with Falco loaded on a real host kernel.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-acme
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: tenant-acme
+  labels:
+    olaitan.scenario: s1-container-escape
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          # registry.k8s.io/pause is cached by kind nodes as the per-pod
+          # sandbox image, so the pod reaches Ready without an upstream pull.
+          image: registry.k8s.io/pause:3.10
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - SYS_ADMIN
+                - SYS_PTRACE

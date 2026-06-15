@@ -1,0 +1,11 @@
+# S5 cryptomining target contract (Story 5.2, BI-2).
+#
+# floor=false because AC6's success criterion is the EXACT state RESTRICTED.
+scenario_id: s5
+mitre_technique: T1496
+target_fsm_state: RESTRICTED
+target_time_to_detect_seconds: 120
+floor: false
+triggering_rules:
+  - OLT-IMPACT-005
+  - OLT-IMPACT-006

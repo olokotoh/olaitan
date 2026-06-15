@@ -102,7 +102,7 @@ Reset -> Warm -> ConfigOverlay.Apply -> Scenario.Run -> Capturer.Capture -> Clea
 |---|---|---|
 | `ClusterController` (`Reset`/`Warm`/`Cleanup`) | 5.1 | reuses the rs_smoke kind bring-up; no-op phases at the foundation layer |
 | `ConfigOverlay` (`Apply`) | Story 5.3 | `rsOverlay` reuses `evaluation.config=RS` |
-| `Scenario` (`Run`) | Story 5.2 | `rsScenario` reuses the rs_smoke synthetic S1 container-escape event |
+| `Scenario` (`Run`) | Story 5.2 | FILLED: `scenarioHarness` (scenario.go) resolves `--scenario sN` to the `deploy/demo/scenarios/sN-<slug>/` harness + its `target.yaml`; the synthetic-event injection lives in `tests/e2e/scenarios_smoke_test.go` on kind (BI-3) |
 | `Capturer` (`Capture`) | Story 5.4 | `metadataOnlyCapturer` writes the placeholder marker only |
 | `DigestVerifier` (`Verify`) | 5.1 | `imageDigestVerifier` checks the image digest; corpus/SHA checks deferred |
 

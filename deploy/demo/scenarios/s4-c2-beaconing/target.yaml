@@ -1,0 +1,15 @@
+# S4 C2-beaconing target contract (Story 5.2, BI-2).
+#
+# floor=true because AC5's success criterion is ">=SUSPICIOUS": the named
+# state SUSPICIOUS OR any higher state satisfies it (FSM ordering, BI-6). S4
+# is the longest window (300s) and the lowest-severity scenario; its
+# detection may rest partly on the outbound_unique_dst_ips baseline deviation
+# as well as the OLT-NET rule match (BI-4).
+scenario_id: s4
+mitre_technique: T1071
+target_fsm_state: SUSPICIOUS
+target_time_to_detect_seconds: 300
+floor: true
+triggering_rules:
+  - OLT-NET-001
+  - OLT-NET-002
