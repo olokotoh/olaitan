@@ -1,0 +1,58 @@
+# Olaitan evaluation reproducibility envelope (NFR37).
+#
+# This single file pins every input that makes an evaluation run
+# reproducible. olaitan-eval loads it, computes its SHA256 over THESE
+# committed bytes (re-derivable via `sha256sum eval/manifest.yaml`), and
+# records that hash as manifest_sha256 in every run's metadata.yaml. The
+# harness REFUSES to start if any pinned artefact's actual digest fails to
+# match (the fail-closed digest gate; see eval/README.md and the
+# --allow-unverified escape hatch).
+#
+# Edit this file as the human-editable contract; the struct in
+# cmd/olaitan-eval/manifest.go mirrors these keys verbatim. See
+# eval/README.md for each field and how to regenerate the pins.
+
+# (1) Container image digests. Each logical name pins a repo@sha256:<digest>
+# reference; the harness verifies the actual loaded digest against the pin.
+# The aggregator pin below is a PLACEHOLDER digest (the published image is
+# not yet digest-pinned in the chart; Story 5.3 wires analyst.model and a
+# real published-image pin). Regenerate with:
+#   docker buildx imagetools inspect <repo>:<tag> --format '{{.Manifest.Digest}}'
+images:
+  aggregator: ghcr.io/olokotoh/olaitan@sha256:2158bb18545621bc64d93dbeb1999a123bfdce638ea3e50c7fad60c00b711227
+
+# (2) Kubernetes patch version (architecture.md:79). Matches the
+# ENVTEST_K8S_VERSION pin in the Makefile and the kind node image line.
+kubernetes_patch_version: 1.29.x
+
+# (3) Falco rule corpus tag. Pinned to the Falco subchart version in
+# deploy/helm/olaitan/Chart.yaml (the corpus ships with the chart). Digest
+# verification of this corpus is deferred (allow-listed) until it is
+# harness-reachable (Story 5.x).
+falco_rule_corpus_tag: falco-chart-8.0.2
+
+# (4) Sigma corpus git SHA. The commit of the rules/ OLT Sigma corpus
+# (latest commit touching rules/ at envelope-creation time). Regenerate:
+#   git log -1 --format=%H -- rules/
+sigma_corpus_git_sha: c7f7ff1f84cdfc41f725bede05eb230abfa2aba3
+
+# (5) LLM model version. The REAL current analyst model. The epic's
+# placeholder claude-opus-4-7-2026-MM-DD never shipped and is STALE;
+# Story 5.1 pins claude-opus-4-8 (BI-3). Recorded + hashed here; wired to
+# the chart's analyst.model by Story 5.3/5.5.
+llm_model_version: claude-opus-4-8
+
+# (6) Random seed. Deterministic default threaded to any harness-side
+# randomness. 0 is a valid, fully-deterministic choice.
+random_seed: 0
+
+# (7) Sysctl snapshot. The host sysctl values the run assumes, inline.
+# For a captured-file form, use a single `path: <file>` entry instead.
+sysctl_snapshot:
+  kernel.unprivileged_bpf_disabled: "1"
+  net.ipv4.ip_forward: "1"
+
+# (8) Cluster bootstrap script git SHA. The commit of deploy/demo/setup.sh.
+# Regenerate:
+#   git log -1 --format=%H -- deploy/demo/setup.sh
+cluster_bootstrap_script_git_sha: 89dde84be474c1b801c6c0cea8c3543f37a23332

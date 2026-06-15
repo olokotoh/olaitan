@@ -1,0 +1,14 @@
+# Example run metadata.yaml (committed skeleton documenting the layout).
+#
+# This is the MINIMAL Story 5.1 schema. Story 5.5 owns and extends it with
+# the full per-trial / statistical / analysis-pipeline fields. The
+# manifest_sha256 field is the BI-5 carrier: it equals
+# `sha256sum eval/manifest.yaml` of the envelope the run used.
+run_id: 20260615T093000.000Z-s1-rs-69d1b5f452cd
+manifest_sha256: 69d1b5f452cd0d91eec2bbe94f6047ab68588b7a5faf724bc57dda0d86462a5a
+scenario: s1
+config: rs
+runs: 1
+started_at: "2026-06-15T09:30:00Z"
+finished_at: "2026-06-15T09:31:12Z"
+olaitan_eval_version: dev

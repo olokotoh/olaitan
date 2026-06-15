@@ -1136,6 +1136,39 @@ takes no API key (`analyst.local.{endpoint,model}` is its only config). The loca
 ScoreCap defaults to 25, so the trust-bound is, if anything, tighter on the
 air-gapped path.
 
+### 1.4f Running the eval harness (Story 5.1, FR53-FR54/NFR37)
+
+The `olaitan-eval` binary (`cmd/olaitan-eval/`) orchestrates a reproducible
+evaluation run from the single `eval/manifest.yaml` reproducibility
+envelope. A run:
+
+```
+olaitan-eval --manifest eval/manifest.yaml --scenario s1 --config rs --runs 1
+```
+
+loads + validates the manifest (the eight NFR37 fields, fail-fast on any
+missing one), computes its SHA256 over the committed file bytes (re-derive
+with `sha256sum eval/manifest.yaml`), runs the fail-closed
+digest-verification gate ONCE before the first trial, generates a sortable
+`run_id` (`<UTC-timestamp>-<scenario>-<config>-<short-hash>`), creates
+`runs/<run_id>/`, runs `--runs` trials, and writes the per-run
+`metadata.yaml` carrying `manifest_sha256`.
+
+The digest gate REFUSES to start (non-zero exit, expected-vs-actual error)
+on any pinned-artefact digest mismatch OR any artefact whose actual digest
+cannot be resolved. The ONLY override is `--allow-unverified=<name>` (off
+by default), which voids the reproducibility guarantee for that artefact;
+use it only as a research escape hatch.
+
+`make eval-smoke` brings up the RS-arm kind cluster (the Story-1.19
+`e2e-local` precedent), builds the binary, and runs the AC5 S1 + RS +
+1-trial smoke. Story 5.1 is the FOUNDATION: the rich S1-S5 scenarios
+(Story 5.2), the F/RSL/RSLT-full overlays (Story 5.3), the six-file
+artefact capture (Story 5.4), and the full metadata schema plus the
+`analysis/analyse.py` pipeline (Story 5.5) fill the frozen seams later. The
+`metadata.yaml` schema here is the minimal set; Story 5.5 owns and extends
+it.
+
 ### 1.5 Naming-convention reconciliation
 
 The Story 1.18 acceptance criteria text uses a mix of singular-ring and plural-ring metric names (e.g. AC2 says `olaitan_decision_rule_matches_total` singular; AC3 says `olaitan_decision_baseline_deviations_total{metric, sigma_bucket}` plural). The actual registrations follow `architecture.md:472-475` which mandates the `olaitan_<ring>_<metric>` pattern with the engine subfamily conventionally plural (`rules`, `baseline`) because the engine evaluates a corpus, not a single rule. The AC singular spellings are documentation aliases, not parallel families.

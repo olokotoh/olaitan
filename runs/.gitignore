@@ -1,0 +1,8 @@
+# Eval run outputs are not committed (NFR37: runs are reproducible from
+# eval/manifest.yaml, not from checked-in artefacts). Ignore everything in
+# this directory EXCEPT the committed example/ skeleton, which documents
+# the runs/<run_id>/ layout the harness writes.
+*
+!.gitignore
+!example/
+!example/**

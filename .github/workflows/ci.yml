@@ -232,7 +232,19 @@ jobs:
             --wait --timeout 5m
 
       - name: Run smoke test
-        run: go test -tags=e2e -v -count=1 ./tests/e2e/...
+        run: go test -tags=e2e -v -count=1 -run TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation ./tests/e2e/...
+
+      # Story 5.1 (AC5): the olaitan-eval harness smoke rides on the SAME
+      # RS-arm bring-up above (Falco-off, NO LLM). It builds the
+      # olaitan-eval binary and runs a single S1 + RS + 1-trial invocation,
+      # asserting the run completes, runs/<run_id>/metadata.yaml is present,
+      # and manifest_sha256 matches `sha256sum eval/manifest.yaml`. Scoped to
+      # the one test by -run so it does not re-run the RS smoke above.
+      - name: Build olaitan-eval
+        run: go build -o bin/olaitan-eval ./cmd/olaitan-eval
+
+      - name: Run eval-harness smoke (Story 5.1 AC5)
+        run: go test -tags=e2e -v -count=1 -run TestEvalSmoke_S1_RS_OneTrial ./tests/e2e/...
 
       - name: Debug logs on failure
         if: failure()

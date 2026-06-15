@@ -9,7 +9,7 @@ CONFIG_SRC       := config/olaitan.yaml
 AUDIT_POLICY_SRC := config/audit-policy-default.yaml
 CHART_FILES      := $(CHART_DIR)/files/olaitan.yaml $(CHART_DIR)/files/audit-policy-default.yaml
 
-.PHONY: build test lint docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics e2e-local-down
+.PHONY: build test lint docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics eval-smoke e2e-local-down
 
 # envtest-bin downloads the kube-apiserver and etcd binaries that the
 # Story 1.11 posture-client integration tests (and any future
@@ -282,6 +282,33 @@ e2e-local-forensics: helm-prepare helm-deps docker-build
 		--set nats.streamMaxBytesOverride=1073741824 \
 		--wait --timeout 5m
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) OLT_E2E_FORENSICS=1 go test -tags=e2e -v -count=1 -run TestKindSmoke_Forensics_FullSlice ./tests/e2e/...
+
+# Story 5.1 (AC5): the olaitan-eval harness smoke. Reuses the SAME RS-arm
+# kind bring-up as e2e-local (the chart installs healthy under
+# evaluation.config=RS, Falco-off, NO LLM), builds the olaitan-eval binary,
+# and runs a single S1 + RS + 1-trial `olaitan-eval` invocation, asserting
+# the run completes, runs/<run_id>/metadata.yaml is present, and
+# manifest_sha256 matches `sha256sum eval/manifest.yaml` (BI-7). The
+# OLT_E2E gate is not needed: the eval-smoke test SKIPS gracefully when the
+# kind cluster is absent, and it reuses the RS bring-up the default CI e2e
+# job already runs, so it rides alongside the RS smoke (OA5).
+eval-smoke: helm-prepare helm-deps docker-build
+	kind get clusters | grep -q '^$(KIND_CLUSTER_NAME)$$' || \
+		kind create cluster --name $(KIND_CLUSTER_NAME) --config hack/kind-config.yaml
+	kind load docker-image $(IMAGE):$(TAG) --name $(KIND_CLUSTER_NAME)
+	helm install olaitan $(CHART_DIR) \
+		--set image.repository=$(IMAGE) \
+		--set-string image.tag=$(TAG) \
+		--set image.pullPolicy=Never \
+		--set evaluation.config=RS \
+		--set baselines.warmupDuration=5s \
+		--set secrets.redisPassword=ci-test \
+		--set falco.enabled=false \
+		--set endpoints.falco=tcp://127.0.0.1:0 \
+		--set nats.streamMaxBytesOverride=1073741824 \
+		--wait --timeout 5m
+	go build $(LDFLAGS) -o bin/olaitan-eval ./cmd/olaitan-eval
+	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) go test -tags=e2e -v -count=1 -run TestEvalSmoke_S1_RS_OneTrial ./tests/e2e/...
 
 e2e-local-down:
 	kind delete cluster --name $(KIND_CLUSTER_NAME)
