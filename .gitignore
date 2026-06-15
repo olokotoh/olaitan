@@ -55,6 +55,10 @@ spikes/sigma-parser/custom/custom
 # Root build binary — `go build ./cmd/olaitan` from the repo root drops an
 # `olaitan` ELF here. The binary is never committed; the source is cmd/olaitan/.
 /olaitan
+# Same footgun for the Story 5.1 eval harness: `go build ./cmd/olaitan-eval`
+# from the repo root drops an `olaitan-eval` ELF here. It is never committed;
+# the source is cmd/olaitan-eval/ and the make/CI targets build to bin/.
+/olaitan-eval
 
 # Claude Code transient agent worktrees
 .claude/worktrees/
