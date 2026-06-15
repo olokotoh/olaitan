@@ -152,8 +152,11 @@ jobs:
       - name: Free up disk space
         run: |
           df -h /
+          # NB: do NOT remove $AGENT_TOOLSDIRECTORY (/opt/hostedtoolcache) -- it
+          # holds the Go and Node.js runtimes that setup-go and the JS-based
+          # kind-action need. Remove only the large unused toolchains.
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
-            /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/lib/jvm || true
           sudo docker image prune --all --force || true
           df -h /
 
@@ -503,8 +506,11 @@ jobs:
       - name: Free up disk space
         run: |
           df -h /
+          # NB: do NOT remove $AGENT_TOOLSDIRECTORY (/opt/hostedtoolcache) -- it
+          # holds the Go and Node.js runtimes that setup-go and the JS-based
+          # kind-action need. Remove only the large unused toolchains.
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
-            /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/lib/jvm || true
           sudo docker image prune --all --force || true
           df -h /
 
