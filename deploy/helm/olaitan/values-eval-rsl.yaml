@@ -1,0 +1,33 @@
+# values-eval-rsl.yaml -- the Epic 5 "RSL" evaluation arm (FR53, Story 5.3).
+#
+#   helm upgrade --install olaitan deploy/helm/olaitan \
+#     --set secrets.redisPassword=<password> \
+#     --set secrets.llmApiKey=<key> \
+#     -f deploy/helm/olaitan/values-eval-rsl.yaml
+#
+# RSL = RS plus a single-LLM analyst (Standard mode). The chart sets
+# analyst.provider=api, l2_enabled=false, senior_enabled=true so L1 acts
+# as Senior (the effective L1-only chain). THIN overlay: it sets
+# evaluation.config plus the reproducibility model pin (BI-3); the
+# rules/baselines/provider/l2/senior values are computed by the chart from
+# evaluation.config and clobber any operator per-knob values (see
+# deploy/helm/olaitan/EVAL.md operator-override semantics).
+#
+# REPRODUCIBILITY MODEL PIN (NFR37, BI-3): analyst.api.model is pinned to
+# the model string recorded as llm_model_version in eval/manifest.yaml so
+# the manifest pin and the chart pin cannot drift. Keep these two byte
+# identical.
+#
+# INSTALL-TIME POINTERS (operator-supplied): analyst.api.endpoint stays
+# empty (the vendor default endpoint) and analyst.api.apiKeySecret stays
+# at the chart default (olaitan-llm). Supply the API key via
+# secrets.llmApiKey at install; for an in-cluster fake-LLM run set
+# analyst.api.endpoint=http://fake-llm:8080/v1 (the make e2e-local-rslt
+# pattern). Without a key the provider degrades to rules-only with an
+# api_key_set=false log; the chart never silently dials a public endpoint.
+evaluation:
+  config: RSL
+
+analyst:
+  api:
+    model: claude-opus-4-8

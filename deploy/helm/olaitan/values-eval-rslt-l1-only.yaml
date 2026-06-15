@@ -1,0 +1,44 @@
+# values-eval-rslt-l1-only.yaml -- the Epic 5 "RSLT-L1-only" evaluation
+# arm (FR53, Story 5.3).
+#
+#   helm upgrade --install olaitan deploy/helm/olaitan \
+#     --set secrets.redisPassword=<password> \
+#     --set secrets.llmApiKey=<key> \
+#     -f deploy/helm/olaitan/values-eval-rslt-l1-only.yaml
+#
+# RSLT-L1-only = RSLT ablation, L1 only (L2 off => Senior off by Go-side
+# precedence). The chart sets analyst.provider=api, l2_enabled=false,
+# senior_enabled=true (the senior literal is set for clarity; the Go-side
+# SeniorEnabledOrDefault precedence collapses it to off when L2 is off).
+# THIN overlay: it sets evaluation.config plus the reproducibility model
+# pin (BI-3); the rules/baselines/provider/l2/senior values are computed
+# by the chart from evaluation.config and clobber any operator per-knob
+# values (see deploy/helm/olaitan/EVAL.md operator-override semantics).
+#
+# BI-1 FILENAME: the in-file evaluation.config is the canonical chart enum
+# RSLT-L1-only verbatim so the chart validator and effective-value helpers
+# fire unchanged; the filename matches that arm with no normalisation.
+#
+# NOTE: this arm renders the same analyst provider/l2/senior shape as the
+# RSL arm (api / l2 off / senior on) by design (EVAL.md); they differ only
+# in the evaluation.config label so the eval matrix records them as
+# distinct arms.
+#
+# REPRODUCIBILITY MODEL PIN (NFR37, BI-3): analyst.api.model is pinned to
+# the model string recorded as llm_model_version in eval/manifest.yaml so
+# the manifest pin and the chart pin cannot drift. Keep these two byte
+# identical.
+#
+# INSTALL-TIME POINTERS (operator-supplied): analyst.api.endpoint stays
+# empty (the vendor default endpoint) and analyst.api.apiKeySecret stays
+# at the chart default (olaitan-llm). Supply the API key via
+# secrets.llmApiKey at install; for an in-cluster fake-LLM run set
+# analyst.api.endpoint=http://fake-llm:8080/v1 (the make e2e-local-rslt
+# pattern). Without a key the provider degrades to rules-only with an
+# api_key_set=false log; the chart never silently dials a public endpoint.
+evaluation:
+  config: RSLT-L1-only
+
+analyst:
+  api:
+    model: claude-opus-4-8

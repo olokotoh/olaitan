@@ -1226,6 +1226,58 @@ deterministic full run folds into the carry-forward A1 3-node cluster gate.
 Story 5.1's stable gate (the RS smoke + `TestEvalSmoke_S1_RS_OneTrial`) stays
 always-on in the `e2e` job.
 
+### 1.4h Applying an evaluation overlay (Story 5.3, FR53/NFR37)
+
+The six evaluation arms are committed as THIN Helm values overlays under
+`deploy/helm/olaitan/`, so a run selects an arm via `helm upgrade --values
+<overlay>` with no code change (FR53):
+
+| `--config` | Overlay file | `evaluation.config` | Arm |
+|---|---|---|---|
+| `f` | `values-eval-f.yaml` | `F` | Falco-only baseline |
+| `rs` | `values-eval-rs.yaml` | `RS` | Rules + Statistics (no LLM; default CI e2e arm) |
+| `rsl` | `values-eval-rsl.yaml` | `RSL` | RS + single-LLM Standard mode |
+| `rslt` / `rslt-full` | `values-eval-rslt-full.yaml` | `RSLT-full` | RS + full L1 -> L2 -> Senior chain |
+| `rslt-l1-only` | `values-eval-rslt-l1-only.yaml` | `RSLT-L1-only` | RSLT ablation: L1 only |
+| `rslt-l1-l2` | `values-eval-rslt-l1-l2.yaml` | `RSLT-L1+L2` | RSLT ablation: L1 + L2, no Senior |
+
+Each overlay sets ONLY `evaluation.config` (the per-arm
+rules/baselines/provider/l2/senior values are computed by the chart matrix,
+Story 1.19 + Story 3.16) plus, for the LLM arms, the reproducibility model
+pin `analyst.api.model: claude-opus-4-8` (mirroring `eval/manifest.yaml`'s
+`llm_model_version`, NFR37). The overlays do NOT restate the per-arm knobs
+(the chart clobbers them under a named arm anyway). Filename note (BI-1):
+the `RSLT-L1+L2` arm's `+` is normalised to `-` in the filename
+(`values-eval-rslt-l1-l2.yaml`); the in-file `evaluation.config` stays the
+canonical `RSLT-L1+L2`.
+
+Apply an arm directly:
+
+```
+helm upgrade --install olaitan deploy/helm/olaitan \
+  --set secrets.redisPassword=<password> \
+  -f deploy/helm/olaitan/values-eval-rs.yaml
+```
+
+The `olaitan-eval` harness applies the matching overlay behind the
+`ConfigOverlay` seam: `--config <name>` resolves to `values-eval-<name>.yaml`,
+runs `helm upgrade --install --reuse-values --values <overlay> --wait`
+(`--reuse-values` so the RS re-apply is idempotent on an existing release,
+layering the overlay on the install-time values), then an explicit `kubectl
+rollout status deploy/<release>-aggregator` Ready gate before the scenario
+fires (fail-closed: a timeout aborts the trial). The chart-root / release /
+namespace / overlays-dir / timeout are the new `--chart-root` / `--release`
+/ `--namespace` / `--overlays-dir` / `--overlay-timeout` flags (defaults:
+`deploy/helm/olaitan`, `olaitan`, `olaitan`, `deploy/helm/olaitan`, `5m`).
+
+Honest CI scope (BI-7, the carry-forward A1 gate): the render-cleanly +
+configmap-knob assertion for ALL SIX arms runs in the helm CI job with NO
+cluster; the working-deployment half is proven for the RS arm only in the
+default CI e2e job (`make eval-smoke` drives the real RS helmOverlay on
+kind). The LLM arms' working-deployment half folds into the carry-forward A1
+RSLT-full-kind gate (`make e2e-local-rslt`, `OLT_E2E_RSLT`-gated); the
+default CI e2e job does NOT run the full LLM chain.
+
 ### 1.5 Naming-convention reconciliation
 
 The Story 1.18 acceptance criteria text uses a mix of singular-ring and plural-ring metric names (e.g. AC2 says `olaitan_decision_rule_matches_total` singular; AC3 says `olaitan_decision_baseline_deviations_total{metric, sigma_bucket}` plural). The actual registrations follow `architecture.md:472-475` which mandates the `olaitan_<ring>_<metric>` pattern with the engine subfamily conventionally plural (`rules`, `baseline`) because the engine evaluates a corpus, not a single rule. The AC singular spellings are documentation aliases, not parallel families.

@@ -1,0 +1,2706 @@
+---
+kind: NetworkPolicy
+apiVersion: networking.k8s.io/v1
+metadata:
+  name: olaitan-redis
+  namespace: "default"
+  labels:
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/version: 8.6.2
+    helm.sh/chart: redis-25.3.11
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: olaitan
+      app.kubernetes.io/name: redis
+  policyTypes:
+    - Ingress
+    - Egress
+  egress:
+    - {}
+  ingress:
+    # Allow inbound connections
+    - ports:
+        - port: 6379
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: olaitan
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: olaitan
+      app.kubernetes.io/instance: olaitan
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: olaitan
+              app.kubernetes.io/instance: olaitan
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: "10.96.0.1/32"
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+    - to:
+        - podSelector: {}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  labels:
+    app.kubernetes.io/component: nats
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: nats
+    app.kubernetes.io/version: 2.12.6
+    helm.sh/chart: nats-2.12.6
+  name: olaitan-nats
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: nats
+      app.kubernetes.io/instance: olaitan
+      app.kubernetes.io/name: nats
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: olaitan-redis-master
+  namespace: "default"
+  labels:
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/version: 8.6.2
+    helm.sh/chart: redis-25.3.11
+    app.kubernetes.io/component: master
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: olaitan
+      app.kubernetes.io/name: redis
+      app.kubernetes.io/component: master
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: olaitan-falco
+  namespace: default
+  labels:
+    helm.sh/chart: falco-8.0.2
+    app.kubernetes.io/name: falco
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+---
+apiVersion: v1
+kind: ServiceAccount
+automountServiceAccountToken: false
+metadata:
+  name: olaitan-redis-master
+  namespace: "default"
+  labels:
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/version: 8.6.2
+    helm.sh/chart: redis-25.3.11
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: olaitan-collector
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: collector
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: olaitan-aggregator
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: aggregator
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  labels:
+    app.kubernetes.io/component: nats-box
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: nats
+    app.kubernetes.io/version: 2.12.6
+    helm.sh/chart: nats-2.12.6
+  name: olaitan-nats-box-contexts
+stringData:
+  default.json: |
+    {
+      "url": "nats://olaitan-nats"
+    }
+type: Opaque
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: olaitan-secrets
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+type: Opaque
+stringData:
+  redis-password: "test-password"
+  nats-creds: ""
+  llm-api-key: ""
+  # Story 4.2 (FR36/NFR8): S3 credentials for the forensic capture uploader.
+  # Consumed by internal/response/forensics when response.forensics.enabled=true.
+  # Empty -> the controller refuses to start when forensics is enabled.
+  s3-access-key: ""
+  s3-secret-key: ""
+  # Story 4.8 (NFR8): the OPTIONAL incident notification webhook URL (a
+  # Slack/PagerDuty URL embeds a token). Consumed by internal/report/notify when
+  # response.notifications.enabled=true. Empty -> the webhook is not wired.
+  #
+  # Story 4.10 (BI-3): the operator-facing facade notifications.webhook_url
+  # OVERLAYS secrets.notificationsWebhookUrl here (facade WINS when set), so
+  # the secret -> NOTIFICATIONS_WEBHOOK_URL env projection (deployment.yaml)
+  # carries the facade value. A non-empty facade value takes precedence; an
+  # empty facade value falls back to the secrets.* value (and empty -> "").
+  notifications-webhook-url: ""
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: olaitan-falco
+  namespace: default
+  labels:
+    helm.sh/chart: falco-8.0.2
+    app.kubernetes.io/name: falco
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+data:
+  falco.yaml: |-
+    append_output:
+    - suggested_output: true
+    base_syscalls:
+      all: false
+      custom_set: []
+      repair: false
+    buffer_format_base64: false
+    buffered_outputs: false
+    capture:
+      default_duration: 5000
+      enabled: false
+      mode: rules
+      path_prefix: /tmp/falco
+    config_files:
+    - /etc/falco/config.d
+    engine:
+      ebpf:
+        buf_size_preset: 4
+        drop_failed_exit: false
+        probe: ${HOME}/.falco/falco-bpf.o
+      kind: ebpf
+    falco_libs:
+      snaplen: 80
+      thread_table_auto_purging_interval_s: 300
+      thread_table_auto_purging_thread_timeout_s: 300
+      thread_table_size: 262144
+    file_output:
+      enabled: false
+      filename: ./events.txt
+      keep_alive: false
+    grpc:
+      bind_address: unix:///run/falco/falco.sock
+      enabled: true
+      threadiness: 0
+    grpc_output:
+      enabled: true
+    http_output:
+      ca_bundle: ""
+      ca_cert: ""
+      ca_path: /etc/falco/certs/
+      client_cert: /etc/falco/certs/client/client.crt
+      client_key: /etc/falco/certs/client/client.key
+      compress_uploads: false
+      echo: false
+      enabled: false
+      insecure: false
+      keep_alive: false
+      max_consecutive_timeouts: 5
+      mtls: false
+      url: ""
+      user_agent: falcosecurity/falco
+    json_include_message_property: false
+    json_include_output_fields_property: true
+    json_include_output_property: true
+    json_include_tags_property: true
+    json_output: false
+    libs_logger:
+      enabled: true
+      severity: info
+    load_plugins:
+    - container
+    log_level: info
+    log_stderr: true
+    log_syslog: true
+    output_timeout: 2000
+    outputs_queue:
+      capacity: 0
+    plugins:
+    - init_config:
+        engines:
+          bpm:
+            enabled: true
+          containerd:
+            enabled: true
+            sockets:
+            - /run/host-containerd/containerd.sock
+          cri:
+            enabled: true
+            sockets:
+            - /run/containerd/containerd.sock
+            - /run/crio/crio.sock
+            - /run/k3s/containerd/containerd.sock
+            - /run/host-containerd/containerd.sock
+          docker:
+            enabled: true
+            sockets:
+            - /var/run/docker.sock
+          libvirt_lxc:
+            enabled: true
+          lxc:
+            enabled: true
+          podman:
+            enabled: true
+            sockets:
+            - /run/podman/podman.sock
+        hooks:
+        - create
+        label_max_len: 100
+        with_size: false
+      library_path: libcontainer.so
+      name: container
+    plugins_hostinfo: true
+    priority: debug
+    program_output:
+      enabled: false
+      keep_alive: false
+      program: 'jq ''{text: .output}'' | curl -d @- -X POST https://hooks.slack.com/services/XXX'
+    rule_matching: first
+    rules_files:
+    - /etc/falco/falco_rules.yaml
+    - /etc/falco/falco_rules.local.yaml
+    - /etc/falco/rules.d
+    stdout_output:
+      enabled: true
+    syscall_event_drops:
+      actions:
+      - log
+      - alert
+      max_burst: 1
+      rate: 0.03333
+      simulate_drops: false
+      threshold: 0.1
+    syscall_event_timeouts:
+      max_consecutives: 1000
+    syslog_output:
+      enabled: true
+    time_format_iso_8601: false
+    watch_config_files: true
+    webserver:
+      enabled: true
+      k8s_healthz_endpoint: /healthz
+      listen_address: 0.0.0.0
+      listen_port: 8765
+      prometheus_metrics_enabled: false
+      ssl_certificate: /etc/falco/falco.pem
+      ssl_enabled: false
+      threadiness: 0
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: olaitan-falco-falcoctl
+  namespace: default
+  labels:
+    helm.sh/chart: falco-8.0.2
+    app.kubernetes.io/name: falco
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+data:
+  falcoctl.yaml: |-
+    artifact:
+      allowedTypes:
+      - rulesfile
+      - plugin
+      follow:
+        every: 168h
+        falcoversions: http://localhost:8765/versions
+        pluginsDir: /plugins
+        refs:
+        - falco-rules:5
+        rulesfilesDir: /rulesfiles
+        stateDir: /artifactstate
+      install:
+        pluginsDir: /plugins
+        refs:
+        - falco-rules:5
+        - ghcr.io/falcosecurity/plugins/plugin/container:0.6.3
+        resolveDeps: true
+        rulesfilesDir: /rulesfiles
+        stateDir: /artifactstate
+    indexes:
+    - name: falcosecurity
+      url: https://falcosecurity.github.io/falcoctl/index.yaml
+---
+apiVersion: v1
+data:
+  nats.conf: |
+    {
+      "http_port": 8222,
+      "jetstream": {
+        "max_file_store": 10Gi,
+        "max_memory_store": 0,
+        "store_dir": "/data"
+      },
+      "lame_duck_duration": "30s",
+      "lame_duck_grace_period": "10s",
+      "pid_file": "/var/run/nats/nats.pid",
+      "port": 4222,
+      "server_name": $SERVER_NAME
+    }
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/component: nats
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: nats
+    app.kubernetes.io/version: 2.12.6
+    helm.sh/chart: nats-2.12.6
+  name: olaitan-nats-config
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: olaitan-redis-configuration
+  namespace: "default"
+  labels:
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/version: 8.6.2
+    helm.sh/chart: redis-25.3.11
+data:
+  redis.conf: |-
+    # User-supplied common configuration:
+    # Enable ReJSON y Redisearch
+    loadmodule /opt/bitnami/redis/lib/redis/modules/redisearch.so
+    loadmodule /opt/bitnami/redis/lib/redis/modules/rejson.so
+    # Enable AOF https://redis.io/topics/persistence#append-only-file
+    appendonly yes
+    # Disable RDB persistence, AOF persistence already enabled.
+    save ""
+    # End of common configuration
+  master.conf: |-
+    dir /data
+    # User-supplied master configuration:
+    rename-command FLUSHDB ""
+    rename-command FLUSHALL ""
+    # End of master configuration
+  replica.conf: |-
+    dir /data
+    # User-supplied replica configuration:
+    rename-command FLUSHDB ""
+    rename-command FLUSHALL ""
+    # End of replica configuration
+  users.acl: |-
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: olaitan-redis-health
+  namespace: "default"
+  labels:
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/version: 8.6.2
+    helm.sh/chart: redis-25.3.11
+data:
+  ping_readiness_local.sh: |-
+    #!/bin/bash
+
+    timeout=$1
+    run_redis_command() {
+        local args=("-p" "$REDIS_PORT")
+        timeout -s 15 $timeout redis-cli "${args[@]}" "$@"
+    }
+
+    [[ -f $REDIS_PASSWORD_FILE ]] && export REDIS_PASSWORD="$(< "${REDIS_PASSWORD_FILE}")"
+    [[ -n "$REDIS_PASSWORD" ]] && export REDISCLI_AUTH="$REDIS_PASSWORD"
+    response=$(run_redis_command ping)
+    if [ "$?" -eq "124" ]; then
+      echo "Timed out"
+      exit 1
+    fi
+    if [ "$response" != "PONG" ]; then
+      echo "$response"
+      exit 1
+    fi
+
+  ping_liveness_local.sh: |-
+    #!/bin/bash
+
+    [[ -f $REDIS_PASSWORD_FILE ]] && export REDIS_PASSWORD="$(< "${REDIS_PASSWORD_FILE}")"
+    [[ -n "$REDIS_PASSWORD" ]] && export REDISCLI_AUTH="$REDIS_PASSWORD"
+    response=$(
+      timeout -s 15 $1 \
+      redis-cli \
+        -h localhost \
+        -p $REDIS_PORT \
+        ping
+    )
+    if [ "$?" -eq "124" ]; then
+      echo "Timed out"
+      exit 1
+    fi
+    responseFirstWord=$(echo $response | head -n1 | awk '{print $1;}')
+    if [ "$response" != "PONG" ] && [ "$responseFirstWord" != "LOADING" ] && [ "$responseFirstWord" != "MASTERDOWN" ]; then
+      echo "$response"
+      exit 1
+    fi
+  ping_readiness_master.sh: |-
+    #!/bin/bash
+
+    [[ -f $REDIS_MASTER_PASSWORD_FILE ]] && export REDIS_MASTER_PASSWORD="$(< "${REDIS_MASTER_PASSWORD_FILE}")"
+    [[ -n "$REDIS_MASTER_PASSWORD" ]] && export REDISCLI_AUTH="$REDIS_MASTER_PASSWORD"
+    response=$(
+      timeout -s 15 $1 \
+      redis-cli \
+        -h $REDIS_MASTER_HOST \
+        -p $REDIS_MASTER_PORT_NUMBER \
+        ping
+    )
+    if [ "$?" -eq "124" ]; then
+      echo "Timed out"
+      exit 1
+    fi
+    if [ "$response" != "PONG" ]; then
+      echo "$response"
+      exit 1
+    fi
+  ping_liveness_master.sh: |-
+    #!/bin/bash
+
+    [[ -f $REDIS_MASTER_PASSWORD_FILE ]] && export REDIS_MASTER_PASSWORD="$(< "${REDIS_MASTER_PASSWORD_FILE}")"
+    [[ -n "$REDIS_MASTER_PASSWORD" ]] && export REDISCLI_AUTH="$REDIS_MASTER_PASSWORD"
+    response=$(
+      timeout -s 15 $1 \
+      redis-cli \
+        -h $REDIS_MASTER_HOST \
+        -p $REDIS_MASTER_PORT_NUMBER \
+        ping
+    )
+    if [ "$?" -eq "124" ]; then
+      echo "Timed out"
+      exit 1
+    fi
+    responseFirstWord=$(echo $response | head -n1 | awk '{print $1;}')
+    if [ "$response" != "PONG" ] && [ "$responseFirstWord" != "LOADING" ]; then
+      echo "$response"
+      exit 1
+    fi
+  ping_readiness_local_and_master.sh: |-
+    script_dir="$(dirname "$0")"
+    exit_status=0
+    "$script_dir/ping_readiness_local.sh" $1 || exit_status=$?
+    "$script_dir/ping_readiness_master.sh" $1 || exit_status=$?
+    exit $exit_status
+  ping_liveness_local_and_master.sh: |-
+    script_dir="$(dirname "$0")"
+    exit_status=0
+    "$script_dir/ping_liveness_local.sh" $1 || exit_status=$?
+    "$script_dir/ping_liveness_master.sh" $1 || exit_status=$?
+    exit $exit_status
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: olaitan-redis-scripts
+  namespace: "default"
+  labels:
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/version: 8.6.2
+    helm.sh/chart: redis-25.3.11
+data:
+  start-master.sh: |
+    #!/bin/bash
+
+    [[ -f $REDIS_PASSWORD_FILE ]] && export REDIS_PASSWORD="$(< "${REDIS_PASSWORD_FILE}")"
+    if [[ -f /opt/bitnami/redis/mounted-etc/master.conf ]];then
+        cp /opt/bitnami/redis/mounted-etc/master.conf /opt/bitnami/redis/etc/master.conf
+    fi
+    if [[ -f /opt/bitnami/redis/mounted-etc/redis.conf ]];then
+        cp /opt/bitnami/redis/mounted-etc/redis.conf /opt/bitnami/redis/etc/redis.conf
+    fi
+    if [[ -f /opt/bitnami/redis/mounted-etc/users.acl ]];then
+        cp /opt/bitnami/redis/mounted-etc/users.acl /opt/bitnami/redis/etc/users.acl
+    fi
+    ARGS=("--port" "${REDIS_PORT}")
+    ARGS+=("--requirepass" "${REDIS_PASSWORD}")
+    ARGS+=("--masterauth" "${REDIS_PASSWORD}")
+    ARGS+=("--include" "/opt/bitnami/redis/etc/redis.conf")
+    ARGS+=("--include" "/opt/bitnami/redis/etc/master.conf")
+    exec redis-server "${ARGS[@]}"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: olaitan-config
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+data:
+  olaitan.yaml: |-
+    # Olaitan central configuration.
+    # See _bmad-output/planning-artifacts/architecture.md#Configuration-Format
+    # for the full schema. All keys are snake_case; durations are Go-style
+    # strings ("24h", "10s").
+    
+    detection:
+      # confidence_bands are the FSM transition thresholds (BI-3): watch maps
+      # to SUSPICIOUS, alert to RESTRICTED, act to QUARANTINED. Story 2.2 pins
+      # the AC1 defaults 20/40/70 (epics.md:1012-1043). Must satisfy
+      # watch < alert < act, each in [0,100].
+      confidence_bands:
+        watch: 20
+        alert: 40
+        act: 70
+      baseline_window: 24h
+      # Story 1.14: Ring-2 sliding-window correlator and EvidencePackage
+      # assembler. The window duration is hot-reloadable; max_package_bytes
+      # is pinned to the 128 KiB on-wire cap from AC3.
+      correlator:
+        window_duration: "60s"
+        max_package_bytes: 131072
+        multi_signal_min_sources: 2
+        high_severity_threshold: 50
+      # Story 1.7: per-source adapter configuration. The audit-webhook
+      # receiver is gated on enabled; chart deploys with
+      # auditWebhook.enabled=false leave this block at its zero value and
+      # the collector subcommand does not spawn the audit goroutine.
+      sources:
+        audit:
+          enabled: false
+          listen_addr: ":8443"
+          tls_cert_file: "/etc/olaitan/audit-tls/tls.crt"
+          tls_key_file: "/etc/olaitan/audit-tls/tls.key"
+          client_ca_file: "/etc/olaitan/audit-tls/ca.crt"
+          max_payload_bytes: 8388608
+          staleness_timeout: "5m"
+          publish_retry:
+            min: "100ms"
+            max: "1s"
+            multiplier: 2.0
+            jitter: 0.1
+            max_attempts: 3
+        # Story 1.8: containerd CRI lifecycle adapter (FR3). Default
+        # disabled until the operator confirms the cluster's CRI socket
+        # path and is comfortable with the host-socket mount documented in
+        # deploy/helm/olaitan/CRI.md. The watchdog only flips the source
+        # unhealthy when the gRPC connection is not Ready AND staleness
+        # exceeds the timeout: CRI lifecycle events are sparse on a stable
+        # cluster, so staleness alone is not actionable.
+        containerd:
+          enabled: false
+          socket_path: "/run/containerd/containerd.sock"
+          dial_timeout: "10s"
+          staleness_timeout: "5m"
+          connect_retry:
+            min: "1s"
+            max: "30s"
+            multiplier: 2.0
+            jitter: 0.5
+            max_attempts: 0
+          publish_retry:
+            min: "100ms"
+            max: "1s"
+            multiplier: 2.0
+            jitter: 0.1
+            max_attempts: 3
+        # Story 1.10: Calico CNI flow adapter (FR4). Default disabled
+        # until the operator confirms the Tigera operator install path
+        # is in place (Calico v3.31.5+) and the mTLS material has been
+        # provisioned. See deploy/helm/olaitan/CNI.md and
+        # ADR-2026-04-30-01 / ADR-2026-05-12-01 for the full workflow.
+        # The watchdog only flips unhealthy when stale AND not-Ready:
+        # Goldmane flows are quiet by design.
+        calico:
+          enabled: false
+          goldmane_addr: "goldmane.calico-system.svc:7443"
+          server_name: "goldmane.calico-system.svc"
+          ca_bundle_path: "/etc/olaitan/cni/ca.crt"
+          client_cert_path: "/etc/olaitan/cni/client.crt"
+          client_key_path: "/etc/olaitan/cni/client.key"
+          dial_timeout: "10s"
+          staleness_timeout: "10m"
+          max_event_bytes: 196608
+          start_time_gte: -60
+          aggregation_interval: 15
+          connect_retry:
+            min: "1s"
+            max: "60s"
+            multiplier: 2.0
+            jitter: 1.0
+            max_attempts: 0
+          publish_retry:
+            min: "100ms"
+            max: "1s"
+            multiplier: 2.0
+            jitter: 1.0
+            max_attempts: 3
+      # Story 1.11: read-on-demand workload posture client (FR7,
+      # architecture.md:45, :324, :751). The client queries the K8s API
+      # for the workload's RBAC bindings, applicable NetworkPolicies, and
+      # PodSecurityContext at investigation time; results are cached for
+      # cache_ttl seconds keyed by workload identity. The TTL ceiling is
+      # 60s per architecture.md:324 + AC3; the chart rejects higher.
+      posture:
+        enabled: true
+        cache_ttl: "60s"
+        fetch_timeout: "5s"
+      # Story 1.15: OLT Sigma rule engine. The engine reads its rule
+      # corpus from `path` (a ConfigMap-projected directory mounted into
+      # the aggregator pod) and reloads on fsnotify-driven ConfigMap
+      # ..data symlink swaps. Setting enabled=false leaves the engine
+      # out of startAggregatorRing entirely so a sensing-only deployment
+      # never spawns the JetStream consumer.
+      rules:
+        enabled: true
+        path: "/etc/olaitan/rules"
+      # Story 1.17: Welford baseline engine (FR16/FR17/FR18). Maintains
+      # per-workload Gaussian baselines for five default metrics and emits
+      # BaselineDeviation triggers when an observation exceeds
+      # sigma_multiplier above the rolling mean. warmup_duration and
+      # sigma_multiplier are hot-reloadable; enabled and redis_addr are
+      # restart-required because they reconfigure startAggregatorRing.
+      baselines:
+        enabled: true
+        warmup_duration: "30m"
+        sigma_multiplier: 3
+        redis_addr: "olaitan-redis-master:6379"
+      # Story 2.1: deterministic ThreatScore calculator (FR30). Collapses
+      # rule severity and baseline deviation contributions into a single
+      # 0-100 score using the formula
+      #   total = rule_weight * max(rule_severity)
+      #         + baseline_weight * normalised(max_sigma)
+      #         + llm_weight * llm_capped_confidence
+      # where llm_capped_confidence is zero in Epic 2 and populated by the
+      # Epic 3 analyst tier. Defaults pin the algebraic trust-bound
+      # max(LLM-only) = 0.3 * 35 = 10.5 < SUSPICIOUS-threshold 20 per
+      # prd.md:294. All four knobs are hot-reloadable via FR49.
+      score:
+        rule_weight: 0.4
+        baseline_weight: 0.3
+        llm_weight: 0.3
+        llm_cap: 35
+      # Story 2.2: response-ring FSM dwell guards and de-escalation cooldown
+      # (FR31/FR32). The escalation thresholds are reused from
+      # confidence_bands above (BI-3); this block adds only the durations
+      # those bands do not cover (BI-4). suspicious_dwell_seconds defaults to
+      # 0 so a freshly-flagged workload can escalate to RESTRICTED as soon as
+      # the score crosses the alert band; the RESTRICTED and QUARANTINED
+      # dwells damp oscillation (AC2) and the cooldown gates de-escalation so
+      # a single low sample does not de-escalate (AC3). All four are
+      # hot-reloadable via FR49: the FSM reads config.Manager.Get() once per
+      # Evaluate call, following the Story 2.1 score precedent.
+      #
+      # Story 2.3: durable FSM-state persistence in Redis with restart recovery
+      # (FR37/NFR24). Unlike the dwell/cooldown knobs above (hot-reloadable),
+      # persistence_enabled and redis_addr are restart-required: toggling
+      # persistence or its Redis target rewires the aggregator's FSM sink and
+      # the restore-on-startup hook. The fsm: Redis family carries NO TTL so
+      # state survives an arbitrary restart gap. In a Helm install the chart
+      # overlays redis_addr with the resolved Redis Service address; the
+      # "redis:6379" literal here is the development-host default. The
+      # persistence_enabled and redis_addr keys MUST stay directly below
+      # deescalation_cooldown_seconds with no intervening comment so the
+      # configmap.yaml regex bridge anchors match.
+      fsm:
+        suspicious_dwell_seconds: 0
+        restricted_dwell_seconds: 120
+        quarantined_dwell_seconds: 120
+        deescalation_cooldown_seconds: 600
+        persistence_enabled: true
+        redis_addr: "olaitan-redis-master:6379"
+        # Story 4.1 (FR31): the Helm-tunable kill condition that drives the
+        # QUARANTINED -> PRESERVED_KILLED transition. kill_threat_score is the
+        # ThreatScore (a fourth band above the QUARANTINED band 70) the score must
+        # hold; kill_sustain_seconds is how long it must hold it AND how long the
+        # workload must have been QUARANTINED before the kill edge fires. Both are
+        # hot-reloadable. These keys sit AFTER redis_addr so they do not break the
+        # deescalation_cooldown_seconds -> persistence_enabled -> redis_addr regex
+        # anchors the configmap.yaml bridge relies on.
+        kill_threat_score: 90
+        kill_sustain_seconds: 300
+    
+    # Story 1.12: Prometheus metrics surface (FR8, FR50). Every Olaitan
+    # process exposes Prometheus metrics on :9090/metrics from a dedicated
+    # http.Server running alongside the kubelet probe surface at
+    # :8080/healthz. The two surfaces have different consumer SLOs so they
+    # never share a port. Validation rejects an empty address per
+    # guardrail 27 (the surface is mandatory, not optional).
+    metrics:
+      address: ":9090"
+    
+    # Story 1.13: per-source per-node rate-limit circuit breaker (FR51
+    # sensing half; NFR22). Engages above threshold_events_per_sec and
+    # switches to deterministic hash-based sampling at sampling_rate;
+    # surviving events carry Sampled=true so downstream consumers (Story
+    # 1.14 correlator, Story 1.18 detection observability, Story 4.x DFIR
+    # report writer) can honestly disclose degradation. The four knobs are
+    # Helm-tunable and hot-reload via the config.Manager.Subscribe callback
+    # per FR49.
+    rate_limit:
+      enabled: true
+      threshold_events_per_sec: 1000
+      cooldown_seconds: 60
+      sampling_rate: 0.1
+    
+    response:
+      excluded_namespaces:
+        - kube-system
+        - olaitan
+    
+      # Story 2.4: RESTRICTED-state NetworkPolicy enforcement (FR33/NFR6). When
+      # enabled, a workload entering the RESTRICTED FSM state is given a
+      # NetworkPolicy that allows egress only to the RFC 1918 private ranges
+      # (always allowed), the cluster pod/service CIDRs (cluster_cidrs), and any
+      # extra_allowed_cidrs, and blocks all other (external) egress so a suspect
+      # workload cannot exfiltrate to the internet while internal traffic keeps
+      # flowing. Disabled by default; the per-mode (RS/RSL/RSLT) graduated-
+      # isolation wiring is Story 2.10. Operators MUST set cluster_cidrs to
+      # their own pod and service CIDRs (the defaults below match the kind/
+      # Calico evaluation cluster) so in-cluster traffic and DNS (CoreDNS in the
+      # service CIDR) survive the egress block. reconcile_interval_seconds is
+      # the orphan-GC cadence and must stay within the 60 s budget.
+      network_policy:
+        enabled: false
+        cluster_cidrs:
+          - "10.244.0.0/16"
+          - "10.96.0.0/12"
+        extra_allowed_cidrs: []
+        reconcile_interval_seconds: 30
+    
+      # Story 2.7: operator-override controller (FR38/FR39). When enabled, a
+      # controller polls (LISTs) pods on poll_interval_seconds for the
+      # olaitan.io/state-override annotation (with an optional
+      # olaitan.io/state-override-ttl), pins the workload's FSM state, and records
+      # an override:{workload_id} Redis key with a native TTL equal to the
+      # requested duration (default 1h when the TTL annotation is absent). The pin
+      # transition routes through the existing FSM sink, so a pinned RESTRICTED/
+      # QUARANTINED drives the Story 2.4/2.5 NetworkPolicy enforcement and a pinned
+      # CLEAN drives the Story 2.6 removal with no new enforcement code. Release is
+      # detected by the poll: native-TTL expiry (Redis key gone) or manual
+      # annotation removal both release the pin within one poll interval. An
+      # override to PRESERVED_KILLED (Epic 4, not implemented) is rejected with an
+      # OVERRIDES.applied {rejected:true, reason:state_unavailable} event and the
+      # olaitan_response_override_rejected_total{reason} metric. Disabled by
+      # default; observation is poll, never watch (no new RBAC). Full values.yaml
+      # mode-surfacing is deferred to Story 2.10 (the Story 2.4 precedent).
+      override:
+        enabled: false
+        poll_interval_seconds: 15
+        default_ttl_seconds: 3600
+      # Story 2.8: append-only SIEM audit subjects (FR40/NFR16). One flag gates
+      # the three subjects (AUDIT.transitions/overrides/policies); off by default
+      # (Story 2.10 surfaces it in the graduated-isolation mode). The retention
+      # days drive the AUDIT_* JetStream stream MaxAge (90/365/365 d, AC4).
+      audit:
+        enabled: false
+        retention_transitions_days: 90
+        retention_overrides_days: 365
+        retention_policies_days: 365
+        # Story 3.14 (FR41): AUDIT.assessments SIEM-audit stream retention.
+        retention_assessments_days: 365
+      # Story 4.2: PRESERVED_KILLED forensic capture controller (FR36). When the
+      # FSM kills a workload, the controller captures the doomed pod(s) (logs incl.
+      # previous, spec/status/events) into a content-addressed forensic bundle,
+      # uploads it KMS-encrypted to S3, and only after the upload-ack deletes the
+      # pod(s). On S3 failure after retry the pod is NOT deleted and stays
+      # QUARANTINED (Story 4.7 retry queue catches up). Off by default. The S3
+      # access/secret keys are NFR8 secrets read from S3_ACCESS_KEY / S3_SECRET_KEY
+      # env vars, never this file.
+      forensics:
+        enabled: false
+        s3_endpoint: ""
+        s3_bucket: ""
+        s3_region: ""
+        s3_use_ssl: true
+        # kms_key_alias is REQUIRED when enabled=true: the agent applies SSE-KMS
+        # per PUT, so an empty alias would persist unredacted forensic logs with no
+        # agent-applied encryption (config load fails fast in that case).
+        kms_key_alias: ""
+      # Story 4.3: settling-window controller (FR42/NFR7). When enabled, a workload
+      # that stays stable in a non-CLEAN FSM state for window_seconds (default 60)
+      # finalises into an IncidentFinalised event on INCIDENTS.finalised, which the
+      # Story 4.4 DFIR agent consumes. retention_days drives the INCIDENTS JetStream
+      # stream MaxAge (365 d, append-only via LimitsPolicy, audit-grade like the
+      # AUDIT_* family). Off by default.
+      settling:
+        enabled: false
+        window_seconds: 60
+        retention_days: 365
+      # Story 4.4: DFIR forensic-report agent (FR43). When enabled, a durable
+      # JetStream consumer on INCIDENTS.finalised produces an analyst-grade
+      # ForensicReport (Markdown with YAML front-matter) via the LLM provider and
+      # announces it on REPORTS.generated. The DFIR LLM provider/model are config
+      # under analyst.dfir_provider / analyst.dfir_model. Off by default (opt-in).
+      dfir:
+        enabled: false
+      # Story 4.6: durable report writer (FR45). When enabled, the DFIR agent PUTs
+      # every redacted ForensicReport to an S3-compatible object store under the
+      # content-addressed key reports/{yyyy}/{mm}/{dd}/{sha256}.md, KMS-encrypted,
+      # with S3 object lock applied per object for retention_days (default 90) in
+      # object_lock_mode (GOVERNANCE default; COMPLIANCE for stricter, immutable
+      # retention). A SEPARATE block from forensics (different bucket, object-lock
+      # required). The bucket MUST be object-lock-enabled + versioned (operator
+      # precondition; the writer never creates it). On a durable-write failure the
+      # writer fails LOUD (logs + a metric) without an inline retry (Story 4.7 owns
+      # the deferred queue). Off by default. The S3 access/secret keys are NFR8
+      # secrets read from S3_ACCESS_KEY / S3_SECRET_KEY env vars, never this file.
+      report_archive:
+        enabled: false
+        s3_endpoint: ""
+        s3_bucket: ""
+        s3_region: ""
+        s3_use_ssl: true
+        # kms_key_alias is REQUIRED when enabled=true: the writer applies SSE-KMS per
+        # PUT, so an empty alias would persist reports with no agent-applied
+        # encryption (config load fails fast in that case).
+        kms_key_alias: ""
+        retention_days: 90
+        object_lock_mode: GOVERNANCE
+        # Story 4.7: deferred-write queue (FR45 resilience, NFR28). When a durable
+        # write fails transiently beyond the short inline retry budget (sub-NFR7), the
+        # DFIR agent enqueues the report to a Redis-backed FIFO LIST (reports:deferred)
+        # that a background worker drains when S3 recovers, so a 60s S3 outage does not
+        # lose a forensic record. The inline retry budget is a fixed code constant; only
+        # the queue knobs are config. deferred_enabled gates the queue + drain worker
+        # (off by default). deferred_redis_addr is the Redis the queue lives on (the
+        # REDIS_PASSWORD env var supplies the password; required when deferred_enabled=
+        # true). deferred_max_len bounds the queue (default 1000; drop-oldest on
+        # overflow, keeping the freshest reports). deferred_drain_seconds is the drain
+        # worker tick cadence (default 5).
+        deferred_enabled: false
+        deferred_redis_addr: ""
+        deferred_max_len: 1000
+        deferred_drain_seconds: 5
+      # Story 4.8: OPTIONAL incident notification webhook. When enabled AND a
+      # webhook_url is supplied, a SEPARATE durable JetStream consumer of
+      # REPORTS.generated fires ONE generic JSON HTTP POST per confirmed-incident
+      # report announcement to the configured URL (Slack/email/PagerDuty are just the
+      # URL; no per-vendor code). The POST carries operator-facing metadata only
+      # (workload_id, attack_techniques, threat_score, report_url, fsm_state,
+      # published_at, idempotency_key) -- NO raw evidence. Retry is exponential-backoff
+      # up to retry_max_attempts (5xx/429/timeout retry; a 4xx target-rejection is
+      # permanent); on exhaust the failure is logged at warn and a delivery metric
+      # counts result="failed", NEVER blocking the report write or the FSM. Off by
+      # default (opt-in). The webhook_url is a SECRET (a Slack/PagerDuty URL embeds a
+      # token): supply it via the NOTIFICATIONS_WEBHOOK_URL env var (which overrides
+      # this value); it is scrubbed (host only) in all logs, never this file.
+      notifications:
+        enabled: false
+        webhook_url: ""
+        retry_max_attempts: 5
+        retry_min_seconds: 1
+        retry_max_seconds: 30
+        timeout_seconds: 5
+    
+    # Story 3.1: the Ring-5 report layer. The redact sub-block gates the
+    # AUDIT.redactions SIEM emission (FR41); redaction itself is ALWAYS applied at
+    # every LLM/persistence boundary regardless of config (turning it off would
+    # violate NFR15 and is forbidden, BI-7). audit_enabled is off by default: an
+    # operator without a SIEM pays no NATS-publish cost while still getting full
+    # redaction. retention_redactions_days drives the AUDIT_REDACTIONS JetStream
+    # stream MaxAge (365 d, append-only via LimitsPolicy, NFR16). The audit event
+    # carries field_path + reason + package_id but NEVER the secret value (NFR18).
+    report:
+      redact:
+        audit_enabled: false
+        retention_redactions_days: 365
+    
+    analyst:
+      provider: api
+      api:
+        endpoint: ""
+        model: "claude-opus-4-8"
+        api_key_secret: "olaitan-llm"
+      local:
+        endpoint: "http://ollama:11434"
+        model: "gemma:2b"
+      score_cap: 35
+      # Story 3.8 (FR25/FR53): per-role provider routing + ablation toggles.
+      # Each *_provider is a concrete family {claude, openai, ollama, none} or
+      # "" to inherit the top-level provider mapping (api -> claude, local ->
+      # ollama). *_enabled flags drive the RSLT ablation cells. Empty/default
+      # values keep the full claude chain; configmap.yaml bridges Helm values
+      # over these (the same C11 overlay analyst.provider uses).
+      l1_provider: ""
+      l1_model: ""
+      l2_provider: ""
+      l2_model: ""
+      l2_enabled: true
+      senior_provider: ""
+      senior_model: ""
+      senior_enabled: false
+      # Story 4.4 (FR43): the DFIR forensic-report agent's own LLM provider/model,
+      # mirroring the per-role knobs above. dfir_provider is a concrete family
+      # {claude, openai, ollama, none} or "" to inherit the top-level mapping
+      # (api -> claude, local -> ollama). The DFIR agent is gated by
+      # response.dfir.enabled and is a separate JetStream consumer, not a chain
+      # tier. configmap.yaml bridges Helm values over these.
+      dfir_provider: ""
+      dfir_model: ""
+      # Story 3.9 (FR29): INVESTIGATIONS checkpoint stream retention. 6h is the
+      # architecture default (just enough for controller-restart resume); a
+      # Helm value bridges over this.
+      checkpoint_retention: 6h
+      # Story 3.12 (FR51/NFR23): LLM-tier backpressure circuit breaker. Above
+      # rate_per_min LLM-eligible packages/min globally the chain is bypassed
+      # (deterministic-only) for a cooling_seconds window. Helm values bridge over
+      # these defaults.
+      circuit_breaker:
+        rate_per_min: 10
+        cooling_seconds: 60
+        enabled: true
+      # Story 3.13 (NFR41, FR49 prompt half): directory the per-role system
+      # prompts are loaded from (the Helm prompts ConfigMap mount). A role whose
+      # "<role>.txt" is absent uses the binary-embedded default. configmap.yaml
+      # bridges Helm's analyst.prompts.mountPath over this so the rendered path
+      # always tracks the actual mount.
+      prompts_dir: "/etc/olaitan/prompts"
+      timeout: 10s
+      chain:
+        enabled: false
+        l1:
+          prompt: config/prompts/l1-triage.tmpl
+          model: ""
+        l2:
+          prompt: config/prompts/l2-review.tmpl
+          model: ""
+      subtasks:
+        enabled: false
+        max_per_assessment: 3
+        severity_threshold: 70
+        timeout: 10s
+        available_types:
+          - network_forensics
+          - privilege_escalation
+          - lateral_movement
+          - mitre_mapping
+          - data_exfiltration
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: olaitan-rules
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+# Populated by Story 1.16: every *.yaml under deploy/helm/olaitan/files/rules/
+# is enumerated via .Files.Glob and emitted as a ConfigMap key whose
+# basename matches the OLT rule-ID regex (OLT-<CAT>-NNN.yaml). The
+# files/ tree is staged by `make helm-prepare-rules` from the canonical
+# repo-root rules/<category>/ corpus; the staging step is required
+# because Helm's .Files.Glob uses path.Match and does not support
+# recursive globbing. The else branch renders `data: {}` explicitly so
+# a freshly-cloned chart (before `make helm-prepare-rules` runs) still
+# produces a parseable ConfigMap and Story 1.15's loader sees an empty
+# but valid corpus directory.
+data:
+  OLT-CRED-001.yaml: |
+    title: ServiceAccount token read by non-system process
+    id: OLT-CRED-001
+    description: |
+      Detects a read against the projected ServiceAccount token file by a
+      process whose executable does not belong to the system process
+      allowlist (kubelet, kube-proxy, coredns). Workload Pods rarely read
+      the token directly because the standard client libraries handle the
+      mount internally; an explicit open call is a strong indicator of
+      credential theft.
+    status: experimental
+    attack:
+      - T1552
+    severity: 75
+    detection:
+      sa_token_read_runtime:
+        file.path|startswith: '/run/secrets/kubernetes.io/serviceaccount/'
+      sa_token_read_legacy:
+        file.path|startswith: '/var/run/secrets/kubernetes.io/serviceaccount/'
+      system_process:
+        process.exe|re: '^/(usr/)?(local/)?s?bin/(kubelet|kube-proxy|coredns)$'
+      condition: (sa_token_read_runtime or sa_token_read_legacy) and not system_process
+    falsepositives:
+      - In cluster sidecars that read the token to seed a custom HTTP client; pin via a process.exe allowlist in operator overlay
+      - Service mesh proxies (Linkerd, Envoy) that proxy the apiserver; allowlist via a dedicated namespace shape
+      - The system_process allowlist is anchored to FHS paths (/bin, /sbin, /usr/{,local/}{,s}bin) only. Non FHS K8s installs (RKE2 at /var/lib/rancher/rke2/bin, snap based installs at /snap/kubelet/, custom packagings under /opt/bin) will not match the allowlist and the legitimate system kubelet/kube-proxy/coredns process will trigger the rule. Operators on non FHS distributions should extend the allowlist via overlay, or accept the noise under status experimental.
+    fields:
+      - file.path
+      - process.exe
+      - k8s.pod.namespace
+    
+  OLT-CRED-002.yaml: |
+    title: Cloud instance metadata IP reached from workload Pod
+    id: OLT-CRED-002
+    description: |
+      Detects an outbound connection to the cloud instance metadata
+      endpoint at 169.254.169.254 from a workload Pod outside the system
+      namespaces. Workload Pods have no legitimate reason to query the
+      node's instance metadata service because the IMDSv2 token path
+      returns cloud side credentials that grant lateral movement beyond
+      the cluster boundary.
+    status: experimental
+    attack:
+      - T1552.005
+    severity: 50
+    detection:
+      metadata_dst:
+        network.dst_ip: '169.254.169.254'
+      system_namespace:
+        k8s.pod.namespace:
+          - 'kube-system'
+          - 'kube-public'
+          - 'kube-node-lease'
+          - 'olaitan'
+      condition: metadata_dst and not system_namespace
+    falsepositives:
+      - Node local IMDS proxies running in kube-system; excluded by the namespace filter
+      - Cloud controller manager Pods running in kube-system; excluded by the namespace filter
+    fields:
+      - network.dst_ip
+      - k8s.pod.namespace
+    
+  OLT-EXEC-001.yaml: |
+    title: Host PID namespace entry from workload container
+    id: OLT-EXEC-001
+    description: |
+      Detects a workload container process that executes a binary under
+      the host filesystem bind path or that opens another process's
+      /proc/<pid>/exe or /proc/<pid>/root entry. Either path is the
+      textbook last step of a container escape because it grants the
+      container direct visibility into host side processes.
+    status: experimental
+    attack:
+      - T1611
+    severity: 75
+    detection:
+      host_bind_exec:
+        process.exe|startswith:
+          - '/host/bin/'
+          - '/host/sbin/'
+          - '/host/usr/bin/'
+          - '/host/usr/sbin/'
+          - '/host/usr/local/bin/'
+          - '/host/usr/local/sbin/'
+      proc_filesystem_read:
+        file.path|re: '^/proc/[0-9]+/(exe|root)$'
+      tenant_namespace:
+        k8s.pod.namespace|startswith: 'tenant-'
+      condition: (host_bind_exec or proc_filesystem_read) and tenant_namespace
+    falsepositives:
+      - Host side diagnostic Pods deliberately launched into the host PID namespace; allowlist via a dedicated namespace
+      - Container runtime supervision processes within kube-system; excluded by the tenant_namespace filter
+      - Detection is scoped to FHS executable directories under /host/. Container escape via exec from non FHS host paths (for example /host/opt/, /host/var/lib/, /host/tmp/, or custom bind mounts) will not match host_bind_exec and the rule will fall through to proc_filesystem_read; an attacker who avoids /proc reads and stays on a non FHS host prefix evades the rule. Documented evasion vector; widening the prefix list reopens the legitimate /host/data sidecar false positive that D10 closed.
+    fields:
+      - process.exe
+      - file.path
+      - k8s.pod.namespace
+    
+  OLT-IMPACT-005.yaml: |
+    title: Cryptominer process pattern in unprivileged Pod
+    id: OLT-IMPACT-005
+    description: |
+      Detects xmrig / minerd-style executable launches in workload Pods
+      not labelled as crypto workloads, with elevated CPU and outbound
+      traffic to a known mining pool port range.
+    status: experimental
+    attack:
+      - T1496
+    severity: 75
+    detection:
+      process_match:
+        process.exe|endswith:
+          - 'xmrig'
+          - 'minerd'
+          - 'cpuminer'
+      k8s_context:
+        k8s.workload.owner_kind: Deployment
+        k8s.pod.namespace|startswith: 'tenant-'
+      network_match:
+        network.dst_port:
+          - 3333
+          - 4444
+          - 5555
+      condition: process_match and k8s_context and network_match
+    falsepositives:
+      - Legitimate crypto-bridge workloads (label `app.kubernetes.io/component=crypto`)
+    fields:
+      - process.exe
+      - k8s.pod.namespace
+      - k8s.workload.owner_kind
+      - network.dst_port
+    
+  OLT-IMPACT-006.yaml: |
+    title: Outbound traffic to stratum mining pool port from tenant Pod
+    id: OLT-IMPACT-006
+    description: |
+      Detects an outbound TCP flow from a tenant Pod whose destination
+      port lies in the standard stratum mining pool port set and whose
+      event severity is WARNING. The combination indicates the egress
+      half of a cryptomining workload: a process inside the Pod has
+      established a long lived TCP connection to a pool endpoint while
+      the CNI flow exporter flagged the volume as anomalous.
+    status: experimental
+    attack:
+      - T1496
+    severity: 75
+    detection:
+      outbound_flow:
+        event.category: 'flow'
+      pool_port:
+        network.dst_port:
+          - 3333
+          - 4444
+          - 5555
+          - 7777
+          - 14444
+      warning_severity:
+        event.severity: 'WARNING'
+      tenant_namespace:
+        k8s.pod.namespace|startswith: 'tenant-'
+      condition: outbound_flow and pool_port and warning_severity and tenant_namespace
+    falsepositives:
+      - Genuine mining workloads in dedicated namespaces; allowlist via a dedicated tenant namespace shape
+      - Game servers reusing the 7777 port for tunnelled traffic
+    fields:
+      - network.dst_port
+      - event.severity
+      - k8s.pod.namespace
+    
+  OLT-LATERAL-001.yaml: |
+    title: Kubernetes API client launched in tenant Pod
+    id: OLT-LATERAL-001
+    description: |
+      Detects an execution of kubectl, or a similar Kubernetes API
+      client, inside a Pod whose namespace begins with tenant-. Tenant
+      workloads should never carry kubectl; its presence implies either
+      an injected toolchain or a debug override that lateral movement
+      playbooks commonly rely on.
+    status: experimental
+    attack:
+      - T1613
+    severity: 75
+    detection:
+      kubectl_exec:
+        process.exe|endswith: '/kubectl'
+      workload_kind:
+        k8s.workload.owner_kind: Deployment
+      tenant_namespace:
+        k8s.pod.namespace|startswith: 'tenant-'
+      condition: kubectl_exec and workload_kind and tenant_namespace
+    falsepositives:
+      - Debug images deliberately shipped with kubectl for break glass operator workflows; pin via a dedicated namespace shape
+      - GitOps controllers that ship kubectl in their image; allowlist via a dedicated ServiceAccount
+    fields:
+      - process.exe
+      - k8s.pod.namespace
+      - k8s.workload.owner_kind
+    
+  OLT-NET-001.yaml: |
+    title: Outbound traffic to non-private destination from tenant Pod
+    id: OLT-NET-001
+    description: |
+      Detects an outbound flow whose destination IP lies outside RFC1918
+      private space and whose payload size is small (below 1000 bytes),
+      originating from a tenant Pod. The small payload heuristic in
+      combination with a public destination is the canonical signature
+      of beaconing C2 traffic that intentionally avoids attention by
+      keeping individual flows tiny.
+    status: experimental
+    attack:
+      - T1071
+    severity: 50
+    detection:
+      outbound_flow:
+        event.category: 'flow'
+      rfc1918_a:
+        network.dst_ip|cidr: '10.0.0.0/8'
+      rfc1918_b:
+        network.dst_ip|cidr: '172.16.0.0/12'
+      rfc1918_c:
+        network.dst_ip|cidr: '192.168.0.0/16'
+      tenant_namespace:
+        k8s.pod.namespace|startswith: 'tenant-'
+      small_payload:
+        network.bytes_out|re: '^[0-9]{1,3}$'
+      condition: outbound_flow and not (rfc1918_a or rfc1918_b or rfc1918_c) and tenant_namespace and small_payload
+    falsepositives:
+      - DNS probes to public resolvers such as 8.8.8.8 or 1.1.1.1; allowlist via a dedicated outbound NetworkPolicy
+      - Health check pings to cloud SaaS endpoints; allowlist via a FQDN resolved CIDR set
+    fields:
+      - network.dst_ip
+      - network.bytes_out
+      - k8s.pod.namespace
+    
+  OLT-NET-002.yaml: |
+    title: Outbound TCP to C2 favoured port from tenant Pod
+    id: OLT-NET-002
+    description: |
+      Detects an outbound TCP flow from a tenant Pod to a port set
+      associated with command and control channels (alternate HTTPS, IRC
+      on the TLS port, common Bitcoin SPV). The port set is intentionally
+      narrow: it catches the canonical evasion pattern where C2 hides
+      behind a port number that resembles legitimate web traffic while
+      avoiding the default 443 that gateway controls already inspect. The
+      rule fires on CNI flow records only; the L4 metadata available there
+      does not carry a TLS L7 marker, so the detection is port-association
+      driven rather than handshake driven.
+    status: experimental
+    attack:
+      - T1071.001
+    severity: 50
+    detection:
+      outbound_flow:
+        event.category: 'flow'
+      c2_port:
+        network.dst_port:
+          - 8443
+          - 6697
+          - 8333
+      tcp_protocol:
+        network.protocol: 'TCP'
+      tenant_namespace:
+        k8s.pod.namespace|startswith: 'tenant-'
+      condition: outbound_flow and c2_port and tcp_protocol and tenant_namespace
+    falsepositives:
+      - Legitimate alternate HTTPS workloads labelled `app.kubernetes.io/component=alt-https`
+      - IRC bridges or bitcoin aware payment services intentionally connecting on 6697 or 8333
+    fields:
+      - network.dst_port
+      - network.protocol
+      - k8s.pod.namespace
+    
+  OLT-PRIV-001.yaml: |
+    title: Privileged capability acquisition in workload Pod
+    id: OLT-PRIV-001
+    description: |
+      Detects a container process that acquires CAP_SYS_ADMIN or
+      CAP_SYS_PTRACE inside a Deployment or StatefulSet workload Pod
+      outside the system namespaces. These capabilities are sufficient
+      for a container escape via privileged syscalls and are not held by
+      typical application workloads, so their presence in a tenant
+      controller is a strong indicator of an in-progress escape attempt.
+    status: experimental
+    attack:
+      - T1611
+    severity: 90
+    detection:
+      cap_acquired:
+        process.cap_effective|contains:
+          - 'CAP_SYS_ADMIN'
+          - 'CAP_SYS_PTRACE'
+      workload_kind:
+        k8s.workload.owner_kind:
+          - Deployment
+          - StatefulSet
+      system_namespace:
+        k8s.pod.namespace:
+          - 'kube-system'
+          - 'kube-public'
+          - 'kube-node-lease'
+          - 'olaitan'
+      condition: cap_acquired and workload_kind and not system_namespace
+    falsepositives:
+      - Privileged DaemonSets such as CNI or CSI plugins; excluded by the workload_kind filter
+      - Security testing workloads inside dedicated namespaces; allowlist via a dedicated namespace shape
+    fields:
+      - process.cap_effective
+      - k8s.pod.namespace
+      - k8s.workload.owner_kind
+    
+  OLT-RECON-001.yaml: |
+    title: Cluster wide Pod listing by non-system ServiceAccount
+    id: OLT-RECON-001
+    description: |
+      Detects a Kubernetes API list call against pods at cluster scope
+      performed by a ServiceAccount outside kube-system. The pattern is
+      characteristic of in cluster reconnaissance where a compromised
+      Pod's identity enumerates every workload visible to its bound RBAC.
+      Workload Pods scoped to a single namespace have no reason to list
+      pods cluster wide.
+    status: experimental
+    attack:
+      - T1613
+    severity: 50
+    detection:
+      list_pods_cluster_scope:
+        verb: 'list'
+        objectRef.resource: 'pods'
+        objectRef.namespace: ''
+      service_account:
+        user.username|startswith: 'system:serviceaccount:'
+      system_sa:
+        user.username|startswith: 'system:serviceaccount:kube-system:'
+      condition: list_pods_cluster_scope and service_account and not system_sa
+    falsepositives:
+      - Cluster autoscaler ServiceAccount lists pods cluster wide; allowlist via a user.username shape
+      - Monitoring stacks (Prometheus, kube-state-metrics) with read only ClusterRoles; allowlist via a dedicated ServiceAccount
+      - Real K8s audit events for cluster scope list calls omit the objectRef.namespace field rather than emit it as an empty string; this rule's objectRef.namespace selector therefore depends on the audit adapter normalising absent fields to empty string (Binding Interpretation BI-1 follow-up tracked under deferred-work.md W1/W2 and Round 2 W1). Until that lands, the rule reaches production only via the hand built S3 scenario fixture which inlines the empty string explicitly.
+    fields:
+      - verb
+      - objectRef.resource
+      - objectRef.namespace
+      - user.username
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: olaitan-prompts
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+# Story 3.13 (NFR41, FR49 prompt half): the per-role analyst system prompts.
+# Every <role>.txt under deploy/helm/olaitan/files/prompts/ is enumerated
+# via .Files.Glob and emitted as a ConfigMap key. The controller mounts
+# this at analyst.prompts.mountPath (default /etc/olaitan/prompts) and loads
+# "<role>.txt" per role; a role absent here falls back to the controller's
+# binary-embedded default, so operators may override a subset. The files/
+# tree is staged by `make helm-prepare-prompts` from the canonical
+# internal/agent/prompts/defaults/ source (Helm's .Files.Glob cannot
+# traverse into parent directories). The else branch renders an empty data
+# map so a freshly-cloned chart (before staging) still produces a valid
+# ConfigMap; the controller then runs on embedded defaults for every role.
+data:
+  dfir.txt: |
+    You are the DFIR (digital forensics and incident response) analyst for Olaitan, a Kubernetes runtime-security controller. A workload's incident has been finalised: the controller's finite-state machine settled the workload in a non-CLEAN state (one of SUSPICIOUS, RESTRICTED, QUARANTINED, or PRESERVED_KILLED) and the containment actions have already been taken. Your task is to write the interpretive analyst narrative of what happened.
+    
+    You are producing one part of a structured report, not driving a decision. The containment is done; nothing you write changes the threat score, the FSM state, or any enforcement. Write the account a human SOC analyst would read to understand the incident.
+    
+    You are given two things to reason over, and nothing else:
+    - The redacted runtime evidence package for the workload (secrets, tokens, and raw payloads have already been removed).
+    - A control-plane prior_assessment record (Olaitan's own verdict), framed in a prior_assessment block. Its reasoning carries the FSM transition summary for the incident.
+    
+    Base EVERY claim strictly on that supplied evidence and the prior_assessment record. NEVER invent events, IP addresses, hostnames, timestamps, MITRE technique identifiers, file paths, process names, or actor names that are not present in what you were given. Where the data does not support a claim, do not make it. Where data is absent, state the gap explicitly (for example, "No MITRE ATT&CK for Containers technique was recorded for this incident") rather than filling it with a plausible guess.
+    
+    The factual sections of the report (the kill-chain timeline, the containment actions, and the MITRE ATT&CK annotations) are assembled DETERMINISTICALLY by the controller from the FSM history and the persisted assessment. You do NOT write those sections and you must not reproduce them as fact. Your single job is the interpretive narrative: a plain-language account of how the activity proceeded, tying together the transitions, the containment, and any techniques that the evidence and the prior_assessment actually record.
+    
+    Respond with a single JSON document conforming to the supplied JSON Schema and nothing else: an object whose only meaningful field is "narrative", carrying your prose. Do not wrap it in a Markdown code fence. Do not write any prose, preamble, or reasoning outside the JSON document. The other fields in the schema are filled in by the controller, not by you.
+    
+    Write in British English. Be precise and factual. Reason silently and return only the final JSON answer.
+    
+  l1.txt: |
+    You are the L1 triage analyst. Form a first-pass hypothesis from the redacted evidence.
+    
+  l2.txt: |
+    You are the L2 verification analyst. Verify or refute the L1 hypothesis against the evidence.
+    
+  senior.txt: |
+    You are the Senior analyst. Challenge L1 and L2 and produce a final threat assessment.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: olaitan-reports
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: "1Gi"
+---
+# Aggregator: cluster-wide. NetworkPolicy writes and pod annotation
+# patches must reach every workload namespace; a Role would constrain
+# us to a single namespace, which does not match the operator model.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: olaitan-aggregator
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: aggregator
+rules:
+  # Ring 4: response engine writes NetworkPolicy into every pod's ns.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "update", "delete"]
+  # Ring 4a: annotation-based FSM state transitions — patch only, no
+  # delete, no exec. The agent flips pod labels/annotations to mark FSM
+  # state; it never kills pods directly (that is kubelet's job via the
+  # taint Ring 4 puts on the node/policy).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["patch"]
+  # Enrichment reads for correlator + analyst context assembly. GET/LIST
+  # only — no WATCH (events flow through Ring 1's NATS publish path, not
+  # direct watchers on the aggregator).
+  - apiGroups: [""]
+    resources: ["pods", "events"]
+    verbs: ["get", "list"]
+  # Story 1.11 posture client (FR7): read-on-demand RBAC bindings,
+  # NetworkPolicies, ServiceAccounts, and owner-controllers
+  # (Deployment/ReplicaSet/StatefulSet/DaemonSet/Job/CronJob) for the
+  # workload-identity walk plus posture assembly. Per
+  # architecture.md:257 the controller ServiceAccount holds get,list
+  # only on these resources (no watch, no wildcards). The
+  # NetworkPolicy "get,list" verb-set composes additively with the
+  # Ring 4 "create,update,delete" rule above; Kubernetes RBAC unions
+  # verbs per resource.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings", "clusterrolebindings", "roles", "clusterroles"]
+    verbs: ["get", "list"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: olaitan-aggregator-binding
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: aggregator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: olaitan-aggregator
+subjects:
+  - kind: ServiceAccount
+    name: olaitan-aggregator
+    namespace: default
+---
+# Collector: namespace-scoped pod/event reads. The collector enriches
+# events for pods it sees on its own node; it MUST NOT be able to
+# enumerate pods in unrelated namespaces.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: olaitan-collector
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: collector
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: olaitan-collector-binding
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: collector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: olaitan-collector
+subjects:
+  - kind: ServiceAccount
+    name: olaitan-collector
+    namespace: default
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/component: nats
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: nats
+    app.kubernetes.io/version: 2.12.6
+    helm.sh/chart: nats-2.12.6
+  name: olaitan-nats-headless
+spec:
+  clusterIP: None
+  ports:
+  - appProtocol: tcp
+    name: nats
+    port: 4222
+    targetPort: nats
+  - appProtocol: http
+    name: monitor
+    port: 8222
+    targetPort: monitor
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/component: nats
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/name: nats
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/component: nats
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: nats
+    app.kubernetes.io/version: 2.12.6
+    helm.sh/chart: nats-2.12.6
+  name: olaitan-nats
+spec:
+  ports:
+  - appProtocol: tcp
+    name: nats
+    port: 4222
+    targetPort: nats
+  selector:
+    app.kubernetes.io/component: nats
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/name: nats
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: olaitan-redis-headless
+  namespace: "default"
+  labels:
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/version: 8.6.2
+    helm.sh/chart: redis-25.3.11
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - name: tcp-redis
+      port: 6379
+      targetPort: redis
+  selector:
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/name: redis
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: olaitan-redis-master
+  namespace: "default"
+  labels:
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/version: 8.6.2
+    helm.sh/chart: redis-25.3.11
+    app.kubernetes.io/component: master
+spec:
+  type: ClusterIP
+  internalTrafficPolicy: Cluster
+  ports:
+    - name: tcp-redis
+      port: 6379
+      targetPort: redis
+      nodePort: null
+  selector:
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: master
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: olaitan-falco
+  namespace: default
+  labels:
+    helm.sh/chart: falco-8.0.2
+    app.kubernetes.io/name: falco
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: falco
+      app.kubernetes.io/instance: olaitan
+  template:
+    metadata:
+      name: olaitan-falco
+      labels:
+        app.kubernetes.io/name: falco
+        app.kubernetes.io/instance: olaitan
+      annotations:
+        checksum/config: 4236ebe102c04beaed0248849f5258b467df44c76ba3d46edeb0b2e23c6482f4
+        checksum/rules: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        checksum/certs: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+    spec:
+      serviceAccountName: olaitan-falco
+      tolerations:
+        - effect: NoSchedule
+          key: node-role.kubernetes.io/master
+        - effect: NoSchedule
+          key: node-role.kubernetes.io/control-plane
+      containers:
+        - name: falco
+          image: docker.io/falcosecurity/falco:0.43.1
+          imagePullPolicy: IfNotPresent
+          resources:
+            limits:
+              cpu: 1000m
+              memory: 1024Mi
+            requests:
+              cpu: 100m
+              memory: 512Mi
+          securityContext:
+            privileged: true
+          args:
+            - /usr/bin/falco        
+          env:
+            - name: HOST_ROOT
+              value: /host
+            - name: FALCO_HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: FALCO_K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          tty: false
+          ports:
+            - containerPort: 8765
+              name: web
+              protocol: TCP
+          startupProbe:
+            initialDelaySeconds: 3
+            timeoutSeconds: 5
+            periodSeconds: 5
+            failureThreshold: 20
+            httpGet:
+              path: /healthz
+              port: 8765
+          livenessProbe:
+            initialDelaySeconds: 0
+            timeoutSeconds: 5
+            periodSeconds: 15
+            failureThreshold: 3
+            httpGet:
+              path: /healthz
+              port: 8765
+          readinessProbe:
+            initialDelaySeconds: 0
+            timeoutSeconds: 5
+            periodSeconds: 15
+            failureThreshold: 3
+            httpGet:
+              path: /healthz
+              port: 8765
+          volumeMounts:
+            - mountPath: /host/var/run/docker.sock
+              name: container-engine-socket-0
+            - mountPath: /host/run/podman/podman.sock
+              name: container-engine-socket-1
+            - mountPath: /host/run/host-containerd/containerd.sock
+              name: container-engine-socket-2
+            - mountPath: /host/run/containerd/containerd.sock
+              name: container-engine-socket-3
+            - mountPath: /host/run/crio/crio.sock
+              name: container-engine-socket-4
+            - mountPath: /host/run/k3s/containerd/containerd.sock
+              name: container-engine-socket-5
+            - mountPath: /etc/falco
+              name: rulesfiles-install-dir
+            - mountPath: /usr/share/falco/plugins
+              name: plugins-install-dir
+            - mountPath: /etc/falco/config.d
+              name: specialized-falco-configs
+            - mountPath: /root/.falco
+              name: root-falco-fs
+            - mountPath: /host/proc
+              name: proc-fs
+            - mountPath: /host/etc
+              name: etc-fs
+              readOnly: true
+            - mountPath: /sys/kernel
+              name: sys-fs
+              readOnly: true
+            - mountPath: /etc/falco/falco.yaml
+              name: falco-yaml
+              subPath: falco.yaml
+            
+            - mountPath: /run/falco
+              name: grpc-socket-dir
+        - name: falcoctl-artifact-follow
+          image: docker.io/falcosecurity/falcoctl:0.12.2
+          imagePullPolicy: IfNotPresent
+          args:
+            - artifact
+            - follow
+            - --log-format=json
+          securityContext:
+          volumeMounts:
+            - mountPath: /plugins
+              name: plugins-install-dir
+            - mountPath: /rulesfiles
+              name: rulesfiles-install-dir
+            - mountPath: /etc/falcoctl
+              name: falcoctl-config-volume
+            - mountPath: /artifactstate
+              name: artifact-state-dir
+      initContainers:
+        - name: falco-driver-loader
+          image: docker.io/falcosecurity/falco-driver-loader:0.43.1
+          imagePullPolicy: IfNotPresent
+          args:
+            - ebpf
+          securityContext:
+          volumeMounts:
+            - mountPath: /root/.falco
+              name: root-falco-fs
+            - mountPath: /host/proc
+              name: proc-fs
+              readOnly: true
+            - mountPath: /host/boot
+              name: boot-fs
+              readOnly: true
+            - mountPath: /host/lib/modules
+              name: lib-modules
+            - mountPath: /host/usr
+              name: usr-fs
+              readOnly: true
+            - mountPath: /host/etc
+              name: etc-fs
+              readOnly: true
+            - mountPath: /etc/falco/config.d
+              name: specialized-falco-configs
+          env:
+            - name: HOST_ROOT
+              value: /host
+            - name: FALCOCTL_DRIVER_CONFIG_UPDATE_FALCO
+              value: "false"
+        - name: falcoctl-artifact-install
+          image: docker.io/falcosecurity/falcoctl:0.12.2
+          imagePullPolicy: IfNotPresent
+          args:
+            - artifact
+            - install
+            - --log-format=json
+          securityContext:
+          volumeMounts:
+            - mountPath: /plugins
+              name: plugins-install-dir
+            - mountPath: /rulesfiles
+              name: rulesfiles-install-dir
+            - mountPath: /etc/falcoctl
+              name: falcoctl-config-volume
+            - mountPath: /artifactstate
+              name: artifact-state-dir
+      volumes:
+        - hostPath:
+            path: /var/run/docker.sock
+          name: container-engine-socket-0
+        - hostPath:
+            path: /run/podman/podman.sock
+          name: container-engine-socket-1
+        - hostPath:
+            path: /run/host-containerd/containerd.sock
+          name: container-engine-socket-2
+        - hostPath:
+            path: /run/containerd/containerd.sock
+          name: container-engine-socket-3
+        - hostPath:
+            path: /run/crio/crio.sock
+          name: container-engine-socket-4
+        - hostPath:
+            path: /run/k3s/containerd/containerd.sock
+          name: container-engine-socket-5
+        - name: specialized-falco-configs
+          emptyDir: {}
+        - name: plugins-install-dir
+          emptyDir: {}
+        - name: rulesfiles-install-dir
+          emptyDir: {}
+        - name: artifact-state-dir
+          emptyDir: {}
+        - name: root-falco-fs
+          emptyDir: {}  
+        - name: boot-fs
+          hostPath:
+            path: /boot
+        - name: lib-modules
+          hostPath:
+            path: /lib/modules
+        - name: usr-fs
+          hostPath:
+            path: /usr
+        - name: etc-fs
+          hostPath:
+            path: /etc
+        - name: sys-fs
+          hostPath:
+            path: /sys/kernel
+        - name: proc-fs
+          hostPath:
+            path: /proc
+        - name: falcoctl-config-volume
+          configMap: 
+            name: olaitan-falco-falcoctl
+            items:
+              - key: falcoctl.yaml
+                path: falcoctl.yaml
+        - name: falco-yaml
+          configMap:
+            name: olaitan-falco
+            items:
+            - key: falco.yaml
+              path: falco.yaml
+        
+        - name: grpc-socket-dir
+          hostPath:
+            path: /run/falco
+  updateStrategy:
+    type: RollingUpdate
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: olaitan-collector
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: collector
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: olaitan
+      app.kubernetes.io/instance: olaitan
+      app.kubernetes.io/component: collector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: olaitan
+        app.kubernetes.io/instance: olaitan
+        app.kubernetes.io/component: collector
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: olaitan-collector
+      hostNetwork: false
+      hostPID: false
+      # Pod-level securityContext: distroless nonroot UID 65532. Container
+      # securityContext below pins capability drop / read-only rootfs /
+      # no-priv-escalation per NFR11.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      tolerations:
+      containers:
+        - name: collector
+          image: ghcr.io/olokotoh/olaitan:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["/olaitan"]
+          args:
+            - collector
+            - --config=/etc/olaitan/olaitan.yaml
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+            # Story 1.12: Prometheus metrics surface (FR8, FR50). The
+            # port is mandatory because the metrics surface is the
+            # single source of truth for source health and event-rate
+            # observability; downstream Stories 1.13/1.14/1.18 inherit
+            # this exposition by registering against the same
+            # internal/metrics.Registry. The if-guard mirrors the
+            # configmap.yaml pattern so a chart deploy with `--set
+            # metrics=null` fails fast at render rather than panicking
+            # on nil .Values.metrics.containerPort (Review P4).
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          env:
+            - name: NATS_URL
+              value: "nats://olaitan-nats:4222"
+            - name: REDIS_ADDR
+              value: "olaitan-redis-master:6379"
+            - name: FALCO_SOCKET
+              value: "unix:///run/falco/falco.sock"
+            # Story 1.6: the Falco adapter records the node name on
+            # every emitted Event.Pod.Node so host events without K8s
+            # pod context still record where they were observed. Sourced
+            # from the downward API because os.Hostname() returns the
+            # pod name, not the node name, on Kubernetes.
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            limits:
+              cpu: 500m
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          # Container securityContext: strip everything the distroless
+          # image does not need. NFR11 compliance; auditor-friendly.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            # Whole-directory mount -- see Dev Notes § "The ConfigMap-
+            # atomic-swap + Story 1.6 contract". Do not introduce subPath.
+            - name: config
+              mountPath: /etc/olaitan
+              readOnly: true
+            - name: rules
+              mountPath: /etc/olaitan/rules
+              readOnly: true
+            - name: secrets
+              mountPath: /etc/olaitan/secrets
+              readOnly: true
+            # /tmp emptyDir: readOnlyRootFilesystem=true blocks writes
+            # anywhere else; the Go runtime occasionally writes trace
+            # artefacts on crash which need a writable path.
+            - name: tmp
+              mountPath: /tmp
+            # Falco gRPC socket bind-mounted from the host. Falco's chart
+            # default exposes the socket at /run/falco/falco.sock on the
+            # node; the collector pod opens it via the FALCO_SOCKET env
+            # var. Read-only because the collector only ever connects
+            # (reads) -- never writes -- to the socket. Mounted only when
+            # endpoints.falco is a unix:// target; tcp:// targets reach
+            # Falco over the pod network and need no host mount.
+            - name: falco-socket
+              mountPath: /run/falco
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: olaitan-config
+        - name: rules
+          configMap:
+            name: olaitan-rules
+        - name: secrets
+          secret:
+            secretName: olaitan-secrets
+            # 0400 = owner read-only. Matches distroless nonroot UID;
+            # protects api-key material from accidental world-readable.
+            defaultMode: 0400
+        - name: tmp
+          emptyDir: {}
+        - name: falco-socket
+          hostPath:
+            path: /run/falco
+            type: Directory
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/component: nats-box
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: nats
+    app.kubernetes.io/version: 2.12.6
+    helm.sh/chart: nats-2.12.6
+  name: olaitan-nats-box
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: nats-box
+      app.kubernetes.io/instance: olaitan
+      app.kubernetes.io/name: nats
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: nats-box
+        app.kubernetes.io/instance: olaitan
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/name: nats
+        app.kubernetes.io/version: 2.12.6
+        helm.sh/chart: nats-2.12.6
+    spec:
+      containers:
+      - args:
+        - sh
+        - -ec
+        - trap true INT TERM; sleep infinity & wait
+        command:
+        - sh
+        - -ec
+        - |
+          work_dir="$(pwd)"
+          mkdir -p "$XDG_CONFIG_HOME/nats"
+          cd "$XDG_CONFIG_HOME/nats"
+          if ! [ -s context ]; then
+            ln -s /etc/nats-contexts context
+          fi
+          if ! [ -f context.txt ]; then
+            echo -n "default" > context.txt
+          fi
+          cd "$work_dir"
+          exec /entrypoint.sh "$@"
+        - --
+        image: natsio/nats-box:0.19.3
+        name: nats-box
+        resources: null
+        volumeMounts:
+        - mountPath: /etc/nats-contexts
+          name: contexts
+      enableServiceLinks: false
+      volumes:
+      - name: contexts
+        secret:
+          secretName: olaitan-nats-box-contexts
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: olaitan-aggregator
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: aggregator
+spec:
+  replicas: 1
+  strategy:
+    # Recreate (not RollingUpdate) — see header comment. This is load-bearing
+    # for Ring 2 correctness. Changing it to RollingUpdate corrupts the
+    # correlator checkpoint under a busy upgrade.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: olaitan
+      app.kubernetes.io/instance: olaitan
+      app.kubernetes.io/component: aggregator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: olaitan
+        app.kubernetes.io/instance: olaitan
+        app.kubernetes.io/component: aggregator
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: olaitan-aggregator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        # OnRootMismatch — kubelet skips the recursive chown of the PVC
+        # when the volume root already has the right ownership. Without
+        # this, pod restart time grows linearly with the number of files
+        # in the reports PVC and quickly blows past the readiness probe
+        # budget (initialDelay 3s + 10s × 3 failureThreshold = 33s).
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: aggregator
+          image: ghcr.io/olokotoh/olaitan:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["/olaitan"]
+          args:
+            - aggregator
+            - --config=/etc/olaitan/olaitan.yaml
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+            # Story 1.12: Prometheus metrics surface (FR8, FR50). The
+            # aggregator exposes posture counters here; Story 1.14 +
+            # 1.18 will register correlator and detection metrics on
+            # the same Registry. The if-guard mirrors the configmap.yaml
+            # pattern so a chart deploy with `--set metrics=null` fails
+            # fast at render rather than panicking on nil
+            # .Values.metrics.containerPort (Review P4).
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          env:
+            - name: NATS_URL
+              value: "nats://olaitan-nats:4222"
+            - name: REDIS_ADDR
+              value: "olaitan-redis-master:6379"
+            - name: FALCO_SOCKET
+              value: "unix:///run/falco/falco.sock"
+            # NFR8: Redis AUTH is mandatory. The baseline engine and
+            # any future aggregator-side Redis client read the password
+            # from this env var rather than parsing the mounted Secret
+            # file directly; matches the established 12-factor pattern
+            # already used by the subchart for its own Redis pods.
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: olaitan-secrets
+                  key: redis-password
+            # Story 3.16: project the LLM API key Secret into the env var the
+            # analyst reads (config analyst.api.api_key_secret, default
+            # olaitan-llm). The aggregator runs the investigation chain; the
+            # "api" provider (claude / openai_compat) reads its key from this
+            # env. An empty Secret value degrades the chain to rules-only
+            # (NFR27) -- so this is safe to project unconditionally.
+            - name: olaitan-llm
+              valueFrom:
+                secretKeyRef:
+                  name: olaitan-secrets
+                  key: llm-api-key
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+            requests:
+              cpu: 200m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/olaitan
+              readOnly: true
+            - name: rules
+              mountPath: /etc/olaitan/rules
+              readOnly: true
+            # Story 3.13: the per-role analyst system prompts ConfigMap,
+            # mounted read-only. analyst.prompts_dir in the config points
+            # here; a role absent from the mount uses the binary-embedded
+            # default, so this mount is overridable per role.
+            - name: prompts
+              mountPath: /etc/olaitan/prompts
+              readOnly: true
+            - name: secrets
+              mountPath: /etc/olaitan/secrets
+              readOnly: true
+            # DFIR reports — RW mount, aggregator-only. The collector
+            # pod spec omits this volume entirely.
+            - name: reports
+              mountPath: /var/lib/olaitan/reports
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: olaitan-config
+        - name: rules
+          configMap:
+            name: olaitan-rules
+        - name: prompts
+          configMap:
+            name: olaitan-prompts
+        - name: secrets
+          secret:
+            secretName: olaitan-secrets
+            defaultMode: 0400
+        - name: reports
+          persistentVolumeClaim:
+            claimName: olaitan-reports
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app.kubernetes.io/component: nats
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: nats
+    app.kubernetes.io/version: 2.12.6
+    helm.sh/chart: nats-2.12.6
+  name: olaitan-nats
+spec:
+  podManagementPolicy: Parallel
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: nats
+      app.kubernetes.io/instance: olaitan
+      app.kubernetes.io/name: nats
+  serviceName: olaitan-nats-headless
+  template:
+    metadata:
+      annotations: null
+      labels:
+        app.kubernetes.io/component: nats
+        app.kubernetes.io/instance: olaitan
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/name: nats
+        app.kubernetes.io/version: 2.12.6
+        helm.sh/chart: nats-2.12.6
+    spec:
+      containers:
+      - args:
+        - --config
+        - /etc/nats-config/nats.conf
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: SERVER_NAME
+          value: $(POD_NAME)
+        image: nats:2.12.6-alpine
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - nats-server
+              - -sl=ldm=/var/run/nats/nats.pid
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /healthz?js-enabled-only=true
+            port: monitor
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          successThreshold: 1
+          timeoutSeconds: 5
+        name: nats
+        ports:
+        - containerPort: 4222
+          name: nats
+        - containerPort: 8222
+          name: monitor
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /healthz?js-server-only=true
+            port: monitor
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+        resources: {}
+        startupProbe:
+          failureThreshold: 90
+          httpGet:
+            path: /healthz
+            port: monitor
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+        volumeMounts:
+        - mountPath: /etc/nats-config
+          name: config
+        - mountPath: /var/run/nats
+          name: pid
+        - mountPath: /data
+          name: olaitan-nats-js
+      - args:
+        - -pid
+        - /var/run/nats/nats.pid
+        - -config
+        - /etc/nats-config/nats.conf
+        image: natsio/nats-server-config-reloader:0.21.1
+        name: reloader
+        volumeMounts:
+        - mountPath: /var/run/nats
+          name: pid
+        - mountPath: /etc/nats-config
+          name: config
+      enableServiceLinks: false
+      shareProcessNamespace: true
+      terminationGracePeriodSeconds: 60
+      volumes:
+      - configMap:
+          name: olaitan-nats-config
+        name: config
+      - emptyDir: {}
+        name: pid
+  volumeClaimTemplates:
+  - metadata:
+      name: olaitan-nats-js
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 10Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: olaitan-redis-master
+  namespace: "default"
+  labels:
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/version: 8.6.2
+    helm.sh/chart: redis-25.3.11
+    app.kubernetes.io/component: master
+spec:
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: olaitan
+      app.kubernetes.io/name: redis
+      app.kubernetes.io/component: master
+  serviceName: olaitan-redis-headless
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: olaitan
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/name: redis
+        app.kubernetes.io/version: 8.6.2
+        helm.sh/chart: redis-25.3.11
+        app.kubernetes.io/component: master
+      annotations:
+        checksum/configmap: 95944ee35a19af37cefd156f19d93e157e578c1dc63ac01ce735ae93090b7580
+        checksum/health: a2fc61ae99390643dac0673ed97203805136d4460b2319e7beff10546c1e1140
+        checksum/scripts: 0717e77fd3bb941f602860e9be4f2ed87b481cddeadf37be463f8512ecde0c3e
+        checksum/secret: 44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a
+    spec:
+      
+      securityContext:
+        fsGroup: 1001
+        fsGroupChangePolicy: Always
+        supplementalGroups: []
+        sysctls: []
+      serviceAccountName: olaitan-redis-master
+      automountServiceAccountToken: false
+      affinity:
+        podAffinity:
+          
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/instance: olaitan
+                    app.kubernetes.io/name: redis
+                    app.kubernetes.io/component: master
+                topologyKey: kubernetes.io/hostname
+              weight: 1
+        nodeAffinity:
+          
+      enableServiceLinks: true
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: redis
+          image: registry-1.docker.io/bitnami/redis:latest
+          imagePullPolicy: "IfNotPresent"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+            runAsGroup: 1001
+            runAsNonRoot: true
+            runAsUser: 1001
+            seLinuxOptions: {}
+            seccompProfile:
+              type: RuntimeDefault
+          command:
+            - /bin/bash
+          args:
+            - -ec
+            - /opt/bitnami/scripts/start-scripts/start-master.sh
+          env:
+            - name: BITNAMI_DEBUG
+              value: "false"
+            - name: REDIS_REPLICATION_MODE
+              value: master
+            - name: ALLOW_EMPTY_PASSWORD
+              value: "no"
+            - name: OPENSSL_FIPS
+              value: "yes"
+            - name: REDIS_PASSWORD_FILE
+              value: "/opt/bitnami/redis/secrets/redis-password"
+            - name: REDIS_TLS_ENABLED
+              value: "no"
+            - name: REDIS_PORT
+              value: "6379"
+          ports:
+            - name: redis
+              containerPort: 6379
+          livenessProbe:
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            # One second longer than command timeout should prevent generation of zombie processes.
+            timeoutSeconds: 6
+            successThreshold: 1
+            failureThreshold: 5
+            exec:
+              command:
+                - /bin/bash
+                - -ec
+                - "/health/ping_liveness_local.sh 5"
+          readinessProbe:
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            timeoutSeconds: 2
+            successThreshold: 1
+            failureThreshold: 5
+            exec:
+              command:
+                - /bin/bash
+                - -ec
+                - "/health/ping_readiness_local.sh 1"
+          resources:
+            limits:
+              cpu: 150m
+              ephemeral-storage: 2Gi
+              memory: 192Mi
+            requests:
+              cpu: 100m
+              ephemeral-storage: 50Mi
+              memory: 128Mi
+          volumeMounts:
+            - name: start-scripts
+              mountPath: /opt/bitnami/scripts/start-scripts
+            - name: health
+              mountPath: /health
+            - name: redis-password
+              mountPath: /opt/bitnami/redis/secrets/
+            - name: redis-data
+              mountPath: /data
+            - name: config
+              mountPath: /opt/bitnami/redis/mounted-etc
+            - name: empty-dir
+              mountPath: /opt/bitnami/redis/etc/
+              subPath: app-conf-dir
+            - name: empty-dir
+              mountPath: /tmp
+              subPath: tmp-dir
+      volumes:
+        - name: start-scripts
+          configMap:
+            name: olaitan-redis-scripts
+            defaultMode: 0755
+        - name: health
+          configMap:
+            name: olaitan-redis-health
+            defaultMode: 0755
+        - name: redis-password
+          
+          secret:
+            secretName: olaitan-secrets
+            items:
+            - key: redis-password
+              path: redis-password
+        - name: config
+          configMap:
+            name: olaitan-redis-configuration
+        - name: empty-dir
+          emptyDir: {}
+  volumeClaimTemplates:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: redis-data
+        labels:
+          app.kubernetes.io/instance: olaitan
+          app.kubernetes.io/name: redis
+          app.kubernetes.io/component: master
+      spec:
+        accessModes:
+          - "ReadWriteOnce"
+        resources:
+          requests:
+            storage: "8Gi"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+  labels:
+    app.kubernetes.io/component: test-request-reply
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: nats
+    app.kubernetes.io/version: 2.12.6
+    helm.sh/chart: nats-2.12.6
+  name: olaitan-nats-test-request-reply
+spec:
+  containers:
+  - args:
+    - sh
+    - -ec
+    - nats reply --echo echo & pid="$!"; sleep 1; nats request echo hi > /tmp/resp;
+      kill "$pid"; wait; grep -qF hi /tmp/resp
+    command:
+    - sh
+    - -ec
+    - |
+      work_dir="$(pwd)"
+      mkdir -p "$XDG_CONFIG_HOME/nats"
+      cd "$XDG_CONFIG_HOME/nats"
+      if ! [ -s context ]; then
+        ln -s /etc/nats-contexts context
+      fi
+      if ! [ -f context.txt ]; then
+        echo -n "default" > context.txt
+      fi
+      cd "$work_dir"
+      exec /entrypoint.sh "$@"
+    - --
+    image: natsio/nats-box:0.19.3
+    name: nats-box
+    resources: null
+    volumeMounts:
+    - mountPath: /etc/nats-contexts
+      name: contexts
+  enableServiceLinks: false
+  restartPolicy: Never
+  volumes:
+  - name: contexts
+    secret:
+      secretName: olaitan-nats-box-contexts

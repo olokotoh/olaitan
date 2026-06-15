@@ -1,0 +1,21 @@
+# values-eval-rs.yaml -- the Epic 5 "RS" evaluation arm (FR53, Story 5.3).
+#
+#   helm upgrade --install olaitan deploy/helm/olaitan \
+#     --set secrets.redisPassword=<password> \
+#     -f deploy/helm/olaitan/values-eval-rs.yaml
+#
+# RS = Rules + Statistics. The deterministic detection layer (the Olaitan
+# rule engine + the baseline engine) runs end-to-end; the LLM tier is
+# bypassed (analyst.provider=none). This is the Epic 1 closure target and
+# the arm the default CI e2e job exercises on kind (the lightest honest
+# arm, BI-7).
+#
+# THIN overlay: it sets ONLY evaluation.config. The chart computes
+# rules.enabled=true / baselines.enabled=true / analyst.provider=none from
+# that one knob and clobbers any operator-supplied per-knob values (see
+# deploy/helm/olaitan/EVAL.md operator-override semantics).
+#
+# NO model pin: the RS arm runs analyst.provider=none (the LLM tier is
+# bypassed), so analyst.api.model is irrelevant here.
+evaluation:
+  config: RS

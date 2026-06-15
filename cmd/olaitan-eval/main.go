@@ -35,6 +35,17 @@ type runConfig struct {
 	runs            int
 	out             string
 	allowUnverified []string
+	// Story 5.3: the helmOverlay wiring threaded into newRunner (the
+	// Story 5.2 --scenarios-root precedent). chartRoot / overlaysDir
+	// locate the chart + the committed values-eval-<name>.yaml overlays;
+	// release / namespace name the helm release + namespace the overlay
+	// upgrades; overlayTimeout bounds the helm --wait + the aggregator
+	// rollout-status Ready gate so a slow LLM-arm pull cannot hang forever.
+	chartRoot      string
+	release        string
+	namespace      string
+	overlaysDir    string
+	overlayTimeout time.Duration
 }
 
 // metadata is the MINIMAL per-run metadata.yaml schema (BI-5, BI-8). It
@@ -56,7 +67,7 @@ type metadata struct {
 }
 
 func main() {
-	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
+	if err := run(os.Args[1:], os.Stdout, os.Stderr, execRunCmd); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "olaitan-eval: %v\n", err)
 		os.Exit(1)
 	}
@@ -67,8 +78,11 @@ func main() {
 // trial, generates a run_id, lays out runs/<run_id>/, drives the trial
 // loop, and writes the per-run metadata.yaml. It is separated from main so
 // main_test.go can exercise the full dispatch with injectable
-// stdout/stderr and without os.Exit.
-func run(args []string, stdout, stderr io.Writer) error {
+// stdout/stderr and without os.Exit. runCmd is the external-command runner
+// the Story-5.3 helmOverlay shells out through (main passes the real
+// execRunCmd; a unit test passes a fake so the full dispatch runs without a
+// cluster).
+func run(args []string, stdout, stderr io.Writer, runCmd overlayRunFunc) error {
 	cfg, err := parseFlags(args, stderr)
 	if err != nil {
 		return err
@@ -119,7 +133,17 @@ func run(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	r := newRunner(cfg.config, scenario, logger)
+	// Story 5.3: build the real helmOverlay from the threaded overlay flags
+	// (the Story 5.2 --scenarios-root precedent) and wire it behind the
+	// frozen ConfigOverlay seam.
+	oc := overlayConfig{
+		chartRoot:   cfg.chartRoot,
+		release:     cfg.release,
+		namespace:   cfg.namespace,
+		overlaysDir: cfg.overlaysDir,
+		timeout:     cfg.overlayTimeout,
+	}
+	r := newRunner(cfg.config, scenario, oc, runCmd, logger)
 
 	// The N-trial loop (AC4). Each trial writes runs/<run_id>/trial-<n>/.
 	// A trial error aborts that trial and is recorded; the run continues
@@ -171,6 +195,14 @@ func parseFlags(args []string, stderr io.Writer) (runConfig, error) {
 	fs.IntVar(&cfg.runs, "runs", 1, "number of trials to run")
 	fs.StringVar(&cfg.out, "out", "runs", "output directory for runs/<run_id>/")
 	fs.Var(&allow, "allow-unverified", "artefact names to skip in the digest gate (comma-separated or repeated; voids the reproducibility guarantee for each; off by default)")
+	// Story 5.3: the ConfigOverlay (helmOverlay) wiring (BI-5). Defaults
+	// match the in-repo chart layout + the canonical olaitan release.
+	defOverlay := defaultOverlayConfig()
+	fs.StringVar(&cfg.chartRoot, "chart-root", defOverlay.chartRoot, "path to the Helm chart the ConfigOverlay upgrades")
+	fs.StringVar(&cfg.release, "release", defOverlay.release, "Helm release name the ConfigOverlay upgrades")
+	fs.StringVar(&cfg.namespace, "namespace", defOverlay.namespace, "Kubernetes namespace the ConfigOverlay upgrades into")
+	fs.StringVar(&cfg.overlaysDir, "overlays-dir", defOverlay.overlaysDir, "directory holding the values-eval-<name>.yaml configuration overlays")
+	fs.DurationVar(&cfg.overlayTimeout, "overlay-timeout", defOverlay.timeout, "budget for the helm --wait + the aggregator rollout-status Ready gate")
 
 	if err := fs.Parse(args); err != nil {
 		return runConfig{}, err
@@ -190,6 +222,9 @@ func parseFlags(args []string, stderr io.Writer) (runConfig, error) {
 	}
 	if cfg.runs < 1 {
 		return runConfig{}, fmt.Errorf("--runs must be >= 1 (got %d)", cfg.runs)
+	}
+	if cfg.overlayTimeout <= 0 {
+		return runConfig{}, fmt.Errorf("--overlay-timeout must be > 0 (got %s)", cfg.overlayTimeout)
 	}
 	cfg.allowUnverified = []string(allow)
 	return cfg, nil
@@ -224,18 +259,22 @@ func validateScenario(s string) error {
 }
 
 // validateConfig rejects an unknown --config arm so a typo (e.g. "rls" for
-// "rsl") does not silently no-op into a meaningless run. It accepts the
-// FR53 four-way matrix (F, RS, RSL, RSLT-full) plus the RSLT ablation family
-// (rslt-<ablation>, owned by Story 5.3), case-insensitively.
+// "rsl") does not silently no-op into a meaningless run. Story 5.3 (BI-4)
+// tightens this to EXACTLY the six arms that have a committed
+// values-eval-<name>.yaml overlay: the FR53 four-way matrix (f, rs, rsl,
+// rslt/rslt-full -- the legacy "rslt" alias collapses to the same overlay)
+// plus the two RSLT ablation arms (rslt-l1-only, rslt-l1-l2),
+// case-insensitively. The open "rslt-" prefix Story 5.1 accepted as a
+// forward-compat placeholder is gone: an unknown arm (e.g. "rslt-bogus")
+// now fails fast at flag-parse rather than dispatching into a missing
+// overlay file. The keys here MUST stay in lock-step with overlayFiles
+// (overlay.go), the config -> overlay-file map the helmOverlay resolves.
 func validateConfig(c string) error {
 	switch strings.ToLower(c) {
-	case "f", "rs", "rsl", "rslt", "rslt-full":
+	case "f", "rs", "rsl", "rslt", "rslt-full", "rslt-l1-only", "rslt-l1-l2":
 		return nil
 	}
-	if strings.HasPrefix(strings.ToLower(c), "rslt-") {
-		return nil
-	}
-	return fmt.Errorf("--config %q is not a known evaluation arm (want one of f, rs, rsl, rslt, rslt-full, or an rslt-<ablation>)", c)
+	return fmt.Errorf("--config %q is not a known evaluation arm (want one of f, rs, rsl, rslt, rslt-full, rslt-l1-only, rslt-l1-l2)", c)
 }
 
 // errIfRunDirInUse returns an error when runDir already exists and is
@@ -267,15 +306,17 @@ func newRunID(at time.Time, scenario, config, manifestHash string) string {
 }
 
 // newRunner wires the Runner with the seam impls for the configured arm. The
-// Scenario seam is now filled by the Story-5.2 rich per-scenario harness
-// (threaded in from run() via newScenario, replacing the 5.1 rsScenario
-// no-op marker); the Cluster / Overlay / Capturer seams keep their 5.1
-// minimal impls (Story 5.3 / 5.4 swap in the rich ones behind the same
-// interfaces). The Runner loop shape is unchanged (the 5.1 freeze).
-func newRunner(config string, scenario Scenario, logger *slog.Logger) *Runner {
+// Scenario seam is filled by the Story-5.2 rich per-scenario harness
+// (threaded in from run() via newScenario) and the ConfigOverlay seam is now
+// filled by the Story-5.3 real helmOverlay (built from the threaded overlay
+// flags + the injected command runner, replacing the 5.1 rsOverlay
+// log-deferral); the Cluster / Capturer seams keep their 5.1 minimal impls
+// (Story 5.4 swaps in the rich Capturer behind the same interface). The
+// Runner loop shape is unchanged (the 5.1 freeze).
+func newRunner(config string, scenario Scenario, oc overlayConfig, runCmd overlayRunFunc, logger *slog.Logger) *Runner {
 	return &Runner{
 		Cluster:  &clusterController{logger: logger},
-		Overlay:  &rsOverlay{logger: logger},
+		Overlay:  newHelmOverlay(oc, runCmd, logger),
 		Scenario: scenario,
 		Capturer: &metadataOnlyCapturer{logger: logger},
 		Config:   config,

@@ -63,6 +63,53 @@ func TestParseFlags_Defaults(t *testing.T) {
 	}
 }
 
+// TestParseFlags_OverlayFlagsDefaultsAndOverride asserts the Story-5.3
+// overlay flags default to the in-repo chart wiring and that explicit values
+// override (the BI-5 flag surface threaded into newRunner).
+func TestParseFlags_OverlayFlagsDefaultsAndOverride(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		cfg, err := parseFlags([]string{"--scenario", "s1", "--config", "rs"}, &bytes.Buffer{})
+		if err != nil {
+			t.Fatalf("parseFlags: %v", err)
+		}
+		if cfg.chartRoot != "deploy/helm/olaitan" || cfg.overlaysDir != "deploy/helm/olaitan" {
+			t.Errorf("default chartRoot/overlaysDir = %q/%q; want deploy/helm/olaitan", cfg.chartRoot, cfg.overlaysDir)
+		}
+		if cfg.release != "olaitan" || cfg.namespace != "olaitan" {
+			t.Errorf("default release/namespace = %q/%q; want olaitan", cfg.release, cfg.namespace)
+		}
+		if cfg.overlayTimeout != 5*time.Minute {
+			t.Errorf("default overlay-timeout = %s; want 5m0s", cfg.overlayTimeout)
+		}
+	})
+
+	t.Run("override", func(t *testing.T) {
+		cfg, err := parseFlags([]string{
+			"--scenario", "s1", "--config", "rs",
+			"--chart-root", "x/chart",
+			"--release", "rel2",
+			"--namespace", "ns2",
+			"--overlays-dir", "x/overlays",
+			"--overlay-timeout", "2m",
+		}, &bytes.Buffer{})
+		if err != nil {
+			t.Fatalf("parseFlags: %v", err)
+		}
+		if cfg.chartRoot != "x/chart" || cfg.release != "rel2" || cfg.namespace != "ns2" ||
+			cfg.overlaysDir != "x/overlays" || cfg.overlayTimeout != 2*time.Minute {
+			t.Errorf("overridden overlay flags not threaded: %+v", cfg)
+		}
+	})
+
+	t.Run("non-positive timeout rejected", func(t *testing.T) {
+		if _, err := parseFlags([]string{
+			"--scenario", "s1", "--config", "rs", "--overlay-timeout", "0",
+		}, &bytes.Buffer{}); err == nil {
+			t.Errorf("expected rejection of --overlay-timeout 0, got nil")
+		}
+	})
+}
+
 func TestParseFlags_RequiredAndRange(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -110,19 +157,26 @@ func TestNewRunID_Format(t *testing.T) {
 
 // TestParseFlags_RejectsUnknownArms asserts a typo'd --scenario or --config
 // is rejected (not silently accepted into an official-looking but
-// meaningless run), while every FR53 arm and the RSLT ablation family parse.
+// meaningless run). Story 5.3 (BI-4) TIGHTENS validateConfig to EXACTLY the
+// six arms with a committed overlay: the open "rslt-" prefix Story 5.1
+// accepted is gone, so a placeholder ablation slug (rslt-l1, rslt-l1l2) or
+// an unknown rslt arm (rslt-bogus) now fails fast at flag-parse.
 func TestParseFlags_RejectsUnknownArms(t *testing.T) {
 	reject := [][]string{
 		{"--scenario", "s99", "--config", "rs"},
-		{"--scenario", "s1", "--config", "rls"}, // typo for rsl
-		{"--scenario", "s1", "--config", "bogus-arm"},
+		{"--scenario", "s1", "--config", "rls"},        // typo for rsl
+		{"--scenario", "s1", "--config", "bogus-arm"},  // not an arm
+		{"--scenario", "s1", "--config", "rslt-bogus"}, // BI-4: open prefix gone
+		{"--scenario", "s1", "--config", "rslt-l1"},    // BI-4: not a real ablation slug
+		{"--scenario", "s1", "--config", "rslt-l1l2"},  // BI-4: not a real ablation slug
 	}
 	for _, args := range reject {
 		if _, err := parseFlags(args, &bytes.Buffer{}); err == nil {
 			t.Errorf("expected rejection for %v, got nil", args)
 		}
 	}
-	accept := []string{"f", "rs", "rsl", "rslt", "rslt-full", "RSLT-full", "rslt-l1", "rslt-l1l2"}
+	// The six real arms (plus the legacy "rslt" alias) parse, case-insensitively.
+	accept := []string{"f", "rs", "rsl", "rslt", "rslt-full", "RSLT-full", "rslt-l1-only", "RSLT-L1-only", "rslt-l1-l2", "RSLT-L1-L2"}
 	for _, c := range accept {
 		if _, err := parseFlags([]string{"--scenario", "s1", "--config", c}, &bytes.Buffer{}); err != nil {
 			t.Errorf("expected --config %q to parse, got %v", c, err)
@@ -186,6 +240,17 @@ func TestRun_LayoutTrialsAndMetadata(t *testing.T) {
 	outDir := filepath.Join(dir, "runs")
 
 	var stdout, stderr bytes.Buffer
+	// Inject a fake command runner so the Story-5.3 helmOverlay's RS-arm
+	// helm upgrade + kubectl rollout-status run WITHOUT a cluster: the unit
+	// test exercises the full dispatch (digest gate -> run_id -> N trials ->
+	// metadata) while the overlay shell-out is a recorded no-op. The
+	// overlay's --overlays-dir is pointed at the in-repo chart dir so the
+	// RS overlay file exists for the helmOverlay's fail-closed os.Stat.
+	var overlayCalls int
+	fakeRun := func(ctx context.Context, name string, args ...string) error {
+		overlayCalls++
+		return nil
+	}
 	err := run([]string{
 		"--manifest", manifestPath,
 		"--scenario", "s1",
@@ -196,9 +261,18 @@ func TestRun_LayoutTrialsAndMetadata(t *testing.T) {
 		"--runs", "3",
 		"--out", outDir,
 		"--allow-unverified", "aggregator",
-	}, &stdout, &stderr)
+		// Point the overlay at the in-repo chart so the RS overlay file
+		// resolves; the fake runner means no real helm/kubectl runs.
+		"--overlays-dir", filepath.Join("..", "..", "deploy", "helm", "olaitan"),
+		"--chart-root", filepath.Join("..", "..", "deploy", "helm", "olaitan"),
+	}, &stdout, &stderr, fakeRun)
 	if err != nil {
 		t.Fatalf("run: unexpected error: %v\nstderr:\n%s", err, stderr.String())
+	}
+	// The RS overlay runs once per trial (helm upgrade + rollout status =
+	// two shell-outs each), so 3 trials drive 6 fake runCmd calls.
+	if overlayCalls != 6 {
+		t.Errorf("overlay runCmd calls = %d; want 6 (helm + rollout-status per trial x 3)", overlayCalls)
 	}
 
 	runID := extractRunID(t, stdout.String())
@@ -258,7 +332,7 @@ func TestRun_DigestGateRefusesWithoutAllowlist(t *testing.T) {
 		"--scenario", "s1",
 		"--config", "rs",
 		"--out", filepath.Join(dir, "runs"),
-	}, &stdout, &stderr)
+	}, &stdout, &stderr, execRunCmd)
 	if err == nil {
 		t.Fatalf("expected a fail-closed REFUSE, got nil")
 	}

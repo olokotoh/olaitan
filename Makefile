@@ -283,12 +283,19 @@ e2e-local-forensics: helm-prepare helm-deps docker-build
 		--wait --timeout 5m
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) OLT_E2E_FORENSICS=1 go test -tags=e2e -v -count=1 -run TestKindSmoke_Forensics_FullSlice ./tests/e2e/...
 
-# Story 5.1 (AC5): the olaitan-eval harness smoke. Reuses the SAME RS-arm
-# kind bring-up as e2e-local (the chart installs healthy under
-# evaluation.config=RS, Falco-off, NO LLM), builds the olaitan-eval binary,
-# and runs a single S1 + RS + 1-trial `olaitan-eval` invocation, asserting
-# the run completes, runs/<run_id>/metadata.yaml is present, and
-# manifest_sha256 matches `sha256sum eval/manifest.yaml` (BI-7). The
+# Story 5.1 (AC5) + Story 5.3 (AC4 HALF B, BI-8): the olaitan-eval harness
+# smoke. Reuses the SAME RS-arm kind bring-up as e2e-local (the chart
+# installs healthy under evaluation.config=RS, Falco-off, NO LLM), builds
+# the olaitan-eval binary, and runs a single S1 + RS + 1-trial
+# `olaitan-eval` invocation. Story 5.3: the harness now drives the REAL RS
+# helmOverlay -- the install below pre-stages the chart (release olaitan,
+# namespace default, the kind image/falco overrides) and the harness then
+# runs an idempotent `helm upgrade --install --reuse-values --values
+# values-eval-rs.yaml --wait` + `kubectl rollout status
+# deploy/olaitan-aggregator` (BI-8 option (a): make installs the kind
+# prerequisites; the harness idempotently re-applies the RS arm + confirms
+# Ready). Asserts the run completes, runs/<run_id>/metadata.yaml is present,
+# and manifest_sha256 matches `sha256sum eval/manifest.yaml` (BI-7). The
 # OLT_E2E gate is not needed: the eval-smoke test SKIPS gracefully when the
 # kind cluster is absent, and it reuses the RS bring-up the default CI e2e
 # job already runs, so it rides alongside the RS smoke (OA5).
