@@ -31,8 +31,29 @@ func TestRun_OfflineEmitsAndProvesBound(t *testing.T) {
 			t.Errorf("stdout missing %q\n--- got ---\n%s", want, out)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(dir, "fr55-offline-fake-rslt-full", "trials.jsonl")); err != nil {
+	if _, err := os.Stat(filepath.Join(dir, "fr55-offline-fake-claude-rslt-full", "trials.jsonl")); err != nil {
 		t.Errorf("trials.jsonl not emitted: %v", err)
+	}
+}
+
+// TestRun_OfflineShapeDistinctDirs is the CLI-level Story 5.6 R2 collision
+// guard: --provider claude and --provider ollama for the SAME config emit to
+// DISTINCT dirs through one --out, so neither overwrites the other.
+func TestRun_OfflineShapeDistinctDirs(t *testing.T) {
+	dir := t.TempDir()
+	for _, provider := range []string{"claude", "ollama"} {
+		var stdout, stderr bytes.Buffer
+		if err := run([]string{
+			"--offline", "--config", "rsl", "--provider", provider,
+			"--trials", "3", "--out", dir,
+		}, &stdout, &stderr); err != nil {
+			t.Fatalf("run %s: %v\nstderr: %s", provider, err, stderr.String())
+		}
+	}
+	for _, name := range []string{"fr55-offline-fake-claude-rsl", "fr55-offline-fake-ollama-rsl"} {
+		if _, err := os.Stat(filepath.Join(dir, name, "trials.jsonl")); err != nil {
+			t.Errorf("expected distinct dir %q to survive: %v", name, err)
+		}
 	}
 }
 

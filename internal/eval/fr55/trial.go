@@ -22,6 +22,23 @@ const OfflineRunIDPrefix = "fr55-offline-"
 // "claude"/"ollama" trial.
 const OfflineProviderLabel = "fake"
 
+// ProviderShape names the EMULATED provider shape of an offline run: which
+// per-provider score cap the deterministic fake reports (Claude 35 -> bound
+// 10.5; Ollama 25 -> bound 7.5, BI-6). It is DISTINCT from the honest
+// transport label (always OfflineProviderLabel == "fake" offline): the
+// transport is genuinely fake, but the shape records which real provider's
+// cap the run emulated. It is carried into the emitted run-dir name and
+// run_id so the same config under two different shapes does NOT collide on
+// one un-shaped dir (Story 5.6 R2 emitter-collision fix).
+type ProviderShape string
+
+const (
+	// ShapeClaude emulates the Claude provider cap (35 -> bound 10.5).
+	ShapeClaude ProviderShape = "claude"
+	// ShapeOllama emulates the Ollama provider cap (25 -> bound 7.5).
+	ShapeOllama ProviderShape = "ollama"
+)
+
 // Config identifies the LLM configuration under test (AC3). RSL is the
 // single-LLM Standard mode (the effective L1-only chain); RSLT-full is the
 // full L1 -> L2 -> Senior chain. F and RS carry no LLM and are out of FR55
@@ -72,6 +89,13 @@ type Trial struct {
 type BoundSummary struct {
 	// Provider is the honest provider label for the run.
 	Provider string
+	// Shape is the emulated provider shape (which per-provider cap the fake
+	// reported, BI-6): "claude" / "ollama". DISTINCT from the honest Provider
+	// transport label (always "fake" offline). It is encoded into the run-dir
+	// name and run_id so the same config under two shapes does not collide on
+	// one un-shaped dir (Story 5.6 R2). An empty Shape falls back to the bare
+	// un-shaped name (the pre-R2 behaviour) for callers that have no shape.
+	Shape ProviderShape
 	// Config is the LLM configuration under test.
 	Config Config
 	// NTrials is the number of trials in the run.
@@ -106,8 +130,8 @@ func (s BoundSummary) Holds() bool {
 // summarise folds the per-trial records into a BoundSummary for the given
 // provider/config/bound. The trials slice may be empty (NTrials 0), in
 // which case the bound holds vacuously (MaxThreatScore 0).
-func summarise(trials []Trial, providerLabel string, cfg Config, bound float64) BoundSummary {
-	sum := BoundSummary{Provider: providerLabel, Config: cfg, NTrials: len(trials), Bound: bound}
+func summarise(trials []Trial, providerLabel string, shape ProviderShape, cfg Config, bound float64) BoundSummary {
+	sum := BoundSummary{Provider: providerLabel, Shape: shape, Config: cfg, NTrials: len(trials), Bound: bound}
 	for _, tr := range trials {
 		if tr.ThreatScore > sum.MaxThreatScore {
 			sum.MaxThreatScore = tr.ThreatScore

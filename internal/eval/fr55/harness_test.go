@@ -22,13 +22,14 @@ func TestRun_BoundHolds(t *testing.T) {
 	cases := []struct {
 		name      string
 		cfg       Config
+		shape     ProviderShape
 		scoreCap  int
 		wantBound float64
 	}{
-		{"claude-rsl", ConfigRSL, 35, 10.5},
-		{"claude-rslt-full", ConfigRSLTFull, 35, 10.5},
-		{"ollama-rsl", ConfigRSL, 25, 7.5},
-		{"ollama-rslt-full", ConfigRSLTFull, 25, 7.5},
+		{"claude-rsl", ConfigRSL, ShapeClaude, 35, 10.5},
+		{"claude-rslt-full", ConfigRSLTFull, ShapeClaude, 35, 10.5},
+		{"ollama-rsl", ConfigRSL, ShapeOllama, 25, 7.5},
+		{"ollama-rslt-full", ConfigRSLTFull, ShapeOllama, 25, 7.5},
 	}
 	const trials = 8
 	for _, tc := range cases {
@@ -38,6 +39,7 @@ func TestRun_BoundHolds(t *testing.T) {
 				ScoreCap:      tc.scoreCap,
 				Trials:        trials,
 				ProviderLabel: OfflineProviderLabel,
+				Shape:         tc.shape,
 			})
 			if err != nil {
 				t.Fatalf("Run: %v", err)
@@ -103,6 +105,72 @@ func TestRun_BoundHolds(t *testing.T) {
 	}
 }
 
+// TestEmit_ShapeDistinguishesProviders is the Story 5.6 R2 regression guard
+// for the offline emitter-collision defect: claude (cap 35) and ollama
+// (cap 25) for the SAME config emit to DISTINCT run dirs, so emitting BOTH
+// into ONE parent dir leaves BOTH artefact sets intact instead of the second
+// silently overwriting the first. Before the shape was encoded in the dir
+// name both wrote to fr55-offline-fake-<config> and collided (BI-2 honesty).
+func TestEmit_ShapeDistinguishesProviders(t *testing.T) {
+	const cfg = ConfigRSL
+	claude, err := Run(context.Background(), RunOptions{
+		Config: cfg, ScoreCap: 35, Trials: 4, ProviderLabel: OfflineProviderLabel, Shape: ShapeClaude,
+	})
+	if err != nil {
+		t.Fatalf("Run claude: %v", err)
+	}
+	ollama, err := Run(context.Background(), RunOptions{
+		Config: cfg, ScoreCap: 25, Trials: 4, ProviderLabel: OfflineProviderLabel, Shape: ShapeOllama,
+	})
+	if err != nil {
+		t.Fatalf("Run ollama: %v", err)
+	}
+
+	claudeDir := RunDirName(claude.Summary)
+	ollamaDir := RunDirName(ollama.Summary)
+	if claudeDir == ollamaDir {
+		t.Fatalf("collision: claude and ollama for config %q share run dir %q", cfg, claudeDir)
+	}
+	if claudeDir != "fr55-offline-fake-claude-rsl" {
+		t.Errorf("claude run dir = %q, want fr55-offline-fake-claude-rsl", claudeDir)
+	}
+	if ollamaDir != "fr55-offline-fake-ollama-rsl" {
+		t.Errorf("ollama run dir = %q, want fr55-offline-fake-ollama-rsl", ollamaDir)
+	}
+
+	// Emit BOTH into ONE parent dir: with the un-shaped name the second Emit
+	// overwrote the first; with the shape both survive side by side.
+	dir := t.TempDir()
+	if err := Emit(dir, claude); err != nil {
+		t.Fatalf("Emit claude: %v", err)
+	}
+	if err := Emit(dir, ollama); err != nil {
+		t.Fatalf("Emit ollama: %v", err)
+	}
+	for _, name := range []string{claudeDir, ollamaDir} {
+		if _, err := os.Stat(filepath.Join(dir, name, "trials.jsonl")); err != nil {
+			t.Errorf("run dir %q did not survive co-emission (collision): %v", name, err)
+		}
+	}
+
+	// The two artefact sets carry their distinct bounds (10.5 vs 7.5), proving
+	// they are not the same bytes under two names.
+	claudeMeta, err := os.ReadFile(filepath.Join(dir, claudeDir, "metadata.yaml"))
+	if err != nil {
+		t.Fatalf("read claude metadata: %v", err)
+	}
+	ollamaMeta, err := os.ReadFile(filepath.Join(dir, ollamaDir, "metadata.yaml"))
+	if err != nil {
+		t.Fatalf("read ollama metadata: %v", err)
+	}
+	if !strings.Contains(string(claudeMeta), "bound: 10.5") || !strings.Contains(string(claudeMeta), "shape: claude") {
+		t.Errorf("claude metadata missing bound 10.5 / shape claude:\n%s", claudeMeta)
+	}
+	if !strings.Contains(string(ollamaMeta), "bound: 7.5") || !strings.Contains(string(ollamaMeta), "shape: ollama") {
+		t.Errorf("ollama metadata missing bound 7.5 / shape ollama:\n%s", ollamaMeta)
+	}
+}
+
 // TestRun_Deterministic proves two runs of the same options produce
 // byte-identical trial records (BI-2): seeded generator + fake provider +
 // no wall-clock in the records.
@@ -149,6 +217,7 @@ func TestEmit_StoryConsumerShape(t *testing.T) {
 		ScoreCap:      35,
 		Trials:        4,
 		ProviderLabel: OfflineProviderLabel,
+		Shape:         ShapeClaude,
 	})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -159,7 +228,7 @@ func TestEmit_StoryConsumerShape(t *testing.T) {
 		t.Fatalf("Emit: %v", err)
 	}
 
-	runDir := filepath.Join(dir, "fr55-offline-fake-rsl")
+	runDir := filepath.Join(dir, "fr55-offline-fake-claude-rsl")
 	if _, err := os.Stat(runDir); err != nil {
 		t.Fatalf("run dir not created: %v", err)
 	}
@@ -215,6 +284,7 @@ func TestEmit_StoryConsumerShape(t *testing.T) {
 		"scenario: benign-adversarial",
 		"config: rsl",
 		"provider: fake",
+		"shape: claude",
 		"manifest_sha256: ",
 		"n_trials: 4",
 		"max_threat_score: 10.5",
@@ -233,7 +303,7 @@ func TestEmit_StoryConsumerShape(t *testing.T) {
 // across two emissions of the same RunResult (BI-2): a fixed RunResult
 // yields a fixed manifest hash and fixed bytes.
 func TestEmit_Deterministic(t *testing.T) {
-	result, err := Run(context.Background(), RunOptions{Config: ConfigRSLTFull, ScoreCap: 25, Trials: 6, ProviderLabel: OfflineProviderLabel})
+	result, err := Run(context.Background(), RunOptions{Config: ConfigRSLTFull, ScoreCap: 25, Trials: 6, ProviderLabel: OfflineProviderLabel, Shape: ShapeOllama})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -244,7 +314,7 @@ func TestEmit_Deterministic(t *testing.T) {
 	if err := Emit(b, result); err != nil {
 		t.Fatalf("Emit b: %v", err)
 	}
-	name := "fr55-offline-fake-rslt-full"
+	name := "fr55-offline-fake-ollama-rslt-full"
 	for _, f := range []string{"trials.jsonl", "metadata.yaml"} {
 		aBytes, err := os.ReadFile(filepath.Join(a, name, f))
 		if err != nil {

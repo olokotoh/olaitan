@@ -35,6 +35,12 @@ type RunOptions struct {
 	// ProviderLabel is the honest provider marker recorded on every trial.
 	// On the offline path callers pass OfflineProviderLabel ("fake", BI-2).
 	ProviderLabel string
+	// Shape is the emulated provider shape ("claude" / "ollama", BI-6): the
+	// per-provider cap the fake reports. DISTINCT from the honest fake
+	// transport label. It is carried into the emitted run-dir name and run_id
+	// so the same config under two shapes does NOT collide (Story 5.6 R2).
+	// An empty Shape falls back to the un-shaped dir name.
+	Shape ProviderShape
 }
 
 // RunResult is the output of one bound-test run: the per-trial records and
@@ -104,7 +110,7 @@ func Run(ctx context.Context, opts RunOptions) (RunResult, error) {
 		trials = append(trials, tr)
 	}
 
-	return RunResult{Trials: trials, Summary: summarise(trials, providerLabel, opts.Config, bound)}, nil
+	return RunResult{Trials: trials, Summary: summarise(trials, providerLabel, opts.Shape, opts.Config, bound)}, nil
 }
 
 // buildChain constructs the real analyst.Chain for the requested config

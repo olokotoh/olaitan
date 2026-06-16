@@ -87,6 +87,11 @@ func run(args []string, stdout, stderr io.Writer) error {
 		ScoreCap:      scoreCap,
 		Trials:        *trials,
 		ProviderLabel: fr55.OfflineProviderLabel,
+		// The emulated provider shape (claude / ollama) is encoded into the
+		// run-dir name and run_id so the same config under two shapes does NOT
+		// collide on one un-shaped dir (Story 5.6 R2). The --provider flag is
+		// validated against providerScoreCap above, so it is a known shape.
+		Shape: fr55.ProviderShape(*providerFlag),
 	})
 	if err != nil {
 		return err
@@ -105,7 +110,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if err := fr55.Emit(*out, result); err != nil {
 			return err
 		}
-		_, _ = fmt.Fprintf(stdout, "  artefacts:          %s/%s%s-%s/\n", *out, fr55.OfflineRunIDPrefix, sum.Provider, sum.Config)
+		_, _ = fmt.Fprintf(stdout, "  artefacts:          %s/%s/\n", *out, fr55.RunDirName(sum))
 	}
 
 	if !sum.Holds() {

@@ -1,8 +1,9 @@
-run_id: fr55-offline-fake-rslt-full
+run_id: fr55-offline-fake-claude-rslt-full
 manifest_sha256: eae8de26d335a3bce58c91b48d57bdc117b9a0bb5983562e8842bbde9fec9e7b
 scenario: benign-adversarial
 config: rslt-full
 provider: fake
+shape: claude
 n_trials: 10
 max_threat_score: 10.5
 n_past_suspicious: 0

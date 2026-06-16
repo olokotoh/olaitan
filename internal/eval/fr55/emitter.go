@@ -25,12 +25,19 @@ import (
 // run_id are prefixed OfflineRunIDPrefix and the provider is labelled
 // honestly (BI-2): the offline fake set is never a thesis-final number.
 //
+// The run-dir name also encodes the EMULATED provider SHAPE (Story 5.6 R2):
+// fr55-offline-fake-<shape>-<config>. Without the shape the same config
+// under two shapes (claude cap 35 / ollama cap 25) both wrote to
+// fr55-offline-fake-<config> and silently overwrote one another; the shape
+// makes every offline run dir collision-free and CLI-reproducible. The
+// transport label stays the honest "fake" (provider: fake in the metadata).
+//
 // Emit is deterministic: it sorts nothing it does not already control,
 // uses no wall-clock in the artefact bytes, and computes manifest_sha256
 // over the canonical trials.jsonl bytes, so two runs of the same RunResult
 // produce byte-identical artefacts.
 func Emit(dir string, result RunResult) error {
-	runDirName := fmt.Sprintf("%s%s-%s", OfflineRunIDPrefix, result.Summary.Provider, result.Summary.Config)
+	runDirName := RunDirName(result.Summary)
 	runDir := filepath.Join(dir, runDirName)
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		return fmt.Errorf("fr55: create run dir %s: %w", runDir, err)
@@ -50,6 +57,19 @@ func Emit(dir string, result RunResult) error {
 		return fmt.Errorf("fr55: write metadata.yaml: %w", err)
 	}
 	return nil
+}
+
+// RunDirName is the single source of truth for the offline run-dir name (and
+// the matching metadata run_id), so the CLI banner and the emitter stay in
+// sync. It is fr55-offline-fake-<shape>-<config> when a provider shape is
+// present (the collision-free Story 5.6 R2 form), and falls back to the bare
+// fr55-offline-fake-<config> when no shape is set (pre-R2 callers). The
+// "fake" transport marker is always retained (BI-2).
+func RunDirName(sum BoundSummary) string {
+	if sum.Shape != "" {
+		return fmt.Sprintf("%s%s-%s-%s", OfflineRunIDPrefix, sum.Provider, sum.Shape, sum.Config)
+	}
+	return fmt.Sprintf("%s%s-%s", OfflineRunIDPrefix, sum.Provider, sum.Config)
 }
 
 // marshalTrials renders the trials as canonical JSONL: one compact
@@ -97,6 +117,10 @@ func marshalMetadata(runID, manifest string, sum BoundSummary) []byte {
 		fmt.Sprintf("config: %s", sum.Config),
 		// The honest provider marker (BI-2): "fake" on the offline set.
 		fmt.Sprintf("provider: %s", sum.Provider),
+		// The emulated provider shape (BI-6, Story 5.6 R2): which per-provider
+		// cap the fake reported. DISTINCT from the honest "fake" transport
+		// above; it makes the offline run dir collision-free + self-describing.
+		fmt.Sprintf("shape: %s", sum.Shape),
 		fmt.Sprintf("n_trials: %d", sum.NTrials),
 		// The bound-proof summary fields the FR55 row reads (AC4/AC6).
 		fmt.Sprintf("max_threat_score: %s", formatFloat(sum.MaxThreatScore)),
