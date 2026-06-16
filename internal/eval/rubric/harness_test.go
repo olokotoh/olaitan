@@ -252,12 +252,17 @@ func TestEmit_MetadataCarriesJoinKeys(t *testing.T) {
 
 // TestEmitStaticWorkflow_BlindedFilesNoVariantLabel asserts the static-file
 // workflow writes the blinded report files + per-rater scoring sheets and that
-// the rater-facing report files are INDISTINGUISHABLE in their identifying
-// header (AC2/OQ3, HIGH-1): neither file may carry the variant label OR the
-// asymmetric provenance metadata (report_kind / dfir_provider / dfir_model /
-// prompt_hash, the LLM report.v1, the templated rubric.templated.v1), and both
-// files' front-matter blocks must be structurally identical (same keys). The
-// un-blinding key is kept separate (off disk).
+// the rater-facing report files are INDISTINGUISHABLE in their self-description
+// (AC2/OQ3, HIGH-1): the ENTIRE rater-facing body - front-matter AND prose -
+// carries no variant label, no asymmetric provenance metadata (report_kind /
+// dfir_provider / dfir_model / prompt_hash, the LLM report.v1, the templated
+// rubric.templated.v1), and no prose self-identifying tell (the
+// templated-baseline markers "fixed Markdown template" / "language-model" /
+// "machine-rendered" / "baseline", or the LLM-variant markers "SYNTHETIC" /
+// "synthetic offline" / "not a thesis-final"). Both files' front-matter blocks
+// must also be structurally identical (same keys). The two reports may differ
+// ONLY in narrative substance/quality, never in self-description. The un-blinding
+// key is kept separate (off disk).
 func TestEmitStaticWorkflow_BlindedFilesNoVariantLabel(t *testing.T) {
 	result, err := RunOffline(Options{Scenario: "s1", NRaters: 2})
 	if err != nil {
@@ -268,12 +273,18 @@ func TestEmitStaticWorkflow_BlindedFilesNoVariantLabel(t *testing.T) {
 		t.Fatalf("EmitStaticWorkflow: %v", err)
 	}
 	incidentDir := filepath.Join(dir, RunDirName(result.Summary), "workflow", result.Pairs[0].IncidentID)
-	// The variant-identifying tokens that must NOT appear in EITHER rater-facing
-	// file (the LLM-only and templated-only front-matter markers, HIGH-1).
+	// The variant-identifying tokens that must NOT appear ANYWHERE in EITHER
+	// rater-facing file - front-matter AND prose (HIGH-1, the prose-level
+	// blinding regression). The first group are the front-matter provenance
+	// markers; the rest are the prose self-labelling tells (the templated
+	// baseline's and the synthetic narrative's self-description).
 	identifyingTokens := []string{
 		"variant: llm", "variant: templated", `"variant"`,
 		"report_kind", "dfir_provider", "dfir_model", "prompt_hash",
 		"report.v1", "rubric.templated.v1",
+		"language-model", "fixed Markdown template", "templated-baseline", "baseline",
+		"machine-rendered", "machine-generated", "SYNTHETIC", "synthetic offline",
+		"not a thesis-final",
 	}
 	var frontMatterKeySets [][]string
 	for _, slot := range blindLabels {

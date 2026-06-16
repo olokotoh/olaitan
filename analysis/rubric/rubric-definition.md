@@ -96,12 +96,18 @@ to the Wilcoxon family.
   variant-identifying provenance metadata is STRIPPED from the rater-facing file
   (the LLM variant's `report.v1`/`prompt_hash`/`dfir_provider`/`dfir_model` and
   the templated baseline's `rubric.templated.v1`/`report_kind`), so neither the
-  variant label nor an asymmetric header reveals which report is
-  machine-generated. The report PROSE legitimately differs between the variants
-  (that quality difference is exactly what the rater scores); only the
-  identifying metadata header is normalised. The harness retains the full
-  per-variant provenance ONLY in the off-disk un-blinding key (slot -> variant),
-  used at scoring time, never in the rater-facing files.
+  variant label nor an asymmetric header reveals which report is which. The two
+  rater-facing files are also IDENTICAL in their self-description: they share the
+  same section headings/structure and the prose carries NO self-identifying tell
+  (no "synthetic"/"offline"/"LLM" marker on variant (a), no
+  "template"/"machine-rendered"/"baseline"/"language-model" marker on variant
+  (b)). The files differ ONLY in the substance/quality of the analyst narrative -
+  variant (a) carries an interpretive narrative, variant (b) states its absence
+  neutrally ("Analyst narrative: not provided.") - and that quality difference is
+  exactly what the rater scores. The identifying provenance (which slot is the
+  LLM variant, the synthetic honesty flag) is retained ONLY in the off-disk
+  un-blinding key (slot -> variant) and run metadata, used at scoring time, never
+  in the rater-facing files.
 - **Conflict-of-interest exclusion:** a rater who contributed to Olaitan's
   development (including the author) is EXCLUDED from scoring, so the comparison
   is not self-graded.

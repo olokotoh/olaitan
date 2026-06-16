@@ -28,23 +28,32 @@ const (
 // literal, NEVER under internal/agent/prompts/defaults (BI-3): the offline path
 // makes NO live LLM call, so this string stands in for the model's interpretive
 // prose without prompting. The (a)-vs-(b) contrast is exactly this narrative:
-// variant (a) carries it, variant (b) carries the fixed templated stub below.
+// variant (a) carries this interpretive narrative, variant (b) carries the
+// neutral absence line below.
+//
+// BLINDING (AC2): this is rater-facing prose, so it carries NO self-identifying
+// tell (no "synthetic"/"offline"/"LLM"/"not a thesis-final" marker). The
+// synthetic honesty marker lives OFF-disk only (synthetic: true in metadata, the
+// rubric-offline- run prefix, and the un-blinding key), never in this prose. In
+// the real study this string is replaced by the real LLM narrative.
 const syntheticNarrative = "This finalised incident shows a container-escape kill chain: the workload " +
 	"escalated from CLEAN through SUSPICIOUS and RESTRICTED into QUARANTINED as the " +
 	"ThreatScore crossed the escalation thresholds. The MITRE ATT&CK technique T1611 " +
 	"(Escape to Host) is consistent with the privilege-escalation kill-chain stage. " +
-	"Containment quarantined the workload before any kill condition was met. " +
-	"(SYNTHETIC offline narrative for the rubric data-path proof; not a thesis-final report.)"
+	"Containment quarantined the workload before any kill condition was met."
 
-// templatedStub is the fixed templated-baseline analyst section (variant b). It
-// makes NO interpretive claim the deterministic factual sections do not already
-// carry: the baseline omits the LLM narrative and states that omission honestly,
-// so the (a)-vs-(b) rubric contrast isolates the LLM-sourced interpretation.
-const templatedStub = "This report is generated from the incident evidence by a fixed Markdown " +
-	"template with no language-model interpretation. The factual sections above " +
-	"(kill-chain timeline, containment actions, MITRE ATT&CK annotations, and " +
-	"contributing posture findings) are the complete machine-rendered record; no " +
-	"analyst narrative is supplied by this baseline."
+// templatedStub is the fixed analyst-narrative section for variant (b). The
+// baseline carries no interpretive narrative, and that absence is the legitimate
+// quality contrast a rater scores (variant a's interpretive narrative vs variant
+// b's absence) - that contrast is inherent to RQ5 and must remain.
+//
+// BLINDING (AC2): this is rater-facing prose, so it states the absence NEUTRALLY
+// and factually under the SAME "Analyst narrative" heading variant (a) uses; it
+// carries NO self-identifying tell (no "template"/"machine"/"baseline"/
+// "language-model"/"no LLM" marker that would announce this is the templated
+// variant). Only the narrative CONTENT differs (present + interpretive vs
+// absent), never the self-description.
+const templatedStub = "Analyst narrative: not provided."
 
 // RenderLLMVariant produces variant (a) by REUSING the frozen Story-4.4 renderer
 // read-only (BI-1). It builds a dfir.ForensicReport from the incident evidence

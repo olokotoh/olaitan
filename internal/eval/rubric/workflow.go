@@ -40,8 +40,10 @@ func EmitStaticWorkflow(dir string, result Result) error {
 			// asymmetric variant front-matter (report.v1 vs rubric.templated.v1,
 			// report_kind, dfir_provider, dfir_model, prompt_hash) is STRIPPED
 			// here and retained only in the off-disk un-blinding key/archive. The
-			// prose itself legitimately differs (raters score quality); only the
-			// metadata header must not label the source (AC2).
+			// prose bodies differ ONLY in narrative substance/quality (variant a's
+			// interpretive narrative vs variant b's neutral absence line, which is
+			// what raters score); neither prose body nor the header self-identifies
+			// the source (AC2).
 			path := filepath.Join(incidentDir, report.Slot+".md")
 			body := blindReportBody(pair.IncidentID, report.Body)
 			if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
