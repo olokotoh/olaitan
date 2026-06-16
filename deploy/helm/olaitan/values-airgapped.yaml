@@ -62,3 +62,31 @@ analyst:
 # intra-namespace egress already covers aggregator -> ollama.)
 networkPolicy:
   extraEgress: []
+
+# AC2 RECONCILIATION (Story 6.6). The air-gapped AC names two literals
+# that the chart renders differently; both are honoured by the chart's
+# own machinery, not by hand-forcing a value:
+#
+#   - analyst.provider: ollama  -- the chart provider enum is
+#     [none, api, local]; "ollama" is valid only as a per-ROLE provider.
+#     "local" is the chart-level selector the Go loader maps to the
+#     in-cluster Ollama provider (api -> claude, local -> ollama), so
+#     provider: "local" above IS the air-gapped Ollama selection.
+#   - analyst.endpoint: http://ollama.olaitan.svc.cluster.local:11434 --
+#     the chart key is analyst.local.endpoint, and with ollama.enabled
+#     the chart DERIVES it to
+#     http://<fullname>-ollama.<namespace>.svc.cluster.local:11434
+#     (for `helm install olaitan -n olaitan`:
+#     http://olaitan-ollama.olaitan.svc.cluster.local:11434). The
+#     hostname differs from the AC literal only by the chart's
+#     <fullname>-ollama Service-naming convention; the intent (an
+#     in-cluster Ollama Service, no external dial) is met. Leaving
+#     analyst.local.endpoint empty above lets the chart derive it for
+#     any release / namespace.
+
+# No outbound incident notifications: the air-gapped posture has no
+# external webhook to reach (FR48). This is the chart default; it is
+# stated explicitly here so the no-external-egress commitment is
+# self-documenting for the air-gapped operator.
+notifications:
+  enabled: false

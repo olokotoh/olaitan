@@ -858,3 +858,101 @@ jobs:
         run: |
           kubectl get pods -A
           kubectl logs -l app.kubernetes.io/name=olaitan --tail=300 --all-containers || true
+
+  # Deployment-posture overlay smoke on a real kind cluster (Story 6.6 AC5). It
+  # installs ONE posture overlay (the air-gapped overlay: in-cluster ollama +
+  # empty egress, the richest commitment surface) under the SAME Falco-off kind
+  # bring-up as the always-on `e2e` job, then runs the OLT_E2E_OVERLAYS-gated
+  # smoke that verifies the operator-experience commitments (pod hardening,
+  # least-privilege RBAC, namespace NetworkPolicy, no external egress) against
+  # live pod / chart inspection.
+  #
+  # OPT-IN (mirrors the e2e-forensics / e2e-scenarios gates; carry-forward A1):
+  # this job runs ONLY when a PR carries the `e2e-overlays` label, so it does not
+  # add a per-overlay bring-up to the constrained single-node kind runner on
+  # every push. This is honest scoping consistent with the A1 carry-forward, NOT
+  # a silent lowering of the bar: the SAME commitments (security context, RBAC,
+  # netpol, no-egress) are covered deterministically with NO cluster by the
+  # `-tags=helm` golden + knob tests (TestProductionOverlayHardeningRenders,
+  # TestAirgappedOverlayNoExternalEgress, TestEvalOverlayBaseKnobsRender), which
+  # run in the always-on `helm` job. Add the `e2e-overlays` label to run this.
+  e2e-overlays:
+    if: contains(github.event.pull_request.labels.*.name, 'e2e-overlays')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      # Free disk on the runner before the kind cluster (see the `e2e` job
+      # rationale): the nats subchart sizes JetStream off actual free disk.
+      - name: Free up disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/lib/jvm || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Build Olaitan image
+        run: make docker-build
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1.12.0
+        with:
+          version: v0.26.0
+          cluster_name: olaitan-e2e
+          config: hack/kind-config.yaml
+
+      - name: Load image into kind
+        run: |
+          tag=$(make -s version-tag)
+          kind load docker-image olaitan:"$tag" --name olaitan-e2e
+
+      - name: Prepare chart
+        run: make helm-prepare
+
+      - name: Fetch subchart dependencies
+        run: |
+          helm repo add falcosecurity https://falcosecurity.github.io/charts
+          helm repo add nats https://nats-io.github.io/k8s/helm/charts/
+          helm repo update
+          helm dependency update deploy/helm/olaitan
+
+      # Install the air-gapped posture overlay under the Falco-off kind bring-up.
+      # The overlay enables the in-cluster ollama Deployment/Service/NetworkPolicy
+      # (the model is NOT provisioned in CI; the smoke inspects the chart objects,
+      # not a live ollama dial). nats.streamMaxBytesOverride keeps JetStream under
+      # the kind PVC; analyst.local.model is pinned so the provider constructs.
+      - name: Install chart under the air-gapped overlay
+        run: |
+          tag=$(make -s version-tag)
+          helm install olaitan ./deploy/helm/olaitan \
+            --set image.repository=olaitan \
+            --set-string image.tag="$tag" \
+            --set image.pullPolicy=Never \
+            --set secrets.redisPassword=ci-test \
+            --set falco.enabled=false \
+            --set endpoints.falco=tcp://127.0.0.1:0 \
+            --set-string nats.streamMaxBytesOverride=536870912 \
+            --set analyst.local.model=fake \
+            -f deploy/helm/olaitan/values-airgapped.yaml \
+            --wait --timeout 6m
+
+      - name: Run posture overlay smoke (Story 6.6 AC5)
+        env:
+          OLT_E2E_OVERLAYS: "1"
+          OLT_E2E_OVERLAY: airgapped
+        run: go test -tags=e2e -v -count=1 -run TestKindSmoke_Overlays_OperatorCommitments ./tests/e2e/...
+
+      - name: Debug logs on failure
+        if: failure()
+        run: |
+          kubectl get pods -A
+          kubectl logs -l app.kubernetes.io/name=olaitan --tail=300 --all-containers || true
