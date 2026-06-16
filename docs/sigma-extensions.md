@@ -73,10 +73,10 @@ Every OLT rule MUST declare an `attack:` field at the top level whose
 value is a non-empty YAML list of MITRE ATT&CK for Containers v18
 technique IDs. Two ID forms are valid:
 
-- **Base technique** — uppercase `T` followed by exactly four digits
-  (`T1496`, `T1611`). No separator, no trailing dot.
-- **Sub-technique** — base technique ID, a single dot, and exactly
-  three digits (`T1059.004`).
+- **Base technique** (uppercase `T` followed by exactly four digits,
+  e.g. `T1496`, `T1611`). No separator, no trailing dot.
+- **Sub-technique** (base technique ID, a single dot, and exactly
+  three digits, e.g. `T1059.004`).
 
 Both forms are accepted in the same list. The four-digit base and
 three-digit sub-technique counts match MITRE ATT&CK Enterprise v18.
@@ -93,6 +93,15 @@ attack:
 The five evaluation scenarios pin to these technique IDs. The CI lint
 tool rejects rules without an `attack:` field, rules whose `attack:`
 list is empty, and IDs that fail the regex `^T[0-9]{4}(\.[0-9]{3})?$`.
+
+The annotation is a single top-level `attack:` key whose value is the
+YAML list of technique IDs. It is NOT a per-technique dotted key of the
+form `attack.<technique>`: there is one `attack:` field per rule, and a
+rule that covers several techniques lists them all under that one key.
+The parser reads the list from the rule's extension map
+(`extractAttack` over sigmalite's `Rule.Extra["attack"]`,
+`internal/decision/rules/parser/parser.go`), so a malformed shape is
+rejected at parse time.
 
 Rationale: `attack:` is the join key between rule output, the
 `EvidencePackage.attack_techniques` slice (Story 1.14), the `L1Hypothesis`
@@ -220,7 +229,188 @@ loud parser error is the safer disposition for security tooling.
 The numeric severity is consumed by the ThreatScore weighting
 documented in `_bmad-output/planning-artifacts/architecture.md`.
 
-## 9. Hand-off into the rule engine
+## 9. False-positive characterisation field (`falsepositives:`)
+
+Every OLT rule MUST declare a `falsepositives:` field whose value is a
+non-empty YAML list of human-readable strings. The field carries its
+standard SIGMA-HQ semantics (a list of known benign conditions that can
+trip the rule) and OLT raises it to a required convention because a
+deterministic detection that ships without its benign-context notes is
+not operable: the operator needs the false-positive characterisation to
+tune allowlists and to triage an alert.
+
+The corpus enforces this. The default-tag corpus walk
+(`TestCorpusLint_AllRulesParse`,
+`internal/decision/rules/corpus_lint_test.go`) asserts the AC2
+falsepositives gate over every rule under `rules/`, so a rule that omits
+the field, or that ships an empty list, fails the build.
+
+OLT pins one additional convention on the content of each entry: an
+entry names BOTH the benign source AND the allowlist mechanism that
+suppresses it, so the note is actionable rather than decorative. The
+real corpus follows this shape, for example (from
+`rules/priv/OLT-PRIV-001.yaml`):
+
+```yaml
+falsepositives:
+  - Privileged DaemonSets such as CNI or CSI plugins; excluded by the workload_kind filter
+  - Security testing workloads inside dedicated namespaces; allowlist via a dedicated namespace shape
+```
+
+The first clause identifies the benign workload; the second names how an
+operator excludes it (a detection-side filter the rule already carries,
+or an allowlist mechanism an operator adds in an overlay). A rule whose
+false positives cannot be characterised this way is usually too broad
+and should be narrowed before it ships.
+
+## 10. Additional worked examples
+
+Section 7 gives the first worked example (`OLT-IMPACT-005`). The two
+rules below complete the minimum set of three, each drawn verbatim from
+the real corpus and each exercising a different combination of OLT and
+SIGMA-HQ surfaces.
+
+### 10.1 `OLT-PRIV-001`: privileged capability acquisition
+
+This rule exercises the `process.cap_effective|contains` list match, a
+`k8s.workload.owner_kind` list value, a negated `k8s.pod.namespace`
+system-namespace filter in the `condition`, the highest severity band
+(`severity: 90`), and the container-escape technique `T1611`.
+
+```yaml
+title: Privileged capability acquisition in workload Pod
+id: OLT-PRIV-001
+description: |
+  Detects a container process that acquires CAP_SYS_ADMIN or
+  CAP_SYS_PTRACE inside a Deployment or StatefulSet workload Pod
+  outside the system namespaces. These capabilities are sufficient
+  for a container escape via privileged syscalls and are not held by
+  typical application workloads, so their presence in a tenant
+  controller is a strong indicator of an in-progress escape attempt.
+status: experimental
+attack:
+  - T1611
+severity: 90
+detection:
+  cap_acquired:
+    process.cap_effective|contains:
+      - 'CAP_SYS_ADMIN'
+      - 'CAP_SYS_PTRACE'
+  workload_kind:
+    k8s.workload.owner_kind:
+      - Deployment
+      - StatefulSet
+  system_namespace:
+    k8s.pod.namespace:
+      - 'kube-system'
+      - 'kube-public'
+      - 'kube-node-lease'
+      - 'olaitan'
+  condition: cap_acquired and workload_kind and not system_namespace
+falsepositives:
+  - Privileged DaemonSets such as CNI or CSI plugins; excluded by the workload_kind filter
+  - Security testing workloads inside dedicated namespaces; allowlist via a dedicated namespace shape
+fields:
+  - process.cap_effective
+  - k8s.pod.namespace
+  - k8s.workload.owner_kind
+```
+
+### 10.2 `OLT-CRED-001`: ServiceAccount token read by a non-system process
+
+This rule exercises the `file.path|startswith` modifier on two parallel
+selections, the `process.exe|re` regular-expression modifier, a
+multi-branch `condition` combining `or` and `not`, and the
+credential-access technique `T1552`.
+
+```yaml
+title: ServiceAccount token read by non-system process
+id: OLT-CRED-001
+description: |
+  Detects a read against the projected ServiceAccount token file by a
+  process whose executable does not belong to the system process
+  allowlist (kubelet, kube-proxy, coredns). Workload Pods rarely read
+  the token directly because the standard client libraries handle the
+  mount internally; an explicit open call is a strong indicator of
+  credential theft.
+status: experimental
+attack:
+  - T1552
+severity: 75
+detection:
+  sa_token_read_runtime:
+    file.path|startswith: '/run/secrets/kubernetes.io/serviceaccount/'
+  sa_token_read_legacy:
+    file.path|startswith: '/var/run/secrets/kubernetes.io/serviceaccount/'
+  system_process:
+    process.exe|re: '^/(usr/)?(local/)?s?bin/(kubelet|kube-proxy|coredns)$'
+  condition: (sa_token_read_runtime or sa_token_read_legacy) and not system_process
+falsepositives:
+  - In cluster sidecars that read the token to seed a custom HTTP client; pin via a process.exe allowlist in operator overlay
+  - Service mesh proxies (Linkerd, Envoy) that proxy the apiserver; allowlist via a dedicated namespace shape
+  - The system_process allowlist is anchored to FHS paths (/bin, /sbin, /usr/{,local/}{,s}bin) only. Non FHS K8s installs (RKE2 at /var/lib/rancher/rke2/bin, snap based installs at /snap/kubelet/, custom packagings under /opt/bin) will not match the allowlist and the legitimate system kubelet/kube-proxy/coredns process will trigger the rule. Operators on non FHS distributions should extend the allowlist via overlay, or accept the noise under status experimental.
+fields:
+  - file.path
+  - process.exe
+  - k8s.pod.namespace
+```
+
+These three (`OLT-IMPACT-005`, `OLT-PRIV-001`, `OLT-CRED-001`) span the
+`endswith`, `contains`, `startswith`, and `re` modifiers; integer and
+string pattern lists; negated and multi-branch `condition` expressions;
+the `k8s.*` posture references; the `attack:` list; and the `severity:`
+and `falsepositives:` conventions. A fourth corpus rule,
+`rules/net/OLT-NET-001.yaml`, additionally demonstrates the `cidr`
+modifier (`network.dst_ip|cidr`) over a negated RFC1918 condition for
+beacon-shaped outbound traffic.
+
+## 11. Validating an OLT rule against the SIGMA-HQ reference parser
+
+The strict-superset property (NFR30) is not aspirational: it is backed by
+the parser implementation and a corpus test that runs in CI.
+
+**The parser is a thin wrap of the SIGMA-HQ reference parser.** The OLT
+parser depends on `github.com/runreveal/sigmalite` (pinned in `go.mod`,
+no source fork; the upstream commit is recorded in
+`internal/decision/rules/parser/NOTICE` under Apache-2.0).
+`parser.ParseRule(yamlBytes)` calls `sigma.ParseRule(yamlBytes)` first
+(`internal/decision/rules/parser/parser.go`), and only after the
+SIGMA-HQ parse succeeds does it extract the OLT-only `attack:` and
+`severity:` fields from sigmalite's `Rule.Extra` extension map. If
+sigmalite rejects the YAML (a malformed `detection:`, a missing `title:`,
+a bad modifier), the parse fails before any OLT check runs. Because the
+OLT additions ride sigmalite's documented extension surface and never
+remove or redefine a SIGMA-HQ field, an OLT rule is a SIGMA-HQ rule plus
+additive annotations.
+
+**A test parses the whole corpus through that path.**
+`TestCorpusLint_AllRulesParse` (`internal/decision/rules/corpus_lint_test.go`)
+walks every rule under `rules/` and runs `parser.ParseRule` (hence
+`sigma.ParseRule`) over each one, asserting it parses without error.
+
+To validate a rule you are authoring, drop it under the appropriate
+`rules/<category>/` directory and run the corpus walk:
+
+```sh
+go test ./internal/decision/rules/ -run TestCorpusLint -count=1
+```
+
+This target also runs by default under `make test`, so a rule that does
+not parse through the SIGMA-HQ reference parser fails the build. The
+wrap-path proof-of-concept lives under `spikes/sigma-parser/` (with
+`testdata/OLT-IMPACT-005.yaml` as the parser-validation fixture), and the
+parser-strategy decision is recorded in
+[`deferred-decisions.md`](deferred-decisions.md) ADR-2026-04-28-01.
+
+**Scope of the claim.** The strict-superset evidence is (i) the additive
+wrap-path architecture (OLT adds only `attack:` and `severity:` on the
+sigmalite extension surface and never removes or redefines a SIGMA-HQ
+field) and (ii) the corpus walk that parses every OLT rule through the
+SIGMA-HQ reference parser. It is not a full SIGMA-HQ conformance-suite
+round-trip over the entire upstream SIGMA-HQ ruleset; the claim is that
+OLT rules validate as SIGMA-HQ rules, demonstrated over the OLT corpus.
+
+## 12. Hand-off into the rule engine
 
 The OLT field resolver, lint regex, severity convention, and ATT&CK
 annotation enforcement land in `internal/decision/rules/` under
