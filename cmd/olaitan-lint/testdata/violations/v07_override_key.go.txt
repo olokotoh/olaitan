@@ -1,0 +1,4 @@
+package fixture
+
+// v7 (edge): an override: key with a { dynamic-segment opener.
+const overrideKey = "override:{workload_id}"

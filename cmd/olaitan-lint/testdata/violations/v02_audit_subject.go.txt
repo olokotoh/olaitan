@@ -1,0 +1,4 @@
+package fixture
+
+// v2: a dotted-UPPER AUDIT.* published-contract subject.
+const auditTransitions = "AUDIT.transitions"

@@ -1,0 +1,4 @@
+package fixture
+
+// v10: the INCIDENTS.finalised published-contract subject.
+const incidentFinalised = "INCIDENTS.finalised"

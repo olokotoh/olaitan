@@ -1,0 +1,4 @@
+package fixture
+
+// v6: a baseline: key with namespace:pod:metrics tokens.
+const baselineKey = "baseline:tenant-acme:web-0:metrics"

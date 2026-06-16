@@ -17,14 +17,17 @@ package scenario
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/olokotoh/olaitan/internal/subjects"
 )
 
 // The raw-event subjects the synthetic injection targets (the subjects the
-// production Falco / CNI exporters publish to). Held as local constants so this
-// package does not couple to internal/subjects.
+// production Falco / CNI exporters publish to). Sourced from the canonical
+// internal/subjects package (no import cycle: subjects has no internal deps),
+// so the recipe stimulus cannot drift from the production subject contract.
 const (
-	RawFalcoSubject   = "olaitan.events.raw.falco"
-	RawNetworkSubject = "olaitan.events.raw.network"
+	RawFalcoSubject   = subjects.RawFalco
+	RawNetworkSubject = subjects.RawNetwork
 )
 
 // Event is one synthetic raw event in a scenario's deterministic stimulus: the

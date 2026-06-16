@@ -9,7 +9,7 @@ CONFIG_SRC       := config/olaitan.yaml
 AUDIT_POLICY_SRC := config/audit-policy-default.yaml
 CHART_FILES      := $(CHART_DIR)/files/olaitan.yaml $(CHART_DIR)/files/audit-policy-default.yaml
 
-.PHONY: build test lint prereg-check analysis analysis-test docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics eval-smoke scenarios-smoke capture-it e2e-local-down schemas helm-values-doc
+.PHONY: build test lint olaitan-lint prereg-check analysis analysis-test docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics eval-smoke scenarios-smoke capture-it e2e-local-down schemas helm-values-doc
 
 # envtest-bin downloads the kube-apiserver and etcd binaries that the
 # Story 1.11 posture-client integration tests (and any future
@@ -35,6 +35,24 @@ test:
 
 lint:
 	golangci-lint run ./...
+
+# olaitan-lint (Story 6.5, NFR34/NFR42) mechanically enforces the two
+# canonical-name conventions docs/patterns.md sections 1-2 record: a NATS
+# subject must come from internal/subjects/ and a Redis key from
+# internal/keys/, never from a string literal at a call site. It scans the Go
+# source tree with go/ast (so comments mentioning a subject are never flagged)
+# and fails non-zero on any string literal matching a canonical subject shape
+# outside internal/subjects/ or a canonical key shape outside internal/keys/,
+# printing file:line:col and the offending literal. This is a SEPARATE target
+# (and a SEPARATE CI step) from `make lint`/golangci-lint so a canonical-name
+# failure is attributable rather than buried among the staticcheck/errcheck
+# output (the Story 6.3 schema-gate / 6.4 helm-doc-gate step-per-enforcement
+# precedent). A genuine intentional literal is suppressed with an auditable
+# `//olaitan-lint:allow <subject|key> <reason>` comment (the reason is
+# mandatory). Test files are out of scope by default (NFR35 integration tests
+# legitimately drive real subjects through embedded NATS).
+olaitan-lint:
+	go run ./cmd/olaitan-lint ./...
 
 # prereg-check (Story 5.8) is the lightest honest structural gate for the
 # pre-registered analysis plan: it asserts analysis/preregistration.md exists

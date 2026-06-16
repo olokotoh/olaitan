@@ -194,9 +194,26 @@ before the reviewer does.
   call site. Use the constants and validating builders in
   `internal/subjects/` (see `docs/patterns.md` section 1). A literal
   subject is invisible to a rename and skips the reserved-character
-  guard. This is a convention enforced in review (and by the
-  `internal/subjects` conformance tests), not yet a custom linter; treat
-  it as binding.
+  guard. This is mechanically enforced by `cmd/olaitan-lint`
+  (`make olaitan-lint`, the always-on CI `go` job): it scans the tree with
+  `go/ast` and fails the build on any string literal matching a canonical
+  subject shape outside `internal/subjects/`, printing the file, line, and
+  offending literal. A genuinely intentional literal (a deliberate decoupling
+  decision) is suppressed with an auditable
+  `//olaitan-lint:allow subject <reason>` comment on the literal's line; the
+  reason is mandatory, so the escape hatch is greppable rather than silent.
+  The linter is literal-anchored and does not track data flow: a fully dynamic
+  concatenation whose prefix is itself built from a variable is not detected,
+  though the natural bare-prefix concatenation (`"fsm:" + id`, `"AUDIT." + verb`)
+  IS caught because the literal operand equals a known family prefix.
+- **Hardcoded Redis-key strings.** Likewise, never hard-code a Redis key at a
+  call site. Use the family prefixes and validating builders in
+  `internal/keys/` (see `docs/patterns.md` section 2). `cmd/olaitan-lint`
+  enforces this too: a string literal matching a canonical key shape
+  (a family prefix immediately followed by a key token, distinguished from a
+  `package: message` error string by the absence of a space after the colon)
+  outside `internal/keys/` fails the build. Suppress an intentional literal
+  with `//olaitan-lint:allow key <reason>`.
 - **Mock-only ring crossings (NFR35).** Do not assert an acceptance
   criterion by reaching into a mock's internal state. Drive the real
   boundary (embedded NATS, bufconn) and assert on the observed result.

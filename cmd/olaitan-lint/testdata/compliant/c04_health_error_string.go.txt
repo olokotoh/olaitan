@@ -1,0 +1,10 @@
+package fixture
+
+import "fmt"
+
+// c4: a health: package error string with a space after the colon.
+func serve() error {
+	return fmt.Errorf("health: serve: %w", errExample)
+}
+
+var errExample = fmt.Errorf("x")

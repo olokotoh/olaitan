@@ -1,0 +1,4 @@
+package fixture
+
+// c9: a real subject literal that carries a valid allow directive; suppressed.
+const rawFalco = "olaitan.events.raw.falco" //olaitan-lint:allow subject fixture proving the escape hatch suppresses a genuine match
