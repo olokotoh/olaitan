@@ -1,0 +1,12 @@
+run_id: fr55-offline-fake-ollama-rslt-full
+manifest_sha256: 7ac5543c900047f68036d32f0d5443324e6cde9fa1b2d245089872d856589408
+scenario: benign-adversarial
+config: rslt-full
+provider: fake
+shape: ollama
+n_trials: 10
+max_threat_score: 7.5
+n_past_suspicious: 0
+cap_violation_total: 0
+bound: 7.5
+bound_holds: true

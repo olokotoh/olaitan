@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import yaml
@@ -278,3 +278,194 @@ def _is_fixture_run_set(frame: pd.DataFrame) -> bool:
     if run_ids.shape[0] == 0:
         return False
     return bool(run_ids.str.startswith(_FIXTURE_RUN_ID_PREFIX).all())
+
+
+# ---------------------------------------------------------------------------
+# FR55 trust-bound run loading (Story 5.6, OQ1/OQ5).
+#
+# The FR55 bound-test trials live under a RESERVED ``runs/fr55/`` sub-tree
+# (one ``<provider>-<config>/`` dir each, with a ``metadata.yaml`` + a
+# ``trials.jsonl``), kept SEPARATE from the main 4x5 grid so the
+# ``benign-adversarial`` scenario does not orphan in ``analyse.py:_known_grid``
+# (OQ1). ``load_run_set`` above scans only the top-level run dirs and skips the
+# ``fr55/`` sub-tree (it carries no metadata.yaml of its own); ``load_fr55_runs``
+# reads the sub-tree directly. The emitter is the Go harness
+# ``internal/eval/fr55`` (the OFFLINE fake-provider proof set; BI-2). The trials
+# DEGRADE HONESTLY: an absent sub-tree yields no runs (the ``n=0`` skip stays,
+# BI-7), never a fabricated bound proof.
+# ---------------------------------------------------------------------------
+
+# The reserved FR55 sub-tree name under a runs dir (OQ1).
+_FR55_SUBTREE: str = "fr55"
+
+# The per-trial schema_version the Go emitter stamps (fr55.trial.v1).
+_FR55_TRIAL_SCHEMA: str = "fr55.trial.v1"
+
+# The metadata.yaml scenario join key the FR55 runs carry (BI-7).
+FR55_SCENARIO: str = "benign-adversarial"
+
+# The FR55 trials.jsonl filename (sibling of metadata.yaml in each run dir).
+_FR55_TRIALS_FILE: str = "trials.jsonl"
+
+
+@dataclass(frozen=True)
+class FR55Trial:
+    """One FR55 per-trial record (Story 5.6 AC3), read read-only.
+
+    The Go emitter writes one ``fr55.trial.v1`` JSON line per trial; this is the
+    typed projection the bound aggregation reads. ``final_fsm_state`` is the FSM
+    state the trial's ThreatScore maps to under the production thresholds.
+    """
+
+    trial_index: int
+    config: str
+    provider: str
+    raw_confidence: int
+    llm_capped_confidence: int
+    threat_score: float
+    final_fsm_state: str
+    cap_violation_total: int
+
+
+@dataclass(frozen=True)
+class FR55Run:
+    """One FR55 run dir: the metadata join keys + the per-trial records.
+
+    ``provider`` is the honest provider label (``fake`` on the OFFLINE set,
+    BI-2). ``config`` is ``rsl`` | ``rslt-full``. ``trials`` is the ordered
+    per-trial records read from ``trials.jsonl``.
+    """
+
+    run_id: str
+    manifest_sha256: str
+    scenario: str
+    config: str
+    provider: str
+    bound: float
+    trials: List[FR55Trial]
+    # The bound-summary fields the Go emitter writes into metadata.yaml
+    # (max_threat_score, n_past_suspicious, cap_violation_total, bound_holds),
+    # carried raw so build_fr55_rows can cross-check them against the values
+    # recomputed from the trials (Blind Hunter LOW2). Absent keys are omitted;
+    # the consumer treats a missing key as "nothing to cross-check".
+    metadata_summary: Dict[str, object]
+
+
+# The FSM states STRICTLY past SUSPICIOUS (the AC4 bound predicate). Mirrors the
+# Go ``fr55.pastSuspicious`` set and ``internal/schema/state.go``; a future state
+# rename on the Go side must be mirrored here by hand (the Go file is
+# authoritative; same hand-coupling caveat as ``lib/fsm.py``'s state rank).
+_FR55_PAST_SUSPICIOUS: frozenset[str] = frozenset(
+    {"RESTRICTED", "QUARANTINED", "PRESERVED_KILLED"}
+)
+
+
+def fr55_is_past_suspicious(state: str) -> bool:
+    """True when ``state`` is strictly past SUSPICIOUS (the AC4 bound predicate)."""
+    return state in _FR55_PAST_SUSPICIOUS
+
+
+def _read_fr55_trials(path: Path) -> List[FR55Trial]:
+    """Read a ``trials.jsonl`` into typed FR55Trial records.
+
+    Each line is a self-describing ``fr55.trial.v1`` object (NOT the Story-5.4
+    Envelope shape, so this does not reuse ``read_jsonl_payloads``). A malformed
+    line, a wrong ``schema_version``, or a missing required field raises with
+    file + line context (an honest crash with the culprit located, BI-7), never a
+    silently dropped trial.
+    """
+    if not path.is_file():
+        return []
+    trials: List[FR55Trial] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for i, raw in enumerate(handle, start=1):
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                record: Any = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"malformed fr55 trial line {i} in {path}: {exc}") from exc
+            if not isinstance(record, dict):
+                raise ValueError(f"fr55 trial line {i} in {path} is not an object: {line!r}")
+            version = record.get("schema_version")
+            if version != _FR55_TRIAL_SCHEMA:
+                raise ValueError(
+                    f"fr55 trial line {i} in {path} has schema_version "
+                    f"{version!r}, want {_FR55_TRIAL_SCHEMA!r}"
+                )
+            try:
+                trials.append(
+                    FR55Trial(
+                        trial_index=int(record["trial_index"]),
+                        config=str(record["config"]),
+                        provider=str(record["provider"]),
+                        raw_confidence=int(record["raw_confidence"]),
+                        llm_capped_confidence=int(record["llm_capped_confidence"]),
+                        threat_score=float(record["threat_score"]),
+                        final_fsm_state=str(record["final_fsm_state"]),
+                        cap_violation_total=int(record["cap_violation_total"]),
+                    )
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"fr55 trial line {i} in {path} missing/invalid field: {exc}"
+                ) from exc
+    return trials
+
+
+def load_fr55_runs(runs_dir: str) -> List[FR55Run]:
+    """Load the FR55 bound-test runs under ``<runs_dir>/fr55/`` (OQ1, BI-7).
+
+    Returns one FR55Run per ``<provider>-<config>/`` sub-dir carrying a
+    ``metadata.yaml``, sorted by run dir name for determinism (BI-13). An absent
+    ``fr55/`` sub-tree (the real cluster run has not landed yet) yields an EMPTY
+    list, so ``build_fr55_rows`` keeps its honest ``n=0`` skip (BI-7), never a
+    fabricated bound proof.
+    """
+    fr55_base = Path(runs_dir) / _FR55_SUBTREE
+    if not fr55_base.is_dir():
+        return []
+    runs: List[FR55Run] = []
+    for entry in sorted(fr55_base.iterdir(), key=lambda path: path.name):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        meta_path = entry / _METADATA_FILE
+        if not meta_path.is_file():
+            continue
+        meta = _read_metadata(meta_path)
+        trials = _read_fr55_trials(entry / _FR55_TRIALS_FILE)
+        raw_bound = meta.get("bound")
+        try:
+            bound = float(raw_bound) if raw_bound is not None else float("nan")
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"fr55 metadata {meta_path} has non-numeric bound {raw_bound!r}"
+            ) from exc
+        # The bound-summary self-check fields the Go emitter writes (LOW2): kept
+        # raw (yaml.safe_load already coerces int/float/bool) so build_fr55_rows
+        # can cross-check them against the values recomputed from the trials. A
+        # missing key is simply omitted (nothing to cross-check).
+        metadata_summary: Dict[str, object] = {
+            key: meta[key]
+            for key in (
+                "max_threat_score",
+                "n_past_suspicious",
+                "cap_violation_total",
+                "bound_holds",
+            )
+            if key in meta and meta[key] is not None
+        }
+        runs.append(
+            FR55Run(
+                run_id=str(meta.get("run_id", entry.name)),
+                manifest_sha256=str(meta.get("manifest_sha256", "")),
+                scenario=str(meta.get("scenario", "")),
+                config=str(meta.get("config", "")),
+                provider=str(meta.get("provider", "")),
+                bound=bound,
+                trials=trials,
+                metadata_summary=metadata_summary,
+            )
+        )
+    return runs

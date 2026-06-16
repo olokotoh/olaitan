@@ -150,7 +150,7 @@
 | rubric | killchain | LLM vs templated | n/a | 0 | wilcoxon | RQ5-RUBRIC-WILCOXON-KILLCHAIN | 0.010000 | n/a | skipped (insufficient data, n=0) | n/a | False |  | False |
 | rubric | actionability | LLM vs templated | n/a | 0 | wilcoxon | RQ5-RUBRIC-WILCOXON-ACTIONABILITY | 0.010000 | n/a | skipped (insufficient data, n=0) | n/a | False |  | False |
 | rubric | rater-agreement | inter-rater | n/a | 0 | icc2k | RQ5-ICC | n/a | n/a | skipped (insufficient data, n=0) | n/a | False |  | False |
-| rsl;rslt-full | benign-adversarial | fr55_trust_bound | n/a | 0 | empirical_bound_count | RQ4-FR55-BOUND | n/a | n/a | skipped (insufficient data, n=0) | n/a | False |  | False |
+| rsl;rslt-full | benign-adversarial | fr55_trust_bound | 0/40 past SUSPICIOUS; max@7.5=7.5<=7.5, max@10.5=10.5<=10.5; cap_violations=0 | 40 | empirical_bound_count | RQ4-FR55-BOUND | n/a | n/a | run | mixed | True |  | False |
 
 ## RSLT ablation
 

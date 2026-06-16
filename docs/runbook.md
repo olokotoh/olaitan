@@ -1105,6 +1105,32 @@ SUSPICIOUS; the LLM contribution stays capped (`0.3 x 35 = 10.5 < 20`), enforced
 at the provider cap, the `GuardCappedConfidence` chokepoint, and the `score.go`
 re-clamp regardless of which arm is deployed.
 
+**FR55 offline trust-bound test (`olaitan-fr55`, Story 5.6).** The EMPIRICAL
+counterpart of the algebraic bound above. It drives the REAL analyst chain over
+benign packages (`rule_severity = baseline_max_deviation = 0`) under a
+harness-only adversarial L1/L2/Senior prompt set, with a deterministic FAKE
+provider returning the MAXIMAL raw confidence, and asserts the bound on the
+OBSERVED records: zero trials past SUSPICIOUS, max ThreatScore within the
+per-provider cap, and `olaitan_llm_cap_violation_total` == 0. It needs NO cluster
+and NO network. Run it as a Go test or via the CLI:
+
+```sh
+go test ./internal/eval/fr55/...                                  # the offline bound proof
+go run ./cmd/olaitan-fr55 --offline --config rslt-full --provider claude --trials 100   # bound 10.5 (cap 35)
+go run ./cmd/olaitan-fr55 --offline --config rsl --provider ollama --trials 100         # bound 7.5 (cap 25)
+```
+
+The bound is cap-parameterised, read from `provider.ScoreCap()` (Claude 35 ->
+10.5; Ollama 25 -> 7.5), not hard-coded. Pass `--out runs/fr55` to emit the
+per-trial `trials.jsonl` + bound-summary `metadata.yaml` the Story-5.5 analysis
+pipeline (`analyse.build_fr55_rows`) consumes. **HONEST DEGRADATION (BI-2):** the
+offline run uses a FAKE provider and is labelled `provider: fake` /
+`fr55-offline-` run-id prefix; it is the data-path proof, NEVER a thesis-final
+number. The real 100-trial run against the live Claude/Ollama providers needs the
+3-node cluster and is a deferred carry-forward. A non-zero CLI exit (or a failing
+`go test`) means the OBSERVED bound was violated -- that is a PRODUCTION DEFECT to
+escalate (page on it), never a thing to patch around.
+
 **Upgrading an Epic-2 RS-with-isolation deployment to LLM-enriched verdicts.** An
 existing RS (rules + graduated-isolation, no LLM) install gains the multi-agent
 analyst by switching to an LLM-bearing arm and supplying the API-key Secret the
