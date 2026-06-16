@@ -47,6 +47,18 @@ jobs:
       - name: Canonical-name lint (olaitan-lint, NFR34)
         run: make olaitan-lint
 
+      # Story 6.7 (FR50/NFR32/NFR34): the dashboard metric-reference + schema
+      # gate. olaitan-dashboard-lint is the "no live Grafana" testable proxy
+      # for the pre-built Grafana dashboards: it asserts every
+      # deploy/grafana/dashboards/*.json parses, carries the pinned
+      # schemaVersion (39, Grafana 11.1.x), and references ONLY metrics the
+      # agent actually exports (the canonical set is DERIVED FROM the olaitan_*
+      # literals in internal/ + cmd/, minus the Story 4.9 retired names), so a
+      # dashboard panel referencing a non-existent or retired metric fails the
+      # build. A SEPARATE attributable step (the 6.5 olaitan-lint precedent).
+      - name: Dashboard metric-reference + schema gate (Story 6.7)
+        run: make dashboard-lint
+
       # Story 6.3 (NFR40/NFR33): the schema drift gate. `make schemas`
       # reflection-regenerates the three Class A external-consumer schemas
       # (olt_event, evidence_package, workload_posture) from the
