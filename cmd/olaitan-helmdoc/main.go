@@ -137,7 +137,7 @@ var configOnly = []configOnlyParam{
 		rang:     "not configurable",
 		effect:   "the baseline:* family carries a 48h server-side Redis TTL (EXPIRE, internal/redis/setters.go ttlBaseline) and the fsm:{workload_id} family carries NO TTL (BI-2, so durable FSM state survives an arbitrary restart gap); both are code-fixed, not Helm values",
 		ref:      "-",
-		location: "internal/redis/keys.go, internal/redis/setters.go (code-fixed; not a Helm or config value)",
+		location: "internal/keys/keys.go, internal/redis/setters.go (code-fixed; not a Helm or config value)",
 	},
 	{
 		name:     "NATS core-stream time retention (MaxAge)",
