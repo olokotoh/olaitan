@@ -832,7 +832,8 @@ Alert on a sustained `rate(olaitan_llm_circuit_breaker_engaged_total[10m]) > 0`:
 either a real burst or a too-low threshold. Set
 `analyst.circuit_breaker.enabled: false` (config-file) to disable.
 
-**LLM retry, Ollama fallback, and `llm_unavailable`** (Story 3.10, FR26/FR28).
+#### LLM retry, Ollama fallback, and `llm_unavailable` (Story 3.10, FR26/FR28)
+
 Each role's provider call runs under a 3-strike retry (exponential base delays
 1s then 4s, capped at 16s, plus jitter; with 3 strikes only the 1s and 4s
 back-offs are slept): a schema violation or a non-timeout transient provider
@@ -986,7 +987,9 @@ empty `choices[0].message.content` (OpenAI-compatible), or an empty
 `success`; callers (Stories 3.5-3.7) must treat an empty `Raw` as a
 failed verdict.
 
-**Air-gapped / data-residency mode (Story 3.4, FR48).** When
+#### Air-gapped / data-residency mode (Story 3.4, FR48)
+
+When
 `analyst.provider` is `api`, evidence packages cross the cluster
 boundary into a third-party LLM provider. Operators under
 data-residency constraints run the LLM tier fully in-cluster instead
@@ -1625,7 +1628,7 @@ correlated on `workload_id`. Inspect: `nats sub OVERRIDES.applied --raw`,
 - *The whole workload did not get pinned:* annotate the OWNER, not a single pod;
   an owner-level annotation pins the whole workload. Conflicting per-pod
   annotations resolve to the most-isolating state with a WARN log.
-- *`olaitan.io/state-override: PRESERVED+KILLED` was rejected:* that pin is legal
+- *`olaitan.io/state-override: PRESERVED_KILLED` was rejected:* that pin is legal
   ONLY from QUARANTINED (a pin from a lower state is refused inside the FSM); see
   [PRESERVED_KILLED, the fifth FSM state](#preserved_killed-the-fifth-fsm-state-story-41-fr31).
 
@@ -1789,8 +1792,8 @@ kubectl rollout restart deploy/olaitan-aggregator   # provider change is restart
 
 The overlay sets `ollama.enabled: true` (renders the `olaitan-ollama`
 Deployment, Service, and a NetworkPolicy with declared-EMPTY egress),
-`analyst.provider: local`, the pinned `analyst.local.{endpoint,model}`, and
-`analyst.score_cap: 25`. The full mechanics (the NetworkPolicy-as-auth boundary,
+`analyst.provider: local`, the pinned `analyst.local.model` (the endpoint is
+chart-derived, not set in the overlay), and `analyst.score_cap: 25`. The full mechanics (the NetworkPolicy-as-auth boundary,
 the trust-cap ladder, model provisioning, context-window pairing, cold-load
 Health) are in
 [Air-gapped / data-residency mode](#air-gapped--data-residency-mode-story-34-fr48).
