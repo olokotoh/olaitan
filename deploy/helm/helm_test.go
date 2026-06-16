@@ -4384,3 +4384,249 @@ func TestForensicsFacade_RSLTFullArmKeepsEpic4GatesOff(t *testing.T) {
 		t.Error("the RSLT-full arm must NOT auto-enable any Epic-4 controller gate (AC1 additive upgrade-safety)")
 	}
 }
+
+// --- Story 6.6: production / air-gapped / evaluation posture overlays -----
+//
+// AC4: each of the three deployment-posture overlays (values-production.yaml,
+// values-airgapped.yaml, values-eval.yaml) renders to a byte-stable golden,
+// `helm lint` is clean, and the rendered manifests are committed as the golden
+// file (NFR31). The tests reuse the existing golden harness (runGoldenValues /
+// normaliseGolden / HELM_GOLDEN_UPDATE) via a posture-overlay path resolver and
+// a multi-`-f` render for the AC3 base-relationship proof.
+
+// posturePath resolves the absolute path to a committed values-<slug>.yaml
+// posture overlay under the chart dir (the values-eval-<slug> overlays use the
+// sibling overlayPath; these top-level posture overlays drop the `-eval-`
+// infix).
+func posturePath(t *testing.T, slug string) string {
+	t.Helper()
+	return filepath.Join(chartDir(t), "values-"+slug+".yaml")
+}
+
+// helmTemplateValuesMulti renders the chart with an ordered list of -f overlay
+// files (later files win), plus the mandatory Redis password. It is the
+// multi-`-f` sibling of helmTemplateValues used to render the AC3 layered
+// composition (base values-eval.yaml + an arm overlay) exactly as an operator
+// would apply them.
+func helmTemplateValuesMulti(t *testing.T, valuesPaths ...string) string {
+	t.Helper()
+	args := []string{"template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+	}
+	for _, p := range valuesPaths {
+		args = append(args, "--values", p)
+	}
+	cmd := exec.Command("helm", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("helm template --values %v failed: %v\nstderr:\n%s", valuesPaths, err, stderr.String())
+	}
+	return stdout.String()
+}
+
+// runGoldenPosture renders a single posture overlay (values-<slug>.yaml),
+// normalises, and diffs against deploy/helm/testdata/golden/<slug>.golden.yaml
+// (regenerate with HELM_GOLDEN_UPDATE=1). It mirrors runGoldenValues but
+// resolves the top-level posture path rather than the values-eval- sibling.
+func runGoldenPosture(t *testing.T, slug string) {
+	t.Helper()
+	rendered := helmTemplateValues(t, posturePath(t, slug))
+	got := normaliseGolden(rendered)
+	path := goldenPath(t, slug)
+	if goldenUpdate() {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir golden dir: %v", err)
+		}
+		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
+			t.Fatalf("write golden file: %v", err)
+		}
+		fmt.Fprintf(os.Stderr, "HELM_GOLDEN_UPDATE=1: wrote golden file %s\n", path)
+		return
+	}
+	wantBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read golden file %s: %v (regenerate with HELM_GOLDEN_UPDATE=1)", path, err)
+	}
+	if got != string(wantBytes) {
+		t.Errorf("golden mismatch for posture %s. Regenerate with HELM_GOLDEN_UPDATE=1.", slug)
+	}
+}
+
+// The three posture golden tests (AC4): drift in any posture overlay's rendered
+// output fails the build.
+func TestGoldenFile_Posture_Production(t *testing.T) { runGoldenPosture(t, "production") }
+func TestGoldenFile_Posture_Airgapped(t *testing.T)  { runGoldenPosture(t, "airgapped") }
+func TestGoldenFile_Posture_Eval(t *testing.T)       { runGoldenPosture(t, "eval") }
+
+// TestProductionOverlayHardeningRenders (AC1) asserts the production overlay's
+// SUPPORTED knobs actually land in the rendered manifests, and the chart's
+// unconditional pod-hardening (runAsNonRoot / readOnlyRootFilesystem) is
+// present. The honest-gap knobs (mTLS NATS/Redis, AppArmor, Trivy, log level,
+// scrape interval) have NO chart surface and are documented, not asserted.
+func TestProductionOverlayHardeningRenders(t *testing.T) {
+	rendered := helmTemplateValues(t, posturePath(t, "production"))
+
+	// Scrape annotations (the real chart surface for scraping).
+	assertContains(t, rendered, `prometheus.io/scrape: "true"`, "production overlay must emit scrape annotations")
+
+	// Pod-hardening the chart enforces unconditionally (NFR13/NFR14). Scope to
+	// the two OLAITAN-OWNED ring components (collector DaemonSet, aggregator
+	// Deployment) by component name -- the falco/nats-box subchart pods are not
+	// Olaitan-owned and carry their upstream security posture, not ours.
+	hardened := 0
+	for _, m := range parseManifests(t, rendered) {
+		if m.Kind != "DaemonSet" && m.Kind != "Deployment" {
+			continue
+		}
+		if !strings.Contains(m.Metadata.Name, "olaitan-collector") &&
+			!strings.Contains(m.Metadata.Name, "olaitan-aggregator") {
+			continue
+		}
+		hardened++
+		yamlBytes, _ := yaml.Marshal(&m.Raw)
+		s := string(yamlBytes)
+		for _, want := range []string{"runAsNonRoot: true", "readOnlyRootFilesystem: true", "type: RuntimeDefault"} {
+			if !strings.Contains(s, want) {
+				t.Errorf("production overlay %s/%s missing %q", m.Kind, m.Metadata.Name, want)
+			}
+		}
+	}
+	if hardened < 2 {
+		t.Errorf("production overlay: expected the collector DaemonSet + aggregator Deployment hardened, found %d", hardened)
+	}
+
+	// Audit-grade retention: the four AUDIT_* retentions + settling +
+	// report-archive must all be 365 days, and the audit controller enabled.
+	embedded := extractEmbeddedConfigYAML(t, rendered)
+	if !configFromRender(t, rendered).Response.Audit.EnabledOrDefault() {
+		t.Error("production overlay must enable response.audit (365 d SIEM streams)")
+	}
+	for _, want := range []string{
+		"retention_transitions_days: 365",
+		"retention_overrides_days: 365",
+		"retention_policies_days: 365",
+		"retention_assessments_days: 365",
+	} {
+		if !strings.Contains(embedded, want) {
+			t.Errorf("production overlay rendered config missing %q", want)
+		}
+	}
+	// Both retention_days leaves (settling INCIDENTS + report_archive object
+	// lock) must be 365 -- the report-archive 365 lands via the
+	// forensics.s3.retention_days FACADE knob (the response.reportArchive value
+	// is shadowed by that facade overlay, so the facade is the real surface).
+	if strings.Contains(embedded, "retention_days: 90") {
+		t.Errorf("production overlay left a retention_days at the 90 d default; expected 365 (settling + report_archive)")
+	}
+}
+
+// TestAirgappedOverlayNoExternalEgress (AC2) asserts the air-gapped overlay
+// selects the in-cluster Ollama provider, derives the cluster-local endpoint,
+// renders the Ollama Deployment + Service + NetworkPolicy with an EMPTY egress
+// (the FR48 no-external-egress statement), and disables notifications.
+func TestAirgappedOverlayNoExternalEgress(t *testing.T) {
+	rendered := helmTemplateValues(t, posturePath(t, "airgapped"))
+
+	// provider local (the chart selector the Go loader maps to ollama).
+	if got := findEvalLine(t, rendered, "analyst", "provider"); got != "local" {
+		t.Errorf("airgapped analyst.provider = %q, want local (the in-cluster ollama selector)", got)
+	}
+
+	// The chart-derived cluster-local Ollama endpoint (default namespace ->
+	// olaitan-ollama.default.svc...). The hostname carries the chart's
+	// <fullname>-ollama Service-naming convention.
+	if !strings.Contains(rendered, "ollama.default.svc.cluster.local:11434") {
+		t.Errorf("airgapped overlay must derive the cluster-local ollama endpoint\n%s", snippet(rendered, "11434"))
+	}
+
+	// Ollama Deployment + Service + NetworkPolicy all render under
+	// ollama.enabled, and the ollama NetworkPolicy declares an EMPTY egress.
+	ms := parseManifests(t, rendered)
+	var ollamaNP, ollamaDeploy, ollamaSvc bool
+	for _, m := range ms {
+		if !strings.Contains(m.Metadata.Name, "ollama") {
+			continue
+		}
+		switch m.Kind {
+		case "NetworkPolicy":
+			ollamaNP = true
+			yamlBytes, _ := yaml.Marshal(&m.Raw)
+			if !strings.Contains(string(yamlBytes), "egress: []") {
+				t.Errorf("ollama NetworkPolicy must declare an empty egress (FR48 no-external-egress)\n%s", string(yamlBytes))
+			}
+		case "Deployment":
+			ollamaDeploy = true
+		case "Service":
+			ollamaSvc = true
+		}
+	}
+	if !ollamaNP || !ollamaDeploy || !ollamaSvc {
+		t.Errorf("airgapped overlay must render ollama Deployment(%v)+Service(%v)+NetworkPolicy(%v)", ollamaDeploy, ollamaSvc, ollamaNP)
+	}
+
+	// notifications disabled (no external webhook to reach).
+	cfg := configFromRender(t, rendered)
+	if cfg.Response.Notifications.EnabledOrDefault() {
+		t.Error("airgapped overlay must disable notifications (no external egress)")
+	}
+}
+
+// TestEvalOverlayBaseKnobsRender (AC3) asserts the evaluation BASE overlay
+// carries the eval-friendly operational tuning (lowered rate-limit threshold,
+// faster settling window, faster baseline warm-up) in the rendered config.
+func TestEvalOverlayBaseKnobsRender(t *testing.T) {
+	rendered := helmTemplateValues(t, posturePath(t, "eval"))
+	if !strings.Contains(rendered, "threshold_events_per_sec: 100") {
+		t.Errorf("eval base must lower the rate-limit threshold to 100\n%s", snippet(rendered, "threshold_events_per_sec"))
+	}
+	if !strings.Contains(rendered, "window_seconds: 10") {
+		t.Errorf("eval base must set the settling window to 10s\n%s", snippet(rendered, "window_seconds"))
+	}
+	if !strings.Contains(rendered, `warmup_duration: "5s"`) {
+		t.Errorf("eval base must set baseline warmup to 5s\n%s", snippet(rendered, "warmup_duration"))
+	}
+}
+
+// TestEvalBaseLayersUnderArm (AC3, the base-relationship proof) asserts the
+// layered composition `helm -f values-eval.yaml -f values-eval-rs.yaml` renders
+// cleanly and carries BOTH the eval-base tuning AND the RS arm config. This is
+// the test that proves values-eval.yaml is genuinely usable AS the base of the
+// Story 5.3 arm overlays (rather than only documented as such).
+func TestEvalBaseLayersUnderArm(t *testing.T) {
+	rendered := helmTemplateValuesMulti(t, posturePath(t, "eval"), overlayPath(t, "rs"))
+
+	// Eval-base tuning survived the layering.
+	if !strings.Contains(rendered, "threshold_events_per_sec: 100") {
+		t.Errorf("layered base+rs lost the eval-base rate-limit threshold\n%s", snippet(rendered, "threshold_events_per_sec"))
+	}
+	if !strings.Contains(rendered, "window_seconds: 10") {
+		t.Errorf("layered base+rs lost the eval-base settling window\n%s", snippet(rendered, "window_seconds"))
+	}
+
+	// RS arm config applied on top: rules+baselines enabled, provider none.
+	if got := findEvalLine(t, rendered, "rules", "enabled"); got != "true" {
+		t.Errorf("layered base+rs rules.enabled = %q, want true (RS arm)", got)
+	}
+	if got := findEvalLine(t, rendered, "analyst", "provider"); got != "none" {
+		t.Errorf("layered base+rs analyst.provider = %q, want none (RS arm)", got)
+	}
+}
+
+// configFromRender round-trips an already-rendered manifest stream through the
+// production config.Load path, returning the parsed config (the shared body of
+// the loadEmbedded helper, generalised to an arbitrary render so the posture
+// overlays - which use -f files, not --set - can be config-checked).
+func configFromRender(t *testing.T, rendered string) *config.Config {
+	t.Helper()
+	tmp := filepath.Join(t.TempDir(), "olaitan.yaml")
+	if err := os.WriteFile(tmp, []byte(extractEmbeddedConfigYAML(t, rendered)), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := configLoad(t, tmp)
+	if err != nil {
+		t.Fatalf("config.Load rejected the render: %v", err)
+	}
+	return cfg
+}

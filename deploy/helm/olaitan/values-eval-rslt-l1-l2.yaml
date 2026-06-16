@@ -38,3 +38,15 @@ evaluation:
 analyst:
   api:
     model: claude-opus-4-8
+
+# EVALUATION BASE (Story 6.6 AC3): this arm overlay sits on top of the
+# common evaluation base values-eval.yaml (eval-friendly tuning: faster
+# settling window, lower per-source rate-limit threshold, faster baseline
+# warm-up). The base is OPTIONAL and orthogonal to evaluation.config; to
+# run this arm with the eval tuning, layer them:
+#   helm install olaitan deploy/helm/olaitan \
+#     -f deploy/helm/olaitan/values-eval.yaml \
+#     -f deploy/helm/olaitan/values-eval-rslt-l1-l2.yaml --set secrets.redisPassword=<password>
+# The Epic-5 cmd/olaitan-eval runner applies this arm overlay on its own
+# (single --values); the layered composition is render-tested in
+# deploy/helm/helm_test.go.

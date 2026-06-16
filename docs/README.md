@@ -51,6 +51,30 @@ Alternatives considered and rejected / Hand-off), where the
   range, effect, FR/NFR reference), auto-generated from the `# @schema`
   annotations in `deploy/helm/olaitan/values.yaml` by
   `make helm-values-doc`; CI fails any un-regenerated drift.
+- Deployment-posture overlays (`deploy/helm/olaitan/`) - three
+  ready-made values overlays so an operator picks a posture without
+  composing the configuration by hand (Story 6.6):
+  - `values-production.yaml` - production hardening (365 d audit / settling
+    / report-archive retention, scrape annotations on; the chart already
+    enforces `runAsNonRoot` / `readOnlyRootFilesystem` / seccomp / cap-drop
+    unconditionally). `helm install olaitan deploy/helm/olaitan
+    --set secrets.redisPassword=<pw> -f deploy/helm/olaitan/values-production.yaml`.
+    The header documents the AC1 knobs with no chart surface (NATS/Redis
+    mTLS, AppArmor, Trivy, log level, the Prometheus-server-owned scrape
+    interval) as honest gaps rather than fabricated keys.
+  - `values-airgapped.yaml` - the FR48 air-gapped posture (in-cluster
+    Ollama Deployment + Service + NetworkPolicy with empty egress, provider
+    `local`, notifications off, no external egress).
+    `... -f deploy/helm/olaitan/values-airgapped.yaml`.
+  - `values-eval.yaml` - the common evaluation BASE (faster settling
+    window, lower per-source rate-limit threshold, faster baseline warm-up)
+    that the six `values-eval-<arm>.yaml` arm overlays reference as their
+    base. Layer it under an arm:
+    `... -f deploy/helm/olaitan/values-eval.yaml -f deploy/helm/olaitan/values-eval-rs.yaml`.
+  Every overlay renders to a committed golden (`deploy/helm/testdata/golden/`)
+  and a `-tags=helm` knob test; the air-gapped posture's operator-experience
+  commitments are also verified live by the label-gated `e2e-overlays` kind
+  smoke (`make e2e-local-overlays`).
 - [Prompt changelog](prompt-changelog.md) - the NFR41 prompt-content
   audit trail.
 - [Traceability matrix](traceability.md) - the NFR42 code-to-thesis

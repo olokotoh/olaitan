@@ -9,7 +9,7 @@ CONFIG_SRC       := config/olaitan.yaml
 AUDIT_POLICY_SRC := config/audit-policy-default.yaml
 CHART_FILES      := $(CHART_DIR)/files/olaitan.yaml $(CHART_DIR)/files/audit-policy-default.yaml
 
-.PHONY: build test lint olaitan-lint prereg-check analysis analysis-test docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics eval-smoke scenarios-smoke capture-it e2e-local-down schemas helm-values-doc
+.PHONY: build test lint olaitan-lint prereg-check analysis analysis-test docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics e2e-local-overlays eval-smoke scenarios-smoke capture-it e2e-local-down schemas helm-values-doc
 
 # envtest-bin downloads the kube-apiserver and etcd binaries that the
 # Story 1.11 posture-client integration tests (and any future
@@ -354,6 +354,35 @@ e2e-local-forensics: helm-prepare helm-deps docker-build
 		--set nats.streamMaxBytesOverride=1073741824 \
 		--wait --timeout 5m
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) OLT_E2E_FORENSICS=1 go test -tags=e2e -v -count=1 -run TestKindSmoke_Forensics_FullSlice ./tests/e2e/...
+
+# Story 6.6 (AC5): the deployment-posture overlay smoke. Installs ONE posture
+# overlay (default air-gapped, the richest commitment surface: in-cluster ollama
+# + empty egress) on kind and runs the OLT_E2E_OVERLAYS-gated smoke that verifies
+# the operator-experience commitments (pod hardening, least-privilege RBAC,
+# namespace NetworkPolicy, no external egress) against live pod / chart
+# inspection. Override the overlay with OVERLAY=production|eval.
+#
+# HONEST GATING (Story 6.6 AC5, mirrors the e2e-local-forensics carry-forward):
+# this target + tests/e2e/overlays_smoke_test.go are the AC5 TEST CODE. The live
+# label-gated run (the `e2e-overlays` CI job) is the carry-forward A1-style
+# cluster gate; it does NOT run in the always-on CI e2e job. The same
+# commitments are covered with no cluster by the `-tags=helm` golden/knob tests.
+OVERLAY ?= airgapped
+e2e-local-overlays: helm-prepare helm-deps docker-build
+	kind get clusters | grep -q '^$(KIND_CLUSTER_NAME)$$' || \
+		kind create cluster --name $(KIND_CLUSTER_NAME) --config hack/kind-config.yaml
+	kind load docker-image $(IMAGE):$(TAG) --name $(KIND_CLUSTER_NAME)
+	helm install olaitan $(CHART_DIR) \
+		--set image.repository=$(IMAGE) \
+		--set-string image.tag=$(TAG) \
+		--set image.pullPolicy=Never \
+		--set secrets.redisPassword=ci-test \
+		--set falco.enabled=false \
+		--set endpoints.falco=tcp://127.0.0.1:0 \
+		--set-string nats.streamMaxBytesOverride=536870912 \
+		-f $(CHART_DIR)/values-$(OVERLAY).yaml \
+		--wait --timeout 5m
+	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) OLT_E2E_OVERLAYS=1 OLT_E2E_OVERLAY=$(OVERLAY) go test -tags=e2e -v -count=1 -run TestKindSmoke_Overlays_OperatorCommitments ./tests/e2e/...
 
 # Story 5.1 (AC5) + Story 5.3 (AC4 HALF B, BI-8): the olaitan-eval harness
 # smoke. Reuses the SAME RS-arm kind bring-up as e2e-local (the chart

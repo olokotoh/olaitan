@@ -1,0 +1,111 @@
+# values-production.yaml -- the production-hardened deployment posture
+# overlay (Story 6.6; NFR13, NFR14, NFR31).
+#
+#   helm install olaitan deploy/helm/olaitan \
+#     --set secrets.redisPassword=<password> \
+#     -f deploy/helm/olaitan/values-production.yaml
+#
+# WHY: an SRE bringing Olaitan up in a real cluster wants the audit-grade
+# retention + append-only SIEM streams + scrape annotations turned on by
+# one file rather than composing them knob-by-knob. This overlay bundles
+# the production-hardened DEFAULTS that the chart exposes as real values;
+# the hardening the chart enforces unconditionally (pod security context)
+# is documented below so an operator can see the full posture in one place.
+#
+# RESTART semantics: enabling response.audit drives a new aggregator ring
+# wiring; run `kubectl rollout restart deploy/olaitan-aggregator` after a
+# first install if the audit subjects do not appear.
+#
+# =====================================================================
+# HARDENING THE CHART ENFORCES UNCONDITIONALLY (no value to set here)
+# =====================================================================
+# These are NOT Helm values; they are hardcoded into every rendered pod
+# spec, so they apply in production exactly as in any other render. They
+# are listed here so this overlay documents the full NFR13/NFR14 posture:
+#
+#   - runAsNonRoot: true        (pod securityContext; distroless UID 65532)
+#   - readOnlyRootFilesystem: true   (every container)
+#   - allowPrivilegeEscalation: false
+#   - capabilities.drop: [ALL]
+#   - seccompProfile.type: RuntimeDefault
+#
+# Source: deploy/helm/olaitan/templates/{daemonset,deployment}.yaml;
+# pinned by TestPodSecurityContext in deploy/helm/helm_test.go. There is
+# no knob to weaken them, which is the point.
+#
+# =====================================================================
+# AC1 KNOBS WITH NO CHART SUPPORT (honest gaps, NOT fabricated keys)
+# =====================================================================
+# The Story 6.6 AC names several hardening items that the chart does not
+# expose as a value today. Rather than invent a fake key that renders to
+# nothing, each is recorded here as an honest gap (mirrors the Story 6.4
+# helm-values doc honesty fence):
+#
+#   - mTLS for NATS and Redis: NO chart knob, TRACKED CARRY-FORWARD. The
+#     NATS subchart exposes no client-side TLS value and the Redis subchart
+#     exposes AUTH / password only (NFR8), not mTLS. The mTLS knobs the
+#     chart DOES carry are for the audit webhook and the Calico / applog
+#     inbound sensor, not the NATS / Redis client connections. In-cluster
+#     NATS / Redis mTLS is an OPEN carry-forward to a future Target-tier
+#     HA / TLS story (not closed here; not claimed against a control that
+#     does not exist).
+#   - AppArmor profile: NO chart annotation, TRACKED CARRY-FORWARD. The
+#     pod is already confined by seccompProfile RuntimeDefault +
+#     capabilities.drop [ALL] + allowPrivilegeEscalation false (above); a
+#     per-node AppArmor profile reference is an OPEN carry-forward to the
+#     same future Target-tier hardening story (it needs a host-provisioned
+#     profile name).
+#   - Trivy CVE check: ENFORCED as a real CI gate, not a chart render-time
+#     value. The `docker` job in .github/workflows/ci.yml builds the image
+#     and then runs the pinned official trivy container (aquasec/trivy:0.71.1)
+#     over the built olaitan:<version-tag> image (vuln-type os,library; severity
+#     CRITICAL,HIGH; ignore-unfixed; exit-code 1), so a fixable CRITICAL or
+#     HIGH reds the build. This is the NFR13/NFR14 supply-chain gate; it
+#     lives in the image-build pipeline (not a helm value), and is now a
+#     genuine enforced control rather than a claim.
+#   - log level "info": the process logs via a code-fixed slog JSON
+#     handler (cmd/olaitan/main.go); there is no per-component log-level
+#     value in the chart or config (docs/helm-values.md, "logging level").
+#     The effective default is already info.
+#   - scrape interval 30 s: the scrape INTERVAL is owned by the Prometheus
+#     SERVER config (scrape_interval), not the chart. The chart only emits
+#     the prometheus.io/scrape + port + path pod annotations, enabled
+#     below; set the 30 s interval in your Prometheus scrape config.
+
+# Append-only SIEM audit streams with audit-grade retention (NFR16).
+# Enabling response.audit creates the AUDIT_* JetStream streams; the
+# production posture sets every retention to 365 days (the transitions
+# stream defaults to 90; the others already default to 365 and are
+# restated here so the posture is self-documenting).
+response:
+  audit:
+    enabled: true
+    retentionTransitionsDays: 365
+    retentionOverridesDays: 365
+    retentionPoliciesDays: 365
+    retentionAssessmentsDays: 365
+  # The settling-window controller's INCIDENTS stream retention is
+  # audit-grade (365 d default; restated for clarity). Enabling the
+  # settling controller itself is an operator decision (forensic slice),
+  # left at the chart default here so this overlay does not silently turn
+  # on the full DFIR pipeline.
+  settling:
+    retentionDays: 365
+
+# Durable forensic-report object-lock retention. The chart default is 90
+# days; the production posture raises it to 365 to match the audit
+# streams. NOTE: this MUST be set via the forensics.s3.retention_days
+# FACADE knob, not response.reportArchive.retentionDays -- the Story 4.10
+# facade overlays the report bucket's retention LAST in the configmap
+# bridge (it always wins over the response.reportArchive block), so the
+# facade key is the real surface. Applies only when reportArchive is
+# enabled (an operator decision; off by default here).
+forensics:
+  s3:
+    retention_days: 365
+
+# Prometheus scrape annotations on every Olaitan ring pod (the real chart
+# surface for scraping). The scrape INTERVAL (30 s) is a Prometheus-server
+# concern (see the honest-gap note above), not a chart value.
+metrics:
+  scrapeAnnotations: true

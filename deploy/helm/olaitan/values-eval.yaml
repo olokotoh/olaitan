@@ -1,0 +1,61 @@
+# values-eval.yaml -- the common evaluation BASE overlay (Story 6.6).
+#
+#   # standalone (eval tuning only, no arm selected):
+#   helm install olaitan deploy/helm/olaitan \
+#     --set secrets.redisPassword=<password> \
+#     -f deploy/helm/olaitan/values-eval.yaml
+#
+#   # layered under a Story 5.3 arm (the base relationship):
+#   helm install olaitan deploy/helm/olaitan \
+#     --set secrets.redisPassword=<password> \
+#     -f deploy/helm/olaitan/values-eval.yaml \
+#     -f deploy/helm/olaitan/values-eval-rs.yaml
+#
+# WHY: the Epic 5 evaluation arms (values-eval-{f,rs,rsl,rslt-full,
+# rslt-l1-only,rslt-l1-l2}.yaml) select WHICH detection layers run via the
+# single evaluation.config knob. This file bundles the eval-FRIENDLY
+# OPERATIONAL tuning that every arm shares: faster timers for quicker
+# iteration and a lower rate-limit threshold for traceable degradation.
+# Those knobs are orthogonal to evaluation.config (which clobbers only
+# rules/baselines.enabled/provider/l2/senior), so this base LAYERS cleanly
+# under any arm overlay.
+#
+# BASE RELATIONSHIP (Story 6.6 AC3): the six Story 5.3 arm overlays
+# reference this file as their common evaluation base. They remain
+# self-sufficient (the Epic-5 cmd/olaitan-eval runner applies a single
+# arm overlay), so layering this base is OPTIONAL: pass `-f values-eval
+# .yaml -f values-eval-<arm>.yaml` to get the eval tuning under the arm.
+# The layered composition is render-tested in deploy/helm/helm_test.go.
+#
+# RESTART semantics: rateLimit.* and baselines.warmupDuration hot-reload;
+# response.settling.windowSeconds is read by the settling controller.
+
+# Lower the per-source rate-limit threshold so the sensing circuit breaker
+# engages earlier under eval load and the deterministic sampling
+# disclosure (Sampled / SamplingRate) surfaces in eval traces for
+# traceability. Production default is 1000 ev/s; 100 makes the breaker's
+# behaviour observable within a short evaluation run (NFR22).
+rateLimit:
+  thresholdEventsPerSec: 100
+
+# Faster settling window so an incident finalises quickly during an
+# evaluation run instead of waiting the 60 s production default. Both the
+# response.settling controller and the forensics-facade settling knob are
+# set so the faster window applies whichever the eval arm exercises.
+response:
+  settling:
+    windowSeconds: 10
+forensics:
+  settling_window_seconds: 10
+
+# Faster baseline warm-up so a re-run does not spend the 30 m production
+# warm-up before deviations can fire (mirrors the CI / e2e eval bring-up).
+baselines:
+  warmupDuration: "5s"
+
+# HONEST GAP (Story 6.6 AC3): an eval log level "debug" has NO chart or
+# config knob -- the process logs via a code-fixed slog JSON handler
+# (cmd/olaitan/main.go), with no per-component log-level value (see
+# docs/helm-values.md, "logging level"). The eval base sets the knobs that
+# DO exist; the debug-level intent is recorded as a follow-up rather than
+# fabricated as a fake key.

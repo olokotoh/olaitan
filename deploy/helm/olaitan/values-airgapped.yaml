@@ -62,3 +62,54 @@ analyst:
 # intra-namespace egress already covers aggregator -> ollama.)
 networkPolicy:
   extraEgress: []
+
+# AC2 RECONCILIATION (Story 6.6). The air-gapped AC names two literals
+# that the chart renders differently; both are honoured by the chart's
+# own machinery, not by hand-forcing a value:
+#
+#   - analyst.provider: ollama  -- the chart provider enum is
+#     [none, api, local]; "ollama" is valid only as a per-ROLE provider.
+#     "local" is the chart-level selector the Go loader maps to the
+#     in-cluster Ollama provider (api -> claude, local -> ollama), so
+#     provider: "local" above IS the air-gapped Ollama selection.
+#   - analyst.endpoint: http://ollama.olaitan.svc.cluster.local:11434 --
+#     the chart key is analyst.local.endpoint, and with ollama.enabled
+#     the chart DERIVES it to
+#     http://<fullname>-ollama.<namespace>.svc.cluster.local:11434
+#     (for `helm install olaitan -n olaitan`:
+#     http://olaitan-ollama.olaitan.svc.cluster.local:11434). The
+#     hostname differs from the AC literal only by the chart's
+#     <fullname>-ollama Service-naming convention; the intent (an
+#     in-cluster Ollama Service, no external dial) is met. Leaving
+#     analyst.local.endpoint empty above lets the chart derive it for
+#     any release / namespace.
+
+# No outbound incident notifications: the air-gapped posture has no
+# external webhook to reach (FR48). This is the chart default; it is
+# stated explicitly here so the no-external-egress commitment is
+# self-documenting for the air-gapped operator.
+notifications:
+  enabled: false
+
+# Close the Bitnami Redis subchart's allow-all egress. The subchart
+# defaults networkPolicy.allowExternalEgress to true, which renders the
+# Redis NetworkPolicy egress as `- {}` (every destination, every port) --
+# a namespace egress hole that contradicts the air-gapped no-external-
+# egress commitment. Setting it false drops that wildcard rule. Redis is a
+# state STORE here (the aggregator dials INTO it; architecture=standalone,
+# no replica / sentinel peers), so the only outbound it needs is cluster
+# DNS resolution, scoped explicitly below via extraEgress. With
+# architecture=standalone the subchart's built-in replica/peer egress
+# branch is inert, so extraEgress is the one rule that survives, giving a
+# closed-by-default Redis netpol with DNS only and no external destination.
+redis:
+  networkPolicy:
+    allowExternalEgress: false
+    # Cluster DNS only (kube-dns / CoreDNS on UDP+TCP 53). No external
+    # destination: that is the whole point of the air-gapped overlay.
+    extraEgress:
+      - ports:
+          - port: 53
+            protocol: UDP
+          - port: 53
+            protocol: TCP
