@@ -1,0 +1,6 @@
+run_id: rubric-offline-s1
+manifest_sha256: 3de08d7111368e74ed24ab3ebbf6f31fbbaf25112d14e68817713b051059f282
+scenario: s1
+n_incidents: 1
+n_raters: 2
+synthetic: true

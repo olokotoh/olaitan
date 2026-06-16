@@ -1131,6 +1131,41 @@ number. The real 100-trial run against the live Claude/Ollama providers needs th
 `go test`) means the OBSERVED bound was violated -- that is a PRODUCTION DEFECT to
 escalate (page on it), never a thing to patch around.
 
+**DFIR rubric study harness (`olaitan-rubric`, Story 5.7, RQ5).** Produces the
+two report variants over the SAME incident evidence (variant (a) the Story-4.4
+Olaitan DFIR LLM report, reused read-only with a synthetic narrative and NO live
+LLM call; variant (b) a NEW no-LLM templated baseline), distributes them as
+seeded blind-randomised variant pairs, and emits the `rubric.score.v1` scores
+artefact the Story-5.5 analysis pipeline (`analyse.build_rubric_rows`) consumes.
+It needs NO cluster and NO network. Run it as a Go test or via the CLI:
+
+```sh
+go test ./internal/eval/rubric/...                               # the offline end-to-end proof
+go run ./cmd/olaitan-rubric --offline --scenario s1 --raters 2 --out runs/rubric  # emit the scores artefact
+go run ./cmd/olaitan-rubric --offline --out runs/rubric --workflow                # also write the static-file rater workflow
+```
+
+The CLI generates both variants over a single SYNTHETIC S1 incident, blind-pairs
+them (seeded from the incident_id; the un-blinding key is kept separately from
+the rater-facing files), and writes the reserved `runs/rubric/<run-dir>/`
+sub-tree: one `rubric.score.v1` record per `(incident, variant, rater,
+dimension)` Likert score in `scores.jsonl` plus a join/provenance
+`metadata.yaml`. With `--workflow` it also writes the STATIC-FILE rater workflow
+(the blinded `report-a.md`/`report-b.md` plus a per-rater scoring sheet over the
+5 canonical dimensions); there is no live web UI. The five dimensions are the
+fixed confirmatory family (`clarity`, `completeness`, `attack-coverage`,
+`killchain`, `actionability`); the rubric definition, rater-recruitment criteria,
+and the Miva FYP IRB/ethics template live in
+`analysis/rubric/rubric-definition.md`. **HONEST DEGRADATION (BI-2):** the
+offline run uses CLEARLY-SYNTHETIC placeholder rater scores (every record carries
+`synthetic: true` / `rater: synthetic-*`, under a `rubric-offline-` run dir); it
+is the data-path proof, NEVER a thesis-final RQ5 number. The analysis degrades
+honestly at tiny n (a single-incident sample yields n=1, so Wilcoxon/ICC compute
+without crashing and without a fabricated significant p-value). The REAL N>=3
+raters x N=10 cluster-captured incidents study is a DEFERRED carry-forward; it
+lands the same artefact shape under the same sub-tree, which
+`build_rubric_rows` reads unchanged.
+
 **Upgrading an Epic-2 RS-with-isolation deployment to LLM-enriched verdicts.** An
 existing RS (rules + graduated-isolation, no LLM) install gains the multi-agent
 analyst by switching to an LLM-bearing arm and supplying the API-key Secret the

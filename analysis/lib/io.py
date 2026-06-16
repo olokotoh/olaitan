@@ -469,3 +469,206 @@ def load_fr55_runs(runs_dir: str) -> List[FR55Run]:
             )
         )
     return runs
+
+
+# ---------------------------------------------------------------------------
+# Rubric score loading (Story 5.7, RQ5, OQ1/OQ4).
+#
+# The DFIR rubric study scores live under a RESERVED ``runs/rubric/`` sub-tree
+# (one ``rubric-offline-<scenario>/`` dir each, with a ``metadata.yaml`` + a
+# ``scores.jsonl``), kept SEPARATE from the main 4x5 grid so the rubric scenario
+# does not orphan in ``analyse.py:load_run_set`` (the sub-tree carries no
+# top-level metadata.yaml of its own, so ``load_run_set`` skips it;
+# ``load_rubric_scores`` reads it directly, mirroring ``load_fr55_runs``). The
+# emitter is the Go harness ``internal/eval/rubric`` (the OFFLINE synthetic proof
+# set; BI-2). The scores DEGRADE HONESTLY: an absent sub-tree yields no records
+# (``build_rubric_rows`` keeps the honest ``n=0`` skip, BI-4), never a fabricated
+# rubric finding. The offline records are LABELLED synthetic (``synthetic: true``,
+# ``rater: synthetic-*``); they are NEVER a thesis-final RQ5 number (BI-2).
+# ---------------------------------------------------------------------------
+
+# The reserved rubric sub-tree name under a runs dir (OQ4).
+_RUBRIC_SUBTREE: str = "rubric"
+
+# The per-score schema_version the Go emitter stamps (rubric.score.v1).
+_RUBRIC_SCORE_SCHEMA: str = "rubric.score.v1"
+
+# The rubric scores.jsonl filename (sibling of metadata.yaml in each run dir).
+_RUBRIC_SCORES_FILE: str = "scores.jsonl"
+
+# The 5 CANONICAL rubric dimensions (BI-5, FIXED by the pre-registration). A
+# score record carrying any other dimension key is a drift error (the Go emitter
+# and this reader must agree on the exact five). Mirrors the Go
+# ``internal/eval/rubric`` CanonicalDimensions and the build_rubric_rows registry.
+_RUBRIC_DIMENSIONS: frozenset[str] = frozenset(
+    {"clarity", "completeness", "attack-coverage", "killchain", "actionability"}
+)
+
+# The two report variants the reader pivots on (paired per incident_id): the
+# Story-4.4 LLM report vs the no-LLM templated baseline.
+_RUBRIC_VARIANT_LLM: str = "llm"
+_RUBRIC_VARIANT_TEMPLATED: str = "templated"
+
+# The canonical variants set: a score record carrying any other variant is a
+# drift error. An unknown variant is dropped from the Wilcoxon pairing but would
+# otherwise STILL enter the ICC frame and corrupt the reliability estimate, so
+# it is rejected at the trust boundary here. Mirrors the Go emitter's Variant
+# constants (internal/eval/rubric/variants.go).
+_RUBRIC_VARIANTS: frozenset[str] = frozenset(
+    {_RUBRIC_VARIANT_LLM, _RUBRIC_VARIANT_TEMPLATED}
+)
+
+# The documented Likert scale bounds (1-5) the rubric is collected on, mirroring
+# the Go emitter's LikertMin/LikertMax (internal/eval/rubric/schema.go). A score
+# outside this inclusive range is rejected here so an out-of-range hand edit
+# cannot load silently into the Wilcoxon / ICC estimates (the hand-edit trust
+# boundary for the deferred real study).
+_RUBRIC_LIKERT_MIN: int = 1
+_RUBRIC_LIKERT_MAX: int = 5
+
+
+@dataclass(frozen=True)
+class RubricScore:
+    """One rubric.score.v1 record (Story 5.7 AC2/AC3), read read-only.
+
+    The Go emitter writes one ``rubric.score.v1`` JSON line per
+    ``(incident_id, variant, rater, dimension)`` Likert score; this is the typed
+    projection ``build_rubric_rows`` pivots into the paired Wilcoxon vectors + the
+    ICC ratings frame. ``synthetic`` is the honesty marker (``True`` on the
+    OFFLINE synthetic set, BI-2), carried through so a consumer never mistakes a
+    placeholder score for a real rater score.
+    """
+
+    incident_id: str
+    scenario: str
+    variant: str
+    rater: str
+    dimension: str
+    score: float
+    synthetic: bool
+
+
+@dataclass(frozen=True)
+class RubricRun:
+    """One rubric run dir: the metadata join keys + the per-score records.
+
+    ``scenario`` is the rubric scenario the scores were collected for; ``scores``
+    is the ordered per-score records read from ``scores.jsonl``; ``synthetic`` is
+    the run-level honesty flag from metadata.yaml (BI-2).
+    """
+
+    run_id: str
+    manifest_sha256: str
+    scenario: str
+    synthetic: bool
+    scores: List[RubricScore]
+
+
+def _read_rubric_scores(path: Path) -> List[RubricScore]:
+    """Read a ``scores.jsonl`` into typed RubricScore records.
+
+    Each line is a self-describing ``rubric.score.v1`` object (NOT the Story-5.4
+    Envelope shape, so this does not reuse ``read_jsonl_payloads``). A malformed
+    line, a wrong ``schema_version``, an unknown dimension, an unknown variant, a
+    ``score`` outside the Likert range, or a missing required field raises with
+    file + line context (an honest crash with the culprit located, BI-4), never a
+    silently dropped or out-of-range score.
+    """
+    if not path.is_file():
+        return []
+    scores: List[RubricScore] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for i, raw in enumerate(handle, start=1):
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                record: Any = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"malformed rubric score line {i} in {path}: {exc}") from exc
+            if not isinstance(record, dict):
+                raise ValueError(f"rubric score line {i} in {path} is not an object: {line!r}")
+            version = record.get("schema_version")
+            if version != _RUBRIC_SCORE_SCHEMA:
+                raise ValueError(
+                    f"rubric score line {i} in {path} has schema_version "
+                    f"{version!r}, want {_RUBRIC_SCORE_SCHEMA!r}"
+                )
+            dimension = str(record.get("dimension", ""))
+            if dimension not in _RUBRIC_DIMENSIONS:
+                raise ValueError(
+                    f"rubric score line {i} in {path} has dimension {dimension!r}, "
+                    f"not one of the 5 canonical dimensions {sorted(_RUBRIC_DIMENSIONS)}"
+                )
+            variant = str(record.get("variant", ""))
+            if variant not in _RUBRIC_VARIANTS:
+                # An unknown variant is dropped from the Wilcoxon pairing but would
+                # still enter the ICC frame and corrupt the reliability estimate;
+                # reject it at the trust boundary (BI-5).
+                raise ValueError(
+                    f"rubric score line {i} in {path} has variant {variant!r}, "
+                    f"not one of the canonical variants {sorted(_RUBRIC_VARIANTS)}"
+                )
+            try:
+                score = float(record["score"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"rubric score line {i} in {path} missing/invalid field: {exc}"
+                ) from exc
+            if not _RUBRIC_LIKERT_MIN <= score <= _RUBRIC_LIKERT_MAX:
+                # An out-of-range hand edit (e.g. 0 or 6 on the 1-5 scale) would
+                # load silently into Wilcoxon / ICC; reject it honestly.
+                raise ValueError(
+                    f"rubric score line {i} in {path} has score {score!r} outside "
+                    f"the Likert range [{_RUBRIC_LIKERT_MIN}, {_RUBRIC_LIKERT_MAX}]"
+                )
+            try:
+                scores.append(
+                    RubricScore(
+                        incident_id=str(record["incident_id"]),
+                        scenario=str(record["scenario"]),
+                        variant=variant,
+                        rater=str(record["rater"]),
+                        dimension=dimension,
+                        score=score,
+                        synthetic=bool(record.get("synthetic", False)),
+                    )
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"rubric score line {i} in {path} missing/invalid field: {exc}"
+                ) from exc
+    return scores
+
+
+def load_rubric_scores(runs_dir: str) -> List[RubricRun]:
+    """Load the rubric runs under ``<runs_dir>/rubric/`` (OQ1/OQ4, BI-4).
+
+    Returns one RubricRun per ``rubric-offline-<scenario>/`` sub-dir carrying a
+    ``metadata.yaml``, sorted by run dir name for determinism. An absent
+    ``rubric/`` sub-tree (the real N>=3 x N=10 rater study has not landed yet)
+    yields an EMPTY list, so ``build_rubric_rows`` keeps its honest ``n=0`` skip
+    (BI-4), never a fabricated rubric finding. Mirrors ``load_fr55_runs``.
+    """
+    rubric_base = Path(runs_dir) / _RUBRIC_SUBTREE
+    if not rubric_base.is_dir():
+        return []
+    runs: List[RubricRun] = []
+    for entry in sorted(rubric_base.iterdir(), key=lambda path: path.name):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        meta_path = entry / _METADATA_FILE
+        if not meta_path.is_file():
+            continue
+        meta = _read_metadata(meta_path)
+        scores = _read_rubric_scores(entry / _RUBRIC_SCORES_FILE)
+        runs.append(
+            RubricRun(
+                run_id=str(meta.get("run_id", entry.name)),
+                manifest_sha256=str(meta.get("manifest_sha256", "")),
+                scenario=str(meta.get("scenario", "")),
+                synthetic=bool(meta.get("synthetic", False)),
+                scores=scores,
+            )
+        )
+    return runs
