@@ -132,6 +132,22 @@ jobs:
       - name: Unit tests + deterministic fixture smoke test
         run: pytest analysis/tests/
 
+      # Story 6.9 (NFR42): the traceability matrix audit. audit_traceability.py
+      # parses the docs/traceability.md Matrix and fails the build if any row's
+      # code_package / test_files point at a non-existent path, or any cited
+      # test_id is not a byte-equal `func Test...` in the row's test files, or
+      # the matrix is self-inconsistent (duplicate claim_id, claim-prefix /
+      # ch3_section disagreement). This makes the no-lies claim chain
+      # machine-checked on every push, preventing matrix drift between chapter
+      # freeze and submission. The eval_run_ids column is honestly deferred to
+      # the cluster phase (Stories 5.9/5.10) and the Chapter 3 orphan
+      # cross-check needs the thesis markdown (absent from this repo / the CI
+      # checkout), so both are reported-not-gated here while the
+      # extant-artefact + self-consistency checks are the hard gate. A SEPARATE
+      # attributable step (the 6.3/6.4/6.5/6.7 one-step-per-gate precedent).
+      - name: Traceability matrix audit (Story 6.9, NFR42)
+        run: python analysis/audit_traceability.py
+
   # Story 3.13 (NFR41): a PR that changes any per-role default prompt must
   # record the new content hash in docs/prompt-changelog.md. Only runs on
   # pull_request (needs a base ref to diff against); fetch-depth 0 so the
