@@ -149,7 +149,7 @@ def test_build_fr55_rows_bound_holds_known_answer(tmp_path: Path) -> None:
     assert row.status == "run"
     assert isinstance(row.value, str)
     assert "0/6 past SUSPICIOUS" in row.value
-    assert "max=10.5<=10.5" in row.value
+    assert "max@10.5=10.5<=10.5" in row.value
     assert "cap_violations=0" in row.value
     # Distinct manifests across the two runs -> mixed (M4/BI-10 honesty).
     assert row.mixed_manifest is True
@@ -177,6 +177,95 @@ def test_build_fr55_rows_flags_bound_violation(tmp_path: Path) -> None:
     assert "1/1 past SUSPICIOUS" in row.value
 
 
+def test_build_fr55_rows_mixed_provider_within_bound_passes(tmp_path: Path) -> None:
+    # A MIXED claude(10.5) + ollama(7.5) pool where every run's max clears its
+    # OWN bound -> a passing row with a per-provider/per-bound value string. This
+    # exercises the 7.5 bound end-to-end (the new ollama shape, Story 5.6 R1).
+    _write_fr55_run(
+        tmp_path,
+        "fr55-offline-fake-rsl",
+        "rsl",
+        [_trial(i, "rsl", "CLEAN", 10.5) for i in range(2)],
+        manifest="hash-claude",
+    )
+    _write_fr55_run(
+        tmp_path,
+        "fr55-offline-fake-ollama-rsl",
+        "rsl",
+        [_trial(i, "rsl", "CLEAN", 7.5) for i in range(2)],
+        bound=7.5,
+        max_score=7.5,
+        manifest="hash-ollama",
+    )
+    run_set = io.RunSet(frame=io._coerce_frame([]), runs_dir=str(tmp_path), is_fixture=False)
+    registry = parse_registry(_PREREG)
+    row = analyse.build_fr55_rows(run_set, registry)[0]
+    assert row.n == 4
+    assert row.status == "run"
+    assert isinstance(row.value, str)
+    # Per-provider grouping, sorted by bound (7.5 before 10.5), each within bound.
+    assert "0/4 past SUSPICIOUS" in row.value
+    assert "max@7.5=7.5<=7.5" in row.value
+    assert "max@10.5=10.5<=10.5" in row.value
+
+
+def test_build_fr55_rows_mixed_provider_ollama_over_own_bound_fails(tmp_path: Path) -> None:
+    # The TOOTHY per-run-bound case (Story 5.6 R1, the MEDIUM correctness fix):
+    # a mixed claude(10.5) + ollama(7.5) pool where ONE ollama trial scores 9.0.
+    # 9.0 is below the claude 10.5 ceiling AND below the SUSPICIOUS threshold (so
+    # it stays CLEAN, n_past_suspicious == 0), but it EXCEEDS its own 7.5 ollama
+    # bound. The OLD pooled max(bound)=10.5 check would have masked it and passed
+    # the row; the per-run check MUST fail the bound.
+    _write_fr55_run(
+        tmp_path,
+        "fr55-offline-fake-rsl",
+        "rsl",
+        [_trial(i, "rsl", "CLEAN", 10.5) for i in range(2)],
+        manifest="hash-claude",
+    )
+    _write_fr55_run(
+        tmp_path,
+        "fr55-offline-fake-ollama-rsl",
+        "rsl",
+        [_trial(0, "rsl", "CLEAN", 7.5), _trial(1, "rsl", "CLEAN", 9.0)],
+        bound=7.5,
+        max_score=9.0,  # metadata agrees with the trials (isolate the bound check)
+        manifest="hash-ollama",
+    )
+    run_set = io.RunSet(frame=io._coerce_frame([]), runs_dir=str(tmp_path), is_fixture=False)
+    registry = parse_registry(_PREREG)
+    row = analyse.build_fr55_rows(run_set, registry)[0]
+    assert row.n == 4
+    # No trial transitioned past SUSPICIOUS, yet the bound is VIOLATED (the
+    # ollama run's max 9.0 exceeds its own 7.5 bound). NOT status=run.
+    assert "FAILED" in row.status
+    assert row.status != "run"
+    assert isinstance(row.value, str)
+    assert "0/4 past SUSPICIOUS" in row.value
+    # The per-provider value honestly shows the ollama group's max over its bound.
+    assert "max@7.5=9.0<=7.5" in row.value
+
+
+def test_build_fr55_rows_metadata_mismatch_flags_not_crash(tmp_path: Path) -> None:
+    # Metadata-vs-trials cross-check (LOW2): a corrupted metadata summary field
+    # (max_threat_score declares 7.5 but the trial is 10.5) is FLAGGED and the
+    # row FAILS, but the pipeline does not crash (it degrades honestly, BI-7).
+    _write_fr55_run(
+        tmp_path,
+        "fr55-offline-fake-rsl",
+        "rsl",
+        [_trial(0, "rsl", "CLEAN", 10.5)],
+        max_score=7.5,  # diverges from the trial's actual 10.5
+    )
+    run_set = io.RunSet(frame=io._coerce_frame([]), runs_dir=str(tmp_path), is_fixture=False)
+    registry = parse_registry(_PREREG)
+    row = analyse.build_fr55_rows(run_set, registry)[0]
+    assert "FAILED" in row.status
+    assert isinstance(row.value, str)
+    assert "METADATA MISMATCH" in row.value
+    assert "max_threat_score" in row.value
+
+
 def test_build_fr55_rows_single_run_clean_manifest(tmp_path: Path) -> None:
     # A single run -> a clean (non-mixed) manifest hash on the row.
     _write_fr55_run(
@@ -195,4 +284,4 @@ def test_build_fr55_rows_single_run_clean_manifest(tmp_path: Path) -> None:
     assert row.mixed_manifest is False
     assert row.manifest_hash == "onehash"
     assert isinstance(row.value, str)
-    assert "max=7.5<=7.5" in row.value
+    assert "max@7.5=7.5<=7.5" in row.value

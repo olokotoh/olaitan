@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import yaml
@@ -343,6 +343,12 @@ class FR55Run:
     provider: str
     bound: float
     trials: List[FR55Trial]
+    # The bound-summary fields the Go emitter writes into metadata.yaml
+    # (max_threat_score, n_past_suspicious, cap_violation_total, bound_holds),
+    # carried raw so build_fr55_rows can cross-check them against the values
+    # recomputed from the trials (Blind Hunter LOW2). Absent keys are omitted;
+    # the consumer treats a missing key as "nothing to cross-check".
+    metadata_summary: Dict[str, object]
 
 
 # The FSM states STRICTLY past SUSPICIOUS (the AC4 bound predicate). Mirrors the
@@ -436,6 +442,20 @@ def load_fr55_runs(runs_dir: str) -> List[FR55Run]:
             raise ValueError(
                 f"fr55 metadata {meta_path} has non-numeric bound {raw_bound!r}"
             ) from exc
+        # The bound-summary self-check fields the Go emitter writes (LOW2): kept
+        # raw (yaml.safe_load already coerces int/float/bool) so build_fr55_rows
+        # can cross-check them against the values recomputed from the trials. A
+        # missing key is simply omitted (nothing to cross-check).
+        metadata_summary: Dict[str, object] = {
+            key: meta[key]
+            for key in (
+                "max_threat_score",
+                "n_past_suspicious",
+                "cap_violation_total",
+                "bound_holds",
+            )
+            if key in meta and meta[key] is not None
+        }
         runs.append(
             FR55Run(
                 run_id=str(meta.get("run_id", entry.name)),
@@ -445,6 +465,7 @@ def load_fr55_runs(runs_dir: str) -> List[FR55Run]:
                 provider=str(meta.get("provider", "")),
                 bound=bound,
                 trials=trials,
+                metadata_summary=metadata_summary,
             )
         )
     return runs

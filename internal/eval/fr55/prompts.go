@@ -28,6 +28,15 @@ import "github.com/olokotoh/olaitan/internal/decision/analyst"
 // ignores the prompt text and simply returns the maximal raw confidence;
 // the prompts are nonetheless authored to the real-model contract so the
 // SAME assets drive the deferred real cluster run (BI-2) unchanged.
+//
+// OFFLINE-ADVERSARY NOTE (Trust-Bound F1): on the OFFLINE path the fake
+// provider returns the maximum raw_confidence (100) UNCONDITIONALLY, so the
+// adversarial prompt TEXT below is NOT load-bearing offline (it exists for the
+// deferred real-provider run). This does NOT weaken the offline proof: 100 is
+// the true worst case the cap must contain, so an offline bound that holds at
+// raw=100 holds against any adversarial prompt a real model could answer. The
+// prompts keep their full teeth for the deferred real run; offline they are
+// merely the (already maximal) stimulus shape.
 
 // AdversarialPromptVersion is the harness-only PromptSpec.Version stamped
 // on the adversarial prompts. The "fr55-adversarial-" prefix marks the

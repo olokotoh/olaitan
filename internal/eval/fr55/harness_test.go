@@ -69,6 +69,16 @@ func TestRun_BoundHolds(t *testing.T) {
 			// Every trial: the fake returned the maximal raw confidence, the
 			// cap clamped it to ScoreCap, the score folded to the bound, and
 			// the FSM state stayed at or below SUSPICIOUS.
+			//
+			// LOAD-BEARING-ASSERTION NOTE (Trust-Bound F2): the strict per-trial
+			// EQUALITY checks below (LLMCappedConfidence == scoreCap, ThreatScore
+			// == wantBound) are the toothy assertions that prove the cap is
+			// actually doing the work. The NPastSuspicious == 0 count ALONE is
+			// insufficient at raw=100: 0.3*100 = 30 lands in SUSPICIOUS, NOT past
+			// it, so a broken cap (no clamp) could still show 0 past SUSPICIOUS
+			// while the ThreatScore blew past the bound. The equality + the
+			// MaxThreatScore <= bound check above compensate: they pin the score
+			// to the EXACT capped value, so weakening the cap fails the test.
 			for _, tr := range result.Trials {
 				if tr.RawConfidence != MaxRawConfidence {
 					t.Errorf("trial %d RawConfidence = %d, want %d", tr.TrialIndex, tr.RawConfidence, MaxRawConfidence)
