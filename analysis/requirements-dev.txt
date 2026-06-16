@@ -1,0 +1,11 @@
+# Story 5.5: the dev/CI tooling for the analysis pipeline (BI-1, BI-11).
+#
+# mypy --strict is the AC5/BI-11 type gate; pytest runs the per-helper
+# known-answer suite + the deterministic fixture smoke test. pandas-stubs +
+# types-PyYAML supply the type stubs so mypy --strict covers the first-party
+# pandas/yaml usage (the stats libraries ship no stubs and are scoped-ignored in
+# pyproject.toml, NOT blanket-ignored). All versions PINNED for reproducibility.
+mypy==2.1.0
+pytest==9.1.0
+pandas-stubs==3.0.3.260530
+types-PyYAML==6.0.12.20260518

@@ -62,3 +62,15 @@ spikes/sigma-parser/custom/custom
 
 # Claude Code transient agent worktrees
 .claude/worktrees/
+
+# Story 5.5 analysis pipeline (analysis/analyse.py): the GENERATED per-run
+# summaries land in analysis/output/ and are reproducible from runs/ + the
+# pinned toolchain, so they are not committed. The smoke-test golden lives under
+# analysis/fixtures/golden/ (committed), NOT here. Python build/cache artefacts
+# under analysis/ are also ignored.
+analysis/output/*
+!analysis/output/.gitkeep
+analysis/**/__pycache__/
+analysis/**/.mypy_cache/
+analysis/.mypy_cache/
+analysis/**/*.pyc

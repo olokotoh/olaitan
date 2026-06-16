@@ -1312,6 +1312,38 @@ still exist). `--max-run-size-bytes` is the fail-LOUD per-run size cap (default
 (the cap is a signal, not a quota). `make capture-it` runs the always-on
 embedded-NATS in-process capture suite (no cluster).
 
+### 1.4g Running the analysis pipeline (Story 5.5)
+
+`analysis/analyse.py` is the FIRST Python in this otherwise-Go repo: a
+pure-Python, NO-CLUSTER, OFFLINE pipeline that CONSUMES the per-run artefacts
+above (read-only) and produces the pre-registered inferential statistics. Run
+it after a run-set exists under `runs/`:
+
+```bash
+pip install -r analysis/requirements.txt -r analysis/requirements-dev.txt
+python analysis/analyse.py --runs runs/ --output analysis/output/
+# or: make analysis        (run the pipeline)
+#     make analysis-test    (mypy --strict + pytest, mirrors the CI analysis job)
+```
+
+It writes `analysis/output/summary.csv` + `summary.md` with, per
+`(config, scenario)` cell, Detection Rate, MTTD (the `-1` never-detected
+sentinel excluded), FPR (benign-sweep escalations/hour), and ATT&CK Cohen's
+kappa, plus the pre-registered inferential test rows (McNemar + Bonferroni,
+Kruskal-Wallis + Dunn's-with-Holm, Wilcoxon, ICC(2,k), and the one-sided Poisson
+FPR equivalence test) read from `analysis/preregistration.md`. Every row carries
+the `manifest_sha256` + sample-size + test provenance triad; any test not in the
+prereg registry is stamped `exploratory: true` in a separate section.
+
+HONEST DEGRADATION (the load-bearing fence): the real 400-run thesis numbers are
+produced LATER on the cluster. The pipeline reports `n` per cell, emits `n/a`
+(never a fabricated number) when a cell is empty, flags `underpowered: true`
+below the pre-registered N (15 main / 10 ablation), and SKIPS a test honestly
+(`status: skipped (insufficient data, n=...)`, never a crash or a fabricated
+p-value) when its inputs are absent. The committed `analysis/fixtures/runs/` is
+a SYNTHETIC deterministic set for the smoke test only (labelled `fixture: true`
+in the output header) and is NEVER thesis-final.
+
 ### 1.5 Naming-convention reconciliation
 
 The Story 1.18 acceptance criteria text uses a mix of singular-ring and plural-ring metric names (e.g. AC2 says `olaitan_decision_rule_matches_total` singular; AC3 says `olaitan_decision_baseline_deviations_total{metric, sigma_bucket}` plural). The actual registrations follow `architecture.md:472-475` which mandates the `olaitan_<ring>_<metric>` pattern with the engine subfamily conventionally plural (`rules`, `baseline`) because the engine evaluates a corpus, not a single rule. The AC singular spellings are documentation aliases, not parallel families.

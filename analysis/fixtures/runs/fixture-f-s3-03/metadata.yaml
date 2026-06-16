@@ -1,0 +1,17 @@
+run_id: fixture-f-s3-03
+manifest_sha256: fixture0000000000000000000000000000000000000000000000000000000000
+scenario: s3
+config: f
+runs: 1
+started_at: "2026-06-15T09:30:00Z"
+finished_at: "2026-06-15T09:31:00Z"
+olaitan_eval_version: fixture
+success_criterion_met: false
+measured_time_to_detect: -1
+measured_final_fsm_state: CLEAN
+fsm_state_source: none
+resource_usage:
+  harness_alloc_bytes: 4194304
+  cluster_metrics_available: false
+size_bytes: 4096
+size_cap_exceeded: false

@@ -1,0 +1,33 @@
+# Story 5.5: the FIRST Python toolchain in an otherwise-Go repo.
+# Tooling config for the analysis pipeline only (mypy --strict + pytest). The
+# Go build/test/lint config is untouched (there is no Go in this story).
+
+[tool.mypy]
+# mypy --strict is the AC5/BI-11 gate: full annotations, zero errors. The
+# analysis tree imports as the `analysis.*` package, so the repo root is the
+# mypy module root (run from /home/aslim/olaitan, the analysis CI job's CWD).
+python_version = "3.12"
+strict = true
+# Treat the analysis package as the import root; the repo root holds the
+# `analysis/` package dir.
+mypy_path = "."
+explicit_package_bases = true
+# The third-party stats libraries (scipy / statsmodels / scikit-posthocs /
+# pingouin) ship no type stubs; ignore the MISSING-IMPORT error for those
+# specific modules only (NOT a blanket ignore), so strict typing still covers
+# all first-party code. pandas + yaml DO carry stubs (pandas-stubs,
+# types-PyYAML) and are fully checked.
+[[tool.mypy.overrides]]
+module = [
+    "scipy.*",
+    "statsmodels.*",
+    "scikit_posthocs.*",
+    "pingouin.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+# Run the suite from the repo root so the `analysis.*` imports resolve; the
+# smoke test writes to a tmp dir, never the committed output (BI-13).
+testpaths = ["analysis/tests"]
+addopts = "-q"
