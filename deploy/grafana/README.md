@@ -59,13 +59,42 @@ This grounding is mechanically enforced. `cmd/olaitan-dashboard-lint` (run via
 
 - every `dashboards/*.json` parses as valid JSON and carries the pinned
   `schemaVersion` (39); and
-- every metric name in any panel `targets[].expr` exists in the canonical
-  metric set **derived from the code** (the `olaitan_*` literals registered
-  across `internal/` and `cmd/`), minus the Story 4.9 retired names.
+- every metric name in any panel `targets[].expr` (and in any
+  `templating.list[].query`/`.definition`) exists in the canonical metric set
+  **derived from the code**, minus the Story 4.9 retired names.
 
-A dashboard that references a non-existent or retired metric fails the build.
-Since the canonical set is derived from the code, adding a real metric
-auto-allows a panel for it and a fabricated metric name is rejected.
+The canonical set is derived by parsing `internal/` and `cmd/` with `go/ast`
+and collecting only `olaitan_*` names that reach a real Prometheus
+registration site (a `prometheus.*Opts{Name: ...}` field, an argument to a
+`Register*`/`register*` registrar call, or a metric-table struct literal),
+resolving name-constants to their literal value. `*_test.go` files are
+excluded, so a name that exists only in a negative test, a test fixture, a doc
+comment, or a YAML/JSON struct tag is **not** treated as a real metric and a
+dashboard that references it fails the build. Since the set is derived from the
+registration sites, adding a real metric auto-allows a panel for it and a
+fabricated metric name is rejected.
+
+## Sampling
+
+Source sampling under load is not a separate metric family. When a source sheds
+ingest under backpressure, that is surfaced as the application-log line-shed
+rate (`olaitan_sensor_applog_lines_shed_total`), shown in the **sampling /
+line-shed** panel of `01-source-health`. Read a non-zero shed rate there as the
+"sampling is active" signal.
+
+## Alerting (AC2)
+
+The dashboards ship Grafana **color `thresholds` steps** (the green/red bands
+that mark alert-worthy values), **not** embedded Grafana alert RULES: there are
+zero `alert` blocks in the dashboard JSON. This is intentional. Grafana 11
+moved alerting to **unified alerting**, where alert rules are a separate
+resource (their own provisioning files / API objects) and are no longer carried
+inside the dashboard panel JSON. The color `thresholds` steps therefore mark
+the alert-worthy bands, and `docs/runbook.md` documents those bands as the
+alert predicates (for example, "page on any non-zero cap-violation"). Operators
+wire the actual alert rules via Grafana unified alerting (or Prometheus
+alerting rules) using the predicates the runbook lists; the dashboards give the
+visual thresholds, the runbook gives the alert definitions.
 
 ## Honest metric note: the per-technique "heatmap"
 

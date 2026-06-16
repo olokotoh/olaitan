@@ -245,16 +245,7 @@
           },
           "expr": "increase(olaitan_llm_cap_violation_total[5m])",
           "refId": "A",
-          "legendFormat": "transport cap violations"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "expr": "increase(olaitan_decision_llm_cap_violation_total[5m])",
-          "refId": "B",
-          "legendFormat": "decision cap violations"
+          "legendFormat": "cap violations"
         }
       ],
       "fieldConfig": {
