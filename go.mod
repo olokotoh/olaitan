@@ -6,6 +6,7 @@ require (
 	github.com/alicebob/miniredis/v2 v2.37.0
 	github.com/anthropics/anthropic-sdk-go v1.50.0
 	github.com/fsnotify/fsnotify v1.9.0
+	github.com/invopop/jsonschema v0.14.0
 	github.com/leanovate/gopter v0.2.11
 	github.com/minio/minio-go/v7 v7.2.0
 	github.com/nats-io/nats-server/v2 v2.11.15
@@ -49,7 +50,6 @@ require (
 	github.com/google/gnostic-models v0.7.0 // indirect
 	github.com/google/go-tpm v0.9.8 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/invopop/jsonschema v0.14.0 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/compress v1.18.6 // indirect

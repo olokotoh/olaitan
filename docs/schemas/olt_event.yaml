@@ -1,0 +1,43 @@
+# Canonical on-wire shape of schema.Event.
+#
+# AUTHORITATIVE validation source: docs/schemas/olt_event.json
+# (draft 2020-12). This YAML is the documentation mirror in the
+# docs/schemas/state_transition.yaml style. BOTH files are
+# generated from schema.Event by cmd/olaitan-schemagen; regenerate with
+# `make schemas` (CI fails any drift, NFR33). Source of truth for
+# the Go shape: internal/schema (type Event).
+schema: olt_event.v1
+fields:
+  id:
+    type: string
+    required: true
+  timestamp:
+    type: string
+    required: true
+  source:
+    type: string
+    required: true
+  pod:
+    type: object
+    required: true
+  severity:
+    type: string
+    required: false
+  category:
+    type: string
+    required: true
+  summary:
+    type: string
+    required: true
+  raw:
+    type: any
+    required: false
+  tags:
+    type: array
+    required: false
+  sampled:
+    type: boolean
+    required: false
+  sampling_rate:
+    type: number
+    required: false

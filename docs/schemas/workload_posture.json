@@ -1,0 +1,246 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/olokotoh/olaitan/docs/schemas/workload_posture.json",
+  "properties": {
+    "identity": {
+      "properties": {
+        "namespace": {
+          "type": "string"
+        },
+        "owner_kind": {
+          "type": "string"
+        },
+        "owner_name": {
+          "type": "string"
+        },
+        "pod_name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "namespace",
+        "owner_kind",
+        "owner_name"
+      ]
+    },
+    "orphan_pod": {
+      "type": "boolean"
+    },
+    "unavailable": {
+      "type": "boolean"
+    },
+    "unavailable_reason": {
+      "type": "string"
+    },
+    "captured_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "service_account": {
+      "type": "string"
+    },
+    "role_bindings": {
+      "items": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "role_kind": {
+            "type": "string"
+          },
+          "role_name": {
+            "type": "string"
+          },
+          "verbs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "resources": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "verbs_truncated": {
+            "type": "boolean"
+          },
+          "verbs_unavailable": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "name",
+          "role_kind",
+          "role_name"
+        ]
+      },
+      "type": "array"
+    },
+    "cluster_role_bindings": {
+      "items": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "role_name": {
+            "type": "string"
+          },
+          "verbs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "resources": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "verbs_truncated": {
+            "type": "boolean"
+          },
+          "verbs_unavailable": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "name",
+          "role_name"
+        ]
+      },
+      "type": "array"
+    },
+    "network_policies": {
+      "items": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "policy_types": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ingress_rules": {
+            "type": "integer"
+          },
+          "egress_rules": {
+            "type": "integer"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "name",
+          "policy_types",
+          "ingress_rules",
+          "egress_rules"
+        ]
+      },
+      "type": "array"
+    },
+    "pod_security_context": {
+      "properties": {
+        "run_as_user": {
+          "type": "integer"
+        },
+        "run_as_group": {
+          "type": "integer"
+        },
+        "run_as_non_root": {
+          "type": "boolean"
+        },
+        "fs_group": {
+          "type": "integer"
+        },
+        "supplemental_groups": {
+          "items": {
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "seccomp_profile": {
+          "type": "string"
+        },
+        "selinux_level": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "container_security_contexts": {
+      "items": {
+        "properties": {
+          "container_name": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "inherits": {
+            "type": "boolean"
+          },
+          "privileged": {
+            "type": "boolean"
+          },
+          "allow_privilege_escalation": {
+            "type": "boolean"
+          },
+          "read_only_root_filesystem": {
+            "type": "boolean"
+          },
+          "run_as_user": {
+            "type": "integer"
+          },
+          "run_as_group": {
+            "type": "integer"
+          },
+          "run_as_non_root": {
+            "type": "boolean"
+          },
+          "added_capabilities": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "dropped_capabilities": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "seccomp_profile": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "container_name",
+          "kind"
+        ]
+      },
+      "type": "array"
+    }
+  },
+  "additionalProperties": false,
+  "type": "object",
+  "required": [
+    "identity",
+    "captured_at"
+  ],
+  "title": "WorkloadPosture (workload_posture.v1)",
+  "description": "Generated from schema.WorkloadPosture by cmd/olaitan-schemagen (Story 6.3, NFR40). Authoritative machine-readable wire/persisted contract; workload_posture.yaml is the human-readable mirror. Regenerate with `make schemas`; CI fails any drift (NFR33)."
+}

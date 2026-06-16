@@ -1,0 +1,58 @@
+# Canonical on-wire shape of schema.EvidencePackage.
+#
+# AUTHORITATIVE validation source: docs/schemas/evidence_package.json
+# (draft 2020-12). This YAML is the documentation mirror in the
+# docs/schemas/state_transition.yaml style. BOTH files are
+# generated from schema.EvidencePackage by cmd/olaitan-schemagen; regenerate with
+# `make schemas` (CI fails any drift, NFR33). Source of truth for
+# the Go shape: internal/schema (type EvidencePackage).
+schema: evidence_package.v1
+fields:
+  schema_version:
+    type: string
+    required: true
+  package_id:
+    type: string
+    required: true
+  workload_id:
+    type: string
+    required: true
+  workload_identity:
+    type: object
+    required: true
+  assembled_at:
+    type: string
+    required: true
+  window_start:
+    type: string
+    required: true
+  window_end:
+    type: string
+    required: true
+  trigger:
+    type: object
+    required: true
+  events:
+    type: array
+    required: false
+  rule_matches:
+    type: array
+    required: false
+  baseline_deviations:
+    type: array
+    required: false
+  workload_posture:
+    type: object
+    required: false
+  degraded_sources:
+    type: array
+    required: false
+  sampling_active:
+    type: boolean
+    required: false
+  sampled_sources:
+    type: array
+    required: false
+  overflow:
+    type: object
+    required: false

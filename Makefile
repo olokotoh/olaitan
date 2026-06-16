@@ -9,7 +9,7 @@ CONFIG_SRC       := config/olaitan.yaml
 AUDIT_POLICY_SRC := config/audit-policy-default.yaml
 CHART_FILES      := $(CHART_DIR)/files/olaitan.yaml $(CHART_DIR)/files/audit-policy-default.yaml
 
-.PHONY: build test lint prereg-check analysis analysis-test docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics eval-smoke scenarios-smoke capture-it e2e-local-down
+.PHONY: build test lint prereg-check analysis analysis-test docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics eval-smoke scenarios-smoke capture-it e2e-local-down schemas
 
 # envtest-bin downloads the kube-apiserver and etcd binaries that the
 # Story 1.11 posture-client integration tests (and any future
@@ -62,6 +62,19 @@ analysis:
 analysis-test:
 	$(PYTHON) -m mypy --strict --config-file analysis/pyproject.toml analysis/
 	$(PYTHON) -m pytest analysis/tests/
+
+# schemas (Story 6.3, NFR40/NFR33) reflection-generates the external-
+# consumer JSON-Schema files for the three plain wire/persisted carrier
+# types in internal/schema (Event, EvidencePackage, WorkloadPosture)
+# into docs/schemas/. It writes ONLY those three .json/.yaml pairs; the
+# hand-curated model-facing schemas (l1/l2/threat_assessment/forensic_
+# report/state_transition/fsm_state/audit/*) are left untouched (they
+# encode constraints reflection cannot reproduce). Deterministic: a
+# re-run from a clean tree is a no-op. The CI `go` job runs this then
+# `git diff --exit-code docs/schemas/` so a struct change that is not
+# regenerated, or a hand-edit to any committed schema, breaks the build.
+schemas:
+	go run ./cmd/olaitan-schemagen docs/schemas
 
 docker-build:
 	docker build -t $(IMAGE):$(TAG) .

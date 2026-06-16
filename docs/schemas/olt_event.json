@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/olokotoh/olaitan/docs/schemas/olt_event.json",
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source": {
+      "type": "string"
+    },
+    "pod": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "namespace": {
+          "type": "string"
+        },
+        "node": {
+          "type": "string"
+        },
+        "uid": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "name",
+        "namespace",
+        "uid"
+      ]
+    },
+    "severity": {
+      "type": "string"
+    },
+    "category": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "raw": true,
+    "tags": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "sampled": {
+      "type": "boolean"
+    },
+    "sampling_rate": {
+      "type": "number"
+    }
+  },
+  "additionalProperties": false,
+  "type": "object",
+  "required": [
+    "id",
+    "timestamp",
+    "source",
+    "pod",
+    "category",
+    "summary"
+  ],
+  "title": "Event (olt_event.v1)",
+  "description": "Generated from schema.Event by cmd/olaitan-schemagen (Story 6.3, NFR40). Authoritative machine-readable wire/persisted contract; olt_event.yaml is the human-readable mirror. Regenerate with `make schemas`; CI fails any drift (NFR33)."
+}

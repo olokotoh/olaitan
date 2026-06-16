@@ -1,0 +1,592 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/olokotoh/olaitan/docs/schemas/evidence_package.json",
+  "properties": {
+    "schema_version": {
+      "type": "string"
+    },
+    "package_id": {
+      "type": "string"
+    },
+    "workload_id": {
+      "type": "string"
+    },
+    "workload_identity": {
+      "properties": {
+        "namespace": {
+          "type": "string"
+        },
+        "owner_kind": {
+          "type": "string"
+        },
+        "owner_name": {
+          "type": "string"
+        },
+        "pod_name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "namespace",
+        "owner_kind",
+        "owner_name"
+      ]
+    },
+    "assembled_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "window_start": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "window_end": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "trigger": {
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "event_id": {
+          "type": "string"
+        },
+        "rule_match": {
+          "properties": {
+            "rule_id": {
+              "type": "string"
+            },
+            "rule_name": {
+              "type": "string"
+            },
+            "severity": {
+              "type": "string"
+            },
+            "mitre_tags": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "event_id": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "rule_id",
+            "rule_name",
+            "severity",
+            "event_id"
+          ]
+        },
+        "baseline_deviation": {
+          "properties": {
+            "metric": {
+              "type": "string"
+            },
+            "value": {
+              "type": "number"
+            },
+            "mean": {
+              "type": "number"
+            },
+            "std_dev": {
+              "type": "number"
+            },
+            "sigma": {
+              "type": "number"
+            },
+            "pod_uid": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "metric",
+            "value",
+            "mean",
+            "std_dev",
+            "sigma",
+            "pod_uid"
+          ]
+        },
+        "distinct_sources": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "fired_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "type",
+        "fired_at"
+      ]
+    },
+    "events": {
+      "items": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "source": {
+            "type": "string"
+          },
+          "pod": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "namespace": {
+                "type": "string"
+              },
+              "node": {
+                "type": "string"
+              },
+              "uid": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false,
+            "type": "object",
+            "required": [
+              "name",
+              "namespace",
+              "uid"
+            ]
+          },
+          "severity": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "raw": true,
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "sampled": {
+            "type": "boolean"
+          },
+          "sampling_rate": {
+            "type": "number"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "timestamp",
+          "source",
+          "pod",
+          "category",
+          "summary"
+        ]
+      },
+      "type": "array"
+    },
+    "rule_matches": {
+      "items": {
+        "properties": {
+          "rule_id": {
+            "type": "string"
+          },
+          "rule_name": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string"
+          },
+          "mitre_tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "event_id": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "rule_id",
+          "rule_name",
+          "severity",
+          "event_id"
+        ]
+      },
+      "type": "array"
+    },
+    "baseline_deviations": {
+      "items": {
+        "properties": {
+          "metric": {
+            "type": "string"
+          },
+          "value": {
+            "type": "number"
+          },
+          "mean": {
+            "type": "number"
+          },
+          "std_dev": {
+            "type": "number"
+          },
+          "sigma": {
+            "type": "number"
+          },
+          "pod_uid": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "metric",
+          "value",
+          "mean",
+          "std_dev",
+          "sigma",
+          "pod_uid"
+        ]
+      },
+      "type": "array"
+    },
+    "workload_posture": {
+      "properties": {
+        "identity": {
+          "properties": {
+            "namespace": {
+              "type": "string"
+            },
+            "owner_kind": {
+              "type": "string"
+            },
+            "owner_name": {
+              "type": "string"
+            },
+            "pod_name": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "namespace",
+            "owner_kind",
+            "owner_name"
+          ]
+        },
+        "orphan_pod": {
+          "type": "boolean"
+        },
+        "unavailable": {
+          "type": "boolean"
+        },
+        "unavailable_reason": {
+          "type": "string"
+        },
+        "captured_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "service_account": {
+          "type": "string"
+        },
+        "role_bindings": {
+          "items": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "role_kind": {
+                "type": "string"
+              },
+              "role_name": {
+                "type": "string"
+              },
+              "verbs": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "resources": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "verbs_truncated": {
+                "type": "boolean"
+              },
+              "verbs_unavailable": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": false,
+            "type": "object",
+            "required": [
+              "name",
+              "role_kind",
+              "role_name"
+            ]
+          },
+          "type": "array"
+        },
+        "cluster_role_bindings": {
+          "items": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "role_name": {
+                "type": "string"
+              },
+              "verbs": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "resources": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "verbs_truncated": {
+                "type": "boolean"
+              },
+              "verbs_unavailable": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": false,
+            "type": "object",
+            "required": [
+              "name",
+              "role_name"
+            ]
+          },
+          "type": "array"
+        },
+        "network_policies": {
+          "items": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "policy_types": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "ingress_rules": {
+                "type": "integer"
+              },
+              "egress_rules": {
+                "type": "integer"
+              }
+            },
+            "additionalProperties": false,
+            "type": "object",
+            "required": [
+              "name",
+              "policy_types",
+              "ingress_rules",
+              "egress_rules"
+            ]
+          },
+          "type": "array"
+        },
+        "pod_security_context": {
+          "properties": {
+            "run_as_user": {
+              "type": "integer"
+            },
+            "run_as_group": {
+              "type": "integer"
+            },
+            "run_as_non_root": {
+              "type": "boolean"
+            },
+            "fs_group": {
+              "type": "integer"
+            },
+            "supplemental_groups": {
+              "items": {
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "seccomp_profile": {
+              "type": "string"
+            },
+            "selinux_level": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "type": "object"
+        },
+        "container_security_contexts": {
+          "items": {
+            "properties": {
+              "container_name": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "inherits": {
+                "type": "boolean"
+              },
+              "privileged": {
+                "type": "boolean"
+              },
+              "allow_privilege_escalation": {
+                "type": "boolean"
+              },
+              "read_only_root_filesystem": {
+                "type": "boolean"
+              },
+              "run_as_user": {
+                "type": "integer"
+              },
+              "run_as_group": {
+                "type": "integer"
+              },
+              "run_as_non_root": {
+                "type": "boolean"
+              },
+              "added_capabilities": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "dropped_capabilities": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "seccomp_profile": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false,
+            "type": "object",
+            "required": [
+              "container_name",
+              "kind"
+            ]
+          },
+          "type": "array"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "identity",
+        "captured_at"
+      ]
+    },
+    "degraded_sources": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "sampling_active": {
+      "type": "boolean"
+    },
+    "sampled_sources": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "overflow": {
+      "properties": {
+        "original_event_count": {
+          "type": "integer"
+        },
+        "included_event_count": {
+          "type": "integer"
+        },
+        "dropped_event_count": {
+          "type": "integer"
+        },
+        "counts": {
+          "items": {
+            "properties": {
+              "source": {
+                "type": "string"
+              },
+              "category": {
+                "type": "string"
+              },
+              "count": {
+                "type": "integer"
+              }
+            },
+            "additionalProperties": false,
+            "type": "object",
+            "required": [
+              "source",
+              "category",
+              "count"
+            ]
+          },
+          "type": "array"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "original_event_count",
+        "included_event_count",
+        "dropped_event_count"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "type": "object",
+  "required": [
+    "schema_version",
+    "package_id",
+    "workload_id",
+    "workload_identity",
+    "assembled_at",
+    "window_start",
+    "window_end",
+    "trigger"
+  ],
+  "title": "EvidencePackage (evidence_package.v1)",
+  "description": "Generated from schema.EvidencePackage by cmd/olaitan-schemagen (Story 6.3, NFR40). Authoritative machine-readable wire/persisted contract; evidence_package.yaml is the human-readable mirror. Regenerate with `make schemas`; CI fails any drift (NFR33)."
+}
