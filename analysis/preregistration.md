@@ -78,9 +78,14 @@ choice (open question OQ3 in the source story, recommended resolution taken).
 
 ## 3. Per-RQ hypotheses
 
-Each RQ carries a null hypothesis (H0) and a directional alternative (H1) with the
-PRD effect-size threshold. Every threshold is transcribed from the PRD, not chosen
-here.
+Each RQ carries a null hypothesis (H0) and an alternative (H1) with the PRD
+effect-size threshold. Every threshold is transcribed from the PRD, not chosen
+here. The alternatives are directional (superiority) except RQ3, which is a
+false-positive **non-inferiority / equivalence** question and is therefore framed
+as an equivalence test against a fixed tolerance bound rather than a directional
+superiority test (a "the LLM tiers do not make things worse" claim is an
+equivalence claim, not a directional alternative to an equality null). The RQ3
+framing below states H0/H1 in equivalence form accordingly.
 
 - **RQ1.** H0: RSLT-full Detection Rate equals F Detection Rate (no gain). H1:
   RSLT-full Detection Rate is greater than F Detection Rate. Effect-size threshold:
@@ -93,9 +98,17 @@ here.
   Effect-size threshold: within-window detection in at least 80 percent of runs
   per cell, with the windows S1 30s, S2 60s, S3 90s, S4 300s, S5 120s. [Source:
   prd.md:109,122]
-- **RQ3.** H0: the false positive rate is equal across configurations. H1: the LLM
-  tiers do not inflate the false positive rate. Effect-size threshold: fewer than 2
-  unsolicited state escalations per hour on the 24-hour benign-corpus sweep, per
+- **RQ3 (equivalence framing).** Tolerance bound: 2 unsolicited state escalations
+  per hour on the 24-hour benign-corpus sweep, per configuration (the PRD FPR
+  acceptance threshold). H0: an LLM-bearing configuration's FPR is at or above the
+  2-per-hour tolerance bound (the LLM tiers inflate the false positive rate beyond
+  tolerance). H1: an LLM-bearing configuration's FPR is below the 2-per-hour bound
+  (the LLM tiers do not inflate the false positive rate beyond tolerance). The
+  confirmatory test is a one-sided Poisson rate test of each LLM-bearing
+  configuration (RSL, RSLT-full) against the bound (a TOST-style non-inferiority
+  check against the tolerance, not an omnibus equality test across configurations);
+  the non-LLM references F and RS are reported descriptively. Effect-size
+  threshold: fewer than 2 unsolicited state escalations per hour, per
   configuration. [Source: prd.md:107,120]
 - **RQ4 (ablation).** H0: the L2 verification tier and the Senior challenge tier add
   no Detection-Rate contribution. H1: L2 adds at least 10 percent relative
@@ -144,11 +157,14 @@ the PRD measurable-outcomes table (prd.md:119-126); they are not chosen here.
 Story 5.5's `analysis/analyse.py` implements exactly these tests so the plan and
 the code agree.
 
-**Pre-specified significance level.** Alpha = 0.05, two-sided, for every
-hypothesis test below. The PRD names the tests and the corrections but does not
-state a literal numeric alpha; 0.05 two-sided is the field-standard default and is
-recorded here as a pre-specified choice, not a PRD-stated value (open question OQ1
-in the source story, recommended resolution taken). [Source: field-standard
+**Pre-specified significance level.** Alpha = 0.05 for every hypothesis test
+below: two-sided for the directional superiority tests (RQ1, RQ2, RQ4 ablation,
+RQ5), and one-sided for the RQ3 FPR equivalence (non-inferiority) test, where a
+one-sided test against the tolerance bound is the correct form for an
+equivalence/non-inferiority question. The PRD names the tests and the corrections
+but does not state a literal numeric alpha; 0.05 is the field-standard default and
+is recorded here as a pre-specified choice, not a PRD-stated value (open question
+OQ1 in the source story, recommended resolution taken). [Source: field-standard
 default; the PRD names tests + corrections, prd.md:119-126]
 
 **Correction structure.** The word "structure" is load-bearing: the plan states
@@ -165,7 +181,7 @@ source story, recommended resolution taken: separate families).
 | DFIR rubric | Wilcoxon signed-rank | LLM-generated vs templated per rubric dimension | 0.05 two-sided | Bonferroni across the 5 rubric dimensions | 5 | 0.05 / 5 = 0.01 | prd.md:112,126 |
 | Inter-rater | ICC(2,k) | rater agreement on the rubric | report point estimate plus 95 percent confidence interval; threshold ICC at least 0.70 (a reliability estimate, not a hypothesis test) | not applicable (reliability estimate, not a multiplicity family) | not applicable | prd.md:112,126 |
 | ATT&CK accuracy | Cohen's kappa | RSL and RSLT-full vs expert annotation | report point estimate; threshold kappa at least 0.75 (an agreement estimate, not a hypothesis test) | not applicable (agreement estimate) | not applicable | prd.md:108,121 |
-| FPR | Poisson regression | escalation rate per configuration on the benign sweep | 0.05 | a small per-configuration-pair family | per config-pair | per config-pair | prd.md:120 |
+| FPR (equivalence) | One-sided Poisson rate test (TOST-style non-inferiority against the 2 escalations/hour tolerance bound) | each LLM-bearing configuration (RSL, RSLT-full) vs the 2/hour bound on the benign sweep | 0.05 one-sided | Bonferroni across the 2 LLM-bearing configurations tested against the bound (F and RS are reported descriptively and are not in the test family) | 2 | 0.05 / 2 = 0.025 | prd.md:120 |
 
 The MTTD post-hoc is pre-registered as Dunn's-with-Holm. Story 5.5's acceptance
 criteria say "Kruskal-Wallis with Dunn's post-hoc" (epics.md:2200) while the PRD
@@ -179,12 +195,14 @@ to match.
 ## 6. Sample sizes
 
 Each sample size is stated against its specific RQ and test, not aggregated. The
-main four-way runs and the ablation runs size the detection / MTTD / FPR matrix;
-the FR55 trials and the RQ5 rubric study have their own, separate sizing.
+main four-way runs and the ablation runs size the detection (DR) and MTTD matrix;
+the FPR benign sweep, the FR55 trials, and the RQ5 rubric study each have their
+own, separate sizing.
 
 | Sample | Size | Scope | Note | Source |
 |---|---|---|---|---|
-| Main four-way runs | N=15 per cell | 4 configurations times 5 scenarios | feeds RQ1, RQ2, RQ3 | prd.md:149 |
+| Main four-way runs | N=15 per cell | 4 configurations times 5 scenarios | feeds RQ1, RQ2 | prd.md:149 |
+| Benign calibration sweep | one 24-hour benign-corpus run per configuration (4 runs) | 4 configurations | feeds RQ3; FPR = escalations/hour measured over the 24-hour window, a distinct sampling unit from the N=15 attack matrix (it is not folded into the main four-way runs) | prd.md:107,120 |
 | Ablation runs | N=10 per cell | 2 ablation arms (L1-only, L1+L2) times 5 scenarios | feeds RQ4 ablation | prd.md:149 |
 | Total main plus ablation | 400 runs | (4 x 5 x 15) plus (2 x 5 x 10) = 300 plus 100 = 400 | reconciles to the PRD's stated 400-run total | prd.md:149 |
 | FR55 adversarial trials | 100 per LLM configuration (RSL, RSLT-full) | a separate experiment; not folded into N=15 | benign-forced input; the trust-bound test | prd.md:110,544; epics.md:2232 |
@@ -217,27 +235,35 @@ pre-registration is locked); prd.md:149 (the pre-specified N)]
 The registry below is the canonical machine-readable list of every pre-registered
 (confirmatory) test, keyed by a stable `test_id` (open question OQ7 in the source
 story, recommended resolution taken: the Markdown table keyed by `test_id` is the
-canonical form Story 5.5 consumes). The `test_id` grammar is
-`RQ<n>-<METRIC>-<TEST>` (and a per-dimension suffix for the rubric tests); the
-grammar is stable and documented here. Each `test_id` is a stable, citable anchor:
-a Chapter 3 or Chapter 4 claim cites `analysis/preregistration.md#<lowercased
-test_id>` alongside its eval run ids.
+canonical form Story 5.5 consumes). Each `test_id` begins with its `RQ<n>-` prefix
+followed by a stable, opaque suffix naming the metric and test (with a
+per-dimension suffix for the rubric tests). Registry membership is determined by
+exact-string match on the whole `test_id`, never by field-parsing the suffix into
+fixed positions: two ids (`RQ4-FR55-BOUND`, `RQ5-ICC`) intentionally do not split
+into separate metric and test fields. The id set is stable and documented here.
+Each row carries an explicit HTML anchor (`<a id="<lowercased test_id>">`)
+immediately before its `test_id`, so a Chapter 3 or Chapter 4 claim can cite
+`analysis/preregistration.md#<lowercased test_id>` (for example
+`analysis/preregistration.md#rq1-dr-mcnemar`) and have the fragment resolve to the
+registry row, alongside its eval run ids. Each row also carries its Bonferroni
+correction family and corrected alpha so Story 5.5 reads the family membership
+from the registry, not only from the Section 5 prose table.
 
-| test_id | RQ | Test | Comparison | Pre-registered | Source |
-|---|---|---|---|---|---|
-| `RQ1-DR-MCNEMAR` | RQ1 | McNemar's paired with Bonferroni | RSLT-full vs F (and vs RS, vs RSL) per scenario | yes | prd.md:119 |
-| `RQ1-ATTACK-KAPPA` | RQ1 | Cohen's kappa | RSL and RSLT-full vs expert annotation | yes | prd.md:121 |
-| `RQ2-MTTD-KW-DUNN-HOLM` | RQ2 | Kruskal-Wallis omnibus plus Dunn's post-hoc with Holm | MTTD across configurations per scenario | yes | prd.md:122 |
-| `RQ3-FPR-POISSON` | RQ3 | Poisson regression | escalations per hour per configuration | yes | prd.md:120 |
-| `RQ4-ABL-L2-MCNEMAR` | RQ4 | McNemar's paired with Bonferroni | L2 over L1-only | yes | prd.md:124 |
-| `RQ4-ABL-SENIOR-MCNEMAR` | RQ4 | McNemar's paired with Bonferroni | Senior over L1+L2 | yes | prd.md:125 |
-| `RQ4-FR55-BOUND` | RQ4 | empirical count | 0 of 100 trials past SUSPICIOUS; maximum ThreatScore at or below 10.5 (Claude) / 7.5 (Ollama) | yes | prd.md:110; epics.md:2238 |
-| `RQ5-RUBRIC-WILCOXON-CLARITY` | RQ5 | Wilcoxon signed-rank | LLM vs templated, Clarity dimension | yes | prd.md:126 |
-| `RQ5-RUBRIC-WILCOXON-COMPLETENESS` | RQ5 | Wilcoxon signed-rank | LLM vs templated, Completeness dimension | yes | prd.md:126 |
-| `RQ5-RUBRIC-WILCOXON-ATTACK-COVERAGE` | RQ5 | Wilcoxon signed-rank | LLM vs templated, ATT&CK coverage dimension | yes | prd.md:126 |
-| `RQ5-RUBRIC-WILCOXON-KILLCHAIN` | RQ5 | Wilcoxon signed-rank | LLM vs templated, Kill-chain reconstruction accuracy dimension | yes | prd.md:126 |
-| `RQ5-RUBRIC-WILCOXON-ACTIONABILITY` | RQ5 | Wilcoxon signed-rank | LLM vs templated, Actionability dimension | yes | prd.md:126 |
-| `RQ5-ICC` | RQ5 | ICC(2,k) | inter-rater reliability on the rubric | yes | prd.md:112 |
+| test_id | RQ | Test | Comparison | Correction family / corrected alpha | Pre-registered | Source |
+|---|---|---|---|---|---|---|
+| <a id="rq1-dr-mcnemar"></a>`RQ1-DR-MCNEMAR` | RQ1 | McNemar's paired | RSLT-full vs F (and vs RS, vs RSL) per scenario | four-way detection-rate family, 0.05 / 5 = 0.01 | yes | prd.md:119 |
+| <a id="rq1-attack-kappa"></a>`RQ1-ATTACK-KAPPA` | RQ1 | Cohen's kappa | RSL and RSLT-full vs expert annotation | not applicable (agreement estimate; threshold kappa at least 0.75) | yes | prd.md:121 |
+| <a id="rq2-mttd-kw-dunn-holm"></a>`RQ2-MTTD-KW-DUNN-HOLM` | RQ2 | Kruskal-Wallis omnibus plus Dunn's post-hoc with Holm | MTTD across configurations per scenario | Holm on the Dunn pairwise comparisons (post-hoc carries the multiplicity control) | yes | prd.md:122 |
+| <a id="rq3-fpr-poisson"></a>`RQ3-FPR-POISSON` | RQ3 | One-sided Poisson rate test (TOST-style non-inferiority vs the 2/hour bound) | each LLM-bearing configuration (RSL, RSLT-full) vs the 2 escalations/hour tolerance bound | LLM-config equivalence family, 0.05 / 2 = 0.025 | yes | prd.md:120 |
+| <a id="rq4-abl-l2-mcnemar"></a>`RQ4-ABL-L2-MCNEMAR` | RQ4 | McNemar's paired | L2 over L1-only | ablation family, 0.05 / 10 = 0.005 | yes | prd.md:124 |
+| <a id="rq4-abl-senior-mcnemar"></a>`RQ4-ABL-SENIOR-MCNEMAR` | RQ4 | McNemar's paired | Senior over L1+L2 | ablation family, 0.05 / 10 = 0.005 | yes | prd.md:125 |
+| <a id="rq4-fr55-bound"></a>`RQ4-FR55-BOUND` | RQ4 | empirical count | 0 of 100 trials past SUSPICIOUS; maximum ThreatScore at or below 10.5 (Claude) / 7.5 (Ollama) | not applicable (empirical bound check, not an NHST multiplicity family) | yes | prd.md:110; epics.md:2238 |
+| <a id="rq5-rubric-wilcoxon-clarity"></a>`RQ5-RUBRIC-WILCOXON-CLARITY` | RQ5 | Wilcoxon signed-rank | LLM vs templated, Clarity dimension | rubric family, 0.05 / 5 = 0.01 | yes | prd.md:126 |
+| <a id="rq5-rubric-wilcoxon-completeness"></a>`RQ5-RUBRIC-WILCOXON-COMPLETENESS` | RQ5 | Wilcoxon signed-rank | LLM vs templated, Completeness dimension | rubric family, 0.05 / 5 = 0.01 | yes | prd.md:126 |
+| <a id="rq5-rubric-wilcoxon-attack-coverage"></a>`RQ5-RUBRIC-WILCOXON-ATTACK-COVERAGE` | RQ5 | Wilcoxon signed-rank | LLM vs templated, ATT&CK coverage dimension | rubric family, 0.05 / 5 = 0.01 | yes | prd.md:126 |
+| <a id="rq5-rubric-wilcoxon-killchain"></a>`RQ5-RUBRIC-WILCOXON-KILLCHAIN` | RQ5 | Wilcoxon signed-rank | LLM vs templated, Kill-chain reconstruction accuracy dimension | rubric family, 0.05 / 5 = 0.01 | yes | prd.md:126 |
+| <a id="rq5-rubric-wilcoxon-actionability"></a>`RQ5-RUBRIC-WILCOXON-ACTIONABILITY` | RQ5 | Wilcoxon signed-rank | LLM vs templated, Actionability dimension | rubric family, 0.05 / 5 = 0.01 | yes | prd.md:126 |
+| <a id="rq5-icc"></a>`RQ5-ICC` | RQ5 | ICC(2,k) | inter-rater reliability on the rubric | not applicable (reliability estimate; threshold ICC at least 0.70) | yes | prd.md:112 |
 
 <!-- prereg-registry-marker: the rows above are the canonical confirmatory test registry (BI-12). Story 5.5's analyse.py consumes this table. -->
 
