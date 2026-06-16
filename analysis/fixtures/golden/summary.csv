@@ -147,4 +147,4 @@ confirmatory,rubric,attack-coverage,LLM vs templated,n/a,0,n/a,False,wilcoxon,RQ
 confirmatory,rubric,killchain,LLM vs templated,n/a,0,n/a,False,wilcoxon,RQ5-RUBRIC-WILCOXON-KILLCHAIN,0.010000,n/a,"skipped (insufficient data, n=0)",,False,False
 confirmatory,rubric,actionability,LLM vs templated,n/a,0,n/a,False,wilcoxon,RQ5-RUBRIC-WILCOXON-ACTIONABILITY,0.010000,n/a,"skipped (insufficient data, n=0)",,False,False
 confirmatory,rubric,rater-agreement,inter-rater,n/a,0,n/a,False,icc2k,RQ5-ICC,n/a,n/a,"skipped (insufficient data, n=0)",,False,False
-confirmatory,rsl;rslt-full,benign-adversarial,fr55_trust_bound,n/a,0,n/a,False,empirical_bound_count,RQ4-FR55-BOUND,n/a,n/a,"skipped (insufficient data, n=0)",,False,False
+confirmatory,rsl;rslt-full,benign-adversarial,fr55_trust_bound,0/20 past SUSPICIOUS; max=10.5<=10.5; cap_violations=0,20,mixed,True,empirical_bound_count,RQ4-FR55-BOUND,n/a,n/a,run,,False,False
