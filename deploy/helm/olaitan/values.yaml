@@ -1143,7 +1143,9 @@ analyst:
   # {claude, openai, ollama, none} or "" to inherit the top-level mapping. The
   # DFIR agent is gated by response.dfir.enabled (a separate JetStream consumer,
   # not a chain tier). Empty values keep the file-side defaults.
+  # @schema type:string enum:claude|openai|ollama|none| effect:"DFIR forensic-report agent provider family; empty inherits the top-level provider mapping" ref:FR43
   dfir_provider: ""
+  # @schema type:string effect:"DFIR forensic-report agent model name; empty keeps the file-side default" ref:FR43
   dfir_model: ""
 
   # Story 3.8 (FR53): RSLT ablation toggles. l2_enabled: false = L1-only

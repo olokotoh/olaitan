@@ -130,6 +130,33 @@ var configOnly = []configOnlyParam{
 		ref:      "-",
 		location: "cmd/olaitan/main.go (hardcoded; not a Helm or config value)",
 	},
+	{
+		name:     "Redis key-family TTLs",
+		typ:      "duration",
+		def:      "baseline:* 48h, fsm:{workload_id} no-TTL",
+		rang:     "not configurable",
+		effect:   "the baseline:* family carries a 48h server-side Redis TTL (EXPIRE, internal/redis/setters.go ttlBaseline) and the fsm:{workload_id} family carries NO TTL (BI-2, so durable FSM state survives an arbitrary restart gap); both are code-fixed, not Helm values",
+		ref:      "-",
+		location: "internal/redis/keys.go, internal/redis/setters.go (code-fixed; not a Helm or config value)",
+	},
+	{
+		name:     "NATS core-stream time retention (MaxAge)",
+		typ:      "duration",
+		def:      "EVENTS 24h, EVENTS_RAW 6h, EVIDENCE never-expire",
+		rang:     "not configurable",
+		effect:   "the core-stream MaxAge values for EVENTS, EVENTS_RAW and EVIDENCE are code-fixed in internal/nats/streams.go, not a Helm value; only the size cap (nats.streamMaxBytesOverride, the OLT_NATS_STREAM_MAXBYTES_OVERRIDE env var) is Helm-exposed",
+		ref:      "-",
+		location: "internal/nats/streams.go (code-fixed; only nats.streamMaxBytesOverride is Helm-exposed)",
+	},
+	{
+		name:     "worker pool sizes and graceful shutdown grace period",
+		typ:      "integer",
+		def:      "folded into aggregator.replicas (1); no separate grace-period knob",
+		rang:     "not configurable",
+		effect:   "the worker pool maps to aggregator.replicas (hard-constrained to 1; the rings are cooperative goroutines in one process), and there is no separate terminationGracePeriodSeconds knob (the process drains on SIGTERM within the default 30s grace)",
+		ref:      "-",
+		location: "deploy/helm/olaitan/values.yaml aggregator.replicas (folded); no separate grace-period value",
+	},
 }
 
 func main() {
@@ -495,7 +522,7 @@ func render(params []param, valuesPath string) []byte {
 				ref = "-"
 			}
 			fmt.Fprintf(&b, "| `%s` | %s | `%s` | %s | %s | %s |\n",
-				p.path, p.typ, p.def, mdEscape(p.rang), mdEscape(p.effect), ref)
+				p.path, p.typ, mdEscape(p.def), mdEscape(p.rang), mdEscape(p.effect), ref)
 		}
 		b.WriteString("\n")
 	}
@@ -517,7 +544,7 @@ func render(params []param, valuesPath string) []byte {
 			ref = "-"
 		}
 		fmt.Fprintf(&b, "| %s | %s | `%s` | %s | %s | %s | %s |\n",
-			mdEscape(c.name), c.typ, c.def, mdEscape(c.rang), mdEscape(c.effect), ref, mdEscape(c.location))
+			mdEscape(c.name), c.typ, mdEscape(c.def), mdEscape(c.rang), mdEscape(c.effect), ref, mdEscape(c.location))
 	}
 	b.WriteString("\n")
 	return b.Bytes()

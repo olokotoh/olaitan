@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -189,6 +190,100 @@ func TestRangeOf(t *testing.T) {
 				t.Errorf("rangeOf(%v) = %q, want %q", c.attrs, got, c.want)
 			}
 		})
+	}
+}
+
+// configOnlyDefaultFor returns the rendered def literal carried in the
+// generator's configOnly honesty table for the named parameter.
+func configOnlyDefaultFor(name string) (string, bool) {
+	for _, c := range configOnly {
+		if c.name == name {
+			return c.def, true
+		}
+	}
+	return "", false
+}
+
+// TestConfigOnlyDefaultsMatchFile is the FIX 2 drift guard (Blind #2): the
+// honesty table hardcodes config-file-only defaults as Go literals that are
+// read from no file, so if deploy/helm/olaitan/files/olaitan.yaml changes the
+// doc would silently drift and the FR47 git-diff gate (which only covers the
+// generated doc, not its inputs) would not catch it. This test parses the real
+// config file and asserts each hardcoded literal still equals the file value,
+// so CI fails the moment they diverge.
+func TestConfigOnlyDefaultsMatchFile(t *testing.T) {
+	const configPath = "../../deploy/helm/olaitan/files/olaitan.yaml"
+	src, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config file %s: %v", configPath, err)
+	}
+	root, err := parseTree(src)
+	if err != nil {
+		t.Fatalf("parse config file: %v", err)
+	}
+
+	// fileValue renders a dotted leaf from the config file the same way the
+	// generator renders a values.yaml leaf, so the literal and the file value
+	// are compared in the same form.
+	fileValue := func(path string) string {
+		return lookupDefault(root, path)
+	}
+
+	// normalise strips YAML quoting and surrounding whitespace so the
+	// human-readable honesty-table literal (e.g. `[kube-system, olaitan]`)
+	// compares equal to the file's rendered value (e.g. `["kube-system",
+	// "olaitan"]`) while a REAL value change (an added namespace, a flipped
+	// bool, a different number) still diverges and fails the test.
+	normalise := func(s string) string {
+		s = strings.ReplaceAll(s, `"`, "")
+		s = strings.ReplaceAll(s, " ", "")
+		return s
+	}
+
+	cases := []struct {
+		name string // configOnly[].name
+		path string // dotted path in files/olaitan.yaml
+		want string // expected rendered file value (raw, pre-normalise)
+	}{
+		{"response.excluded_namespaces", "response.excluded_namespaces", `["kube-system", "olaitan"]`},
+		{"report.redact.audit_enabled", "report.redact.audit_enabled", "false"},
+		{"report.redact.retention_redactions_days", "report.redact.retention_redactions_days", "365"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := fileValue(c.path)
+			if got != c.want {
+				t.Fatalf("config file %s = %q, want %q (the test's own expectation drifted from the file)", c.path, got, c.want)
+			}
+			lit, ok := configOnlyDefaultFor(c.name)
+			if !ok {
+				t.Fatalf("configOnly has no entry named %q", c.name)
+			}
+			// Compare normalised forms: the honesty-table literal is human
+			// readable, the file value is YAML-quoted, but the underlying value
+			// must match. A genuine config change (e.g. a third namespace, or
+			// retention 365 -> 90) survives normalisation and trips the failure.
+			if normalise(lit) != normalise(got) {
+				t.Errorf("configOnly[%q].def = %q but files/olaitan.yaml renders %q; the hardcoded honesty-table literal has drifted from the real config (update main.go's configOnly table or the file)", c.name, lit, got)
+			}
+		})
+	}
+	// Defensive: make sure the test actually exercised every file-backed
+	// config-only entry, so a future literal added without a case here is
+	// noticed.
+	covered := map[string]bool{}
+	for _, c := range cases {
+		covered[c.name] = true
+	}
+	fileBacked := []string{
+		"response.excluded_namespaces",
+		"report.redact.audit_enabled",
+		"report.redact.retention_redactions_days",
+	}
+	for _, n := range fileBacked {
+		if !covered[n] {
+			t.Errorf("file-backed config-only entry %q is not covered by a drift case", n)
+		}
 	}
 }
 

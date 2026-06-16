@@ -98,6 +98,8 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 | `analyst.l2_model` | string | `""` | - | L2 analyst model name; empty keeps the file-side default | FR25 |
 | `analyst.senior_provider` | string | `""` | one of: claude, openai, ollama (or empty to inherit) | Senior orchestrator provider family; empty inherits the top-level provider mapping | FR25 |
 | `analyst.senior_model` | string | `""` | - | Senior orchestrator model name; empty keeps the file-side default | FR25 |
+| `analyst.dfir_provider` | string | `""` | one of: claude, openai, ollama, none (or empty to inherit) | DFIR forensic-report agent provider family; empty inherits the top-level provider mapping | FR43 |
+| `analyst.dfir_model` | string | `""` | - | DFIR forensic-report agent model name; empty keeps the file-side default | FR43 |
 | `analyst.l2_enabled` | boolean | `true` | - | RSLT ablation toggle; false = L1-only (Senior also off) | FR53 |
 | `analyst.senior_enabled` | boolean | `true` | - | RSLT ablation toggle; false = L1+L2 (Senior off) | FR53 |
 | `analyst.circuit_breaker.rate_per_min` | integer | `""` | minimum 1 | LLM-eligible packages/min above which the LLM tier is bypassed; empty keeps file-side default 10 | NFR23 |
@@ -121,8 +123,11 @@ completeness. Set them by editing the mounted config, not via `--set`.
 
 | Parameter | Type | Default | Valid range | Effect | Ref | Where |
 |-----------|------|---------|-------------|--------|-----|-------|
+| NATS core-stream time retention (MaxAge) | duration | `EVENTS 24h, EVENTS_RAW 6h, EVIDENCE never-expire` | not configurable | the core-stream MaxAge values for EVENTS, EVENTS_RAW and EVIDENCE are code-fixed in internal/nats/streams.go, not a Helm value; only the size cap (nats.streamMaxBytesOverride, the OLT_NATS_STREAM_MAXBYTES_OVERRIDE env var) is Helm-exposed | - | internal/nats/streams.go (code-fixed; only nats.streamMaxBytesOverride is Helm-exposed) |
+| Redis key-family TTLs | duration | `baseline:* 48h, fsm:{workload_id} no-TTL` | not configurable | the baseline:* family carries a 48h server-side Redis TTL (EXPIRE, internal/redis/setters.go ttlBaseline) and the fsm:{workload_id} family carries NO TTL (BI-2, so durable FSM state survives an arbitrary restart gap); both are code-fixed, not Helm values | - | internal/redis/keys.go, internal/redis/setters.go (code-fixed; not a Helm or config value) |
 | logging level (per component) | string | `info` | not configurable | structured slog JSON logging runs process-wide at its default level (cmd/olaitan/main.go: slog.NewJSONHandler(stderr, nil)); there is no per-component log-level knob in the chart or config today | - | cmd/olaitan/main.go (hardcoded; not a Helm or config value) |
 | report.redact.audit_enabled | boolean | `false` | true\|false | gates the AUDIT.redactions SIEM emission; redaction itself is ALWAYS applied at every LLM/persistence boundary regardless of this flag (NFR15) | FR41/NFR15 | config/olaitan.yaml (report.redact) |
 | report.redact.retention_redactions_days | integer | `365` | minimum 1 (days) | AUDIT_REDACTIONS JetStream stream MaxAge; the redaction-pattern set itself is code-embedded, not a tunable value | NFR16 | config/olaitan.yaml (report.redact.retention_redactions_days) |
 | response.excluded_namespaces | array | `[kube-system, olaitan]` | list of namespace names | namespaces whose events are dropped before correlation (self-exclusion + control plane) | FR47 | config/olaitan.yaml (response.excluded_namespaces) |
+| worker pool sizes and graceful shutdown grace period | integer | `folded into aggregator.replicas (1); no separate grace-period knob` | not configurable | the worker pool maps to aggregator.replicas (hard-constrained to 1; the rings are cooperative goroutines in one process), and there is no separate terminationGracePeriodSeconds knob (the process drains on SIGTERM within the default 30s grace) | - | deploy/helm/olaitan/values.yaml aggregator.replicas (folded); no separate grace-period value |
 
