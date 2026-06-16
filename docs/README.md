@@ -33,8 +33,13 @@ Alternatives considered and rejected / Hand-off), where the
 
 ## Operator and reference documentation
 
-- [Runbook](runbook.md) - operational scenarios, evaluation arms, and
-  deployment notes.
+- [Runbook](runbook.md) - the operator reference: Section 1 is the Prometheus
+  metric catalogue and Section 2 is the ten NFR34 operational scenarios (Helm
+  install, state-override + TTL, per-source health, missed-detection
+  investigation, rule corpus hot-reload, air-gapped Ollama, rules-only mode,
+  S3 forensic queries, metric interpretation, SIEM via the AUDIT.* subjects),
+  each with steps, expected metric responses, expected audit-subject signals,
+  and troubleshooting, plus the evaluation arms and deployment notes.
 - [Metrics](metrics.md) - the Prometheus metric surface (names, types,
   labels, PromQL).
 - [Pre-built Grafana dashboards](../deploy/grafana/README.md) - six

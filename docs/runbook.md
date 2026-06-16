@@ -1,6 +1,6 @@
 # Olaitan operator runbook
 
-Scope: this runbook is the operator-facing reference for the Olaitan deterministic-detection layer. Story 1.18 lays down **Section 1 only** (the metric catalogue). Sections 2 through 10 cover the ten common operational scenarios from NFR34 (incident triage, false-positive tuning, rule corpus management, baseline reset, etc.) and are filled in by Story 6.8.
+Scope: this runbook is the operator-facing reference for the Olaitan deterministic-detection and response layers. Story 1.18 laid down **Section 1** (the metric catalogue). **Section 2** (Story 6.8) covers the ten common operational scenarios mandated by NFR34, each with steps, expected outputs, expected Prometheus metric responses, expected audit-subject signals, and a troubleshooting subsection. Section 2 is the SRE entry point; it summarises each procedure and cross-references the detailed per-feature prose that Epics 1 through 5 contributed throughout this document, so a single source stays authoritative without duplication.
 
 Audience: SREs, on-call engineers, and SOC analysts consuming the Prometheus surface at `:9090/metrics`. The runbook assumes familiarity with PromQL, Kubernetes, and the Olaitan three-ring (collector, correlator, decision) architecture documented in the FYP planning artefacts under `_bmad-output/planning-artifacts/` and the per-PR §3.4 chapter under `report/chapter-3-methodology.md`.
 
@@ -1445,18 +1445,566 @@ eval_run_ids:   TBD (Epic 5 evaluation harness wires the metric surface into per
 
 ---
 
-## Sections 2 through 10 -- placeholder
+## Section 2. Operational scenarios (NFR34)
 
-Sections 2 (incident triage), 3 (false-positive tuning), 4 (rule corpus management), 5 (baseline reset), 6 (capacity planning), 7 (TLS/auth rotation), 8 (NATS stream recovery), 9 (config rollback), and 10 (post-incident review) are owned by Story 6.8. Story 1.18 deliberately scopes the runbook to the deterministic-detection metric catalogue so the FR50/NFR32/NFR34 surface is documented at the moment it lands, without pre-empting the operational-scenario writing that Story 6.8 conducts against the live cluster.
+This section is the SRE entry point. It documents the ten common operational
+scenarios NFR34 mandates, so an operator can diagnose and resolve a situation
+without reading the source tree (FR52, NFR34). Each scenario carries five
+elements: **Steps**, **Expected output**, **Expected metric response**,
+**Expected audit-subject signal**, and **Troubleshooting** ("if X happens, do
+Y"). Every command, metric name, and audit subject is grounded in the real
+system: the metric names are the Section 1 catalogue and `docs/metrics.md`; the
+subjects are the canonical constants in `internal/subjects/subjects.go`,
+documented in `docs/nats-subjects.md`; the Helm values are the chart's real
+`values.yaml`, documented in `docs/helm-values.md`. Where a scenario has NO
+audit subject (source health, a rule reload), this is stated honestly rather
+than a subject invented.
 
-The placeholder anchors below let dashboards and operator tooling deep-link to specific sections without breaking when Story 6.8 lands.
+The ten scenarios deliberately summarise procedures whose detailed mechanics
+already live in this document's per-feature prose (the Section 1 catalogue and
+the "Operator scenario:" blocks contributed by Epics 1 through 5). Each
+scenario cross-references that detail rather than duplicating it, so the
+document stays single-source.
 
-### 2 Incident triage (Story 6.8)
-### 3 False-positive tuning (Story 6.8)
-### 4 Rule corpus management (Story 6.8)
-### 5 Baseline reset and warm-up override (Story 6.8)
-### 6 Capacity planning and scrape budget (Story 6.8)
-### 7 TLS and auth rotation (Story 6.8)
-### 8 NATS stream recovery (Story 6.8)
-### 9 Configuration rollback (Story 6.8)
-### 10 Post-incident review (Story 6.8)
+### 2.0 Self-documenting traceability schema (NFR34 inline reference)
+
+Per NFR34, an operator copying this runbook can read the project's
+code-to-thesis claim chain in situ. Every claim in the dissertation's
+Chapter 3 methodology is cited from working code, a passing test, and (once the
+evaluation harness has run) a recorded eval run id, through one row of the
+traceability matrix at [`docs/traceability.md`](traceability.md). A matrix row
+has this fixed schema:
+
+```
+claim_id:       c3.4-deterministic-detection-observability   # c<chapter>.<section>[.<sub>]-<slug>
+ch3_section:    §3.4 Deterministic Detection Observability Surface
+code_package:   internal/metrics, internal/correlator, internal/decision/rules, ...
+test_files:     internal/metrics/metrics_test.go, internal/correlator/correlator_metrics_test.go, ...
+test_ids:       TestRegisterCounterVec_*, TestIntegration_CorrelatorMetricsExposeAllThreeFamilies, ...
+eval_run_ids:   <canonical run id(s) once the Epic 5 harness has run; n/a for substrate/docs>
+```
+
+A worked example is the Section-1 metric-catalogue row at
+[section 1.6](#16-traceability-matrix-sample-row); the runbook itself is
+recorded under `c3.10.8-operator-runbook`. The `claim_id` identifies the claim,
+not the implementing file, so a refactor that moves a package changes only
+`code_package`, never the `claim_id` (slugs are write-once). This is the
+no-orphan-claim invariant: no Chapter 3 claim may exist without a matrix row,
+and no row may cite a non-existent test or package.
+
+### 2.1 Helm install and basic configuration
+
+**Steps.** Olaitan installs as a single Helm chart. The exact command the
+project's CI `e2e` job and `make eval-smoke` run on a fresh `kind` cluster
+(`.github/workflows/ci.yml`, `Makefile` `eval-smoke` target) is:
+
+```sh
+# 1. a single-node kind cluster (kind v0.26.0, the project-pinned version)
+kind create cluster --name olaitan-e2e --config hack/kind-config.yaml
+# 2. (kind only) load the locally-built image so pullPolicy=Never resolves
+kind load docker-image olaitan:<tag> --name olaitan-e2e
+# 3. install the chart and block on readiness
+helm install olaitan deploy/helm/olaitan \
+  --set image.repository=olaitan \
+  --set-string image.tag=<tag> \
+  --set image.pullPolicy=Never \
+  --set evaluation.config=RS \
+  --set baselines.warmupDuration=5s \
+  --set secrets.redisPassword=<redis-password> \
+  --set falco.enabled=false \
+  --set endpoints.falco=tcp://127.0.0.1:0 \
+  --set-string nats.streamMaxBytesOverride=536870912 \
+  --wait --timeout 5m
+```
+
+On a real (non-kind) cluster, drop the kind-only / evaluation-only flags
+(`image.pullPolicy=Never`, `evaluation.config=RS`, `baselines.warmupDuration=5s`,
+`falco.enabled=false`, `endpoints.falco`, `nats.streamMaxBytesOverride`) and
+supply your own image registry, the `secrets.redisPassword`, and an
+`evaluation.config` (or no overlay) appropriate to the posture. The three
+posture overlays (`-f deploy/helm/olaitan/values-production.yaml` /
+`-airgapped` / `-eval`, Story 6.6) bundle the right knobs per posture so you do
+not compose them by hand. `helm upgrade olaitan deploy/helm/olaitan
+--reuse-values --set <knob>=<value>` applies a hot-reloadable change without a
+restart (see the per-feature prose for which knobs are restart-required).
+
+**Expected output.** The chart renders 31 Kubernetes manifests (collector
+DaemonSet, aggregator Deployment, the NATS and Redis subcharts, the rules and
+prompts ConfigMaps, RBAC, Services, NetworkPolicies). `helm install --wait
+--timeout 5m` returns `STATUS: deployed` once the aggregator Deployment and the
+NATS/Redis StatefulSets reach Ready. Confirm with `kubectl get pods -l
+app.kubernetes.io/name=olaitan` (all Running/Ready) and the aggregator startup
+log lines (`aggregator: ...` in `kubectl logs deploy/olaitan-aggregator`).
+
+**Expected metric response.** Scrape `:9090/metrics`:
+`olaitan_source_healthy{source}` appears for each of the five sources. With
+`falco.enabled=false` on kind, `olaitan_source_healthy{source="falco"}` reads
+`0` and the rest read `1` once their streams produce events; this is expected
+on kind (the Falco eBPF probe cannot load there). `olaitan_sensor_events_total`
+begins climbing as events flow.
+
+**Expected audit-subject signal.** A bare install enables NO audit subjects:
+`response.audit.enabled` defaults `false`, so `AUDIT.*` carries no traffic until
+you enable it (see scenario 2.10). This is correct: a fresh install is silent on
+the SIEM surface by design. Enable graduated isolation + audit explicitly when
+the posture calls for it.
+
+**Time-to-working window (NFR34, <= 15 minutes).** The documented procedure
+above is the SAME one the always-on CI `e2e` job runs on every PR; that job's
+documented runtime is approximately 5 to 7 minutes end-to-end (kind bring-up +
+chart install + the readiness gate + the smoke test), comfortably inside the
+<= 15-minute window. **Honest provenance note:** this runbook does NOT assert a
+freshly-run live install from this writing session; the working-deployment proof
+is the green CI `e2e` job (`TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation`
++ `TestEvalSmoke_S1_RS_OneTrial`, `tests/e2e/`) that exercises exactly the
+command above on every change. The documented invocation was render-verified
+(`helm lint` clean, `helm template` renders all 31 manifests) at authoring time.
+
+**Troubleshooting.**
+- *`helm install --wait` times out with "context deadline exceeded" on a
+  constrained single-node cluster:* the aggregator can restart on a
+  NATS-not-ready startup race. Pass a smaller
+  `--set-string nats.streamMaxBytesOverride=536870912` (or `1073741824`) so the
+  JetStream PVC fits the node, and re-run; the documented kind path uses this.
+- *The collector pod stays Pending on kind:* the Falco hostPath mount does not
+  exist inside kind nodes. `--set falco.enabled=false` (as above) drops the
+  hostPath so the collector starts; `source_healthy{source="falco"}=0` is then
+  expected and not a fault.
+- *Redis pod CrashLoopBackOff:* you omitted `--set secrets.redisPassword`; the
+  Redis subchart requires it. Supply a value.
+
+### 2.2 State-override workflow and TTL management
+
+**Steps.** To manually pin a workload's FSM state for a fixed window, annotate
+the workload's owner (Deployment/StatefulSet/DaemonSet/...) or pod with the
+override pair, after enabling the controller (`response.override.enabled: true`,
+off by default):
+
+```sh
+kubectl annotate deployment web \
+  olaitan.io/state-override=QUARANTINED \
+  olaitan.io/state-override-ttl=2h \
+  olaitan.io/state-override-by=alice
+```
+
+The full mechanics (poll-not-watch observation, the native-Redis-TTL hard
+deadline, the manual-removal-by-owner-read confirmation, precedence/conflicts)
+are documented in
+[Operator scenario: pinning a workload's state with an annotation](#operator-scenario-pinning-a-workloads-state-with-an-annotation-story-27-fr38fr39).
+Inspect the live TTL with `redis-cli TTL override:default/Deployment/web`.
+
+**Expected output.** The override controller pins the FSM to the requested
+state on its next poll (default `response.override.poll_interval_seconds` 15 s);
+the `override:default/Deployment/web` Redis key carries a native TTL equal to
+the requested duration. The pin auto-releases when the native TTL elapses (a
+HARD deadline, never refreshed by the annotation merely remaining present); to
+extend, change the annotation or remove-and-reapply it.
+
+**Expected metric response.** `olaitan_response_override_applied_total{state}`
+increments once per applied pin; `olaitan_response_override_active{state}` (a
+gauge, refreshed each reconcile from the FSM pin set) reads `1` for the pinned
+workload's state while the pin is live and returns to `0` on release. A typo'd
+state increments `olaitan_response_override_rejected_total{reason="invalid_state"}`
+(counted once per distinct rejection, not per poll; see
+[`olaitan_response_override_rejected_total`](#olaitan_response_override_rejected_total-story-27-fr38fr39)).
+
+**Expected audit-subject signal.** Every applied AND rejected override emits one
+`OVERRIDES.applied` event (`internal/subjects/subjects.go` `OverridesApplied`,
+the `OVERRIDES` stream, 365 d). When `response.audit.enabled` is on, an applied
+override ALSO emits one `AUDIT.overrides` event (365 d, full FR40 attribution:
+who, what state, what TTL) AND one `AUDIT.transitions` event for the state change
+(`trigger_type=override`); a rejected override emits only `AUDIT.overrides`. Do
+not "deduplicate" the transition and override events; they are complementary,
+correlated on `workload_id`. Inspect: `nats sub OVERRIDES.applied --raw`,
+`nats sub AUDIT.overrides --raw`.
+
+**Troubleshooting.**
+- *The override does not release at the TTL:* the FSM resumes on the first poll
+  AFTER the deadline, so release latency is one `poll_interval_seconds`. Lower
+  the interval for tighter release.
+- *The whole workload did not get pinned:* annotate the OWNER, not a single pod;
+  an owner-level annotation pins the whole workload. Conflicting per-pod
+  annotations resolve to the most-isolating state with a WARN log.
+- *`olaitan.io/state-override: PRESERVED+KILLED` was rejected:* that pin is legal
+  ONLY from QUARANTINED (a pin from a lower state is refused inside the FSM); see
+  [PRESERVED_KILLED, the fifth FSM state](#preserved_killed-the-fifth-fsm-state-story-41-fr31).
+
+### 2.3 Per-source health troubleshooting via `source_healthy{source}`
+
+**Steps.** Each sensor source exposes a binary health gauge. Query the surface:
+
+```promql
+min(olaitan_source_healthy) by (source)
+```
+
+A `0` for a source means its upstream stream is disconnected or stalled. Drill
+into the per-source loss counters
+([Section 1.1](#11-collector-ring-stories-112-113)) for the cause:
+`olaitan_sensor_audit_rejected_total{reason}` (audit),
+`olaitan_sensor_circuit_breaker_engaged_total{source}` (rate-limit breaker),
+`olaitan_sensor_cni_consecutive_eofs` (a stuck Goldmane stream),
+`olaitan_sensor_cri_publish_drops_total` / `olaitan_sensor_applog_lines_shed_total`.
+
+**Expected output.** A healthy source reads `1`; the per-source ingest rate
+`sum(rate(olaitan_sensor_events_total[5m])) by (source)` is non-zero. A stalled
+source reads `0` and its ingest rate flatlines.
+
+**Expected metric response.** The alerting predicate
+`min(olaitan_source_healthy) by (source) == 0 for 5m` pages on a sustained
+source outage; `rate(olaitan_sensor_events_total{source="audit"}[5m]) < 0.01 for
+10m` pages when a specific source's ingest collapses.
+
+**Expected audit-subject signal.** **Honest gap:** source health has NO
+dedicated NATS audit subject. Health is a Prometheus signal, and the
+`olaitan.health.*` subjects in the contract are reserved/ephemeral with no
+active producer in this build (`docs/nats-subjects.md`, Reserved subjects). The
+audit-equivalent signal for a source problem is therefore the per-source loss
+counter family above, not an `AUDIT.*` event. Do not subscribe a health subject;
+alert on the gauge.
+
+**Troubleshooting.**
+- *`source_healthy{source="audit"}=0`:* the K8s audit webhook receiver is not
+  reaching the aggregator. Check `olaitan_sensor_audit_rejected_total{reason}`
+  for `decode_error` (an API-server payload schema change) or
+  `payload_too_large`; verify the API-server audit webhook config points at the
+  receiver Service.
+- *`source_healthy{source="network"}=0` with a rising
+  `olaitan_sensor_cni_consecutive_eofs`:* the Goldmane flow endpoint is
+  unreachable; the gauge above `10` for 5 minutes is the alert. Verify Calico
+  Goldmane is up.
+- *`source_healthy{source="falco"}=0` on kind/CI:* expected when
+  `falco.enabled=false`; not a fault.
+
+### 2.4 Missed-detection investigation via NATS audit subjects and package replay
+
+**Steps.** When an attack should have been caught but was not, reconstruct the
+decision from the durable streams. The evidence stream is replayable: the
+`EVIDENCE` JetStream stream holds `olaitan.evidence.packages` with `MaxAge 0`
+(NEVER auto-expires, `MaxBytes 100 GiB` safety cap), so every EvidencePackage
+the correlator ever produced is re-readable.
+
+```sh
+# 1. replay the evidence the correlator produced for the window
+nats sub "olaitan.evidence.packages" --raw
+# 2. read the FSM decisions and the LLM verdicts for the same window
+nats sub "AUDIT.transitions" --raw
+nats sub "AUDIT.assessments" --raw
+```
+
+For a reproducible offline capture, the `olaitan-eval` harness drains these same
+subjects into `runs/<run_id>/{events.jsonl,evidence.jsonl,assessments.jsonl,fsm.jsonl}`
+(see [Per-run artefact capture](#per-run-artefact-capture-story-54-fr54)).
+
+**Expected output.** The replayed `olaitan.evidence.packages` shows whether the
+correlator even ASSEMBLED a package for the workload. If it did,
+`AUDIT.transitions` / `AUDIT.assessments` show what score and verdict the
+package received; if it did not, the gap is upstream (collection or correlation),
+not detection.
+
+**Expected metric response.** A rule that evaluated but did not match shows as
+`olaitan_decision_rules_evaluations_total{outcome="miss"}` (vs `match`);
+`olaitan_correlator_evidence_packages_total{trigger_type}` confirms the
+correlator produced (or did not produce) a package. A
+`olaitan_correlator_overflow_summarised_total` increment means the window
+overflowed and was summarised, which can drop detail.
+
+**Expected audit-subject signal.** The decision trail is `AUDIT.transitions`
+(90 d, every FSM state change) and `AUDIT.assessments` (365 d, every
+investigation-chain run, keyed on `package_id`, carrying the per-role verdicts
+and the redacted evidence). Correlate on `package_id` / `workload_id` across
+both, plus the replayed `olaitan.evidence.packages`.
+
+**Troubleshooting.**
+- *No evidence package was assembled:* check `olaitan_source_healthy` for the
+  source the attack would have used (scenario 2.3); a stalled source means the
+  event never reached correlation.
+- *A package was scored but no rule matched:* the corpus may lack a rule for the
+  technique; see the rule-corpus hot-reload scenario (2.5) to add one, and
+  `docs/sigma-extensions.md` for authoring.
+- *A package was scored but no LLM assessment exists:* the chain may be in
+  rules-only mode (scenario 2.7) or the FR19 trigger gate declined
+  (`olaitan_investigation_chain_runs_total{outcome="not_triggered"}`), which is
+  expected for low-severity packages.
+
+### 2.5 Rule corpus hot-reload workflow
+
+**Steps.** The OLT Sigma rule corpus is mounted from the `olaitan-rules`
+ConfigMap at `rules.path` (default `/etc/olaitan/rules`) and hot-reloaded by an
+fsnotify watcher; the rule contents reload WITHOUT a pod restart. To change the
+corpus:
+
+```sh
+# edit the mounted ConfigMap directly, or re-render via helm upgrade
+kubectl edit configmap olaitan-rules
+# (the loader catches the projected-volume ..data symlink swap, debounces, and
+#  atomically swaps the live corpus on the next evaluation)
+```
+
+Restart semantics (`deploy/helm/olaitan/values.yaml`, the `rules:` block):
+the rule CONTENTS hot-reload; changing `rules.path` or flipping `rules.enabled`
+is restart-required (`kubectl rollout restart deploy/olaitan-aggregator`).
+
+**Expected output.** A successful reload logs nothing alarming and the new rules
+take effect on the next EvidencePackage. A malformed rule file is rejected: the
+loader logs `rules: reload rejected` with the offending file path and RETAINS
+the prior corpus, so the pod stays Ready and detection never goes dark.
+
+**Expected metric response.** A successful reload increments
+`olaitan_decision_rules_reloads_total{outcome="success"}` and moves
+`olaitan_decision_rules_loaded` (the live rule count,
+[Section 1.3](#13-rule-engine-ring-stories-115-118)). A rejected reload
+increments `olaitan_decision_rules_reloads_total{outcome="rejected"}` and leaves
+`olaitan_decision_rules_loaded` unchanged.
+
+**Expected audit-subject signal.** **Honest gap:** a rule reload is a
+control-plane configuration change, not an FSM transition, override, or
+NetworkPolicy mutation, so it produces NO `AUDIT.*` event (the audit subjects
+record real workload activity, not reconcile/config cadence; see the
+[append-only SIEM audit subjects](#append-only-siem-audit-subjects-story-28-fr40nfr16)
+operational notes). The audit-equivalent signal for a reload is the
+`olaitan_decision_rules_reloads_total{outcome}` metric and the `rules: reload
+rejected` log line, not a subject.
+
+**Troubleshooting.**
+- *The new rule is not matching:* confirm `olaitan_decision_rules_loaded` rose
+  by the number of rules you added (if it did not, the reload was rejected);
+  check the `rules: reload rejected` log for a parse error and validate the rule
+  against the SIGMA-HQ reference parser (`docs/sigma-extensions.md`).
+- *Changing `rules.path` did not take effect:* a path change is a Deployment-spec
+  change and is restart-required; the pod rolls. The contents (not the path) are
+  the hot-reloadable surface.
+
+### 2.6 Air-gapped Ollama deployment
+
+**Steps.** Under data-residency constraints, run the LLM tier fully in-cluster
+via Ollama instead of dialling an external vendor. The reference overlay is
+`deploy/helm/olaitan/values-airgapped.yaml`:
+
+```sh
+helm upgrade --install olaitan deploy/helm/olaitan \
+  --set secrets.redisPassword=<pw> \
+  -f deploy/helm/olaitan/values-airgapped.yaml
+kubectl rollout restart deploy/olaitan-aggregator   # provider change is restart-required
+```
+
+The overlay sets `ollama.enabled: true` (renders the `olaitan-ollama`
+Deployment, Service, and a NetworkPolicy with declared-EMPTY egress),
+`analyst.provider: local`, the pinned `analyst.local.{endpoint,model}`, and
+`analyst.score_cap: 25`. The full mechanics (the NetworkPolicy-as-auth boundary,
+the trust-cap ladder, model provisioning, context-window pairing, cold-load
+Health) are in
+[Air-gapped / data-residency mode](#air-gapped--data-residency-mode-story-34-fr48).
+
+**Expected output.** The `olaitan-ollama` Deployment and Service render and
+reach Ready (verified: the overlay renders the `olaitan-ollama` workload with an
+empty-egress NetworkPolicy). The aggregator dials
+`http://<release>-ollama.<namespace>.svc.cluster.local:11434`; no external egress
+leaves the cluster.
+
+**Expected metric response.** `olaitan_llm_calls_total{provider="ollama",role,status}`
+increments per analyst call; a cold model surfaces as `status="timeout"` until
+warmed. The local tier contributes at most `score_cap` 25 of 100 to the
+ThreatScore (the trust ladder), so `olaitan_llm_cap_violation_total` stays 0.
+
+**Expected audit-subject signal.** `AUDIT.assessments` (when audit is enabled)
+records the per-role `providers`/`models`, so an air-gapped run is auditable as
+having used the local Ollama provider, with the redacted evidence the model saw.
+
+**Troubleshooting.**
+- *Every call returns a permanent 404:* the model named in `analyst.local.model`
+  is not provisioned. A 404 from Ollama means "model not present", not a
+  transient outage; bake the model into the image or pre-populate a volume
+  (`ollama.persistence.existingClaim`) - in a true air-gap `ollama pull` has
+  nowhere to pull from.
+- *The Ollama Health probe reports unhealthy for minutes after deploy:* a cold
+  large-model load takes minutes; warm it with one throwaway request before
+  relying on Health-gated automation.
+- *The Ollama pod is reachable cluster-wide despite the NetworkPolicy:* the
+  NetworkPolicy IS the auth boundary here (Ollama takes no API key); it requires
+  an enforcing CNI (the project's Calico enforces). A non-enforcing CNI (bare
+  Flannel) leaves the credential-free pod open - use an enforcing CNI.
+
+### 2.7 Rules-only mode fallback when no LLM available
+
+**Steps.** Olaitan runs fully without an LLM. Set `analyst.provider: none` (the
+chart enum is `none` / `api` / `local`, `docs/helm-values.md`): the multi-agent
+chain is not built, EvidencePackages are still consumed and scored on
+rules-and-baselines-only ThreatScores, and the FSM drives graduated isolation as
+normal (NFR27). This is also the automatic degrade when an API key is absent or
+both LLM tiers exhaust mid-flight (the `llm_unavailable` path,
+[Section on LLM retry/fallback](#llm-retry-ollama-fallback-and-llm_unavailable-story-310-fr26fr28)).
+
+**Expected output.** With `analyst.provider: none`, the aggregator starts
+normally, discloses rules-only mode once at startup, and runs the full
+deterministic detection + response pipeline. With an `api` provider but a
+missing key, the construction log records `api_key_set=false` (NFR18) and the
+provider is simply not built - the chart never silently dials a public endpoint
+with no key.
+
+**Expected metric response.** `olaitan_investigation_chain_runs_total{outcome="not_triggered"}`
+is high and healthy (the chain is bypassed). When an LLM-bearing arm degrades
+mid-flight, `olaitan_decision_llm_calls_total{status="unavailable"}` rises and
+`olaitan_llm_fallback_total` shows the primary-to-Ollama fall-throughs;
+sustained, both mean both tiers are down and verdicts are deterministic-only.
+
+**Expected audit-subject signal.** A Senior role that exhausted both providers
+produces a degraded assessment marked `llm_unavailable`
+(`llm_capped_confidence: 0`), recorded in `AUDIT.assessments` with status
+`unavailable`. The deterministic FSM transitions still emit `AUDIT.transitions`,
+so the response trail is unbroken even with no LLM.
+
+**Troubleshooting.**
+- *Verdicts feel "deterministic only" when you expected LLM enrichment:* check
+  `analyst.provider` (is it `none`?) and the `api_key_set` startup log (is the
+  key projected?). A `local` provider with an unprovisioned model also degrades
+  to rules-only (scenario 2.6).
+- *The FSM still isolates workloads in rules-only mode:* correct and intended -
+  the LLM only enriches the verdict the FSM already bounds; graduated isolation
+  is a deterministic capability.
+
+### 2.8 Forensic report queries against the S3 archive
+
+**Steps.** When the forensic tier is enabled (`response.dfir.enabled`,
+`response.reportArchive.enabled`), each finalised incident produces a redacted
+Markdown `ForensicReport` PUT to the S3-compatible archive under a
+content-addressed key. The announcement event carries the key:
+
+```sh
+# read the report announcements (carrying the SHA256 and the content-addressed url)
+nats sub "REPORTS.generated" --raw
+# the object key is reports/{yyyy}/{mm}/{dd}/{sha256}.md in the report bucket;
+# fetch it from the object store with your S3 client (mc / aws s3 cp), e.g.
+mc cp myminio/olaitan-reports/reports/2026/06/16/<sha256>.md ./report.md
+```
+
+The full write path (KMS, object-lock GOVERNANCE/COMPLIANCE, HEAD-then-skip
+dedup, the deferred-queue resilience) is in
+[Durable report writer](#durable-report-writer-story-46-fr45nfr7) and
+[Forensic write retry and deferred queue](#forensic-write-retry-and-deferred-queue-story-47-fr45-resiliencenfr28).
+The captured forensic BUNDLE (logs + pod spec/status + events) lives separately
+under `forensic-bundles/<sha256>/forensic-bundle.tar.gz`.
+
+**Expected output.** `REPORTS.generated` carries `report_url`
+(`reports/{yyyy}/{mm}/{dd}/{sha256}.md`) and the `report_sha256`; the object at
+that key is the redacted report (the SHA is computed over the redacted bytes
+actually persisted, so the announced key matches the stored object). Object-lock
+retention prevents deletion until expiry.
+
+**Expected metric response.** `olaitan_report_writes_total{result}` (`success`/
+`deduped`/`error`/`retried`/`deferred`) and `olaitan_report_write_duration_seconds`
+instrument the PUT tail (`docs/metrics.md`); `olaitan_report_writes_deferred_count`
+is the live depth of the Redis `reports:deferred` queue. A non-zero deferred
+count means S3 is unreachable and reports are queued, not lost.
+
+**Expected audit-subject signal.** `REPORTS.generated` is the announcement;
+`AUDIT.assessments` carries the DFIR call as a role-keyed `dfir` row; and the
+persistence-side redaction emits `AUDIT.redactions` (the WHERE and WHY of each
+redacted region, never the secret value, NFR18).
+
+**Troubleshooting.**
+- *The report is not in the bucket:* check `olaitan_report_writes_deferred_count
+  > 0` (S3 down: the report is queued in Redis and drains on recovery) or
+  `olaitan_report_writes_total{result="error"}` (a permanent misconfiguration -
+  403 AccessDenied / 404 NoSuchBucket - logged loudly).
+- *A delete of a report object is rejected:* object-lock is working as intended
+  (GOVERNANCE allows an audited bypass by a privileged identity; COMPLIANCE is
+  immutable until expiry).
+- *The report bucket cannot be enabled for object lock:* object lock must be set
+  at bucket CREATION (it forces versioning); the writer never creates the bucket.
+  Recreate the bucket with object lock + SSE-KMS default + access logging before
+  enabling the writer.
+
+### 2.9 Prometheus metric interpretation for SRE decision-making
+
+**Steps.** The complete metric catalogue is [Section 1](#section-1-deterministic-detection-metric-catalogue)
+(detection rings) and [`docs/metrics.md`](metrics.md) (forensic tier); the six
+importable Grafana dashboards (`deploy/grafana/dashboards/`, Story 6.7) render
+them. This scenario is the decision table: what a rising metric MEANS and what
+to DO. Each row is a real exported metric.
+
+| Signal (rising / firing) | What it means | What to do |
+|---|---|---|
+| `min(olaitan_source_healthy) by (source) == 0` | a sensor source is stalled | scenario 2.3: drill into the per-source loss counters |
+| `olaitan_response_network_policy_apply_total{result="dropped"}` or `{result="error"}` sustained | RESTRICTED transitions are not being enforced (apply queue full / API error); an enforcement-coverage gap, not a latency blip | investigate API-server latency; the manager does not retry a dropped transition until the FSM re-emits it |
+| `increase(olaitan_llm_cap_violation_total[5m]) > 0` | a code path bypassed the trust-bound LLM cap (should be impossible by construction) | page immediately; this is a trust-bound breach to escalate, never patch around |
+| `olaitan_report_writes_deferred_count > 0` sustained | S3/MinIO is down; forensic reports are queued in Redis | restore S3 reachability + KMS validity; reports drain automatically on recovery |
+| `increase(olaitan_report_writes_dropped_total[15m]) > 0` | the deferred-report backlog exceeded its cap; the OLDEST queued reports were dropped | a very long S3 outage; restore S3 and reduce finalisation volume |
+| `increase(olaitan_response_audit_transitions_dropped_total[5m]) > 0` | the AUDIT.transitions buffer overflowed during a NATS outage; SIEM events were dropped | restore NATS; the dropped events are an observability gap, not a control-plane failure |
+| `rate(olaitan_llm_circuit_breaker_engaged_total[10m]) > 0` sustained | the LLM-tier cost breaker is engaging (an attack-driven burst or a too-low threshold) | check for an event spray; tune `analyst.circuit_breaker.rate_per_min` |
+| FSM apply p99 `histogram_quantile(0.99, ... olaitan_response_network_policy_apply_seconds_bucket ...) > 1` | the NFR6 1 s isolation-latency budget is breached | investigate API-server latency |
+
+**Expected output.** Each PromQL above returns the documented shape against the
+live `:9090/metrics`; the Grafana dashboards mark the alert-worthy bands as
+color `thresholds` steps (Story 6.7) which `deploy/grafana/README.md` documents
+operators wire as unified-alerting rules.
+
+**Expected metric response.** This scenario IS the metric-response reference;
+each row's left column is the firing predicate, the right column the SRE action.
+
+**Expected audit-subject signal.** Where a metric corresponds to an auditable
+event, the relevant `AUDIT.*` subject carries the record (e.g. a netpol apply ->
+`AUDIT.policies`, an FSM transition -> `AUDIT.transitions`); see scenario 2.10
+for the SIEM surface.
+
+**Troubleshooting.**
+- *A metric you expect is absent:* some series exist only when a feature is
+  enabled (e.g. `olaitan_notification_webhook_delivered_total` only when the
+  webhook is on; the `olaitan_sensor_posture_*` counters only when posture is
+  enabled). Absence of an opt-in series is not a fault.
+- *A histogram quantile looks wrong:* aggregate by `le` first
+  (`sum(rate(..._bucket[5m])) by (le)`) before `histogram_quantile`.
+
+### 2.10 SIEM integration via NATS audit subjects
+
+**Steps.** Olaitan exposes five append-only NATS audit subjects for SIEM
+consumption (Splunk / Elastic / Datadog). Enable them with
+`response.audit.enabled: true` (off by default; `report.redact.audit_enabled`
+gates the fifth, `AUDIT.redactions`). Subscribe a durable consumer from your
+SIEM connector:
+
+```sh
+nats sub "AUDIT.transitions"  --raw   # every FSM state change (90 d)
+nats sub "AUDIT.overrides"    --raw   # every override applied AND rejected (365 d)
+nats sub "AUDIT.policies"     --raw   # every NetworkPolicy mutation (365 d)
+nats sub "AUDIT.redactions"   --raw   # one event per redacted field, WHERE+WHY only (365 d)
+nats sub "AUDIT.assessments"  --raw   # every LLM investigation-chain verdict (365 d)
+nats sub "AUDIT.>"            --raw   # all five at once
+```
+
+Each event is structured JSON with documented field names (no NL parsing); the
+committed schemas are `docs/schemas/audit/*.yaml`. The per-subject producer,
+stream, retention, and schema reference are in
+[`docs/nats-subjects.md`](nats-subjects.md) (SIEM audit subjects) and the
+[append-only SIEM audit subjects](#append-only-siem-audit-subjects-story-28-fr40nfr16)
+prose.
+
+**Expected output.** With the gate on, each subscribed subject delivers a JSON
+event per real activity (an FSM change, an override, a policy mutation, a
+redaction, a chain verdict). Each rides a `LimitsPolicy` JetStream stream, so the
+stream is append-only by construction: a consumer cannot delete an event by
+acking it (NFR16). `AUDIT.redactions` and `AUDIT.assessments` NEVER carry a
+secret value (NFR18), so the streams are safe to ship to a SIEM.
+
+**Expected metric response.** A NATS outage drops audit events from the buffered
+sinks (best-effort, never blocking enforcement); the drop is visible as
+`olaitan_response_audit_transitions_dropped_total` /
+`olaitan_response_audit_policies_dropped_total`. A sustained non-zero drop rate
+means the SIEM is missing events.
+
+**Expected audit-subject signal.** This scenario IS the audit-subject reference:
+the five `AUDIT.*` subjects are the SIEM surface. Note an applied override emits
+BOTH `AUDIT.transitions` and `AUDIT.overrides` by design (correlate, do not
+deduplicate); a mutation-only discipline means an idempotent no-op produces no
+event (audit volume tracks real activity, not reconcile cadence).
+
+**Troubleshooting.**
+- *No audit events arrive:* the gate is off. Set `response.audit.enabled: true`
+  (and `report.redact.audit_enabled: true` for `AUDIT.redactions`). Redaction
+  itself is ALWAYS applied regardless of the flag (NFR15); only the SIEM emission
+  is gated.
+- *Events are being missed intermittently:* check the dropped counters above;
+  a NATS outage drops audit lines rather than stalling the control plane. The
+  fix is NATS availability, not a code change.
+- *You are unsure of a field's meaning:* read the committed schema at
+  `docs/schemas/audit/<subject>.yaml`; the events are schema-validated, never
+  free text.
