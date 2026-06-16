@@ -73,10 +73,10 @@ Every OLT rule MUST declare an `attack:` field at the top level whose
 value is a non-empty YAML list of MITRE ATT&CK for Containers v18
 technique IDs. Two ID forms are valid:
 
-- **Base technique** — uppercase `T` followed by exactly four digits
-  (`T1496`, `T1611`). No separator, no trailing dot.
-- **Sub-technique** — base technique ID, a single dot, and exactly
-  three digits (`T1059.004`).
+- **Base technique** (uppercase `T` followed by exactly four digits,
+  e.g. `T1496`, `T1611`). No separator, no trailing dot.
+- **Sub-technique** (base technique ID, a single dot, and exactly
+  three digits, e.g. `T1059.004`).
 
 Both forms are accepted in the same list. The four-digit base and
 three-digit sub-technique counts match MITRE ATT&CK Enterprise v18.
