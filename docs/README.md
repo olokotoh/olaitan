@@ -37,6 +37,12 @@ Alternatives considered and rejected / Hand-off), where the
   deployment notes.
 - [Metrics](metrics.md) - the Prometheus metric surface (names, types,
   labels, PromQL).
+- [Pre-built Grafana dashboards](../deploy/grafana/README.md) - six
+  importable Grafana dashboards (`deploy/grafana/dashboards/`) covering
+  source health, detection, FSM state, the LLM tier, and forensic
+  reporting, with `schemaVersion` pinned to Grafana 11.1.x; every panel
+  PromQL is grounded in a real exported metric, mechanically enforced by
+  `make dashboard-lint` (Story 6.7).
 - [IAM](iam.md) - identity and access notes.
 - [NATS subjects](nats-subjects.md) - the per-subject integrator
   reference (producer, consumers, payload schema, retention, and a

@@ -54,6 +54,18 @@ lint:
 olaitan-lint:
 	go run ./cmd/olaitan-lint ./...
 
+# dashboard-lint (Story 6.7, FR50/NFR32/NFR34) is the "no live Grafana"
+# testable proxy for the pre-built Grafana dashboards: it asserts every
+# deploy/grafana/dashboards/*.json parses, carries the pinned schemaVersion
+# (39, Grafana 11.1.x), and references ONLY metrics the agent actually exports
+# (the olaitan_* literals registered across internal/ + cmd/, minus the Story
+# 4.9 retired names). A dashboard referencing a non-existent or retired metric
+# fails the build. This is a SEPARATE target (and a SEPARATE CI step) from
+# `make lint`/olaitan-lint so a dashboard-grounding failure is attributable
+# (the 6.3/6.4/6.5 step-per-enforcement precedent).
+dashboard-lint:
+	go run ./cmd/olaitan-dashboard-lint deploy/grafana/dashboards internal cmd
+
 # prereg-check (Story 5.8) is the lightest honest structural gate for the
 # pre-registered analysis plan: it asserts analysis/preregistration.md exists
 # and carries the eight mandated section headings plus the confirmatory test
