@@ -58,7 +58,9 @@ MTTD_SECONDS: Dict[str, int] = {
 NEVER_DETECTED = -1
 
 
-def _metadata(run_id: str, config: str, scenario: str, detected: bool, ttd: int) -> str:
+def _metadata(
+    run_id: str, config: str, scenario: str, detected: bool, ttd: int, instance: int
+) -> str:
     lines = [
         f"run_id: {run_id}",
         f"manifest_sha256: {FIXTURE_MANIFEST}",
@@ -72,6 +74,11 @@ def _metadata(run_id: str, config: str, scenario: str, detected: bool, ttd: int)
         f"measured_time_to_detect: {ttd}",
         f"measured_final_fsm_state: {'QUARANTINED' if detected else 'CLEAN'}",
         f"fsm_state_source: {'observed_transitions' if detected else 'none'}",
+        # The scenario-instance pairing key (H2/BI-8): instance i of a scenario is
+        # the SAME deterministic Story-5.2 stimulus across every config, so the
+        # paired McNemar/ablation tests align config A's instance i with config
+        # B's instance i. Story 5.9 must populate this per replicate on real runs.
+        f"scenario_instance: {instance}",
         "resource_usage:",
         "  harness_alloc_bytes: 4194304",
         "  cluster_metrics_available: false",
@@ -95,6 +102,9 @@ def _benign_metadata(run_id: str, config: str, escalations: int) -> str:
         f"measured_time_to_detect: {NEVER_DETECTED}",
         "measured_final_fsm_state: CLEAN",
         "fsm_state_source: none",
+        # The benign sweep carries a single instance-00 per config (no pairing is
+        # done on it); the key is recorded for shape-consistency with attack cells.
+        "scenario_instance: 0",
         "resource_usage:",
         "  harness_alloc_bytes: 4194304",
         "  cluster_metrics_available: false",
@@ -159,7 +169,9 @@ def generate(base: Path) -> None:
                 run_id = f"fixture-{config}-{scenario}-{index:02d}"
                 effective_ttd = ttd if detected else NEVER_DETECTED
                 files = {
-                    "metadata.yaml": _metadata(run_id, config, scenario, detected, effective_ttd),
+                    "metadata.yaml": _metadata(
+                        run_id, config, scenario, detected, effective_ttd, index
+                    ),
                     "fsm.jsonl": _fsm_jsonl(["QUARANTINED"] if detected else []),
                     "evidence.jsonl": "",
                     "events.jsonl": "",

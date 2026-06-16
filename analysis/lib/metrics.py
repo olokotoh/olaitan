@@ -185,16 +185,27 @@ def fpr(cell: pd.DataFrame, runs_dir: str) -> FPR:
     n = int(cell.shape[0])
     if n == 0:
         return FPR(value=None, escalations=0, window_hours=0.0, n=0)
+    # Accumulate per-run (escalations, hours) and include a run in BOTH the
+    # numerator and the denominator only when its wall-window is usable (M2). A
+    # run with a zero/negative/unparseable window is skipped ENTIRELY (its
+    # escalations are NOT counted either), so a mixed cell cannot inflate the rate
+    # by summing escalations whose hours were dropped. ``escalations`` and
+    # ``n_usable`` therefore describe the SAME run set.
     escalations = 0
     total_hours = 0.0
+    n_usable = 0
     for _, row in cell.iterrows():
+        hours = _wall_window_hours(row["started_at"], row["finished_at"])
+        if hours is None:
+            continue
         run_dir = Path(runs_dir) / str(row["run_id"])
+        run_escalations = 0
         for after_state in io.fsm_after_states(run_dir):
             if escalates_past_clean(after_state):
-                escalations += 1
-        hours = _wall_window_hours(row["started_at"], row["finished_at"])
-        if hours is not None:
-            total_hours += hours
+                run_escalations += 1
+        escalations += run_escalations
+        total_hours += hours
+        n_usable += 1
     if total_hours <= 0.0:
         return FPR(value=None, escalations=escalations, window_hours=0.0, n=n)
     return FPR(
@@ -250,19 +261,29 @@ def cohens_kappa(predicted: List[str], truth: List[str]) -> Optional[float]:
     return (observed - expected) / (1.0 - expected)
 
 
-def attack_kappa(cell: pd.DataFrame, runs_dir: str, is_llm_config: bool) -> Kappa:
-    """ATT&CK Cohen's kappa for a cell (BI-6).
+def attack_kappa(config_frame: pd.DataFrame, runs_dir: str, is_llm_config: bool) -> Kappa:
+    """ATT&CK Cohen's kappa POOLED across scenarios S1-S5 per config (BI-6, M3).
 
-    Reads the predicted technique from each run's ``assessments.jsonl`` and
-    pairs it against the scenario ground-truth (``SCENARIO_GROUND_TRUTH``).
-    Returns ``value=None`` (``n/a``) for non-LLM arms (F/RS) or when no
-    assessment carries a technique (empty/constrained env), per BI-6.
+    The prereg's RQ1-ATTACK-KAPPA is "RSL/RSLT-full vs expert annotation" ACROSS
+    techniques, so kappa MUST be pooled over the five scenarios (whose ground-truth
+    labels T1611/T1552/T1613/T1071/T1496 VARY) and computed PER CONFIG. A per-cell
+    kappa over a single scenario has a CONSTANT ground-truth label, which makes the
+    expected agreement degenerate (kappa structurally 0.0 for both 3/4-correct and
+    all-wrong); pooling restores a meaningful agreement estimate.
+
+    Reads the predicted technique from each run's ``assessments.jsonl`` across the
+    WHOLE config frame and pairs it against each run's scenario ground-truth
+    (``SCENARIO_GROUND_TRUTH``). Returns ``value=None`` (``n/a``) for non-LLM arms
+    (F/RS) or when no assessment carries a technique (empty/constrained env), per
+    BI-6.
     """
     if not is_llm_config:
         return Kappa(value=None, n=0)
     predicted: List[str] = []
     truth: List[str] = []
-    for _, row in cell.iterrows():
+    # Iterate in run_id order so the pooled label sequence is deterministic (BI-13).
+    ordered = config_frame.sort_values(by="run_id", kind="mergesort")
+    for _, row in ordered.iterrows():
         scenario = str(row["scenario"]).lower()
         ground_truth = SCENARIO_GROUND_TRUTH.get(scenario)
         if ground_truth is None:

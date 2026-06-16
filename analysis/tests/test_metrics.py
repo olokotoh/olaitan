@@ -5,6 +5,8 @@ Each test pins a HAND-COMPUTED answer so a math-breaking refactor fails (BI-12).
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
 
 from analysis.lib import io, metrics
@@ -98,6 +100,58 @@ def test_attack_kappa_na_for_non_llm() -> None:
     result = metrics.attack_kappa(cell, ".", is_llm_config=False)
     assert result.value is None
     assert result.n == 0
+
+
+def _assessment_run(base: Path, run_id: str, scenario: str, technique: str) -> None:
+    run_dir = base / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "assessments.jsonl").write_text(
+        '{"schema_version":"audit.assessments.v1","payload":'
+        f'{{"mitre_techniques":["{technique}"]}}}}\n',
+        encoding="utf-8",
+    )
+
+
+def test_attack_kappa_pooled_across_scenarios(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # M3: kappa is pooled across S1-S5 per config so the ground-truth label VARIES
+    # (T1611..T1496). All five predictions correct -> perfect agreement -> kappa
+    # 1.0 over n=5 (a single-scenario per-cell kappa would be structurally
+    # degenerate because its ground truth is constant).
+    scenarios = ["s1", "s2", "s3", "s4", "s5"]
+    techniques = ["T1611", "T1552", "T1613", "T1071", "T1496"]
+    for scenario, technique in zip(scenarios, techniques):
+        _assessment_run(tmp_path, f"r-{scenario}", scenario, technique)
+    config_frame = pd.DataFrame(
+        {
+            "run_id": [f"r-{s}" for s in scenarios],
+            "config": ["rsl"] * 5,
+            "scenario": scenarios,
+        }
+    )
+    result = metrics.attack_kappa(config_frame, str(tmp_path), is_llm_config=True)
+    assert result.n == 5
+    assert result.value == 1.0
+
+
+def test_attack_kappa_pooled_partial_disagreement(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # M3: a wrong prediction on one scenario lowers the pooled kappa below 1.0
+    # (it is no longer perfect agreement) -- proving pooling actually discriminates.
+    scenarios = ["s1", "s2", "s3", "s4", "s5"]
+    # s5 predicted wrongly (T1611 instead of T1496).
+    predicted = ["T1611", "T1552", "T1613", "T1071", "T1611"]
+    for scenario, technique in zip(scenarios, predicted):
+        _assessment_run(tmp_path, f"r-{scenario}", scenario, technique)
+    config_frame = pd.DataFrame(
+        {
+            "run_id": [f"r-{s}" for s in scenarios],
+            "config": ["rslt-full"] * 5,
+            "scenario": scenarios,
+        }
+    )
+    result = metrics.attack_kappa(config_frame, str(tmp_path), is_llm_config=True)
+    assert result.n == 5
+    assert result.value is not None
+    assert result.value < 1.0
 
 
 def test_expected_cell_n() -> None:

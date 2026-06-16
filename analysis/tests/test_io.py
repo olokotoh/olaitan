@@ -56,11 +56,31 @@ def test_load_run_set_typed_columns(tmp_path: Path) -> None:
     assert int(row["measured_time_to_detect"]) == 18
 
 
-def test_fixture_path_flagged(tmp_path: Path) -> None:
-    fixtures = tmp_path / "fixtures" / "runs"
-    _write_run(fixtures, "fixture-a", "rsl", "s1", True)
-    run_set = io.load_run_set(str(fixtures))
+def test_fixture_flagged_off_run_id_prefix(tmp_path: Path) -> None:
+    # L1: is_fixture is driven by the per-run ``fixture-`` run_id prefix, not the
+    # path. Every run carrying the prefix -> fixture: true.
+    runs = tmp_path / "runs"
+    _write_run(runs, "fixture-a", "rsl", "s1", True)
+    _write_run(runs, "fixture-b", "rsl", "s2", False)
+    run_set = io.load_run_set(str(runs))
     assert run_set.is_fixture is True
+
+
+def test_real_run_under_fixtures_path_not_flagged(tmp_path: Path) -> None:
+    # L1: a REAL run-set (no ``fixture-`` prefix) under a path that contains a
+    # ``fixtures`` segment must NOT be mislabelled fixture: true.
+    fixtures = tmp_path / "fixtures" / "runs"
+    _write_run(fixtures, "20260615T093000.000Z-s1-rsl-abc123", "rsl", "s1", True)
+    run_set = io.load_run_set(str(fixtures))
+    assert run_set.is_fixture is False
+
+
+def test_scenario_instance_key_prefers_explicit_field() -> None:
+    # H2: the explicit scenario_instance field wins; else the run_id -NN suffix.
+    assert io.scenario_instance_key("20260615T093000.000Z-s1-rsl-abc", 3) == "3"
+    assert io.scenario_instance_key("fixture-rsl-s1-02", None) == "02"
+    # A real run_id (hash-suffixed) with no explicit field has no parseable index.
+    assert io.scenario_instance_key("20260615T093000.000Z-s1-rsl-abc123", None) is None
 
 
 def test_fsm_after_states(tmp_path: Path) -> None:

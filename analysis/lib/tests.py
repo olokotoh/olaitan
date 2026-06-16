@@ -89,9 +89,11 @@ def mcnemar_paired(
     with its n (BI-7), never a fabricated p-value.
 
     Uses the exact binomial McNemar for small discordant counts and the
-    chi-square approximation otherwise (statsmodels' ``mcnemar`` selects exact
-    via the ``exact`` flag; we pass ``exact=True`` for <= 25 discordant pairs,
-    the statsmodels default heuristic).
+    chi-square approximation otherwise: we apply the conventional <= 25-discordant
+    exact / chi-square-with-continuity-correction switch (passing ``exact=True``
+    for <= 25 discordant pairs). This is our own defensible choice, NOT a
+    statsmodels auto-heuristic (statsmodels has no such automatic switch; its
+    ``mcnemar`` honours whatever ``exact`` flag we pass).
     """
     n = min(len(outcomes_a), len(outcomes_b))
     if n < 1:

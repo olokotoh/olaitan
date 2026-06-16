@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Optional
 
 import pandas as pd
 import yaml
@@ -44,11 +44,25 @@ _METADATA_COLUMNS: List[str] = [
     "measured_time_to_detect",
     "measured_final_fsm_state",
     "fsm_state_source",
+    # The explicit scenario-instance index over the deterministic Story-5.2
+    # stimulus (H2/BI-8/OQ7 pairing key). Story 5.9 must populate it per replicate
+    # so the paired McNemar/ablation tests align config A's instance i with config
+    # B's instance i over the SAME stimulus, never positional wall-clock order. A
+    # run that omits it falls back to the run_id ``-NN`` suffix (see
+    # ``scenario_instance_key``); a run with neither is dropped from a pair
+    # honestly (BI-7), never positionally mis-paired.
+    "scenario_instance",
 ]
 
 _METADATA_FILE: str = "metadata.yaml"
 _FSM_FILE: str = "fsm.jsonl"
 _ASSESSMENTS_FILE: str = "assessments.jsonl"
+
+# The synthetic-fixture run_id prefix (BI-13 mandates a ``fixture-`` prefix on
+# every committed synthetic run). ``is_fixture`` is driven off THIS per-run
+# signal, not a path substring (L1), so a real run-set under a path that happens
+# to contain a ``fixtures`` segment is never mislabelled.
+_FIXTURE_RUN_ID_PREFIX: str = "fixture-"
 
 # Dir names that are NOT run dirs (skipped honestly, BI-7). ``example`` is the
 # committed Story-5.1 layout skeleton; it carries no measured fields to compute.
@@ -105,11 +119,18 @@ def read_jsonl_payloads(path: Path) -> List[dict[str, Any]]:
         return []
     payloads: List[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
+        for i, line in enumerate(handle, start=1):
             line = line.strip()
             if not line:
                 continue
-            envelope: Any = json.loads(line)
+            # Re-raise a malformed/truncated line with file + line-number
+            # context (mirrors _read_metadata's named-path failure above);
+            # a file-anonymous JSONDecodeError gives the operator nothing to
+            # find. Honest crash with the culprit located (BI-7).
+            try:
+                envelope: Any = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"malformed jsonl line {i} in {path}: {exc}") from exc
             if not isinstance(envelope, dict):
                 raise ValueError(f"jsonl line in {path} is not an object: {line!r}")
             payload: Any = envelope.get("payload")
@@ -143,6 +164,40 @@ def assessment_payloads(run_dir: Path) -> List[dict[str, Any]]:
     honestly for those cells.
     """
     return read_jsonl_payloads(run_dir / _ASSESSMENTS_FILE)
+
+
+def scenario_instance_key(run_id: object, scenario_instance: object) -> Optional[str]:
+    """The stable scenario-instance pairing key for a run (H2/BI-8/OQ7).
+
+    The paired tests (McNemar, ablation contributions) MUST align config A's
+    instance i with config B's instance i over the SAME deterministic Story-5.2
+    stimulus, not positional wall-clock order (the real ``run_id`` is
+    timestamp-first, so positional order is arbitrary across configs). The key is,
+    in order of preference:
+
+    1. the explicit ``scenario_instance`` metadata field (the canonical Story-5.9
+       signal), rendered as a string; else
+    2. the trailing ``-NN`` instance index parsed from the ``run_id`` (the
+       convention the committed fixtures use, e.g. ``fixture-rsl-s1-03`` -> ``03``).
+
+    Returns ``None`` when neither is available, so the caller drops the run from
+    any pair honestly (BI-7) rather than fabricating a positional alignment.
+
+    DETERMINISTIC-STIMULUS ASSUMPTION (documented for round-2 scrutiny): this
+    pairing is only valid because instance i of a scenario is the SAME stimulus
+    across every config (Story 5.2 seeds the scenario deterministically per
+    instance index). If that assumption ever breaks, the paired tests must be
+    re-derived; the key here is the contract surface where it is enforced.
+    """
+    if scenario_instance is not None and not (
+        isinstance(scenario_instance, float) and scenario_instance != scenario_instance
+    ):
+        return str(scenario_instance)
+    if isinstance(run_id, str):
+        tail = run_id.rsplit("-", 1)
+        if len(tail) == 2 and tail[1].isdigit():
+            return tail[1]
+    return None
 
 
 def _is_run_dir(entry: Path) -> bool:
@@ -198,5 +253,22 @@ def load_run_set(runs_dir: str) -> RunSet:
         meta = _read_metadata(entry / _METADATA_FILE)
         rows.append(_row_from_metadata(meta, entry.name))
     frame = _coerce_frame(rows)
-    is_fixture = "fixtures" in Path(runs_dir).parts
+    is_fixture = _is_fixture_run_set(frame)
     return RunSet(frame=frame, runs_dir=str(base), is_fixture=is_fixture)
+
+
+def _is_fixture_run_set(frame: pd.DataFrame) -> bool:
+    """True when this is a SYNTHETIC fixture run-set, off an explicit per-run signal.
+
+    Driven off the per-run ``run_id`` ``fixture-`` prefix (BI-13 mandates the
+    prefix on every synthetic run), NOT a path substring: a real run-set living
+    under any directory that happens to contain a ``fixtures`` path segment would
+    otherwise be mislabelled ``fixture: true``. A non-empty run-set is a fixture
+    set only when EVERY run carries the prefix (a mixed set is not a fixture set).
+    """
+    if "run_id" not in frame.columns or frame.shape[0] == 0:
+        return False
+    run_ids = frame["run_id"].dropna().astype(str)
+    if run_ids.shape[0] == 0:
+        return False
+    return bool(run_ids.str.startswith(_FIXTURE_RUN_ID_PREFIX).all())

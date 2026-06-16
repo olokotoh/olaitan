@@ -10,6 +10,7 @@ success_criterion_met: true
 measured_time_to_detect: 22
 measured_final_fsm_state: QUARANTINED
 fsm_state_source: observed_transitions
+scenario_instance: 1
 resource_usage:
   harness_alloc_bytes: 4194304
   cluster_metrics_available: false

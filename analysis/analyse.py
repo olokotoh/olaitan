@@ -147,18 +147,31 @@ class PipelineResult:
 _NA: str = "n/a"
 
 
+# Below this magnitude a fixed-6dp render collapses to ``0.000000`` and loses a
+# genuinely tiny (but non-zero) p-value, so we switch to scientific notation
+# (L3). A p like 4e-7 must not render byte-identical to a true zero.
+_SMALL_MAGNITUDE: float = 1e-4
+
+
 def _format_value(value: object) -> object:
     """Render a value deterministically (BI-13).
 
     Floats are formatted to a fixed precision so the byte-deterministic golden
     never drifts on platform float repr; ``None`` becomes the honest ``n/a``
-    (BI-7); everything else passes through.
+    (BI-7); everything else passes through. A very small non-zero magnitude (e.g.
+    a p-value like 4e-7) is rendered with ``%.3g`` scientific notation so it does
+    NOT collapse to ``0.000000`` and read as a true zero (L3). ``-0.0`` is
+    normalised to ``0.0`` first so the sign bit never makes the golden drift.
     """
     if value is None:
         return _NA
     if isinstance(value, float):
         if value != value:  # NaN guard (an honest gap, BI-7)
             return _NA
+        if value == 0.0:  # normalise -0.0 -> 0.0 (sign bit, L3)
+            value = 0.0
+        if 0.0 < abs(value) < _SMALL_MAGNITUDE:
+            return f"{value:.3g}"
         return f"{value:.6f}"
     return value
 
@@ -252,27 +265,35 @@ def build_metric_rows(run_set: io.RunSet) -> List[OutputRow]:
                     exploratory=False,
                 )
             )
-            kappa = metrics.attack_kappa(cell, run_set.runs_dir, config in LLM_CONFIGS)
-            rows.append(
-                OutputRow(
-                    section="metrics",
-                    config=config,
-                    scenario=scenario,
-                    metric_or_test="attack_kappa",
-                    value=kappa.value,
-                    n=kappa.n,
-                    manifest_hash=manifest_hash,
-                    mixed_manifest=mixed,
-                    test=provenance.DESCRIPTIVE,
-                    test_id="",
-                    alpha_corrected=None,
-                    p_value=None,
-                    status=tests.STATUS_RUN if kappa.n > 0 else "n/a",
-                    fsm_source_partition=partition_str,
-                    underpowered=False,
-                    exploratory=False,
-                )
+    # ATT&CK kappa is emitted PER CONFIG (pooled across S1-S5), not per cell: a
+    # single-scenario cell has a constant ground-truth label, so its kappa is
+    # structurally degenerate (M3). The prereg's RQ1-ATTACK-KAPPA estimates
+    # agreement ACROSS the five techniques. Emitted after the per-cell rows so the
+    # config grouping reads cleanly; scenario="all" marks the pooled scope.
+    for config in PRIMARY_CONFIGS + ABLATION_CONFIGS:
+        config_frame = frame[frame["config"] == config]
+        manifest_hash, mixed = provenance.cell_manifest(config_frame)
+        kappa = metrics.attack_kappa(config_frame, run_set.runs_dir, config in LLM_CONFIGS)
+        rows.append(
+            OutputRow(
+                section="metrics",
+                config=config,
+                scenario="all",
+                metric_or_test="attack_kappa_pooled",
+                value=kappa.value,
+                n=kappa.n,
+                manifest_hash=manifest_hash,
+                mixed_manifest=mixed,
+                test=provenance.DESCRIPTIVE,
+                test_id="",
+                alpha_corrected=None,
+                p_value=None,
+                status=tests.STATUS_RUN if kappa.n > 0 else "n/a",
+                fsm_source_partition="",
+                underpowered=False,
+                exploratory=False,
             )
+        )
     return rows
 
 
@@ -332,18 +353,72 @@ def build_fpr_rows(run_set: io.RunSet, registry: Registry) -> List[OutputRow]:
                 window_hours=fpr.window_hours,
                 corrected_alpha=fpr_test_alpha,
             )
-            rows.append(_test_row(result, config, registry))
+            rows.append(_test_row(result, config, registry, contributing=cell))
     return rows
 
 
-def _outcomes(cell: pd.DataFrame) -> List[bool]:
-    """The ordered ``success_criterion_met`` booleans for a cell (BI-8 pairing).
+@dataclass
+class _PairedCell:
+    """Two configs' verdicts aligned on the SHARED scenario-instance key (H2/BI-8).
 
-    Sorted by run_id so the deterministic scenario-instance index aligns run i
-    of one config with run i of another (BI-8). NA verdicts are dropped.
+    ``outcomes_a`` / ``outcomes_b`` are the success-criterion booleans for the
+    paired instances ONLY (an instance present and non-NA on BOTH sides), in
+    sorted-key order. ``frame`` is the sub-frame of the contributing runs from
+    both configs, threaded into the provenance triad (M4). ``n`` is the paired n.
     """
-    column = cell.sort_values(by="run_id", kind="mergesort")["success_criterion_met"]
-    return [bool(value) for value in column.dropna().tolist()]
+
+    outcomes_a: List[bool]
+    outcomes_b: List[bool]
+    frame: pd.DataFrame
+    n: int
+
+
+def _keyed_verdicts(cell: pd.DataFrame) -> Dict[str, "tuple[bool, pd.Series]"]:
+    """Map each run's scenario-instance key -> (verdict, its frame row) for a cell.
+
+    Keyed on the SHARED scenario-instance index (H2/BI-8): the explicit
+    ``scenario_instance`` field, else the ``run_id`` ``-NN`` suffix (see
+    ``io.scenario_instance_key``). A run with an NA verdict or no derivable key is
+    dropped (it cannot enter a pair honestly, BI-7). On the (degenerate) chance two
+    runs of one config share a key, the run_id-sorted-last one wins deterministically.
+    """
+    result: Dict[str, "tuple[bool, pd.Series]"] = {}
+    ordered = cell.sort_values(by="run_id", kind="mergesort")
+    for _, row in ordered.iterrows():
+        verdict = row["success_criterion_met"]
+        if pd.isna(verdict):
+            continue
+        instance = row["scenario_instance"] if "scenario_instance" in row else None
+        key = io.scenario_instance_key(row["run_id"], instance)
+        if key is None:
+            continue
+        result[key] = (bool(verdict), row)
+    return result
+
+
+def _pair_cells(cell_a: pd.DataFrame, cell_b: pd.DataFrame) -> _PairedCell:
+    """Inner-join two cells on the shared scenario-instance key (H2/BI-8).
+
+    Replaces the old positional ``[:min(n_a, n_b)]`` truncation, which mis-paired
+    whenever a verdict was NA AND, because the real ``run_id`` is timestamp-first,
+    even with no NAs (positional order is wall-clock order, not instance order). A
+    pair is included only when BOTH configs have a non-NA verdict for the SAME
+    instance key; the verdicts are emitted in sorted-key order so the pairing is
+    deterministic (BI-13). The contributing-run sub-frame is assembled for the
+    provenance triad (M4).
+    """
+    verdicts_a = _keyed_verdicts(cell_a)
+    verdicts_b = _keyed_verdicts(cell_b)
+    shared = sorted(set(verdicts_a) & set(verdicts_b))
+    outcomes_a = [verdicts_a[key][0] for key in shared]
+    outcomes_b = [verdicts_b[key][0] for key in shared]
+    contributing_rows = [verdicts_a[key][1] for key in shared]
+    contributing_rows += [verdicts_b[key][1] for key in shared]
+    if contributing_rows:
+        frame = pd.DataFrame(contributing_rows)
+    else:
+        frame = cell_a.iloc[0:0]
+    return _PairedCell(outcomes_a=outcomes_a, outcomes_b=outcomes_b, frame=frame, n=len(shared))
 
 
 def build_dr_mcnemar_rows(run_set: io.RunSet, registry: Registry) -> List[OutputRow]:
@@ -358,17 +433,16 @@ def build_dr_mcnemar_rows(run_set: io.RunSet, registry: Registry) -> List[Output
     alpha = registry.corrected_alpha(_DR_MCNEMAR_TEST_ID)
     for reference in ("f", "rs", "rsl"):
         for scenario in SCENARIOS:
-            full = _outcomes(_cell(frame, "rslt-full", scenario))
-            ref = _outcomes(_cell(frame, reference, scenario))
+            paired = _pair_cells(_cell(frame, "rslt-full", scenario), _cell(frame, reference, scenario))
             result = tests.mcnemar_paired(
                 test_id=_DR_MCNEMAR_TEST_ID,
                 scenario=scenario,
                 comparison=f"rslt-full vs {reference}",
-                outcomes_a=full,
-                outcomes_b=ref,
+                outcomes_a=paired.outcomes_a,
+                outcomes_b=paired.outcomes_b,
                 corrected_alpha=alpha,
             )
-            rows.append(_test_row(result, "rslt-full", registry))
+            rows.append(_test_row(result, "rslt-full", registry, contributing=paired.frame))
     return rows
 
 
@@ -379,18 +453,27 @@ def build_mttd_rows(run_set: io.RunSet, registry: Registry) -> List[OutputRow]:
     alpha = registry.corrected_alpha(_MTTD_TEST_ID)
     for scenario in SCENARIOS:
         groups: Dict[str, List[float]] = {}
+        contributing_frames: List[pd.DataFrame] = []
         for config in PRIMARY_CONFIGS:
             cell = _cell(frame, config, scenario)
-            mt = cell["measured_time_to_detect"].dropna()
-            detected = mt[mt != io.NEVER_DETECTED_SENTINEL]
-            groups[config] = [float(value) for value in detected.tolist()]
+            detected_mask = cell["measured_time_to_detect"].notna() & (
+                cell["measured_time_to_detect"] != io.NEVER_DETECTED_SENTINEL
+            )
+            detected_cell = cell[detected_mask]
+            groups[config] = [
+                float(value) for value in detected_cell["measured_time_to_detect"].tolist()
+            ]
+            contributing_frames.append(detected_cell)
+        # The KW provenance is over the DETECTED runs that actually contributed an
+        # MTTD value across the four configs (M4/BI-10); a mixed manifest surfaces.
+        contributing = pd.concat(contributing_frames) if contributing_frames else frame.iloc[0:0]
         result = tests.kruskal_dunn_holm(
             test_id=_MTTD_TEST_ID,
             scenario=scenario,
             groups=groups,
             corrected_alpha=alpha,
         )
-        rows.append(_test_row(result, "all", registry))
+        rows.append(_test_row(result, "all", registry, contributing=contributing))
     return rows
 
 
@@ -408,33 +491,42 @@ def build_ablation_rows(run_set: io.RunSet, registry: Registry) -> List[OutputRo
     senior_alpha = registry.corrected_alpha(_ABL_SENIOR_TEST_ID)
     for scenario in SCENARIOS:
         technique = metrics.SCENARIO_GROUND_TRUTH.get(scenario, _NA)
-        l1_only = _outcomes(_cell(frame, "rslt-l1-only", scenario))
-        l1_l2 = _outcomes(_cell(frame, "rslt-l1-l2", scenario))
-        full = _outcomes(_cell(frame, "rslt-full", scenario))
-
-        l2 = ablation.contribution("l2_contribution", scenario, technique, l1_l2, l1_only)
-        rows.append(_contribution_row(l2, _ABL_L2_TEST_ID, registry))
+        # Pair each contrast on the SHARED scenario-instance key (H2/BI-8): the
+        # contribution CI and its McNemar consume the SAME aligned (high, low)
+        # vectors, so the effect size and the test agree on the paired instances.
+        l2_paired = _pair_cells(_cell(frame, "rslt-l1-l2", scenario), _cell(frame, "rslt-l1-only", scenario))
+        l2 = ablation.contribution(
+            "l2_contribution", scenario, technique, l2_paired.outcomes_a, l2_paired.outcomes_b
+        )
+        rows.append(_contribution_row(l2, _ABL_L2_TEST_ID, registry, contributing=l2_paired.frame))
         l2_test = tests.mcnemar_paired(
             test_id=_ABL_L2_TEST_ID,
             scenario=scenario,
             comparison="L1+L2 vs L1-only",
-            outcomes_a=l1_l2,
-            outcomes_b=l1_only,
+            outcomes_a=l2_paired.outcomes_a,
+            outcomes_b=l2_paired.outcomes_b,
             corrected_alpha=l2_alpha,
         )
-        rows.append(_test_row(l2_test, "rslt-l1-l2", registry, section="ablation"))
+        rows.append(
+            _test_row(l2_test, "rslt-l1-l2", registry, section="ablation", contributing=l2_paired.frame)
+        )
 
-        senior = ablation.contribution("senior_contribution", scenario, technique, full, l1_l2)
-        rows.append(_contribution_row(senior, _ABL_SENIOR_TEST_ID, registry))
+        senior_paired = _pair_cells(_cell(frame, "rslt-full", scenario), _cell(frame, "rslt-l1-l2", scenario))
+        senior = ablation.contribution(
+            "senior_contribution", scenario, technique, senior_paired.outcomes_a, senior_paired.outcomes_b
+        )
+        rows.append(_contribution_row(senior, _ABL_SENIOR_TEST_ID, registry, contributing=senior_paired.frame))
         senior_test = tests.mcnemar_paired(
             test_id=_ABL_SENIOR_TEST_ID,
             scenario=scenario,
             comparison="full vs L1+L2",
-            outcomes_a=full,
-            outcomes_b=l1_l2,
+            outcomes_a=senior_paired.outcomes_a,
+            outcomes_b=senior_paired.outcomes_b,
             corrected_alpha=senior_alpha,
         )
-        rows.append(_test_row(senior_test, "rslt-full", registry, section="ablation"))
+        rows.append(
+            _test_row(senior_test, "rslt-full", registry, section="ablation", contributing=senior_paired.frame)
+        )
     return rows
 
 
@@ -506,10 +598,24 @@ def _test_row(
     config: str,
     registry: Registry,
     section: str = "confirmatory",
+    contributing: Optional[pd.DataFrame] = None,
 ) -> OutputRow:
-    """Convert a TestResult into an OutputRow, stamping exploratory (BI-14)."""
+    """Convert a TestResult into an OutputRow, stamping exploratory (BI-14).
+
+    The provenance triad (M4/BI-10) is built from the ``contributing`` run
+    sub-frame (the paired McNemar / KW group runs) via ``provenance.for_runs`` so
+    a test row carries the REAL manifest_hash of its inputs, not a hardcoded
+    ``n/a``. A genuinely mixed-manifest paired test surfaces ``mixed_manifest:
+    true`` so a cross-envelope pooling is never silent. ``contributing=None``
+    (a test with no run inputs, e.g. the pending rubric tests) keeps ``n/a``.
+    """
     exploratory = registry.is_exploratory(result.test_id)
     row_section = "exploratory" if exploratory else section
+    if contributing is not None and contributing.shape[0] > 0:
+        triad = provenance.for_runs(contributing, n=result.n, test=result.test)
+        manifest_hash, mixed = triad.manifest_hash, triad.mixed_manifest
+    else:
+        manifest_hash, mixed = _NA, False
     return OutputRow(
         section=row_section,
         config=config,
@@ -517,8 +623,8 @@ def _test_row(
         metric_or_test=result.comparison,
         value=result.statistic,
         n=result.n,
-        manifest_hash=_NA,
-        mixed_manifest=False,
+        manifest_hash=manifest_hash,
+        mixed_manifest=mixed,
         test=result.test,
         test_id=result.test_id,
         alpha_corrected=result.corrected_alpha,
@@ -534,13 +640,23 @@ def _contribution_row(
     contribution: ablation.Contribution,
     test_id: str,
     registry: Registry,
+    contributing: Optional[pd.DataFrame] = None,
 ) -> OutputRow:
-    """Convert an ablation Contribution into an OutputRow (AC3, BI-9)."""
+    """Convert an ablation Contribution into an OutputRow (AC3, BI-9, M4).
+
+    The provenance triad is built from the ``contributing`` paired-run sub-frame
+    (M4/BI-10) so the ablation effect-size row carries the real manifest_hash of
+    its inputs, not a hardcoded ``n/a``; a mixed-manifest pair surfaces ``mixed``.
+    """
     ci = _NA
     if contribution.ci_lower is not None and contribution.ci_upper is not None:
         ci = f"[{contribution.ci_lower:.6f}, {contribution.ci_upper:.6f}]"
     exploratory = registry.is_exploratory(test_id)
     status = tests.STATUS_RUN if contribution.n > 0 else "skipped (insufficient data, n=0)"
+    if contributing is not None and contributing.shape[0] > 0:
+        manifest_hash, mixed = provenance.cell_manifest(contributing)
+    else:
+        manifest_hash, mixed = _NA, False
     return OutputRow(
         section="ablation",
         config=contribution.name,
@@ -548,8 +664,8 @@ def _contribution_row(
         metric_or_test=f"{contribution.name} (technique {contribution.technique})",
         value=contribution.difference,
         n=contribution.n,
-        manifest_hash=_NA,
-        mixed_manifest=False,
+        manifest_hash=manifest_hash,
+        mixed_manifest=mixed,
         test=f"dr_difference;ci95={ci}",
         test_id=test_id,
         alpha_corrected=None,
@@ -559,6 +675,54 @@ def _contribution_row(
         underpowered=False,
         exploratory=exploratory,
     )
+
+
+def _known_grid() -> frozenset[tuple[str, str]]:
+    """The known ``(config, scenario)`` grid the pipeline aggregates over (M1).
+
+    The five attack scenarios for every primary AND ablation config, plus the
+    ``benign`` sweep for the primary configs (the FPR cell). A run whose
+    ``(config, scenario)`` is NOT in this set contributes to no cell and is an
+    ORPHAN (a silent data drop the grid would otherwise hide, BI-7).
+    """
+    grid: set[tuple[str, str]] = set()
+    for config in PRIMARY_CONFIGS + ABLATION_CONFIGS:
+        for scenario in SCENARIOS:
+            grid.add((config, scenario))
+    for config in PRIMARY_CONFIGS:
+        grid.add((config, "benign"))
+    return frozenset(grid)
+
+
+def _orphaned_runs(frame: pd.DataFrame) -> List[str]:
+    """List off-grid ``(config, scenario, run_id)`` runs (M1, BI-7 honesty).
+
+    A run whose ``(config, scenario)`` pair is not in the known grid (a typo'd
+    config/scenario) is counted in ``total_runs`` but feeds no cell; surfacing it
+    here makes the silent drop visible. Sorted for determinism (BI-13).
+    """
+    grid = _known_grid()
+    orphans: List[str] = []
+    for _, row in frame.iterrows():
+        pair = (str(row["config"]), str(row["scenario"]))
+        if pair not in grid:
+            orphans.append(f"{row['config']}/{row['scenario']}/{row['run_id']}")
+    return sorted(orphans)
+
+
+def _cell_n_total(frame: pd.DataFrame) -> int:
+    """Sum the per-cell run counts over the KNOWN grid (M1 reconciliation).
+
+    Compared against ``total_runs`` in the header: a non-zero delta means runs
+    were dropped (orphaned off-grid), the exact silent-drop BI-7 guards against.
+    """
+    grid = _known_grid()
+    total = 0
+    for config, scenario in grid:
+        total += int(
+            ((frame["config"] == config) & (frame["scenario"] == scenario)).sum()
+        )
+    return total
 
 
 def run_pipeline(runs_dir: str, prereg_path: str = DEFAULT_PREREG) -> PipelineResult:
@@ -582,10 +746,19 @@ def run_pipeline(runs_dir: str, prereg_path: str = DEFAULT_PREREG) -> PipelineRe
     rows.extend(build_fr55_rows(run_set, registry))
 
     distinct_manifests = provenance._distinct_manifest_hashes(run_set.frame)
+    total_runs = int(run_set.frame.shape[0])
+    orphaned = _orphaned_runs(run_set.frame)
+    on_grid_n = _cell_n_total(run_set.frame)
     header: Dict[str, object] = {
         "runs_dir": run_set.runs_dir,
         "fixture": run_set.is_fixture,
-        "total_runs": int(run_set.frame.shape[0]),
+        "total_runs": total_runs,
+        "on_grid_runs": on_grid_n,
+        # The reconciliation delta (M1): total_runs - sum(per-cell n). A non-zero
+        # delta is the count of runs dropped off-grid (orphaned); 0 means every
+        # loaded run feeds a cell. Surfaced so a silent data drop is visible (BI-7).
+        "orphaned_run_count": total_runs - on_grid_n,
+        "orphaned_runs": orphaned,
         "distinct_manifest_count": len(distinct_manifests),
         "prereg": prereg_path,
         "confirmatory_test_ids": sorted(registry.entries),
@@ -633,6 +806,13 @@ def write_markdown(result: PipelineResult, path: Path) -> None:
     lines.append(f"- runs_dir: `{header['runs_dir']}`")
     lines.append(f"- fixture: {header['fixture']}")
     lines.append(f"- total_runs: {header['total_runs']}")
+    lines.append(f"- on_grid_runs: {header['on_grid_runs']}")
+    lines.append(f"- orphaned_run_count: {header['orphaned_run_count']}")
+    orphaned = header.get("orphaned_runs") or []
+    if isinstance(orphaned, list) and orphaned:
+        lines.append(f"- orphaned_runs: {', '.join(str(o) for o in orphaned)}")
+    else:
+        lines.append("- orphaned_runs: none")
     lines.append(f"- distinct_manifest_count: {header['distinct_manifest_count']}")
     lines.append(f"- prereg: `{header['prereg']}`")
     lines.append("")

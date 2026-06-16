@@ -15,6 +15,12 @@ from typing import Dict
 # The canonical FSM escalation ranks (CLEAN is the non-escalated baseline). An
 # unknown state name is treated as NOT-an-escalation (rank below CLEAN) so a
 # malformed after_state can never inflate the FPR count (BI-5, BI-7 honesty).
+#
+# CROSS-LANGUAGE COUPLING (L2): this table is hand-mirrored from the Go source of
+# truth, ``internal/schema/state.go`` (StateRank). A future state ADDITION or
+# RENAME on the Go side MUST be mirrored here, or the FPR escalation predicate
+# will silently disagree with the FSM. There is no automated cross-language check;
+# treat the Go file as authoritative and keep this map in lock-step by hand.
 _STATE_RANK: Dict[str, int] = {
     "CLEAN": 0,
     "SUSPICIOUS": 1,

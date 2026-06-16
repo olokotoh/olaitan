@@ -10,6 +10,7 @@ success_criterion_met: false
 measured_time_to_detect: -1
 measured_final_fsm_state: CLEAN
 fsm_state_source: none
+scenario_instance: 1
 resource_usage:
   harness_alloc_bytes: 4194304
   cluster_metrics_available: false
