@@ -24,6 +24,26 @@ import (
 // matching negative case per schema proves the committed schema actually
 // constrains (additionalProperties:false / missing-required), so a
 // vacuous always-passing schema cannot slip the gate.
+//
+// AC4 coverage scope (round-1 review, Edge Case Hunter): this suite owns
+// the three Class A plain wire/persisted carriers (Event,
+// EvidencePackage, WorkloadPosture). The remaining committed schemas
+// (l1_hypothesis, l2_verification, threat_assessment, forensic_report)
+// are Class B MODEL-FACING contracts: their committed .json validates the
+// model's RESPONSE shape, a deliberate SUBSET of the persisted Go struct
+// under additionalProperties:false, so marshalling the full struct
+// through them would (correctly) fail. Those schemas are validated
+// against real payloads by their owning packages' exemplar suites,
+// already wired into CI via make test:
+// internal/decision/analyst/{l1_schema_test.go,l2_schema_test.go,
+// senior_test.go} and internal/report/dfir/report_schema_test.go (each
+// compiles the committed docs/schemas/*.json, validates exemplars, and
+// pins the go:embed copy to the docs file byte-for-byte). So the AC4
+// "all current production payloads validate cleanly, exercised in CI by a
+// property test" obligation is met across the whole schema surface: Class
+// A here, Class B there. state_transition and fsm_state are intentionally
+// YAML-only documentation mirrors (no committed .json), so they have no
+// jsonschema target to validate against.
 
 // pinnedParams fixes the gopter seed so the property suite is flake-free
 // across runs (the repo-wide Story 1.17 retrospective lesson).
