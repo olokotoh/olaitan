@@ -228,12 +228,6 @@ jobs:
             *) echo "smoke: unexpected version output: $out" >&2; exit 1 ;;
           esac
 
-      # Resolve the version tag once into an env var so the trivy-action
-      # step (which cannot run a shell substitution in `image-ref`) can
-      # reference the exact tag `make docker-build` produced.
-      - name: Resolve image tag
-        run: echo "IMAGE_TAG=$(make -s version-tag)" >> "$GITHUB_ENV"
-
       # Story 6.6 (AC1; NFR13/NFR14): the REAL Trivy CVE gate. The
       # values-production.yaml overlay commits to "Trivy CVE check
       # enforced", so this step makes that genuine rather than a claim
@@ -244,19 +238,29 @@ jobs:
       # ignore-unfixed:true keeps the gate enforced-but-green: it blocks on
       # vulnerabilities an operator could actually remediate (a base/dep
       # bump) and does not red the whole epic-6 pipeline on un-actionable
-      # upstream noise. Verified locally against the current image with
-      # trivy v0.71.1: 0 CRITICAL/HIGH (debian 12.14: 0, gobinary: 0),
-      # exit 0. trivy-action is pinned by tag for parity with the other
-      # third-party action pins in this workflow.
+      # upstream noise. Verified against the current image with trivy
+      # v0.71.1: 0 CRITICAL/HIGH (debian 12.14: 0, gobinary: 0), exit 0.
+      #
+      # We run the pinned official trivy CONTAINER directly (mounting the
+      # docker socket so it reads the locally-built image) rather than
+      # aquasecurity/trivy-action: that action's tagged releases pin an
+      # internal `aquasecurity/setup-trivy@vX` whose tag was removed
+      # upstream (v0.28.0 -> setup-trivy@v0.2.1, no longer resolvable),
+      # which fails the job at "Set up job". The container pin has no such
+      # transitive-tag fragility.
       - name: Trivy image CVE scan (AC1, NFR13/NFR14)
-        uses: aquasecurity/trivy-action@v0.28.0
-        with:
-          image-ref: olaitan:${{ env.IMAGE_TAG }}
-          scan-type: image
-          vuln-type: os,library
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          exit-code: '1'
+        run: |
+          tag="$(make -s version-tag)"
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+            aquasec/trivy:0.71.1 image \
+              --scanners vuln \
+              --vuln-type os,library \
+              --severity CRITICAL,HIGH \
+              --ignore-unfixed \
+              --exit-code 1 \
+              "olaitan:${tag}"
 
   # Story 1.19: kind-based RS smoke test. Boots a single-node kind
   # cluster via helm/kind-action@v1.12.0 (kind v0.26.0, released

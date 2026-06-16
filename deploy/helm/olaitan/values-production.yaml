@@ -57,8 +57,8 @@
 #     profile name).
 #   - Trivy CVE check: ENFORCED as a real CI gate, not a chart render-time
 #     value. The `docker` job in .github/workflows/ci.yml builds the image
-#     and then runs aquasecurity/trivy-action over the built
-#     olaitan:<version-tag> image (vuln-type os,library; severity
+#     and then runs the pinned official trivy container (aquasec/trivy:0.71.1)
+#     over the built olaitan:<version-tag> image (vuln-type os,library; severity
 #     CRITICAL,HIGH; ignore-unfixed; exit-code 1), so a fixable CRITICAL or
 #     HIGH reds the build. This is the NFR13/NFR14 supply-chain gate; it
 #     lives in the image-build pipeline (not a helm value), and is now a
