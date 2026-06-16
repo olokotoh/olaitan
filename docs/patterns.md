@@ -61,9 +61,12 @@ namespace or accidentally forming a Redis match pattern.
 `OverridePrefix = "override:"`) and a validating builder
 (`FSMState(workloadID)`, `Override(workloadID)`, `FSMHistory(workloadID)`,
 `BaselineMetrics(namespace, pod)`, `State(namespace, pod)`, and so on).
-The package-level `validateToken` rejects the Redis-hierarchy-reserved
-characters `:`, `*`, `?`, `[` and whitespace, so a built key is never a
-pattern and never crosses a namespace boundary. A `Family` enum
+The package-level `validateToken` allows only `[A-Za-z0-9_.-]` (and
+rejects the `-`/`+` XRANGE sentinels), so the Redis-reserved `:`, `*`,
+`?`, `[` and whitespace can never appear in a token; a built key is
+therefore never a pattern and never crosses a namespace boundary.
+(Note this is an allowlist, unlike the NATS denylist in the subjects
+pattern above.) A `Family` enum
 (`keys.go:47-59`) drives TTL-policy enforcement per family (for
 example the no-TTL `fsm:` family versus the natively-TTL'd `override:`
 family).

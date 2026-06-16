@@ -52,7 +52,7 @@ explicitly discard every error) and `staticcheck`-clean.
 |---|---|
 | `go` | `make prereg-check`, `make build`, `make test`, `golangci-lint run`. |
 | `analysis` | The Python analysis pipeline: `mypy --strict` plus `pytest` over `analysis/`. |
-| `prompt-changelog` | `.github/scripts/check-prompt-changelog.sh` (NFR41): any change to `internal/agent/prompts/defaults/*.txt` must be recorded with its SHA-256 hash in `docs/prompt-changelog.md`. |
+| `prompt-changelog` | `hack/check-prompt-changelog.sh` (NFR41): any change to `internal/agent/prompts/defaults/*.txt` must be recorded with its SHA-256 hash in `docs/prompt-changelog.md`. |
 | `helm` | `helm lint`, `helm template` plus `kubeconform`, and the Helm Go test suite (`go test ./deploy/helm/... -tags=helm`). |
 | `docker` | `make docker-build` plus a smoke `version` run of the image. |
 | `e2e` | A kind cluster running the chart under the RS arm with a smoke test (always on). |

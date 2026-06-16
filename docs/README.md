@@ -7,8 +7,13 @@ their rationale survives the people who made them.
 
 ## Architecture Decision Records
 
-Each ADR follows a consistent Context / Decision / Consequences /
-Alternatives structure.
+Each ADR follows a consistent decision-record structure. The
+schema-versioning, patterns, and contributing records use the
+Context / Decision / Consequences / Alternatives shape; the
+deferred-decisions spike records use an extended shape
+(Status / Context / Decision / Why this direction / Risks /
+Alternatives considered and rejected / Hand-off), where the
+"Why this direction" and "Risks" sections stand in for Consequences.
 
 - [Schema versioning](schema-versioning.md) - the `schema_version` semver
   convention, the schema-on-read MINOR rule, and the dual-publish MAJOR
