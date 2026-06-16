@@ -206,13 +206,16 @@ func configOnlyDefaultFor(name string) (string, bool) {
 
 // TestConfigOnlyDefaultsMatchFile is the FIX 2 drift guard (Blind #2): the
 // honesty table hardcodes config-file-only defaults as Go literals that are
-// read from no file, so if deploy/helm/olaitan/files/olaitan.yaml changes the
-// doc would silently drift and the FR47 git-diff gate (which only covers the
-// generated doc, not its inputs) would not catch it. This test parses the real
-// config file and asserts each hardcoded literal still equals the file value,
-// so CI fails the moment they diverge.
+// read from no file, so if config/olaitan.yaml changes the doc would silently
+// drift and the FR47 git-diff gate (which only covers the generated doc, not
+// its inputs) would not catch it. This test parses the canonical config source
+// and asserts each hardcoded literal still equals the file value, so CI fails
+// the moment they diverge. It reads config/olaitan.yaml (the committed source)
+// rather than the chart-staged deploy/helm/olaitan/files/olaitan.yaml, which is
+// a gitignored verbatim copy produced by `make helm-prepare` and is absent in
+// the `go` CI job.
 func TestConfigOnlyDefaultsMatchFile(t *testing.T) {
-	const configPath = "../../deploy/helm/olaitan/files/olaitan.yaml"
+	const configPath = "../../config/olaitan.yaml"
 	src, err := os.ReadFile(configPath)
 	if err != nil {
 		t.Fatalf("read config file %s: %v", configPath, err)
@@ -242,7 +245,7 @@ func TestConfigOnlyDefaultsMatchFile(t *testing.T) {
 
 	cases := []struct {
 		name string // configOnly[].name
-		path string // dotted path in files/olaitan.yaml
+		path string // dotted path in config/olaitan.yaml
 		want string // expected rendered file value (raw, pre-normalise)
 	}{
 		{"response.excluded_namespaces", "response.excluded_namespaces", `["kube-system", "olaitan"]`},
@@ -264,7 +267,7 @@ func TestConfigOnlyDefaultsMatchFile(t *testing.T) {
 			// must match. A genuine config change (e.g. a third namespace, or
 			// retention 365 -> 90) survives normalisation and trips the failure.
 			if normalise(lit) != normalise(got) {
-				t.Errorf("configOnly[%q].def = %q but files/olaitan.yaml renders %q; the hardcoded honesty-table literal has drifted from the real config (update main.go's configOnly table or the file)", c.name, lit, got)
+				t.Errorf("configOnly[%q].def = %q but config/olaitan.yaml renders %q; the hardcoded honesty-table literal has drifted from the real config (update main.go's configOnly table or the file)", c.name, lit, got)
 			}
 		})
 	}
