@@ -1,0 +1,43 @@
+# Canonical on-wire shape of schema.WorkloadPosture.
+#
+# AUTHORITATIVE validation source: docs/schemas/workload_posture.json
+# (draft 2020-12). This YAML is the documentation mirror in the
+# docs/schemas/state_transition.yaml style. BOTH files are
+# generated from schema.WorkloadPosture by cmd/olaitan-schemagen; regenerate with
+# `make schemas` (CI fails any drift, NFR33). Source of truth for
+# the Go shape: internal/schema (type WorkloadPosture).
+schema: workload_posture.v1
+fields:
+  identity:
+    type: object
+    required: true
+  orphan_pod:
+    type: boolean
+    required: false
+  unavailable:
+    type: boolean
+    required: false
+  unavailable_reason:
+    type: string
+    required: false
+  captured_at:
+    type: string
+    required: true
+  service_account:
+    type: string
+    required: false
+  role_bindings:
+    type: array
+    required: false
+  cluster_role_bindings:
+    type: array
+    required: false
+  network_policies:
+    type: array
+    required: false
+  pod_security_context:
+    type: object
+    required: false
+  container_security_contexts:
+    type: array
+    required: false

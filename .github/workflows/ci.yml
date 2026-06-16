@@ -32,6 +32,19 @@ jobs:
       - name: Build
         run: make build
 
+      # Story 6.3 (NFR40/NFR33): the schema drift gate. `make schemas`
+      # reflection-regenerates the three Class A external-consumer schemas
+      # (olt_event, evidence_package, workload_posture) from the
+      # internal/schema Go structs; the diff covers the WHOLE docs/schemas/
+      # tree, so a struct change that is not regenerated AND a hand-edit to
+      # any committed schema (including the hand-curated model-facing ones
+      # the generator never writes) both fail here. The generator is
+      # deterministic, so a clean tree leaves no diff.
+      - name: Schema drift gate (NFR33)
+        run: |
+          make schemas
+          git diff --exit-code docs/schemas/
+
       - name: Test
         run: make test
 

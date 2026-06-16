@@ -51,7 +51,15 @@ Alternatives considered and rejected / Hand-off), where the
 - [Traceability matrix](traceability.md) - the NFR42 code-to-thesis
   claim chain.
 - [Schemas](schemas/) - the committed JSON/YAML schema artefacts for the
-  wire, persisted, and role contracts.
+  wire, persisted, and role contracts, so an external consumer can
+  validate and parse Olaitan's outputs without the Go module (NFR40). The
+  three plain wire/persisted carriers (`olt_event`, `evidence_package`,
+  `workload_posture`) are reflection-generated from the `internal/schema`
+  Go structs by `make schemas` and CI fails any drift (NFR33); the
+  hand-curated, model-facing schemas (`l1_hypothesis`, `l2_verification`,
+  `threat_assessment`, `forensic_report`, the FSM and `audit/` subjects)
+  stay hand-authored because they encode bounds and rules reflection
+  cannot reproduce.
 
 ## The canonical architecture document
 
