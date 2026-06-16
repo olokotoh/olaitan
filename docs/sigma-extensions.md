@@ -348,6 +348,7 @@ detection:
 falsepositives:
   - In cluster sidecars that read the token to seed a custom HTTP client; pin via a process.exe allowlist in operator overlay
   - Service mesh proxies (Linkerd, Envoy) that proxy the apiserver; allowlist via a dedicated namespace shape
+  - The system_process allowlist is anchored to FHS paths (/bin, /sbin, /usr/{,local/}{,s}bin) only. Non FHS K8s installs (RKE2 at /var/lib/rancher/rke2/bin, snap based installs at /snap/kubelet/, custom packagings under /opt/bin) will not match the allowlist and the legitimate system kubelet/kube-proxy/coredns process will trigger the rule. Operators on non FHS distributions should extend the allowlist via overlay, or accept the noise under status experimental.
 fields:
   - file.path
   - process.exe

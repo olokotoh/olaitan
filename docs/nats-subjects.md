@@ -265,7 +265,12 @@ These subjects are defined in the subject contract (and several already
 have a provisioned JetStream stream) but have no active producer and no
 active consumer in the current wiring. They are documented here as a
 reserved architectural contract so an integrator does not subscribe a
-subject that will never receive traffic in this build.
+subject that will never receive traffic in this build. The payload-schema
+and `nats sub` sample columns are intentionally omitted from the table
+below: a reserved subject has no producer, so there is no payload to
+schematise and no traffic to sample (the sample subscription for any
+reserved subject is therefore "no producer in this build"). These
+columns are populated for every live subject in the sections above.
 
 | Subject / builder | Constant or builder | Status | Stream (if any) |
 |---|---|---|---|
