@@ -38,8 +38,9 @@ toolchain.
 from __future__ import annotations
 
 import argparse
-import glob
+import fnmatch
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,6 +58,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _PATH_EXTENSIONS: frozenset[str] = frozenset(
     {
         ".go",
+        ".py",
         ".yaml",
         ".yml",
         ".json",
@@ -79,13 +81,32 @@ _BARE_FILE_TOKENS: frozenset[str] = frozenset({"Makefile", "NOTICE"})
 # check (it is documenting a code symbol, not a file).
 _GO_SYMBOL_RE = re.compile(r"^[A-Za-z_]\w*(\.[A-Za-z_]\w*)+$")
 
-# A Go test function declaration. We parse the file as TEXT (not via the Go
-# toolchain) so a ``//go:build integration`` tag does not hide the function
-# from the audit: a build-tag-gated test file still defines real test ids.
-_TEST_FUNC_RE = re.compile(r"^func (Test\w+)\(", re.MULTILINE)
+# A Go test/benchmark/fuzz/example function declaration. We parse the file as
+# TEXT (not via the Go toolchain) so a ``//go:build integration`` tag does not
+# hide the function from the audit: a build-tag-gated test file still defines
+# real test ids. All four Go testing-func forms are recognised so a cited
+# ``Benchmark*``/``Fuzz*``/``Example*`` id is verified, not silently unaudited.
+_TEST_FUNC_RE = re.compile(r"^func ((?:Test|Benchmark|Fuzz|Example)\w+)\(", re.MULTILINE)
 
-# A ``Test*`` identifier cited inside a test_ids cell.
-_TEST_ID_RE = re.compile(r"`(Test\w+)`")
+# A test identifier cited inside a test_ids cell. Covers the Go forms
+# (``Test*``/``Benchmark*``/``Fuzz*``/``Example*``) and the Python pytest form
+# (``test_*``), so a Python ``test_*`` id cited against a ``.py`` test file is
+# verified against that file rather than skipped.
+_TEST_ID_RE = re.compile(r"`((?:Test|Benchmark|Fuzz|Example)\w+|test_\w+)`")
+
+# A Python test function declaration: a module-level ``def test_x(`` or a
+# pytest class method ``def test_x(self``. Parsed as text to mirror the Go
+# helper; ``\s*`` after the name tolerates a space before the paren.
+_PY_TEST_FUNC_RE = re.compile(r"^\s*def (test_\w+)\s*\(", re.MULTILINE)
+
+# A ``.py`` test-file token (used to pick the Python resolver over the Go one).
+_PY_FILE_RE = re.compile(r"\.py$")
+
+# The matrix's own column names are backticked in prose (e.g. "every row's
+# ``code_package``/``test_files``/``test_ids``"). They match the ``test_*``
+# id shape but are NOT cited test functions, so they are excluded from the
+# test_id scan to avoid a false missing-test_id finding.
+_COLUMN_NAME_TOKENS: frozenset[str] = frozenset({"test_files", "test_ids", "test_id"})
 
 # Any backticked token.
 _BACKTICK_RE = re.compile(r"`([^`]+)`")
@@ -125,6 +146,7 @@ class Findings:
     missing_test_ids: List[Tuple[str, str]] = field(default_factory=list)
     duplicate_claim_ids: List[str] = field(default_factory=list)
     prefix_mismatches: List[Tuple[str, str]] = field(default_factory=list)
+    malformed_rows: List[str] = field(default_factory=list)
 
     # Informational only (never fails the build): see BI-5 (sort order) and
     # BI-3 (Chapter 3 section granularity).
@@ -140,20 +162,23 @@ class Findings:
             or self.missing_test_ids
             or self.duplicate_claim_ids
             or self.prefix_mismatches
+            or self.malformed_rows
         )
 
 
-def parse_matrix(text: str) -> List[Row]:
+def parse_matrix(text: str) -> Tuple[List[Row], List[str]]:
     """Extract the six-column rows from the ``## Matrix`` table.
 
-    The table runs from the header row (``| claim_id | ch3_section | ... |``)
-    through to the blank line before the next ``## `` section. The header and
-    the ``|---|`` separator row are dropped. A malformed row (not exactly six
-    pipe-delimited cells) is skipped rather than silently mis-parsed; the audit
-    surfaces nothing for it, but the row count will not include it, so a
-    structural break is visible in the report.
+    Returns ``(rows, malformed)``. The table runs from the header row
+    (``| claim_id | ch3_section | ... |``) through to the next ``## `` section.
+    The header and the ``|---|`` separator row are dropped. A ``|``-shaped data
+    line under the table that does NOT split into exactly six cells (a dropped,
+    over-split, or pipe-in-cell row) is collected into ``malformed`` so the
+    caller can turn it into a HARD finding: a structurally-broken row FAILS the
+    build instead of silently vanishing.
     """
     rows: List[Row] = []
+    malformed: List[str] = []
     in_table = False
     for line in text.splitlines():
         stripped = line.strip()
@@ -173,12 +198,16 @@ def parse_matrix(text: str) -> List[Row]:
             # mis-parse trailing prose.
             break
         cells = [c.strip() for c in stripped.strip("|").split("|")]
-        if len(cells) != 6:
-            continue
-        if cells[0] == "claim_id":
+        if cells and cells[0] == "claim_id":
             continue
         # The ``|---|---|...`` separator row: every cell is only dashes.
-        if all(set(c) <= set("-") and c for c in cells):
+        if cells and all(set(c) <= set("-") and c for c in cells):
+            continue
+        if len(cells) != 6:
+            # A pipe-shaped data line that does not yield six cells is a
+            # structural break (dropped/extra cell, or an unescaped pipe inside
+            # a cell). Record it so it becomes a hard finding.
+            malformed.append(stripped)
             continue
         rows.append(
             Row(
@@ -190,7 +219,7 @@ def parse_matrix(text: str) -> List[Row]:
                 eval_run_ids=cells[5],
             )
         )
-    return rows
+    return rows, malformed
 
 
 def _expand_braces(token: str) -> List[str]:
@@ -250,39 +279,96 @@ def path_tokens(cell: str) -> List[str]:
     return out
 
 
-def _path_exists(token: str, root: Path) -> bool:
-    """Resolve a path token against the repo root; glob if it has a wildcard."""
+def git_tracked_paths(root: Path) -> Set[str]:
+    """The set of repo-relative paths under version control (``git ls-files``).
+
+    Membership in this set, NOT filesystem ``os.path.exists``, is the basis for
+    the extant check. A gitignored-but-locally-present file (e.g. a
+    ``make helm-prepare`` staged copy under ``deploy/helm/olaitan/files/``)
+    therefore does NOT satisfy a path token, so the audit is byte-identical
+    between a developer's working tree and a fresh CI checkout. Stdlib only:
+    ``git ls-files`` via subprocess, run once at the repo root.
+
+    When ``root`` is not inside a git work tree (a unit test's scratch
+    directory), ``git ls-files`` returns nothing useful, so we fall back to a
+    filesystem walk: every present file is treated as tracked. The repo / CI
+    path always goes through ``git ls-files`` and gets the strict git-tracked
+    semantics that catch the gitignored-staged-copy drift.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        tracked = {p for p in result.stdout.split("\0") if p}
+        if tracked:
+            return tracked
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    return {
+        str(p.relative_to(root)).replace("\\", "/")
+        for p in root.rglob("*")
+        if p.is_file()
+    }
+
+
+def _path_tracked(token: str, tracked: Set[str]) -> bool:
+    """True iff a path token names a git-tracked file (or matches one tracked).
+
+    A literal token must be a tracked path. A glob token (``*?[``) matches if at
+    least one tracked path matches it. A directory token (no extension, names no
+    tracked file directly) matches if some tracked path lives under it; this
+    covers the ``internal/foo/`` package-directory idiom in the matrix.
+    """
     if any(ch in token for ch in "*?["):
-        return bool(glob.glob(str(root / token)))
-    return (root / token).exists()
+        return any(fnmatch.fnmatch(p, token) for p in tracked)
+    if token in tracked:
+        return True
+    prefix = token + "/"
+    return any(p.startswith(prefix) for p in tracked)
 
 
-def _test_funcs_in(files: Sequence[str], root: Path, cache: Dict[str, Set[str]]) -> Set[str]:
-    """Union of ``Test*`` function names declared across the given test files.
+def _test_funcs_in(
+    files: Sequence[str], root: Path, tracked: Set[str], cache: Dict[str, Set[str]]
+) -> Set[str]:
+    """Union of test-func names declared across the given (tracked) test files.
 
-    Globs are expanded; a file that does not exist contributes nothing (its
-    absence is already a separate missing-path finding). Parsing is textual so
-    build-tag-gated files still contribute their declarations.
+    Go files contribute their ``Test*``/``Benchmark*``/``Fuzz*``/``Example*``
+    declarations; ``.py`` files contribute their ``def test_*`` declarations
+    (module-level or pytest class methods). Globs are expanded against the
+    git-tracked set; a file that is not tracked contributes nothing (its absence
+    is already a separate missing-path finding). Parsing is textual so
+    build-tag-gated Go files still contribute their declarations.
     """
     names: Set[str] = set()
     for token in files:
-        expanded = (
-            glob.glob(str(root / token))
-            if any(ch in token for ch in "*?[")
-            else [str(root / token)]
-        )
-        for resolved in expanded:
-            if resolved in cache:
-                names |= cache[resolved]
+        if any(ch in token for ch in "*?["):
+            resolved_rel = sorted(p for p in tracked if fnmatch.fnmatch(p, token))
+        else:
+            resolved_rel = [token] if token in tracked else []
+        for rel in resolved_rel:
+            if rel in cache:
+                names |= cache[rel]
                 continue
             found: Set[str] = set()
-            path = Path(resolved)
+            path = root / rel
             if path.exists():
                 contents = path.read_text(encoding="utf-8", errors="replace")
-                found = set(_TEST_FUNC_RE.findall(contents))
-            cache[resolved] = found
+                pattern = _PY_TEST_FUNC_RE if _PY_FILE_RE.search(rel) else _TEST_FUNC_RE
+                found = set(pattern.findall(contents))
+            cache[rel] = found
             names |= found
     return names
+
+
+# An allowed eval_run_ids deferral: ``n/a`` or ``deferred`` as a whole token,
+# optionally followed by a parenthetical rationale (``n/a (substrate)``). The
+# token must be the entire value or be followed by whitespace / ``(`` so a
+# real-looking id with a ``deferred`` prefix (``deferred-but-real-123``) is NOT
+# mis-accepted as deferred.
+_EVAL_DEFERRED_RE = re.compile(r"^(n/a|deferred)(\s|\(|$)")
 
 
 def _is_eval_deferred(value: str) -> bool:
@@ -290,9 +376,7 @@ def _is_eval_deferred(value: str) -> bool:
     low = value.strip().lower()
     if low == "":
         return True
-    # A leading ``n/a`` or ``deferred`` (optionally with a parenthetical
-    # rationale, e.g. ``n/a (substrate/documentation)``) is allowed.
-    return low.startswith("n/a") or low.startswith("deferred")
+    return _EVAL_DEFERRED_RE.match(low) is not None
 
 
 def _claim_family_prefix(claim_id: str) -> Optional[str]:
@@ -313,9 +397,26 @@ def _claim_family_prefix(claim_id: str) -> Optional[str]:
     return prefix
 
 
-def audit(rows: Sequence[Row], root: Path, chapter3: Optional[Path]) -> Findings:
-    """Run every AC1/AC2 check over the parsed rows; return the findings."""
+def audit(
+    rows: Sequence[Row],
+    root: Path,
+    chapter3: Optional[Path],
+    tracked: Optional[Set[str]] = None,
+    malformed: Optional[Sequence[str]] = None,
+) -> Findings:
+    """Run every AC1/AC2 check over the parsed rows; return the findings.
+
+    ``tracked`` is the git-tracked path set the extant check resolves against;
+    it is computed from ``root`` via ``git ls-files`` when not supplied. A
+    gitignored-but-present file therefore does NOT satisfy a path token, so the
+    audit is byte-identical local vs CI. ``malformed`` carries the
+    structurally-broken matrix lines ``parse_matrix`` could not parse; each is a
+    hard finding.
+    """
     findings = Findings()
+    if tracked is None:
+        tracked = git_tracked_paths(root)
+    findings.malformed_rows = sorted(malformed) if malformed else []
     func_cache: Dict[str, Set[str]] = {}
     seen_ids: Set[str] = set()
 
@@ -335,18 +436,20 @@ def audit(rows: Sequence[Row], root: Path, chapter3: Optional[Path]) -> Findings
             if sec_num != family:
                 findings.prefix_mismatches.append((row.claim_id, row.ch3_section))
 
-        # AC1: code_package + test_files paths are extant.
+        # AC1: code_package + test_files paths are extant (git-tracked).
         file_tokens = path_tokens(row.test_files)
         for cell in (row.code_package, row.test_files):
             for token in path_tokens(cell):
                 findings.path_tokens_checked += 1
-                if not _path_exists(token, root):
+                if not _path_tracked(token, tracked):
                     findings.missing_paths.append((row.claim_id, _col_name(cell, row), token))
 
-        # AC1: every cited test_id is a real func in the row's test files.
-        cited_ids = _TEST_ID_RE.findall(row.test_ids)
+        # AC1: every cited test_id is a real func in the row's test files. The
+        # matrix's own column-name tokens (``test_files``/``test_ids``) can
+        # appear backticked in a row's prose; they are not cited test funcs.
+        cited_ids = [t for t in _TEST_ID_RE.findall(row.test_ids) if t not in _COLUMN_NAME_TOKENS]
         if cited_ids:
-            available = _test_funcs_in(file_tokens, root, func_cache)
+            available = _test_funcs_in(file_tokens, root, tracked, func_cache)
             for test_id in cited_ids:
                 findings.test_ids_checked += 1
                 if test_id not in available:
@@ -455,6 +558,15 @@ def render_report(findings: Findings) -> str:
     lines.append("")
 
     lines.append("AC2: self-consistency (hard)")
+    if findings.malformed_rows:
+        lines.append(
+            f"  DRIFT: {len(findings.malformed_rows)} malformed matrix row(s) "
+            "(not six pipe-delimited cells):"
+        )
+        for raw in findings.malformed_rows:
+            lines.append(f"    - {raw}")
+    else:
+        lines.append("  ok: every matrix data row has exactly six cells")
     if findings.duplicate_claim_ids:
         lines.append(f"  DRIFT: duplicate claim_id(s): {sorted(set(findings.duplicate_claim_ids))}")
     else:
@@ -542,8 +654,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         chapter3 = _auto_discover_chapter3(root)
 
-    rows = parse_matrix(matrix_path.read_text(encoding="utf-8"))
-    findings = audit(rows, root, chapter3)
+    rows, malformed = parse_matrix(matrix_path.read_text(encoding="utf-8"))
+    findings = audit(rows, root, chapter3, malformed=malformed)
     print(render_report(findings))
     return 1 if findings.has_hard_drift() else 0
 

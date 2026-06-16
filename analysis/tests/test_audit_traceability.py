@@ -218,20 +218,130 @@ def test_chapter3_absent_skips_gracefully(tmp_path: Path) -> None:
     assert findings.orphan_claims == []
 
 
+# --- Go benchmark/fuzz/example + Python test_id recognition (FIX 3) ----------
+
+
+def test_go_benchmark_fuzz_example_ids_recognised(tmp_path: Path) -> None:
+    # Benchmark/Fuzz/Example funcs are real test ids; a cited one must resolve,
+    # and a fake one must FAIL rather than pass silently unaudited.
+    (tmp_path / "x_test.go").write_text(
+        "func BenchmarkReal(b *testing.B) {}\n"
+        "func FuzzReal(f *testing.F) {}\n"
+        "func ExampleReal() {}\n"
+    )
+    ok = _row(
+        code_package="`x_test.go`",
+        test_files="`x_test.go`",
+        test_ids="`BenchmarkReal`, `FuzzReal`, `ExampleReal`",
+    )
+    findings = audit.audit([ok], tmp_path, chapter3=None)
+    assert findings.missing_test_ids == []
+    assert findings.test_ids_checked == 3
+    bad = _row(code_package="`x_test.go`", test_files="`x_test.go`", test_ids="`BenchmarkNope`")
+    findings = audit.audit([bad], tmp_path, chapter3=None)
+    assert ("c3.4-foo", "BenchmarkNope") in findings.missing_test_ids
+    assert findings.has_hard_drift()
+
+
+def test_python_test_ids_recognised(tmp_path: Path) -> None:
+    # A test_id cited against a .py test file resolves via the Python def
+    # matcher (module-level + pytest class method); a fake one FAILS.
+    (tmp_path / "test_thing.py").write_text(
+        "def test_module_level():\n    pass\n\n"
+        "class TestSuite:\n    def test_method(self):\n        pass\n"
+    )
+    ok = _row(
+        code_package="`test_thing.py`",
+        test_files="`test_thing.py`",
+        test_ids="`test_module_level`, `test_method`",
+    )
+    findings = audit.audit([ok], tmp_path, chapter3=None)
+    assert findings.missing_test_ids == []
+    assert findings.test_ids_checked == 2
+    bad = _row(
+        code_package="`test_thing.py`",
+        test_files="`test_thing.py`",
+        test_ids="`test_nope`",
+    )
+    findings = audit.audit([bad], tmp_path, chapter3=None)
+    assert ("c3.4-foo", "test_nope") in findings.missing_test_ids
+    assert findings.has_hard_drift()
+
+
+# --- git-tracked membership (FIX 2): gitignored-but-present file fails --------
+
+
+def test_extant_check_uses_git_tracked_set(tmp_path: Path) -> None:
+    # A file that exists on disk but is NOT in the tracked set must be flagged
+    # missing (this is the gitignored helm-staged-copy case the CI caught).
+    (tmp_path / "staged.yaml").write_text("present-but-untracked\n")
+    (tmp_path / "real.yaml").write_text("tracked\n")
+    row = _row(
+        claim_id="c3.4-foo",
+        code_package="`real.yaml`, `staged.yaml`",
+        test_files="`real.yaml`",
+        test_ids="",
+    )
+    findings = audit.audit([row], tmp_path, chapter3=None, tracked={"real.yaml"})
+    flagged = {token for _, _, token in findings.missing_paths}
+    assert "staged.yaml" in flagged
+    assert "real.yaml" not in flagged
+    assert findings.has_hard_drift()
+
+
+# --- malformed-row hard gate (FIX 4) -----------------------------------------
+
+
+def test_malformed_row_is_hard_drift(tmp_path: Path) -> None:
+    text = (
+        "## Matrix\n\n"
+        "| claim_id | ch3_section | code_package | test_files | test_ids | eval_run_ids |\n"
+        "|---|---|---|---|---|---|\n"
+        "| `c3.4-a` | §3.4 | `x` | `y` | `TestX` | n/a |\n"
+        "| `c3.4-b` | §3.4 | only | three | cells |\n"
+        "\n## Provenance\n"
+    )
+    rows, malformed = audit.parse_matrix(text)
+    assert len(rows) == 1
+    assert len(malformed) == 1
+    findings = audit.audit(rows, tmp_path, chapter3=None, tracked=set(), malformed=malformed)
+    assert findings.malformed_rows
+    assert findings.has_hard_drift()
+
+
+# --- deferred-token anchor (FIX 5) -------------------------------------------
+
+
+def test_eval_deferred_token_is_exact() -> None:
+    assert audit._is_eval_deferred("n/a")
+    assert audit._is_eval_deferred("deferred")
+    assert audit._is_eval_deferred("n/a (substrate/documentation)")
+    assert audit._is_eval_deferred("deferred (cluster phase)")
+    assert audit._is_eval_deferred("")
+    # A real-looking id that merely starts with the deferred token must NOT be
+    # mis-accepted as deferred.
+    assert not audit._is_eval_deferred("deferred-but-real-123")
+    assert not audit._is_eval_deferred("n/areal")
+
+
 # --- end-to-end against the REAL committed matrix (the regression guard) -----
 
 
 def test_audit_real_matrix_is_clean() -> None:
     matrix = _REPO_ROOT / "docs" / "traceability.md"
-    rows = audit.parse_matrix(matrix.read_text(encoding="utf-8"))
-    # Sanity: the parse must see the whole table, not break early.
+    rows, malformed = audit.parse_matrix(matrix.read_text(encoding="utf-8"))
+    # Sanity: the parse must see the whole table, not break early, and every
+    # data row is well-formed (six cells).
     assert len(rows) >= 90
+    assert malformed == []
     ids = [r.claim_id for r in rows]
     assert "c3.10.9-traceability-audit" in ids  # the Story 6.9 self-row.
     # The Chapter 3 cross-check is intentionally NOT exercised here (the thesis
     # markdown is absent from the code repo / CI checkout, BI-2); the hard gate
     # is the extant-artefact + self-consistency checks against the real tree.
-    findings = audit.audit(rows, _REPO_ROOT, chapter3=None)
+    # The extant check resolves against the GIT-TRACKED path set (git ls-files),
+    # so this is byte-identical to the CI clean checkout.
+    findings = audit.audit(rows, _REPO_ROOT, chapter3=None, malformed=malformed)
     assert not findings.has_hard_drift(), audit.render_report(findings)
 
 
