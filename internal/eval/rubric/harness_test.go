@@ -252,8 +252,12 @@ func TestEmit_MetadataCarriesJoinKeys(t *testing.T) {
 
 // TestEmitStaticWorkflow_BlindedFilesNoVariantLabel asserts the static-file
 // workflow writes the blinded report files + per-rater scoring sheets and that
-// the rater-facing report files NEVER leak the variant label (AC2/OQ3): the
-// un-blinding key is kept separate.
+// the rater-facing report files are INDISTINGUISHABLE in their identifying
+// header (AC2/OQ3, HIGH-1): neither file may carry the variant label OR the
+// asymmetric provenance metadata (report_kind / dfir_provider / dfir_model /
+// prompt_hash, the LLM report.v1, the templated rubric.templated.v1), and both
+// files' front-matter blocks must be structurally identical (same keys). The
+// un-blinding key is kept separate (off disk).
 func TestEmitStaticWorkflow_BlindedFilesNoVariantLabel(t *testing.T) {
 	result, err := RunOffline(Options{Scenario: "s1", NRaters: 2})
 	if err != nil {
@@ -264,13 +268,31 @@ func TestEmitStaticWorkflow_BlindedFilesNoVariantLabel(t *testing.T) {
 		t.Fatalf("EmitStaticWorkflow: %v", err)
 	}
 	incidentDir := filepath.Join(dir, RunDirName(result.Summary), "workflow", result.Pairs[0].IncidentID)
+	// The variant-identifying tokens that must NOT appear in EITHER rater-facing
+	// file (the LLM-only and templated-only front-matter markers, HIGH-1).
+	identifyingTokens := []string{
+		"variant: llm", "variant: templated", `"variant"`,
+		"report_kind", "dfir_provider", "dfir_model", "prompt_hash",
+		"report.v1", "rubric.templated.v1",
+	}
+	var frontMatterKeySets [][]string
 	for _, slot := range blindLabels {
 		body := readFile(t, filepath.Join(incidentDir, slot+".md"))
-		// The blinded report must NOT contain the un-blinding variant key
-		// (a rater reading report-a.md must not see "variant: llm").
-		if strings.Contains(body, `"variant"`) || strings.Contains(body, "variant: llm") || strings.Contains(body, "variant: templated") {
-			t.Fatalf("blinded report %s leaks the variant label", slot)
+		for _, tok := range identifyingTokens {
+			if strings.Contains(body, tok) {
+				t.Fatalf("blinded report %s leaks identifying token %q", slot, tok)
+			}
 		}
+		frontMatterKeySets = append(frontMatterKeySets, frontMatterKeys(t, slot, body))
+	}
+	// The two rater-facing files must be structurally identical in their
+	// identifying header: same front-matter keys, in the same order.
+	if len(frontMatterKeySets) != 2 {
+		t.Fatalf("expected 2 blinded files, got %d", len(frontMatterKeySets))
+	}
+	if strings.Join(frontMatterKeySets[0], ",") != strings.Join(frontMatterKeySets[1], ",") {
+		t.Fatalf("blinded files have different front-matter keys: %v vs %v",
+			frontMatterKeySets[0], frontMatterKeySets[1])
 	}
 	for raterIdx := 1; raterIdx <= result.Summary.NRaters; raterIdx++ {
 		sheet := readFile(t, filepath.Join(incidentDir, "scoring-sheet-synthetic-"+itoa(raterIdx)+".md"))
@@ -280,6 +302,33 @@ func TestEmitStaticWorkflow_BlindedFilesNoVariantLabel(t *testing.T) {
 			}
 		}
 	}
+}
+
+// frontMatterKeys extracts the ordered YAML keys of the leading front-matter
+// block of a rater-facing report body (the "---" ... "---" header), so the test
+// can assert the two blinded files are structurally identical in their
+// identifying header. It fails the test if the body has no front-matter block.
+func frontMatterKeys(t *testing.T, slot, body string) []string {
+	t.Helper()
+	if !strings.HasPrefix(body, "---\n") {
+		t.Fatalf("blinded report %s has no leading front-matter block", slot)
+	}
+	rest := body[len("---\n"):]
+	end := strings.Index(rest, "\n---\n")
+	if end < 0 {
+		t.Fatalf("blinded report %s front-matter is not closed", slot)
+	}
+	var keys []string
+	for _, line := range strings.Split(rest[:end], "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if i := strings.Index(line, ":"); i >= 0 {
+			keys = append(keys, line[:i])
+		}
+	}
+	return keys
 }
 
 func readFile(t *testing.T, path string) string {

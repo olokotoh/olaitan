@@ -124,6 +124,33 @@ def test_load_rubric_scores_rejects_unknown_dimension(tmp_path: Path) -> None:
         raise AssertionError("expected a ValueError on an unknown dimension")
 
 
+def test_load_rubric_scores_rejects_out_of_range_score(tmp_path: Path) -> None:
+    # A score outside the 1-5 Likert range (here 6) is rejected at the trust
+    # boundary: an out-of-range hand edit must not load silently into Wilcoxon /
+    # ICC. Mirrors the unknown-dimension drift guard.
+    bad = _score("inc-1", "llm", "synthetic-1", "clarity", 6)
+    _write_rubric_run(tmp_path, "rubric-offline-s1", [bad])
+    try:
+        io.load_rubric_scores(str(tmp_path))
+    except ValueError as exc:
+        assert "Likert range" in str(exc)
+    else:
+        raise AssertionError("expected a ValueError on an out-of-range score")
+
+
+def test_load_rubric_scores_rejects_unknown_variant(tmp_path: Path) -> None:
+    # An unknown variant is dropped from the Wilcoxon pairing but would still
+    # enter the ICC frame and corrupt the reliability estimate; reject it (BI-5).
+    bad = _score("inc-1", "human", "synthetic-1", "clarity", 4)
+    _write_rubric_run(tmp_path, "rubric-offline-s1", [bad])
+    try:
+        io.load_rubric_scores(str(tmp_path))
+    except ValueError as exc:
+        assert "variant" in str(exc)
+    else:
+        raise AssertionError("expected a ValueError on an unknown variant")
+
+
 def test_build_rubric_rows_skips_when_absent(tmp_path: Path) -> None:
     # No rubric/ sub-tree -> the honest n=0 skip on every row (BI-4), never a
     # fabricated finding.

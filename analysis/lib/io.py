@@ -509,6 +509,23 @@ _RUBRIC_DIMENSIONS: frozenset[str] = frozenset(
 _RUBRIC_VARIANT_LLM: str = "llm"
 _RUBRIC_VARIANT_TEMPLATED: str = "templated"
 
+# The canonical variants set: a score record carrying any other variant is a
+# drift error. An unknown variant is dropped from the Wilcoxon pairing but would
+# otherwise STILL enter the ICC frame and corrupt the reliability estimate, so
+# it is rejected at the trust boundary here. Mirrors the Go emitter's Variant
+# constants (internal/eval/rubric/variants.go).
+_RUBRIC_VARIANTS: frozenset[str] = frozenset(
+    {_RUBRIC_VARIANT_LLM, _RUBRIC_VARIANT_TEMPLATED}
+)
+
+# The documented Likert scale bounds (1-5) the rubric is collected on, mirroring
+# the Go emitter's LikertMin/LikertMax (internal/eval/rubric/schema.go). A score
+# outside this inclusive range is rejected here so an out-of-range hand edit
+# cannot load silently into the Wilcoxon / ICC estimates (the hand-edit trust
+# boundary for the deferred real study).
+_RUBRIC_LIKERT_MIN: int = 1
+_RUBRIC_LIKERT_MAX: int = 5
+
 
 @dataclass(frozen=True)
 class RubricScore:
@@ -552,9 +569,10 @@ def _read_rubric_scores(path: Path) -> List[RubricScore]:
 
     Each line is a self-describing ``rubric.score.v1`` object (NOT the Story-5.4
     Envelope shape, so this does not reuse ``read_jsonl_payloads``). A malformed
-    line, a wrong ``schema_version``, an unknown dimension, or a missing required
-    field raises with file + line context (an honest crash with the culprit
-    located, BI-4), never a silently dropped score.
+    line, a wrong ``schema_version``, an unknown dimension, an unknown variant, a
+    ``score`` outside the Likert range, or a missing required field raises with
+    file + line context (an honest crash with the culprit located, BI-4), never a
+    silently dropped or out-of-range score.
     """
     if not path.is_file():
         return []
@@ -582,15 +600,37 @@ def _read_rubric_scores(path: Path) -> List[RubricScore]:
                     f"rubric score line {i} in {path} has dimension {dimension!r}, "
                     f"not one of the 5 canonical dimensions {sorted(_RUBRIC_DIMENSIONS)}"
                 )
+            variant = str(record.get("variant", ""))
+            if variant not in _RUBRIC_VARIANTS:
+                # An unknown variant is dropped from the Wilcoxon pairing but would
+                # still enter the ICC frame and corrupt the reliability estimate;
+                # reject it at the trust boundary (BI-5).
+                raise ValueError(
+                    f"rubric score line {i} in {path} has variant {variant!r}, "
+                    f"not one of the canonical variants {sorted(_RUBRIC_VARIANTS)}"
+                )
+            try:
+                score = float(record["score"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"rubric score line {i} in {path} missing/invalid field: {exc}"
+                ) from exc
+            if not _RUBRIC_LIKERT_MIN <= score <= _RUBRIC_LIKERT_MAX:
+                # An out-of-range hand edit (e.g. 0 or 6 on the 1-5 scale) would
+                # load silently into Wilcoxon / ICC; reject it honestly.
+                raise ValueError(
+                    f"rubric score line {i} in {path} has score {score!r} outside "
+                    f"the Likert range [{_RUBRIC_LIKERT_MIN}, {_RUBRIC_LIKERT_MAX}]"
+                )
             try:
                 scores.append(
                     RubricScore(
                         incident_id=str(record["incident_id"]),
                         scenario=str(record["scenario"]),
-                        variant=str(record["variant"]),
+                        variant=variant,
                         rater=str(record["rater"]),
                         dimension=dimension,
-                        score=float(record["score"]),
+                        score=score,
                         synthetic=bool(record.get("synthetic", False)),
                     )
                 )

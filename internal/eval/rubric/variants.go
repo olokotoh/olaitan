@@ -80,8 +80,11 @@ func RenderLLMVariant(inc dfir.Incident) string {
 func RenderTemplatedVariant(inc dfir.Incident) string {
 	var b strings.Builder
 	// YAML front-matter mirroring the factual front-matter of variant (a),
-	// stamped with a templated-baseline provider marker so a reader can tell the
-	// two variants apart in the un-blinded record (the blinding strips this).
+	// stamped with a templated-baseline marker (report_kind) so a reader can tell
+	// the two variants apart in the UN-BLINDED record. This identifying header is
+	// NOT visible to raters: the static-file workflow normalises it away via
+	// blindReportBody (HIGH-1) before writing the rater-facing report-a/b.md, so
+	// the rater-facing files carry only a neutral, variant-agnostic header.
 	b.WriteString("---\n")
 	writeTemplatedScalar(&b, "schema_version", "rubric.templated.v1")
 	writeTemplatedScalar(&b, "incident_id", inc.Event.PackageID)

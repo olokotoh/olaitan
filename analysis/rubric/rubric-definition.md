@@ -90,10 +90,18 @@ to the Wilcoxon family.
   final-year cyber-security student under supervision) able to read a Markdown
   forensic report and judge the five dimensions on the documented anchors.
 - **Blinding protocol:** each incident's two variants are presented in a SEEDED
-  random slot order (`report-a`, `report-b`) WITHOUT the variant label, so a
-  rater cannot tell which report is machine-generated. The harness keeps the
-  un-blinding key (slot -> variant) separately for scoring; the rater-facing
-  files never carry the variant label.
+  random slot order (`report-a`, `report-b`). The rater-facing report files
+  carry a NORMALISED, variant-agnostic front-matter header (a neutral
+  `schema_version: "rubric.blinded.v1"` plus the shared `incident_id` only): the
+  variant-identifying provenance metadata is STRIPPED from the rater-facing file
+  (the LLM variant's `report.v1`/`prompt_hash`/`dfir_provider`/`dfir_model` and
+  the templated baseline's `rubric.templated.v1`/`report_kind`), so neither the
+  variant label nor an asymmetric header reveals which report is
+  machine-generated. The report PROSE legitimately differs between the variants
+  (that quality difference is exactly what the rater scores); only the
+  identifying metadata header is normalised. The harness retains the full
+  per-variant provenance ONLY in the off-disk un-blinding key (slot -> variant),
+  used at scoring time, never in the rater-facing files.
 - **Conflict-of-interest exclusion:** a rater who contributed to Olaitan's
   development (including the author) is EXCLUDED from scoring, so the comparison
   is not self-graded.
