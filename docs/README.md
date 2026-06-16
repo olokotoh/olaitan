@@ -38,8 +38,14 @@ Alternatives considered and rejected / Hand-off), where the
 - [Metrics](metrics.md) - the Prometheus metric surface (names, types,
   labels, PromQL).
 - [IAM](iam.md) - identity and access notes.
+- [NATS subjects](nats-subjects.md) - the per-subject integrator
+  reference (producer, consumers, payload schema, retention, and a
+  sample `nats sub` invocation) for building an external SIEM consumer.
 - [Sigma extensions](sigma-extensions.md) - the OLT Sigma dialect
-  specification.
+  specification: the `k8s.*` field references, the `attack:` annotation,
+  the severity and false-positive conventions, worked examples from the
+  rule corpus, and how to validate a rule against the SIGMA-HQ reference
+  parser.
 - [Prompt changelog](prompt-changelog.md) - the NFR41 prompt-content
   audit trail.
 - [Traceability matrix](traceability.md) - the NFR42 code-to-thesis
