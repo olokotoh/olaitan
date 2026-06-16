@@ -33,7 +33,9 @@ mixed in the same reporting section.
 `analyse.py` has landed (Story 5.5). It is the FIRST Python in this otherwise-Go
 repo: a pure-Python, NO-CLUSTER, OFFLINE pipeline that CONSUMES the merged
 Story-5.4 per-run artefacts under `runs/<run_id>/` (read-only) and produces, per
-`(config, scenario)` cell, Detection Rate, MTTD, FPR, and ATT&CK Cohen's kappa
+`(config, scenario)` cell, Detection Rate, MTTD, and FPR, plus ATT&CK Cohen's
+kappa pooled across scenarios per config (so the ground-truth technique label
+varies across S1-S5 rather than being constant within a single-scenario cell)
 (AC1), runs the pre-registered inferential tests READ FROM `preregistration.md`
 section 8a (McNemar + Bonferroni, Kruskal-Wallis + Dunn's-with-Holm, Wilcoxon
 signed-rank, ICC(2,k), and the one-sided Poisson FPR equivalence test, AC2/AC3),

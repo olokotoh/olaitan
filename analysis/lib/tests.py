@@ -83,8 +83,10 @@ def mcnemar_paired(
 
     The two vectors are PAIRED over the deterministic scenario-instance index
     (run i of config A paired with run i of config B over the same Story-5.2
-    deterministic stimulus, BI-8/OQ7). The caller pairs over ``min(n_a, n_b)``
-    when the run counts differ (BI-7). With fewer than one pair, or with no
+    deterministic stimulus, BI-8/OQ7). The caller pre-pairs the two vectors by an
+    inner join on the shared scenario-instance key, so they arrive equal-length and
+    index-aligned and this function does not re-pair (a partial run-set drops the
+    unmatched instances during the join, BI-7). With fewer than one pair, or with no
     discordant pairs (the contingency is degenerate), the test SKIPS honestly
     with its n (BI-7), never a fabricated p-value.
 

@@ -195,7 +195,13 @@ def scenario_instance_key(run_id: object, scenario_instance: object) -> Optional
         return str(scenario_instance)
     if isinstance(run_id, str):
         tail = run_id.rsplit("-", 1)
-        if len(tail) == 2 and tail[1].isdigit():
+        # Bound the fallback index to a short numeric suffix so a real run_id
+        # whose 12-char manifest-hash suffix happens to be all-digits cannot be
+        # mis-read as an instance index (it would simply fail to join and drop
+        # the run honestly, BI-7, but bounding avoids the rare mis-key). The
+        # committed fixtures use a 1-3 digit -NN suffix; real runs carry the
+        # explicit scenario_instance field (Story 5.9) and never reach here.
+        if len(tail) == 2 and tail[1].isdigit() and len(tail[1]) <= 3:
             return tail[1]
     return None
 
