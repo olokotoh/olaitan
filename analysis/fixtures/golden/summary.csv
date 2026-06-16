@@ -141,10 +141,10 @@ ablation,l2_contribution,s5,l2_contribution (technique T1496),0.250000,4,fixture
 ablation,rslt-l1-l2,s5,L1+L2 vs L1-only,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ4-ABL-L2-MCNEMAR,0.005000,1.000000,run,,False,False
 ablation,senior_contribution,s5,senior_contribution (technique T1496),0.250000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,"dr_difference;ci95=[0.000000, 0.750000]",RQ4-ABL-SENIOR-MCNEMAR,n/a,n/a,run,,False,False
 ablation,rslt-full,s5,full vs L1+L2,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ4-ABL-SENIOR-MCNEMAR,0.005000,1.000000,run,,False,False
-confirmatory,rubric,clarity,LLM vs templated,n/a,0,n/a,False,wilcoxon,RQ5-RUBRIC-WILCOXON-CLARITY,0.010000,n/a,"skipped (insufficient data, n=0)",,False,False
-confirmatory,rubric,completeness,LLM vs templated,n/a,0,n/a,False,wilcoxon,RQ5-RUBRIC-WILCOXON-COMPLETENESS,0.010000,n/a,"skipped (insufficient data, n=0)",,False,False
-confirmatory,rubric,attack-coverage,LLM vs templated,n/a,0,n/a,False,wilcoxon,RQ5-RUBRIC-WILCOXON-ATTACK-COVERAGE,0.010000,n/a,"skipped (insufficient data, n=0)",,False,False
-confirmatory,rubric,killchain,LLM vs templated,n/a,0,n/a,False,wilcoxon,RQ5-RUBRIC-WILCOXON-KILLCHAIN,0.010000,n/a,"skipped (insufficient data, n=0)",,False,False
-confirmatory,rubric,actionability,LLM vs templated,n/a,0,n/a,False,wilcoxon,RQ5-RUBRIC-WILCOXON-ACTIONABILITY,0.010000,n/a,"skipped (insufficient data, n=0)",,False,False
-confirmatory,rubric,rater-agreement,inter-rater,n/a,0,n/a,False,icc2k,RQ5-ICC,n/a,n/a,"skipped (insufficient data, n=0)",,False,False
+confirmatory,rubric,clarity,LLM vs templated,0.000000,1,n/a,False,wilcoxon,RQ5-RUBRIC-WILCOXON-CLARITY,0.010000,1.000000,run,,False,False
+confirmatory,rubric,completeness,LLM vs templated,0.000000,1,n/a,False,wilcoxon,RQ5-RUBRIC-WILCOXON-COMPLETENESS,0.010000,1.000000,run,,False,False
+confirmatory,rubric,attack-coverage,LLM vs templated,0.000000,1,n/a,False,wilcoxon,RQ5-RUBRIC-WILCOXON-ATTACK-COVERAGE,0.010000,1.000000,run,,False,False
+confirmatory,rubric,killchain,LLM vs templated,0.000000,1,n/a,False,wilcoxon,RQ5-RUBRIC-WILCOXON-KILLCHAIN,0.010000,1.000000,run,,False,False
+confirmatory,rubric,actionability,LLM vs templated,0.000000,1,n/a,False,wilcoxon,RQ5-RUBRIC-WILCOXON-ACTIONABILITY,0.010000,1.000000,run,,False,False
+confirmatory,rubric,rater-agreement,inter-rater,0.600000,20,n/a,False,icc2k,RQ5-ICC,n/a,n/a,run,,False,False
 confirmatory,rsl;rslt-full,benign-adversarial,fr55_trust_bound,"0/40 past SUSPICIOUS; max@7.5=7.5<=7.5, max@10.5=10.5<=10.5; cap_violations=0",40,mixed,True,empirical_bound_count,RQ4-FR55-BOUND,n/a,n/a,run,,False,False

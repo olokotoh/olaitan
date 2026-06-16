@@ -144,12 +144,12 @@
 | all | s3 | MTTD across configs | 9.000000 | 10 | kruskal_wallis+dunn(holm) | RQ2-MTTD-KW-DUNN-HOLM | n/a | 0.029291 | run | fixture0000000000000000000000000000000000000000000000000000000000 | False |  | False |
 | all | s4 | MTTD across configs | 9.000000 | 10 | kruskal_wallis+dunn(holm) | RQ2-MTTD-KW-DUNN-HOLM | n/a | 0.029291 | run | fixture0000000000000000000000000000000000000000000000000000000000 | False |  | False |
 | all | s5 | MTTD across configs | 9.000000 | 10 | kruskal_wallis+dunn(holm) | RQ2-MTTD-KW-DUNN-HOLM | n/a | 0.029291 | run | fixture0000000000000000000000000000000000000000000000000000000000 | False |  | False |
-| rubric | clarity | LLM vs templated | n/a | 0 | wilcoxon | RQ5-RUBRIC-WILCOXON-CLARITY | 0.010000 | n/a | skipped (insufficient data, n=0) | n/a | False |  | False |
-| rubric | completeness | LLM vs templated | n/a | 0 | wilcoxon | RQ5-RUBRIC-WILCOXON-COMPLETENESS | 0.010000 | n/a | skipped (insufficient data, n=0) | n/a | False |  | False |
-| rubric | attack-coverage | LLM vs templated | n/a | 0 | wilcoxon | RQ5-RUBRIC-WILCOXON-ATTACK-COVERAGE | 0.010000 | n/a | skipped (insufficient data, n=0) | n/a | False |  | False |
-| rubric | killchain | LLM vs templated | n/a | 0 | wilcoxon | RQ5-RUBRIC-WILCOXON-KILLCHAIN | 0.010000 | n/a | skipped (insufficient data, n=0) | n/a | False |  | False |
-| rubric | actionability | LLM vs templated | n/a | 0 | wilcoxon | RQ5-RUBRIC-WILCOXON-ACTIONABILITY | 0.010000 | n/a | skipped (insufficient data, n=0) | n/a | False |  | False |
-| rubric | rater-agreement | inter-rater | n/a | 0 | icc2k | RQ5-ICC | n/a | n/a | skipped (insufficient data, n=0) | n/a | False |  | False |
+| rubric | clarity | LLM vs templated | 0.000000 | 1 | wilcoxon | RQ5-RUBRIC-WILCOXON-CLARITY | 0.010000 | 1.000000 | run | n/a | False |  | False |
+| rubric | completeness | LLM vs templated | 0.000000 | 1 | wilcoxon | RQ5-RUBRIC-WILCOXON-COMPLETENESS | 0.010000 | 1.000000 | run | n/a | False |  | False |
+| rubric | attack-coverage | LLM vs templated | 0.000000 | 1 | wilcoxon | RQ5-RUBRIC-WILCOXON-ATTACK-COVERAGE | 0.010000 | 1.000000 | run | n/a | False |  | False |
+| rubric | killchain | LLM vs templated | 0.000000 | 1 | wilcoxon | RQ5-RUBRIC-WILCOXON-KILLCHAIN | 0.010000 | 1.000000 | run | n/a | False |  | False |
+| rubric | actionability | LLM vs templated | 0.000000 | 1 | wilcoxon | RQ5-RUBRIC-WILCOXON-ACTIONABILITY | 0.010000 | 1.000000 | run | n/a | False |  | False |
+| rubric | rater-agreement | inter-rater | 0.600000 | 20 | icc2k | RQ5-ICC | n/a | n/a | run | n/a | False |  | False |
 | rsl;rslt-full | benign-adversarial | fr55_trust_bound | 0/40 past SUSPICIOUS; max@7.5=7.5<=7.5, max@10.5=10.5<=10.5; cap_violations=0 | 40 | empirical_bound_count | RQ4-FR55-BOUND | n/a | n/a | run | mixed | True |  | False |
 
 ## RSLT ablation

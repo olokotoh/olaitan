@@ -530,33 +530,108 @@ def build_ablation_rows(run_set: io.RunSet, registry: Registry) -> List[OutputRo
     return rows
 
 
-def build_rubric_rows(run_set: io.RunSet, registry: Registry) -> List[OutputRow]:
-    """Wilcoxon (per rubric dimension) + ICC(2,k) rows (Story 5.7 inputs, BI-7).
+# The FIXED registry mapping the 5 confirmatory Wilcoxon test_ids to the 5
+# canonical rubric dimension keys (BI-5, FIXED by the pre-registration). It is
+# the AUTHORITATIVE key set the Story-5.7 Go emitter must match; a 6th "overall
+# usefulness" dimension is EXPLORATORY-only and NEVER joins this family (it would
+# break the family=5 Bonferroni 0.05/5 = 0.01).
+_RUBRIC_DIMENSIONS: Dict[str, str] = {
+    "RQ5-RUBRIC-WILCOXON-CLARITY": "clarity",
+    "RQ5-RUBRIC-WILCOXON-COMPLETENESS": "completeness",
+    "RQ5-RUBRIC-WILCOXON-ATTACK-COVERAGE": "attack-coverage",
+    "RQ5-RUBRIC-WILCOXON-KILLCHAIN": "killchain",
+    "RQ5-RUBRIC-WILCOXON-ACTIONABILITY": "actionability",
+}
 
-    The Story-5.7 rubric scores have not been collected, so every rubric test
-    SKIPS honestly with ``n=0`` (BI-7); the rows still appear so the thesis
-    sees the test was registered and is pending its input, never fabricated.
+
+def _rubric_paired_vectors(
+    scores: List[io.RubricScore], dimension: str
+) -> tuple[List[float], List[float]]:
+    """Pivot the rubric scores into the paired LLM-vs-templated vectors for one
+    dimension (paired on ``incident_id``), the Wilcoxon input (AC3, OQ1).
+
+    Each incident contributes ONE paired observation per dimension: the LLM
+    variant's mean rater score vs the templated variant's mean rater score (the
+    rater dimension is averaged so the pair is per incident, the unit the
+    pre-registration pairs on). Only incidents scored on BOTH variants for this
+    dimension are paired; an incident missing a side is dropped honestly (BI-4),
+    never positionally mis-paired. The vectors are returned in a stable
+    incident-id-sorted order so the result is deterministic.
     """
+    # incident_id -> variant -> list of rater scores for this dimension.
+    per_incident: Dict[str, Dict[str, List[float]]] = {}
+    for sc in scores:
+        if sc.dimension != dimension:
+            continue
+        per_incident.setdefault(sc.incident_id, {}).setdefault(sc.variant, []).append(sc.score)
+    llm_scores: List[float] = []
+    templated_scores: List[float] = []
+    for incident_id in sorted(per_incident):
+        variants = per_incident[incident_id]
+        llm = variants.get(io._RUBRIC_VARIANT_LLM)
+        templated = variants.get(io._RUBRIC_VARIANT_TEMPLATED)
+        if not llm or not templated:
+            # An incident scored on only one variant cannot be paired; drop it
+            # honestly (BI-4), never fabricate the missing side.
+            continue
+        llm_scores.append(sum(llm) / len(llm))
+        templated_scores.append(sum(templated) / len(templated))
+    return llm_scores, templated_scores
+
+
+def _rubric_icc_frame(scores: List[io.RubricScore]) -> pd.DataFrame:
+    """Build the long-form ICC(2,k) ratings frame (AC3, OQ1).
+
+    Inter-rater reliability is measured across every rated cell: the ICC
+    ``target`` is the composite ``incident_id|variant|dimension`` rated unit, the
+    ``rater`` is the scorer, and ``score`` is the Likert value. ICC needs >= 2
+    targets and >= 2 raters; the helper SKIPS honestly otherwise (BI-4). Rows are
+    sorted (target, rater) for determinism.
+    """
+    rows: List[Dict[str, object]] = []
+    for sc in scores:
+        target = f"{sc.incident_id}|{sc.variant}|{sc.dimension}"
+        rows.append({"target": target, "rater": sc.rater, "score": sc.score})
+    rows.sort(key=lambda row: (str(row["target"]), str(row["rater"])))
+    return pd.DataFrame(rows, columns=["target", "rater", "score"])
+
+
+def build_rubric_rows(run_set: io.RunSet, registry: Registry) -> List[OutputRow]:
+    """Wilcoxon (per rubric dimension) + ICC(2,k) rows (Story 5.7, RQ5, BI-4/OQ1).
+
+    READS the Story-5.7 rubric scores under the reserved ``<runs_dir>/rubric/``
+    sub-tree (the Go harness ``internal/eval/rubric`` emitter), pivots them into
+    the paired LLM-vs-templated vectors per dimension (paired on ``incident_id``)
+    + the long-form ICC ratings frame, and FEEDS the EXISTING
+    ``tests.wilcoxon_signed_rank`` + ``tests.icc_2k`` helpers (5.7 does NOT modify
+    the helpers, BI-4). With NO scores present (the real N>=3 x N=10 rater study
+    is a DEFERRED carry-forward, BI-2) the rows keep their honest ``n=0`` skip,
+    never a fabricated rubric finding. The helpers DEGRADE HONESTLY at tiny n (a
+    single-incident offline sample yields n=1, so Wilcoxon/ICC SKIP honestly): the
+    data PATH is validated end-to-end without a fabricated p-value (AC5).
+
+    The OFFLINE synthetic scores are LABELLED synthetic (``synthetic: true``,
+    ``rater: synthetic-*``); they are NEVER a thesis-final RQ5 number (BI-2).
+    """
+    runs = io.load_rubric_scores(run_set.runs_dir)
+    scores: List[io.RubricScore] = []
+    for run in runs:
+        scores.extend(run.scores)
+
     rows: List[OutputRow] = []
-    dimensions = {
-        "RQ5-RUBRIC-WILCOXON-CLARITY": "clarity",
-        "RQ5-RUBRIC-WILCOXON-COMPLETENESS": "completeness",
-        "RQ5-RUBRIC-WILCOXON-ATTACK-COVERAGE": "attack-coverage",
-        "RQ5-RUBRIC-WILCOXON-KILLCHAIN": "killchain",
-        "RQ5-RUBRIC-WILCOXON-ACTIONABILITY": "actionability",
-    }
-    for test_id, dimension in dimensions.items():
+    for test_id, dimension in _RUBRIC_DIMENSIONS.items():
+        llm_scores, templated_scores = _rubric_paired_vectors(scores, dimension)
         result = tests.wilcoxon_signed_rank(
             test_id=test_id,
             dimension=dimension,
-            llm_scores=[],
-            templated_scores=[],
+            llm_scores=llm_scores,
+            templated_scores=templated_scores,
             corrected_alpha=registry.corrected_alpha(test_id),
         )
         rows.append(_test_row(result, "rubric", registry))
     icc = tests.icc_2k(
         test_id="RQ5-ICC",
-        ratings=pd.DataFrame(columns=["target", "rater", "score"]),
+        ratings=_rubric_icc_frame(scores),
         corrected_alpha=registry.corrected_alpha("RQ5-ICC"),
     )
     rows.append(_test_row(icc, "rubric", registry))
