@@ -43,6 +43,12 @@ jobs:
       - name: Schema drift gate (NFR33)
         run: |
           make schemas
+          # `git add -N` (intent-to-add) registers any NEWLY generated but
+          # uncommitted file so the diff sees it; a bare
+          # `git diff --exit-code` is blind to untracked files, which would
+          # let a new allow-list target that was generated-but-never-added
+          # slip the gate.
+          git add -N docs/schemas/
           git diff --exit-code docs/schemas/
 
       - name: Test
