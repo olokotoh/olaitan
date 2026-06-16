@@ -180,6 +180,22 @@ jobs:
       - name: helm lint
         run: helm lint deploy/helm/olaitan
 
+      # Story 6.6 follow-up: the base lint above runs default values only, so
+      # an overlay that introduced a typo'd key or a structurally invalid
+      # block would slip the gate. Lint each posture overlay explicitly so the
+      # three shipped overlays (production, airgapped, eval) are CI-validated.
+      # secrets.redisPassword is faked so the lint does not trip the
+      # required-secret guard; the airgapped local-model is a runtime concern
+      # the linter does not exercise, so no analyst.local.model is needed here.
+      - name: helm lint (posture overlays)
+        run: |
+          for o in production airgapped eval; do
+            echo "== helm lint overlay: $o =="
+            helm lint deploy/helm/olaitan \
+              -f "deploy/helm/olaitan/values-$o.yaml" \
+              --set secrets.redisPassword=ci-fake-password
+          done
+
       - name: helm template + kubeconform
         run: |
           helm template deploy/helm/olaitan --generate-name \
@@ -211,6 +227,36 @@ jobs:
             olaitan\ *) ;;
             *) echo "smoke: unexpected version output: $out" >&2; exit 1 ;;
           esac
+
+      # Resolve the version tag once into an env var so the trivy-action
+      # step (which cannot run a shell substitution in `image-ref`) can
+      # reference the exact tag `make docker-build` produced.
+      - name: Resolve image tag
+        run: echo "IMAGE_TAG=$(make -s version-tag)" >> "$GITHUB_ENV"
+
+      # Story 6.6 (AC1; NFR13/NFR14): the REAL Trivy CVE gate. The
+      # values-production.yaml overlay commits to "Trivy CVE check
+      # enforced", so this step makes that genuine rather than a claim
+      # against a non-existent control. It scans the LOCAL image that the
+      # Build step above produced (olaitan:<version-tag>) -- the same
+      # distroless-static-debian12 final stage the chart ships -- and fails
+      # the build on any FIXABLE CRITICAL/HIGH in the OS or Go-binary layer.
+      # ignore-unfixed:true keeps the gate enforced-but-green: it blocks on
+      # vulnerabilities an operator could actually remediate (a base/dep
+      # bump) and does not red the whole epic-6 pipeline on un-actionable
+      # upstream noise. Verified locally against the current image with
+      # trivy v0.71.1: 0 CRITICAL/HIGH (debian 12.14: 0, gobinary: 0),
+      # exit 0. trivy-action is pinned by tag for parity with the other
+      # third-party action pins in this workflow.
+      - name: Trivy image CVE scan (AC1, NFR13/NFR14)
+        uses: aquasecurity/trivy-action@v0.28.0
+        with:
+          image-ref: olaitan:${{ env.IMAGE_TAG }}
+          scan-type: image
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
 
   # Story 1.19: kind-based RS smoke test. Boots a single-node kind
   # cluster via helm/kind-action@v1.12.0 (kind v0.26.0, released
@@ -876,9 +922,21 @@ jobs:
   # `-tags=helm` golden + knob tests (TestProductionOverlayHardeningRenders,
   # TestAirgappedOverlayNoExternalEgress, TestEvalOverlayBaseKnobsRender), which
   # run in the always-on `helm` job. Add the `e2e-overlays` label to run this.
+  #
+  # MATRIX (Story 6.6 follow-up): the smoke is overlay-parameterized via
+  # OLT_E2E_OVERLAY, so the job fans out across all three posture overlays
+  # (production, airgapped, eval) instead of proving only one. Each matrix
+  # leg gets its OWN kind cluster (fail-fast disabled so one overlay's
+  # failure does not cancel the others), and the overlay name flows through
+  # to the chart install and the smoke env so each leg installs and inspects
+  # its own posture.
   e2e-overlays:
     if: contains(github.event.pull_request.labels.*.name, 'e2e-overlays')
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        overlay: [production, airgapped, eval]
     steps:
       - uses: actions/checkout@v4
 
@@ -925,14 +983,21 @@ jobs:
           helm repo update
           helm dependency update deploy/helm/olaitan
 
-      # Install the air-gapped posture overlay under the Falco-off kind bring-up.
-      # The overlay enables the in-cluster ollama Deployment/Service/NetworkPolicy
-      # (the model is NOT provisioned in CI; the smoke inspects the chart objects,
-      # not a live ollama dial). nats.streamMaxBytesOverride keeps JetStream under
-      # the kind PVC; analyst.local.model is pinned so the provider constructs.
-      - name: Install chart under the air-gapped overlay
+      # Install the matrix-selected posture overlay under the Falco-off kind
+      # bring-up. The overlay file flows from the matrix leg. The air-gapped
+      # overlay enables the in-cluster ollama Deployment/Service/NetworkPolicy
+      # (the model is NOT provisioned in CI; the smoke inspects the chart
+      # objects, not a live ollama dial), so analyst.local.model is pinned for
+      # that leg ONLY so the local provider constructs. The production and eval
+      # legs use the chart's default (api) provider path and do not need it.
+      # nats.streamMaxBytesOverride keeps JetStream under the kind PVC.
+      - name: Install chart under the ${{ matrix.overlay }} overlay
         run: |
           tag=$(make -s version-tag)
+          extra=()
+          if [ "${{ matrix.overlay }}" = "airgapped" ]; then
+            extra+=(--set analyst.local.model=fake)
+          fi
           helm install olaitan ./deploy/helm/olaitan \
             --set image.repository=olaitan \
             --set-string image.tag="$tag" \
@@ -941,14 +1006,14 @@ jobs:
             --set falco.enabled=false \
             --set endpoints.falco=tcp://127.0.0.1:0 \
             --set-string nats.streamMaxBytesOverride=536870912 \
-            --set analyst.local.model=fake \
-            -f deploy/helm/olaitan/values-airgapped.yaml \
+            "${extra[@]}" \
+            -f "deploy/helm/olaitan/values-${{ matrix.overlay }}.yaml" \
             --wait --timeout 6m
 
       - name: Run posture overlay smoke (Story 6.6 AC5)
         env:
           OLT_E2E_OVERLAYS: "1"
-          OLT_E2E_OVERLAY: airgapped
+          OLT_E2E_OVERLAY: ${{ matrix.overlay }}
         run: go test -tags=e2e -v -count=1 -run TestKindSmoke_Overlays_OperatorCommitments ./tests/e2e/...
 
       - name: Debug logs on failure

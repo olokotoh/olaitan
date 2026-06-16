@@ -90,3 +90,26 @@ networkPolicy:
 # self-documenting for the air-gapped operator.
 notifications:
   enabled: false
+
+# Close the Bitnami Redis subchart's allow-all egress. The subchart
+# defaults networkPolicy.allowExternalEgress to true, which renders the
+# Redis NetworkPolicy egress as `- {}` (every destination, every port) --
+# a namespace egress hole that contradicts the air-gapped no-external-
+# egress commitment. Setting it false drops that wildcard rule. Redis is a
+# state STORE here (the aggregator dials INTO it; architecture=standalone,
+# no replica / sentinel peers), so the only outbound it needs is cluster
+# DNS resolution, scoped explicitly below via extraEgress. With
+# architecture=standalone the subchart's built-in replica/peer egress
+# branch is inert, so extraEgress is the one rule that survives, giving a
+# closed-by-default Redis netpol with DNS only and no external destination.
+redis:
+  networkPolicy:
+    allowExternalEgress: false
+    # Cluster DNS only (kube-dns / CoreDNS on UDP+TCP 53). No external
+    # destination: that is the whole point of the air-gapped overlay.
+    extraEgress:
+      - ports:
+          - port: 53
+            protocol: UDP
+          - port: 53
+            protocol: TCP

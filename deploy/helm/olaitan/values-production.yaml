@@ -41,19 +41,28 @@
 # nothing, each is recorded here as an honest gap (mirrors the Story 6.4
 # helm-values doc honesty fence):
 #
-#   - mTLS for NATS and Redis: NO chart knob. The NATS subchart exposes
-#     no client-side TLS value and the Redis subchart exposes AUTH /
-#     password only (NFR8), not mTLS. The mTLS knobs the chart DOES carry
-#     are for the audit webhook and the Calico / applog inbound sensor,
-#     not the NATS / Redis client connections. In-cluster NATS / Redis
-#     mTLS is deferred to the Target-tier HA / TLS story.
-#   - AppArmor profile: NO chart annotation. The pod is already confined
-#     by seccompProfile RuntimeDefault + capabilities.drop [ALL] +
-#     allowPrivilegeEscalation false (above); a per-node AppArmor profile
-#     reference is deferred (it needs a host-provisioned profile name).
-#   - Trivy CVE check: a CI / supply-chain image-scan gate, not a chart
-#     render-time value. It belongs to the image-build pipeline, not a
-#     helm value.
+#   - mTLS for NATS and Redis: NO chart knob, TRACKED CARRY-FORWARD. The
+#     NATS subchart exposes no client-side TLS value and the Redis subchart
+#     exposes AUTH / password only (NFR8), not mTLS. The mTLS knobs the
+#     chart DOES carry are for the audit webhook and the Calico / applog
+#     inbound sensor, not the NATS / Redis client connections. In-cluster
+#     NATS / Redis mTLS is an OPEN carry-forward to a future Target-tier
+#     HA / TLS story (not closed here; not claimed against a control that
+#     does not exist).
+#   - AppArmor profile: NO chart annotation, TRACKED CARRY-FORWARD. The
+#     pod is already confined by seccompProfile RuntimeDefault +
+#     capabilities.drop [ALL] + allowPrivilegeEscalation false (above); a
+#     per-node AppArmor profile reference is an OPEN carry-forward to the
+#     same future Target-tier hardening story (it needs a host-provisioned
+#     profile name).
+#   - Trivy CVE check: ENFORCED as a real CI gate, not a chart render-time
+#     value. The `docker` job in .github/workflows/ci.yml builds the image
+#     and then runs aquasecurity/trivy-action over the built
+#     olaitan:<version-tag> image (vuln-type os,library; severity
+#     CRITICAL,HIGH; ignore-unfixed; exit-code 1), so a fixable CRITICAL or
+#     HIGH reds the build. This is the NFR13/NFR14 supply-chain gate; it
+#     lives in the image-build pipeline (not a helm value), and is now a
+#     genuine enforced control rather than a claim.
 #   - log level "info": the process logs via a code-fixed slog JSON
 #     handler (cmd/olaitan/main.go); there is no per-component log-level
 #     value in the chart or config (docs/helm-values.md, "logging level").
