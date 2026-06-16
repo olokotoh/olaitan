@@ -55,6 +55,7 @@ import (
 	rulesloader "github.com/olokotoh/olaitan/internal/decision/rules/loader"
 	"github.com/olokotoh/olaitan/internal/decision/score"
 	"github.com/olokotoh/olaitan/internal/health"
+	"github.com/olokotoh/olaitan/internal/keys"
 	"github.com/olokotoh/olaitan/internal/metrics"
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
 	"github.com/olokotoh/olaitan/internal/ratelimit"
@@ -623,7 +624,7 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 			return nil
 		})
 		log.Info("aggregator: baseline engine wired",
-			"path", "baseline:",
+			"path", keys.BaselinePrefix,
 			"warmup_duration", cfg.Detection.Baselines.WarmupDurationOrDefault(),
 			"sigma_multiplier", cfg.Detection.Baselines.SigmaMultiplierOrDefault())
 	} else {

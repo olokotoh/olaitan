@@ -39,10 +39,19 @@
 //
 // The match is anchored at the START of the literal: the forbidden pattern is
 // hard-coding a subject AS the subject at a call site, not mentioning a subject
-// name mid-prose. Test files (*_test.go) are out of default scope: the subjects
-// conformance suite pins every constant to its literal, and integration tests
-// drive REAL subjects through embedded NATS by design (NFR35). Pass
-// -include-tests to scan them too.
+// name mid-prose.
+//
+// LIMITATION (literal-anchored, no data-flow): the linter inspects string
+// LITERALS only; it does not track data flow. A fully dynamic concatenation
+// where the prefix is itself built from a variable (`p := buildPrefix(); _ = p
+// + id`) is NOT detected. It DOES catch the bare-prefix-literal concatenation
+// (`_ = "fsm:" + id`, `_ = "AUDIT." + verb`), because the literal operand
+// `"fsm:"` / `"AUDIT."` equals a known family prefix and is flagged on its own.
+//
+// Test files (*_test.go) are out of default scope: the subjects conformance
+// suite pins every constant to its literal, and integration tests drive REAL
+// subjects through embedded NATS by design (NFR35). Pass -include-tests to scan
+// them too.
 //
 // ESCAPE HATCH: a `//olaitan-lint:allow subject <reason>` or
 // `//olaitan-lint:allow key <reason>` comment on the same line as (or the line
@@ -92,24 +101,24 @@ var subjectLowerPrefixes = []string{
 // subject-token rune (an UPPER family letter, a lower-case token, or a `{`
 // dynamic-segment opener), so a bare word like "AUDITED" does not match.
 var subjectUpperPrefixes = []string{
-	"AUDIT.",
-	"OVERRIDES.",
-	"INCIDENTS.",
-	"REPORTS.",
-	"INVESTIGATIONS.",
-	"THREATS.",
+	"AUDIT.",          //olaitan-lint:allow subject this is the canonical-prefix derivation the matcher is built from, not a call-site subject
+	"OVERRIDES.",      //olaitan-lint:allow subject this is the canonical-prefix derivation the matcher is built from, not a call-site subject
+	"INCIDENTS.",      //olaitan-lint:allow subject this is the canonical-prefix derivation the matcher is built from, not a call-site subject
+	"REPORTS.",        //olaitan-lint:allow subject this is the canonical-prefix derivation the matcher is built from, not a call-site subject
+	"INVESTIGATIONS.", //olaitan-lint:allow subject this is the canonical-prefix derivation the matcher is built from, not a call-site subject
+	"THREATS.",        //olaitan-lint:allow subject this is the canonical-prefix derivation the matcher is built from, not a call-site subject
 }
 
 // keyPrefixes are the canonical Redis key-family prefixes from
 // internal/keys/keys.go.
 var keyPrefixes = []string{
-	"baseline:",
-	"checkpoint:",
-	"state:",
-	"evidence:",
-	"health:",
-	"fsm:",
-	"override:",
+	"baseline:",   //olaitan-lint:allow key this is the canonical-prefix derivation the matcher is built from, not a call-site key
+	"checkpoint:", //olaitan-lint:allow key this is the canonical-prefix derivation the matcher is built from, not a call-site key
+	"state:",      //olaitan-lint:allow key this is the canonical-prefix derivation the matcher is built from, not a call-site key
+	"evidence:",   //olaitan-lint:allow key this is the canonical-prefix derivation the matcher is built from, not a call-site key
+	"health:",     //olaitan-lint:allow key this is the canonical-prefix derivation the matcher is built from, not a call-site key
+	"fsm:",        //olaitan-lint:allow key this is the canonical-prefix derivation the matcher is built from, not a call-site key
+	"override:",   //olaitan-lint:allow key this is the canonical-prefix derivation the matcher is built from, not a call-site key
 }
 
 // finding is one reported canonical-name violation.
@@ -284,15 +293,19 @@ func matchesSubject(s string) bool {
 		}
 	}
 	for _, p := range subjectUpperPrefixes {
-		if strings.HasPrefix(s, p) {
-			rest := s[len(p):]
-			if rest == "" {
-				continue
-			}
-			r := rest[0]
-			if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || r == '{' {
-				return true
-			}
+		if !strings.HasPrefix(s, p) {
+			continue
+		}
+		rest := s[len(p):]
+		// A literal that is EXACTLY a known UPPER subject-family prefix (e.g.
+		// `"AUDIT."` from `"AUDIT." + verb`) is the single most natural
+		// forbidden concatenation this story exists to stop, so flag it.
+		if rest == "" {
+			return true
+		}
+		r := rest[0]
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '{' {
+			return true
 		}
 	}
 	return false
@@ -307,8 +320,13 @@ func matchesKey(s string) bool {
 			continue
 		}
 		rest := s[len(p):]
+		// A literal that is EXACTLY a known key-family prefix (e.g. `"fsm:"`
+		// from `"fsm:" + id`) is the most natural forbidden concatenation, so
+		// flag it. The `package: message` error idiom always has a SPACE after
+		// the colon (`"baseline: store: %w"`), so it still passes: an empty
+		// rest is a bare prefix, a space-led rest is the error idiom.
 		if rest == "" {
-			continue
+			return true
 		}
 		if isKeyTokenByte(rest[0]) {
 			return true
@@ -337,11 +355,18 @@ func isKeyTokenByte(b byte) bool {
 
 // allowDirectives builds a map from line number to the set of categories
 // suppressed on that line by an //olaitan-lint:allow <category> <reason>
-// comment. A directive applies to the literal on its OWN line (trailing
-// comment) or to the line immediately below it (leading comment). A directive
-// missing a reason, or naming an unknown category, is an error so the escape
-// hatch cannot be misused to silently mute a finding.
+// comment. A directive is either TRAILING (the comment shares its line with
+// code) or STANDALONE/LEADING (the comment is alone on its own line). A
+// trailing directive suppresses ONLY its own line; a leading directive
+// suppresses ONLY the line immediately below it. This split matters: a blanket
+// "own line AND next line" rule lets a trailing directive silently mute a real
+// violation on the following line (a blind spot), so the two forms are kept
+// distinct using the AST code lines. A directive missing a reason, or naming an
+// unknown category, is an error so the escape hatch cannot be misused to
+// silently mute a finding.
 func allowDirectives(fset *token.FileSet, f *ast.File) (map[int]map[string]bool, error) {
+	codeLines := codeLineSet(fset, f)
+
 	allows := map[int]map[string]bool{}
 	add := func(line int, cat string) {
 		if allows[line] == nil {
@@ -369,13 +394,45 @@ func allowDirectives(fset *token.FileSet, f *ast.File) (map[int]map[string]bool,
 				return nil, fmt.Errorf("olaitan-lint:allow %s directive requires a reason", cat)
 			}
 			line := fset.Position(c.Pos()).Line
-			// Suppress on the directive's own line (trailing comment) and the
-			// next line (leading comment above the literal).
-			add(line, cat)
-			add(line+1, cat)
+			if codeLines[line] {
+				// Trailing directive: code shares the comment's line, so the
+				// flagged literal is on THIS line. Suppress only this line, NOT
+				// line+1 (which carries no directive of its own).
+				add(line, cat)
+			} else {
+				// Standalone leading directive: the comment is alone on its
+				// line, so it governs the literal on the line immediately below.
+				add(line+1, cat)
+			}
 		}
 	}
 	return allows, nil
+}
+
+// codeLineSet returns the set of source lines on which a non-comment AST node
+// begins, so allowDirectives can tell a trailing directive (a comment sharing
+// a code line) from a standalone leading directive (a comment alone on its
+// line). Every node's start position is recorded; a string literal flagged by
+// the linter is itself a node, so its line is always present.
+func codeLineSet(fset *token.FileSet, f *ast.File) map[int]bool {
+	lines := map[int]bool{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		if n == nil {
+			return false
+		}
+		if _, ok := n.(*ast.Comment); ok {
+			return true
+		}
+		if _, ok := n.(*ast.CommentGroup); ok {
+			return true
+		}
+		pos := n.Pos()
+		if pos.IsValid() {
+			lines[fset.Position(pos).Line] = true
+		}
+		return true
+	})
+	return lines
 }
 
 // relPath cleans a walked path to a forward-slash relative form for stable,

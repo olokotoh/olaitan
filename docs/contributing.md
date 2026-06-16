@@ -202,6 +202,10 @@ before the reviewer does.
   decision) is suppressed with an auditable
   `//olaitan-lint:allow subject <reason>` comment on the literal's line; the
   reason is mandatory, so the escape hatch is greppable rather than silent.
+  The linter is literal-anchored and does not track data flow: a fully dynamic
+  concatenation whose prefix is itself built from a variable is not detected,
+  though the natural bare-prefix concatenation (`"fsm:" + id`, `"AUDIT." + verb`)
+  IS caught because the literal operand equals a known family prefix.
 - **Hardcoded Redis-key strings.** Likewise, never hard-code a Redis key at a
   call site. Use the family prefixes and validating builders in
   `internal/keys/` (see `docs/patterns.md` section 2). `cmd/olaitan-lint`

@@ -113,6 +113,9 @@ func TestMatchesSubject(t *testing.T) {
 		{"INVESTIGATIONS.pkg-1.l1", true},
 		{"INVESTIGATIONS.{id}.l1", true},
 		{"THREATS.act", true},
+		// FIX 2: a digit-first UPPER segment is a real subject (e.g. a numeric
+		// package_id), so it must be flagged.
+		{"INVESTIGATIONS.123abc.l1", true},
 		// Guard 1: annotation domain + schema version are NOT subjects.
 		{"olaitan.io/log-sidecar", false},
 		{"olaitan.io/state-override", false},
@@ -121,8 +124,10 @@ func TestMatchesSubject(t *testing.T) {
 		{"see olaitan.events docs", false},
 		// Lowercase token is not the dotted-UPPER family.
 		{"audit.local.scope", false},
-		// A bare UPPER word without a trailing token rune.
-		{"AUDIT.", false},
+		// FIX 1: a literal that EQUALS a known UPPER subject-family prefix is the
+		// natural `"AUDIT." + verb` concatenation, so it is flagged.
+		{"AUDIT.", true},
+		// A bare UPPER word that is NOT a known prefix (no trailing dot match).
 		{"AUDITED", false},
 		{"REPORTSomething", false},
 	}
@@ -153,14 +158,16 @@ func TestMatchesKey(t *testing.T) {
 		{"override:default/Deployment/web", true},
 		// The package:message error idiom (space after the colon) is NOT a key.
 		{"baseline: store: redis client is nil", false},
+		{"baseline: store: %w", false},
 		{"health: serve: %w", false},
 		{"state: pending", false},
 		{"evidence: incident not found", false},
 		{"checkpoint: load failed", false},
-		// A bare prefix with nothing after the colon is not a key (and only
-		// ever appears in internal/keys/ anyway).
-		{"fsm:", false},
-		{"override:", false},
+		// FIX 1: a bare prefix that EQUALS a known key family (nothing after the
+		// colon) is the natural `"fsm:" + id` concatenation, so it is flagged.
+		// This is distinct from the space-led error idiom above, which passes.
+		{"fsm:", true},
+		{"override:", true},
 		// Unrelated literal.
 		{"some random string", false},
 	}
@@ -204,6 +211,37 @@ const c = "AUDIT.transitions"
 	}
 	if findings[0].literal != "AUDIT.transitions" {
 		t.Errorf("surviving finding = %q, want AUDIT.transitions", findings[0].literal)
+	}
+}
+
+// TestTrailingDirectiveDoesNotLeakToNextLine asserts FIX 3: a TRAILING
+// directive (a comment sharing a code line) suppresses ONLY that line, so it
+// cannot silently mute a real violation on the immediately following line. The
+// old "own line AND next line" rule created that blind spot.
+func TestTrailingDirectiveDoesNotLeakToNextLine(t *testing.T) {
+	const src = `package x
+const a = "olaitan.events.raw.falco" //olaitan-lint:allow subject ok
+const b = "AUDIT.transitions"
+`
+	findings := scanSource(t, "trailing.go", src)
+	if len(findings) != 1 {
+		t.Fatalf("trailing directive must not suppress line+1; want exactly one surviving finding, got %d: %+v", len(findings), findings)
+	}
+	if findings[0].literal != "AUDIT.transitions" || findings[0].line != 3 {
+		t.Errorf("surviving finding = %q on line %d, want AUDIT.transitions on line 3", findings[0].literal, findings[0].line)
+	}
+}
+
+// TestExistingTreeIsClean pins AC4 inside `go test`: the linter must report
+// ZERO findings over the real repository tree (not only in the CI step). If a
+// future change hard-codes a canonical subject or key, this fails locally.
+func TestExistingTreeIsClean(t *testing.T) {
+	findings, err := run([]string{"../.."}, false)
+	if err != nil {
+		t.Fatalf("run over repo root: %v", err)
+	}
+	if len(findings) != 0 {
+		t.Errorf("AC4: existing tree must be clean, got %d finding(s): %+v", len(findings), findings)
 	}
 }
 
