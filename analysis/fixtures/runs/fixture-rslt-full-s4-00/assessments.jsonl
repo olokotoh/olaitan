@@ -1,0 +1,1 @@
+{"payload": {"mitre_techniques": ["T1071"], "mode": "rsl", "package_id": "pkg-fixture", "schema_version": "audit.assessments.v2", "workload_id": "tenant-fixture/Deployment/web"}, "published_at": "2026-06-15T09:30:10Z", "schema_version": "audit.assessments.v1", "subject": "AUDIT.assessments"}

@@ -1,0 +1,1 @@
+{"payload": {"after_state": "QUARANTINED", "decided_at": "2026-06-15T09:30:18Z", "package_id": "pkg-fixture", "schema_version": "audit.transitions.v1", "workload_id": "tenant-fixture/Deployment/web"}, "published_at": "2026-06-15T09:30:10Z", "schema_version": "audit.transitions.v1", "subject": "AUDIT.transitions"}

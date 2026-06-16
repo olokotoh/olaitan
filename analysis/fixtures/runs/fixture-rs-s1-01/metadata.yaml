@@ -1,0 +1,18 @@
+run_id: fixture-rs-s1-01
+manifest_sha256: fixture0000000000000000000000000000000000000000000000000000000000
+scenario: s1
+config: rs
+runs: 1
+started_at: "2026-06-15T09:30:00Z"
+finished_at: "2026-06-15T09:31:00Z"
+olaitan_eval_version: fixture
+success_criterion_met: true
+measured_time_to_detect: 30
+measured_final_fsm_state: QUARANTINED
+fsm_state_source: observed_transitions
+scenario_instance: 1
+resource_usage:
+  harness_alloc_bytes: 4194304
+  cluster_metrics_available: false
+size_bytes: 4096
+size_cap_exceeded: false

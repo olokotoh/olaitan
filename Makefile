@@ -9,7 +9,7 @@ CONFIG_SRC       := config/olaitan.yaml
 AUDIT_POLICY_SRC := config/audit-policy-default.yaml
 CHART_FILES      := $(CHART_DIR)/files/olaitan.yaml $(CHART_DIR)/files/audit-policy-default.yaml
 
-.PHONY: build test lint prereg-check docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics eval-smoke scenarios-smoke capture-it e2e-local-down
+.PHONY: build test lint prereg-check analysis analysis-test docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics eval-smoke scenarios-smoke capture-it e2e-local-down
 
 # envtest-bin downloads the kube-apiserver and etcd binaries that the
 # Story 1.11 posture-client integration tests (and any future
@@ -45,6 +45,23 @@ lint:
 # Wired into the always-on `go` CI job so the contract is enforced on every PR.
 prereg-check:
 	hack/check-preregistration.sh
+
+# Story 5.5: the analysis pipeline targets (analysis/analyse.py, the FIRST
+# Python in this Go repo). PYTHON defaults to `python3`; point it at a venv
+# interpreter to use the pinned deps (analysis/requirements*.txt). `analysis`
+# runs the pipeline over runs/ into analysis/output/ (it DEGRADES HONESTLY on a
+# missing/partial run-set, reporting n per cell, never fabricating, BI-7).
+# `analysis-test` mirrors the no-cluster CI job locally: mypy --strict + pytest.
+PYTHON ?= python3
+ANALYSIS_RUNS ?= runs/
+ANALYSIS_OUT ?= analysis/output/
+
+analysis:
+	$(PYTHON) analysis/analyse.py --runs $(ANALYSIS_RUNS) --output $(ANALYSIS_OUT)
+
+analysis-test:
+	$(PYTHON) -m mypy --strict --config-file analysis/pyproject.toml analysis/
+	$(PYTHON) -m pytest analysis/tests/
 
 docker-build:
 	docker build -t $(IMAGE):$(TAG) .

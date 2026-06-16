@@ -1,0 +1,150 @@
+section,config,scenario,metric_or_test,value,n,manifest_hash,mixed_manifest,test,test_id,alpha_corrected,p_value,status,fsm_source_partition,underpowered,exploratory
+metrics,f,s1,detection_rate,0.250000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=1;detection_signal_only=0;none=3,True,False
+metrics,f,s1,mttd_median,40.000000,1,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=1;detection_signal_only=0;none=3,True,False
+metrics,f,s1,mttd_mean,40.000000,1,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=1;detection_signal_only=0;none=3,True,False
+metrics,f,s2,detection_rate,0.250000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=1;detection_signal_only=0;none=3,True,False
+metrics,f,s2,mttd_median,40.000000,1,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=1;detection_signal_only=0;none=3,True,False
+metrics,f,s2,mttd_mean,40.000000,1,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=1;detection_signal_only=0;none=3,True,False
+metrics,f,s3,detection_rate,0.250000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=1;detection_signal_only=0;none=3,True,False
+metrics,f,s3,mttd_median,40.000000,1,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=1;detection_signal_only=0;none=3,True,False
+metrics,f,s3,mttd_mean,40.000000,1,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=1;detection_signal_only=0;none=3,True,False
+metrics,f,s4,detection_rate,0.250000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=1;detection_signal_only=0;none=3,True,False
+metrics,f,s4,mttd_median,40.000000,1,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=1;detection_signal_only=0;none=3,True,False
+metrics,f,s4,mttd_mean,40.000000,1,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=1;detection_signal_only=0;none=3,True,False
+metrics,f,s5,detection_rate,0.250000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=1;detection_signal_only=0;none=3,True,False
+metrics,f,s5,mttd_median,40.000000,1,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=1;detection_signal_only=0;none=3,True,False
+metrics,f,s5,mttd_mean,40.000000,1,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=1;detection_signal_only=0;none=3,True,False
+metrics,rs,s1,detection_rate,0.500000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rs,s1,mttd_median,30.000000,2,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rs,s1,mttd_mean,30.000000,2,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rs,s2,detection_rate,0.500000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rs,s2,mttd_median,30.000000,2,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rs,s2,mttd_mean,30.000000,2,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rs,s3,detection_rate,0.500000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rs,s3,mttd_median,30.000000,2,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rs,s3,mttd_mean,30.000000,2,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rs,s4,detection_rate,0.500000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rs,s4,mttd_median,30.000000,2,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rs,s4,mttd_mean,30.000000,2,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rs,s5,detection_rate,0.500000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rs,s5,mttd_median,30.000000,2,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rs,s5,mttd_mean,30.000000,2,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rsl,s1,detection_rate,0.750000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rsl,s1,mttd_median,22.000000,3,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rsl,s1,mttd_mean,22.000000,3,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rsl,s2,detection_rate,0.750000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rsl,s2,mttd_median,22.000000,3,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rsl,s2,mttd_mean,22.000000,3,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rsl,s3,detection_rate,0.750000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rsl,s3,mttd_median,22.000000,3,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rsl,s3,mttd_mean,22.000000,3,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rsl,s4,detection_rate,0.750000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rsl,s4,mttd_median,22.000000,3,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rsl,s4,mttd_mean,22.000000,3,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rsl,s5,detection_rate,0.750000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rsl,s5,mttd_median,22.000000,3,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rsl,s5,mttd_mean,22.000000,3,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rslt-full,s1,detection_rate,1.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=4;detection_signal_only=0;none=0,True,False
+metrics,rslt-full,s1,mttd_median,18.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=4;detection_signal_only=0;none=0,True,False
+metrics,rslt-full,s1,mttd_mean,18.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=4;detection_signal_only=0;none=0,True,False
+metrics,rslt-full,s2,detection_rate,1.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=4;detection_signal_only=0;none=0,True,False
+metrics,rslt-full,s2,mttd_median,18.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=4;detection_signal_only=0;none=0,True,False
+metrics,rslt-full,s2,mttd_mean,18.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=4;detection_signal_only=0;none=0,True,False
+metrics,rslt-full,s3,detection_rate,1.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=4;detection_signal_only=0;none=0,True,False
+metrics,rslt-full,s3,mttd_median,18.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=4;detection_signal_only=0;none=0,True,False
+metrics,rslt-full,s3,mttd_mean,18.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=4;detection_signal_only=0;none=0,True,False
+metrics,rslt-full,s4,detection_rate,1.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=4;detection_signal_only=0;none=0,True,False
+metrics,rslt-full,s4,mttd_median,18.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=4;detection_signal_only=0;none=0,True,False
+metrics,rslt-full,s4,mttd_mean,18.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=4;detection_signal_only=0;none=0,True,False
+metrics,rslt-full,s5,detection_rate,1.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=4;detection_signal_only=0;none=0,True,False
+metrics,rslt-full,s5,mttd_median,18.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=4;detection_signal_only=0;none=0,True,False
+metrics,rslt-full,s5,mttd_mean,18.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=4;detection_signal_only=0;none=0,True,False
+metrics,rslt-l1-only,s1,detection_rate,0.500000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rslt-l1-only,s1,mttd_median,28.000000,2,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rslt-l1-only,s1,mttd_mean,28.000000,2,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rslt-l1-only,s2,detection_rate,0.500000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rslt-l1-only,s2,mttd_median,28.000000,2,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rslt-l1-only,s2,mttd_mean,28.000000,2,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rslt-l1-only,s3,detection_rate,0.500000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rslt-l1-only,s3,mttd_median,28.000000,2,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rslt-l1-only,s3,mttd_mean,28.000000,2,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rslt-l1-only,s4,detection_rate,0.500000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rslt-l1-only,s4,mttd_median,28.000000,2,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rslt-l1-only,s4,mttd_mean,28.000000,2,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rslt-l1-only,s5,detection_rate,0.500000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rslt-l1-only,s5,mttd_median,28.000000,2,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rslt-l1-only,s5,mttd_mean,28.000000,2,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=2;detection_signal_only=0;none=2,True,False
+metrics,rslt-l1-l2,s1,detection_rate,0.750000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rslt-l1-l2,s1,mttd_median,24.000000,3,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rslt-l1-l2,s1,mttd_mean,24.000000,3,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rslt-l1-l2,s2,detection_rate,0.750000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rslt-l1-l2,s2,mttd_median,24.000000,3,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rslt-l1-l2,s2,mttd_mean,24.000000,3,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rslt-l1-l2,s3,detection_rate,0.750000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rslt-l1-l2,s3,mttd_median,24.000000,3,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rslt-l1-l2,s3,mttd_mean,24.000000,3,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rslt-l1-l2,s4,detection_rate,0.750000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rslt-l1-l2,s4,mttd_median,24.000000,3,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rslt-l1-l2,s4,mttd_mean,24.000000,3,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rslt-l1-l2,s5,detection_rate,0.750000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rslt-l1-l2,s5,mttd_median,24.000000,3,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,rslt-l1-l2,s5,mttd_mean,24.000000,3,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,observed=3;detection_signal_only=0;none=1,True,False
+metrics,f,all,attack_kappa_pooled,n/a,0,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,n/a,,False,False
+metrics,rs,all,attack_kappa_pooled,n/a,0,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,n/a,,False,False
+metrics,rsl,all,attack_kappa_pooled,1.000000,15,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,,False,False
+metrics,rslt-full,all,attack_kappa_pooled,1.000000,20,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,,False,False
+metrics,rslt-l1-only,all,attack_kappa_pooled,1.000000,10,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,,False,False
+metrics,rslt-l1-l2,all,attack_kappa_pooled,1.000000,15,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,,False,False
+metrics,f,benign,fpr_per_hour,0.000000,1,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,,False,False
+metrics,rs,benign,fpr_per_hour,0.000000,1,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,,False,False
+metrics,rsl,benign,fpr_per_hour,1.000000,1,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,,False,False
+confirmatory,rsl,benign-sweep,rsl vs 2.0/hour bound,1.000000,1,fixture0000000000000000000000000000000000000000000000000000000000,False,poisson_one_sided,RQ3-FPR-POISSON,0.025000,0.406006,run,,False,False
+metrics,rslt-full,benign,fpr_per_hour,1.000000,1,fixture0000000000000000000000000000000000000000000000000000000000,False,descriptive,,n/a,n/a,run,,False,False
+confirmatory,rslt-full,benign-sweep,rslt-full vs 2.0/hour bound,1.000000,1,fixture0000000000000000000000000000000000000000000000000000000000,False,poisson_one_sided,RQ3-FPR-POISSON,0.025000,0.406006,run,,False,False
+confirmatory,rslt-full,s1,rslt-full vs f,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ1-DR-MCNEMAR,0.010000,0.250000,run,,False,False
+confirmatory,rslt-full,s2,rslt-full vs f,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ1-DR-MCNEMAR,0.010000,0.250000,run,,False,False
+confirmatory,rslt-full,s3,rslt-full vs f,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ1-DR-MCNEMAR,0.010000,0.250000,run,,False,False
+confirmatory,rslt-full,s4,rslt-full vs f,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ1-DR-MCNEMAR,0.010000,0.250000,run,,False,False
+confirmatory,rslt-full,s5,rslt-full vs f,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ1-DR-MCNEMAR,0.010000,0.250000,run,,False,False
+confirmatory,rslt-full,s1,rslt-full vs rs,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ1-DR-MCNEMAR,0.010000,0.500000,run,,False,False
+confirmatory,rslt-full,s2,rslt-full vs rs,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ1-DR-MCNEMAR,0.010000,0.500000,run,,False,False
+confirmatory,rslt-full,s3,rslt-full vs rs,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ1-DR-MCNEMAR,0.010000,0.500000,run,,False,False
+confirmatory,rslt-full,s4,rslt-full vs rs,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ1-DR-MCNEMAR,0.010000,0.500000,run,,False,False
+confirmatory,rslt-full,s5,rslt-full vs rs,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ1-DR-MCNEMAR,0.010000,0.500000,run,,False,False
+confirmatory,rslt-full,s1,rslt-full vs rsl,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ1-DR-MCNEMAR,0.010000,1.000000,run,,False,False
+confirmatory,rslt-full,s2,rslt-full vs rsl,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ1-DR-MCNEMAR,0.010000,1.000000,run,,False,False
+confirmatory,rslt-full,s3,rslt-full vs rsl,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ1-DR-MCNEMAR,0.010000,1.000000,run,,False,False
+confirmatory,rslt-full,s4,rslt-full vs rsl,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ1-DR-MCNEMAR,0.010000,1.000000,run,,False,False
+confirmatory,rslt-full,s5,rslt-full vs rsl,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ1-DR-MCNEMAR,0.010000,1.000000,run,,False,False
+confirmatory,all,s1,MTTD across configs,9.000000,10,fixture0000000000000000000000000000000000000000000000000000000000,False,kruskal_wallis+dunn(holm),RQ2-MTTD-KW-DUNN-HOLM,n/a,0.029291,run,,False,False
+confirmatory,all,s2,MTTD across configs,9.000000,10,fixture0000000000000000000000000000000000000000000000000000000000,False,kruskal_wallis+dunn(holm),RQ2-MTTD-KW-DUNN-HOLM,n/a,0.029291,run,,False,False
+confirmatory,all,s3,MTTD across configs,9.000000,10,fixture0000000000000000000000000000000000000000000000000000000000,False,kruskal_wallis+dunn(holm),RQ2-MTTD-KW-DUNN-HOLM,n/a,0.029291,run,,False,False
+confirmatory,all,s4,MTTD across configs,9.000000,10,fixture0000000000000000000000000000000000000000000000000000000000,False,kruskal_wallis+dunn(holm),RQ2-MTTD-KW-DUNN-HOLM,n/a,0.029291,run,,False,False
+confirmatory,all,s5,MTTD across configs,9.000000,10,fixture0000000000000000000000000000000000000000000000000000000000,False,kruskal_wallis+dunn(holm),RQ2-MTTD-KW-DUNN-HOLM,n/a,0.029291,run,,False,False
+ablation,l2_contribution,s1,l2_contribution (technique T1611),0.250000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,"dr_difference;ci95=[0.000000, 0.750000]",RQ4-ABL-L2-MCNEMAR,n/a,n/a,run,,False,False
+ablation,rslt-l1-l2,s1,L1+L2 vs L1-only,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ4-ABL-L2-MCNEMAR,0.005000,1.000000,run,,False,False
+ablation,senior_contribution,s1,senior_contribution (technique T1611),0.250000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,"dr_difference;ci95=[0.000000, 0.750000]",RQ4-ABL-SENIOR-MCNEMAR,n/a,n/a,run,,False,False
+ablation,rslt-full,s1,full vs L1+L2,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ4-ABL-SENIOR-MCNEMAR,0.005000,1.000000,run,,False,False
+ablation,l2_contribution,s2,l2_contribution (technique T1552),0.250000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,"dr_difference;ci95=[0.000000, 0.750000]",RQ4-ABL-L2-MCNEMAR,n/a,n/a,run,,False,False
+ablation,rslt-l1-l2,s2,L1+L2 vs L1-only,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ4-ABL-L2-MCNEMAR,0.005000,1.000000,run,,False,False
+ablation,senior_contribution,s2,senior_contribution (technique T1552),0.250000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,"dr_difference;ci95=[0.000000, 0.750000]",RQ4-ABL-SENIOR-MCNEMAR,n/a,n/a,run,,False,False
+ablation,rslt-full,s2,full vs L1+L2,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ4-ABL-SENIOR-MCNEMAR,0.005000,1.000000,run,,False,False
+ablation,l2_contribution,s3,l2_contribution (technique T1613),0.250000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,"dr_difference;ci95=[0.000000, 0.750000]",RQ4-ABL-L2-MCNEMAR,n/a,n/a,run,,False,False
+ablation,rslt-l1-l2,s3,L1+L2 vs L1-only,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ4-ABL-L2-MCNEMAR,0.005000,1.000000,run,,False,False
+ablation,senior_contribution,s3,senior_contribution (technique T1613),0.250000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,"dr_difference;ci95=[0.000000, 0.750000]",RQ4-ABL-SENIOR-MCNEMAR,n/a,n/a,run,,False,False
+ablation,rslt-full,s3,full vs L1+L2,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ4-ABL-SENIOR-MCNEMAR,0.005000,1.000000,run,,False,False
+ablation,l2_contribution,s4,l2_contribution (technique T1071),0.250000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,"dr_difference;ci95=[0.000000, 0.750000]",RQ4-ABL-L2-MCNEMAR,n/a,n/a,run,,False,False
+ablation,rslt-l1-l2,s4,L1+L2 vs L1-only,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ4-ABL-L2-MCNEMAR,0.005000,1.000000,run,,False,False
+ablation,senior_contribution,s4,senior_contribution (technique T1071),0.250000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,"dr_difference;ci95=[0.000000, 0.750000]",RQ4-ABL-SENIOR-MCNEMAR,n/a,n/a,run,,False,False
+ablation,rslt-full,s4,full vs L1+L2,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ4-ABL-SENIOR-MCNEMAR,0.005000,1.000000,run,,False,False
+ablation,l2_contribution,s5,l2_contribution (technique T1496),0.250000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,"dr_difference;ci95=[0.000000, 0.750000]",RQ4-ABL-L2-MCNEMAR,n/a,n/a,run,,False,False
+ablation,rslt-l1-l2,s5,L1+L2 vs L1-only,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ4-ABL-L2-MCNEMAR,0.005000,1.000000,run,,False,False
+ablation,senior_contribution,s5,senior_contribution (technique T1496),0.250000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,"dr_difference;ci95=[0.000000, 0.750000]",RQ4-ABL-SENIOR-MCNEMAR,n/a,n/a,run,,False,False
+ablation,rslt-full,s5,full vs L1+L2,0.000000,4,fixture0000000000000000000000000000000000000000000000000000000000,False,mcnemar,RQ4-ABL-SENIOR-MCNEMAR,0.005000,1.000000,run,,False,False
+confirmatory,rubric,clarity,LLM vs templated,n/a,0,n/a,False,wilcoxon,RQ5-RUBRIC-WILCOXON-CLARITY,0.010000,n/a,"skipped (insufficient data, n=0)",,False,False
+confirmatory,rubric,completeness,LLM vs templated,n/a,0,n/a,False,wilcoxon,RQ5-RUBRIC-WILCOXON-COMPLETENESS,0.010000,n/a,"skipped (insufficient data, n=0)",,False,False
+confirmatory,rubric,attack-coverage,LLM vs templated,n/a,0,n/a,False,wilcoxon,RQ5-RUBRIC-WILCOXON-ATTACK-COVERAGE,0.010000,n/a,"skipped (insufficient data, n=0)",,False,False
+confirmatory,rubric,killchain,LLM vs templated,n/a,0,n/a,False,wilcoxon,RQ5-RUBRIC-WILCOXON-KILLCHAIN,0.010000,n/a,"skipped (insufficient data, n=0)",,False,False
+confirmatory,rubric,actionability,LLM vs templated,n/a,0,n/a,False,wilcoxon,RQ5-RUBRIC-WILCOXON-ACTIONABILITY,0.010000,n/a,"skipped (insufficient data, n=0)",,False,False
+confirmatory,rubric,rater-agreement,inter-rater,n/a,0,n/a,False,icc2k,RQ5-ICC,n/a,n/a,"skipped (insufficient data, n=0)",,False,False
+confirmatory,rsl;rslt-full,benign-adversarial,fr55_trust_bound,n/a,0,n/a,False,empirical_bound_count,RQ4-FR55-BOUND,n/a,n/a,"skipped (insufficient data, n=0)",,False,False

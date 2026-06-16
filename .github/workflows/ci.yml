@@ -41,6 +41,33 @@ jobs:
       - name: Lint
         run: golangci-lint run
 
+  # Story 5.5 (BI-1, BI-9): the FIRST Python toolchain in this otherwise-Go
+  # repo. analysis/analyse.py is a pure-Python, NO-CLUSTER, OFFLINE statistical
+  # pipeline that consumes the Story-5.4 run artefacts. This standalone job
+  # mirrors the go/helm job idiom (checkout + one setup + run steps) but with
+  # setup-python: it pins the deps, runs mypy --strict (the BI-11 type gate),
+  # and runs pytest (the per-helper known-answer suite + the deterministic
+  # fixture smoke test). NO kind cluster, NO services, NO label gate: it is pure
+  # offline analysis on committed fixtures, proven on EVERY PR (the strongest
+  # honest gate). A failure here is isolated from the Go job times.
+  analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pinned analysis deps
+        run: pip install -r analysis/requirements.txt -r analysis/requirements-dev.txt
+
+      - name: Type-check (mypy --strict)
+        run: mypy --strict --config-file analysis/pyproject.toml analysis/
+
+      - name: Unit tests + deterministic fixture smoke test
+        run: pytest analysis/tests/
+
   # Story 3.13 (NFR41): a PR that changes any per-role default prompt must
   # record the new content hash in docs/prompt-changelog.md. Only runs on
   # pull_request (needs a base ref to diff against); fetch-depth 0 so the
