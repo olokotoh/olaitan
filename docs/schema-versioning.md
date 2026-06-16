@@ -14,6 +14,85 @@ The Olaitan project follows semver for the on-the-wire schema:
 - **PATCH** bumps adjust documentation, comments, or examples and do
   not touch the marshalled bytes.
 
+## Major-version migration policy (dual-publish)
+
+This is the load-bearing decision that governs how a breaking
+(`MAJOR`) schema change is rolled out without dropping events, framed
+as an ADR so the rationale survives the people who wrote it.
+
+**Context.** Olaitan is a single-binary streaming pipeline whose rings
+communicate only over NATS JetStream subjects (`internal/subjects/`).
+A producer and its consumers are deployed as one image, but a rolling
+restart, a replay of retained messages, or an external SIEM consumer
+(the `AUDIT.*` family is retained for 90 to 365 days) means an old and
+a new schema shape can be live on the same subject at the same time.
+The schema therefore needs a rule that lets a consumer keep working
+across a version change rather than crashing on an unexpected shape.
+
+**Decision.** The on-the-wire schema follows two complementary rules,
+matching the semver bands above.
+
+- **Schema-on-read for MINOR changes (the steady-state path).** A
+  `MINOR` bump only adds fields, each tagged `json:",omitempty"`, so
+  the pre-bump wire form is byte-identical for the zero value and a
+  consumer that does not know the new field simply ignores it. The
+  consumer reads what it understands and tolerates the rest; it never
+  fails closed on an unknown field. Persisted families apply the same
+  rule on load: an unknown `schema_version` is skipped (logged and
+  passed over) rather than aborting recovery (see the `fsm:`,
+  `override:`, and `AUDIT.*` rows below).
+
+- **Dual-publish for MAJOR changes (the migration path).** A `MAJOR`
+  bump is a breaking change (a field removed or renamed, a type
+  changed, a closed enum tightened) that schema-on-read cannot absorb.
+  It is rolled out by **publishing both the old and the new schema
+  version concurrently for a 7-day migration window**. During the
+  window every consumer can be cut over from the old version to the
+  new one at its own pace, draining any retained old-shape messages.
+  At the end of the 7 days the old version is retired and the producer
+  publishes only the new shape. The window is fixed at 7 days so it
+  comfortably exceeds the longest operational lag (a weekend plus a
+  working day) without holding two shapes live indefinitely.
+
+**Consequences.** The steady state is cheap: a `MINOR` addition costs
+one `omitempty` field and a round-trip test, and no migration window.
+A `MAJOR` change costs a bounded operational window during which a
+producer emits two shapes (and a consumer may briefly need to accept
+both), which is the price of never dropping an event across a breaking
+change. The 7-day bound keeps the dual-publish state from becoming
+permanent technical debt. Because the policy is schema-on-read first,
+almost every change recorded in the table below is a `MINOR` additive
+bump, and no `MAJOR` dual-publish has yet been required.
+
+**Affected NATS subjects.** The policy governs every versioned subject
+in `internal/subjects/subjects.go`: the per-source raw events under
+`olaitan.events.raw.*` (the `RawPrefix` family), `olaitan.events.normalised`,
+the per-pod `olaitan.correlated.*` / `olaitan.state.*` / `olaitan.threats.*`
+subjects, `olaitan.evidence.*`, the published dotted-upper contracts
+`OVERRIDES.applied`, `INCIDENTS.finalised`, `REPORTS.generated`, the
+per-investigation checkpoints `INVESTIGATIONS.{package_id}.{l1,l2}`, and
+the five append-only SIEM audit subjects `AUDIT.transitions` /
+`AUDIT.overrides` / `AUDIT.policies` / `AUDIT.redactions` /
+`AUDIT.assessments`. The persisted Redis families (`fsm:`, `override:`)
+follow the same MINOR schema-on-read rule on load.
+
+**Alternatives considered and rejected.**
+
+- *Hard cutover (stop the old producer, start the new one).* Rejected
+  because retained JetStream messages and a rolling restart guarantee
+  an overlap, so a hard cutover would drop or mis-decode every in-flight
+  old-shape message. The dual-publish window makes the overlap explicit
+  and safe instead of pretending it cannot happen.
+- *An unbounded dual-publish forever.* Rejected because two live shapes
+  per subject is a standing complexity and storage cost; the 7-day
+  bound forces the migration to finish and the old version to retire.
+- *Version-in-subject-name (`SUBJECT.v2`).* Rejected because it
+  fragments the subject space, breaks the stable JetStream stream
+  bindings, and pushes the version into routing rather than into the
+  payload where `schema_version` already records it; the `schema_version`
+  field plus the dual-publish window achieves the same migration without
+  a subject rename.
+
 | Date | Story | Version | Change | Field(s) | Backwards compatible? |
 |---|---|---|---|---|---|
 | 2026-05-15 | 1.13 | MINOR | Added per-event sampling annotation for the per-source rate-limit circuit breaker. | `Event.Sampled` (`bool`, `json:"sampled,omitempty"`); `Event.SamplingRate` (`float64`, `json:"sampling_rate,omitempty"`) | Yes. `omitempty` keeps unsampled events bit-identical to the pre-1.13 wire form; the EVENTS.raw `MaxMsgSize` budget is unaffected. |
