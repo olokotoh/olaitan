@@ -50,7 +50,7 @@ explicitly discard every error) and `staticcheck`-clean.
 
 | Job | What it enforces |
 |---|---|
-| `go` | `make prereg-check`, `make build`, `make test`, `golangci-lint run`. |
+| `go` | `make prereg-check`, `make build`, the schema drift gate (NFR33), the Helm values doc drift gate (FR47), `make test`, `golangci-lint run`. |
 | `analysis` | The Python analysis pipeline: `mypy --strict` plus `pytest` over `analysis/`. |
 | `prompt-changelog` | `hack/check-prompt-changelog.sh` (NFR41): any change to `internal/agent/prompts/defaults/*.txt` must be recorded with its SHA-256 hash in `docs/prompt-changelog.md`. |
 | `helm` | `helm lint`, `helm template` plus `kubeconform`, and the Helm Go test suite (`go test ./deploy/helm/... -tags=helm`). |
@@ -62,6 +62,45 @@ explicitly discard every error) and `staticcheck`-clean.
 
 Heavier suites (`forensics-integration`, `report-archive-integration`,
 `e2e-forensics`, `e2e-scenarios`) are MinIO-backed or label-gated.
+
+## Helm values documentation (FR47)
+
+`docs/helm-values.md` is the operator-facing reference for every tunable
+chart value, and it is AUTO-GENERATED, never hand-edited. It is produced
+by `cmd/olaitan-helmdoc` from the `# @schema ...` annotations carried in
+`deploy/helm/olaitan/values.yaml`. The `go` CI job regenerates it and
+runs `git diff --exit-code docs/helm-values.md`, so a `values.yaml`
+change that is not regenerated (or a hand-edit to the committed doc)
+fails the build.
+
+When you add or change a tunable chart value, annotate its leaf with a
+single `# @schema ...` comment on the line immediately above it, then run
+`make helm-values-doc` and commit the regenerated `docs/helm-values.md`.
+The grammar is:
+
+```yaml
+# @schema type:<t> [minimum:<n>] [maximum:<n>] [enum:a|b|c]
+#         [pattern:"<range>"] effect:"<short effect>" [ref:FRxx]
+key: <default>
+```
+
+- `type:` is one of `integer`, `number`, `string`, `boolean`, `object`,
+  `array`, `duration` (a Go duration string such as `"30m"`).
+- The valid range is taken from `minimum:`/`maximum:` (numeric),
+  `enum:a|b|c` (a trailing empty member, `enum:claude|openai|`, renders
+  "or empty to inherit"), or `pattern:"..."` (a short human range).
+- `effect:` is a short quoted description (British English, no
+  em-dashes).
+- `ref:` is the FR/NFR reference where one applies; omit it otherwise.
+- The DEFAULT is read from the YAML leaf below the annotation, never
+  typed into the annotation, so the documented default can never drift
+  from the real chart default.
+
+A few FR47-named parameters have no chart value (they live only in
+`config/olaitan.yaml`, e.g. `response.excluded_namespaces` and
+`report.redact`, or are code-fixed like the process-wide log level).
+Those are documented in the generator's "Config-file-only parameters"
+literal table, not as fake `values.yaml` keys.
 
 ## PR conventions
 

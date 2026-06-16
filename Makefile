@@ -9,7 +9,7 @@ CONFIG_SRC       := config/olaitan.yaml
 AUDIT_POLICY_SRC := config/audit-policy-default.yaml
 CHART_FILES      := $(CHART_DIR)/files/olaitan.yaml $(CHART_DIR)/files/audit-policy-default.yaml
 
-.PHONY: build test lint prereg-check analysis analysis-test docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics eval-smoke scenarios-smoke capture-it e2e-local-down schemas
+.PHONY: build test lint prereg-check analysis analysis-test docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics eval-smoke scenarios-smoke capture-it e2e-local-down schemas helm-values-doc
 
 # envtest-bin downloads the kube-apiserver and etcd binaries that the
 # Story 1.11 posture-client integration tests (and any future
@@ -75,6 +75,20 @@ analysis-test:
 # regenerated, or a hand-edit to any committed schema, breaks the build.
 schemas:
 	go run ./cmd/olaitan-schemagen docs/schemas
+
+# helm-values-doc (Story 6.4, FR47) regenerates docs/helm-values.md from
+# the `# @schema ...` annotations carried in deploy/helm/olaitan/
+# values.yaml. The generator parses each annotation and pairs it with the
+# REAL default value beneath it in the YAML, so the documented default
+# never drifts from the chart default. It also emits a "Config-file-only
+# parameters" section for the FR47-named items that have no Helm value
+# (excluded_namespaces, redaction patterns, per-component logging). The CI
+# `go` job runs this then `git add -N docs/helm-values.md && git diff
+# --exit-code docs/helm-values.md` so a values.yaml change that is not
+# regenerated, or a hand-edit to the committed doc, breaks the build.
+# Deterministic: a re-run from a clean tree is a no-op.
+helm-values-doc:
+	go run ./cmd/olaitan-helmdoc
 
 docker-build:
 	docker build -t $(IMAGE):$(TAG) .

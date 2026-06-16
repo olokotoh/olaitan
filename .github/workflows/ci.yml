@@ -51,6 +51,24 @@ jobs:
           git add -N docs/schemas/
           git diff --exit-code docs/schemas/
 
+      # Story 6.4 (FR47): the Helm values doc drift gate. `make
+      # helm-values-doc` regenerates docs/helm-values.md from the
+      # `# @schema ...` annotations in deploy/helm/olaitan/values.yaml,
+      # reading each value's REAL default from the YAML leaf. A values.yaml
+      # annotation or default change that is not regenerated, AND a
+      # hand-edit to the committed doc, both fail here. The generator is
+      # deterministic, so a clean tree leaves no diff. Same `git add -N`
+      # hardening as the schema gate (a bare diff is blind to a
+      # newly-generated-but-uncommitted file).
+      - name: Helm values doc drift gate (FR47)
+        run: |
+          make helm-values-doc
+          git add -N docs/helm-values.md
+          git diff --exit-code docs/helm-values.md || { \
+            echo "::error::values.yaml changed but docs/helm-values.md was not regenerated. Run 'make helm-values-doc' and commit docs/helm-values.md."; \
+            exit 1; \
+          }
+
       - name: Test
         run: make test
 

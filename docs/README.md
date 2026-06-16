@@ -46,6 +46,11 @@ Alternatives considered and rejected / Hand-off), where the
   the severity and false-positive conventions, worked examples from the
   rule corpus, and how to validate a rule against the SIGMA-HQ reference
   parser.
+- [Helm values reference](helm-values.md) - the operator-facing FR47
+  reference for every tunable chart value (name, type, default, valid
+  range, effect, FR/NFR reference), auto-generated from the `# @schema`
+  annotations in `deploy/helm/olaitan/values.yaml` by
+  `make helm-values-doc`; CI fails any un-regenerated drift.
 - [Prompt changelog](prompt-changelog.md) - the NFR41 prompt-content
   audit trail.
 - [Traceability matrix](traceability.md) - the NFR42 code-to-thesis
