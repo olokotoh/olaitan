@@ -1,0 +1,6 @@
+package fixture
+
+// v8 (edge): a subject literal as a map value, not a const.
+var routes = map[string]string{
+	"correlated": "olaitan.correlated.tenant-acme.web-0",
+}

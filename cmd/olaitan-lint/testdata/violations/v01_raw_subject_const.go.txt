@@ -1,0 +1,4 @@
+package fixture
+
+// v1 (easy): a plain raw-event subject const at a call-site package.
+const rawFalco = "olaitan.events.raw.falco"

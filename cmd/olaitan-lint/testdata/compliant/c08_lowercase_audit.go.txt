@@ -1,0 +1,4 @@
+package fixture
+
+// c8 (edge): a lowercase "audit." token is not the dotted-UPPER AUDIT. family.
+const auditLabel = "audit.local.scope"

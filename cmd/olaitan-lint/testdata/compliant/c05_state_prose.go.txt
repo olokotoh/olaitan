@@ -1,0 +1,4 @@
+package fixture
+
+// c5: a bare English phrase that happens to start "state:" with a space.
+const statusLabel = "state: pending"

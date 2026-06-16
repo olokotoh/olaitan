@@ -1,0 +1,4 @@
+package fixture
+
+// v5: an fsm: key with a workload-id token after the colon.
+const fsmKey = "fsm:default/Deployment/web"

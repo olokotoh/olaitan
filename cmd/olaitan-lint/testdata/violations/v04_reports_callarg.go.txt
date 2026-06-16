@@ -1,0 +1,8 @@
+package fixture
+
+func publish(subject string, payload []byte) {}
+
+// v4: subject hard-coded as a call argument.
+func emit() {
+	publish("REPORTS.generated", nil)
+}

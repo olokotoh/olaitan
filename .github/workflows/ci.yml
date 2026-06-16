@@ -32,6 +32,21 @@ jobs:
       - name: Build
         run: make build
 
+      # Story 6.5 (NFR34/NFR42): the canonical-name lint gate. olaitan-lint
+      # scans the Go source tree with go/ast and fails the build on any string
+      # literal that matches a canonical NATS-subject shape outside
+      # internal/subjects/ or a canonical Redis-key shape outside
+      # internal/keys/, printing file:line:col and the offending literal. This
+      # mechanically enforces the docs/patterns.md sections 1-2 conventions
+      # (previously review-only). It is a SEPARATE step from the golangci-lint
+      # step below so a canonical-name failure is attributable to THIS gate
+      # rather than buried among the staticcheck/errcheck output (the 6.3
+      # schema-gate / 6.4 helm-doc-gate one-named-step-per-enforcement
+      # precedent). An intentional literal is suppressed with an auditable
+      # `//olaitan-lint:allow <subject|key> <reason>` comment.
+      - name: Canonical-name lint (olaitan-lint, NFR34)
+        run: make olaitan-lint
+
       # Story 6.3 (NFR40/NFR33): the schema drift gate. `make schemas`
       # reflection-regenerates the three Class A external-consumer schemas
       # (olt_event, evidence_package, workload_posture) from the

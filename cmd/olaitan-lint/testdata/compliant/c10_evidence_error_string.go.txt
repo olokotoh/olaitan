@@ -1,0 +1,6 @@
+package fixture
+
+import "errors"
+
+// c10: an evidence: package error string (space after colon -> not a key).
+var errNotFound = errors.New("evidence: incident not found")

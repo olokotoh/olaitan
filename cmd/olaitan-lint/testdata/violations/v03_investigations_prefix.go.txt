@@ -1,0 +1,5 @@
+package fixture
+
+// v3 (edge): an INVESTIGATIONS.* dynamic checkpoint subject built at a call
+// site instead of via subjects.InvestigationL1.
+const investigationL1 = "INVESTIGATIONS.pkg-1.l1"

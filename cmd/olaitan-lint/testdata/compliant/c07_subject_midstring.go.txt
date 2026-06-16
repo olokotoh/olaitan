@@ -1,0 +1,5 @@
+package fixture
+
+// c7 (edge): a subject name MID-string (not anchored at literal start). The
+// heuristic anchors at the start, so a prose mention is compliant by design.
+const helpText = "see the olaitan.events docs for the subject contract"

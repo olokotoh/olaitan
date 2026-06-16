@@ -23,8 +23,8 @@ import (
 // production Falco / CNI exporters publish to). Held as local constants so this
 // package does not couple to internal/subjects.
 const (
-	RawFalcoSubject   = "olaitan.events.raw.falco"
-	RawNetworkSubject = "olaitan.events.raw.network"
+	RawFalcoSubject   = "olaitan.events.raw.falco"   //olaitan-lint:allow subject deliberate local constant so this shared recipe package does not couple to internal/subjects (imported by cmd/olaitan-eval and tests/e2e, which cannot import package main)
+	RawNetworkSubject = "olaitan.events.raw.network" //olaitan-lint:allow subject deliberate local constant so this shared recipe package does not couple to internal/subjects (imported by cmd/olaitan-eval and tests/e2e, which cannot import package main)
 )
 
 // Event is one synthetic raw event in a scenario's deterministic stimulus: the

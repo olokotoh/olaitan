@@ -1,0 +1,7 @@
+package fixture
+
+import "errors"
+
+// c3 (hard): a package:message error string. The space after the colon is the
+// discriminator that keeps it out of the key check.
+var errNilClient = errors.New("baseline: store load: redis client is nil")

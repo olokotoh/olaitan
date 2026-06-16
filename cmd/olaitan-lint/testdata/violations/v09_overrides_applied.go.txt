@@ -1,0 +1,4 @@
+package fixture
+
+// v9: the OVERRIDES.applied published-contract subject.
+const overridesApplied = "OVERRIDES.applied"

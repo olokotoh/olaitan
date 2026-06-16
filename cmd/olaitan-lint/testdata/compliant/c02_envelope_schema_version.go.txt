@@ -1,0 +1,5 @@
+package fixture
+
+// c2: the self-describing envelope schema-version (olaitan.eval... is not an
+// enumerated subject second segment).
+const envelopeSchemaVersion = "olaitan.eval.capture.envelope.v1"

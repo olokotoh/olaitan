@@ -1,0 +1,5 @@
+package fixture
+
+// c6: AUDIT.transitions and olaitan.events.raw.falco appear in THIS comment;
+// a comment is not a BasicLit, so the AST walk never sees them.
+const unrelated = "just a value"

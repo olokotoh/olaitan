@@ -1,0 +1,5 @@
+package fixture
+
+// c1: a Kubernetes annotation domain (olaitan.io/ has a / second segment,
+// never legal in a subject; the enumerated-second-segment guard excludes it).
+const annotationEnable = "olaitan.io/log-sidecar"
