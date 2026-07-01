@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,16 +33,41 @@ const (
 // DefaultRoleTimeouts returns the AC-mandated per-role TOTAL retry budget
 // (Story 3.2 AC2: 30s l1, 30s l2, 60s senior, 120s dfir-reserved). A fresh
 // map is returned per call so one provider's test seam cannot mutate
-// another provider's table. Making these config-routable is DEFERRED
-// (DW3.8-1): no Story 3.8 AC requires it, so the per-role timeout config
-// knob lands with Story 3.16 mode wiring or whenever an AC needs it.
+// another provider's table.
+//
+// DW3.8-1 (config-routability): the AC defaults are calibrated for the
+// Claude baseline. A slower cloud provider (e.g. an OpenAI-compatible
+// endpoint under load) can exceed them, so OLT_LLM_ROLE_TIMEOUT_MULTIPLIER
+// scales every per-role default by a positive float. Unset/empty/invalid
+// (<= 0 or unparseable) leaves the AC defaults byte-identical, so existing
+// callers and tests observe no change.
 func DefaultRoleTimeouts() map[Role]time.Duration {
-	return map[Role]time.Duration{
-		RoleL1:     30 * time.Second,
-		RoleL2:     30 * time.Second,
-		RoleSenior: 60 * time.Second,
-		RoleDFIR:   120 * time.Second,
+	m := roleTimeoutMultiplier()
+	scale := func(d time.Duration) time.Duration {
+		return time.Duration(float64(d) * m)
 	}
+	return map[Role]time.Duration{
+		RoleL1:     scale(30 * time.Second),
+		RoleL2:     scale(30 * time.Second),
+		RoleSenior: scale(60 * time.Second),
+		RoleDFIR:   scale(120 * time.Second),
+	}
+}
+
+// roleTimeoutMultiplier reads OLT_LLM_ROLE_TIMEOUT_MULTIPLIER (DW3.8-1) as
+// a positive float scaling the per-role default timeouts. Absent, empty,
+// unparseable, or non-positive all resolve to 1.0 (the AC-mandated
+// defaults, unchanged).
+func roleTimeoutMultiplier() float64 {
+	v := strings.TrimSpace(os.Getenv("OLT_LLM_ROLE_TIMEOUT_MULTIPLIER"))
+	if v == "" {
+		return 1.0
+	}
+	m, err := strconv.ParseFloat(v, 64)
+	if err != nil || m <= 0 {
+		return 1.0
+	}
+	return m
 }
 
 // ResolveStatus maps the final outcome of a retried provider call onto the

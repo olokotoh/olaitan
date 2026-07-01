@@ -40,7 +40,7 @@ sigma_corpus_git_sha: c7f7ff1f84cdfc41f725bede05eb230abfa2aba3
 # placeholder claude-opus-4-7-2026-MM-DD never shipped and is STALE;
 # Story 5.1 pins claude-opus-4-8 (BI-3). Recorded + hashed here; wired to
 # the chart's analyst.model by Story 5.3/5.5.
-llm_model_version: claude-opus-4-8
+llm_model_version: deepseek-chat
 
 # (6) Random seed. Deterministic default threaded to any harness-side
 # randomness. 0 is a valid, fully-deterministic choice.
