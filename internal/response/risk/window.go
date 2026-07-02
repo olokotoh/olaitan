@@ -21,12 +21,25 @@
 package risk
 
 import (
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/olokotoh/olaitan/internal/decision/severitybucket"
 	"github.com/olokotoh/olaitan/internal/schema"
 )
+
+// severityRank ranks a RuleMatch severity for "strongest match" selection. It
+// mirrors how the score calculator reads severity: a numeric string is its
+// value (so "100" outranks "75"), and a keyword ("critical"/"high"/...) falls
+// back to the severitybucket mapping. Using severitybucket alone would collapse
+// all numeric strings to one bucket and fail to distinguish 75 from 100.
+func severityRank(sev string) int {
+	if n, err := strconv.Atoi(sev); err == nil {
+		return n
+	}
+	return severitybucket.Score(sev)
+}
 
 // entry is a workload's current rolling aggregate.
 type entry struct {
@@ -73,7 +86,7 @@ func (w *Window) Observe(workloadID string, pkg schema.EvidencePackage, llmCappe
 	// Strongest rule match by bucketed severity.
 	for i := range pkg.RuleMatches {
 		rm := pkg.RuleMatches[i]
-		s := severitybucket.Score(rm.Severity)
+		s := severityRank(rm.Severity)
 		if e.rule == nil || s > e.ruleScore {
 			cp := rm
 			e.rule = &cp
