@@ -25,6 +25,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -70,6 +71,7 @@ import (
 	"github.com/olokotoh/olaitan/internal/response/fsm"
 	"github.com/olokotoh/olaitan/internal/response/netpol"
 	"github.com/olokotoh/olaitan/internal/response/override"
+	"github.com/olokotoh/olaitan/internal/response/risk"
 	"github.com/olokotoh/olaitan/internal/response/settling"
 	"github.com/olokotoh/olaitan/internal/retry"
 	"github.com/olokotoh/olaitan/internal/schema"
@@ -1164,7 +1166,13 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 			return err
 		})
 	}
-	if err := wireFSMConsumer(ctx, g, log, nc, scoreCalc, stateMachine, chain, chainMode, breaker, assessmentPub, chainRuns); err != nil {
+	// Rolling per-workload risk window: score a workload on its recent
+	// correlated evidence (strongest rule + baseline + capped LLM within the
+	// window) instead of each single-signal package in isolation, so a
+	// sustained multi-signal attack escalates. OLT_RISK_WINDOW_SECONDS sets the
+	// decay TTL; 0/unset disables it (the per-package behaviour, unchanged).
+	riskWindow := risk.New(time.Duration(envSeconds("OLT_RISK_WINDOW_SECONDS", 0)) * time.Second)
+	if err := wireFSMConsumer(ctx, g, log, nc, scoreCalc, stateMachine, chain, chainMode, breaker, assessmentPub, chainRuns, riskWindow); err != nil {
 		closeNATS()
 		return fmt.Errorf("aggregator: fsm consumer: %w", err)
 	}
@@ -1692,12 +1700,34 @@ const fsmFetchBackoff = time.Second
 // a live JetStream consumer (round-2 review: the inline call site was
 // otherwise untested -- a regression feeding 0 instead of llmCapped shipped
 // green).
-func chainAdjustedScore(ctx context.Context, pkg schema.EvidencePackage, scoreCalc *score.Calculator, chain *analyst.Chain, chainMode string, breaker *analyst.CircuitBreaker, auditPub responseaudit.AssessmentAuditPublisher, chainRuns *prometheus.CounterVec, log *slog.Logger) (schema.ConfidenceScore, error) {
+// envSeconds reads a non-negative integer env var (seconds), returning def when
+// unset, empty, or unparseable/negative.
+func envSeconds(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return def
+	}
+	return n
+}
+
+func chainAdjustedScore(ctx context.Context, pkg schema.EvidencePackage, scoreCalc *score.Calculator, chain *analyst.Chain, chainMode string, breaker *analyst.CircuitBreaker, auditPub responseaudit.AssessmentAuditPublisher, chainRuns *prometheus.CounterVec, riskWindow *risk.Window, now time.Time, log *slog.Logger) (schema.ConfidenceScore, error) {
 	llmCapped := 0
 	if chain != nil {
 		llmCapped = safeChainConfidence(ctx, pkg, chain, chainMode, breaker, auditPub, chainRuns, log)
 	}
-	return scoreCalc.Score(&pkg, llmCapped)
+	// Fold this package's signals into the workload's rolling risk aggregate and
+	// score the aggregate, so recent correlated evidence (rule + baseline + LLM)
+	// sums rather than each single-signal package scoring alone. A disabled
+	// window returns the package's own signals, so the score is unchanged.
+	rules, devs, llm := riskWindow.Observe(pkg.WorkloadID, pkg, llmCapped, now)
+	agg := pkg
+	agg.RuleMatches = rules
+	agg.BaselineDeviations = devs
+	return scoreCalc.Score(&agg, llm)
 }
 
 // wireFSMConsumer wires the Story 2.2 scoring + FSM evidence consumer, which
@@ -1710,7 +1740,7 @@ func chainAdjustedScore(ctx context.Context, pkg schema.EvidencePackage, scoreCa
 // recorded inline (the standalone investigation-chain consumer is removed).
 // It runs on its own errgroup goroutine and returns nil on graceful ctx
 // cancellation.
-func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, nc *natsclient.Client, scoreCalc *score.Calculator, stateMachine *fsm.Machine, chain *analyst.Chain, chainMode string, breaker *analyst.CircuitBreaker, auditPub responseaudit.AssessmentAuditPublisher, chainRuns *prometheus.CounterVec) error {
+func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, nc *natsclient.Client, scoreCalc *score.Calculator, stateMachine *fsm.Machine, chain *analyst.Chain, chainMode string, breaker *analyst.CircuitBreaker, auditPub responseaudit.AssessmentAuditPublisher, chainRuns *prometheus.CounterVec, riskWindow *risk.Window) error {
 	stream, err := nc.JetStream().Stream(ctx, "EVIDENCE")
 	if err != nil {
 		return fmt.Errorf("stream EVIDENCE: %w", err)
@@ -1769,7 +1799,7 @@ func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, n
 			// score (a nil chain folds 0 = deterministic-only, Epic 2). The
 			// chain->fold->score wiring lives in chainAdjustedScore so it is
 			// unit-testable without a live JetStream consumer.
-			sc, serr := chainAdjustedScore(ctx, pkg, scoreCalc, chain, chainMode, breaker, auditPub, chainRuns, log)
+			sc, serr := chainAdjustedScore(ctx, pkg, scoreCalc, chain, chainMode, breaker, auditPub, chainRuns, riskWindow, time.Now().UTC(), log)
 			if serr != nil {
 				log.Warn("aggregator: fsm score failed; dropping", "err", serr, "package_id", pkg.PackageID)
 				_ = msg.Ack()

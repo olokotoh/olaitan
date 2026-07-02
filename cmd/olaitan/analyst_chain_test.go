@@ -16,6 +16,7 @@ import (
 	"github.com/olokotoh/olaitan/internal/decision/score"
 	"github.com/olokotoh/olaitan/internal/metrics"
 	responseaudit "github.com/olokotoh/olaitan/internal/response/audit"
+	"github.com/olokotoh/olaitan/internal/response/risk"
 	"github.com/olokotoh/olaitan/internal/schema"
 )
 
@@ -192,11 +193,11 @@ func TestFSMConsumerFoldsChainConfidenceIntoScore(t *testing.T) {
 	// chain's capped confidence at this call site must fail this test
 	// (round-2 Regression Hunter: the inline call site was previously
 	// unprotected).
-	withChain, err := chainAdjustedScore(context.Background(), pkg, calc, chain, chain.Mode(), nil, pub, nil, chainTestLogger())
+	withChain, err := chainAdjustedScore(context.Background(), pkg, calc, chain, chain.Mode(), nil, pub, nil, risk.New(0), time.Now().UTC(), chainTestLogger())
 	if err != nil {
 		t.Fatalf("chainAdjustedScore(with chain): %v", err)
 	}
-	noChain, err := chainAdjustedScore(context.Background(), pkg, calc, nil, "", nil, nil, nil, chainTestLogger())
+	noChain, err := chainAdjustedScore(context.Background(), pkg, calc, nil, "", nil, nil, nil, risk.New(0), time.Now().UTC(), chainTestLogger())
 	if err != nil {
 		t.Fatalf("chainAdjustedScore(nil chain): %v", err)
 	}
