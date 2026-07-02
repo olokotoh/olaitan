@@ -146,6 +146,15 @@ func runOneEvalTrial(t *testing.T, js jetstream.JetStream, capturer *capture.Cap
 	// FSM state, so runs never contaminate one another.
 	podName := fmt.Sprintf("web-%s-%s-r%02d", tr.config, tr.scenario, tr.run)
 	deployName := podName
+	if os.Getenv("OLT_EVAL_REAL_WORKLOAD") != "" {
+		// Create a REAL Deployment-owned pod so the rule's falco event resolves
+		// (via the correlator) to tenant-acme/Deployment/<deployName>, the SAME
+		// key the preseed baseline uses. Without a real pod the rule falls back
+		// to a tenant-acme/Pod/<name> key while the preseed baseline sits on the
+		// Deployment key, so the two signals never co-locate and the risk window
+		// has nothing to sum. applyScenarioWorkload returns the actual pod name.
+		podName = applyScenarioWorkload(t, deployName)
+	}
 
 	// Clean the pipeline streams so the capturer drains ONLY this run.
 	purgeEvalStreams(t, js)
