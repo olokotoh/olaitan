@@ -96,7 +96,12 @@ func TestEvalMatrix(t *testing.T) {
 
 	t.Logf("matrix: config=%s scenarios=%v runs=%d ceiling=%s", config, scenarios, runs, ceiling)
 	for _, sc := range scenarios {
-		tgt := readScenarioTarget(t, scenariosRoot, sc)
+		// The benign sweep (Story 7.3) has no attack target file and its own
+		// observation flow; the attack scenarios read their target.yaml.
+		var tgt evalScenarioTarget
+		if sc != evalscenario.BenignScenarioID {
+			tgt = readScenarioTarget(t, scenariosRoot, sc)
+		}
 		for run := 0; run < runs; run++ {
 			tr := evalTrial{
 				config:      config,
@@ -113,10 +118,106 @@ func TestEvalMatrix(t *testing.T) {
 			// t.Fatalf aborting every remaining scenario and run (PR #92
 			// review). A failed subtest still fails the overall test.
 			t.Run(fmt.Sprintf("%s-%s-r%02d", config, sc, run), func(t *testing.T) {
+				if tr.scenario == evalscenario.BenignScenarioID {
+					runOneBenignSweep(t, js, capturer, tr)
+					return
+				}
 				runOneEvalTrial(t, js, capturer, tr)
 			})
 		}
 	}
+}
+
+// runOneBenignSweep runs one benign false-positive observation (Story 7.3): it
+// primes the workload's baseline, then injects the benign event stream at a
+// steady rate for OLT_EVAL_BENIGN_MINUTES of real time, capturing every FSM
+// transition. Zero transitions is the good (and expected) result; the analysis
+// pipeline reads escalations-past-CLEAN over the wall window as the FPR. The
+// injected-event count is recorded so a zero-escalation run is distinguishable
+// from a broken (no-injection) one.
+func runOneBenignSweep(t *testing.T, js jetstream.JetStream, capturer *capture.Capturer, tr evalTrial) {
+	t.Helper()
+	podName := fmt.Sprintf("web-%s-benign-r%02d", tr.config, tr.run)
+	deployName := podName
+	if os.Getenv("OLT_EVAL_REAL_WORKLOAD") != "" {
+		podName = applyScenarioWorkload(t, deployName)
+	}
+
+	waitForPipelineQuiescent(t, js, 90*time.Second)
+	purgeEvalStreams(t, js)
+
+	// Prime the baseline so a benign observation is judged against an
+	// established profile (else warm-up would suppress deviations anyway, but
+	// priming makes the sweep test the STEADY-STATE FPR).
+	publishSyntheticEvidencePackagesFor(t, js, podName, deployName)
+	waitForBaselineConsumerDrained(t, js)
+	waitForPipelineQuiescent(t, js, 60*time.Second)
+	purgeEvalStreams(t, js)
+
+	minutes := envInt("OLT_EVAL_BENIGN_MINUTES", 10)
+	if minutes <= 0 {
+		t.Fatalf("OLT_EVAL_BENIGN_MINUTES must be positive, got %d", minutes)
+	}
+	ratePerMin := envInt("OLT_EVAL_BENIGN_RATE_PER_MIN", 30)
+	if ratePerMin <= 0 {
+		t.Fatalf("OLT_EVAL_BENIGN_RATE_PER_MIN must be positive, got %d", ratePerMin)
+	}
+	interval := time.Minute / time.Duration(ratePerMin)
+
+	startedAt := time.Now().UTC()
+	window := time.Duration(minutes) * time.Minute
+	deadline := time.Now().Add(window)
+	injected := 0
+	for tick := 0; time.Now().Before(deadline); tick++ {
+		for _, ev := range evalscenario.BenignEvents(podName, time.Now(), tick) {
+			publishJS(t, js, ev.Subject, ev.Payload)
+			injected++
+		}
+		select {
+		case <-time.After(interval):
+		case <-time.After(time.Until(deadline)):
+		}
+	}
+	// Let the last events settle through the pipeline before capture.
+	waitForPipelineQuiescent(t, js, 60*time.Second)
+
+	runID := fmt.Sprintf("%s-%s-benign-r%02d",
+		startedAt.Format("20060102T150405.000Z"), tr.config, tr.run)
+	runDir := filepath.Join(tr.outRoot, runID)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	res, err := capturer.Capture(ctx, runDir)
+	cancel()
+	if err != nil {
+		t.Fatalf("capture benign %s: %v", runID, err)
+	}
+	sz, err := capture.CheckSize(runDir, capture.DefaultMaxRunSizeBytes)
+	if err != nil {
+		t.Fatalf("size check %s: %v", runID, err)
+	}
+
+	meta := evalRunMetadata{
+		RunID:                runID,
+		ManifestSHA256:       tr.manifestSHA,
+		Scenario:             evalscenario.BenignScenarioID,
+		Config:               tr.config,
+		Runs:                 1,
+		StartedAt:            startedAt.Format(time.RFC3339Nano),
+		FinishedAt:           time.Now().UTC().Format(time.RFC3339Nano),
+		OlaitanEvalVersion:   tr.evalVersion,
+		ScenarioInstance:     tr.run,
+		ResourceUsage:        capture.SnapshotResourceUsage(),
+		SizeBytes:            sz.SizeBytes,
+		SizeCapExceeded:      sz.SizeCapExceeded,
+		RiskWindowSeconds:    envInt("OLT_RISK_WINDOW_SECONDS", 0),
+		RealWorkload:         os.Getenv("OLT_EVAL_REAL_WORKLOAD") != "",
+		PreseedDirectPublish: true,
+		BenignSweep:          true,
+		BenignMinutes:        minutes,
+		BenignRatePerMin:     ratePerMin,
+		BenignInjectedEvents: injected,
+	}
+	writeEvalMetadata(t, runDir, meta)
+	t.Logf("benign sweep %s: injected=%d fsm_transitions=%d over %dm", runID, injected, res.Counts.FSM, minutes)
 }
 
 type evalScenarioTarget struct {
@@ -167,6 +268,11 @@ type evalRunMetadata struct {
 	PreseedDirectPublish bool `yaml:"preseed_direct_publish"`
 	PreseedTransitions   int  `yaml:"preseed_transitions"`
 	Staged               bool `yaml:"staged"`
+	// Benign false-positive sweep (Story 7.3).
+	BenignSweep          bool `yaml:"benign_sweep,omitempty"`
+	BenignMinutes        int  `yaml:"benign_minutes,omitempty"`
+	BenignRatePerMin     int  `yaml:"benign_rate_per_min,omitempty"`
+	BenignInjectedEvents int  `yaml:"benign_injected_events,omitempty"`
 }
 
 func runOneEvalTrial(t *testing.T, js jetstream.JetStream, capturer *capture.Capturer, tr evalTrial) {
