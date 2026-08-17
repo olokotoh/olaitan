@@ -36,6 +36,37 @@ func TestDefaultRoleTimeoutsContract(t *testing.T) {
 	}
 }
 
+// TestRoleTimeoutMultiplier_RejectsPathologicalValues pins the PR #92 review
+// fix: NaN, Inf, oversized, non-positive, and unparseable multipliers must all
+// resolve to the unscaled AC defaults. Before the guard, NaN passed `m <= 0`
+// and an oversized multiplier overflowed the duration arithmetic to a negative
+// timeout, killing every provider call instantly.
+func TestRoleTimeoutMultiplier_RejectsPathologicalValues(t *testing.T) {
+	defaults := map[Role]time.Duration{
+		RoleL1: 30 * time.Second, RoleL2: 30 * time.Second,
+		RoleSenior: 60 * time.Second, RoleDFIR: 120 * time.Second,
+	}
+	for _, bad := range []string{"NaN", "nan", "Inf", "+Inf", "-Inf", "0", "-1", "2x", "1e18", "101"} {
+		t.Setenv("OLT_LLM_ROLE_TIMEOUT_MULTIPLIER", bad)
+		got := DefaultRoleTimeouts()
+		for role, d := range defaults {
+			if got[role] != d {
+				t.Errorf("multiplier %q: DefaultRoleTimeouts[%s] = %v, want unscaled %v", bad, role, got[role], d)
+			}
+		}
+		for role, d := range got {
+			if d <= 0 {
+				t.Errorf("multiplier %q: DefaultRoleTimeouts[%s] = %v is non-positive", bad, role, d)
+			}
+		}
+	}
+	// A sane multiplier still scales.
+	t.Setenv("OLT_LLM_ROLE_TIMEOUT_MULTIPLIER", "4")
+	if got := DefaultRoleTimeouts()[RoleL1]; got != 120*time.Second {
+		t.Errorf("multiplier 4: RoleL1 = %v, want 120s", got)
+	}
+}
+
 func TestResolveStatusMapping(t *testing.T) {
 	sentinelPermanent := errors.New("permanent-class")
 	isPermanent := func(err error) bool { return errors.Is(err, sentinelPermanent) }

@@ -1,0 +1,30 @@
+# values-eval-egress.yaml -- operator-supplied LLM-provider egress for the
+# live evaluation run.
+#
+# The release NetworkPolicy's egress allowlist is DNS + apiserver +
+# intra-namespace only (networkpolicy.yaml). A real cloud LLM analyst
+# (DeepSeek / Claude / OpenAI) needs HTTPS egress to the public endpoint,
+# which the chart exposes as the operator-supplied networkPolicy.extraEgress
+# hole (networkpolicy.yaml:18 "extra egress CIDRs and ports for LLM
+# provider"). This overlay opens TCP 443 to public IPs while EXCLUDING the
+# RFC1918 private ranges, so intra-cluster and node traffic still flow only
+# through the declared intra-namespace / apiserver rules -- the production
+# pattern for an operator that allowlists an external LLM.
+networkPolicy:
+  extraEgress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              # Non-public ranges beyond RFC1918 (PR #92 review): link-local /
+              # cloud-metadata (169.254.0.0/16) and CGNAT (100.64.0.0/10, the
+              # space kind and several CNIs allocate from) must not become
+              # reachable through the "public IPs only" hole.
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443

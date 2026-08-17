@@ -175,6 +175,15 @@ spec:
             - name: OLT_NATS_STREAM_MAXBYTES_OVERRIDE
               value: {{ . | quote }}
             {{- end }}
+            {{- range .Values.aggregator.extraEnv }}
+            # Operator-supplied aggregator environment (PR #92 review: the
+            # risk-window and LLM-timeout knobs, OLT_RISK_WINDOW_SECONDS and
+            # OLT_LLM_ROLE_TIMEOUT_MULTIPLIER, previously had no committed
+            # deploy mechanism and could only be set by out-of-band
+            # `kubectl set env`).
+            - name: {{ .name | quote }}
+              value: {{ .value | quote }}
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /healthz

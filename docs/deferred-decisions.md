@@ -1246,3 +1246,66 @@ unchanged across all three ADRs.
 - Project memory (`project_olaitan.md`) is refreshed by Story
   1.10 to reflect v3.31.5 and the operator install path. Done
   out of band; this ADR is the durable technical record.
+
+## ADR-2026-08-17-01: Risk-window scoring model (Option B) ratified; evaluation decisions closed post-graduation
+
+**Status.** Accepted.
+
+**Context.** Story 7.1 established that the per-package scoring model
+structurally prevented a workload's rule match and baseline deviation
+(which arrive as separate single-signal EvidencePackages) from summing
+in the ThreatScore, capping every rule-bearing arm at SUSPICIOUS. Two
+remedies were identified: Option A (combined-signal package assembly in
+the correlator) and Option B (a rolling per-workload risk aggregate).
+The choice was reserved for the academic supervisor while the
+dissertation was under examination, and the thesis honestly reported
+the as-designed SUSPICIOUS ceiling with the risk window as a
+demonstrated mechanism plus future work. The degree completed on
+2026-08-15; the reserved supervision gate is thereby discharged, and
+decision authority rests with the project owner.
+
+**Decision.** The project owner ratifies **Option B**, the rolling
+per-workload risk window (`internal/response/risk`), as the shipped
+scoring model, off by default (`OLT_RISK_WINDOW_SECONDS` unset = the
+per-package behaviour, byte-identical). Rationale: Option B models
+SIEM-style workload risk accumulation, requires no correlator
+assembly-contract change, is flag-guarded so the pre-window behaviour
+remains the default and reproducible, and preserves the trust bound by
+construction (the window aggregates the already-capped LLM term; the
+calculator re-clamps at LLMCap regardless).
+
+The following evaluation-methodology decisions reserved alongside it
+are recorded as closed by the same authority, for the post-thesis
+publication campaign:
+
+1. **Detection metric**: at-least-SUSPICIOUS remains the primary
+   detection criterion; exact-target-state is reported alongside as a
+   secondary, risk-window-dependent measure.
+2. **Provider substitution**: the recorded campaign ran `deepseek-chat`
+   (OpenAI-compatible provider, trust-tier cap 30) in place of the
+   originally pinned `claude-opus-4-8`. Disclosed in eval/manifest.yaml,
+   the evaluation log, and every reported result; results against the
+   substituted provider are reported as such. Post-freeze consequence:
+   confirmatory tests affected by the substitution are reported as
+   exploratory per the pre-registration's own amendment rule.
+3. **LLM-arm state differentiation (Story 7.1 AC4)**: by trust-bound
+   design the capped LLM term cannot change the FSM state reached, so
+   the FSM-state headline differentiates the single-source baseline
+   from the rule-bearing arms only. The LLM arms' measured value is
+   ATT&CK attribution quality (Track A). The AC is closed as
+   by-design-unreachable and the epic goal re-scoped accordingly.
+4. **AUDIT.transitions composition field**: extending the transition
+   audit schema with the per-term score composition (rules/baseline/
+   LLM plus risk-window provenance) is DEFERRED as an additive MINOR
+   schema change; until it lands, the composition is emitted on the
+   FSM consumer's structured transition log line (PR #92).
+5. **Risk-window restart semantics**: the window is process-local and
+   resets on aggregator restart while FSM state restores from Redis.
+   Accepted: the failure direction is conservative (scores can only be
+   lower after a restart, never higher), and persisting the window is
+   deferred until operational need is demonstrated.
+
+**Provenance.** PR #92; risk window commits dbce5d7/5413f84/42e7300
+plus the PR #92 review-fix commits; evaluation log
+(supervision/EVAL-LOG.md) 2026-07-02 entries; traceability row
+`c3.6.4-risk-window`.

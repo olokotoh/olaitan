@@ -4276,6 +4276,28 @@ func TestStreamMaxBytesOverride_OnBothAggregatorAndCollector(t *testing.T) {
 	}
 }
 
+// TestAggregatorExtraEnv_Projected pins the PR #92 fix: aggregator.extraEnv is
+// the committed deploy mechanism for the aggregator's env-tuned knobs
+// (OLT_RISK_WINDOW_SECONDS, OLT_LLM_ROLE_TIMEOUT_MULTIPLIER); before it, those
+// knobs could only be set by out-of-band `kubectl set env`, leaving no
+// repo-recorded provenance for a deployed configuration.
+func TestAggregatorExtraEnv_Projected(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"aggregator.extraEnv[0].name=OLT_RISK_WINDOW_SECONDS",
+		"aggregator.extraEnv[0].value=60",
+	})
+	if !strings.Contains(rendered, "name: \"OLT_RISK_WINDOW_SECONDS\"") ||
+		!strings.Contains(rendered, "value: \"60\"") {
+		t.Errorf("aggregator.extraEnv did not project onto the aggregator Deployment\n%s",
+			snippet(rendered, "olaitan-aggregator"))
+	}
+	// Default render carries no extraEnv (golden-file stability).
+	plain := helmTemplate(t, nil)
+	if strings.Contains(plain, "OLT_RISK_WINDOW_SECONDS") {
+		t.Error("default render must not carry OLT_RISK_WINDOW_SECONDS")
+	}
+}
+
 // TestNotificationsFacade_WebhookUrlOverridesSecret pins the facade-wins
 // precedence on the webhook secret: a non-empty facade webhook_url overrides
 // secrets.notificationsWebhookUrl; an empty facade value falls back to it.

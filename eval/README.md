@@ -26,7 +26,7 @@ on any missing or empty required field.
 | `kubernetes_patch_version` | the cluster patch level (architecture.md:79); matches the Makefile `ENVTEST_K8S_VERSION`. | match the kind node image / `ENVTEST_K8S_VERSION` |
 | `falco_rule_corpus_tag` | the Falco rule corpus tag (pinned to the Falco subchart version in `deploy/helm/olaitan/Chart.yaml`). | `grep -A1 'name: falco' deploy/helm/olaitan/Chart.yaml` |
 | `sigma_corpus_git_sha` | the commit of the `rules/` OLT Sigma corpus. | `git log -1 --format=%H -- rules/` |
-| `llm_model_version` | the analyst model. Pinned to the REAL current model `claude-opus-4-8`. The epic's placeholder `claude-opus-4-7-2026-MM-DD` never shipped and is stale. | the current analyst model |
+| `llm_model_version` | the analyst model actually run. Currently `deepseek-chat` (OpenAI-compatible provider), the disclosed substitution for the originally pinned `claude-opus-4-8` (ADR-2026-08-17-01). | the current analyst model |
 | `random_seed` | the deterministic seed threaded to harness-side randomness. `0` is a valid, fully-deterministic choice. | a fixed integer |
 | `sysctl_snapshot` | the host sysctl values the run assumes, inline; or a single `path: <file>` entry for the captured-file form. | `sysctl -a` (selected keys) |
 | `cluster_bootstrap_script_git_sha` | the commit of `deploy/demo/setup.sh`. | `git log -1 --format=%H -- deploy/demo/setup.sh` |

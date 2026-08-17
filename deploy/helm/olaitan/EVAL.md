@@ -89,8 +89,9 @@ change:
 Each overlay is THIN: it sets ONLY `evaluation.config` (the per-arm
 rules/baselines/provider/l2/senior values are COMPUTED by the chart from
 that one knob, per the canonical-arms table above) plus, for the LLM arms,
-the reproducibility model pin `analyst.api.model: claude-opus-4-8`
-(mirroring `eval/manifest.yaml`'s `llm_model_version`, NFR37). The overlays
+the reproducibility model pin `analyst.api.model` mirroring
+`eval/manifest.yaml`'s `llm_model_version` (NFR37; currently `deepseek-chat`,
+the disclosed provider substitution of the recorded 2026-07 campaign). The overlays
 do NOT restate the per-arm knobs (the chart clobbers them under a named arm
 anyway; restating them is dead weight that risks drift).
 
@@ -189,3 +190,33 @@ kubectl rollout restart deploy/olaitan-aggregator
   A1); the default CI e2e job still exercises the RS arm only
   (`tests/e2e/rs_smoke_test.go`). Full per-arm end-to-end is the Epic 5
   evaluation harness (Stories 5.1-5.5).
+
+## Matrix-driver environment flags (PR #92)
+
+`tests/e2e/eval_matrix_test.go` (the batch inject -> settle -> capture ->
+measure loop, gated on `OLT_EVAL_MATRIX=1`) reads these flags. Every flag is
+recorded into each run's `metadata.yaml` so captured runs are
+machine-distinguishable by harness configuration.
+
+| Flag | Effect |
+|---|---|
+| `OLT_EVAL_CONFIG` | REQUIRED arm label (`f`/`rs`/`rsl`/`rslt-full`/`rslt-l1-only`/`rslt-l1-l2`) |
+| `OLT_EVAL_RUNS` | trials per scenario (default 10; zero/negative FAILS the matrix) |
+| `OLT_EVAL_SCENARIOS` | comma list (default `s1,s2,s3,s4,s5`; empty FAILS) |
+| `OLT_EVAL_CEILING` | per-trial settle ceiling (default 45s) |
+| `OLT_EVAL_WAIT_ASSESS` | settle on `AUDIT_ASSESSMENTS` instead of transitions; ignored (with a log line) on non-LLM arms |
+| `OLT_EVAL_REAL_WORKLOAD` | create a real Deployment-owned pod per trial so the rule event resolves to the SAME `tenant-acme/Deployment/<name>` key the preseed baseline uses |
+| `OLT_EVAL_FORCE_PRESEED` | force the baseline preseed for every scenario |
+| `OLT_EVAL_STRONG` | co-inject anomalous flows into the rule's correlator window (sustained-attack stimulus) |
+| `OLT_EVAL_OUT` / `OLT_EVAL_MANIFEST_SHA` / `OLT_EVAL_VERSION` / `OLT_EVAL_SCENARIOS_ROOT` | artefact plumbing |
+
+Honesty notes recorded per run: `preseed_direct_publish` (the preseed
+publishes EvidencePackages directly to the evidence subject with a hand-built
+workload key; it primes the baseline engine without traversing the
+correlator's identity resolution) and `preseed_transitions` (whether the
+preseed itself escalated the workload during setup; the driver drains and
+re-purges the measurement streams after preseeding so settle/capture see only
+scenario-driven signals, but the FSM state in Redis survives the purge).
+To enable the risk window for a campaign, set `OLT_RISK_WINDOW_SECONDS` via
+`aggregator.extraEnv` (see `docs/runbook.md`, "The rolling per-workload risk
+window"); the value is recorded per run as `risk_window_seconds`.

@@ -76,6 +76,18 @@ aggregator:
   # twice, recovery breaks.
   # @schema type:integer minimum:1 maximum:1 effect:"aggregator replica count and the chart's worker-pool surface; HARD CONSTRAINT at 1 (rings are cooperative goroutines in one process) until leader election lands" ref:NFR20
   replicas: 1
+  # Extra environment for the aggregator container, as {name, value} pairs.
+  # The committed mechanism for the aggregator's env-tuned knobs:
+  #   OLT_RISK_WINDOW_SECONDS         rolling per-workload risk-window decay
+  #                                   TTL in seconds; 0/unset disables (the
+  #                                   per-package scoring behaviour). See
+  #                                   docs/runbook.md "risk window".
+  #   OLT_LLM_ROLE_TIMEOUT_MULTIPLIER positive finite float scaling the
+  #                                   per-role LLM timeout budget for slow
+  #                                   providers (DW3.8-1); invalid values
+  #                                   fall back to 1.0.
+  # @schema type:array effect:"operator-supplied aggregator environment as {name, value} pairs; the committed mechanism for OLT_RISK_WINDOW_SECONDS and OLT_LLM_ROLE_TIMEOUT_MULTIPLIER" ref:FR30
+  extraEnv: []
   # 256Mi request / 512Mi limit. NFR5 targets "< 200 MB steady state",
   # but 256Mi leaves headroom for fsnotify watch buffers (1.6) and
   # future LLM context assembly (Epic 4). The 512Mi limit prevents OOM

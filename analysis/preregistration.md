@@ -288,3 +288,30 @@ cite run ids that do not yet exist. The traceability matrix row
 `c3.9.8-preregistration` (docs/traceability.md, section 3.9.8) registers this plan
 as canonical and states this forward contract. [Source: epics.md:2302-2304,
 2320-2322; NFR42]
+
+## Amendments
+
+Amendments are dated, additive, and never rewrite the frozen text above.
+
+### A1 (2026-08-17): provider substitution and post-freeze status
+
+The frozen plan pins `claude-opus-4-8`. The recorded 200-run campaign
+(2026-07) ran `deepseek-chat` through the OpenAI-compatible provider
+(trust-tier cap 30), because the pinned provider was unavailable to the
+project at execution time. Per this plan's own amendment rule, every
+confirmatory test whose result depends on the analyst model is therefore
+reported as EXPLORATORY against this plan; deterministic-arm results
+(F, RS) are unaffected. The substitution, its disclosure trail, and the
+post-graduation decision authority are recorded in
+`docs/deferred-decisions.md` ADR-2026-08-17-01.
+
+### A2 (2026-08-17): risk-window scoring model for the publication campaign
+
+The frozen plan's detection metrics assume the per-package scoring model.
+The publication campaign additionally runs with the rolling per-workload
+risk window (`OLT_RISK_WINDOW_SECONDS`, ADR-2026-08-17-01) enabled, which
+allows independently-arriving rule and baseline signals to sum. Runs
+carry `risk_window_seconds` in their metadata so the two scoring models
+are machine-distinguishable; window-enabled results are reported as
+exploratory against this plan and pre-registered afresh for any future
+confirmatory claim.

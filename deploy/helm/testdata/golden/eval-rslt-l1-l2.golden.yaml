@@ -990,7 +990,7 @@ data:
       provider: api
       api:
         endpoint: ""
-        model: "claude-opus-4-8"
+        model: "deepseek-chat"
         api_key_secret: "olaitan-llm"
       local:
         endpoint: "http://ollama:11434"

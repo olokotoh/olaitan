@@ -14,6 +14,7 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 | Value | Type | Default | Valid range | Effect | Ref |
 |-------|------|---------|-------------|--------|-----|
 | `aggregator.replicas` | integer | `1` | 1 to 1 | aggregator replica count and the chart's worker-pool surface; HARD CONSTRAINT at 1 (rings are cooperative goroutines in one process) until leader election lands | NFR20 |
+| `aggregator.extraEnv` | array | `[]` | - | operator-supplied aggregator environment as {name, value} pairs; the committed mechanism for OLT_RISK_WINDOW_SECONDS and OLT_LLM_ROLE_TIMEOUT_MULTIPLIER | FR30 |
 
 ## `correlator`
 

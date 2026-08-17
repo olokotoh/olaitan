@@ -222,15 +222,28 @@ def _predicted_technique(payload: dict[str, object]) -> Optional[str]:
     Scores the PRIMARY technique: a list field uses its first entry; a scalar
     field is used as-is. Returns ``None`` when no technique field is present (so
     the example/non-LLM payloads degrade to n/a honestly).
+
+    The real audit.assessments.v2 Senior verdict nests the MITRE list under
+    ``threat_assessment`` (the top level carries only the ``threat_type``
+    category, which is NOT an ATT&CK id). Search the nested verdict FIRST so the
+    explicit ``mitre_techniques`` list wins over the top-level ``threat_type``
+    fallback; committed fixtures (which put the list top-level and carry no
+    ``threat_assessment``) are unaffected.
     """
-    for field in _PREDICTED_TECHNIQUE_FIELDS:
-        value = payload.get(field)
-        if isinstance(value, str) and value:
-            return value
-        if isinstance(value, list) and value:
-            first = value[0]
-            if isinstance(first, str) and first:
-                return first
+    sources: list[dict[str, object]] = []
+    nested = payload.get("threat_assessment")
+    if isinstance(nested, dict):
+        sources.append(nested)
+    sources.append(payload)
+    for src in sources:
+        for field in _PREDICTED_TECHNIQUE_FIELDS:
+            value = src.get(field)
+            if isinstance(value, str) and value:
+                return value
+            if isinstance(value, list) and value:
+                first = value[0]
+                if isinstance(first, str) and first:
+                    return first
     return None
 
 

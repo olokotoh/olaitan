@@ -41,7 +41,7 @@ evaluation:
 
 analyst:
   api:
-    model: claude-opus-4-8
+    model: deepseek-chat
 
 # EVALUATION BASE (Story 6.6 AC3): this arm overlay sits on top of the
 # common evaluation base values-eval.yaml (eval-friendly tuning: faster
