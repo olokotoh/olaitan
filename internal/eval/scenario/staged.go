@@ -9,6 +9,7 @@
 package scenario
 
 import (
+	"encoding/json"
 	"time"
 )
 
@@ -36,7 +37,9 @@ func staggerProfile(scenarioID string) (offsets []time.Duration, span time.Durat
 	case "s4": // beaconing: >=3 beacons at jittered intervals, span ~100s
 		return []time.Duration{0, 90 * s}, 100 * s
 	case "s5": // miner launch (priming, proc) then sustained-load flow inside ~10s
-		return []time.Duration{0, 5 * s, 9 * s}, 10 * s
+		// 4s/9s gap (not 5s/9s) so even at the +/-2s jitter extremes the two
+		// non-priming events cannot coincide.
+		return []time.Duration{0, 4 * s, 9 * s}, 10 * s
 	}
 	return nil, 0
 }
@@ -77,12 +80,17 @@ func StaggerSpan(scenarioID string) time.Duration {
 }
 
 // StagedEvents returns the scenario stimulus with per-event injection offsets
-// (Story 7.2 AC1-AC2). Event content is byte-identical to Events; only the
-// offsets carry the seeded per-run jitter. The returned slice is in recipe
-// order (which equals non-decreasing base offset); the driver publishes each
-// event at start+Offset. If the stagger profile and the recipe disagree on
-// length (a programming error, guarded by a unit test), every offset is 0 so
-// the stimulus degrades to all-at-once rather than mis-scheduling.
+// (Story 7.2 AC1-AC2). Every field EXCEPT the embedded timestamp is identical
+// to Events; the timestamp is re-stamped to ts+Offset so an event's embedded
+// time equals when the driver actually injects it. This is load-bearing: the
+// correlator evicts window events older than its 60s window by their EMBEDDED
+// timestamp, so a match published at ts+90s but stamped ts would arrive
+// already-stale and be dropped, and the scenario could never be detected
+// (PR #93 review). The returned slice is in recipe order (non-decreasing base
+// offset); the driver publishes each event at start+Offset. If the stagger
+// profile and the recipe disagree on length (a programming error, guarded by a
+// unit test), every offset is 0 and timestamps are unchanged so the stimulus
+// degrades to all-at-once rather than mis-scheduling.
 func StagedEvents(scenarioID, podName string, ts time.Time, run int) []StagedEvent {
 	base := Events(scenarioID, podName, ts)
 	offsets, _ := staggerProfile(scenarioID)
@@ -98,7 +106,29 @@ func StagedEvents(scenarioID, podName string, ts time.Time, run int) []StagedEve
 		if off < 0 {
 			off = 0
 		}
-		out[i] = StagedEvent{Event: e, Offset: off}
+		out[i] = StagedEvent{Event: restampEvent(e, ts.Add(off)), Offset: off}
 	}
 	return out
+}
+
+// restampEvent returns a copy of ev with its embedded JSON "timestamp" field
+// set to at (RFC3339Nano). Only the timestamp changes; every other byte of the
+// payload is preserved. On any decode/encode error the event is returned
+// unchanged (the payloads are engine-produced JSON objects, so this never
+// happens in practice; failing closed to the original is safe).
+func restampEvent(ev Event, at time.Time) Event {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(ev.Payload, &m); err != nil {
+		return ev
+	}
+	stamp, err := json.Marshal(at.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return ev
+	}
+	m["timestamp"] = stamp
+	b, err := json.Marshal(m)
+	if err != nil {
+		return ev
+	}
+	return Event{Subject: ev.Subject, Payload: b}
 }

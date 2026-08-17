@@ -1,15 +1,32 @@
 package scenario
 
 import (
-	"bytes"
+	"encoding/json"
 	"testing"
 	"time"
 )
 
-// TestStagedEvents_ContentByteIdenticalAcrossRuns proves staging changes ONLY
-// timing: the event payloads are byte-identical to Events and stable across
-// run seeds (AC1).
-func TestStagedEvents_ContentByteIdenticalAcrossRuns(t *testing.T) {
+// contentSansTimestamp returns the event payload with the timestamp field
+// removed, so two events can be compared on everything BUT their timestamp.
+func contentSansTimestamp(t *testing.T, payload []byte) string {
+	t.Helper()
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &m); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	delete(m, "timestamp")
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	return string(b)
+}
+
+// TestStagedEvents_ContentIdenticalExceptTimestamp proves staging changes ONLY
+// timing: every field except the embedded timestamp is identical to Events and
+// stable across run seeds, and the timestamp is re-stamped to ts+Offset so the
+// event is not evicted as stale by the correlator window (AC1, PR #93 review).
+func TestStagedEvents_ContentIdenticalExceptTimestamp(t *testing.T) {
 	ts := time.Unix(1000, 0)
 	for _, sc := range []string{"s1", "s2", "s3", "s4", "s5"} {
 		base := Events(sc, "web", ts)
@@ -19,8 +36,24 @@ func TestStagedEvents_ContentByteIdenticalAcrossRuns(t *testing.T) {
 				t.Fatalf("%s run %d: %d staged events, want %d", sc, run, len(staged), len(base))
 			}
 			for i := range base {
-				if staged[i].Subject != base[i].Subject || !bytes.Equal(staged[i].Payload, base[i].Payload) {
-					t.Fatalf("%s run %d event %d: staged content diverged from Events", sc, run, i)
+				if staged[i].Subject != base[i].Subject {
+					t.Fatalf("%s run %d event %d: subject changed", sc, run, i)
+				}
+				if contentSansTimestamp(t, staged[i].Payload) != contentSansTimestamp(t, base[i].Payload) {
+					t.Fatalf("%s run %d event %d: non-timestamp content diverged from Events", sc, run, i)
+				}
+				// Embedded timestamp must equal ts+Offset (RFC3339Nano).
+				var m map[string]json.RawMessage
+				if err := json.Unmarshal(staged[i].Payload, &m); err != nil {
+					t.Fatalf("unmarshal staged payload: %v", err)
+				}
+				var got string
+				if err := json.Unmarshal(m["timestamp"], &got); err != nil {
+					t.Fatalf("decode timestamp: %v", err)
+				}
+				want := ts.Add(staged[i].Offset).UTC().Format(time.RFC3339Nano)
+				if got != want {
+					t.Fatalf("%s run %d event %d: embedded timestamp %q, want ts+offset %q", sc, run, i, got, want)
 				}
 			}
 		}

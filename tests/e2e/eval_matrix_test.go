@@ -336,21 +336,21 @@ func runOneEvalTrial(t *testing.T, js jetstream.JetStream, capturer *capture.Cap
 		// Staged injection (Story 7.2): publish each event at its per-run
 		// offset so the stimulus unfolds over the attack's real temporal shape
 		// and measured_time_to_detect is a non-degenerate latency. startedAt is
-		// the FIRST publish (offset 0); measurement still derives solely from
-		// captured timestamps. A ceiling overrun fails the trial loudly rather
-		// than truncating the schedule.
+		// the FIRST publish (offset 0); each event's embedded timestamp is
+		// re-stamped to startedAt+offset by StagedEvents so it is not evicted
+		// as stale by the correlator's 60s window (PR #93 review); measurement
+		// still derives solely from captured timestamps.
 		sev := evalscenario.StagedEvents(tr.scenario, podName, startedAt, tr.run)
 		if len(sev) == 0 {
 			t.Fatalf("no staged recipe events for scenario %q", tr.scenario)
 		}
 		schedStart := time.Now()
 		for _, ev := range sev {
+			// Sleep until this event's scheduled instant. A slow machine can
+			// slip the schedule; that is fine (measurement is from captured
+			// timestamps, and the effective settle ceiling below absorbs it).
 			if d := time.Until(schedStart.Add(ev.Offset)); d > 0 {
-				select {
-				case <-time.After(d):
-				case <-time.After(tr.ceiling + evalscenario.StaggerSpan(tr.scenario)):
-					t.Fatalf("staged schedule for %q exceeded its bound before offset %v", tr.scenario, ev.Offset)
-				}
+				time.Sleep(d)
 			}
 			publishJS(t, js, ev.Subject, ev.Payload)
 		}
