@@ -96,7 +96,12 @@ func TestEvalMatrix(t *testing.T) {
 
 	t.Logf("matrix: config=%s scenarios=%v runs=%d ceiling=%s", config, scenarios, runs, ceiling)
 	for _, sc := range scenarios {
-		tgt := readScenarioTarget(t, scenariosRoot, sc)
+		// The benign sweep (Story 7.3) has no attack target file and its own
+		// observation flow; the attack scenarios read their target.yaml.
+		var tgt evalScenarioTarget
+		if sc != evalscenario.BenignScenarioID {
+			tgt = readScenarioTarget(t, scenariosRoot, sc)
+		}
 		for run := 0; run < runs; run++ {
 			tr := evalTrial{
 				config:      config,
@@ -113,10 +118,113 @@ func TestEvalMatrix(t *testing.T) {
 			// t.Fatalf aborting every remaining scenario and run (PR #92
 			// review). A failed subtest still fails the overall test.
 			t.Run(fmt.Sprintf("%s-%s-r%02d", config, sc, run), func(t *testing.T) {
+				if tr.scenario == evalscenario.BenignScenarioID {
+					runOneBenignSweep(t, js, capturer, tr)
+					return
+				}
 				runOneEvalTrial(t, js, capturer, tr)
 			})
 		}
 	}
+}
+
+// runOneBenignSweep runs one benign false-positive observation (Story 7.3): it
+// primes the workload's baseline, then injects the benign event stream at a
+// steady rate for OLT_EVAL_BENIGN_MINUTES of real time, capturing every FSM
+// transition. Zero transitions is the good (and expected) result; the analysis
+// pipeline reads escalations-past-CLEAN over the wall window as the FPR. The
+// injected-event count is recorded so a zero-escalation run is distinguishable
+// from a broken (no-injection) one.
+func runOneBenignSweep(t *testing.T, js jetstream.JetStream, capturer *capture.Capturer, tr evalTrial) {
+	t.Helper()
+	podName := fmt.Sprintf("web-%s-benign-r%02d", tr.config, tr.run)
+	deployName := podName
+	if os.Getenv("OLT_EVAL_REAL_WORKLOAD") != "" {
+		podName = applyScenarioWorkload(t, deployName)
+	}
+
+	waitForPipelineQuiescent(t, js, 90*time.Second)
+	purgeEvalStreams(t, js)
+
+	// Prime the baseline so a benign observation is judged against an
+	// established profile (else warm-up would suppress deviations anyway, but
+	// priming makes the sweep test the STEADY-STATE FPR).
+	publishSyntheticEvidencePackagesFor(t, js, podName, deployName)
+	waitForBaselineConsumerDrained(t, js)
+	waitForPipelineQuiescent(t, js, 60*time.Second)
+	purgeEvalStreams(t, js)
+
+	minutes := envInt("OLT_EVAL_BENIGN_MINUTES", 10)
+	if minutes <= 0 {
+		t.Fatalf("OLT_EVAL_BENIGN_MINUTES must be positive, got %d", minutes)
+	}
+	ratePerMin := envInt("OLT_EVAL_BENIGN_RATE_PER_MIN", 30)
+	if ratePerMin <= 0 {
+		t.Fatalf("OLT_EVAL_BENIGN_RATE_PER_MIN must be positive, got %d", ratePerMin)
+	}
+	interval := time.Minute / time.Duration(ratePerMin)
+
+	startedAt := time.Now().UTC()
+	window := time.Duration(minutes) * time.Minute
+	deadline := time.Now().Add(window)
+	injected := 0
+	for tick := 0; time.Now().Before(deadline); tick++ {
+		for _, ev := range evalscenario.BenignEvents(podName, time.Now(), tick) {
+			publishJS(t, js, ev.Subject, ev.Payload)
+			injected++
+		}
+		select {
+		case <-time.After(interval):
+		case <-time.After(time.Until(deadline)):
+		}
+	}
+	// Let the last events settle through the pipeline before capture. Trailing
+	// benign escalations (if any) land during this settle window, so the FPR
+	// observation window MUST include it; it MUST NOT include the subsequent
+	// capture-drain dead time, during which nothing is injected and no
+	// escalation can newly fire. Anchor finished_at here, before Capture, so
+	// the FPR denominator (finished_at - started_at) is the true observation
+	// window and the rate is not biased downward (PR #93 review).
+	waitForPipelineQuiescent(t, js, 60*time.Second)
+	finishedAt := time.Now().UTC()
+
+	runID := fmt.Sprintf("%s-%s-benign-r%02d",
+		startedAt.Format("20060102T150405.000Z"), tr.config, tr.run)
+	runDir := filepath.Join(tr.outRoot, runID)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	res, err := capturer.Capture(ctx, runDir)
+	cancel()
+	if err != nil {
+		t.Fatalf("capture benign %s: %v", runID, err)
+	}
+	sz, err := capture.CheckSize(runDir, capture.DefaultMaxRunSizeBytes)
+	if err != nil {
+		t.Fatalf("size check %s: %v", runID, err)
+	}
+
+	meta := evalRunMetadata{
+		RunID:                runID,
+		ManifestSHA256:       tr.manifestSHA,
+		Scenario:             evalscenario.BenignScenarioID,
+		Config:               tr.config,
+		Runs:                 1,
+		StartedAt:            startedAt.Format(time.RFC3339Nano),
+		FinishedAt:           finishedAt.Format(time.RFC3339Nano),
+		OlaitanEvalVersion:   tr.evalVersion,
+		ScenarioInstance:     tr.run,
+		ResourceUsage:        capture.SnapshotResourceUsage(),
+		SizeBytes:            sz.SizeBytes,
+		SizeCapExceeded:      sz.SizeCapExceeded,
+		RiskWindowSeconds:    envInt("OLT_RISK_WINDOW_SECONDS", 0),
+		RealWorkload:         os.Getenv("OLT_EVAL_REAL_WORKLOAD") != "",
+		PreseedDirectPublish: true,
+		BenignSweep:          true,
+		BenignMinutes:        minutes,
+		BenignRatePerMin:     ratePerMin,
+		BenignInjectedEvents: injected,
+	}
+	writeEvalMetadata(t, runDir, meta)
+	t.Logf("benign sweep %s: injected=%d fsm_transitions=%d over %dm", runID, injected, res.Counts.FSM, minutes)
 }
 
 type evalScenarioTarget struct {
@@ -166,6 +274,12 @@ type evalRunMetadata struct {
 	WaitAssess           bool `yaml:"wait_assess"`
 	PreseedDirectPublish bool `yaml:"preseed_direct_publish"`
 	PreseedTransitions   int  `yaml:"preseed_transitions"`
+	Staged               bool `yaml:"staged"`
+	// Benign false-positive sweep (Story 7.3).
+	BenignSweep          bool `yaml:"benign_sweep,omitempty"`
+	BenignMinutes        int  `yaml:"benign_minutes,omitempty"`
+	BenignRatePerMin     int  `yaml:"benign_rate_per_min,omitempty"`
+	BenignInjectedEvents int  `yaml:"benign_injected_events,omitempty"`
 }
 
 func runOneEvalTrial(t *testing.T, js jetstream.JetStream, capturer *capture.Capturer, tr evalTrial) {
@@ -222,14 +336,45 @@ func runOneEvalTrial(t *testing.T, js jetstream.JetStream, capturer *capture.Cap
 		purgeEvalStreams(t, js)
 	}
 
-	startedAt := time.Now().UTC()
+	staged := os.Getenv("OLT_EVAL_STAGED") != ""
+	// ONE anchor for both re-stamping and scheduling (PR #93 Copilot review):
+	// events are stamped at anchor+offset AND published at anchor+offset, and
+	// startedAt (the measurement base) is anchor, so the embedded timestamps,
+	// the schedule, and the MTTD base cannot drift apart. anchor keeps its
+	// monotonic reading for the schedule waits; startedAt is its wall-clock
+	// form for the recipe and metadata.
+	anchor := time.Now()
+	startedAt := anchor.UTC()
 
-	events := evalscenario.Events(tr.scenario, podName, startedAt)
-	if len(events) == 0 {
-		t.Fatalf("no recipe events for scenario %q", tr.scenario)
-	}
-	for _, ev := range events {
-		publishJS(t, js, ev.Subject, ev.Payload)
+	if staged {
+		// Staged injection (Story 7.2): publish each event at its per-run
+		// offset so the stimulus unfolds over the attack's real temporal shape
+		// and measured_time_to_detect is a non-degenerate latency. Each event's
+		// embedded timestamp is re-stamped to anchor+offset by StagedEvents so
+		// it is not evicted as stale by the correlator's 60s window (PR #93
+		// review); measurement still derives solely from captured timestamps.
+		sev := evalscenario.StagedEvents(tr.scenario, podName, startedAt, tr.run)
+		if len(sev) == 0 {
+			t.Fatalf("no staged recipe events for scenario %q", tr.scenario)
+		}
+		for _, ev := range sev {
+			// Sleep until this event's scheduled instant, anchored to the SAME
+			// base used for the embedded timestamps. A slow machine can slip
+			// the schedule; that is fine (measurement is from captured
+			// timestamps, and the effective settle ceiling below absorbs it).
+			if d := time.Until(anchor.Add(ev.Offset)); d > 0 {
+				time.Sleep(d)
+			}
+			publishJS(t, js, ev.Subject, ev.Payload)
+		}
+	} else {
+		events := evalscenario.Events(tr.scenario, podName, startedAt)
+		if len(events) == 0 {
+			t.Fatalf("no recipe events for scenario %q", tr.scenario)
+		}
+		for _, ev := range events {
+			publishJS(t, js, ev.Subject, ev.Payload)
+		}
 	}
 	// OLT_EVAL_STRONG (option-2 prototype): co-inject anomalous distinct-IP
 	// network flows into the SAME correlator window as the rule-match event,
@@ -270,7 +415,18 @@ func runOneEvalTrial(t *testing.T, js jetstream.JetStream, capturer *capture.Cap
 			t.Logf("OLT_EVAL_WAIT_ASSESS ignored for non-LLM arm %q; waiting on AUDIT_TRANSITIONS", tr.config)
 		}
 	}
-	waitForEvalSettle(t, js, waitStream, tr.ceiling)
+	// Effective ceiling accounts for the staged injection span (AC5): a staged
+	// s4 run spreads events over ~100s, so a ceiling calibrated for
+	// instantaneous injection would truncate it.
+	effectiveCeiling := tr.ceiling
+	if staged {
+		// Include the jitter margin: an event's jittered offset can exceed the
+		// nominal StaggerSpan by up to MaxStagedJitter, so widen the settle
+		// ceiling by that margin too or a late-scheduled event could truncate
+		// the wait (PR #93 Copilot review).
+		effectiveCeiling = tr.ceiling + evalscenario.StaggerSpan(tr.scenario) + evalscenario.MaxStagedJitter
+	}
+	waitForEvalSettle(t, js, waitStream, effectiveCeiling)
 
 	runID := fmt.Sprintf("%s-%s-%s-r%02d",
 		startedAt.Format("20060102T150405.000Z"), tr.config, tr.scenario, tr.run)
@@ -318,6 +474,7 @@ func runOneEvalTrial(t *testing.T, js jetstream.JetStream, capturer *capture.Cap
 		WaitAssess:            os.Getenv("OLT_EVAL_WAIT_ASSESS") != "",
 		PreseedDirectPublish:  preseeded,
 		PreseedTransitions:    preseedTransitions,
+		Staged:                staged,
 	}
 	writeEvalMetadata(t, runDir, meta)
 
