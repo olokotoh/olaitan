@@ -1,6 +1,8 @@
 package risk
 
 import (
+	"math"
+	"strconv"
 	"testing"
 	"time"
 
@@ -34,13 +36,98 @@ func TestObserve_SumsRuleAndBaselineWithinWindow(t *testing.T) {
 	// A rule-only package, then a baseline-only package for the SAME workload
 	// arrive within the window (the two separate single-signal packages the
 	// rules and baseline engines fire). The aggregate must carry BOTH.
-	w.Observe("wl", rulePkg("wl", "critical"), 0, now)
+	w.Observe("wl", rulePkg("wl", "90"), 0, now)
 	rules, devs, _ := w.Observe("wl", devPkg("wl", 6), 30, now.Add(2*time.Second))
 	if len(rules) != 1 || len(devs) != 1 {
 		t.Fatalf("aggregate must carry both signals, got rules=%d devs=%d", len(rules), len(devs))
 	}
-	if rules[0].Severity != "critical" || devs[0].Sigma != 6 {
+	if rules[0].Severity != "90" || devs[0].Sigma != 6 {
 		t.Fatalf("aggregate lost the strongest signals: %+v %+v", rules[0], devs[0])
+	}
+}
+
+// TestObserve_SustainedTrafficStillDecays pins the PR #92 review fix: a
+// retained signal expires TTL after ITS OWN observation, even when unrelated
+// packages keep arriving for the workload. Under the previous single
+// updatedAt, every package refreshed the whole entry's TTL, so a critical rule
+// never decayed while any traffic flowed and de-escalation was blocked.
+func TestObserve_SustainedTrafficStillDecays(t *testing.T) {
+	w := New(30 * time.Second)
+	now := time.Unix(9000, 0)
+	w.Observe("wl", rulePkg("wl", "90"), 0, now)
+	// Signal-less packages keep arriving every 10s past the rule's TTL.
+	for i := 1; i <= 4; i++ {
+		rules, _, _ := w.Observe("wl", schema.EvidencePackage{WorkloadID: "wl"}, 0, now.Add(time.Duration(10*i)*time.Second))
+		if i <= 3 && len(rules) != 1 {
+			// At 10s/20s/30s the rule (age <= TTL) must still be present.
+			t.Fatalf("t+%ds: rule should still be live, got %d", 10*i, len(rules))
+		}
+		if i == 4 && len(rules) != 0 {
+			// At 40s the rule is older than TTL and must be gone despite the
+			// intervening traffic.
+			t.Fatalf("t+40s: rule should have decayed under sustained traffic, got %d", len(rules))
+		}
+	}
+}
+
+// TestObserve_KeywordSeverityNeverDisplacesNumeric pins the severity-semantics
+// alignment with the score calculator: the calculator scores non-numeric
+// severities as zero, so a keyword match must never displace a numeric match
+// as "strongest" (that would zero the aggregate's rule term).
+func TestObserve_KeywordSeverityNeverDisplacesNumeric(t *testing.T) {
+	w := New(60 * time.Second)
+	now := time.Unix(9500, 0)
+	w.Observe("wl", rulePkg("wl", "75"), 0, now)
+	rules, _, _ := w.Observe("wl", rulePkg("wl", "critical"), 0, now.Add(time.Second))
+	if len(rules) != 1 || rules[0].Severity != "75" {
+		t.Fatalf("numeric 75 must survive a keyword challenger, got %+v", rules)
+	}
+	// A keyword-only history stores nothing; the package's own matches pass
+	// through so solo-scoring parity is preserved.
+	rules, _, _ = w.Observe("wl2", rulePkg("wl2", "critical"), 0, now)
+	if len(rules) != 1 || rules[0].Severity != "critical" {
+		t.Fatalf("keyword-only package should pass through unchanged, got %+v", rules)
+	}
+}
+
+// TestObserve_SignallessPackagesDoNotGrowMap pins the eviction fix: packages
+// with no signals create no entries, and entries whose signals all expired are
+// swept, so churned workload IDs cannot grow the map without bound.
+func TestObserve_SignallessPackagesDoNotGrowMap(t *testing.T) {
+	w := New(10 * time.Second)
+	now := time.Unix(10000, 0)
+	for i := 0; i < 100; i++ {
+		wl := "churn-" + strconv.Itoa(i)
+		w.Observe(wl, schema.EvidencePackage{WorkloadID: wl}, 0, now)
+	}
+	if n := len(w.m); n != 0 {
+		t.Fatalf("signal-less packages must not create entries, map has %d", n)
+	}
+	// Real signals for churned workloads expire and are swept once TTL passes.
+	for i := 0; i < 50; i++ {
+		wl := "sig-" + strconv.Itoa(i)
+		w.Observe(wl, rulePkg(wl, "75"), 0, now)
+	}
+	w.Observe("late", rulePkg("late", "50"), 0, now.Add(25*time.Second))
+	if n := len(w.m); n != 1 {
+		t.Fatalf("expired entries must be swept, map has %d (want 1)", n)
+	}
+}
+
+// TestObserve_MalformedSigmaSkipped mirrors the score calculator's poisoned-
+// sigma guard: NaN/Inf/negative sigmas must never become the retained
+// strongest deviation.
+func TestObserve_MalformedSigmaSkipped(t *testing.T) {
+	w := New(60 * time.Second)
+	now := time.Unix(11000, 0)
+	w.Observe("wl", devPkg("wl", 4), 0, now)
+	_, devs, _ := w.Observe("wl", devPkg("wl", math.Inf(1)), 0, now.Add(time.Second))
+	if len(devs) != 1 || devs[0].Sigma != 4 {
+		t.Fatalf("Inf sigma must not displace the real deviation, got %+v", devs)
+	}
+	_, devs, _ = w.Observe("wl", devPkg("wl", math.NaN()), 0, now.Add(2*time.Second))
+	if len(devs) != 1 || devs[0].Sigma != 4 {
+		t.Fatalf("NaN sigma must not displace the real deviation, got %+v", devs)
 	}
 }
 
@@ -63,7 +150,7 @@ func TestObserve_KeepsStrongestAndDecays(t *testing.T) {
 func TestObserve_IsolatesWorkloads(t *testing.T) {
 	w := New(60 * time.Second)
 	now := time.Unix(3000, 0)
-	w.Observe("a", rulePkg("a", "critical"), 0, now)
+	w.Observe("a", rulePkg("a", "90"), 0, now)
 	rules, devs, _ := w.Observe("b", devPkg("b", 5), 0, now)
 	if len(rules) != 0 || len(devs) != 1 {
 		t.Fatalf("workload b must not inherit a's rule, got rules=%d devs=%d", len(rules), len(devs))

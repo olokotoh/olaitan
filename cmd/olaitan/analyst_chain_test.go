@@ -171,6 +171,39 @@ func TestBuildInvestigationChainOpenAIReachable(t *testing.T) {
 	}
 }
 
+// TestChainAdjustedScore_EnabledWindowSumsAcrossPackages drives the ACTUAL
+// FSM-consumer wiring with an ENABLED risk window (PR #92 review: every prior
+// test through chainAdjustedScore passed risk.New(0), recreating the exact
+// unprotected-call-site hazard the function's own comment documents). A
+// rule-only package then a baseline-only package for the same workload must
+// score, through this call site, as one aggregate exceeding either solo score.
+func TestChainAdjustedScore_EnabledWindowSumsAcrossPackages(t *testing.T) {
+	calc, err := score.New(nil, metrics.NewRegistry())
+	if err != nil {
+		t.Fatalf("score.New: %v", err)
+	}
+	w := risk.New(60 * time.Second)
+	now := time.Now()
+
+	rulePkg := schema.EvidencePackage{WorkloadID: "t/Deployment/w", RuleMatches: []schema.RuleMatch{{RuleID: "OLT-EXEC-001", Severity: "90"}}}
+	basePkg := schema.EvidencePackage{WorkloadID: "t/Deployment/w", BaselineDeviations: []schema.BaselineDeviation{{Metric: "m", Sigma: 3.8}}}
+
+	s1, err := chainAdjustedScore(context.Background(), rulePkg, calc, nil, "", nil, nil, nil, w, now, chainTestLogger())
+	if err != nil {
+		t.Fatalf("chainAdjustedScore(rule pkg): %v", err)
+	}
+	s2, err := chainAdjustedScore(context.Background(), basePkg, calc, nil, "", nil, nil, nil, w, now.Add(2*time.Second), chainTestLogger())
+	if err != nil {
+		t.Fatalf("chainAdjustedScore(baseline pkg): %v", err)
+	}
+	if s2.Total <= s1.Total {
+		t.Fatalf("enabled window at the real call site did not sum: rule-only=%v then rule+baseline=%v", s1.Total, s2.Total)
+	}
+	if s2.Rules <= 0 || s2.Baseline <= 0 {
+		t.Fatalf("aggregate must carry both terms, got rules=%v baseline=%v", s2.Rules, s2.Baseline)
+	}
+}
+
 // TestFSMConsumerFoldsChainConfidenceIntoScore is the Story 3.11 round-1
 // integration proof (the merge BI-7 gap all three reviewers flagged): it
 // threads a triggering package through the SAME composition the merged FSM

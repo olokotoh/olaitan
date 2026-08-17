@@ -4,6 +4,7 @@ package e2e_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -45,6 +46,16 @@ func TestEvalMatrix(t *testing.T) {
 	config := mustEnv(t, "OLT_EVAL_CONFIG") // arm label recorded in metadata (f|rs|rsl|rslt-full)
 	runs := envInt("OLT_EVAL_RUNS", 10)
 	scenarios := envList("OLT_EVAL_SCENARIOS", "s1,s2,s3,s4,s5")
+	// A zero-trial matrix must FAIL, not pass: OLT_EVAL_RUNS=0 or an empty
+	// OLT_EVAL_SCENARIOS list would otherwise execute nothing, write nothing,
+	// and report PASS, indistinguishable from a successful campaign (PR #92
+	// review).
+	if runs <= 0 {
+		t.Fatalf("OLT_EVAL_RUNS must be positive, got %d", runs)
+	}
+	if len(scenarios) == 0 {
+		t.Fatalf("OLT_EVAL_SCENARIOS resolved to an empty list")
+	}
 	outRoot := envStr("OLT_EVAL_OUT", "runs")
 	manifestSHA := envStr("OLT_EVAL_MANIFEST_SHA", "")
 	evalVersion := envStr("OLT_EVAL_VERSION", "eval-matrix")
@@ -83,10 +94,11 @@ func TestEvalMatrix(t *testing.T) {
 		t.Fatalf("mkdir out %q: %v", outRoot, err)
 	}
 
+	t.Logf("matrix: config=%s scenarios=%v runs=%d ceiling=%s", config, scenarios, runs, ceiling)
 	for _, sc := range scenarios {
 		tgt := readScenarioTarget(t, scenariosRoot, sc)
 		for run := 0; run < runs; run++ {
-			runOneEvalTrial(t, js, capturer, evalTrial{
+			tr := evalTrial{
 				config:      config,
 				scenario:    sc,
 				run:         run,
@@ -95,6 +107,13 @@ func TestEvalMatrix(t *testing.T) {
 				manifestSHA: manifestSHA,
 				evalVersion: evalVersion,
 				ceiling:     ceiling,
+			}
+			// One subtest per trial: a single failed capture/size/metadata
+			// write fails THAT trial and the matrix continues, instead of a
+			// t.Fatalf aborting every remaining scenario and run (PR #92
+			// review). A failed subtest still fails the overall test.
+			t.Run(fmt.Sprintf("%s-%s-r%02d", config, sc, run), func(t *testing.T) {
+				runOneEvalTrial(t, js, capturer, tr)
 			})
 		}
 	}
@@ -137,6 +156,16 @@ type evalRunMetadata struct {
 	ResourceUsage         capture.ResourceUsage `yaml:"resource_usage"`
 	SizeBytes             int64                 `yaml:"size_bytes"`
 	SizeCapExceeded       bool                  `yaml:"size_cap_exceeded"`
+	// Harness-configuration provenance (PR #92 review): without these fields a
+	// captured run cannot be distinguished from a run under different harness
+	// flags, yet the reported numbers depend on them.
+	RiskWindowSeconds    int  `yaml:"risk_window_seconds"`
+	RealWorkload         bool `yaml:"real_workload"`
+	ForcePreseed         bool `yaml:"force_preseed"`
+	StrongStimulus       bool `yaml:"strong_stimulus"`
+	WaitAssess           bool `yaml:"wait_assess"`
+	PreseedDirectPublish bool `yaml:"preseed_direct_publish"`
+	PreseedTransitions   int  `yaml:"preseed_transitions"`
 }
 
 func runOneEvalTrial(t *testing.T, js jetstream.JetStream, capturer *capture.Capturer, tr evalTrial) {
@@ -156,18 +185,44 @@ func runOneEvalTrial(t *testing.T, js jetstream.JetStream, capturer *capture.Cap
 		podName = applyScenarioWorkload(t, deployName)
 	}
 
+	// Wait for the previous trial's in-flight pipeline work (including a slow
+	// inline LLM chain run) to finish BEFORE purging: a package still inside
+	// the FSM consumer at purge time would publish its transition/assessment
+	// AFTER the purge and be attributed to this run (PR #92 review).
+	waitForPipelineQuiescent(t, js, 90*time.Second)
+
 	// Clean the pipeline streams so the capturer drains ONLY this run.
 	purgeEvalStreams(t, js)
-
-	startedAt := time.Now().UTC()
 
 	// S4 rests partly on a baseline deviation: pre-seed the per-workload
 	// baseline (the rs_smoke 10-priming-plus-1-spike EvidencePackage pattern)
 	// before the rule-match events, on THIS run's workload key.
-	if evalscenario.BaselinePreseed(tr.scenario) || os.Getenv("OLT_EVAL_FORCE_PRESEED") != "" {
+	//
+	// HONESTY NOTE (PR #92 review): the preseed publishes EvidencePackages
+	// directly to the evidence subject with a hand-built workload key; it
+	// primes the baseline engine but does not traverse the correlator's
+	// identity resolution. This is recorded in metadata.yaml as
+	// preseed_direct_publish so analysis can see it.
+	preseeded := evalscenario.BaselinePreseed(tr.scenario) || os.Getenv("OLT_EVAL_FORCE_PRESEED") != ""
+	preseedTransitions := 0
+	if preseeded {
 		publishSyntheticEvidencePackagesFor(t, js, podName, deployName)
 		waitForBaselineConsumerDrained(t, js)
+		// The preseed's spike package can itself fire a live deviation and an
+		// FSM transition during SETUP. Drain the pipeline, RECORD whether the
+		// harness itself escalated the workload (the FSM state in Redis is
+		// per-workload and survives the purge, so a preseed-escalated run
+		// starts non-CLEAN; metadata carries the count so analysis can see
+		// it), then re-purge the measurement streams so the settle wait and
+		// the capture see only scenario-driven signals, and startedAt (below)
+		// measures the scenario, not the harness (PR #92 review:
+		// measured_time_to_detect otherwise measured the preseed artefact).
+		waitForPipelineQuiescent(t, js, 60*time.Second)
+		preseedTransitions = streamMsgCount(t, js, "AUDIT_TRANSITIONS")
+		purgeEvalStreams(t, js)
 	}
+
+	startedAt := time.Now().UTC()
 
 	events := evalscenario.Events(tr.scenario, podName, startedAt)
 	if len(events) == 0 {
@@ -206,7 +261,14 @@ func runOneEvalTrial(t *testing.T, js jetstream.JetStream, capturer *capture.Cap
 	// OLT_EVAL_WAIT_ASSESS makes the settle wait on the assessment instead.
 	waitStream := "AUDIT_TRANSITIONS"
 	if os.Getenv("OLT_EVAL_WAIT_ASSESS") != "" {
-		waitStream = "AUDIT_ASSESSMENTS"
+		if armHasLLM(tr.config) {
+			waitStream = "AUDIT_ASSESSMENTS"
+		} else {
+			// A non-LLM arm never publishes assessments, so waiting on them
+			// would silently burn the full ceiling on every trial (PR #92
+			// review). Fall back to the transition wait and say so.
+			t.Logf("OLT_EVAL_WAIT_ASSESS ignored for non-LLM arm %q; waiting on AUDIT_TRANSITIONS", tr.config)
+		}
 	}
 	waitForEvalSettle(t, js, waitStream, tr.ceiling)
 
@@ -249,6 +311,13 @@ func runOneEvalTrial(t *testing.T, js jetstream.JetStream, capturer *capture.Cap
 		ResourceUsage:         capture.SnapshotResourceUsage(),
 		SizeBytes:             sz.SizeBytes,
 		SizeCapExceeded:       sz.SizeCapExceeded,
+		RiskWindowSeconds:     envInt("OLT_RISK_WINDOW_SECONDS", 0),
+		RealWorkload:          os.Getenv("OLT_EVAL_REAL_WORKLOAD") != "",
+		ForcePreseed:          os.Getenv("OLT_EVAL_FORCE_PRESEED") != "",
+		StrongStimulus:        os.Getenv("OLT_EVAL_STRONG") != "",
+		WaitAssess:            os.Getenv("OLT_EVAL_WAIT_ASSESS") != "",
+		PreseedDirectPublish:  preseeded,
+		PreseedTransitions:    preseedTransitions,
 	}
 	writeEvalMetadata(t, runDir, meta)
 
@@ -258,22 +327,89 @@ func runOneEvalTrial(t *testing.T, js jetstream.JetStream, capturer *capture.Cap
 }
 
 // purgeEvalStreams purges the pipeline streams so each run captures only its
-// own messages. Streams absent for a given arm are skipped.
+// own messages. Streams genuinely absent for a given arm are skipped; ANY
+// other error (a transient NATS hiccup, a timed-out context, a failed purge)
+// fails the trial loudly, because a silently-unpurged stream breaks the
+// per-run isolation guarantee and attributes the previous run's messages to
+// this one (PR #92 review).
 func purgeEvalStreams(t *testing.T, js jetstream.JetStream) {
 	t.Helper()
 	streams := []string{
 		"EVENTS_RAW", "EVENTS", "EVIDENCE", "AUDIT_ASSESSMENTS",
 		"AUDIT_TRANSITIONS", "THREATS", "INCIDENTS", "INVESTIGATIONS", "REPORTS",
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	for _, name := range streams {
+		// Per-stream context so one slow stream cannot starve the rest of the
+		// shared budget into spurious deadline errors.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		s, err := js.Stream(ctx, name)
 		if err != nil {
-			continue // stream not present for this arm
+			cancel()
+			if errors.Is(err, jetstream.ErrStreamNotFound) {
+				continue // genuinely not provisioned for this arm
+			}
+			t.Fatalf("purge: stream %s lookup failed (isolation cannot be guaranteed): %v", name, err)
 		}
-		_ = s.Purge(ctx)
+		if perr := s.Purge(ctx); perr != nil {
+			cancel()
+			t.Fatalf("purge: stream %s purge failed (isolation cannot be guaranteed): %v", name, perr)
+		}
+		cancel()
 	}
+}
+
+// armHasLLM reports whether the arm label runs the investigation chain (rsl,
+// rslt-full, rslt-l1-only, rslt-l1-l2). f and rs are deterministic-only.
+func armHasLLM(config string) bool {
+	return strings.HasPrefix(config, "rsl")
+}
+
+// streamMsgCount returns the stream's current message count, or 0 when the
+// stream is absent.
+func streamMsgCount(t *testing.T, js jetstream.JetStream, name string) int {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s, err := js.Stream(ctx, name)
+	if err != nil {
+		return 0
+	}
+	info, err := s.Info(ctx)
+	if err != nil {
+		return 0
+	}
+	return int(info.State.Msgs)
+}
+
+// waitForPipelineQuiescent waits until the FSM consumer (which runs the
+// investigation chain INLINE, so an in-flight LLM call shows as an
+// unacknowledged message) has no pending and no ack-pending messages on the
+// EVIDENCE stream, or the bound elapses. Called before each purge so work
+// still in flight from the previous trial cannot publish after the purge and
+// contaminate the next trial's capture (PR #92 review).
+func waitForPipelineQuiescent(t *testing.T, js jetstream.JetStream, bound time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(bound)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		s, err := js.Stream(ctx, "EVIDENCE")
+		if err != nil {
+			cancel()
+			return // no evidence stream, nothing to drain
+		}
+		c, err := s.Consumer(ctx, "olaitan-response-fsm")
+		if err != nil {
+			cancel()
+			return // consumer not provisioned (arm without the FSM consumer)
+		}
+		info, err := c.Info(ctx)
+		cancel()
+		if err == nil && info.NumPending == 0 && info.NumAckPending == 0 {
+			return
+		}
+		time.Sleep(time.Second)
+	}
+	t.Logf("pipeline still busy after %s; proceeding (cross-run bleed possible)", bound)
 }
 
 // waitForEvalSettle polls until an FSM transition has been published (the

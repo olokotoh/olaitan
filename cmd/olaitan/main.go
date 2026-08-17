@@ -1171,7 +1171,13 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	// window) instead of each single-signal package in isolation, so a
 	// sustained multi-signal attack escalates. OLT_RISK_WINDOW_SECONDS sets the
 	// decay TTL; 0/unset disables it (the per-package behaviour, unchanged).
-	riskWindow := risk.New(time.Duration(envSeconds("OLT_RISK_WINDOW_SECONDS", 0)) * time.Second)
+	riskTTLSeconds := envSeconds(log, "OLT_RISK_WINDOW_SECONDS", 0)
+	riskWindow := risk.New(time.Duration(riskTTLSeconds) * time.Second)
+	if riskTTLSeconds > 0 {
+		log.Info("aggregator: risk window enabled", "ttl_seconds", riskTTLSeconds)
+	} else {
+		log.Info("aggregator: risk window disabled (per-package scoring)")
+	}
 	if err := wireFSMConsumer(ctx, g, log, nc, scoreCalc, stateMachine, chain, chainMode, breaker, assessmentPub, chainRuns, riskWindow); err != nil {
 		closeNATS()
 		return fmt.Errorf("aggregator: fsm consumer: %w", err)
@@ -1692,6 +1698,30 @@ const fsmConsumerMaxDeliver = 5
 // engine.
 const fsmFetchBackoff = time.Second
 
+// envSeconds reads a non-negative integer env var (seconds), returning def
+// when unset or empty. An unparseable, negative, or out-of-range value ALSO
+// resolves to def, but loudly: a warning names the variable and the rejected
+// value, because a typo here silently changes security-control behaviour
+// (PR #92 review: OLT_RISK_WINDOW_SECONDS=300s previously fell back to
+// disabled with no trace). Values above one week (604800 s) are rejected as
+// configuration mistakes rather than clamped.
+func envSeconds(log *slog.Logger, key string, def int) int {
+	const maxSeconds = 7 * 24 * 60 * 60
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 || n > maxSeconds {
+		if log != nil {
+			log.Warn("invalid seconds value; using default",
+				"env", key, "value", v, "default", def, "max", maxSeconds)
+		}
+		return def
+	}
+	return n
+}
+
 // chainAdjustedScore runs the investigation chain inline when enabled, folds
 // its per-provider-capped LLM confidence into the deterministic ThreatScore,
 // and returns the combined score that drives the FSM (Story 3.11). A nil chain
@@ -1700,20 +1730,6 @@ const fsmFetchBackoff = time.Second
 // a live JetStream consumer (round-2 review: the inline call site was
 // otherwise untested -- a regression feeding 0 instead of llmCapped shipped
 // green).
-// envSeconds reads a non-negative integer env var (seconds), returning def when
-// unset, empty, or unparseable/negative.
-func envSeconds(key string, def int) int {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return def
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n < 0 {
-		return def
-	}
-	return n
-}
-
 func chainAdjustedScore(ctx context.Context, pkg schema.EvidencePackage, scoreCalc *score.Calculator, chain *analyst.Chain, chainMode string, breaker *analyst.CircuitBreaker, auditPub responseaudit.AssessmentAuditPublisher, chainRuns *prometheus.CounterVec, riskWindow *risk.Window, now time.Time, log *slog.Logger) (schema.ConfidenceScore, error) {
 	llmCapped := 0
 	if chain != nil {
@@ -1799,7 +1815,9 @@ func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, n
 			// score (a nil chain folds 0 = deterministic-only, Epic 2). The
 			// chain->fold->score wiring lives in chainAdjustedScore so it is
 			// unit-testable without a live JetStream consumer.
-			sc, serr := chainAdjustedScore(ctx, pkg, scoreCalc, chain, chainMode, breaker, auditPub, chainRuns, riskWindow, time.Now().UTC(), log)
+			// time.Now() keeps the monotonic reading so the window's TTL
+			// arithmetic is immune to wall-clock steps (PR #92 review).
+			sc, serr := chainAdjustedScore(ctx, pkg, scoreCalc, chain, chainMode, breaker, auditPub, chainRuns, riskWindow, time.Now(), log)
 			if serr != nil {
 				log.Warn("aggregator: fsm score failed; dropping", "err", serr, "package_id", pkg.PackageID)
 				_ = msg.Ack()
@@ -1808,12 +1826,25 @@ func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, n
 
 			st := stateMachine.Evaluate(pkg.WorkloadID, sc.Total, pkg.PackageID)
 			if st.FromState != st.ToState {
+				// The per-term composition is logged with every transition so
+				// a windowed score is explainable: the audit event records the
+				// total against the triggering package, and this structured
+				// line records WHY the total is what it is, including signals
+				// the risk window inherited from earlier packages (PR #92
+				// review: a windowed QUARANTINED score attached to a weak
+				// package was otherwise unexplainable from the audit trail;
+				// the AUDIT.transitions schema extension is deferred, see
+				// docs/deferred-decisions.md).
 				log.Info("aggregator: fsm transition",
 					"workload_id", st.WorkloadID,
 					"from_state", string(st.FromState),
 					"to_state", string(st.ToState),
 					"reason", st.Reason,
 					"score", st.Confidence,
+					"score_rules", sc.Rules,
+					"score_baseline", sc.Baseline,
+					"score_llm", sc.LLM,
+					"risk_window", riskWindow.Enabled(),
 					"package_id", st.PackageID)
 			}
 			_ = msg.Ack()

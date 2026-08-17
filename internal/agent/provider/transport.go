@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -55,16 +56,23 @@ func DefaultRoleTimeouts() map[Role]time.Duration {
 }
 
 // roleTimeoutMultiplier reads OLT_LLM_ROLE_TIMEOUT_MULTIPLIER (DW3.8-1) as
-// a positive float scaling the per-role default timeouts. Absent, empty,
-// unparseable, or non-positive all resolve to 1.0 (the AC-mandated
-// defaults, unchanged).
+// a positive finite float scaling the per-role default timeouts. Absent,
+// empty, unparseable, non-positive, NaN, Inf, or greater than
+// maxRoleTimeoutMultiplier all resolve to 1.0 (the AC-mandated defaults,
+// unchanged). The NaN/Inf/ceiling checks are load-bearing (PR #92 review):
+// ParseFloat accepts "NaN" and "Inf", `NaN <= 0` is false, and an oversized
+// multiplier overflows time.Duration(float64(d)*m) to a NEGATIVE duration,
+// which context.WithTimeout treats as already-expired, so a single bad env
+// value would fail every provider call instantly and silently kill the whole
+// LLM tier.
 func roleTimeoutMultiplier() float64 {
+	const maxRoleTimeoutMultiplier = 100 // 100x the 120s DFIR budget = 3h20m, far below overflow
 	v := strings.TrimSpace(os.Getenv("OLT_LLM_ROLE_TIMEOUT_MULTIPLIER"))
 	if v == "" {
 		return 1.0
 	}
 	m, err := strconv.ParseFloat(v, 64)
-	if err != nil || m <= 0 {
+	if err != nil || math.IsNaN(m) || math.IsInf(m, 0) || m <= 0 || m > maxRoleTimeoutMultiplier {
 		return 1.0
 	}
 	return m

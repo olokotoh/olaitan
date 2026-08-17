@@ -37,11 +37,15 @@ import (
 )
 
 // providerScoreCap maps the provider shape flag to the per-provider score
-// cap the fake reports (BI-6). claude -> 35 -> bound 10.5; ollama -> 25 ->
-// bound 7.5. The harness reads the bound from the provider seam, not from
-// this map; this map only selects which cap the fake reports.
+// cap the fake reports (BI-6). claude -> 35 -> bound 10.5; openai -> 30 ->
+// bound 9.0; ollama -> 25 -> bound 7.5. The harness reads the bound from the
+// provider seam, not from this map; this map only selects which cap the fake
+// reports. The openai shape was added for PR #92: the recorded evaluation
+// campaign ran an OpenAI-compatible provider (deepseek-chat, trust-tier cap
+// 30), and the trust-bound evidence must cover the tier that actually ran.
 var providerScoreCap = map[string]int{
 	"claude": 35,
+	"openai": 30,
 	"ollama": 25,
 }
 
@@ -58,7 +62,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	var (
 		offline      = fs.Bool("offline", false, "run the offline fake-provider bound test (the only supported mode in Story 5.6)")
 		configFlag   = fs.String("config", "rslt-full", "LLM configuration under test: rsl | rslt-full")
-		providerFlag = fs.String("provider", "claude", "provider shape: claude (cap 35, bound 10.5) | ollama (cap 25, bound 7.5)")
+		providerFlag = fs.String("provider", "claude", "provider shape: claude (cap 35, bound 10.5) | openai (cap 30, bound 9.0) | ollama (cap 25, bound 7.5)")
 		trials       = fs.Int("trials", 10, "number of trials to run (offline uses a small deterministic N; the pre-registered N=100 cluster run is deferred)")
 		out          = fs.String("out", "", "output directory for the FR55 run artefacts (the reserved runs/fr55 sub-tree); empty skips emission")
 	)
@@ -76,7 +80,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	}
 	scoreCap, ok := providerScoreCap[*providerFlag]
 	if !ok {
-		return fmt.Errorf("unknown provider %q (want claude or ollama)", *providerFlag)
+		return fmt.Errorf("unknown provider %q (want claude, openai, or ollama)", *providerFlag)
 	}
 	if *trials < 0 {
 		return fmt.Errorf("negative --trials %d", *trials)

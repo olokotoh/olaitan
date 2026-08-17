@@ -936,8 +936,10 @@ POLICY for mid-flight LLM failures is Story 3.10 scope.
 thinking explicitly disabled and a bounded `max_tokens` (default 4096); no
 sampling parameter (`temperature`/`top_p`/`top_k`) and no `budget_tokens` is
 ever sent (removed on Opus 4.8; they return HTTP 400). Default model
-`claude-opus-4-8`, operator-pinnable via `analyst.api.model` (exact model ids
-only, never a date suffix). Evidence is redacted via the Story 3.1 pipeline
+`claude-opus-4-8` for the claude provider family, operator-pinnable via
+`analyst.api.model` (exact model ids only, never a date suffix); the recorded
+evaluation campaign pinned `deepseek-chat` via the OpenAI-compatible provider
+(disclosed substitution, ADR-2026-08-17-01). Evidence is redacted via the Story 3.1 pipeline
 BEFORE the wire payload is built; the captured-request-body integration test
 is the proof.
 
@@ -1308,8 +1310,9 @@ The six evaluation arms are committed as THIN Helm values overlays under
 Each overlay sets ONLY `evaluation.config` (the per-arm
 rules/baselines/provider/l2/senior values are computed by the chart matrix,
 Story 1.19 + Story 3.16) plus, for the LLM arms, the reproducibility model
-pin `analyst.api.model: claude-opus-4-8` (mirroring `eval/manifest.yaml`'s
-`llm_model_version`, NFR37). The overlays do NOT restate the per-arm knobs
+pin `analyst.api.model` mirroring `eval/manifest.yaml`'s `llm_model_version`
+(NFR37; currently `deepseek-chat`, the disclosed provider substitution of the
+recorded 2026-07 campaign, ADR-2026-08-17-01). The overlays do NOT restate the per-arm knobs
 (the chart clobbers them under a named arm anyway). Filename note (BI-1):
 the `RSLT-L1+L2` arm's `+` is normalised to `-` in the filename
 (`values-eval-rslt-l1-l2.yaml`); the in-file `evaluation.config` stays the
@@ -1447,6 +1450,52 @@ eval_run_ids:   TBD (Epic 5 evaluation harness wires the metric surface into per
 ```
 
 ---
+
+### The rolling per-workload risk window (PR #92, ADR-2026-08-17-01)
+
+**What it is.** Off by default, the FSM consumer scores each package's own
+signals in isolation (the pre-window behaviour, byte-identical). With
+`OLT_RISK_WINDOW_SECONDS=<ttl>` set on the aggregator, the consumer scores a
+workload on its rolling aggregate instead: the strongest rule match, the
+strongest baseline deviation, and the max per-provider-capped LLM confidence
+observed for that workload within the TTL, each expiring independently TTL
+after ITS OWN observation. Correlated single-signal packages (a rule match,
+then a baseline deviation) then sum in the ThreatScore and can cross the
+RESTRICTED/QUARANTINED bands no single package could. The trust bound is
+unaffected: the window aggregates the already-capped LLM term and the score
+calculator re-clamps at `llm_cap` regardless.
+
+**How to enable.** The committed mechanism is `aggregator.extraEnv`:
+
+```sh
+helm upgrade olaitan deploy/helm/olaitan --reuse-values   --set aggregator.extraEnv[0].name=OLT_RISK_WINDOW_SECONDS   --set-string aggregator.extraEnv[0].value=60
+```
+
+Restart-required (env change rolls the Deployment). An invalid value (a
+duration suffix, a negative, or > 604800) logs
+`invalid seconds value; using default` and leaves the window DISABLED; the
+startup log line `aggregator: risk window enabled ttl_seconds=N` (or
+`... disabled (per-package scoring)`) is the authoritative confirmation.
+
+**Expected log signal.** Every FSM transition line carries the per-term
+composition (`score_rules` / `score_baseline` / `score_llm`) and
+`risk_window=true|false`, so a windowed escalation is explainable from the
+log even when the triggering package's own signals are weak: the aggregate's
+inherited terms show up in the composition. (The `AUDIT.transitions` payload
+carries the total only; the composition field is a deferred additive schema
+change, ADR-2026-08-17-01.)
+
+**Operational caveats.** The window is process-local: an aggregator restart
+resets aggregates while FSM state restores from Redis, so an in-progress
+multi-signal escalation resumes from single-signal scoring (conservative
+direction; scores can only be lower after a restart). De-escalation timing
+under an enabled window reflects signal expiry: a workload's score drops
+when its strongest retained signal ages past TTL, not merely when packages
+stop arriving.
+
+**Related knob.** `OLT_LLM_ROLE_TIMEOUT_MULTIPLIER` (same `aggregator.extraEnv`
+mechanism) scales every per-role LLM timeout budget by a positive finite
+float (at most 100) for slow providers; invalid values fall back to 1.0.
 
 ## Section 2. Operational scenarios (NFR34)
 

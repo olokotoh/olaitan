@@ -19,6 +19,12 @@ networkPolicy:
               - 10.0.0.0/8
               - 172.16.0.0/12
               - 192.168.0.0/16
+              # Non-public ranges beyond RFC1918 (PR #92 review): link-local /
+              # cloud-metadata (169.254.0.0/16) and CGNAT (100.64.0.0/10, the
+              # space kind and several CNIs allocate from) must not become
+              # reachable through the "public IPs only" hole.
+              - 169.254.0.0/16
+              - 100.64.0.0/10
       ports:
         - protocol: TCP
           port: 443
