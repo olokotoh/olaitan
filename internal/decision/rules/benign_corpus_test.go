@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	evalscenario "github.com/olokotoh/olaitan/internal/eval/scenario"
 	"github.com/olokotoh/olaitan/internal/decision/rules/loader"
+	evalscenario "github.com/olokotoh/olaitan/internal/eval/scenario"
 	"github.com/olokotoh/olaitan/internal/schema"
 )
 
@@ -53,7 +53,7 @@ func TestBenignCorpus_MatchesNoRule(t *testing.T) {
 		}
 	}
 	pkg := &schema.EvidencePackage{
-		PackageID: "benign-pkg",
+		PackageID:  "benign-pkg",
 		WorkloadID: "tenant-acme/Deployment/web",
 		WorkloadPosture: &schema.WorkloadPosture{
 			Identity: schema.WorkloadIdentity{
