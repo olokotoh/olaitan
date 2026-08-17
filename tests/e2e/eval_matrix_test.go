@@ -178,8 +178,15 @@ func runOneBenignSweep(t *testing.T, js jetstream.JetStream, capturer *capture.C
 		case <-time.After(time.Until(deadline)):
 		}
 	}
-	// Let the last events settle through the pipeline before capture.
+	// Let the last events settle through the pipeline before capture. Trailing
+	// benign escalations (if any) land during this settle window, so the FPR
+	// observation window MUST include it; it MUST NOT include the subsequent
+	// capture-drain dead time, during which nothing is injected and no
+	// escalation can newly fire. Anchor finished_at here, before Capture, so
+	// the FPR denominator (finished_at - started_at) is the true observation
+	// window and the rate is not biased downward (PR #93 review).
 	waitForPipelineQuiescent(t, js, 60*time.Second)
+	finishedAt := time.Now().UTC()
 
 	runID := fmt.Sprintf("%s-%s-benign-r%02d",
 		startedAt.Format("20060102T150405.000Z"), tr.config, tr.run)
@@ -202,7 +209,7 @@ func runOneBenignSweep(t *testing.T, js jetstream.JetStream, capturer *capture.C
 		Config:               tr.config,
 		Runs:                 1,
 		StartedAt:            startedAt.Format(time.RFC3339Nano),
-		FinishedAt:           time.Now().UTC().Format(time.RFC3339Nano),
+		FinishedAt:           finishedAt.Format(time.RFC3339Nano),
 		OlaitanEvalVersion:   tr.evalVersion,
 		ScenarioInstance:     tr.run,
 		ResourceUsage:        capture.SnapshotResourceUsage(),

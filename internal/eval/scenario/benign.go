@@ -58,13 +58,22 @@ func BenignEvents(podName string, ts time.Time, tick int) []Event {
 			"process.cap_effective": "",
 		}),
 		// Normal intra-cluster flow: RFC1918 destination, HTTPS to a peer
-		// service, small payload. Not a C2 port, not a non-RFC1918 address.
+		// service. FRAGILITY NOTE (PR #93 review): OLT-NET-001 fires on an
+		// outbound flow in a tenant namespace to a NON-RFC1918 address with a
+		// SMALL payload (bytes_out matching ^[0-9]{1,3}$). This benign flow
+		// already satisfies the outbound/tenant clauses, so it must fail on
+		// BOTH remaining axes, not one, to stay robustly benign: the
+		// destination is RFC1918 (10.0.0.42) AND the payload is 4+ digits
+		// (40960 bytes), so neither the dst_ip negation nor the small-payload
+		// clause matches. Do NOT make this destination public or shrink the
+		// payload below 4 digits "for realism" without re-checking the corpus
+		// (the benign_corpus_test rule-miss property guards the build).
 		mk("flow", RawNetworkSubject, "network", "flow", map[string]any{
 			"dst_ip":            "10.0.0.42",
 			"network.dst_ip":    "10.0.0.42",
 			"network.dst_port":  443,
 			"network.protocol":  "TCP",
-			"network.bytes_out": "256",
+			"network.bytes_out": "40960",
 		}),
 	}
 }
@@ -77,7 +86,7 @@ func BenignEvents(podName string, ts time.Time, tick int) []Event {
 func BenignRawFieldMaps() []map[string]any {
 	return []map[string]any{
 		{"process.exe": "/usr/local/bin/node", "process.cap_effective": ""},
-		{"dst_ip": "10.0.0.42", "network.dst_ip": "10.0.0.42", "network.dst_port": 443, "network.protocol": "TCP", "network.bytes_out": "256"},
+		{"dst_ip": "10.0.0.42", "network.dst_ip": "10.0.0.42", "network.dst_port": 443, "network.protocol": "TCP", "network.bytes_out": "40960"},
 	}
 }
 
