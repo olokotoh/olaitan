@@ -166,6 +166,7 @@ type evalRunMetadata struct {
 	WaitAssess           bool `yaml:"wait_assess"`
 	PreseedDirectPublish bool `yaml:"preseed_direct_publish"`
 	PreseedTransitions   int  `yaml:"preseed_transitions"`
+	Staged               bool `yaml:"staged"`
 }
 
 func runOneEvalTrial(t *testing.T, js jetstream.JetStream, capturer *capture.Capturer, tr evalTrial) {
@@ -222,14 +223,39 @@ func runOneEvalTrial(t *testing.T, js jetstream.JetStream, capturer *capture.Cap
 		purgeEvalStreams(t, js)
 	}
 
+	staged := os.Getenv("OLT_EVAL_STAGED") != ""
 	startedAt := time.Now().UTC()
 
-	events := evalscenario.Events(tr.scenario, podName, startedAt)
-	if len(events) == 0 {
-		t.Fatalf("no recipe events for scenario %q", tr.scenario)
-	}
-	for _, ev := range events {
-		publishJS(t, js, ev.Subject, ev.Payload)
+	if staged {
+		// Staged injection (Story 7.2): publish each event at its per-run
+		// offset so the stimulus unfolds over the attack's real temporal shape
+		// and measured_time_to_detect is a non-degenerate latency. startedAt is
+		// the FIRST publish (offset 0); measurement still derives solely from
+		// captured timestamps. A ceiling overrun fails the trial loudly rather
+		// than truncating the schedule.
+		sev := evalscenario.StagedEvents(tr.scenario, podName, startedAt, tr.run)
+		if len(sev) == 0 {
+			t.Fatalf("no staged recipe events for scenario %q", tr.scenario)
+		}
+		schedStart := time.Now()
+		for _, ev := range sev {
+			if d := time.Until(schedStart.Add(ev.Offset)); d > 0 {
+				select {
+				case <-time.After(d):
+				case <-time.After(tr.ceiling + evalscenario.StaggerSpan(tr.scenario)):
+					t.Fatalf("staged schedule for %q exceeded its bound before offset %v", tr.scenario, ev.Offset)
+				}
+			}
+			publishJS(t, js, ev.Subject, ev.Payload)
+		}
+	} else {
+		events := evalscenario.Events(tr.scenario, podName, startedAt)
+		if len(events) == 0 {
+			t.Fatalf("no recipe events for scenario %q", tr.scenario)
+		}
+		for _, ev := range events {
+			publishJS(t, js, ev.Subject, ev.Payload)
+		}
 	}
 	// OLT_EVAL_STRONG (option-2 prototype): co-inject anomalous distinct-IP
 	// network flows into the SAME correlator window as the rule-match event,
@@ -270,7 +296,14 @@ func runOneEvalTrial(t *testing.T, js jetstream.JetStream, capturer *capture.Cap
 			t.Logf("OLT_EVAL_WAIT_ASSESS ignored for non-LLM arm %q; waiting on AUDIT_TRANSITIONS", tr.config)
 		}
 	}
-	waitForEvalSettle(t, js, waitStream, tr.ceiling)
+	// Effective ceiling accounts for the staged injection span (AC5): a staged
+	// s4 run spreads events over ~100s, so a ceiling calibrated for
+	// instantaneous injection would truncate it.
+	effectiveCeiling := tr.ceiling
+	if staged {
+		effectiveCeiling = tr.ceiling + evalscenario.StaggerSpan(tr.scenario)
+	}
+	waitForEvalSettle(t, js, waitStream, effectiveCeiling)
 
 	runID := fmt.Sprintf("%s-%s-%s-r%02d",
 		startedAt.Format("20060102T150405.000Z"), tr.config, tr.scenario, tr.run)
@@ -318,6 +351,7 @@ func runOneEvalTrial(t *testing.T, js jetstream.JetStream, capturer *capture.Cap
 		WaitAssess:            os.Getenv("OLT_EVAL_WAIT_ASSESS") != "",
 		PreseedDirectPublish:  preseeded,
 		PreseedTransitions:    preseedTransitions,
+		Staged:                staged,
 	}
 	writeEvalMetadata(t, runDir, meta)
 
