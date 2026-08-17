@@ -102,7 +102,7 @@ func TestStagedEvents_OffsetsOrderedAndWithinSpan(t *testing.T) {
 				if e.Offset < 0 {
 					t.Fatalf("%s run %d event %d: negative offset %v", sc, run, i, e.Offset)
 				}
-				if e.Offset > span+maxStagedJitter {
+				if e.Offset > span+MaxStagedJitter {
 					t.Fatalf("%s run %d event %d: offset %v exceeds span %v + jitter", sc, run, i, e.Offset, span)
 				}
 				if e.Offset < prev {

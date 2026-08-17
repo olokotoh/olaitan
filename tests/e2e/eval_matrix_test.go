@@ -337,26 +337,32 @@ func runOneEvalTrial(t *testing.T, js jetstream.JetStream, capturer *capture.Cap
 	}
 
 	staged := os.Getenv("OLT_EVAL_STAGED") != ""
-	startedAt := time.Now().UTC()
+	// ONE anchor for both re-stamping and scheduling (PR #93 Copilot review):
+	// events are stamped at anchor+offset AND published at anchor+offset, and
+	// startedAt (the measurement base) is anchor, so the embedded timestamps,
+	// the schedule, and the MTTD base cannot drift apart. anchor keeps its
+	// monotonic reading for the schedule waits; startedAt is its wall-clock
+	// form for the recipe and metadata.
+	anchor := time.Now()
+	startedAt := anchor.UTC()
 
 	if staged {
 		// Staged injection (Story 7.2): publish each event at its per-run
 		// offset so the stimulus unfolds over the attack's real temporal shape
-		// and measured_time_to_detect is a non-degenerate latency. startedAt is
-		// the FIRST publish (offset 0); each event's embedded timestamp is
-		// re-stamped to startedAt+offset by StagedEvents so it is not evicted
-		// as stale by the correlator's 60s window (PR #93 review); measurement
-		// still derives solely from captured timestamps.
+		// and measured_time_to_detect is a non-degenerate latency. Each event's
+		// embedded timestamp is re-stamped to anchor+offset by StagedEvents so
+		// it is not evicted as stale by the correlator's 60s window (PR #93
+		// review); measurement still derives solely from captured timestamps.
 		sev := evalscenario.StagedEvents(tr.scenario, podName, startedAt, tr.run)
 		if len(sev) == 0 {
 			t.Fatalf("no staged recipe events for scenario %q", tr.scenario)
 		}
-		schedStart := time.Now()
 		for _, ev := range sev {
-			// Sleep until this event's scheduled instant. A slow machine can
-			// slip the schedule; that is fine (measurement is from captured
+			// Sleep until this event's scheduled instant, anchored to the SAME
+			// base used for the embedded timestamps. A slow machine can slip
+			// the schedule; that is fine (measurement is from captured
 			// timestamps, and the effective settle ceiling below absorbs it).
-			if d := time.Until(schedStart.Add(ev.Offset)); d > 0 {
+			if d := time.Until(anchor.Add(ev.Offset)); d > 0 {
 				time.Sleep(d)
 			}
 			publishJS(t, js, ev.Subject, ev.Payload)
@@ -414,7 +420,11 @@ func runOneEvalTrial(t *testing.T, js jetstream.JetStream, capturer *capture.Cap
 	// instantaneous injection would truncate it.
 	effectiveCeiling := tr.ceiling
 	if staged {
-		effectiveCeiling = tr.ceiling + evalscenario.StaggerSpan(tr.scenario)
+		// Include the jitter margin: an event's jittered offset can exceed the
+		// nominal StaggerSpan by up to MaxStagedJitter, so widen the settle
+		// ceiling by that margin too or a late-scheduled event could truncate
+		// the wait (PR #93 Copilot review).
+		effectiveCeiling = tr.ceiling + evalscenario.StaggerSpan(tr.scenario) + evalscenario.MaxStagedJitter
 	}
 	waitForEvalSettle(t, js, waitStream, effectiveCeiling)
 

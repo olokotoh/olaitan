@@ -44,13 +44,15 @@ func staggerProfile(scenarioID string) (offsets []time.Duration, span time.Durat
 	return nil, 0
 }
 
-// maxStagedJitter bounds the per-event seeded jitter. Non-priming events are
+// MaxStagedJitter bounds the per-event seeded jitter. Non-priming events are
 // shifted by up to this much either way, so different runs produce different
-// (but reproducible) offsets and the pipeline latency measurement varies.
-const maxStagedJitter = 2 * time.Second
+// (but reproducible) offsets and the pipeline latency measurement varies. It
+// is exported so the driver can widen the settle ceiling to cover an event
+// whose jittered offset exceeds the nominal StaggerSpan (PR #93 review).
+const MaxStagedJitter = 2 * time.Second
 
 // jitterFor returns a deterministic per-run, per-event jitter in
-// [-maxStagedJitter, +maxStagedJitter], seeded ONLY by
+// [-MaxStagedJitter, +MaxStagedJitter], seeded ONLY by
 // (scenarioID, run, eventIndex) via an FNV-seeded splitmix64 step. Run r of
 // scenario s always reproduces the same jitter; different runs differ. No
 // global rand, no wall clock. The priming event (index 0) is never jittered so
@@ -67,8 +69,8 @@ func jitterFor(scenarioID string, run, eventIndex int) time.Duration {
 	h ^= h >> 30
 	h *= 0xBF58476D1CE4E5B9
 	h ^= h >> 27
-	span := int64(2*maxStagedJitter) + 1
-	return time.Duration(int64(h%uint64(span))) - maxStagedJitter
+	span := int64(2*MaxStagedJitter) + 1
+	return time.Duration(int64(h%uint64(span))) - MaxStagedJitter
 }
 
 // StaggerSpan returns the nominal (un-jittered) time span of a scenario's
@@ -112,10 +114,12 @@ func StagedEvents(scenarioID, podName string, ts time.Time, run int) []StagedEve
 }
 
 // restampEvent returns a copy of ev with its embedded JSON "timestamp" field
-// set to at (RFC3339Nano). Only the timestamp changes; every other byte of the
-// payload is preserved. On any decode/encode error the event is returned
-// unchanged (the payloads are engine-produced JSON objects, so this never
-// happens in practice; failing closed to the original is safe).
+// set to at (RFC3339Nano). Only the timestamp field changes; every other field
+// is preserved semantically (each value round-trips as json.RawMessage, so
+// values are byte-preserved and only the object's key order may differ, which
+// is JSON-equivalent, PR #93 Copilot review). On any decode/encode error the
+// event is returned unchanged (the payloads are engine-produced JSON objects,
+// so this never happens in practice; failing closed to the original is safe).
 func restampEvent(ev Event, at time.Time) Event {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(ev.Payload, &m); err != nil {
