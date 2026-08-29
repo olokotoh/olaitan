@@ -121,7 +121,8 @@ helm-values-doc:
 	go run ./cmd/olaitan-helmdoc
 
 docker-build:
-	docker build -t $(IMAGE):$(TAG) .
+	@test -n '$(VERSION)' || { echo 'VERSION is empty; an empty build arg overrides the Dockerfile default' >&2; exit 1; }
+	docker build --build-arg VERSION='$(VERSION)' -t '$(IMAGE):$(TAG)' .
 
 clean:
 	# Chart.lock is committed to the repo (it pins subchart digests for
