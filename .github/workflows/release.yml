@@ -1,0 +1,583 @@
+# Release pipeline (Story 8.1).
+#
+# Trigger: a pushed tag matching v*. It produces three things an operator
+# can consume without cloning the repo:
+#
+#   1. a multi-arch image at ghcr.io/<owner>/olaitan
+#   2. the Helm chart at oci://ghcr.io/<owner>/charts/olaitan
+#   3. a GitHub Release carrying the chart tarball, SBOM and checksums
+#
+# Image and chart are both cosign-signed keylessly (OIDC, no long-lived
+# key) and carry an SPDX SBOM.
+#
+# The tag is expected to sit on a commit that already passed CI on main.
+# That is ENFORCED, not assumed: the preflight job below refuses to publish
+# a tag whose commit is not an ancestor of main or whose CI run did not
+# conclude successfully. Without that check the Trivy CRITICAL/HIGH gate,
+# the kind e2e suite and the helm schema gate could all be bypassed by
+# tagging any commit.
+#
+# ONE MANUAL STEP, ONCE: GHCR creates a package as PRIVATE on its first
+# push. After the first release, set both packages (olaitan and
+# charts/olaitan) to public under the account's Packages settings, or the
+# clean-machine install fails with a 401 for anyone but the owner.
+# Subsequent releases inherit the visibility.
+#
+# Shell conventions in this file: every multi-line `run` declares
+# `shell: bash` so that pipefail is on (GitHub's default is `bash -e`,
+# which lets a failing command inside a pipeline pass unnoticed), and
+# every value that originates outside the workflow (a tag name, an actor)
+# reaches the script through `env:` rather than `${{ }}` interpolation,
+# so a crafted git ref cannot inject shell into a job that holds a
+# signing identity.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Two tags pushed in quick succession must not race on the mutable
+# `latest` tag. Releases queue instead of cancelling: a half-published
+# release is worse than a slow one.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Preflight: derive and validate the version, and refuse to publish a
+  # tag that did not come from green CI on main.
+  # ---------------------------------------------------------------------
+  preflight:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # The green-CI gate reads workflow runs through the Actions API.
+      actions: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      promote_latest: ${{ steps.promote.outputs.promote }}
+      image: ${{ steps.names.outputs.image }}
+      chart_repo: ${{ steps.names.outputs.chart_repo }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the ancestry check below needs main.
+          fetch-depth: 0
+
+      # OCI repository names must be lowercase, and github.repository_owner
+      # preserves the account's display casing.
+      - name: Derive artefact names
+        id: names
+        shell: bash
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "image=ghcr.io/${owner}/olaitan" >> "$GITHUB_OUTPUT"
+          echo "chart_repo=oci://ghcr.io/${owner}/charts" >> "$GITHUB_OUTPUT"
+
+      # The tag must be strict semver with a leading v. docker/metadata-action
+      # silently emits NO version tag for a ref it cannot parse (v1.0, say),
+      # which would publish an image reachable only as `latest`. Failing here
+      # turns that into a loud error before anything is pushed.
+      - name: Derive and validate version
+        id: version
+        shell: bash
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${REF_NAME#v}"
+          semver='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+          if [[ ! "$version" =~ $semver ]]; then
+            echo "tag '${REF_NAME}' is not vMAJOR.MINOR.PATCH[-prerelease]" >&2
+            echo "build metadata (+) is not supported: Helm rewrites '+' in filenames" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # Any semver pre-release carries a hyphen. That single
+          # discriminator drives both the `latest` tag and the GitHub
+          # Release's pre-release flag, so an rc can never become the tag
+          # an unpinned `helm install` resolves to.
+          if [[ "$version" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Require the tag to sit on main
+        shell: bash
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          # Resolve both refs first: `merge-base --is-ancestor` returns 1 for
+          # "no" and 128 for "bad object", and collapsing the two sends
+          # whoever is on call looking at the wrong thing.
+          git rev-parse --verify --quiet "${SHA}^{commit}" >/dev/null \
+            || { echo "cannot resolve tagged commit ${SHA}" >&2; exit 1; }
+          git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null \
+            || { echo "cannot resolve origin/main after fetch" >&2; exit 1; }
+          if ! git merge-base --is-ancestor "$SHA" refs/remotes/origin/main; then
+            echo "refusing to release: ${SHA} is not an ancestor of origin/main" >&2
+            exit 1
+          fi
+
+      # CI does not run on tag pushes (ci.yml triggers on main pushes and
+      # PRs), so this reads the conclusion of the run that already happened
+      # for this commit rather than waiting for one.
+      # Queried by workflow FILE, not by display name, so renaming the
+      # workflow cannot silently turn this gate into "conclusion: none".
+      # event=push and head_branch=main together exclude a pull_request run:
+      # a PR run skips every job gated on `github.event_name == 'push'`, so
+      # accepting one would let a commit through whose push-only jobs never
+      # executed.
+      - name: Require green CI on the tagged commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          conclusion="$(gh api \
+            "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${SHA}&event=push&branch=main&status=completed" \
+            --jq '[.workflow_runs[]] | sort_by(.created_at) | last | .conclusion // "none"')"
+          echo "CI conclusion for ${SHA}: ${conclusion}"
+          if [[ "$conclusion" != "success" ]]; then
+            echo "refusing to release: CI (push to main) on ${SHA} concluded '${conclusion}'" >&2
+            exit 1
+          fi
+
+      # `latest` must never move backwards. A patch tag cut on an older main
+      # commit passes ancestry and green CI, and would otherwise re-point
+      # `latest` at an older build than the newest release. Promotion is
+      # allowed only when this tag is the highest non-prerelease tag in the
+      # repository.
+      - name: Decide whether this tag may take `latest`
+        id: promote
+        shell: bash
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          if [[ "$PRERELEASE" == "true" ]]; then
+            echo "promote=false" >> "$GITHUB_OUTPUT"
+            echo "pre-release: latest stays where it is"
+            exit 0
+          fi
+          highest="$(git tag --list 'v*' | grep -vE -- '-' | sort -V | tail -1)"
+          echo "highest stable tag: ${highest}, this tag: ${REF_NAME}"
+          if [[ "$highest" == "$REF_NAME" ]]; then
+            echo "promote=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "promote=false" >> "$GITHUB_OUTPUT"
+            echo "not the highest stable tag: publishing the version tag only"
+          fi
+
+  # ---------------------------------------------------------------------
+  # Image: multi-arch build, push the version tag, scan, verify, sign.
+  # This job never touches the mutable `latest` tag: that happens in the
+  # `promote` job, after the chart is published too.
+  # ---------------------------------------------------------------------
+  image:
+    needs: preflight
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # Keyless cosign exchanges this OIDC token for a short-lived
+      # certificate; without it `cosign sign` fails at the Fulcio step.
+      id-token: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # QEMU is only needed for the arm64 leg. The Dockerfile cross-compiles
+      # (builder runs on BUILDPLATFORM, GOARCH targets TARGETARCH), so QEMU
+      # emulates nothing during `go build`.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # Only the immutable version tag here. `latest` is applied after
+          # the verify and sign steps below.
+          tags: ${{ needs.preflight.outputs.image }}:${{ needs.preflight.outputs.version }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          # Buildx attaches both attestations to the pushed index, so the
+          # SBOM and provenance travel with the image rather than living
+          # only in this workflow's artefacts.
+          sbom: true
+          provenance: mode=max
+
+      # Proves the released artefact reports the released version. The
+      # runner is amd64, so this exercises the amd64 leg of the index; the
+      # arm64 leg shares the same build arg and ldflags.
+      # Runs against the DIGEST, not the tag: a tag can be re-pointed by
+      # anything holding packages: write between the push and this step, and
+      # the digest is what gets signed and promoted. Exact string match, not
+      # a substring, so v1.2.30 cannot satisfy a check for v1.2.3.
+      - name: Verify version stamp
+        shell: bash
+        env:
+          IMAGE: ${{ needs.preflight.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          out="$(docker run --rm "${IMAGE}@${DIGEST}" version)"
+          echo "$out"
+          [ "$out" = "olaitan ${REF_NAME}" ] \
+            || { echo "release image reports '$out', expected 'olaitan ${REF_NAME}'" >&2; exit 1; }
+
+      # The CI Trivy gate scanned the image the `docker` job built, which is
+      # a different build from this one (different build args, different
+      # digest). A vulnerability gate that does not run on the digest that
+      # ships is not a gate, so the released digest is scanned here on the
+      # same terms: fixable CRITICAL/HIGH only, pinned scanner.
+      # Ordered after the verify step on purpose: that step's `docker run`
+      # pulls the digest into the local daemon store, which is what the
+      # socket-mounted scanner reads.
+      - name: Trivy CVE gate on the released digest
+        shell: bash
+        env:
+          IMAGE: ${{ needs.preflight.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+            aquasec/trivy:0.71.1 image \
+              --scanners vuln \
+              --vuln-type os,library \
+              --severity CRITICAL,HIGH \
+              --ignore-unfixed \
+              --exit-code 1 \
+              "${IMAGE}@${DIGEST}"
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign image
+        shell: bash
+        env:
+          IMAGE: ${{ needs.preflight.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # --recursive also signs each per-platform manifest under the
+          # index. Admission controllers resolve an image to its platform
+          # digest before verifying, and would find no signature there if
+          # only the index carried one.
+          cosign sign --yes --recursive "${IMAGE}@${DIGEST}"
+  # ---------------------------------------------------------------------
+  # Chart: stage generated files, resolve subcharts from the committed
+  # lock, package, verify the package is complete, push, sign, attest.
+  # ---------------------------------------------------------------------
+  chart:
+    needs: [preflight, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      # deploy/helm/olaitan/files/ is gitignored build output: the default
+      # config, the audit policy, the OLT rule corpus and the prompt
+      # templates are copied in at package time because Helm's .Files.Get
+      # cannot traverse above the chart directory. A chart packaged without
+      # this step installs an agent with no rules.
+      - name: Stage chart files
+        run: make helm-prepare
+
+      # `dependency build` resolves from the committed Chart.lock;
+      # `dependency update` would re-resolve against live upstream repos and
+      # rewrite the lock, so the same tag could package different subchart
+      # versions on a re-run. The chart is signed, so what it contains has
+      # to be determined by the repo, not by what the internet served that
+      # minute.
+      - name: Resolve subchart dependencies from Chart.lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          helm repo add falcosecurity https://falcosecurity.github.io/charts
+          helm repo add nats https://nats-io.github.io/k8s/helm/charts/
+          helm repo update
+          helm dependency build deploy/helm/olaitan
+
+      # The chart is copied to a staging directory before stamping, so a
+      # release never mutates the checked-out tree. version and appVersion
+      # both come from the tag: with image.tag empty (the default) the
+      # chart's image helper falls back to .Chart.AppVersion, which is what
+      # makes a clean-machine install resolve the image this release just
+      # pushed.
+      - name: Stage and stamp the chart
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          rm -rf build/chart
+          mkdir -p build
+          cp -r deploy/helm/olaitan build/chart
+          sed -i -E "s|^version: .*|version: ${VERSION}|" build/chart/Chart.yaml
+          sed -i -E "s|^appVersion: .*|appVersion: \"${VERSION}\"|" build/chart/Chart.yaml
+          # sed exits 0 when it substitutes nothing, so assert both lines
+          # actually carry the release version. A silently missed
+          # appVersion stamp ships a chart that resolves the wrong image.
+          grep -qx "version: ${VERSION}" build/chart/Chart.yaml
+          grep -qx "appVersion: \"${VERSION}\"" build/chart/Chart.yaml
+          git diff --quiet -- deploy/helm/olaitan/Chart.yaml
+
+      - name: Package chart
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Reused runners can carry a dist/ from an earlier tag, which the
+          # checksum and upload steps would happily attach to this release.
+          rm -rf dist
+          mkdir -p dist
+          helm package build/chart --destination dist
+          ls -l dist
+
+      # helm package succeeds on an empty files/ directory, which would
+      # publish a signed chart that installs an agent with no rules and no
+      # prompts. Assert the payload is really in the tarball.
+      - name: Verify the packaged chart is complete
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          tgz="dist/olaitan-${VERSION}.tgz"
+          listing="$(tar tzf "$tgz")"
+          rules="$(grep -c '^olaitan/files/rules/.*\.yaml$' <<<"$listing" || true)"
+          prompts="$(grep -c '^olaitan/files/prompts/.*\.txt$' <<<"$listing" || true)"
+          # helm package expands charts/*.tgz into directories, so the
+          # subchart evidence is each one's Chart.yaml, not a tarball.
+          # Verified against a local `helm package` of this chart.
+          subcharts="$(grep -cE '^olaitan/charts/[^/]+/Chart\.yaml$' <<<"$listing" || true)"
+          # Expected count comes from Chart.lock rather than a literal, so
+          # adding or dropping a dependency cannot leave this gate asserting
+          # a stale number.
+          # Every expected count is derived from the sources the Makefile
+          # stages from, never from a literal: a partially staged corpus is
+          # as bad as an empty one, and a literal would drift the first time
+          # a rule or a dependency is added.
+          expected_subcharts="$(grep -c '^- name:' deploy/helm/olaitan/Chart.lock)"
+          expected_rules="$(find rules -name '*.yaml' | wc -l)"
+          expected_prompts="$(find internal/agent/prompts/defaults -name '*.txt' | wc -l)"
+          echo "rules=${rules}/${expected_rules} prompts=${prompts}/${expected_prompts} subcharts=${subcharts}/${expected_subcharts}"
+          grep -qx 'olaitan/files/olaitan.yaml' <<<"$listing"
+          grep -qx 'olaitan/files/audit-policy-default.yaml' <<<"$listing"
+          [ "$rules" -eq "$expected_rules" ] \
+            || { echo "packaged chart carries ${rules} of ${expected_rules} OLT rules" >&2; exit 1; }
+          [ "$prompts" -eq "$expected_prompts" ] \
+            || { echo "packaged chart carries ${prompts} of ${expected_prompts} prompt templates" >&2; exit 1; }
+          [ "$subcharts" -eq "$expected_subcharts" ] \
+            || { echo "expected ${expected_subcharts} subcharts, found ${subcharts}" >&2; exit 1; }
+
+      # Generated from the packaged tarball, not the working tree, so the
+      # SBOM describes what was actually shipped.
+      - name: SBOM for the chart
+        uses: anchore/sbom-action@v0
+        with:
+          file: dist/olaitan-${{ needs.preflight.outputs.version }}.tgz
+          format: spdx-json
+          artifact-name: olaitan-chart-sbom.spdx.json
+          output-file: dist/olaitan-chart-sbom.spdx.json
+
+      # Syft over a Helm tarball has little to catalogue, so the package
+      # count is logged rather than asserted: the number tells us at rc time
+      # whether this SBOM carries real evidence or is decorative. Story 8.5
+      # revisits it with data instead of a guess.
+      - name: Report chart SBOM contents
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          count="$(jq '.packages | length' "dist/olaitan-chart-sbom.spdx.json")"
+          echo "chart SBOM package count: ${count}"
+
+      - name: Log in to GHCR for Helm
+        shell: bash
+        env:
+          ACTOR: ${{ github.actor }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$TOKEN" | helm registry login ghcr.io -u "$ACTOR" --password-stdin
+
+      - name: Push chart
+        id: push
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          CHART_REPO: ${{ needs.preflight.outputs.chart_repo }}
+        run: |
+          set -euo pipefail
+          helm push "dist/olaitan-${VERSION}.tgz" "${CHART_REPO}" 2>&1 | tee push.log
+          # grep -m1 rather than `grep | head -1`: head closes the pipe on
+          # its first line, grep takes SIGPIPE, and pipefail would abort the
+          # step AFTER a successful push, leaving an unsigned chart.
+          digest="$(grep -m1 -E '^Digest: sha256:[0-9a-f]{64}$' push.log | awk '{print $2}' || true)"
+          [ -n "$digest" ] || { echo "helm push printed no digest" >&2; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign and attest the chart
+        shell: bash
+        env:
+          OWNER_CHART: ${{ needs.preflight.outputs.chart_repo }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # chart_repo carries the oci:// scheme for helm; cosign wants the
+          # bare reference.
+          ref="${OWNER_CHART#oci://}/olaitan@${DIGEST}"
+          cosign sign --yes "$ref"
+          cosign attest --yes --type spdxjson \
+            --predicate dist/olaitan-chart-sbom.spdx.json "$ref"
+
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum ./*.tgz ./*.spdx.json > checksums.txt
+          cat checksums.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/
+
+  # ---------------------------------------------------------------------
+  # Promote: `latest` moves only once the chart is published too. Otherwise
+  # a chart-job failure would leave `latest` advertising a version that has
+  # no chart and no GitHub Release.
+  # ---------------------------------------------------------------------
+  promote:
+    needs: [preflight, image, chart]
+    if: needs.preflight.outputs.promote_latest == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote to latest
+        shell: bash
+        env:
+          IMAGE: ${{ needs.preflight.outputs.image }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --tag "${IMAGE}:latest" "${IMAGE}@${DIGEST}"
+          # imagetools may reuse the source index or synthesise a new one.
+          # If it synthesised, `latest` would resolve to an unsigned digest,
+          # which is precisely what promoting after signing was meant to
+          # prevent. Assert the tag lands on the digest that was signed.
+          got="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "${IMAGE}:latest")"
+          echo "latest -> ${got}"
+          [ "$got" = "$DIGEST" ] \
+            || { echo "latest resolves to ${got}, not the signed digest ${DIGEST}" >&2; exit 1; }
+
+  # ---------------------------------------------------------------------
+  # Release: notes plus the assets an operator may want to verify offline.
+  # ---------------------------------------------------------------------
+  release:
+    needs: [preflight, image, chart]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          prerelease: ${{ needs.preflight.outputs.prerelease == 'true' }}
+          files: |
+            dist/*.tgz
+            dist/*.spdx.json
+            dist/checksums.txt
+          body: |
+            ## Install
+
+            ```sh
+            helm install olaitan ${{ needs.preflight.outputs.chart_repo }}/olaitan \
+              --version ${{ needs.preflight.outputs.version }}
+            ```
+
+            Enforcement is off by default: Olaitan observes and reports until
+            `response.networkPolicy.enabled=true` is set explicitly.
+
+            ## Artefacts
+
+            | | |
+            |---|---|
+            | Image | `${{ needs.preflight.outputs.image }}:${{ needs.preflight.outputs.version }}` |
+            | Digest | `${{ needs.image.outputs.digest }}` |
+            | Platforms | `linux/amd64`, `linux/arm64` |
+            | Chart | `${{ needs.preflight.outputs.chart_repo }}/olaitan` |
+
+            ## Verify
+
+            Both artefacts are signed keylessly, so verification needs the
+            workflow identity that produced them:
+
+            ```sh
+            cosign verify \
+              --certificate-identity-regexp '^https://github.com/${{ github.repository }}/\.github/workflows/release\.yml@' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              ${{ needs.preflight.outputs.image }}@${{ needs.image.outputs.digest }}
+            ```
+
+            The chart verifies the same way, against
+            `ghcr.io/${{ github.repository_owner }}/charts/olaitan`. The
+            `:edge` image is signed by `ci.yml` rather than `release.yml`, so
+            verifying it needs that workflow in the identity regexp.

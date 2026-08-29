@@ -1,0 +1,13 @@
+# Allowlist, not a denylist: everything is excluded and the four paths the
+# image build actually needs are added back. A denylist would ship whatever
+# a developer happens to leave in the tree (a .env, a kubeconfig, a key)
+# into the build context and into buildx's provenance attestation, and it
+# would grow stale as the repo does.
+#
+# Before this file the context was ~1.1 GB, because `runs/` holds 204
+# recorded evaluation runs and the repo root carries built binaries.
+*
+!go.mod
+!go.sum
+!cmd
+!internal

@@ -78,3 +78,5 @@ analysis/**/*.pyc
 # requirements; never committed).
 analysis/.venv/
 analysis/**/.pytest_cache/
+build/
+dist/

@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+# Read-only by default so no job carries write scope by accident; the two
+# jobs that need more (traceability, edge) declare it themselves.
+permissions:
+  contents: read
+
 jobs:
   # Go build/test/lint — the original pipeline, renamed from `build` to
   # `go` so the sibling `helm` job reads naturally alongside it.
@@ -251,10 +256,11 @@ jobs:
           tag=$(make -s version-tag)
           out=$(docker run --rm olaitan:"$tag" version)
           echo "$out"
-          case "$out" in
-            olaitan\ *) ;;
-            *) echo "smoke: unexpected version output: $out" >&2; exit 1 ;;
-          esac
+          # Story 8.1: `make docker-build` now passes VERSION, so the stamp
+          # is asserted exactly. A dropped or renamed build arg fails here on
+          # main rather than at tag time inside the release pipeline.
+          [ "$out" = "olaitan $tag" ] \
+            || { echo "smoke: expected 'olaitan $tag', got: $out" >&2; exit 1; }
 
       # Story 6.6 (AC1; NFR13/NFR14): the REAL Trivy CVE gate. The
       # values-production.yaml overlay commits to "Trivy CVE check
@@ -1053,3 +1059,89 @@ jobs:
         run: |
           kubectl get pods -A
           kubectl logs -l app.kubernetes.io/name=olaitan --tail=300 --all-containers || true
+
+  # Story 8.1 (AC5): the tip of main is always installable.
+  #
+  # A separate job for two reasons. First, least privilege: `packages: write`
+  # lives only here, not on the `docker` job that builds pull-request-authored
+  # content. Second, "green push to main" has to mean green: the `docker` job
+  # alone would publish `:edge` even when the Go build, the helm gate or the
+  # kind e2e failed, because no job in this workflow declares `needs:`.
+  #
+  # Built with buildx for the same two platforms as a tagged release, stamped
+  # with the commit sha so an operator running `:edge` can say which commit
+  # they are on, and signed. Tagged releases are built by release.yml.
+  edge:
+    # Every job in this workflow that actually runs on a push to main.
+    # prompt-changelog and traceability are `pull_request`-only, and the
+    # three e2e-* jobs are PR-label-gated; a job that needs a SKIPPED job is
+    # itself skipped, so listing them here would mean `:edge` never
+    # publishes at all. Adding a new push-eligible job to this workflow
+    # means adding it here too.
+    needs:
+      - go
+      - analysis
+      - helm
+      - docker
+      - e2e
+      - forensics-integration
+      - report-archive-integration
+      - integration-inproc
+      - integration-envtest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # `:edge` is a mutable tag. Two merges landing close together must not
+    # race on it, and a run must not be cancelled between the push and the
+    # signature, which would leave an unsigned `:edge` published.
+    concurrency:
+      group: edge
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Derive image name
+        id: names
+        shell: bash
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "image=ghcr.io/${owner}/olaitan" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push :edge
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.names.outputs.image }}:edge
+          build-args: |
+            VERSION=edge-${{ github.sha }}
+          sbom: true
+          provenance: mode=max
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign :edge
+        shell: bash
+        env:
+          IMAGE: ${{ steps.names.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes --recursive "${IMAGE}@${DIGEST}"
