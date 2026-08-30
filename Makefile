@@ -9,6 +9,7 @@ CONFIG_SRC       := config/olaitan.yaml
 AUDIT_POLICY_SRC := config/audit-policy-default.yaml
 CHART_FILES      := $(CHART_DIR)/files/olaitan.yaml $(CHART_DIR)/files/audit-policy-default.yaml
 
+.PHONY: quickstart quickstart-clean
 .PHONY: build test lint olaitan-lint prereg-check analysis analysis-test docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics e2e-local-overlays eval-smoke scenarios-smoke capture-it e2e-local-down schemas helm-values-doc
 
 # envtest-bin downloads the kube-apiserver and etcd binaries that the
@@ -258,8 +259,12 @@ e2e-local: helm-prepare helm-deps docker-build
 	# Story 1.19 D6: instead of lying to JetStream about disk capacity
 	# via fileStore.maxSize=200GB, cap each stream's MaxBytes at 1 GiB
 	# via the OLT_NATS_STREAM_MAXBYTES_OVERRIDE env var (wired through
-	# nats.streamMaxBytesOverride). Sum of caps (3 streams) is 3 GiB,
-	# well under the kind node's PVC backing.
+	# nats.streamMaxBytesOverride). internal/nats/streams.go declares
+	# THIRTEEN streams, but this target leaves response.audit disabled so
+	# the five AUDIT_* streams are never created; the eight that are, at
+	# 1 GiB each, sit under the kind node's 10 GiB max_file_store. An
+	# overlay that enables audit needs a smaller cap -- see
+	# values-quickstart.yaml, which measured this and uses 512 MiB.
 	helm install olaitan $(CHART_DIR) \
 		--set image.repository=$(IMAGE) \
 		--set-string image.tag=$(TAG) \
@@ -488,3 +493,52 @@ capture-it:
 
 e2e-local-down:
 	kind delete cluster --name $(KIND_CLUSTER_NAME)
+
+# --- Story 8.3: the ten-minute path ----------------------------------------
+#
+# `make quickstart` is the only target in this file that installs the PUBLISHED
+# chart rather than the working tree. That is deliberate: it is the path a
+# stranger takes, so it has to break when publishing breaks. The e2e targets
+# above side-load a locally built image precisely because they are testing the
+# working tree; this one is testing the release.
+#
+# What it is honest about: Falco's eBPF probe cannot load inside a kind node,
+# so the scenario is INJECTED on the subjects Falco would have published on
+# (see cmd/olaitan-quickstart). The demo proves the correlation, scoring, FSM
+# and response path on a real cluster. It does not prove eBPF detection.
+QUICKSTART_CLUSTER ?= olaitan-quickstart
+QUICKSTART_CHART   ?= oci://ghcr.io/olokotoh/charts/olaitan
+# Pin explicitly rather than tracking latest, so a demo that worked yesterday
+# still works today. Bump this with each release.
+QUICKSTART_VERSION ?= 1.0.0-rc3
+QUICKSTART_NS      ?= default
+# Obviously-fake credential. If you find yourself copying this value into a
+# real install, stop.
+QUICKSTART_REDIS_PASSWORD ?= quickstart-demo-not-a-real-password
+
+quickstart:
+	@command -v kind >/dev/null || { echo "kind is required: https://kind.sigs.k8s.io"; exit 1; }
+	@command -v helm >/dev/null || { echo "helm is required: https://helm.sh"; exit 1; }
+	@command -v kubectl >/dev/null || { echo "kubectl is required"; exit 1; }
+	# Reuse an existing cluster rather than erroring on "node(s) already
+	# exist", matching the e2e-local guard.
+	kind get clusters | grep -q '^$(QUICKSTART_CLUSTER)$$' || \
+		kind create cluster --name $(QUICKSTART_CLUSTER) --config hack/kind-config.yaml
+	helm install olaitan $(QUICKSTART_CHART) \
+		--version $(QUICKSTART_VERSION) \
+		--namespace $(QUICKSTART_NS) \
+		-f $(CHART_DIR)/values-quickstart.yaml \
+		--set secrets.redisPassword=$(QUICKSTART_REDIS_PASSWORD) \
+		--wait --timeout 5m
+	kubectl wait --for=condition=Ready -n $(QUICKSTART_NS) \
+		--selector=app.kubernetes.io/name=nats --timeout=120s pods
+	kubectl wait --for=condition=Ready -n $(QUICKSTART_NS) \
+		--selector=app.kubernetes.io/component=aggregator --timeout=120s pods
+	kubectl apply -f hack/quickstart-workload.yaml
+	kubectl wait --for=condition=available --timeout=120s \
+		-n tenant-acme deploy/web-quickstart
+	@echo
+	@bash hack/quickstart-run.sh $(QUICKSTART_NS)
+
+quickstart-clean:
+	kind delete cluster --name $(QUICKSTART_CLUSTER)

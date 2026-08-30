@@ -44,6 +44,21 @@ no deterministic signal the most it can contribute is 10.5, below the score of
 [SECURITY.md](SECURITY.md#the-llm-tier-and-prompt-injection) for what that does
 and does not guarantee.
 
+## Try it in ten minutes
+
+With Docker and [kind](https://kind.sigs.k8s.io) on a laptop, no LLM key and
+no cluster:
+
+```bash
+make quickstart        # builds nothing; installs the published chart
+make quickstart-clean  # deletes the cluster
+```
+
+This injects the S1 container-escape scenario and prints the detection and
+isolation timeline. It is an **injected** scenario: Falco's eBPF probe cannot
+load inside a kind node, so the demo exercises correlation, scoring, the state
+machine and the response path for real, with the sensing layer simulated.
+
 ## Install
 
 ```bash
@@ -112,6 +127,7 @@ Read this section before trusting it with anything.
 
 | | |
 | --- | --- |
+| [Ten values that matter](docs/ten-values-that-matter.md) | the settings that decide whether this is useful, safe or expensive |
 | [Operator runbook](docs/runbook.md) | ten operational scenarios, end to end |
 | [Helm values reference](docs/helm-values.md) | every value, generated from the chart |
 | [Architecture decisions](docs/patterns.md) | why the system is shaped this way |
