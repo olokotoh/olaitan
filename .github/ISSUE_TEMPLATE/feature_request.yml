@@ -1,0 +1,39 @@
+name: Feature request
+description: Suggest a capability or a change in behaviour
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Olaitan is a research preview maintained by one person. Proposals that
+        change the scoring model or the trust ladder need to be argued rather
+        than just implemented, because the project's claims rest on them.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that you cannot do today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Including working around it with existing configuration.
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Does this touch detection scoring or the trust ladder?
+      options:
+        - label: "Yes, and I understand this needs discussion before any code"
+        - label: "No, this is packaging, docs, operability or a new integration"
