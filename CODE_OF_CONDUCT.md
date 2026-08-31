@@ -35,10 +35,16 @@ Examples of unacceptable behaviour:
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behaviour may be
-reported to the project maintainer through a
-[private security advisory](https://github.com/olokotoh/olaitan/security/advisories/new)
-or by opening an issue if the matter is not sensitive. All complaints will be
-reviewed and investigated promptly and fairly.
+reported privately to the project maintainer by email at the address on the
+maintainer's GitHub profile.
+
+Please do **not** file a conduct report as a security advisory. That channel is
+for vulnerabilities, and a conduct report filed there is misrouted into
+vulnerability triage. Blank issues are disabled on this repository, so there is
+no public issue path for conduct matters either; email is the route.
+
+This is a research preview maintained by one person, so complaints are reviewed
+as promptly as that allows rather than to any guaranteed timeline.
 
 The maintainer is obligated to respect the privacy and security of the reporter
 of any incident.

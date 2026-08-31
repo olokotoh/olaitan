@@ -1,6 +1,6 @@
 # Olaitan
 
-**Runtime security for Kubernetes: multi-source detection, graduated isolation, and an optional LLM analyst that is never trusted more than the evidence supports.**
+**Runtime security for Kubernetes: multi-source detection, graduated isolation, and an optional LLM analyst whose influence on a decision is bounded by construction.**
 
 [![Release](https://img.shields.io/github/v/release/olokotoh/olaitan?include_prereleases&sort=semver)](https://github.com/olokotoh/olaitan/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -37,17 +37,28 @@ model, cannot escalate a workload on its own say-so.
 ```
 
 Tier 1 and tier 2 are deterministic. Tier 3 is optional, off by default, and
-capped: the analyst's contribution to a score is bounded by a trust ladder, so
-a compromised or manipulated model cannot by itself drive a workload past the
-states the deterministic tiers already justify.
+capped. The analyst's contribution to a workload's score is bounded, and the
+bound is chosen so that the model **on its own cannot escalate anything**: with
+no deterministic signal the most it can contribute is 10.5, below the score of
+20 that reaches the first non-CLEAN state. See
+[SECURITY.md](SECURITY.md#the-llm-tier-and-prompt-injection) for what that does
+and does not guarantee.
 
 ## Install
 
 ```bash
-helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan --version v1.0.0-rc3
+helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan \
+  --version 1.0.0-rc3 \
+  --namespace olaitan --create-namespace
 ```
 
-No clone and no local build. The chart bundles pinned Falco, NATS and Redis
+No clone and no local build. The chart version is unprefixed SemVer, not the
+git tag: `v1.0.0-rc3` is the tag that triggers the release, `1.0.0-rc3` is what
+the registry holds.
+
+Install into the `olaitan` namespace as shown. The agent's default
+`excluded_namespaces` list contains `kube-system` and `olaitan`, so installing
+anywhere else leaves the agent able to act on its own workloads. The chart bundles pinned Falco, NATS and Redis
 subcharts; disable any of them with `--set <name>.enabled=false` if you already
 run that infrastructure.
 
@@ -68,7 +79,7 @@ what happens after a rule fires.
 | Output | an alert stream | an evidence package with a score and a workload state |
 | Repeated weak signals | each alert stands alone | accumulate through a rolling risk window |
 | Statistical drift | not modelled | Welford baselines per workload |
-| Response | left to you | graduated NetworkPolicy isolation with TTL de-escalation |
+| Response | left to you (Talon and falcosidekick are separate components) | graduated NetworkPolicy isolation, cooldown-gated de-escalation |
 | Explanation | the rule text | optional LLM analyst, score-capped and schema-validated |
 
 If you want syscall alerts, run Falco. If you want something that decides a
@@ -113,6 +124,10 @@ Read this section before trusting it with anything.
 Olaitan began as academic work and the evidence trail is kept in the open on
 purpose: a pre-registered analysis plan, a reproducibility envelope that pins
 every input to a run, and a traceability matrix from requirements to tests.
+
+A preprint (IEEE format, targeting arXiv `cs.CR`) is written but **not yet
+posted**; this section will carry the link when it is. Until then the
+repository is the citable artefact.
 
 If you use this in academic work, please cite:
 

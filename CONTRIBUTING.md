@@ -22,9 +22,14 @@ That is the canonical guide; this file is the front door.
 
 ```bash
 make test          # unit and integration
-make lint          # golangci-lint plus the repo's own cmd/olaitan-lint
+make lint          # golangci-lint only
+make olaitan-lint  # the repo's own canonical-name gate, a SEPARATE target
 make e2e-local     # kind-based end-to-end smoke
 ```
+
+`make lint` does **not** run `olaitan-lint`. They are separate targets and
+separate CI steps, deliberately, so a canonical-name failure is attributable.
+Running only `make lint` and seeing it pass is not enough.
 
 Your pull request must:
 

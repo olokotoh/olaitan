@@ -30,10 +30,16 @@ body:
       label: Alternatives you considered
       description: Including working around it with existing configuration.
 
-  - type: checkboxes
+  - type: dropdown
     id: scope
     attributes:
       label: Does this touch detection scoring or the trust ladder?
+      description: >
+        CONTRIBUTING.md makes this the gate on new detection capability, so the
+        form has to ask it. A checkbox pair could be submitted blank or with
+        both ticked; a required dropdown cannot.
       options:
-        - label: "Yes, and I understand this needs discussion before any code"
-        - label: "No, this is packaging, docs, operability or a new integration"
+        - "Yes, and I understand this needs discussion before any code"
+        - "No, this is packaging, docs, operability or a new integration"
+    validations:
+      required: true

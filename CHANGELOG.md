@@ -18,13 +18,9 @@ and false-positive numbers; see [Unreleased](#unreleased).
   blast radius and the LLM tier's prompt-injection threat model,
   `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, issue templates, and a README
   rewritten for operators rather than examiners.
-- Terraform for the evaluation cluster under `deploy/terraform/`: a three-node
-  kubeadm cluster with the software pins the bootstrap procedure specifies.
 
-### Known gaps
-
-- **Detection-latency (MTTD) and false-positive-rate numbers are not yet
-  measured against a live cluster.** The harness, scenarios, pre-registered
+> **Known gap.** Detection-latency (MTTD) and false-positive-rate numbers are
+> not yet measured against a live cluster. The harness, scenarios, pre-registered
   analysis plan and reproducibility envelope are complete; the campaign that
   fills them in is outstanding. No performance figure in this repository should
   be cited until it is.
@@ -70,7 +66,7 @@ First tagged artefact, covering the work of Epics 1 through 7.
   dedicated harness.
 - **Graduated isolation state machine**: CLEAN, SUSPICIOUS, RESTRICTED,
   QUARANTINED, PRESERVED_KILLED, enforced through generated NetworkPolicies,
-  with TTL de-escalation and operator override.
+  with cooldown-gated de-escalation and operator override.
 - **Helm chart** with pinned Falco, NATS and Redis subcharts, plus production,
   air-gapped and evaluation overlays.
 - **Six Grafana dashboards** and an operator runbook covering ten scenarios.
