@@ -20,10 +20,10 @@ and false-positive numbers; see [Unreleased](#unreleased).
   rewritten for operators rather than examiners.
 
 > **Known gap.** Detection-latency (MTTD) and false-positive-rate numbers are
-> not yet measured against a live cluster. The harness, scenarios, pre-registered
-  analysis plan and reproducibility envelope are complete; the campaign that
-  fills them in is outstanding. No performance figure in this repository should
-  be cited until it is.
+> not yet measured against a live cluster. The harness, scenarios,
+> pre-registered analysis plan and reproducibility envelope are complete; the
+> campaign that fills them in is outstanding. No performance figure in this
+> repository should be cited until it is.
 
 ## [v1.0.0-rc3] - 2026-08-30
 
@@ -38,8 +38,10 @@ and false-positive numbers; see [Unreleased](#unreleased).
 
 - **Release pipeline** (#94). Tagging `v*` now publishes a multi-arch
   (`linux/amd64`, `linux/arm64`) image to `ghcr.io/olokotoh/olaitan` and the
-  Helm chart to `oci://ghcr.io/olokotoh/charts`, each with a keyless cosign
-  signature and an SPDX SBOM. Installing no longer requires cloning or building.
+  Helm chart to `oci://ghcr.io/olokotoh/charts`, with a keyless cosign signature
+  and an SPDX SBOM on the image. Chart signing was configured here but did not
+  actually produce a signature until the cosign authentication fix in rc3, so
+  the rc2 chart is unsigned. Installing no longer requires cloning or building.
 - `:edge` image tag published on every green push to `main`.
 - Version stamping: `olaitan version` reports the release tag rather than
   `dev`.
@@ -76,4 +78,4 @@ First tagged artefact, covering the work of Epics 1 through 7.
 [Unreleased]: https://github.com/olokotoh/olaitan/compare/v1.0.0-rc3...HEAD
 [v1.0.0-rc3]: https://github.com/olokotoh/olaitan/compare/v1.0.0-rc2...v1.0.0-rc3
 [v1.0.0-rc2]: https://github.com/olokotoh/olaitan/compare/v1.0.0-rc1...v1.0.0-rc2
-[v1.0.0-rc1]: https://github.com/olokotoh/olaitan/releases/tag/v1.0.0-rc1
+[v1.0.0-rc1]: https://github.com/olokotoh/olaitan/tree/v1.0.0-rc1
