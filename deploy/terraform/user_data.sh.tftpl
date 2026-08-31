@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# Node bootstrap for the Olaitan evaluation cluster.
+#
+# This is the executable form of the "Prerequisites on every node",
+# "Install containerd" and "Install kubeadm" sections of
+# hack/bootstrap-kubeadm.md. It stops short of `kubeadm init` and
+# `kubeadm join`: that step needs a token that only exists once the
+# control plane is up, and the bootstrap doc is explicit that the
+# operator should run it by hand.
+#
+# Two places where this deviates from the letter of that document, both
+# because the archive moved under it since it was written:
+#
+#   1. containerd. The doc says `apt-get install -y containerd` and
+#      expects 1.7.x. Ubuntu 22.04 ships 1.5.9, and jammy-updates has
+#      since moved to 2.2.1. Neither is the documented runtime, so this
+#      installs containerd.io from Docker's repository at an exact
+#      pinned 1.7.x and holds it.
+#
+#   2. Kernel. The doc requires 6.5+ for the Falco eBPF driver. Current
+#      jammy AMIs already ship 6.8, so this is usually a confirmation
+#      rather than a change; older ones shipped 5.15, which would leave
+#      Falco on the kernel-module fallback and silently break the
+#      comparability of every number the campaign produces. Installing
+#      the meta package pins the requirement whichever AMI you land on,
+#      and the floor is asserted rather than assumed. The node reboots
+#      only if the install actually changed the running kernel.
+#
+# Anything logged here lands in /var/log/olaitan-bootstrap.log.
+
+set -euxo pipefail
+exec > >(tee -a /var/log/olaitan-bootstrap.log) 2>&1
+
+echo "olaitan bootstrap starting at $(date -Is)"
+
+# Cloud images run unattended-upgrades on first boot; racing it produces
+# spurious dpkg lock failures.
+wait_for_apt() {
+  local i=0
+  while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+     || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+    i=$((i + 1))
+    if [ "$i" -gt 60 ]; then
+      echo "apt still locked after 5 minutes, proceeding anyway"
+      break
+    fi
+    echo "waiting for apt lock ($i)"
+    sleep 5
+  done
+}
+
+export DEBIAN_FRONTEND=noninteractive
+
+# Belt and braces alongside wait_for_apt: if the lock is still held when
+# apt runs, block for up to five minutes instead of failing the boot.
+mkdir -p /etc/apt/apt.conf.d
+echo 'DPkg::Lock::Timeout "300";' > /etc/apt/apt.conf.d/99olaitan-lock-timeout
+
+# --- 1. Disable swap (kubelet requirement) ------------------------------
+swapoff -a
+sed -i.bak '/\sswap\s/s/^/#/' /etc/fstab
+
+# --- 2. Kernel modules ---------------------------------------------------
+tee /etc/modules-load.d/k8s.conf >/dev/null <<'EOF'
+overlay
+br_netfilter
+EOF
+modprobe overlay
+modprobe br_netfilter
+
+# --- 3. Forwarding and bridge filtering ----------------------------------
+tee /etc/sysctl.d/99-kubernetes.conf >/dev/null <<'EOF'
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+sysctl --system
+
+# --- 4. Apt prerequisites and keyrings -----------------------------------
+wait_for_apt
+apt-get update
+apt-get install -y apt-transport-https ca-certificates curl gpg
+
+install -m 0755 -d /etc/apt/keyrings
+
+# --- 5. Kernel 6.5+ for the Falco eBPF driver ----------------------------
+#
+# Current jammy AMIs already boot 6.8, so this normally installs only the
+# meta package. Keep it anyway: it pins the requirement explicitly so a
+# future AMI that regresses to an older series is caught here rather than
+# discovered as a Falco driver fallback mid-campaign.
+RUNNING_KERNEL="$(uname -r)"
+apt-get install -y ${kernel_meta_package}
+NEWEST_KERNEL="$(ls -1 /boot/vmlinuz-* | sed 's|.*/vmlinuz-||' | sort -V | tail -1)"
+
+# Assert the 6.5 floor rather than trusting it. Sorting "6.5" against the
+# candidate with sort -V and checking the candidate is not the lower of
+# the two is the cheapest correct version compare available here.
+if [ "$(printf '6.5\n%s\n' "$NEWEST_KERNEL" | sort -V | head -1)" = "$NEWEST_KERNEL" ]; then
+  echo "FATAL: kernel $NEWEST_KERNEL is below the 6.5 floor the Falco eBPF driver needs"
+  exit 1
+fi
+echo "kernel check: running $RUNNING_KERNEL, newest installed $NEWEST_KERNEL"
+
+# --- 6. containerd, pinned to the documented 1.7.x -----------------------
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+chmod a+r /etc/apt/keyrings/docker.gpg
+
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu jammy stable" \
+  > /etc/apt/sources.list.d/docker.list
+
+wait_for_apt
+apt-get update
+apt-get install -y containerd.io=${containerd_version}
+apt-mark hold containerd.io
+
+mkdir -p /etc/containerd
+containerd config default > /etc/containerd/config.toml
+sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+# Fail loudly rather than discovering a cgroup-driver mismatch as a
+# kubelet CrashLoop forty minutes into a campaign.
+grep -q 'SystemdCgroup = true' /etc/containerd/config.toml
+
+systemctl restart containerd
+systemctl enable containerd
+
+# --- 7. kubeadm, kubelet, kubectl at an exact patch ----------------------
+curl -fsSL https://pkgs.k8s.io/core:/stable:/${k8s_repo_minor}/deb/Release.key \
+  | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+chmod a+r /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${k8s_repo_minor}/deb/ /" \
+  > /etc/apt/sources.list.d/kubernetes.list
+
+wait_for_apt
+apt-get update
+apt-get install -y \
+  kubelet=${k8s_package_version} \
+  kubeadm=${k8s_package_version} \
+  kubectl=${k8s_package_version}
+apt-mark hold kubelet kubeadm kubectl
+
+systemctl enable kubelet
+
+# --- 8. Record what was actually installed -------------------------------
+#
+# The evaluation's reproducibility envelope is only worth as much as the
+# evidence behind it. This file is the per-node ground truth; collect it
+# into the run metadata rather than trusting these variables.
+tee /etc/olaitan-bootstrap.json >/dev/null <<EOF
+{
+  "bootstrapped_at": "$(date -Is)",
+  "kernel_running": "$RUNNING_KERNEL",
+  "kernel_newest_installed": "$NEWEST_KERNEL",
+  "kernel_meta_package": "${kernel_meta_package}",
+  "containerd": "$(containerd --version 2>/dev/null | head -1)",
+  "kubeadm": "$(kubeadm version -o short 2>/dev/null)",
+  "instance_id": "$(cloud-init query instance_id 2>/dev/null || echo unknown)"
+}
+EOF
+
+touch /var/lib/olaitan-bootstrap.done
+echo "olaitan bootstrap finished at $(date -Is)"
+
+# Reboot only if step 5 actually installed a kernel newer than the running
+# one. On an AMI that already ships 6.8 this is a no-op, and skipping the
+# reboot saves about ninety seconds per node.
+if [ "$RUNNING_KERNEL" != "$NEWEST_KERNEL" ]; then
+  echo "rebooting: $RUNNING_KERNEL -> $NEWEST_KERNEL"
+  systemctl reboot
+else
+  echo "already running the newest installed kernel, no reboot needed"
+fi

@@ -75,34 +75,50 @@ ABSENT from published rc3
 There is currently **no supported path from "found the repo" to "saw it work"
 on any cluster the user already has.**
 
-## Blocker 3 — NetworkPolicy is silently inert (CRITICAL, correctness) — **PROVEN**
+## Blocker 3 — NetworkPolicy may be written but never enforced
 
-The entire response mechanism writes NetworkPolicies. Nothing anywhere checks
-that the cluster's CNI *enforces* them:
+**Status: the PROVEN claim is RETRACTED. The risk is real; the evidence was not.**
+
+The response mechanism writes NetworkPolicies and nothing checks that the
+cluster's CNI *enforces* them:
 
 ```
 $ grep -rn "enforc" internal/response/netpol/*.go   # only internal state naming
 ```
 
-This was not left as an inference. `hack/check-netpol-enforcement.sh` runs a
-client and a server pod, proves the client can reach the server, applies a
-deny-all ingress policy, and re-tests. On a stock kind cluster — **the exact
-cluster `make quickstart` builds and the e2e suite runs on**:
+This was originally recorded as PROVEN on kind, on the strength of
+`hack/check-netpol-enforcement.sh` reporting NOT ENFORCED. **That script was
+broken.** It grepped probe output for `timed out`, while agnhost prints a bare
+uppercase `TIMEOUT`. The pattern never matched, so a *blocked* connection was
+read as *traffic flowing* and the verdict was predetermined: NOT ENFORCED on
+every cluster it was ever pointed at, regardless of the truth.
+
+Found on a real 3-node kubeadm cluster running Calico v3.31.5, where the script
+said NOT ENFORCED and a manual probe proved the opposite — nginx reachable
+before a deny-all, `wget: download timed out` after. The script was accusing a
+CNI that was working correctly the whole time.
+
+Fixed in `d6d20b7`: match every phrasing a blocked connection can produce, and
+self-test the matcher against a known-unreachable address (10.255.255.1) before
+emitting any verdict. If a guaranteed-blocked connection does not read as
+blocked, the script now exits INCONCLUSIVE instead of publishing a finding.
+
+**Corrected result on kubeadm + Calico:**
 
 ```
-$ ./hack/check-netpol-enforcement.sh
-== NetworkPolicy enforcement probe ==
-   context: kind-olaitan-port
-   server pod IP: 10.244.0.5
+$ ./check-netpol-enforcement.sh
    baseline: client CAN reach server (as expected)
-
-RESULT: NetworkPolicy is NOT ENFORCED on this cluster.
-        The API server accepted a deny-all policy and traffic still flowed.
-EXIT=1
+RESULT: NetworkPolicy IS ENFORCED on this cluster.
 ```
 
-Olaitan would mark a workload QUARANTINED, write the audit record, move the FSM
-and light the dashboard green — while the pod keeps talking to the internet.
+**What remains true.** kind's default CNI (kindnet) does not implement
+NetworkPolicy, and k3s's default flannel backend does not either — both
+documented upstream. Olaitan writing a policy on those clusters still achieves
+nothing, and would mark a workload QUARANTINED, write the audit record, move the
+FSM and light the dashboard green while the pod keeps talking to the internet.
+What changed is that **this repository has not demonstrated it**; the earlier
+evidence was an artefact of the bug. Re-run the corrected script on kind before
+making the claim again.
 
 **This is the same class of defect as the security patrol's false closures
 (2026-08-30): a control reporting success it did not achieve.** It is the most
@@ -176,6 +192,92 @@ The honest fix belongs in the default: either size the streams to the volume, or
 size the volume to the streams, and add a render-time guard that fails loudly
 when the declared sum exceeds `nats.persistence.size` rather than letting the
 operator discover it from a JetStream error code at runtime.
+
+## Blocker 7 — the repo's own kubeadm terraform cannot build a working multi-node cluster (CRITICAL) — **PROVEN**
+
+`deploy/terraform` is the module the thesis evaluation runs on. It did not set
+`source_dest_check = false` on the EC2 instances, and AWS defaults it to `true`.
+
+EC2 drops any packet whose source or destination IP does not belong to the
+instance. Every CNI overlay violates that by design: a VXLAN packet leaving a
+node carries a **pod** IP (192.168.0.0/16), not the node's 10.77.0.0/24 address,
+so AWS discards it. Silently — no error, no log, no counter.
+
+What that produces is worse than a broken cluster: a cluster that **looks
+healthy and is not.**
+
+```
+$ kubectl get nodes            # all 3 Ready
+$ kubectl -n olaitan get pods -o wide
+olaitan-falco-brj48    2/2  Running                 ip-10-77-0-28    <- CoreDNS node
+olaitan-falco-jkgt2    0/2  Init:CrashLoopBackOff   ip-10-77-0-25
+olaitan-falco-lgx49    0/2  Init:CrashLoopBackOff   ip-10-77-0-234
+olaitan-aggregator     0/1  CrashLoopBackOff        ip-10-77-0-25
+```
+
+One root cause, four symptoms that each look like a different bug:
+
+- **both CoreDNS replicas** happened to schedule on `ip-10-77-0-28`, so DNS
+  worked on that node and timed out on every other one
+- aggregator on `.25`: `aggregator: nats: connect: dial tcp: lookup
+  olaitan-nats: i/o timeout` — NATS was Running on `.28`
+- falcoctl init: `lookup falcosecurity.github.io: i/o timeout`
+- Calico's own APIService: `FailedDiscoveryCheck ... context deadline exceeded`,
+  which then wedged four namespaces in `Terminating`
+
+Fixed in `main.tf` with the reasoning recorded inline. Verified live on the
+running cluster with `modify-instance-attribute --no-source-dest-check`.
+
+**Why this one matters most.** Single-node kind cannot expose it — there is no
+cross-node traffic to drop. Every Olaitan test to date ran on kind, so the
+multi-node path the thesis claims to evaluate had never actually worked. It also
+generalises: the failure is invisible in `kubectl get nodes`, `helm status`
+reports `deployed`, and the aggregator's own health endpoint answers fine while
+the ring behind it is unreachable.
+
+
+## Blocker 8 — the collector cannot attach to Falco's socket as non-root (CRITICAL) — **PROVEN, UNFIXED**
+
+With cross-node networking repaired, Falco reached 2/2 Running on all three
+nodes and the collector still crash-looped on every one:
+
+```
+$ kubectl -n olaitan logs olaitan-collector-8p7p8 --previous
+"msg":"ring exited with error","ring":"collector",
+"err":"collector: falco run: falco: sub (terminal, no retry): rpc error:
+ code = Unavailable desc = ... dial unix /run/falco/falco.sock:
+ connect: permission denied"
+
+$ sudo ls -la /run/falco/falco.sock
+srwxr-xr-x 1 root root 0 Aug 31 22:37 /run/falco/falco.sock
+```
+
+Falco creates the socket `0755 root:root`. Connecting to a Unix socket requires
+**write** permission, and the collector runs `runAsUser: 65532` /
+`runAsNonRoot: true` per NFR11. Owner-only write means the collector can never
+attach. **Olaitan's primary detection source is unreachable on a stock kubeadm
+cluster** — Falco runs, the collector dies, and no syscall events are ingested.
+
+**Not fixed, deliberately.** A first attempt set `grpc.unix_socket_mode: "0775"`
+in the Falco values. The rendered ConfigMap carried it and the socket stayed
+`0755`, because **that key does not exist** — upstream `falco.yaml` (checked
+through 0.42.0) exposes only `enabled`, `bind_address`, `threadiness` and the
+mTLS cert paths. It was an invented setting that Falco silently ignored, and the
+"fix" would have been published as working. `falcosecurity/falco#1351` is the
+upstream request for exactly this, still open.
+
+Real options, for Story 9.6:
+1. a `chmod` initContainer on the collector DaemonSet (runs as root once, then
+   the long-lived process stays non-root) — most likely correct;
+2. a supplemental group shared with Falco, if the Falco chart can be made to
+   create the socket group-writable;
+3. running the collector as root — rejected: that trades a file permission for
+   a privileged process parsing untrusted event data.
+
+**Why kind never caught it.** On kind, Falco and the collector end up sharing an
+effective identity, so the dial succeeds and the permission question never
+arises. Every prior test ran there.
+
 
 ## Blocker 4 — no NOTES.txt, no capability detection
 

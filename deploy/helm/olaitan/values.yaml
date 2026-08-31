@@ -1297,6 +1297,22 @@ falco:
     grpc:
       enabled: true
       bind_address: "unix:///run/falco/falco.sock"
+      # KNOWN LIMITATION (found 2026-08-31 on 3-node kubeadm, tracked as
+      # Blocker 8): Falco creates this socket 0755 root:root. A Unix socket
+      # needs WRITE permission to connect, and the collector runs as non-root
+      # (runAsUser 65532, NFR11), so the collector cannot attach:
+      #   collector: falco run: falco: sub (terminal, no retry): rpc error:
+      #   code = Unavailable ... connect: permission denied
+      #
+      # There is no Falco config key for the socket mode -- upstream falco.yaml
+      # exposes only enabled/bind_address/threadiness and the mTLS cert paths
+      # (falcosecurity/falco#1351 is the long-standing request). So this cannot
+      # be fixed from values.yaml alone; it needs either a chmod initContainer
+      # on the collector DaemonSet or a matching supplemental group, decided in
+      # Story 9.6 rather than guessed here.
+      #
+      # Not visible on kind, where Falco and the collector end up sharing an
+      # effective identity and the dial succeeds regardless.
     grpc_output:
       enabled: true
 

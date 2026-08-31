@@ -1,0 +1,18 @@
+# Terraform state carries the full resource graph and should never be
+# committed from a workstation. If this stack ever needs to be shared,
+# move state to an S3 backend with DynamoDB locking first.
+.terraform/
+
+# .terraform.lock.hcl is deliberately NOT ignored. It pins provider
+# checksums, which is exactly the kind of thing a reproducibility
+# envelope should hold constant across a rebuild.
+*.tfstate
+*.tfstate.*
+*.tfvars
+!example.tfvars
+crash.log
+crash.*.log
+
+# Fetched from the control plane by `make kubeconfig`. Contains cluster
+# admin credentials.
+kubeconfig.olaitan
