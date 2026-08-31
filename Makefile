@@ -511,7 +511,13 @@ QUICKSTART_CHART   ?= oci://ghcr.io/olokotoh/charts/olaitan
 # Pin explicitly rather than tracking latest, so a demo that worked yesterday
 # still works today. Bump this with each release.
 QUICKSTART_VERSION ?= 1.0.0-rc3
-QUICKSTART_NS      ?= default
+# The agent's default excluded_namespaces list is [kube-system, olaitan], and
+# the match is an exact string comparison against the workload's namespace
+# (internal/response/netpol/manager.go) with nothing deriving the agent's own
+# namespace at runtime. Installing the demo into `default` would leave the
+# agent able to act on its own workloads, which is exactly what the README
+# tells readers not to do. The quickstart must not contradict its own advice.
+QUICKSTART_NS      ?= olaitan
 # Obviously-fake credential. If you find yourself copying this value into a
 # real install, stop.
 QUICKSTART_REDIS_PASSWORD ?= quickstart-demo-not-a-real-password
@@ -526,7 +532,7 @@ quickstart:
 		kind create cluster --name $(QUICKSTART_CLUSTER) --config hack/kind-config.yaml
 	helm install olaitan $(QUICKSTART_CHART) \
 		--version $(QUICKSTART_VERSION) \
-		--namespace $(QUICKSTART_NS) \
+		--namespace $(QUICKSTART_NS) --create-namespace \
 		-f $(CHART_DIR)/values-quickstart.yaml \
 		--set secrets.redisPassword=$(QUICKSTART_REDIS_PASSWORD) \
 		--wait --timeout 5m
