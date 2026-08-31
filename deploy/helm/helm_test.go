@@ -557,24 +557,66 @@ func TestReplicasGuard(t *testing.T) {
 	}
 }
 
-// TestRedisAuthGuard confirms the chart refuses to render when redis
-// is enabled and the operator has not supplied a password — silent
-// AUTH failure at runtime is worse than a loud chart-render error.
-func TestRedisAuthGuard(t *testing.T) {
-	args := []string{
-		"template", "olaitan", chartDir(t),
-		// no --set secrets.redisPassword — must trip the guard
+// TestBundledRedisPasswordIsSupplied pins the Story 9.2 contract.
+//
+// This REPLACES the former TestRedisAuthGuard, which asserted the chart
+// refuses to render without secrets.redisPassword. That guard was correct for
+// a Redis the operator owns and wrong for the subchart WE bundle: it made the
+// first command a stranger runs fail outright
+//
+//	$ helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan
+//	Error: secrets.redisPassword is required when redis.enabled=true
+//
+// The reversal is scoped to the bundled case. Three properties must hold, and
+// the second and third are the ones that could regress silently.
+func TestBundledRedisPasswordIsSupplied(t *testing.T) {
+	render := func(t *testing.T, extra ...string) string {
+		t.Helper()
+		args := append([]string{"template", "olaitan", chartDir(t)}, extra...)
+		cmd := exec.Command("helm", args...)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("helm template failed: %v\nstderr:\n%s", err, stderr.String())
+		}
+		return stdout.String()
 	}
-	cmd := exec.Command("helm", args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err == nil {
-		t.Fatalf("helm template without redisPassword succeeded; expected fail-fast guard to fire")
+
+	// 1. A bare install must succeed with no flags whatsoever.
+	out := render(t)
+	if !strings.Contains(out, "redis-password:") {
+		t.Fatalf("bare render carries no redis-password key")
 	}
-	if !strings.Contains(stderr.String(), "secrets.redisPassword is required") {
-		t.Errorf("expected secrets.redisPassword guard message in stderr; got:\n%s", stderr.String())
+
+	// 2. An explicitly supplied password must be used UNCHANGED. Auto-
+	//    generation silently overriding an operator's secret would be worse
+	//    than the original guard.
+	const explicit = "operator-supplied-not-generated"
+	out = render(t, "--set", "secrets.redisPassword="+explicit)
+	if !strings.Contains(out, explicit) {
+		t.Errorf("explicit secrets.redisPassword was not honoured; got:\n%s",
+			grepLine(out, "redis-password:"))
 	}
+
+	// 3. The generated value must not be a fixed literal baked into the
+	//    chart: two renders must differ. A constant default would ship every
+	//    installation the same Redis password.
+	a := grepLine(render(t), "redis-password:")
+	b := grepLine(render(t), "redis-password:")
+	if a == "" || a == b {
+		t.Errorf("generated redis-password is not random across renders (%q vs %q)", a, b)
+	}
+}
+
+// grepLine returns the first line containing sub, or "".
+func grepLine(s, sub string) string {
+	for _, ln := range strings.Split(s, "\n") {
+		if strings.Contains(ln, sub) {
+			return strings.TrimSpace(ln)
+		}
+	}
+	return ""
 }
 
 // TestAuditWebhookCABundleGuard confirms enabling the audit webhook
