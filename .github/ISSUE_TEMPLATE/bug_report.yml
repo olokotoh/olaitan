@@ -1,0 +1,74 @@
+name: Bug report
+description: Something behaves differently from what the docs say it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For anything security-relevant, please do NOT open an issue. Follow
+        [SECURITY.md](https://github.com/olokotoh/olaitan/blob/main/SECURITY.md)
+        and report it privately instead.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Chart version or image tag, or the commit SHA if you built it yourself.
+      placeholder: v1.0.0-rc3
+    validations:
+      required: true
+
+  - type: dropdown
+    id: enforcement
+    attributes:
+      label: Was enforcement enabled?
+      description: "`response.networkPolicy.enabled`"
+      options:
+        - "No (default, observe-only)"
+        - "Yes"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: cluster
+    attributes:
+      label: Cluster
+      description: Distribution, Kubernetes version, CNI, node kernel version.
+      placeholder: |
+        kubeadm 1.29.15, Calico v3.31.5 via Tigera operator, kernel 6.8.0-1063-aws
+        3 nodes, 4 vCPU / 6 GB each
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead
+      description: Include the exact error text if there is one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence that shows the problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: >
+        Aggregator or collector logs around the event. Please redact anything
+        sensitive; audit events in particular can carry cluster request metadata.
+      render: shell
