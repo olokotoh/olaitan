@@ -44,9 +44,31 @@ probe() {
     --command -- /agnhost connect --timeout=5s "${SERVER_IP}:8080" 2>&1
 }
 
+# What "blocked" looks like. agnhost prints a bare uppercase TIMEOUT on a
+# blocked connection, NOT the "timed out" phrasing wget/curl use -- an earlier
+# version of this script grepped for "timed out", never matched, and therefore
+# reported NOT ENFORCED on every cluster including ones that enforce correctly.
+# For a security tool that failure direction is the dangerous one: it accuses a
+# working CNI of being broken, and it would have shipped as a documented
+# "finding" about kind. Match the real strings, and verify the matcher itself
+# against a known-blocked destination before trusting the verdict.
+BLOCKED_RE="TIMEOUT|timed out|refused|no route|REFUSED|unreachable"
+
+# Self-test: probe an address nothing can reach. If THIS does not read as
+# blocked, the matcher is broken and every later verdict is meaningless.
+SELFTEST="$(kubectl -n "$NS" run probe-selftest --rm -i --restart=Never --quiet \
+  --image=registry.k8s.io/e2e-test-images/agnhost:2.47 \
+  --command -- /agnhost connect --timeout=5s 10.255.255.1:8080 2>&1 || true)"
+if ! echo "$SELFTEST" | grep -qiE "$BLOCKED_RE"; then
+  echo "INCONCLUSIVE: the blocked-connection matcher does not recognise a known"
+  echo "   unreachable destination, so this script cannot tell enforced from not."
+  echo "   probe output was: $SELFTEST"
+  exit 2
+fi
+
 # Step 2: baseline reachability. Without this the test is worthless.
 OUT_BEFORE="$(probe before)"
-if echo "$OUT_BEFORE" | grep -qiE "timed out|refused|no route"; then
+if echo "$OUT_BEFORE" | grep -qiE "$BLOCKED_RE"; then
   echo "INCONCLUSIVE: client could not reach server BEFORE any policy"
   echo "   $OUT_BEFORE"
   exit 2
@@ -69,7 +91,7 @@ sleep 5
 
 # Step 4: the verdict.
 OUT_AFTER="$(probe after)"
-if echo "$OUT_AFTER" | grep -qiE "timed out|refused|no route"; then
+if echo "$OUT_AFTER" | grep -qiE "$BLOCKED_RE"; then
   echo
   echo "RESULT: NetworkPolicy IS ENFORCED on this cluster."
   echo "        Olaitan's isolation response will actually contain a workload."
