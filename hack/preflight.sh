@@ -75,11 +75,14 @@ if [ -n "$DEFSC" ]; then
   ok "default StorageClass: ${B}${DEFSC}${X}"
 else
   if [ "$(kubectl get storageclass --no-headers 2>/dev/null | wc -l | tr -d ' ')" -gt 0 ]; then
-    no "no DEFAULT StorageClass, but classes exist"
-    info "set one: --set nats.persistence.storageClass=<name> --set reports.storageClass=<name>"
+    bad "no DEFAULT StorageClass -- NATS JetStream's PVC will stay Pending forever"
+    info "classes exist but none is marked default. Name one explicitly:"
+    info "--set nats.persistence.storageClass=<name> --set reports.storageClass=<name>"
+    [ "$DISTRO" = "eks" ] && info "EKS >=1.30 ships no default class by design (gp2 lost the annotation)."
   else
     bad "no StorageClass at all -- NATS JetStream cannot bind a volume"
-    info "install a provisioner (k3s local-path, minikube: minikube addons enable storage-provisioner)"
+    info "install a provisioner (k3s local-path, minikube addons enable storage-provisioner)"
+    [ "$DISTRO" = "eks" ] && info "EKS: install the aws-ebs-csi-driver add-on; it needs its own IAM role (IRSA/Pod Identity)."
   fi
 fi
 
@@ -87,6 +90,30 @@ fi
 echo
 echo "${B}2. Privileged workloads${X}  ${D}(Falco's kernel driver needs them)${X}"
 kubectl create ns "$NS" >/dev/null 2>&1 || true
+
+# Platforms that refuse privileged workloads by POLICY. Detected before the
+# dry-run because the failure is a product decision, not a misconfiguration,
+# and the remedy is different in kind.
+case "$DISTRO" in
+  gke)
+    if kubectl get nodes -o jsonpath='{.items[*].metadata.labels}' 2>/dev/null | grep -q "autopilot"; then
+      bad "GKE Autopilot BLOCKS privileged containers (Warden admission webhook)"
+      info "Olaitan cannot run here. Use a GKE Standard cluster."
+    fi ;;
+  aks)
+    if kubectl get ns 2>/dev/null | grep -q "azure-extensions\|aks-automatic"; then
+      no "AKS Automatic enforces Baseline PSS and it CANNOT be turned off"
+      info "privileged, hostPath and host namespaces are refused at admission."
+      info "Only escape hatch: exclude this namespace from Deployment Safeguards."
+    fi ;;
+  eks)
+    if kubectl get nodes -o jsonpath='{.items[*].metadata.labels}' 2>/dev/null | grep -q "fargate"; then
+      bad "EKS Fargate does not support DaemonSets OR privileged containers"
+      info "A Fargate profile matching this namespace SILENTLY swallows the"
+      info "DaemonSet -- no scheduling, no error. Use EC2 node groups."
+    fi ;;
+esac
+
 PSA="$(kubectl get ns "$NS" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}' 2>/dev/null)"
 DRYRUN="$(kubectl -n "$NS" run psa-probe --image=busybox:1.36 --restart=Never --dry-run=server \
   --overrides='{"spec":{"containers":[{"name":"p","image":"busybox:1.36","securityContext":{"privileged":true}}]}}' \
