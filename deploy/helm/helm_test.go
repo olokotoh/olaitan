@@ -4652,3 +4652,59 @@ func configFromRender(t *testing.T, rendered string) *config.Config {
 	}
 	return cfg
 }
+
+// Story 8.3 AC2/AC4/AC6: values-quickstart.yaml is the ten-minute demo
+// overlay. Its job is to make the FIRST install a stranger tries actually
+// come up on a laptop, which the chart defaults do not (issue #96), and to do
+// so without pretending the sensing layer is real.
+//
+// The three properties asserted here are the ones whose absence produced a
+// user-visible failure or a dishonest demo:
+//
+//  1. nats.streamMaxBytesOverride must reach the pod env. Without it a default
+//     kind install leaves the aggregator and collector in CrashLoopBackOff
+//     with "ensure stream EVENTS_RAW: ... insufficient storage resources
+//     available" (issue #96).
+//  2. Falco must be off AND the collector's Falco endpoint must point at a
+//     closed port. Disabling the subchart alone leaves the collector dialling
+//     a gRPC service that was never deployed.
+//  3. The analyst tier must be off. The quickstart's premise is "no LLM key";
+//     an overlay that quietly required one would fail for exactly the reader
+//     it is aimed at.
+func TestValuesQuickstartOverlay(t *testing.T) {
+	args := []string{
+		"template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+		"-f", filepath.Join(chartDir(t), "values-quickstart.yaml"),
+	}
+	cmd := exec.Command("helm", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("helm template with values-quickstart.yaml failed: %v\nstderr:\n%s", err, stderr.String())
+	}
+	rendered := stdout.String()
+
+	// 1. The issue #96 fix must survive into the rendered env var, not just
+	// sit in the values file.
+	if !strings.Contains(rendered, "OLT_NATS_STREAM_MAXBYTES_OVERRIDE") {
+		t.Error("values-quickstart.yaml must set nats.streamMaxBytesOverride (issue #96); OLT_NATS_STREAM_MAXBYTES_OVERRIDE absent from the render")
+	}
+
+	// 2. Falco off, and the endpoint closed. kind nodes are containers and
+	// eBPF is host-scoped, so the probe cannot work here at all.
+	for _, m := range parseManifests(t, rendered) {
+		if strings.Contains(m.Metadata.Name, "-falco") {
+			t.Errorf("values-quickstart.yaml must not render Falco resources; got %s/%s", m.Kind, m.Metadata.Name)
+		}
+	}
+	if !strings.Contains(rendered, "tcp://127.0.0.1:0") {
+		t.Error("values-quickstart.yaml must point endpoints.falco at a closed port so the collector does not dial an undeployed Falco")
+	}
+
+	// 3. No LLM tier. `provider: none` is what evaluation.config=RS renders.
+	if !strings.Contains(rendered, "provider: none") {
+		t.Error("values-quickstart.yaml must leave the analyst tier disabled (evaluation.config=RS renders analyst provider: none)")
+	}
+}

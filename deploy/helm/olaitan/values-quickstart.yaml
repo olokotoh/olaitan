@@ -1,0 +1,141 @@
+# values-quickstart.yaml -- the ten-minute demo overlay (Story 8.3).
+#
+#   make quickstart
+#
+# or by hand, against the published chart:
+#
+#   kind create cluster --name olaitan-quickstart --config hack/kind-config.yaml
+#   helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan \
+#     --version <release> \
+#     -f deploy/helm/olaitan/values-quickstart.yaml \
+#     --set secrets.redisPassword=quickstart-demo-not-a-real-password \
+#     --wait --timeout 5m
+#
+# ---------------------------------------------------------------------------
+# THIS IS A DEMO POSTURE. DO NOT RUN IT ANYWHERE THAT MATTERS.
+#
+# Retention is sized for a laptop, the warm-up and dwell timers are cut to
+# seconds so a demo reaches an interesting state inside ten minutes, and the
+# sensing layer is switched off entirely. Every one of those choices is wrong
+# for a real cluster. For production start from values-production.yaml.
+#
+# WHAT THIS DEMO ACTUALLY DEMONSTRATES:
+#
+# Falco's eBPF probe does not work inside kind: kind nodes are containers and
+# eBPF is host-scoped (hack/kind-config.yaml). So this overlay disables Falco
+# and the quickstart injects the S1 scenario's events directly onto
+# `olaitan.events.raw.falco`, the subject Falco would have published on, the
+# same way tests/e2e/rs_smoke_test.go does.
+#
+# That means the demo exercises correlation, scoring, the FSM and the response
+# path against real infrastructure, with the SENSING layer simulated. It does
+# NOT show eBPF catching a container escape, and nothing built on this overlay
+# should imply that it does.
+# ---------------------------------------------------------------------------
+#
+# BASE RELATIONSHIP: standalone. Unlike values-eval.yaml this is not a base for
+# other overlays; layering it under a production or eval overlay would drag the
+# demo timers along with it.
+#
+# RESTART semantics: baselines.warmupDuration and the fsm dwell/cooldown knobs
+# hot-reload (FR49). nats.streamMaxBytesOverride is read at stream creation and
+# needs a fresh install to take effect.
+
+# --- Sensing: off, because kind cannot run the eBPF probe -------------------
+#
+# Both settings are required. Disabling the subchart without also pointing the
+# collector's Falco endpoint at a closed port leaves it dialling a gRPC service
+# that was never deployed. `make e2e-local` sets the same pair.
+falco:
+  enabled: false
+
+endpoints:
+  falco: "tcp://127.0.0.1:0"
+
+# --- JetStream sizing: the fix for issue #96 --------------------------------
+#
+# Without this, a default install on a single-node kind cluster leaves the
+# aggregator and collector in CrashLoopBackOff with
+#
+#   ensure stream EVENTS_RAW: nats: API error: code=500 err_code=10047
+#   description=insufficient storage resources available
+#
+# because the chart's production stream sizing exceeds what the bundled NATS
+# gets on a default kind node. This is the first thing a new user hits.
+#
+# Story 1.19 D6 established the mechanism: cap each stream's MaxBytes rather
+# than lying to JetStream about disk capacity via fileStore.maxSize.
+#
+# WHY 512 MiB AND NOT THE 1 GiB `make e2e-local` USES.
+#
+# Measured on a default kind node, 2026-08-30. The chart gives NATS
+# max_file_store: 10Gi. internal/nats/streams.go declares THIRTEEN streams, not
+# the three the e2e-local comment claims. e2e-local gets away with 1 GiB
+# because it leaves response.audit disabled, which skips five AUDIT_* streams.
+# This overlay ENABLES audit (the quickstart reads AUDIT.transitions to render
+# its timeline), so all thirteen are created:
+#
+#   13 streams x 1 GiB   = 13 GiB  > 10 GiB  -> fails on INVESTIGATIONS
+#   13 streams x 512 MiB = 6.5 GiB < 10 GiB  -> installs clean
+#
+# The observed failure was NOT the EVENTS_RAW one issue #96 reports; with the
+# 1 GiB cap the earlier streams are created successfully and the budget is
+# exhausted by the time INVESTIGATIONS is reached:
+#
+#   ensure stream INVESTIGATIONS: nats: API error: code=500 err_code=10047
+#   description=insufficient storage resources available
+#
+# 512 MiB is the value issue #96 reported working, and it is the value here.
+nats:
+  streamMaxBytesOverride: "536870912"
+
+# --- LLM analyst tier: off --------------------------------------------------
+#
+# The quickstart's premise is "no LLM key". RS runs the deterministic tiers
+# only (Sigma rules + Welford baselines), which is the configuration a reader
+# can evaluate without spending money or sending cluster telemetry to a
+# third party.
+evaluation:
+  config: RS
+
+# --- Timers: cut so a demo finishes ----------------------------------------
+#
+# Production warm-up is 30m, because a baseline built in seconds is not a
+# baseline. Five seconds is honest only as a demo: it means the statistical
+# tier has effectively no history, and the detection you see is carried by the
+# rule tier.
+baselines:
+  warmupDuration: "5s"
+
+# Production dwell defaults are 0/120/120 seconds and the de-escalation
+# cooldown is 600. Left at those, a ten-minute demo spends most of its life
+# waiting. These values keep the transitions visible without removing the
+# guards entirely.
+fsm:
+  dwellSeconds:
+    suspicious: 0
+    restricted: 10
+    quarantined: 10
+  deescalationCooldownSeconds: 30
+
+# --- Audit subjects: on, so the demo has a timeline to print -----------------
+#
+# response.audit gates the three append-only AUDIT.* subjects and is off by
+# default (Story 2.8). AUDIT.transitions is what the quickstart reads to render
+# the isolation timeline, so the demo would have nothing to show with it off.
+#
+# Retention is left at the chart defaults; on a cluster that is deleted at the
+# end of the demo it makes no difference, and overriding it here would be one
+# more number a reader has to discount as demo-only.
+response:
+  audit:
+    enabled: true
+
+# --- Enforcement: stays off -------------------------------------------------
+#
+# response.networkPolicy.enabled is false by default and this overlay does not
+# change it. Turning it on would need response.networkPolicy.clusterCidrs set
+# to kind's real pod and service CIDRs, and getting that wrong severs in-cluster
+# DNS, which is a poor first impression. The quickstart therefore shows
+# detection and the FSM's decisions, and prints the NetworkPolicy that WOULD be
+# applied rather than applying it.

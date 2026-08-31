@@ -1,0 +1,48 @@
+# Demo workload for `make quickstart` (Story 8.3).
+#
+# The synthetic S1 events cmd/olaitan-quickstart injects are attributed to a
+# pod in this Deployment, so the workload has to exist for the correlator to
+# resolve a WorkloadIdentity and for the FSM to have something to key on.
+#
+# tenant-acme mirrors the namespace the evaluation scenarios use, so what a
+# reader sees in the demo lines up with what the eval harness reports.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-acme
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-quickstart
+  namespace: tenant-acme
+  labels:
+    app: web-quickstart
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web-quickstart
+  template:
+    metadata:
+      labels:
+        app: web-quickstart
+    spec:
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
