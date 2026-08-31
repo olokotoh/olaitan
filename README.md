@@ -38,9 +38,9 @@ model, cannot escalate a workload on its own say-so.
 
 Tier 1 and tier 2 are deterministic. Tier 3 is optional, off by default, and
 capped. The analyst's contribution to a workload's score is bounded, and the
-bound is chosen so that the model **on its own cannot escalate anything**: with
-no deterministic signal the most it can contribute is 10.5, below the score of
-20 that reaches the first non-CLEAN state. See
+bound is chosen so that, on the shipped defaults, the model **on its own cannot
+escalate anything**: with no deterministic signal the most it can contribute is
+10.5, below the score of 20 that reaches the first non-CLEAN state. See
 [SECURITY.md](SECURITY.md#the-llm-tier-and-prompt-injection) for what that does
 and does not guarantee.
 
@@ -77,7 +77,7 @@ what happens after a rule fires.
 | --- | --- | --- |
 | Signal sources | eBPF syscalls | eBPF, K8s audit, CRI, CNI flows, app logs, correlated |
 | Output | an alert stream | an evidence package with a score and a workload state |
-| Repeated weak signals | each alert stands alone | accumulate through a rolling risk window |
+| Repeated weak signals | each alert stands alone | correlated into one evidence package; an optional rolling risk window (off by default) also lets them accumulate over time |
 | Statistical drift | not modelled | Welford baselines per workload |
 | Response | left to you (Talon and falcosidekick are separate components) | graduated NetworkPolicy isolation, cooldown-gated de-escalation |
 | Explanation | the rule text | optional LLM analyst, score-capped and schema-validated |

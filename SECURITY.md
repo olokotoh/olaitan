@@ -58,8 +58,21 @@ but it means **"enforcement is off" is a statement about the agent's behaviour,
 not about what its ServiceAccount could do.** Anyone who can exec into the
 aggregator, or who finds an escalation path through its ServiceAccount, has
 cluster-wide NetworkPolicy write regardless of your settings. Size your review
-against the ClusterRole, not against the flag. Narrowing this is tracked as
-part of Story 8.5.
+against the ClusterRole, not against the flag.
+
+**Setting `response.forensics.enabled` widens this considerably.** That flag is
+gated in the chart, and it adds cluster-wide:
+
+- `pods`: delete
+- `pods/log`: get
+
+Cluster-wide pod-log read is a larger data-exposure surface than the audit
+stream warned about above: it reaches application logs in every namespace,
+including ones Olaitan is not monitoring. Pod delete is what makes the
+PRESERVED_KILLED state possible. Enable forensics deliberately.
+
+The collector's Role is separate and namespace-scoped: get, list and watch on
+`pods` and `events` in the release namespace only.
 
 **What enabling enforcement changes** is that the agent starts using those
 permissions: RESTRICTED cuts a workload's egress to a configured allow-list,
@@ -85,8 +98,8 @@ chart renders `config/olaitan.yaml` into a ConfigMap almost verbatim; only a
 few settings have Helm bridges, and `excluded_namespaces` is not one of them.
 On the published-chart install path you get the defaults, which is why the
 install command in the README puts the release in the `olaitan` namespace: that
-name is already on the default list. Surfacing this guard as a Helm value is
-tracked as part of Story 8.5.
+name is already on the default list. Surfacing this guard as a Helm value is on the roadmap; there is no public
+tracking issue for it yet.
 
 **Two things this list does not include, deliberately:**
 
@@ -99,12 +112,14 @@ tracked as part of Story 8.5.
   workload whose score never drops below its entry threshold for a full
   cooldown stays where the agent put it until you intervene.
 
-  There is a second TTL in the response path, and it is the one that actually
-  governs how fast a workload becomes eligible to step down: the rolling
-  risk-decay window (`internal/response/risk/window.go`), where each signal
-  stops contributing once it is older than the window. It is configured by the
-  `OLT_RISK_WINDOW_SECONDS` environment variable rather than by a config key,
-  which makes it easy to miss when tuning de-escalation.
+  There is a second TTL in the response path, but it is **off by default**:
+  the rolling risk-decay window (`internal/response/risk/window.go`), where a
+  signal stops contributing once it is older than the window. It is enabled by
+  setting `OLT_RISK_WINDOW_SECONDS` to a non-zero value, and
+  `cmd/olaitan/main.go` defaults it to `0`, which selects per-package scoring
+  instead. If you turn it on, it becomes the main thing governing how fast a
+  workload becomes eligible to step down. If you leave it alone, it governs
+  nothing.
 
 ## The LLM tier and prompt injection
 
@@ -130,22 +145,37 @@ proof:
    the deterministic tiers scored at zero.** `TestProperty_NoLLMOnlyEscalation`
    checks that bound in CI.
 
-   What it does **not** guarantee: the contribution is additive, so a workload
-   the deterministic tiers already scored at 19 can be pushed over the
-   SUSPICIOUS threshold by the analyst alone. The cap bounds the model's
-   *contribution*, not the *state* a borderline workload can reach. If you need
-   the stronger property, run with the analyst tier off; everything except
-   tier-3 reasoning works without it.
+   What it does **not** guarantee: the contribution is additive, so the cap
+   bounds the model's *contribution*, not the *state* a borderline workload can
+   reach. This does not bite at the SUSPICIOUS boundary, because the analyst
+   chain only runs at all above a severity floor of 50 or a sigma floor of 3.0
+   (`internal/decision/analyst/trigger.go`), and either already scores at least
+   20 deterministically. It bites at the higher bands: a workload the
+   deterministic tiers put at 35 plus a full 10.5 reaches 45.5 and crosses
+   RESTRICTED at 40. If you need the stronger property, run with the analyst
+   tier off; everything except tier-3 reasoning works without it.
 
-**What the cap does not address: suppression.** Every mitigation above bounds
-the model in the upward direction. An attacker who already controls log lines
-and process arguments may prefer the opposite: arguing a real detection is
-benign, or helping satisfy the "signals subsiding" condition that drives
-de-escalation. The deterministic tiers still fire independently of the analyst,
-so a suppressed verdict cannot erase a rule match or a baseline deviation, but
-the analyst's downward influence on a score is not separately bounded. Treat
-tier-3 output as advisory, and alert on tier-1 and tier-2 signals directly if
-you care about this.
+   **The bound is checked against a constant, not against your configuration.**
+   `config.SuspiciousThreshold` is hardcoded to `20.0` and is what both the
+   config validator and `TestProperty_NoLLMOnlyEscalation` compare against, but
+   the FSM takes its live threshold from `detection.confidence_bands.watch`. A
+   legal `watch: 10` would let the analyst alone clear the bar while the
+   validator and the property test both still pass. If you lower `watch` below
+   20, the no-LLM-only-escalation guarantee no longer holds and nothing will
+   tell you.
+
+**On suppression.** An attacker who controls log lines and process arguments
+may prefer to argue a real detection is benign rather than to manufacture a
+false one. The structure of the score bounds this too, and it is worth being
+exact rather than alarming: the analyst term is clamped to `[0, cap]` and
+**added** to the deterministic score (`total := rules + baseline + llm`). The
+model can never subtract. The whole of its downward influence is contributing
+`0` instead of up to `10.5`, which is the same bound in the same place. A
+suppressed verdict cannot erase a rule match or a baseline deviation.
+
+That is a real structural protection, not a hedge. It is also the reason to
+alert on tier-1 and tier-2 signals directly: they are the part an analyst
+cannot argue away.
 
 If you find a way past the cap in either direction, that is the report we most
 want to receive.

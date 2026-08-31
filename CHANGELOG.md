@@ -12,18 +12,18 @@ and false-positive numbers; see [Unreleased](#unreleased).
 
 ## [Unreleased]
 
+> **Known gap.** Detection-latency (MTTD) and false-positive-rate numbers are
+> not yet measured against a live cluster. The harness, scenarios,
+> pre-registered analysis plan and reproducibility envelope are complete; the
+> campaign that fills them in is outstanding. No performance figure in this
+> repository should be cited until it is.
+
 ### Added
 
 - Repository hygiene for public use: `SECURITY.md` documenting the agent's
   blast radius and the LLM tier's prompt-injection threat model,
   `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, issue templates, and a README
   rewritten for operators rather than examiners.
-
-> **Known gap.** Detection-latency (MTTD) and false-positive-rate numbers are
-> not yet measured against a live cluster. The harness, scenarios,
-> pre-registered analysis plan and reproducibility envelope are complete; the
-> campaign that fills them in is outstanding. No performance figure in this
-> repository should be cited until it is.
 
 ## [v1.0.0-rc3] - 2026-08-30
 
