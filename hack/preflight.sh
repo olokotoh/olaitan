@@ -145,6 +145,30 @@ else
   info "Calico CNI flow adapter: off by default (needs Calico via the Tigera operator)"
 fi
 
+# ------------------------------------------------------- 5. host inotify room
+# Falco watches container lifecycle through inotify. On a workstation running
+# several clusters the per-user instance limit is exhausted before Falco starts
+# and it dies with "could not initialize inotify handler" -- a HOST limit, not
+# a cluster or chart problem, and invisible from kubectl. Hit on this very
+# machine (128 instances vs kind's documented 512).
+echo
+echo "${B}5. Host limits${X}  ${D}(local clusters only -- Falco needs inotify room)${X}"
+case "$DISTRO" in
+  kind|minikube|k3s)
+    INST="$(cat /proc/sys/fs/inotify/max_user_instances 2>/dev/null || echo '')"
+    WATCH="$(cat /proc/sys/fs/inotify/max_user_watches 2>/dev/null || echo '')"
+    if [ -z "$INST" ]; then
+      info "cannot read /proc/sys/fs/inotify (not Linux, or a remote cluster)"
+    elif [ "$INST" -lt 512 ] || [ "$WATCH" -lt 524288 ]; then
+      no "inotify limits are low: instances=$INST (want >=512), watches=$WATCH (want >=524288)"
+      info "Falco will die with 'could not initialize inotify handler'. Raise them:"
+      info "sudo sysctl -w fs.inotify.max_user_instances=512 fs.inotify.max_user_watches=524288"
+    else
+      ok "inotify limits are sufficient (instances=$INST, watches=$WATCH)"
+    fi ;;
+  *) info "remote cluster -- host inotify limits are a node concern, not checkable from here" ;;
+esac
+
 # --------------------------------------------------------------------- verdict
 echo
 if [ "$BLOCKERS" -gt 0 ]; then

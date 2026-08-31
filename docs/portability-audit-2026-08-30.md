@@ -112,6 +112,71 @@ mitigating fact: enforcement is `false` by default, so a default install is
 honest — the trap is armed only when an operator turns response on, which is
 precisely when they are trusting it most.
 
+## Blocker 5 — the chart's default image tag does not exist (CRITICAL) — **PROVEN**
+
+Installing the chart from the repository tree (what a contributor, or anyone
+running `helm install ./deploy/helm/olaitan`, does) schedules pods that can
+never start:
+
+```
+$ helm install olaitan deploy/helm/olaitan -n olaitan --create-namespace   # succeeds
+$ kubectl -n olaitan get pods
+olaitan-aggregator-...   0/1   ErrImagePull
+$ kubectl -n olaitan describe pod ...
+  Failed to pull image "ghcr.io/olokotoh/olaitan:0.1.0":
+    ghcr.io/olokotoh/olaitan:0.1.0: not found
+```
+
+`Chart.yaml` carries `appVersion: "0.1.0"` and `values.yaml` leaves
+`image.tag` empty so the helper falls back to it. The Story 8.1 release
+workflow stamps the real version at package time, so **the published chart is
+fine and only the in-tree default is broken** — which is exactly the path every
+contributor and every `helm install ./chart` user takes.
+
+Tags that actually exist on GHCR: `edge`, `1.0.0-rc2`, `1.0.0-rc3`.
+
+The install *reports success* (`STATUS: deployed`) while nothing can run. Same
+family as the other findings here: a green signal over a broken reality.
+
+## Blocker 6 — the default install cannot start on ANY cluster under ~160 GiB (CRITICAL) — **PROVEN**
+
+With the image tag fixed, the aggregator gets further and then dies:
+
+```
+$ kubectl -n olaitan logs -l app.kubernetes.io/component=aggregator
+ERROR startup: aggregator ring wiring
+  err="ensure stream EVENTS_RAW: nats: API error: code=500 err_code=10047
+       description=insufficient storage resources available"
+```
+
+The PVC is **bound and healthy at 10Gi**, so this is not a cluster limitation.
+`internal/nats/streams.go` declares each stream's `MaxBytes` independently of
+the volume it has to fit in:
+
+| stream | declared MaxBytes |
+| --- | --- |
+| EVENTS | 10 GiB |
+| EVENTS_RAW | 50 GiB |
+| THREATS | 100 GiB |
+| **total** | **160 GiB** |
+
+against a default `nats.persistence.size` of 10 Gi. JetStream reserves against
+the file store up front, so `EVENTS_RAW` alone (50 GiB) exhausts a 10 Gi volume
+and the very first `CreateOrUpdateStream` fails.
+
+This is filed as issue #96 and scoped to Story 8.3 as a *quickstart* fix
+(`values-quickstart.yaml` setting `nats.streamMaxBytesOverride`). **That framing
+is too narrow.** The defect is not specific to kind or to a single-node laptop:
+the chart's declared retention exceeds its own default volume by 16x, so a
+plain `helm install` fails on every cluster whose default StorageClass gives it
+less than ~160 GiB. An override in one demo values file leaves the default
+install broken everywhere else.
+
+The honest fix belongs in the default: either size the streams to the volume, or
+size the volume to the streams, and add a render-time guard that fails loudly
+when the declared sum exceeds `nats.persistence.size` rather than letting the
+operator discover it from a JetStream error code at runtime.
+
 ## Blocker 4 — no NOTES.txt, no capability detection
 
 ```

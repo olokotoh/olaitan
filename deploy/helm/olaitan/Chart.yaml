@@ -6,9 +6,21 @@ type: application
 # Chart version: bumped on every chart-schema change. Independent of the
 # application (binary) version — appVersion tracks the Olaitan binary.
 version: 0.1.0
-# Tracks cmd/olaitan main.version ldflag default. When the Go binary's
-# baseline version moves, bump this and the image tag in lockstep.
-appVersion: "0.1.0"
+# The image tag used when values.yaml leaves image.tag empty (see the
+# "olaitan.image" helper). The release workflow overwrites BOTH fields from the
+# git tag at package time, so this value only governs installs straight from the
+# repository tree — which is exactly the path contributors take.
+#
+# Epic 9: this was pinned at "0.1.0" long after that tag stopped existing, so
+# `helm install ./deploy/helm/olaitan` reported STATUS: deployed and then sat in
+# ErrImagePull forever:
+#
+#     Failed to pull image "ghcr.io/olokotoh/olaitan:0.1.0": not found
+#
+# Published tags are `edge` (tip of main, pushed on every green main build) and
+# the release tags. `edge` is the only honest default for a tree install: it is
+# the image built from the code you are looking at.
+appVersion: "edge"
 
 # Olaitan uses networking.k8s.io/v1 NetworkPolicy (GA since 1.7),
 # projected-volume semantics that matured in 1.20+, and the

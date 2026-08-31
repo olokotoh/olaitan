@@ -1269,7 +1269,28 @@ ollama:
 falco:
   enabled: true
   driver:
-    kind: ebpf
+    # `modern_ebpf` is CO-RE: one prebuilt probe that relocates itself against
+    # the running kernel's BTF. It needs NO kernel headers and compiles NOTHING
+    # at pod start.
+    #
+    # Epic 9: this was `ebpf`, the LEGACY driver, which runs falco-driver-loader
+    # to BUILD a probe on the node. On any node without kernel headers -- kind,
+    # minikube, Bottlerocket, Container-Optimized OS, most managed node images --
+    # the init container dies:
+    #
+    #   mount: /sys/kernel/debug: permission denied
+    #   make[1]: *** /lib/modules/<kernel>/build: No such file or directory
+    #   ERROR failed: failed to build all requested drivers
+    #
+    # Reproduced on kind (kernel 7.0.0-29-generic) before the change. Falco has
+    # defaulted to modern_ebpf since 0.40, and the bundled subchart is 8.0.2, so
+    # this default was inherited from an older chart and never revisited.
+    #
+    # Requires BTF (CONFIG_DEBUG_INFO_BTF) and kernel >= 5.8, true for every
+    # current mainstream node image. On an older kernel, set this back to `ebpf`
+    # (needs headers) or `kmod`. preflight.sh reports the node kernel so the
+    # operator can tell before installing.
+    kind: modern_ebpf
   # Falco's gRPC server -- both `grpc.enabled` and `grpc_output.enabled`
   # must be on for the collector to subscribe.
   falco:
@@ -1295,7 +1316,26 @@ nats:
   # leaves this empty and sizes nats.persistence.size to accommodate
   # the configured sum, rather than overriding fileStore.maxSize.
   # @schema type:string pattern:"byte count as a string (e.g. 1073741824), or empty for production sizing" effect:"per-stream JetStream MaxBytes override for small kind/CI PVCs; empty leaves production retention sized by nats.persistence.size" ref:NFR3
-  streamMaxBytesOverride: ""
+  #
+  # Epic 9: this defaulted to "" (no override), which made the DEFAULT install
+  # unstartable on any cluster whose storage is smaller than the declared
+  # retention. streams.go declares EVENTS 10 GiB + EVENTS_RAW 50 GiB +
+  # THREATS 100 GiB = 160 GiB, while nats.persistence.size defaults to 10 Gi.
+  # JetStream reserves against the file store up front, so EVENTS_RAW alone
+  # exhausted the volume and the aggregator died on its first stream:
+  #
+  #   ensure stream EVENTS_RAW: nats: API error: code=500 err_code=10047
+  #   description=insufficient storage resources available
+  #
+  # Filed as issue #96 and previously treated as a kind/quickstart quirk. It is
+  # not: 160 GiB of declared retention against a 10 Gi default volume fails
+  # everywhere, and reproduced here on a healthy bound 10Gi PVC.
+  #
+  # 512 MiB x 11 streams = 5.5 GiB, which fits the 10 Gi default with headroom
+  # and matches the value CI already proved on kind. Operators running real
+  # retention raise nats.persistence.size AND clear this override together --
+  # the pairing is the point, and NOTES.txt says so at install time.
+  streamMaxBytesOverride: "536870912"
 
 # Redis -- state store (per-workload baselines, FSM state, checkpoints).
 # Standalone architecture is enough for the single-aggregator MVP;
