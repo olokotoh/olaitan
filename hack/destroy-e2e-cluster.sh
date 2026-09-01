@@ -11,10 +11,14 @@
 # nobody is watching. Manual use: ./hack/destroy-e2e-cluster.sh
 set -uo pipefail
 
-TFDIR="/home/aslim/olaitan/deploy/terraform"
-PROFILE="saka"
-REGION="us-east-1"
-DEADLINE_FILE="/tmp/olaitan-e2e-deadline"
+# All four are overridable. They were hard-coded to one workstation (an
+# absolute /home path and a named AWS profile), which made this script
+# unusable for anyone else and unusable from CI. TFDIR now resolves relative
+# to this script, so a clone anywhere works.
+TFDIR="${TFDIR:-$(cd "$(dirname "$0")/../deploy/terraform" && pwd)}"
+PROFILE="${AWS_PROFILE:-default}"
+REGION="${AWS_REGION:-us-east-1}"
+DEADLINE_FILE="${DEADLINE_FILE:-/tmp/olaitan-e2e-deadline}"
 
 log() { printf '[%s] %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
 
@@ -29,7 +33,7 @@ if [ "${1:-}" = "--if-expired" ]; then
   if [ "$now" -lt "$deadline" ]; then
     exit 0   # still within the allotted window; stay quiet
   fi
-  log "DEADLINE EXPIRED — destroying the e2e cluster unconditionally."
+  log "DEADLINE EXPIRED -- destroying the e2e cluster unconditionally."
 fi
 
 cd "$TFDIR" || { log "cannot cd to $TFDIR"; exit 1; }
@@ -47,7 +51,7 @@ LEFT=$(aws --profile "$PROFILE" --region "$REGION" ec2 describe-instances \
   --query 'Reservations[].Instances[].InstanceId' --output text 2>/dev/null)
 
 if [ -n "$LEFT" ]; then
-  log "terraform left instances behind: $LEFT — terminating directly."
+  log "terraform left instances behind: $LEFT -- terminating directly."
   aws --profile "$PROFILE" --region "$REGION" ec2 terminate-instances \
     --instance-ids $LEFT --output table 2>&1 | tail -5
 else

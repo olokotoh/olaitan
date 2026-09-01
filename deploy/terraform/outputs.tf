@@ -25,9 +25,13 @@ output "instance_ids" {
 
 output "ssh" {
   description = "Ready-to-paste SSH commands, one per node."
+  # The key path is derived from key_name (or set explicitly via
+  # ssh_private_key_path) rather than hard-coded. It used to name one
+  # developer's key file, which made the output useless to anyone else and
+  # leaked a personal filename into a public repository.
   value = {
     for name, inst in aws_instance.node :
-    name => "ssh -i ~/.ssh/aslim-aws-ubuntu.pem ubuntu@${inst.public_ip}"
+    name => "ssh -i ${coalesce(var.ssh_private_key_path, "~/.ssh/${var.key_name}.pem")} ubuntu@${inst.public_ip}"
   }
 }
 

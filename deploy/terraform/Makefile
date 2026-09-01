@@ -5,9 +5,13 @@
 # disks and pay only for them), and `make down` when the campaign is
 # finished and the artefacts are safe in runs/.
 
-PROFILE ?= saka
-REGION  ?= us-east-1
-KEY     ?= ~/.ssh/aslim-aws-ubuntu.pem
+# Overridable, and no longer defaulted to one developer's AWS profile and
+# key file. `default` is the profile every AWS install has; KEY is derived
+# from the key pair name so the two stay consistent.
+PROFILE ?= $(if $(AWS_PROFILE),$(AWS_PROFILE),default)
+REGION  ?= $(if $(AWS_REGION),$(AWS_REGION),us-east-1)
+KEY_NAME ?= olaitan-e2e
+KEY     ?= ~/.ssh/$(KEY_NAME).pem
 AWS     := aws --profile $(PROFILE) --region $(REGION)
 
 .DEFAULT_GOAL := help

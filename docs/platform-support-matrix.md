@@ -1,4 +1,4 @@
-# Platform support matrix — what Olaitan can actually do, per platform
+# Platform support matrix: what Olaitan can actually do, per platform
 
 **Researched 2026-08-30** against first-party vendor documentation. Every row is
 cited. Rows marked **UNCERTAIN** were not confirmable in a vendor doc and must
@@ -17,7 +17,7 @@ distinction is never blurred in this document.**
 offers exactly two audit backends, log and webhook; EKS, AKS and GKE all run
 kube-apiserver as a managed component whose flags you cannot set. On every
 managed platform Olaitan's audit source must be re-plumbed through the cloud's
-own log pipeline — a *pull/stream adapter*, not the HTTP receiver Olaitan
+own log pipeline -- a *pull/stream adapter*, not the HTTP receiver Olaitan
 implements today. Falco already ships `k8saudit-eks`, `k8saudit-aks` and
 `k8saudit-gke` plugins for exactly this, which is the cheapest documented path.
 
@@ -68,15 +68,15 @@ so nobody promotes them on the strength of a job existing.
 
 ### Where Olaitan genuinely cannot run
 
-- **EKS Fargate** — "Daemonsets aren't supported on Fargate" and "Privileged
+- **EKS Fargate** -- "Daemonsets aren't supported on Fargate" and "Privileged
   containers aren't supported on Fargate". Worse than an error: a Fargate profile
   matching the namespace **silently swallows the DaemonSet** with no scheduling
   and no message.
-- **AKS Automatic** — Deployment Safeguards + Baseline PSS in Enforce mode, and
+- **AKS Automatic** -- Deployment Safeguards + Baseline PSS in Enforce mode, and
   "the baseline Pod Security Standards in AKS Automatic can't be turned off".
   Rejects privileged containers, hostPath and host namespaces by name. Only
   escape hatch: excluding Olaitan's namespace from Deployment Safeguards.
-- **GKE Autopilot** — the Warden validating admission webhook blocks privileged
+- **GKE Autopilot** -- the Warden validating admission webhook blocks privileged
   containers outright.
 
 These are platform policy, not Olaitan defects. Preflight must detect them and
@@ -97,7 +97,7 @@ and time-limited everywhere"**.
 
 **EKS ≥1.30 ships NO default StorageClass.** "Starting with 1.30, Amazon EKS no
 longer includes the default annotation on the gp2 StorageClass." A PVC with no
-`storageClassName` stays Pending forever — so NATS JetStream never binds and the
+`storageClassName` stays Pending forever -- so NATS JetStream never binds and the
 aggregator never starts. `hack/preflight.sh` already distinguishes "no default
 class" from "no classes at all" and prints the `--set` flags; this research is
 why that distinction earns its place.
@@ -129,7 +129,7 @@ why that distinction earns its place.
 
 ---
 
-## UNCERTAIN — do not claim until tested
+## UNCERTAIN: do not claim until tested
 
 - Whether AKS's Azure-flavoured Ubuntu 5.15 and Azure Linux 3.0 kernels are
   built with `CONFIG_DEBUG_INFO_BTF` (modern eBPF's requirement). Check with

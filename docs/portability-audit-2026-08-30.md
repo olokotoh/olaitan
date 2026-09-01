@@ -1,4 +1,4 @@
-# Portability audit — what actually stops a stranger installing Olaitan
+# Portability audit: what actually stops a stranger installing Olaitan
 
 **Date:** 2026-08-30 · **Branch:** `epic-9/portability-any-cluster` · **Chart under test:** published `oci://ghcr.io/olokotoh/charts/olaitan` v1.0.0-rc3 and the tree at `main` (778c08c)
 
@@ -40,12 +40,12 @@ olaitan/charts/falco/templates/daemonset.yaml  DaemonSet  ['/var/run/docker.sock
 olaitan/templates/daemonset.yaml               DaemonSet  ['/run/falco']
 ```
 
-So the *portability story is much better than the README says* — and nobody can
+So the *portability story is much better than the README says* -- and nobody can
 tell, because the README turns them away at the door.
 
 ---
 
-## Blocker 1 — the very first command fails (CRITICAL)
+## Blocker 1: the very first command fails (CRITICAL)
 
 A stranger's first action after finding the chart is `helm install`. It errors:
 
@@ -60,7 +60,7 @@ subchart, not the operator's, so the chart demands a secret for a component the
 operator did not ask for. **Impact: every install attempt fails until the user
 reads the template source.**
 
-## Blocker 2 — the published chart has no quickstart (CRITICAL)
+## Blocker 2: the published chart has no quickstart (CRITICAL)
 
 `values-quickstart.yaml` exists only on the unmerged `epic-8/story-8-3` branch:
 
@@ -75,7 +75,7 @@ ABSENT from published rc3
 There is currently **no supported path from "found the repo" to "saw it work"
 on any cluster the user already has.**
 
-## Blocker 3 — NetworkPolicy may be written but never enforced
+## Blocker 3: NetworkPolicy may be written but never enforced
 
 **Status: the PROVEN claim is RETRACTED. The risk is real; the evidence was not.**
 
@@ -94,7 +94,7 @@ read as *traffic flowing* and the verdict was predetermined: NOT ENFORCED on
 every cluster it was ever pointed at, regardless of the truth.
 
 Found on a real 3-node kubeadm cluster running Calico v3.31.5, where the script
-said NOT ENFORCED and a manual probe proved the opposite — nginx reachable
+said NOT ENFORCED and a manual probe proved the opposite -- nginx reachable
 before a deny-all, `wget: download timed out` after. The script was accusing a
 CNI that was working correctly the whole time.
 
@@ -112,7 +112,7 @@ RESULT: NetworkPolicy IS ENFORCED on this cluster.
 ```
 
 **What remains true.** kind's default CNI (kindnet) does not implement
-NetworkPolicy, and k3s's default flannel backend does not either — both
+NetworkPolicy, and k3s's default flannel backend does not either -- both
 documented upstream. Olaitan writing a policy on those clusters still achieves
 nothing, and would mark a workload QUARANTINED, write the audit record, move the
 FSM and light the dashboard green while the pod keeps talking to the internet.
@@ -125,10 +125,10 @@ making the claim again.
 serious finding in this audit, it is a correctness problem rather than a
 packaging one, and it exists on clusters we already claim to support. Note the
 mitigating fact: enforcement is `false` by default, so a default install is
-honest — the trap is armed only when an operator turns response on, which is
+honest -- the trap is armed only when an operator turns response on, which is
 precisely when they are trusting it most.
 
-## Blocker 5 — the chart's default image tag does not exist (CRITICAL) — **PROVEN**
+## Blocker 5 -- the chart's default image tag does not exist (CRITICAL) -- **PROVEN**
 
 Installing the chart from the repository tree (what a contributor, or anyone
 running `helm install ./deploy/helm/olaitan`, does) schedules pods that can
@@ -146,7 +146,7 @@ $ kubectl -n olaitan describe pod ...
 `Chart.yaml` carries `appVersion: "0.1.0"` and `values.yaml` leaves
 `image.tag` empty so the helper falls back to it. The Story 8.1 release
 workflow stamps the real version at package time, so **the published chart is
-fine and only the in-tree default is broken** — which is exactly the path every
+fine and only the in-tree default is broken** -- which is exactly the path every
 contributor and every `helm install ./chart` user takes.
 
 Tags that actually exist on GHCR: `edge`, `1.0.0-rc2`, `1.0.0-rc3`.
@@ -154,7 +154,7 @@ Tags that actually exist on GHCR: `edge`, `1.0.0-rc2`, `1.0.0-rc3`.
 The install *reports success* (`STATUS: deployed`) while nothing can run. Same
 family as the other findings here: a green signal over a broken reality.
 
-## Blocker 6 — the default install cannot start on ANY cluster under ~160 GiB (CRITICAL) — **PROVEN**
+## Blocker 6 -- the default install cannot start on ANY cluster under ~160 GiB (CRITICAL) -- **PROVEN**
 
 With the image tag fixed, the aggregator gets further and then dies:
 
@@ -193,7 +193,7 @@ size the volume to the streams, and add a render-time guard that fails loudly
 when the declared sum exceeds `nats.persistence.size` rather than letting the
 operator discover it from a JetStream error code at runtime.
 
-## Blocker 7 — the repo's own kubeadm terraform cannot build a working multi-node cluster (CRITICAL) — **PROVEN**
+## Blocker 7 -- the repo's own kubeadm terraform cannot build a working multi-node cluster (CRITICAL) -- **PROVEN**
 
 `deploy/terraform` is the module the thesis evaluation runs on. It did not set
 `source_dest_check = false` on the EC2 instances, and AWS defaults it to `true`.
@@ -201,7 +201,7 @@ operator discover it from a JetStream error code at runtime.
 EC2 drops any packet whose source or destination IP does not belong to the
 instance. Every CNI overlay violates that by design: a VXLAN packet leaving a
 node carries a **pod** IP (192.168.0.0/16), not the node's 10.77.0.0/24 address,
-so AWS discards it. Silently — no error, no log, no counter.
+so AWS discards it. Silently -- no error, no log, no counter.
 
 What that produces is worse than a broken cluster: a cluster that **looks
 healthy and is not.**
@@ -220,7 +220,7 @@ One root cause, four symptoms that each look like a different bug:
 - **both CoreDNS replicas** happened to schedule on `ip-10-77-0-28`, so DNS
   worked on that node and timed out on every other one
 - aggregator on `.25`: `aggregator: nats: connect: dial tcp: lookup
-  olaitan-nats: i/o timeout` — NATS was Running on `.28`
+  olaitan-nats: i/o timeout` -- NATS was Running on `.28`
 - falcoctl init: `lookup falcosecurity.github.io: i/o timeout`
 - Calico's own APIService: `FailedDiscoveryCheck ... context deadline exceeded`,
   which then wedged four namespaces in `Terminating`
@@ -228,7 +228,7 @@ One root cause, four symptoms that each look like a different bug:
 Fixed in `main.tf` with the reasoning recorded inline. Verified live on the
 running cluster with `modify-instance-attribute --no-source-dest-check`.
 
-**Why this one matters most.** Single-node kind cannot expose it — there is no
+**Why this one matters most.** Single-node kind cannot expose it -- there is no
 cross-node traffic to drop. Every Olaitan test to date ran on kind, so the
 multi-node path the thesis claims to evaluate had never actually worked. It also
 generalises: the failure is invisible in `kubectl get nodes`, `helm status`
@@ -236,7 +236,7 @@ reports `deployed`, and the aggregator's own health endpoint answers fine while
 the ring behind it is unreachable.
 
 
-## Blocker 8 — the collector cannot attach to Falco's socket as non-root (CRITICAL) — **PROVEN, FIXED in Story 9.6**
+## Blocker 8 -- the collector cannot attach to Falco's socket as non-root (CRITICAL) -- **PROVEN, FIXED in Story 9.6**
 
 With cross-node networking repaired, Falco reached 2/2 Running on all three
 nodes and the collector still crash-looped on every one:
@@ -256,7 +256,7 @@ Falco creates the socket `0755 root:root`. Connecting to a Unix socket requires
 **write** permission, and the collector runs `runAsUser: 65532` /
 `runAsNonRoot: true` per NFR11. Owner-only write means the collector can never
 attach. **Olaitan's primary detection source is unreachable on a stock kubeadm
-cluster** — Falco runs, the collector dies, and no syscall events are ingested.
+cluster** -- Falco runs, the collector dies, and no syscall events are ingested.
 
 **Fixed 2026-09-01 (Story 9.6).** The chart now ships a
 `falco-socket-permissions` container in the collector's own pod: root, all
@@ -281,7 +281,7 @@ kind cluster the sidecar starts before the collector and the pod reaches 2/2.
 **The original wrong turn, kept as the record.** A first attempt set
 `grpc.unix_socket_mode: "0775"`
 in the Falco values. The rendered ConfigMap carried it and the socket stayed
-`0755`, because **that key does not exist** — upstream `falco.yaml` (checked
+`0755`, because **that key does not exist** -- upstream `falco.yaml` (checked
 through 0.42.0) exposes only `enabled`, `bind_address`, `threadiness` and the
 mTLS cert paths. It was an invented setting that Falco silently ignored, and the
 "fix" would have been published as working. `falcosecurity/falco#1351` is the
@@ -289,10 +289,10 @@ upstream request for exactly this, still open.
 
 Real options, for Story 9.6:
 1. a `chmod` initContainer on the collector DaemonSet (runs as root once, then
-   the long-lived process stays non-root) — most likely correct;
+   the long-lived process stays non-root) -- most likely correct;
 2. a supplemental group shared with Falco, if the Falco chart can be made to
    create the socket group-writable;
-3. running the collector as root — rejected: that trades a file permission for
+3. running the collector as root -- rejected: that trades a file permission for
    a privileged process parsing untrusted event data.
 
 **Why kind never caught it.** On kind, Falco and the collector end up sharing an
@@ -300,7 +300,7 @@ effective identity, so the dial succeeds and the permission question never
 arises. Every prior test ran there.
 
 
-## Blocker 4 — no NOTES.txt, no capability detection
+## Blocker 4: no NOTES.txt, no capability detection
 
 ```
 $ ls deploy/helm/olaitan/templates/NOTES.txt   # does not exist
@@ -321,7 +321,7 @@ pretend.
 
 | Capability | Where it is impossible | Why |
 | --- | --- | --- |
-| K8s audit webhook | EKS, AKS, GKE (all managed) | needs `--audit-webhook-config-file` on kube-apiserver; managed control planes do not expose flags. Documented alternatives are CloudWatch / Azure Diagnostic Settings / Cloud Logging — a *different* ingestion path, not a flag flip |
+| K8s audit webhook | EKS, AKS, GKE (all managed) | needs `--audit-webhook-config-file` on kube-apiserver; managed control planes do not expose flags. Documented alternatives are CloudWatch / Azure Diagnostic Settings / Cloud Logging -- a *different* ingestion path, not a flag flip |
 | Calico CNI flow adapter | any cluster not running Calico via the Tigera operator | conflicts with cloud CNIs (VPC CNI, Azure CNI) |
 | containerd CRI sensor | CRI-O clusters; any node without `/run/containerd` | socket path differs (k3s: `/run/k3s/containerd/containerd.sock`) |
 | privileged DaemonSet | GKE Autopilot (unless allowlisted) | admission policy blocks privileged workloads |
@@ -338,10 +338,10 @@ install is far more portable than advertised.
   on 2026-08-30**, outputs above.
 - Per-platform limits table: from official vendor documentation gathered in
   parallel research; each row is cited in the Epic 9 story that consumes it.
-  **Not yet verified against a live EKS/AKS/GKE cluster** — that is a story
+  **Not yet verified against a live EKS/AKS/GKE cluster** -- that is a story
   acceptance criterion, not an assumption to build on.
 
-## New finding 2026-09-01 — Falco's gRPC output is DEPRECATED upstream
+## New finding 2026-09-01: Falco's gRPC output is DEPRECATED upstream
 
 Not a portability blocker, and not fixed here, but it belongs on the record
 before this is open-sourced: Falco 0.43.1 announces the interface Olaitan's

@@ -11,9 +11,11 @@ variable "availability_zone" {
 }
 
 variable "profile" {
+  # `default` rather than one developer's profile name, which nobody else
+  # has configured.
   description = "Local AWS CLI profile to authenticate with."
   type        = string
-  default     = "saka"
+  default     = "default"
 }
 
 variable "workstation_cidr" {
@@ -27,9 +29,13 @@ variable "workstation_cidr" {
 }
 
 variable "key_name" {
-  description = "Name of an existing EC2 key pair for SSH access to the nodes."
+  # No default. It used to default to one developer's key pair name, which
+  # could only ever work for that account: AWS rejects an unknown key pair,
+  # so anyone else got a confusing apply-time failure instead of being told
+  # up front what to set. Required is the honest shape for a value only the
+  # operator can know.
+  description = "Name of an existing EC2 key pair in this account/region, for SSH access to the nodes. Required."
   type        = string
-  default     = "aslim-ubuntu"
 }
 
 variable "node_instance_type" {
@@ -119,4 +125,10 @@ variable "pod_network_cidr" {
   description = "Pod network CIDR passed to kubeadm init. Calico's default."
   type        = string
   default     = "192.168.0.0/16"
+}
+
+variable "ssh_private_key_path" {
+  description = "Local path to the private key matching key_name, used only to render the `ssh` output. Nothing is read from it; it is a convenience so the printed command is copy-pasteable. Defaults to the conventional path for key_name."
+  type        = string
+  default     = ""
 }

@@ -9,7 +9,7 @@ version: 0.1.0
 # The image tag used when values.yaml leaves image.tag empty (see the
 # "olaitan.image" helper). The release workflow overwrites BOTH fields from the
 # git tag at package time, so this value only governs installs straight from the
-# repository tree — which is exactly the path contributors take.
+# repository tree: which is exactly the path contributors take.
 #
 # Epic 9: this was pinned at "0.1.0" long after that tag stopped existing, so
 # `helm install ./deploy/helm/olaitan` reported STATUS: deployed and then sat in
