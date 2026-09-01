@@ -31,16 +31,40 @@ stock EKS (VPC CNI) and stock AKS (no policy engine selected).
 
 ## Support matrix
 
-| Platform | Install | Falco driver | NetworkPolicy enforced | Default StorageClass | Audit webhook |
-| --- | --- | --- | --- | --- | --- |
-| **kind** | ✅ verified | modern_ebpf | ❌ **no** (kindnet) | ✅ `standard` | ✅ possible |
-| **kubeadm** | template-verified | modern_ebpf | depends on CNI | depends | ✅ possible |
-| **EKS (EC2)** | template-verified | modern_ebpf **required** | ❌ off until enabled | ❌ **none ≥1.30** | ❌ CloudWatch instead |
-| **EKS Fargate** | ❌ **impossible** | n/a | n/a | n/a | n/a |
-| **AKS Standard** | template-verified | modern_ebpf | ❌ off unless chosen | ✅ `default` | ❌ Event Hub instead |
-| **AKS Automatic** | ❌ **blocked** | n/a | ✅ (Cilium) | ✅ | ❌ |
-| **GKE Standard** | template-verified | modern_ebpf | ✅ with Dataplane V2 | ✅ balanced PD | ❌ Cloud Logging |
-| **GKE Autopilot** | ❌ **blocked** | n/a | ✅ always on | ✅ strongest | ❌ |
+| Platform | Install | Falco driver | NetworkPolicy enforced | Default StorageClass | Audit webhook | Overlay |
+| --- | --- | --- | --- | --- | --- | --- |
+| **kind** | ✅ verified | modern_ebpf | ❌ **no** (kindnet) | ✅ `standard` | ✅ possible | `values-kind.yaml` |
+| **kubeadm** | ✅ verified | modern_ebpf | depends on CNI | depends | ✅ possible | (defaults) |
+| **k3s / k3d** | template-verified | modern_ebpf | ✅ (kube-router) | ✅ `local-path` | ✅ possible | `values-k3s.yaml` |
+| **minikube** | template-verified | modern_ebpf | ❌ unless `--cni=calico` | ✅ addon | ✅ possible | `values-minikube.yaml` |
+| **EKS (EC2)** | template-verified | modern_ebpf **required** | ❌ off until enabled | ❌ **none ≥1.30** | ❌ CloudWatch instead | `values-eks.yaml` |
+| **EKS Fargate** | ❌ **impossible** | n/a | n/a | n/a | n/a | n/a |
+| **AKS Standard** | template-verified | modern_ebpf | ❌ off unless chosen | ✅ `default` | ❌ Event Hub instead | `values-aks.yaml` |
+| **AKS Automatic** | ❌ **blocked** | n/a | ✅ (Cilium) | ✅ | ❌ | n/a |
+| **GKE Standard** | template-verified | modern_ebpf | ✅ with Dataplane V2 | ✅ balanced PD | ❌ Cloud Logging | `values-gke.yaml` |
+| **GKE Autopilot** | ❌ **blocked** | n/a | ✅ always on | ✅ strongest | ❌ | n/a |
+| **OpenShift** | template-verified | modern_ebpf | ✅ (OVN-Kubernetes) | ✅ | ✅ possible | `values-openshift.yaml` |
+
+Each overlay carries only that platform's deltas, every line commented with the
+reason. CI lints and `kubeconform`-validates all seven on every run against the
+chart's `kubeVersion` floor (1.29.0), which is the evidence behind the
+`template-verified` rows and **the only thing they claim**.
+
+The two `verified` rows are separate, and neither rests on CI:
+
+- **kind** is installed and observed on every e2e run, and again by hand on
+  2026-09-01 for Story 9.6.
+- **kubeadm** was installed by hand on a real 3-node cluster on 2026-08-31.
+  Note what that run actually established: the chart installs and every
+  workload schedules, but the collector could not attach to Falco's socket
+  (Blocker 8) until Story 9.6, and **the fix has not yet been re-run on
+  kubeadm**. Story 9.6 was verified in containers and on kind; the kubeadm
+  re-run is outstanding.
+
+The `portability` matrix job (kind, minikube, k3s) is written but **has not run
+yet** -- this branch has never been pushed, so no CI has executed against it.
+Until it does, minikube and k3s stay `template-verified`, and this note is here
+so nobody promotes them on the strength of a job existing.
 
 ### Where Olaitan genuinely cannot run
 

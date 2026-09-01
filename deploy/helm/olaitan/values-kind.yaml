@@ -1,0 +1,32 @@
+# kind overlay (local evaluation and CI).
+#
+#   helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan \
+#     -f values-kind.yaml --namespace olaitan --create-namespace
+#
+# This is the ONE platform marked `verified` in
+# docs/platform-support-matrix.md: the chart is installed and observed here on
+# every CI run.
+
+platform: kind
+
+response:
+  networkPolicy:
+    # OFF, and on kind this is not a default you should override. kindnet
+    # ACCEPTS NetworkPolicy objects and enforces NONE of them. Proven by
+    # hack/check-netpol-enforcement.sh on stock kind:
+    #
+    #   RESULT: NetworkPolicy is NOT ENFORCED on this cluster.
+    #           The API server accepted a deny-all policy and traffic still flowed.
+    #
+    # Turning enforcement on here produces a tool that reports workloads
+    # QUARANTINED while they keep talking to the internet. If you need to
+    # exercise the isolation path locally, create the cluster with
+    # `disableDefaultCNI: true` and install Calico or Cilium.
+    enabled: false
+
+# STORAGE. kind ships a default `standard` StorageClass, so no override is
+# needed. The default nats.streamMaxBytesOverride (512 MiB per stream) already
+# fits kind's 10 Gi volume; without it JetStream declares about 160 GiB and the
+# first stream exhausts the volume (issue #96).
+#
+# HOST LIMITS. Same inotify caveat as minikube -- hack/preflight.sh reports it.

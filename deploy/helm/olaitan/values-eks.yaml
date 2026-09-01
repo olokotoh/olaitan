@@ -1,0 +1,68 @@
+# Amazon EKS (EC2 node groups) overlay.
+#
+#   helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan \
+#     -f values-eks.yaml --namespace olaitan --create-namespace
+#
+# Deltas only. Every line states why, from docs/platform-support-matrix.md
+# (researched 2026-08-30 against the AWS EKS user guide and best-practices
+# guide). This overlay is template-verified, NOT verified: the chart renders
+# and validates for EKS, but nothing in this file has been run on one.
+#
+# EKS FARGATE IS NOT SUPPORTED AND CANNOT BE. Fargate supports neither
+# DaemonSets nor privileged containers, and a Fargate profile matching this
+# namespace SILENTLY swallows the DaemonSet: no scheduling, no event, no
+# error. Use EC2 node groups.
+
+platform: eks
+
+falco:
+  driver:
+    # Required here, not merely preferred. The legacy `ebpf` driver compiles a
+    # probe against kernel headers; Bottlerocket has an immutable dm-verity
+    # rootfs with no headers and kernel lockdown, and Amazon Linux 2023 nodes
+    # carry none by default either. modern_ebpf is CO-RE and compiles nothing.
+    kind: modern_ebpf
+
+containerdSensor:
+  # Off by default; this is the path to use IF you enable it. The socket moves
+  # with the node OS: Amazon Linux 2023 keeps the standard path, Bottlerocket
+  # exposes it under /run/host-containerd/. Set the Bottlerocket path instead
+  # if that is your node AMI.
+  socketPath: /run/containerd/containerd.sock
+
+auditWebhook:
+  # IMPOSSIBLE on EKS, not merely off. The K8s audit webhook needs
+  # --audit-webhook-config-file on kube-apiserver, and EKS runs the API server
+  # as a managed component whose flags you cannot set. Turning this on gets you
+  # a receiver that never receives anything. EKS audit data comes out through
+  # CloudWatch; wiring that up needs a pull adapter Olaitan does not implement
+  # yet (Falco's k8saudit-eks plugin is the documented cheap path).
+  enabled: false
+
+response:
+  networkPolicy:
+    # Left OFF deliberately. Stock EKS runs the VPC CNI with NetworkPolicy
+    # DISABLED, so the API server accepts a policy and nothing enforces it --
+    # Olaitan would report a workload QUARANTINED while it still has full
+    # network access. Enabling this on EKS requires ALL of:
+    #   * enableNetworkPolicy="true" on the VPC CNI add-on
+    #   * VPC CNI >= 1.14.0-eksbuild.3
+    #   * node kernel >= 5.10, on EC2 Linux nodes
+    # Confirm with hack/check-netpol-enforcement.sh before you turn it on.
+    enabled: false
+
+# STORAGE -- read this before installing.
+#
+# EKS >= 1.30 ships NO default StorageClass: the default annotation was removed
+# from gp2. A PVC with no storageClassName stays Pending forever, so NATS
+# JetStream never binds and the aggregator never starts. There is no safe value
+# to put here, because the class name is yours, so set it at install time:
+#
+#   --set nats.persistence.storageClass=<your-class> \
+#   --set reports.storageClass=<your-class>
+#
+# You also need the EBS CSI driver add-on, which is not installed by default
+# and needs its own IAM role (IRSA or Pod Identity). Without it PVCs fail with
+# UnauthorizedOperation.
+#
+# hack/preflight.sh detects both cases and prints the exact flags.

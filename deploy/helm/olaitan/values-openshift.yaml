@@ -1,0 +1,44 @@
+# Red Hat OpenShift overlay.
+#
+#   helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan \
+#     -f values-openshift.yaml --namespace olaitan --create-namespace
+#
+# Deltas only. Template-verified, NOT verified: the chart renders and validates
+# for OpenShift, but nothing here has been run on one.
+
+# OpenShift is the one platform the chart CAN detect on its own (it is the only
+# thing serving security.openshift.io/v1), so this line is belt and braces.
+platform: openshift
+
+openshift:
+  # Ships the RoleBinding the collector needs. Without an SCC that permits
+  # hostPath volumes and a non-assigned UID, the DaemonSet is refused at
+  # admission -- OpenShift's default restricted-v2 allows neither, and the
+  # collector needs both (Falco's socket directory is a hostPath, and the
+  # falco-socket-permissions container runs as UID 0 to chmod the socket).
+  #
+  # This replaces the manual step:
+  #   oc adm policy add-scc-to-user hostmount-anyuid -z <release>-olaitan-collector
+  bindSCC: true
+  # hostmount-anyuid, not privileged. Olaitan's own containers are
+  # unprivileged, drop ALL capabilities and run read-only root filesystems.
+  scc: hostmount-anyuid
+
+auditWebhook:
+  # AVAILABLE on OpenShift, unlike the managed cloud platforms: you control the
+  # control plane, though the supported route is the APIServer config resource
+  # rather than editing kube-apiserver flags directly. Off by default because
+  # it still needs that reconfiguration.
+  enabled: false
+
+response:
+  networkPolicy:
+    # OpenShift SDN and OVN-Kubernetes both enforce NetworkPolicy, so this is
+    # one of the platforms where isolation genuinely works. Still off by
+    # default: enabling enforcement is a deliberate act. Run
+    # hack/check-netpol-enforcement.sh and set
+    # response.networkPolicy.clusterCidrs to your real pod/service CIDRs first.
+    enabled: false
+
+# STORAGE. OpenShift ships a default StorageClass on every supported
+# installation profile, so no override is needed.

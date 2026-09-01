@@ -68,6 +68,47 @@ NetworkPolicies. Turning it on is a deliberate act, and you should set
 `response.networkPolicy.clusterCidrs` to your cluster's real CIDRs first or
 egress blocking under RESTRICTED will take DNS with it.
 
+Run this first, against whatever cluster you are pointed at:
+
+```bash
+hack/preflight.sh      # or: make preflight
+```
+
+It probes storage, privileged-workload admission, NetworkPolicy **enforcement**
+and each optional source, and prints `yes` / `no` / `BLOCKER` with the exact
+remedy flag for each. It changes nothing. After the install, the chart's
+`NOTES.txt` tells you the same thing from inside: what it detected, which
+sources are on, which are off, and why.
+
+### Where it runs
+
+| Platform | Install | NetworkPolicy enforced | Audit webhook | Overlay |
+| --- | --- | --- | --- | --- |
+| kind | ✅ verified | ❌ no (kindnet accepts and ignores) | ✅ possible | `values-kind.yaml` |
+| kubeadm | ✅ verified | depends on your CNI | ✅ possible | (defaults) |
+| k3s / k3d | template-verified | ✅ (kube-router) | ✅ possible | `values-k3s.yaml` |
+| minikube | template-verified | ❌ unless `--cni=calico` | ✅ possible | `values-minikube.yaml` |
+| EKS (EC2) | template-verified | ❌ until VPC CNI policy enabled | ❌ impossible | `values-eks.yaml` |
+| AKS Standard | template-verified | ❌ unless an engine was chosen | ❌ impossible | `values-aks.yaml` |
+| GKE Standard | template-verified | ✅ with Dataplane V2 | ❌ impossible | `values-gke.yaml` |
+| OpenShift | template-verified | ✅ (OVN-Kubernetes) | ✅ possible | `values-openshift.yaml` |
+| EKS Fargate | ❌ impossible | n/a | n/a | n/a |
+| AKS Automatic | ❌ blocked | n/a | n/a | n/a |
+| GKE Autopilot | ❌ blocked | n/a | n/a | n/a |
+
+`verified` means installed and observed on a live cluster of that type.
+`template-verified` means the chart renders and validates for it and nothing
+was run there. Rendering is not running, and the two are never blurred; the
+cited, per-platform detail is in
+[docs/platform-support-matrix.md](docs/platform-support-matrix.md).
+
+The three features that genuinely need a self-managed control plane -- the
+audit webhook, the containerd CRI sensor, the Calico flow adapter -- are all
+**off by default**, and a default render contains no hostPath mount from
+Olaitan's own templates. "Impossible" above means the K8s audit webhook
+specifically: no managed provider exposes `--audit-webhook-config-file`, so
+that one source cannot be turned on there at all. Everything else works.
+
 ## How this differs from Falco alone
 
 Falco is one of Olaitan's five inputs, and an excellent one. The difference is
@@ -94,14 +135,22 @@ Read this section before trusting it with anything.
   yet.** The evaluation harness, scenarios and analysis pipeline are complete
   and reproducible, but the campaign that produces MTTD and FPR against a live
   cluster has not been run. Do not cite performance figures from this repo.
-- **Kubeadm clusters only.** Managed control planes (EKS, GKE, AKS) are out of
-  scope: the audit webhook needs `--audit-webhook-config-file` on the API
-  server, which managed providers do not expose, and the CNI flow adapter needs
-  Calico installed via the Tigera operator, which conflicts with cloud CNIs.
-- **Falco's eBPF driver needs kernel 6.5 or newer.** On older kernels the
-  subchart can fall back to the kernel module, but nothing here was measured
-  that way.
-- **Targets Kubernetes 1.29.** The chart's `kubeVersion` floor is `>=1.29.0`.
+- **NetworkPolicy enforcement is your CNI's job, not Olaitan's.** Olaitan
+  reports a workload `QUARANTINED` once it has written the policy. On a cluster
+  whose CNI does not enforce NetworkPolicy the API server accepts every policy
+  and the data plane ignores all of them, so the workload keeps full network
+  access while the tool says it is contained. Stock kind, stock EKS (VPC CNI)
+  and stock AKS all behave this way. Enforcement is **off by default** for this
+  reason. Before turning it on, run `hack/check-netpol-enforcement.sh`, which
+  pushes real traffic through a deny-all policy and tells you which world you
+  are in.
+- **Falco's modern eBPF driver needs BTF (`CONFIG_DEBUG_INFO_BTF`) and kernel
+  5.8 or newer.** True of every current mainstream node image. On an older
+  kernel set `falco.driver.kind=kmod`; `hack/preflight.sh` reports the node
+  kernel so you can tell before installing.
+- **Targets Kubernetes 1.29 and newer.** The chart's `kubeVersion` floor is
+  `>=1.29.0`, and it is load-bearing rather than conservative: the collector's
+  Falco-socket permission container is a native sidecar, which needs 1.29.
 - **The LLM tier costs money and adds latency.** It is off by default for both
   reasons. Everything except tier-3 reasoning works with it disabled.
 - **The agent writes NetworkPolicies into your cluster when enforcement is on.**
