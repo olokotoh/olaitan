@@ -200,22 +200,6 @@ Olaitan began as academic work and the evidence trail is kept in the open on
 purpose: a pre-registered analysis plan, a reproducibility envelope that pins
 every input to a run, and a traceability matrix from requirements to tests.
 
-A preprint (IEEE format, targeting arXiv `cs.CR`) is written but **not yet
-posted**; this section will carry the link when it is. Until then the
-repository is the citable artefact.
-
-If you use this in academic work, please cite:
-
-```bibtex
-@misc{olokoto2026olaitan,
-  title  = {Trust-Bounded Multi-Agent LLM Integration for Autonomous
-            Kubernetes Runtime Security},
-  author = {Olokoto, Habeeb},
-  year   = {2026},
-  note   = {\url{https://github.com/olokotoh/olaitan}}
-}
-```
-
 The evaluation harness lives in `cmd/olaitan-eval`, the pre-registered plan in
 `analysis/preregistration.md`, and the reproducibility envelope in
 `eval/manifest.yaml`.
