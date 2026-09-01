@@ -343,3 +343,260 @@ that work for in-namespace clients break for cross-namespace dialers.
 {{- define "olaitan.auditWebhookServiceFqdn" -}}
 {{- printf "%s-audit-webhook.%s.svc.cluster.local" (include "olaitan.fullname" .) .Release.Namespace -}}
 {{- end -}}
+
+{{/*
+Falco socket helpers (Story 9.6).
+
+`endpoints.falco` is either a unix:// path (the default: the collector
+opens the socket the node's Falco DaemonSet created) or a tcp:// target
+(an off-node Falco reached over the pod network). Everything the socket
+permission fixer renders is gated on the unix:// case, because there is
+no socket to chmod in the tcp:// case.
+*/}}
+{{- define "olaitan.falcoSocket.isUnix" -}}
+{{- if hasPrefix "unix://" .Values.endpoints.falco -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+Absolute path of the Falco gRPC socket, taken from the same value the
+collector dials so the fixer can never chmod a different file than the
+one that is failing.
+*/}}
+{{- define "olaitan.falcoSocket.path" -}}
+{{- trimPrefix "unix://" .Values.endpoints.falco -}}
+{{- end -}}
+
+{{/*
+Whether the Falco socket permission fixer renders at all.
+
+Off when the operator disabled it, and forced off for a tcp:// endpoint:
+there is no socket to chmod when Falco is reached over the pod network,
+so a tcp:// deployment must render neither the container nor the
+read-write host mount.
+*/}}
+{{- define "olaitan.falcoSocket.fixerEnabled" -}}
+{{- $fix := default (dict) .Values.falcoSocketPermissions -}}
+{{- if and $fix.enabled (include "olaitan.falcoSocket.isUnix" .) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+The Falco socket permission fixer container (Story 9.6).
+
+Defined once and injected into one of two lists by daemonset.yaml:
+`initContainers` with restartPolicy: Always (the native sidecar, ordered
+before the collector's first dial), or `containers` (a plain sidecar for
+clusters with the SidecarContainers gate disabled). The container body
+is identical either way -- only the placement and restartPolicy differ,
+which is why this is a shared template rather than two copies that could
+drift.
+
+Call with: (dict "ctx" $ "native" true|false)
+*/}}
+{{- define "olaitan.falcoSocket.fixerContainer" -}}
+{{- $ctx := .ctx -}}
+{{- $fix := $ctx.Values.falcoSocketPermissions -}}
+{{- $sock := include "olaitan.falcoSocket.path" $ctx -}}
+- name: falco-socket-permissions
+  image: "{{ $fix.image.repository }}:{{ $fix.image.tag }}"
+  imagePullPolicy: {{ $fix.image.pullPolicy }}
+  {{- if .native }}
+  # Native sidecar (KEP-753): an initContainers entry with
+  # restartPolicy: Always starts before the collector and keeps running
+  # beside it. Ordering is the reason this is the default -- the socket
+  # is already group-writable when the collector makes its first dial.
+  restartPolicy: Always
+  {{- end }}
+  command: ["/bin/sh", "-c"]
+  args:
+    - |
+      set -u
+      SOCK={{ $sock | quote }}
+      MODE={{ $fix.socketMode | quote }}
+      GID={{ $fix.socketGroup | quote }}
+      INTERVAL={{ $fix.intervalSeconds }}
+      TIMEOUT={{ $fix.waitTimeoutSeconds }}
+
+      log() { echo "falco-socket-permissions: $*"; }
+
+      # Say something on startup. Found on a live kind cluster: while Falco is
+      # still loading its driver this container produces NO output at all, so
+      # an operator debugging a collector that has not come up sees an empty
+      # log and cannot tell whether the container is waiting, wedged or
+      # misconfigured. One line up front costs nothing and answers that.
+      log "holding $SOCK at mode $MODE group $GID, re-checking every ${INTERVAL}s"
+
+      # Wait for Falco to create the socket. Driver load can take a
+      # minute or more on first start, so a slow appearance is normal and
+      # only a total absence is worth failing on.
+      wait_for_socket() {
+        waited=0
+        [ -S "$SOCK" ] || log "waiting for $SOCK to appear (Falco may still be loading its driver; up to ${TIMEOUT}s)"
+        while [ ! -S "$SOCK" ]; do
+          if [ "$waited" -ge "$TIMEOUT" ]; then
+            log "$SOCK did not appear within ${TIMEOUT}s."
+            log "Is Falco running on this node, and is endpoints.falco the path it binds?"
+            return 1
+          fi
+          sleep 1
+          waited=$((waited + 1))
+        done
+        return 0
+      }
+
+      # Apply, then RE-READ from the filesystem and check the result.
+      # A previous attempt at this fix set a Falco config key that does
+      # not exist: the render looked right, Falco ignored it, and the
+      # socket stayed 0755. Reporting success without observing the
+      # outcome is how that would have shipped, so this verifies.
+      apply_once() {
+        before="$(stat -c '%a %u:%g' "$SOCK" 2>/dev/null)" || return 1
+        chgrp "$GID" "$SOCK" 2>/dev/null
+        chmod "$MODE" "$SOCK" 2>/dev/null
+        after="$(stat -c '%a %u:%g' "$SOCK" 2>/dev/null)" || return 1
+        [ "$before" != "$after" ] && log "$SOCK $before -> $after"
+        # Group-writable is the property the collector actually needs, so
+        # assert that rather than string-matching the requested mode: an
+        # operator who sets 0670 or 0770 still passes.
+        perms="$(stat -c '%a' "$SOCK" 2>/dev/null)"
+        group_bit="$(echo "$perms" | tail -c 3 | head -c 1)"
+        case "$group_bit" in
+          2|3|6|7) return 0 ;;
+          *) log "FAILED: $SOCK is $perms, still not group-writable."
+             log "The collector (GID $GID) cannot connect to it."
+             return 1 ;;
+        esac
+      }
+
+      # Hold the permission for the life of the pod. A one-shot fix is
+      # not enough: a Falco restart deletes and recreates the socket at
+      # 0755, and an init container does not re-run when an app container
+      # restarts, so the collector would be locked out until its pod was
+      # recreated by hand.
+      while true; do
+        if [ ! -S "$SOCK" ]; then
+          wait_for_socket || exit 1
+        fi
+        apply_once || exit 1
+        sleep "$INTERVAL"
+      done
+  securityContext:
+    # Root, because only the socket's owner may chmod it and chgrp to a
+    # group the process is not in needs CAP_CHOWN. This container does
+    # nothing else: no network, no untrusted input, no long-lived
+    # parsing. Running the COLLECTOR as root was the rejected
+    # alternative -- that would put a root process on the hot path of
+    # untrusted event data, which NFR11 exists to prevent.
+    runAsUser: 0
+    runAsGroup: 0
+    runAsNonRoot: false
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+      add:
+        # CHOWN: chgrp to a group we are not a member of.
+        # FOWNER: chmod when the socket is not root-owned (Falco run as a
+        # non-root user under a custom securityContext).
+        - CHOWN
+        - FOWNER
+    seccompProfile:
+      type: RuntimeDefault
+  resources:
+    {{- toYaml $fix.resources | nindent 4 }}
+  volumeMounts:
+    # Read-WRITE, unlike the collector's own mount. Changing an inode's
+    # mode is a write; a read-only bind mount would return EROFS.
+    - name: falco-socket
+      mountPath: {{ dir $sock | quote }}
+{{- end -}}
+
+{{/*
+Capability detection (Story 9.3).
+
+Until now the chart never consulted `.Capabilities` at all: it installed
+the same way everywhere and told the operator nothing about what it had
+concluded. These helpers exist so NOTES.txt can report what is ON, what
+is OFF and WHY, in the operator's own cluster's terms.
+
+A hard rule runs through all of them: never claim a platform we have not
+actually observed. `helm template` renders offline with a stub
+KubeVersion and an empty APIVersions set, and several real platforms
+carry no distinguishing marker at all, so "unknown" is a normal and
+honest answer. NOTES.txt says which of "declared" or "detected" it is
+using, and an operator who needs certainty sets `platform` explicitly.
+*/}}
+
+{{/*
+Platform identifier: one of eks, aks, gke, k3s, rke2, openshift, kind,
+minikube, or "" when it could not be established.
+
+Detection order is deliberate. An explicit `platform` value always wins,
+because the operator knows more than we can infer. After that, only
+signals that are genuinely diagnostic are used:
+
+  - security.openshift.io/v1 is served only by OpenShift.
+  - The API server's git version carries a vendor suffix on EKS
+    (v1.29.15-eks-...), GKE (v1.29.7-gke.1...), k3s (v1.29.4+k3s1) and
+    RKE2 (+rke2r1).
+
+AKS is deliberately absent: it reports an unmodified upstream version
+string and serves no distinguishing API group, so there is nothing to
+detect and guessing would be worse than saying "unknown". Operators on
+AKS set `platform: aks` (values-aks.yaml does).
+*/}}
+{{- define "olaitan.platform" -}}
+{{- if .Values.platform -}}
+{{- .Values.platform -}}
+{{- else if .Capabilities.APIVersions.Has "security.openshift.io/v1" -}}
+openshift
+{{- else -}}
+{{- $v := .Capabilities.KubeVersion.GitVersion | default .Capabilities.KubeVersion.Version | toString -}}
+{{- if contains "-eks" $v -}}eks
+{{- else if contains "-gke." $v -}}gke
+{{- else if contains "+k3s" $v -}}k3s
+{{- else if contains "+rke2" $v -}}rke2
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+How the platform was arrived at: "declared" (the operator set it),
+"detected" (we observed it), or "unknown". NOTES.txt prints this so an
+operator can tell an observation from an assumption.
+*/}}
+{{- define "olaitan.platformSource" -}}
+{{- if .Values.platform -}}declared
+{{- else if include "olaitan.platform" . -}}detected
+{{- else -}}unknown
+{{- end -}}
+{{- end -}}
+
+{{/*
+True on a managed control plane. This is the one capability question with
+a hard, non-negotiable answer: the K8s audit webhook needs
+`--audit-webhook-config-file` on kube-apiserver, and EKS, AKS and GKE do
+not expose kube-apiserver flags at all. No flag, no workaround, no
+support ticket. The setting is not "hard" on those platforms, it is
+inert, and an operator who turns it on gets silence rather than an error.
+*/}}
+{{- define "olaitan.isManagedControlPlane" -}}
+{{- if has (include "olaitan.platform" .) (list "eks" "aks" "gke") -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+A NetworkPolicy implementation we can actually see, or "" when we cannot.
+
+This is NOT a claim that policies are enforced. A cluster can serve these
+CRDs and still not enforce (and, more dangerously, can accept a
+NetworkPolicy object and silently ignore it -- proven on stock kind). The
+only honest test is the runtime probe in hack/check-netpol-enforcement.sh,
+which sends real traffic. This helper exists so NOTES.txt can say "we can
+see Calico here, but you have not proven enforcement" rather than
+implying either more or less than it knows.
+*/}}
+{{- define "olaitan.networkPolicyProvider" -}}
+{{- if or (.Capabilities.APIVersions.Has "crd.projectcalico.org/v1") (.Capabilities.APIVersions.Has "operator.tigera.io/v1") (.Capabilities.APIVersions.Has "projectcalico.org/v3") -}}Calico
+{{- else if .Capabilities.APIVersions.Has "cilium.io/v2" -}}Cilium
+{{- end -}}
+{{- end -}}

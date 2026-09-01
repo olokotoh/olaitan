@@ -9,6 +9,12 @@ and (where applicable) the FR/NFR reference. To document a new tunable,
 annotate its leaf in `values.yaml` with a `# @schema ...` comment and
 rerun `make helm-values-doc` (see `docs/contributing.md`).
 
+## `platform`
+
+| Value | Type | Default | Valid range | Effect | Ref |
+|-------|------|---------|-------------|--------|-----|
+| `platform` | string | `""` | eks\|aks\|gke\|k3s\|rke2\|openshift\|kind\|minikube, or empty to auto-detect | platform reported by NOTES.txt and used to explain which sources are unavailable here | NFR13 |
+
 ## `aggregator`
 
 | Value | Type | Default | Valid range | Effect | Ref |
@@ -110,11 +116,20 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 | `analyst.local.endpoint` | string | `""` | - | Ollama endpoint for the local provider (air-gapped); empty keeps file-side default http://ollama:11434 | FR48 |
 | `analyst.local.model` | string | `""` | - | Ollama model for the local provider; must be a model the operator provisioned (no cross-model default) | FR48 |
 
+## `falcoSocketPermissions`
+
+| Value | Type | Default | Valid range | Effect | Ref |
+|-------|------|---------|-------------|--------|-----|
+| `falcoSocketPermissions.socketMode` | string | `"0660"` | octal file mode | mode applied to the Falco gRPC socket | NFR11 |
+| `falcoSocketPermissions.socketGroup` | integer | `65532` | - | group applied to the Falco gRPC socket; must equal the collector's runAsGroup | NFR11 |
+| `falcoSocketPermissions.intervalSeconds` | integer | `10` | minimum 1 | seconds between permission re-assertions | NFR11 |
+| `falcoSocketPermissions.waitTimeoutSeconds` | integer | `180` | minimum 1 | seconds to wait for the Falco socket to appear before failing | NFR11 |
+
 ## `nats`
 
 | Value | Type | Default | Valid range | Effect | Ref |
 |-------|------|---------|-------------|--------|-----|
-| `nats.streamMaxBytesOverride` | string | `""` | byte count as a string (e.g. 1073741824), or empty for production sizing | per-stream JetStream MaxBytes override for small kind/CI PVCs; empty leaves production retention sized by nats.persistence.size | NFR3 |
+| `nats.streamMaxBytesOverride` | string | `"536870912"` | byte count as a string (e.g. 1073741824), or empty for production sizing | per-stream JetStream MaxBytes override for small kind/CI PVCs; empty leaves production retention sized by nats.persistence.size | NFR3 |
 
 ## Config-file-only parameters (not Helm-exposed)
 

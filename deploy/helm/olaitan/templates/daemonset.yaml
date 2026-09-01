@@ -95,7 +95,30 @@ spec:
         {{- with .Values.collector.tolerations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+      {{- $falcoFix := include "olaitan.falcoSocket.fixerEnabled" . }}
+      {{- if and $falcoFix .Values.falcoSocketPermissions.useNativeSidecar }}
+      # Story 9.6 -- make Falco's gRPC socket reachable by a non-root collector.
+      #
+      # Falco binds the socket without chmod, so it lands 0755 root:root from
+      # the default umask. connect(2) on a Unix socket needs WRITE permission,
+      # and the collector is UID/GID 65532 (NFR11), so without this the dial
+      # fails with "permission denied" and the collector ingests nothing while
+      # Falco itself looks perfectly healthy. Upstream exposes no socket-mode
+      # setting (falcosecurity/falco#1351), so the mode is corrected here, from
+      # the collector's own pod rather than Falco's -- an operator pointing
+      # endpoints.falco at their own Falco DaemonSet needs the same fix, and
+      # falco.extra.initContainers would only reach the bundled subchart.
+      initContainers:
+        {{- include "olaitan.falcoSocket.fixerContainer" (dict "ctx" $ "native" true) | nindent 8 }}
+      {{- end }}
       containers:
+        {{- if and $falcoFix (not .Values.falcoSocketPermissions.useNativeSidecar) }}
+        # Story 9.6, non-native form: same container, injected here because the
+        # cluster has the SidecarContainers gate disabled. Unordered relative to
+        # the collector, so the collector's first dial may lose the race and be
+        # restarted once into a working socket.
+        {{- include "olaitan.falcoSocket.fixerContainer" (dict "ctx" $ "native" false) | nindent 8 }}
+        {{- end }}
         - name: collector
           image: {{ include "olaitan.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}

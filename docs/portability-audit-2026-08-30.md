@@ -236,7 +236,7 @@ reports `deployed`, and the aggregator's own health endpoint answers fine while
 the ring behind it is unreachable.
 
 
-## Blocker 8 — the collector cannot attach to Falco's socket as non-root (CRITICAL) — **PROVEN, UNFIXED**
+## Blocker 8 — the collector cannot attach to Falco's socket as non-root (CRITICAL) — **PROVEN, FIXED in Story 9.6**
 
 With cross-node networking repaired, Falco reached 2/2 Running on all three
 nodes and the collector still crash-looped on every one:
@@ -258,7 +258,28 @@ Falco creates the socket `0755 root:root`. Connecting to a Unix socket requires
 attach. **Olaitan's primary detection source is unreachable on a stock kubeadm
 cluster** — Falco runs, the collector dies, and no syscall events are ingested.
 
-**Not fixed, deliberately.** A first attempt set `grpc.unix_socket_mode: "0775"`
+**Fixed 2026-09-01 (Story 9.6).** The chart now ships a
+`falco-socket-permissions` container in the collector's own pod: root, all
+capabilities dropped except CHOWN/FOWNER, read-only root filesystem, holding
+the socket at `0660` group 65532. It is a native sidecar
+(`initContainers` + `restartPolicy: Always`), so it is ordered before the
+collector's first dial AND keeps running: a Falco restart recreates the socket
+at `0755` and the sidecar repairs it within one interval, which a one-shot init
+container could not do (init containers do not re-run when an app container
+restarts). It lives in the collector's pod rather than Falco's so that an
+operator pointing `endpoints.falco` at their own Falco DaemonSet gets the same
+fix; `falco.extra.initContainers` would only have reached the bundled subchart.
+
+Verified by running it, not by reading it. The defect was reproduced in
+containers (socket bound `0755 root:root` under umask 022; UID 65532 gets
+`EACCES`), the rendered script then made the same dial succeed under exactly
+the shipped securityContext, the source was restarted to prove the reconcile
+loop repairs `0755` within one interval, and the fixer was run with no
+privilege to confirm it exits non-zero rather than reporting success. On a live
+kind cluster the sidecar starts before the collector and the pod reaches 2/2.
+
+**The original wrong turn, kept as the record.** A first attempt set
+`grpc.unix_socket_mode: "0775"`
 in the Falco values. The rendered ConfigMap carried it and the socket stayed
 `0755`, because **that key does not exist** — upstream `falco.yaml` (checked
 through 0.42.0) exposes only `enabled`, `bind_address`, `threadiness` and the
@@ -319,3 +340,26 @@ install is far more portable than advertised.
   parallel research; each row is cited in the Epic 9 story that consumes it.
   **Not yet verified against a live EKS/AKS/GKE cluster** — that is a story
   acceptance criterion, not an assumption to build on.
+
+## New finding 2026-09-01 — Falco's gRPC output is DEPRECATED upstream
+
+Not a portability blocker, and not fixed here, but it belongs on the record
+before this is open-sourced: Falco 0.43.1 announces the interface Olaitan's
+primary detection source depends on as deprecated, twice, on every start:
+
+```
+$ kubectl -n olaitan logs olaitan-falco-88xg6 -c falco
+Using deprecated gRPC server (deprecated as consequence of gRPC output deprecation).
+Using deprecated gRPC output. Please consider using other outputs.
+```
+
+Olaitan reads Falco through `grpc_output` over the Unix socket. That is the
+path Blocker 8 was about, the path Story 9.6 just fixed, and the path upstream
+is signalling it intends to remove. When it goes, Olaitan's largest signal
+source goes with it, on a Falco version bump rather than on a change of ours.
+
+Deliberately NOT actioned in Epic 9, which is a packaging epic: replacing the
+transport is a Ring 1 adapter change with its own tests and its own evaluation
+impact. Recorded here so the decision is made deliberately rather than
+discovered by a CI failure after a subchart bump. The documented successors are
+the `falcosidekick` HTTP output and the JSON output over a file or socket.

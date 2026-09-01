@@ -243,11 +243,11 @@ data:
     config_files:
     - /etc/falco/config.d
     engine:
-      ebpf:
+      kind: modern_ebpf
+      modern_ebpf:
         buf_size_preset: 4
+        cpus_for_each_buffer: 2
         drop_failed_exit: false
-        probe: ${HOME}/.falco/falco-bpf.o
-      kind: ebpf
     falco_libs:
       snaplen: 80
       thread_table_auto_purging_interval_s: 300
@@ -1728,7 +1728,7 @@ spec:
         app.kubernetes.io/name: falco
         app.kubernetes.io/instance: olaitan
       annotations:
-        checksum/config: 4236ebe102c04beaed0248849f5258b467df44c76ba3d46edeb0b2e23c6482f4
+        checksum/config: 8a0c843b42f26d5972d8e0480bc9a02a1118b278e4d1308c40168c373c1a8801
         checksum/rules: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
         checksum/certs: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
     spec:
@@ -1810,8 +1810,6 @@ spec:
               name: rulesfiles-install-dir
             - mountPath: /usr/share/falco/plugins
               name: plugins-install-dir
-            - mountPath: /etc/falco/config.d
-              name: specialized-falco-configs
             - mountPath: /root/.falco
               name: root-falco-fs
             - mountPath: /host/proc
@@ -1846,36 +1844,6 @@ spec:
             - mountPath: /artifactstate
               name: artifact-state-dir
       initContainers:
-        - name: falco-driver-loader
-          image: docker.io/falcosecurity/falco-driver-loader:0.43.1
-          imagePullPolicy: IfNotPresent
-          args:
-            - ebpf
-          securityContext:
-          volumeMounts:
-            - mountPath: /root/.falco
-              name: root-falco-fs
-            - mountPath: /host/proc
-              name: proc-fs
-              readOnly: true
-            - mountPath: /host/boot
-              name: boot-fs
-              readOnly: true
-            - mountPath: /host/lib/modules
-              name: lib-modules
-            - mountPath: /host/usr
-              name: usr-fs
-              readOnly: true
-            - mountPath: /host/etc
-              name: etc-fs
-              readOnly: true
-            - mountPath: /etc/falco/config.d
-              name: specialized-falco-configs
-          env:
-            - name: HOST_ROOT
-              value: /host
-            - name: FALCOCTL_DRIVER_CONFIG_UPDATE_FALCO
-              value: "false"
         - name: falcoctl-artifact-install
           image: docker.io/falcosecurity/falcoctl:0.12.2
           imagePullPolicy: IfNotPresent
@@ -1912,8 +1880,6 @@ spec:
         - hostPath:
             path: /run/k3s/containerd/containerd.sock
           name: container-engine-socket-5
-        - name: specialized-falco-configs
-          emptyDir: {}
         - name: plugins-install-dir
           emptyDir: {}
         - name: rulesfiles-install-dir
@@ -2002,9 +1968,137 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       tolerations:
+      # Story 9.6 -- make Falco's gRPC socket reachable by a non-root collector.
+      #
+      # Falco binds the socket without chmod, so it lands 0755 root:root from
+      # the default umask. connect(2) on a Unix socket needs WRITE permission,
+      # and the collector is UID/GID 65532 (NFR11), so without this the dial
+      # fails with "permission denied" and the collector ingests nothing while
+      # Falco itself looks perfectly healthy. Upstream exposes no socket-mode
+      # setting (falcosecurity/falco#1351), so the mode is corrected here, from
+      # the collector's own pod rather than Falco's -- an operator pointing
+      # endpoints.falco at their own Falco DaemonSet needs the same fix, and
+      # falco.extra.initContainers would only reach the bundled subchart.
+      initContainers:
+        - name: falco-socket-permissions
+          image: "busybox:1.37.0"
+          imagePullPolicy: IfNotPresent
+          # Native sidecar (KEP-753): an initContainers entry with
+          # restartPolicy: Always starts before the collector and keeps running
+          # beside it. Ordering is the reason this is the default -- the socket
+          # is already group-writable when the collector makes its first dial.
+          restartPolicy: Always
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              SOCK="/run/falco/falco.sock"
+              MODE="0660"
+              GID="65532"
+              INTERVAL=10
+              TIMEOUT=180
+        
+              log() { echo "falco-socket-permissions: $*"; }
+        
+              # Say something on startup. Found on a live kind cluster: while Falco is
+              # still loading its driver this container produces NO output at all, so
+              # an operator debugging a collector that has not come up sees an empty
+              # log and cannot tell whether the container is waiting, wedged or
+              # misconfigured. One line up front costs nothing and answers that.
+              log "holding $SOCK at mode $MODE group $GID, re-checking every ${INTERVAL}s"
+        
+              # Wait for Falco to create the socket. Driver load can take a
+              # minute or more on first start, so a slow appearance is normal and
+              # only a total absence is worth failing on.
+              wait_for_socket() {
+                waited=0
+                [ -S "$SOCK" ] || log "waiting for $SOCK to appear (Falco may still be loading its driver; up to ${TIMEOUT}s)"
+                while [ ! -S "$SOCK" ]; do
+                  if [ "$waited" -ge "$TIMEOUT" ]; then
+                    log "$SOCK did not appear within ${TIMEOUT}s."
+                    log "Is Falco running on this node, and is endpoints.falco the path it binds?"
+                    return 1
+                  fi
+                  sleep 1
+                  waited=$((waited + 1))
+                done
+                return 0
+              }
+        
+              # Apply, then RE-READ from the filesystem and check the result.
+              # A previous attempt at this fix set a Falco config key that does
+              # not exist: the render looked right, Falco ignored it, and the
+              # socket stayed 0755. Reporting success without observing the
+              # outcome is how that would have shipped, so this verifies.
+              apply_once() {
+                before="$(stat -c '%a %u:%g' "$SOCK" 2>/dev/null)" || return 1
+                chgrp "$GID" "$SOCK" 2>/dev/null
+                chmod "$MODE" "$SOCK" 2>/dev/null
+                after="$(stat -c '%a %u:%g' "$SOCK" 2>/dev/null)" || return 1
+                [ "$before" != "$after" ] && log "$SOCK $before -> $after"
+                # Group-writable is the property the collector actually needs, so
+                # assert that rather than string-matching the requested mode: an
+                # operator who sets 0670 or 0770 still passes.
+                perms="$(stat -c '%a' "$SOCK" 2>/dev/null)"
+                group_bit="$(echo "$perms" | tail -c 3 | head -c 1)"
+                case "$group_bit" in
+                  2|3|6|7) return 0 ;;
+                  *) log "FAILED: $SOCK is $perms, still not group-writable."
+                     log "The collector (GID $GID) cannot connect to it."
+                     return 1 ;;
+                esac
+              }
+        
+              # Hold the permission for the life of the pod. A one-shot fix is
+              # not enough: a Falco restart deletes and recreates the socket at
+              # 0755, and an init container does not re-run when an app container
+              # restarts, so the collector would be locked out until its pod was
+              # recreated by hand.
+              while true; do
+                if [ ! -S "$SOCK" ]; then
+                  wait_for_socket || exit 1
+                fi
+                apply_once || exit 1
+                sleep "$INTERVAL"
+              done
+          securityContext:
+            # Root, because only the socket's owner may chmod it and chgrp to a
+            # group the process is not in needs CAP_CHOWN. This container does
+            # nothing else: no network, no untrusted input, no long-lived
+            # parsing. Running the COLLECTOR as root was the rejected
+            # alternative -- that would put a root process on the hot path of
+            # untrusted event data, which NFR11 exists to prevent.
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+              add:
+                # CHOWN: chgrp to a group we are not a member of.
+                # FOWNER: chmod when the socket is not root-owned (Falco run as a
+                # non-root user under a custom securityContext).
+                - CHOWN
+                - FOWNER
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            limits:
+              cpu: 50m
+              memory: 32Mi
+            requests:
+              cpu: 5m
+              memory: 16Mi
+          volumeMounts:
+            # Read-WRITE, unlike the collector's own mount. Changing an inode's
+            # mode is a write; a read-only bind mount would return EROFS.
+            - name: falco-socket
+              mountPath: "/run/falco"
       containers:
         - name: collector
-          image: ghcr.io/olokotoh/olaitan:0.1.0
+          image: ghcr.io/olokotoh/olaitan:edge
           imagePullPolicy: IfNotPresent
           command: ["/olaitan"]
           args:
@@ -2042,6 +2136,16 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            # Story 1.19 D6: the collector ring ALSO ensures streams (EVENTS /
+            # EVENTS_RAW / EVIDENCE) on startup, so it MUST receive the same
+            # per-stream MaxBytes cap as the aggregator (deployment.yaml). Without
+            # it the collector creates those streams at their full production
+            # MaxBytes (10 / 50 / 100 GiB) and, when it wins the create-stream race
+            # against the (capped) aggregator, JetStream returns err 10047
+            # "insufficient storage" on a constrained NATS PVC. This was masked in
+            # lighter arms where the aggregator usually created the streams first.
+            - name: OLT_NATS_STREAM_MAXBYTES_OVERRIDE
+              value: "536870912"
           livenessProbe:
             httpGet:
               path: /healthz
@@ -2229,7 +2333,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: aggregator
-          image: ghcr.io/olokotoh/olaitan:0.1.0
+          image: ghcr.io/olokotoh/olaitan:edge
           imagePullPolicy: IfNotPresent
           command: ["/olaitan"]
           args:
@@ -2277,6 +2381,13 @@ spec:
                 secretKeyRef:
                   name: olaitan-secrets
                   key: llm-api-key
+            # Story 1.19 D6: caps every JetStream stream's MaxBytes at
+            # the given int64 byte count. Set this in CI/kind where the
+            # NATS PVC backing is smaller than the production
+            # streamConfigs sum (160 GiB). Production deployments leave
+            # this empty and size the NATS PVC instead.
+            - name: OLT_NATS_STREAM_MAXBYTES_OVERRIDE
+              value: "536870912"
           livenessProbe:
             httpGet:
               path: /healthz

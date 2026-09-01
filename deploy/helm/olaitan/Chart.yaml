@@ -28,7 +28,15 @@ appVersion: "edge"
 # (stable on every supported distribution from 1.19+, but exercised
 # operationally only on 1.29+ in our test matrix). 1.29 is the floor
 # for current LTS-tier clusters per the architecture's deployment-
-# surface note. Upper bound < 2.0.0 guards against silent install on a
+# surface note.
+#
+# Story 9.6 makes 1.29 a HARD floor rather than a conservative one: the
+# collector's falco-socket-permissions container is a native sidecar
+# (an initContainers entry with `restartPolicy: Always`), and the
+# SidecarContainers feature that honours that field landed in 1.29.
+# Below it the field is silently dropped and the collector pod hangs in
+# Init forever. Relaxing this constraint therefore requires switching
+# falcoSocketPermissions.mode to `init` in the same change. Upper bound < 2.0.0 guards against silent install on a
 # future K8s major where deprecated APIs the chart depends on may have
 # been removed.
 kubeVersion: ">=1.29.0 < 2.0.0"
