@@ -511,6 +511,7 @@ applogSidecar:
   # SidecarContainers feature gate is disabled, set to false to
   # inject as a regular container instead, with the documented
   # trade-off that pod-termination semantics differ.
+  # @schema type:boolean effect:"inject the applog sidecar as a native sidecar (initContainer with restartPolicy: Always) rather than a regular container" ref:FR9
   useNativeSidecar: true
 
   # Namespace selector for the MutatingWebhookConfiguration.
@@ -1334,11 +1335,15 @@ falcoSocketPermissions:
   # socket, or when you run your own Falco with a different arrangement.
   # A tcp:// endpoints.falco forces it off regardless: there is no socket
   # to chmod in that mode.
+  # @schema type:boolean effect:"hold Falco's gRPC socket at a mode the non-root collector can connect to; disabling reinstates the Blocker 8 crash-loop on clusters where Falco and the collector do not share an identity" ref:NFR11
   enabled: true
 
-  # Use the K8s 1.28+ native sidecar pattern (initContainer with
-  # restartPolicy: Always per KEP-753), the same choice applogSidecar
-  # documents above. Native is the default because it is ORDERED: the
+  # Use the native sidecar pattern (an initContainer with restartPolicy:
+  # Always, KEP-753), the same choice applogSidecar documents above. Note the
+  # version differs from applogSidecar's comment: SidecarContainers is alpha
+  # and OFF by default in 1.28, beta and ON from 1.29, so 1.29 is the real
+  # floor -- which is also this chart's kubeVersion floor, precisely because
+  # this sidecar is on the DEFAULT path (applogSidecar is not). Native is the default because it is ORDERED: the
   # permission is in place before the collector's first dial, so the
   # collector never crash-loops on startup.
   #
@@ -1353,6 +1358,7 @@ falcoSocketPermissions:
   # available on every cluster this chart installs on. The false path
   # exists for a 1.29+ cluster that has explicitly disabled the gate,
   # which cannot be detected at render time.
+  # @schema type:boolean effect:"render the Falco socket permission holder as a native sidecar (ordered before the collector, so the socket is writable before its first dial) rather than a plain container; needs Kubernetes >=1.29" ref:NFR11
   useNativeSidecar: true
 
   # Target mode and group for the socket. 0660 + the collector's own GID
@@ -1429,8 +1435,8 @@ falco:
       # that, so the non-root collector cannot connect to it (Blocker 8,
       # found 2026-08-31 on 3-node kubeadm). FIXED in Story 9.6 by the
       # `falcoSocketPermissions` block above, which re-applies 0660 + the
-      # collector's group from the collector's own pod. If you set
-      # falcoSocketPermissions.mode=off, this limitation comes back.
+      # collector's group from the collector's own pod. Set
+      # falcoSocketPermissions.enabled=false and this limitation comes back.
     grpc_output:
       enabled: true
 

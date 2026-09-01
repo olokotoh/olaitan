@@ -53,8 +53,9 @@ response:
 
 # STORAGE -- read this before installing.
 #
-# EKS >= 1.30 ships NO default StorageClass: the default annotation was removed
-# from gp2. A PVC with no storageClassName stays Pending forever, so NATS
+# EKS clusters CREATED at 1.30 or later ship no default StorageClass: the
+# default annotation was removed from gp2 for new clusters. A cluster upgraded
+# INTO 1.30 keeps whatever default it already had, so check rather than assume. A PVC with no storageClassName stays Pending forever, so NATS
 # JetStream never binds and the aggregator never starts. There is no safe value
 # to put here, because the class name is yours, so set it at install time:
 #

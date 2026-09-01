@@ -1963,6 +1963,8 @@ spec:
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
+        # Rendered from olaitan.collector.runAsGroup so falcoSocketPermissions
+        # .socketGroup has a single source of truth to be checked against.
         runAsGroup: 65532
         fsGroup: 65532
         seccompProfile:
@@ -1995,21 +1997,28 @@ spec:
               SOCK="/run/falco/falco.sock"
               MODE="0660"
               GID="65532"
-              INTERVAL=10
-              TIMEOUT=180
+              INTERVAL="10"
+              TIMEOUT="180"
         
               log() { echo "falco-socket-permissions: $*"; }
         
-              # Say something on startup. Found on a live kind cluster: while Falco is
-              # still loading its driver this container produces NO output at all, so
-              # an operator debugging a collector that has not come up sees an empty
-              # log and cannot tell whether the container is waiting, wedged or
-              # misconfigured. One line up front costs nothing and answers that.
+              # Validate the injected values once, loudly. `set -u` is satisfied by
+              # an EMPTY variable, so an unquoted null (--set intervalSeconds=null)
+              # used to render `INTERVAL=` and turn the reconcile loop into a busy
+              # spin on `sleep ""` that never timed out and never logged why.
+              case "$INTERVAL" in ''|*[!0-9]*) log "FATAL: intervalSeconds must be a positive integer, got '$INTERVAL'"; exit 2 ;; esac
+              case "$TIMEOUT"  in ''|*[!0-9]*) log "FATAL: waitTimeoutSeconds must be a positive integer, got '$TIMEOUT'"; exit 2 ;; esac
+              case "$GID"      in ''|*[!0-9]*) log "FATAL: socketGroup must be a numeric GID, got '$GID'"; exit 2 ;; esac
+              # Octal digits only. YAML reads an unquoted 0660 as the INTEGER 660,
+              # which chmod would apply as mode 0432 -- group bits 3, still passing a
+              # naive group-writable check while granting the wrong permissions.
+              case "$MODE"     in ''|*[!0-7]*) log "FATAL: socketMode must be quoted octal digits (e.g. \"0660\"), got '$MODE'"; exit 2 ;; esac
+        
               log "holding $SOCK at mode $MODE group $GID, re-checking every ${INTERVAL}s"
         
-              # Wait for Falco to create the socket. Driver load can take a
-              # minute or more on first start, so a slow appearance is normal and
-              # only a total absence is worth failing on.
+              # Wait for Falco to create the socket. Driver load can take a minute or
+              # more on first start, so a slow appearance is normal and only a total
+              # absence is worth failing on.
               wait_for_socket() {
                 waited=0
                 [ -S "$SOCK" ] || log "waiting for $SOCK to appear (Falco may still be loading its driver; up to ${TIMEOUT}s)"
@@ -2026,39 +2035,73 @@ spec:
               }
         
               # Apply, then RE-READ from the filesystem and check the result.
-              # A previous attempt at this fix set a Falco config key that does
-              # not exist: the render looked right, Falco ignored it, and the
-              # socket stayed 0755. Reporting success without observing the
-              # outcome is how that would have shipped, so this verifies.
+              # A previous attempt at this fix set a Falco config key that does not
+              # exist: the render looked right, Falco ignored it, and the socket
+              # stayed 0755. Reporting success without observing the outcome is how
+              # that would have shipped, so this verifies.
+              #
+              # Returns 0 applied and verified, 1 a real failure, 2 the socket
+              # vanished mid-check. The difference between 1 and 2 matters: 2 is what
+              # a Falco restart looks like from here, and treating it as a failure
+              # would exit the container and turn a five-second Falco roll into a
+              # CrashLoopBackOff whose backoff climbs to five minutes -- during which
+              # the socket sits at 0755 and the collector ingests nothing.
               apply_once() {
-                before="$(stat -c '%a %u:%g' "$SOCK" 2>/dev/null)" || return 1
+                before="$(stat -c '%a %u:%g' "$SOCK" 2>/dev/null)" || return 2
                 chgrp "$GID" "$SOCK" 2>/dev/null
                 chmod "$MODE" "$SOCK" 2>/dev/null
-                after="$(stat -c '%a %u:%g' "$SOCK" 2>/dev/null)" || return 1
+                after="$(stat -c '%a %u:%g' "$SOCK" 2>/dev/null)" || return 2
                 [ "$before" != "$after" ] && log "$SOCK $before -> $after"
-                # Group-writable is the property the collector actually needs, so
-                # assert that rather than string-matching the requested mode: an
-                # operator who sets 0670 or 0770 still passes.
-                perms="$(stat -c '%a' "$SOCK" 2>/dev/null)"
-                group_bit="$(echo "$perms" | tail -c 3 | head -c 1)"
-                case "$group_bit" in
+        
+                cur_gid="$(stat -c '%g' "$SOCK" 2>/dev/null)" || return 2
+                cur_mode="$(stat -c '%a' "$SOCK" 2>/dev/null)" || return 2
+        
+                # BOTH properties the collector needs are checked, because either one
+                # alone is insufficient. Checking only the mode passed a socket left
+                # in the wrong group entirely (a mistyped socketGroup, or a dropped
+                # CAP_CHOWN making chgrp a no-op) while the collector stayed locked
+                # out -- the exact regression this container exists to prevent.
+                if [ "$cur_gid" != "$GID" ]; then
+                  log "FAILED: $SOCK is group $cur_gid, not $GID. The collector cannot connect."
+                  log "chgrp did not take effect. It needs CAP_CHOWN, which an admission"
+                  log "policy may have stripped (OpenShift SCCs disallow added capabilities"
+                  log "by default). Check falcoSocketPermissions.socketGroup matches the"
+                  log "collector's runAsGroup, and that CHOWN survived admission."
+                  return 1
+                fi
+        
+                # Normalise before reading a digit by position: stat -c %a emits no
+                # leading zeros, so mode 7 prints "7" and mode 60 prints "60". Taking
+                # a fixed offset from the end of that read the OTHER digit as the
+                # group digit and reported success on a socket the group could not
+                # touch.
+                norm="$(printf '%04d' "$cur_mode" 2>/dev/null)"
+                case "$norm" in
+                  [0-7][0-7][0-7][0-7]) : ;;
+                  *) log "FAILED: cannot read a file mode from $SOCK (stat said '$cur_mode')"; return 1 ;;
+                esac
+                group_digit="$(printf '%s' "$norm" | cut -c3)"
+                case "$group_digit" in
                   2|3|6|7) return 0 ;;
-                  *) log "FAILED: $SOCK is $perms, still not group-writable."
-                     log "The collector (GID $GID) cannot connect to it."
+                  *) log "FAILED: $SOCK is mode $cur_mode, so group $GID has no write permission."
+                     log "Connecting to a unix socket requires write permission; the collector cannot attach."
                      return 1 ;;
                 esac
               }
         
-              # Hold the permission for the life of the pod. A one-shot fix is
-              # not enough: a Falco restart deletes and recreates the socket at
-              # 0755, and an init container does not re-run when an app container
-              # restarts, so the collector would be locked out until its pod was
-              # recreated by hand.
+              # Hold the permission for the life of the pod. A one-shot fix is not
+              # enough: a Falco restart deletes and recreates the socket at 0755, and
+              # an init container does not re-run when an app container restarts, so
+              # the collector would be locked out until its pod was recreated by hand.
               while true; do
                 if [ ! -S "$SOCK" ]; then
                   wait_for_socket || exit 1
                 fi
-                apply_once || exit 1
+                apply_once
+                rc=$?
+                if [ "$rc" -eq 1 ]; then
+                  exit 1
+                fi
                 sleep "$INTERVAL"
               done
           securityContext:
@@ -2077,11 +2120,19 @@ spec:
               drop:
                 - ALL
               add:
-                # CHOWN: chgrp to a group we are not a member of.
-                # FOWNER: chmod when the socket is not root-owned (Falco run as a
-                # non-root user under a custom securityContext).
+                # CHOWN, and only CHOWN: chgrp to a group this process is not a
+                # member of. chmod itself needs nothing, because the socket is
+                # root-owned and so is this container.
+                #
+                # FOWNER was here as a hedge for a Falco running under a custom
+                # non-root securityContext, whose socket we would not own. Dropped:
+                # every added capability is another thing an admission policy has to
+                # allow (OpenShift SCCs disallow added capabilities by default, so
+                # each one is a separate hurdle), and the hedge covers a case the
+                # chart never creates. If you run Falco as non-root, chmod fails and
+                # this container says so and exits rather than looping quietly; add
+                # FOWNER here and to your SCC at that point.
                 - CHOWN
-                - FOWNER
             seccompProfile:
               type: RuntimeDefault
           resources:
@@ -2191,15 +2242,24 @@ spec:
             # artefacts on crash which need a writable path.
             - name: tmp
               mountPath: /tmp
-            # Falco gRPC socket bind-mounted from the host. Falco's chart
-            # default exposes the socket at /run/falco/falco.sock on the
-            # node; the collector pod opens it via the FALCO_SOCKET env
-            # var. Read-only because the collector only ever connects
-            # (reads) -- never writes -- to the socket. Mounted only when
-            # endpoints.falco is a unix:// target; tcp:// targets reach
+            # Falco gRPC socket bind-mounted from the host. The collector pod
+            # opens it via the FALCO_SOCKET env var. Read-only because the
+            # collector only ever connects (reads) -- never writes -- to the
+            # socket. connect(2) still works through a read-only mount: a
+            # readOnly volumeMount is MNT_READONLY, and the check that would
+            # reject a write (__mnt_want_write) is only taken on
+            # open-for-write paths, which connect(2) never takes. Mounted only
+            # when endpoints.falco is a unix:// target; tcp:// targets reach
             # Falco over the pod network and need no host mount.
+            #
+            # The path is DERIVED from endpoints.falco rather than hardcoded.
+            # It used to be the literal /run/falco while FALCO_SOCKET followed
+            # the value, so pointing endpoints.falco at a socket in any other
+            # directory mounted one directory and dialled into another: the
+            # collector failed with "no such file or directory" and nothing in
+            # the chart disagreed with itself loudly enough to say why.
             - name: falco-socket
-              mountPath: /run/falco
+              mountPath: "/run/falco"
               readOnly: true
       volumes:
         - name: config
@@ -2216,9 +2276,14 @@ spec:
             defaultMode: 0400
         - name: tmp
           emptyDir: {}
+        # Source directory derived from endpoints.falco, so the volume, the
+        # collector's mount, the permission fixer's mount and FALCO_SOCKET all
+        # name the same place. type: Directory (not DirectoryOrCreate) so a
+        # node where Falco is not running fails visibly instead of
+        # materialising an empty directory the collector would wait on forever.
         - name: falco-socket
           hostPath:
-            path: /run/falco
+            path: "/run/falco"
             type: Directory
 ---
 apiVersion: apps/v1

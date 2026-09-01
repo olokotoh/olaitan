@@ -17,12 +17,50 @@ needs both exceptions, for two specific and auditable reasons:
     UID 65532 rather than accepting OpenShift's per-namespace allocated
     range.
 
-`hostmount-anyuid` grants exactly those two and nothing else. It is
-deliberately NOT `privileged`: Olaitan's own containers are unprivileged,
-drop ALL capabilities and run with a read-only root filesystem, so
-binding `privileged` here would hand the collector far more than it uses.
-Falco's own DaemonSet does need `privileged` and the Falco subchart ships
-its own SCC for that -- this binding covers Olaitan's pods only.
+`hostmount-anyuid` grants exactly those two. It is deliberately NOT
+`privileged`: Olaitan's own containers are unprivileged, drop ALL
+capabilities and run with a read-only root filesystem, so binding
+`privileged` here would hand the collector far more than it uses. Falco's
+own DaemonSet does need `privileged` and the Falco subchart ships its own
+SCC for that -- this binding covers Olaitan's pods only.
+
+!! IT IS NOT SUFFICIENT ON ITS OWN, and this is stated here rather than
+discovered at admission. The shipped `hostmount-anyuid` SCC has
+`allowedCapabilities: null`, and OpenShift validates `capabilities.add`
+against that list, so the falco-socket-permissions container's request for
+CHOWN is rejected:
+
+    capabilities.add: Invalid value: "CHOWN": capability may not be added
+
+CHOWN is what chgrp needs, so without it the socket keeps Falco's group and
+the collector cannot connect. The container detects exactly this and exits
+non-zero with the reason rather than looping quietly, but the install still
+does not work until you do one of:
+
+  1. Add a custom SCC that is hostmount-anyuid plus CHOWN, and point
+     openshift.scc at it:
+
+       kind: SecurityContextConstraints
+       apiVersion: security.openshift.io/v1
+       metadata: { name: olaitan-hostmount-chown }
+       allowHostDirVolumePlugin: true
+       allowedCapabilities: ["CHOWN"]
+       requiredDropCapabilities: ["MKNOD"]
+       runAsUser: { type: RunAsAny }
+       seLinuxContext: { type: MustRunAs }
+       fsGroup: { type: RunAsAny }
+       supplementalGroups: { type: RunAsAny }
+       volumes: ["configMap","emptyDir","hostPath","projected","secret"]
+
+     then: --set openshift.scc=olaitan-hostmount-chown
+
+  2. Or turn the permission holder off (falcoSocketPermissions.enabled=false)
+     and arrange for Falco to expose a socket the collector's group can
+     already write.
+
+NONE OF THIS HAS BEEN RUN. OpenShift is template-verified only: the chart
+renders and validates for it and no one has installed it on a real cluster.
+Treat the SCC name above as researched, not confirmed.
 
 Bound through RBAC (a RoleBinding to the auto-generated
 `system:openshift:scc:<name>` ClusterRole) rather than

@@ -38,6 +38,12 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 | `probes.periodSeconds` | integer | `10` | minimum 1 | liveness/readiness probe period seconds | NFR24 |
 | `probes.failureThreshold` | integer | `3` | minimum 1 | consecutive probe failures before the pod is restarted | NFR24 |
 
+## `applogSidecar`
+
+| Value | Type | Default | Valid range | Effect | Ref |
+|-------|------|---------|-------------|--------|-----|
+| `applogSidecar.useNativeSidecar` | boolean | `true` | - | inject the applog sidecar as a native sidecar (initContainer with restartPolicy: Always) rather than a regular container | FR9 |
+
 ## `metrics`
 
 | Value | Type | Default | Valid range | Effect | Ref |
@@ -116,10 +122,19 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 | `analyst.local.endpoint` | string | `""` | - | Ollama endpoint for the local provider (air-gapped); empty keeps file-side default http://ollama:11434 | FR48 |
 | `analyst.local.model` | string | `""` | - | Ollama model for the local provider; must be a model the operator provisioned (no cross-model default) | FR48 |
 
+## `openshift`
+
+| Value | Type | Default | Valid range | Effect | Ref |
+|-------|------|---------|-------------|--------|-----|
+| `openshift.bindSCC` | boolean | `false` | - | ship a RoleBinding granting the collector ServiceAccount the SCC named by openshift.scc (OpenShift only) | NFR11 |
+| `openshift.scc` | string | `"hostmount-anyuid"` | an OpenShift SCC name | SCC granted to the collector ServiceAccount when openshift.bindSCC is true | NFR11 |
+
 ## `falcoSocketPermissions`
 
 | Value | Type | Default | Valid range | Effect | Ref |
 |-------|------|---------|-------------|--------|-----|
+| `falcoSocketPermissions.enabled` | boolean | `true` | - | hold Falco's gRPC socket at a mode the non-root collector can connect to; disabling reinstates the Blocker 8 crash-loop on clusters where Falco and the collector do not share an identity | NFR11 |
+| `falcoSocketPermissions.useNativeSidecar` | boolean | `true` | - | render the Falco socket permission holder as a native sidecar (ordered before the collector, so the socket is writable before its first dial) rather than a plain container; needs Kubernetes >=1.29 | NFR11 |
 | `falcoSocketPermissions.socketMode` | string | `"0660"` | octal file mode | mode applied to the Falco gRPC socket | NFR11 |
 | `falcoSocketPermissions.socketGroup` | integer | `65532` | - | group applied to the Falco gRPC socket; must equal the collector's runAsGroup | NFR11 |
 | `falcoSocketPermissions.intervalSeconds` | integer | `10` | minimum 1 | seconds between permission re-assertions | NFR11 |

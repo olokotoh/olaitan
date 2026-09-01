@@ -113,3 +113,25 @@ redis:
             protocol: UDP
           - port: 53
             protocol: TCP
+
+# --- Container images (Story 9.6) --------------------------------------
+# The collector's falco-socket-permissions container is on the DEFAULT path
+# and pulls busybox from Docker Hub. In an environment with no registry
+# egress that is an ImagePullBackOff on the one workload that must be up,
+# and because it is a native sidecar the collector container never starts at
+# all: the pod sits in Init and `helm install --wait` times out saying
+# nothing useful about why.
+#
+# Point it at your mirror. There is no safe default to ship here because the
+# mirror host is yours:
+#
+#   --set falcoSocketPermissions.image.repository=registry.internal/busybox
+#
+# Note the scope of this file: "air-gapped" here has meant LLM-provider
+# egress (Ollama instead of Claude/OpenAI), not registry reachability, so
+# the bundled Falco, NATS and Redis subchart images are equally unmirrored.
+# This one is called out because it is the first that is on by default.
+# falcoSocketPermissions:
+#   image:
+#     repository: registry.internal/busybox
+#     tag: "1.37.0"

@@ -260,7 +260,7 @@ cluster** — Falco runs, the collector dies, and no syscall events are ingested
 
 **Fixed 2026-09-01 (Story 9.6).** The chart now ships a
 `falco-socket-permissions` container in the collector's own pod: root, all
-capabilities dropped except CHOWN/FOWNER, read-only root filesystem, holding
+capabilities dropped except CHOWN, read-only root filesystem, holding
 the socket at `0660` group 65532. It is a native sidecar
 (`initContainers` + `restartPolicy: Always`), so it is ordered before the
 collector's first dial AND keeps running: a Falco restart recreates the socket

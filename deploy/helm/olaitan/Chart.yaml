@@ -35,8 +35,10 @@ appVersion: "edge"
 # (an initContainers entry with `restartPolicy: Always`), and the
 # SidecarContainers feature that honours that field landed in 1.29.
 # Below it the field is silently dropped and the collector pod hangs in
-# Init forever. Relaxing this constraint therefore requires switching
-# falcoSocketPermissions.mode to `init` in the same change. Upper bound < 2.0.0 guards against silent install on a
+# Init forever. Relaxing this constraint therefore requires defaulting
+# falcoSocketPermissions.useNativeSidecar to false in the same change.
+#
+# Upper bound < 2.0.0 guards against silent install on a
 # future K8s major where deprecated APIs the chart depends on may have
 # been removed.
 kubeVersion: ">=1.29.0 < 2.0.0"

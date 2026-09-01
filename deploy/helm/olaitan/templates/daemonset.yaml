@@ -76,7 +76,9 @@ spec:
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
-        runAsGroup: 65532
+        # Rendered from olaitan.collector.runAsGroup so falcoSocketPermissions
+        # .socketGroup has a single source of truth to be checked against.
+        runAsGroup: {{ include "olaitan.collector.runAsGroup" . }}
         fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
@@ -95,6 +97,8 @@ spec:
         {{- with .Values.collector.tolerations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+      {{- include "olaitan.falcoSocket.validateBundled" . }}
+      {{- include "olaitan.falcoSocket.validateGroup" . }}
       {{- $falcoFix := include "olaitan.falcoSocket.fixerEnabled" . }}
       {{- if and $falcoFix .Values.falcoSocketPermissions.useNativeSidecar }}
       # Story 9.6 -- make Falco's gRPC socket reachable by a non-root collector.
@@ -220,16 +224,25 @@ spec:
             # artefacts on crash which need a writable path.
             - name: tmp
               mountPath: /tmp
-            {{- if hasPrefix "unix://" .Values.endpoints.falco }}
-            # Falco gRPC socket bind-mounted from the host. Falco's chart
-            # default exposes the socket at /run/falco/falco.sock on the
-            # node; the collector pod opens it via the FALCO_SOCKET env
-            # var. Read-only because the collector only ever connects
-            # (reads) -- never writes -- to the socket. Mounted only when
-            # endpoints.falco is a unix:// target; tcp:// targets reach
+            {{- if include "olaitan.falcoSocket.isUnix" . }}
+            # Falco gRPC socket bind-mounted from the host. The collector pod
+            # opens it via the FALCO_SOCKET env var. Read-only because the
+            # collector only ever connects (reads) -- never writes -- to the
+            # socket. connect(2) still works through a read-only mount: a
+            # readOnly volumeMount is MNT_READONLY, and the check that would
+            # reject a write (__mnt_want_write) is only taken on
+            # open-for-write paths, which connect(2) never takes. Mounted only
+            # when endpoints.falco is a unix:// target; tcp:// targets reach
             # Falco over the pod network and need no host mount.
+            #
+            # The path is DERIVED from endpoints.falco rather than hardcoded.
+            # It used to be the literal /run/falco while FALCO_SOCKET followed
+            # the value, so pointing endpoints.falco at a socket in any other
+            # directory mounted one directory and dialled into another: the
+            # collector failed with "no such file or directory" and nothing in
+            # the chart disagreed with itself loudly enough to say why.
             - name: falco-socket
-              mountPath: /run/falco
+              mountPath: {{ dir (include "olaitan.falcoSocket.path" .) | quote }}
               readOnly: true
             {{- end }}
             {{- if .Values.auditWebhook.enabled }}
@@ -286,10 +299,15 @@ spec:
             defaultMode: 0400
         - name: tmp
           emptyDir: {}
-        {{- if hasPrefix "unix://" .Values.endpoints.falco }}
+        {{- if include "olaitan.falcoSocket.isUnix" . }}
+        # Source directory derived from endpoints.falco, so the volume, the
+        # collector's mount, the permission fixer's mount and FALCO_SOCKET all
+        # name the same place. type: Directory (not DirectoryOrCreate) so a
+        # node where Falco is not running fails visibly instead of
+        # materialising an empty directory the collector would wait on forever.
         - name: falco-socket
           hostPath:
-            path: /run/falco
+            path: {{ dir (include "olaitan.falcoSocket.path" .) | quote }}
             type: Directory
         {{- end }}
         {{- if .Values.auditWebhook.enabled }}

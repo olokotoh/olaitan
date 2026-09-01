@@ -16,7 +16,7 @@ KEEP_NS="${KEEP_NS:-false}"
 B=$'\033[1m'; G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; D=$'\033[2m'; X=$'\033[0m'
 [ -t 1 ] || { B=""; G=""; Y=""; R=""; D=""; X=""; }
 
-WARNINGS=0; BLOCKERS=0
+WARNINGS=0; BLOCKERS=0; INCONCLUSIVE=0
 ok()    { echo "  ${G}yes${X}     $*"; }
 no()    { echo "  ${Y}no${X}      $*"; WARNINGS=$((WARNINGS+1)); }
 bad()   { echo "  ${R}BLOCKER${X} $*"; BLOCKERS=$((BLOCKERS+1)); }
@@ -126,8 +126,13 @@ else
   ok "privileged pods are admitted${PSA:+  (namespace PSA enforce=$PSA)}"
 fi
 if [ "$DISTRO" = "openshift" ]; then
-  no "OpenShift detected -- the DaemonSet needs the ${B}privileged${X} SCC bound to its ServiceAccount"
-  info "oc adm policy add-scc-to-user privileged -z olaitan-collector -n <namespace>"
+  no "OpenShift detected -- the collector DaemonSet needs an SCC allowing hostPath and any UID"
+  info "the chart ships the binding: --set openshift.bindSCC=true (values-openshift.yaml sets it)"
+  info "it binds ${B}hostmount-anyuid${X}, NOT privileged: Olaitan's own containers are"
+  info "unprivileged, drop ALL capabilities and run read-only root filesystems."
+  info "NOTE: stock hostmount-anyuid sets allowedCapabilities: null, so it REJECTS the"
+  info "CHOWN the socket-permission container needs. See the header comment in"
+  info "deploy/helm/olaitan/templates/openshift-scc-binding.yaml for the custom SCC."
 fi
 
 # ---------------------------------------------- 3. NetworkPolicy ENFORCEMENT
@@ -141,7 +146,8 @@ if [ -x "$(dirname "$0")/check-netpol-enforcement.sh" ]; then
       1) bad "policies are NOT ENFORCED -- the API accepts them, the data plane ignores them"
          info "Olaitan would report a workload QUARANTINED while it still has network access."
          info "Keep response.networkPolicy.enabled=false (the default), or install Calico/Cilium." ;;
-      *) no "enforcement probe inconclusive (see /tmp/olaitan-np.$$)" ;;
+      *) no "enforcement probe inconclusive (see /tmp/olaitan-np.$$)"
+         INCONCLUSIVE=$((INCONCLUSIVE+1)) ;;
     esac
   fi
   rm -f /tmp/olaitan-np.$$ 2>/dev/null
@@ -203,6 +209,17 @@ if [ "$BLOCKERS" -gt 0 ]; then
   echo "Olaitan will install, but read the blockers above first -- at least one means"
   echo "it cannot do what it claims on this cluster."
   exit 1
+fi
+# Exit 2 = a probe could not reach a verdict. Distinct from "ready with
+# caveats" on purpose: a caveat is something we KNOW, and an inconclusive
+# probe is something we do not. Collapsing the two into exit 0 would have a
+# script consuming this treat "we could not tell whether your CNI enforces"
+# as "your cluster is fine", which for this tool is the wrong default.
+if [ "$INCONCLUSIVE" -gt 0 ]; then
+  echo "${Y}${B}$INCONCLUSIVE probe(s) inconclusive${X}, plus $WARNINGS caveat(s)."
+  echo "Nothing here blocks the install, but at least one capability could not be"
+  echo "established either way. Re-run the named probe before trusting that capability."
+  exit 2
 fi
 if [ "$WARNINGS" -gt 0 ]; then
   echo "${G}${B}Ready${X}, with $WARNINGS caveat(s) noted above."

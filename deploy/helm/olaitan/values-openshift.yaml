@@ -22,6 +22,18 @@ openshift:
   bindSCC: true
   # hostmount-anyuid, not privileged. Olaitan's own containers are
   # unprivileged, drop ALL capabilities and run read-only root filesystems.
+  #
+  # !! READ templates/openshift-scc-binding.yaml BEFORE INSTALLING. The stock
+  # hostmount-anyuid SCC sets `allowedCapabilities: null`, and the
+  # falco-socket-permissions container asks for CHOWN (chgrp needs it), so
+  # admission REJECTS it with:
+  #   capabilities.add: Invalid value: "CHOWN": capability may not be added
+  # You need a custom SCC that is hostmount-anyuid plus CHOWN. The exact
+  # object is in that template's header comment; create it, then set
+  # openshift.scc to its name. Left at the stock name here because inventing
+  # a name for an SCC this chart cannot create would be worse.
+  #
+  # Nobody has run this on a live OpenShift cluster. It is template-verified.
   scc: hostmount-anyuid
 
 auditWebhook:

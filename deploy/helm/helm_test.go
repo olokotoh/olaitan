@@ -722,20 +722,65 @@ func TestCollectorDaemonsetMountsFalcoSocketWhenUnix(t *testing.T) {
 		t.Fatalf("helm template failed: %v\nstderr: %s", err, stderr.String())
 	}
 	rendered := stdout.String()
-	wantMount := `- name: falco-socket
-              mountPath: /run/falco
-              readOnly: true`
-	if !strings.Contains(rendered, wantMount) {
-		t.Errorf("falco-socket volumeMount not rendered on collector daemonset; rendered output sample:\n%s",
-			snippet(rendered, "falco-socket"))
+	// Structural, not a text match: the paths are rendered through `quote`
+	// now that they are derived from endpoints.falco rather than written as
+	// literals, so asserting on exact YAML spelling breaks on a change that
+	// is not a defect.
+	assertCollectorFalcoSocket(t, rendered, "/run/falco", true)
+}
+
+// assertCollectorFalcoSocket checks that the collector's falco-socket
+// volume and mount both name wantDir, and that the collector's own mount is
+// read-only (wantReadOnly).
+func assertCollectorFalcoSocket(t *testing.T, rendered, wantDir string, wantReadOnly bool) {
+	t.Helper()
+	ds := collectorDaemonSet(t, rendered)
+	podSpec := ds["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)
+
+	var sawVolume bool
+	for _, v := range podSpec["volumes"].([]any) {
+		vm := v.(map[string]any)
+		if vm["name"] != "falco-socket" {
+			continue
+		}
+		sawVolume = true
+		hp, ok := vm["hostPath"].(map[string]any)
+		if !ok {
+			t.Fatal("falco-socket volume is not a hostPath")
+		}
+		if hp["path"] != wantDir {
+			t.Errorf("falco-socket hostPath = %v, want %s", hp["path"], wantDir)
+		}
+		if hp["type"] != "Directory" {
+			t.Errorf("falco-socket hostPath type = %v, want Directory (DirectoryOrCreate would materialise an empty dir on a node with no Falco)", hp["type"])
+		}
 	}
-	wantVolume := `- name: falco-socket
-          hostPath:
-            path: /run/falco
-            type: Directory`
-	if !strings.Contains(rendered, wantVolume) {
-		t.Errorf("falco-socket hostPath volume not rendered on collector daemonset; rendered output sample:\n%s",
-			snippet(rendered, "hostPath"))
+	if !sawVolume {
+		t.Error("collector DaemonSet has no falco-socket volume")
+	}
+
+	var sawMount bool
+	for _, c := range podSpec["containers"].([]any) {
+		cm := c.(map[string]any)
+		if cm["name"] != "collector" {
+			continue
+		}
+		for _, m := range cm["volumeMounts"].([]any) {
+			mm := m.(map[string]any)
+			if mm["name"] != "falco-socket" {
+				continue
+			}
+			sawMount = true
+			if mm["mountPath"] != wantDir {
+				t.Errorf("collector falco-socket mountPath = %v, want %s", mm["mountPath"], wantDir)
+			}
+			if ro, _ := mm["readOnly"].(bool); ro != wantReadOnly {
+				t.Errorf("collector falco-socket mount readOnly = %v, want %v", ro, wantReadOnly)
+			}
+		}
+	}
+	if !sawMount {
+		t.Error("collector container does not mount falco-socket")
 	}
 }
 
@@ -4723,8 +4768,16 @@ func falcoSocketFixer(t *testing.T, rendered string) (map[string]any, string) {
 	dec := yaml.NewDecoder(strings.NewReader(rendered))
 	for {
 		var doc map[string]any
-		if err := dec.Decode(&doc); err != nil {
+		err := dec.Decode(&doc)
+		if err == io.EOF {
 			break
+		}
+		if err != nil {
+			// Do not swallow this. A decode failure anywhere upstream in
+			// the render used to turn into "container not rendered" and a
+			// t.Fatal blaming Blocker 8, sending the reader after the
+			// wrong defect entirely.
+			t.Fatalf("rendered manifest failed to decode: %v", err)
 		}
 		if doc == nil || doc["kind"] != "DaemonSet" {
 			continue
@@ -4827,27 +4880,24 @@ func TestFalcoSocketFixerIsRootWithMinimalCapabilities(t *testing.T) {
 	if drop := fmt.Sprint(caps["drop"]); !strings.Contains(drop, "ALL") {
 		t.Errorf("capabilities.drop = %v, want ALL", drop)
 	}
-	add := fmt.Sprint(caps["add"])
-	for _, want := range []string{"CHOWN", "FOWNER"} {
-		if !strings.Contains(add, want) {
-			t.Errorf("capabilities.add = %v, missing %s", add, want)
-		}
-	}
-	// Anything beyond CHOWN/FOWNER is scope creep on a root container.
-	for _, banned := range []string{"SYS_ADMIN", "NET_ADMIN", "DAC_OVERRIDE"} {
-		if strings.Contains(add, banned) {
-			t.Errorf("capabilities.add = %v grants %s, more than the chmod needs", add, banned)
-		}
+	// Exactly one capability. CHOWN is what chgrp needs; chmod needs none,
+	// because the socket is root-owned and so is this container. Every
+	// added capability is a separate thing an admission policy must allow
+	// (OpenShift SCCs disallow added capabilities by default), so the list
+	// is asserted exhaustively rather than as a lower bound.
+	addList, _ := caps["add"].([]any)
+	if len(addList) != 1 || fmt.Sprint(addList[0]) != "CHOWN" {
+		t.Errorf("capabilities.add = %v, want exactly [CHOWN]", caps["add"])
 	}
 }
 
 // TestFalcoSocketFixerMountIsWritableAndCollectorMountIsNot guards the
 // asymmetry that makes the fix safe: only the tiny root container gets
 // write access to the host path. The collector's own mount stays
-// read-only, which is correct even though it connects -- sb_permission()
-// exempts S_ISSOCK from the read-only-filesystem write check, so a
-// read-only bind mount does not block connect(2). The mode bits were
-// always the whole problem.
+// read-only, which is correct even though it connects: a readOnly
+// volumeMount is MNT_READONLY, and the check that would reject a write
+// (__mnt_want_write) is only taken on open-for-write paths, which
+// connect(2) never takes. The mode bits were always the whole problem.
 func TestFalcoSocketFixerMountIsWritableAndCollectorMountIsNot(t *testing.T) {
 	rendered := helmTemplate(t, nil)
 	fixer, _ := falcoSocketFixer(t, rendered)
@@ -4869,9 +4919,7 @@ func TestFalcoSocketFixerMountIsWritableAndCollectorMountIsNot(t *testing.T) {
 	if !found {
 		t.Error("permission fixer does not mount falco-socket")
 	}
-	assertContains(t, rendered, `- name: falco-socket
-              mountPath: /run/falco
-              readOnly: true`, "collector's falco-socket mount must stay read-only")
+	assertCollectorFalcoSocket(t, rendered, "/run/falco", true)
 }
 
 // TestFalcoSocketFixerGroupMatchesCollectorRunAsGroup catches the silent
@@ -4902,15 +4950,64 @@ func TestFalcoSocketFixerVerifiesItsOwnEffect(t *testing.T) {
 		t.Fatal("falco-socket-permissions container not rendered")
 	}
 	script := fixerScript(t, fixer)
-	for _, want := range []string{
-		"stat -c",            // re-reads from the filesystem
-		"not group-writable", // says so in plain words
-		"return 1",           // and fails rather than reporting success
-	} {
-		if !strings.Contains(script, want) {
-			t.Errorf("fixer script is missing %q -- it must verify its own effect, not assume it", want)
-		}
+	// Assert the two checks themselves, not prose about them. The earlier
+	// version of this test looked for "stat -c", "return 1" and a message
+	// substring, all of which appear elsewhere in the script: deleting the
+	// entire verification block and keeping the log line would have passed
+	// it. Both properties the collector needs must be read back from the
+	// filesystem and compared.
+	if !strings.Contains(script, `[ "$cur_gid" != "$GID" ]`) {
+		t.Error("fixer never compares the socket's actual group against the target GID; a chgrp that silently failed (dropped CAP_CHOWN, wrong socketGroup) would be reported as success")
 	}
+	if !strings.Contains(script, "group_digit") || !strings.Contains(script, "2|3|6|7") {
+		t.Error("fixer never checks that the group has the write bit; connecting to a unix socket requires it")
+	}
+	// The mode must be normalised before a digit is read by position:
+	// stat -c %a emits no leading zeros, so mode 7 prints "7" and a fixed
+	// offset reads the OTHER digit as the group digit.
+	if !strings.Contains(script, `printf '%04d'`) {
+		t.Error("fixer reads the group digit by position without normalising the mode width")
+	}
+	// A vanished socket is a Falco restart, not a failure. Conflating them
+	// exits the container and turns a five-second roll into a
+	// CrashLoopBackOff that climbs to a five-minute backoff, during which
+	// the socket sits at 0755 and the collector ingests nothing.
+	if !strings.Contains(script, "return 2") || !strings.Contains(script, `[ "$rc" -eq 1 ]`) {
+		t.Error("fixer does not distinguish a transient socket disappearance from a real verification failure")
+	}
+	// An empty or non-numeric injected value must fail loudly, not turn the
+	// reconcile loop into a busy spin on `sleep ""`.
+	if !strings.Contains(script, "FATAL: intervalSeconds") {
+		t.Error("fixer does not validate its injected numeric values")
+	}
+}
+
+// TestFalcoSocketGroupMustMatchCollectorRunAsGroup: values.yaml claims
+// "changing one without the other silently reinstates the crash-loop, so
+// the helm suite asserts the two agree". It did not: only the default
+// render was ever checked, so any non-default socketGroup passed every
+// test while chgrp'ing Falco's socket to a group the collector is not in.
+// The permission holder would then see group-write, report success, and
+// the collector would still be locked out.
+func TestFalcoSocketGroupMustMatchCollectorRunAsGroup(t *testing.T) {
+	args := []string{"template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+		"--set", "falcoSocketPermissions.socketGroup=1000",
+	}
+	cmd := exec.Command("helm", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatal("chart rendered with socketGroup disagreeing with the collector's runAsGroup; the socket would be chgrp'd to a group the collector cannot use")
+	}
+	if !strings.Contains(stderr.String(), "the collector runs as group 65532") {
+		t.Errorf("failure message does not name the collector's actual group: %s", stderr.String())
+	}
+	// Disabling the holder makes the value irrelevant, so it must render.
+	helmTemplate(t, []string{
+		"falcoSocketPermissions.socketGroup=1000",
+		"falcoSocketPermissions.enabled=false",
+	})
 }
 
 // TestFalcoSocketFixerIsNeverSilent: found on a live kind cluster. While
@@ -4980,19 +5077,116 @@ func TestFalcoSocketFixerOmittedWhenDisabledOrTCP(t *testing.T) {
 	}
 }
 
-// TestFalcoSocketFixerTargetsTheEndpointTheCollectorDials: the fixer must
-// chmod the same path the collector opens. Deriving both from
-// endpoints.falco means a custom socket path cannot leave the fixer
-// chmod'ing a file nobody uses while the real one stays 0755.
-func TestFalcoSocketFixerTargetsTheEndpointTheCollectorDials(t *testing.T) {
+// TestFalcoSocketPathsAllAgree: the volume's hostPath source, the
+// collector's mount, the fixer's mount and FALCO_SOCKET must all name the
+// same directory, derived from endpoints.falco.
+//
+// They did not. The mount and the hostPath were the literal /run/falco
+// while FALCO_SOCKET followed the value, so pointing endpoints.falco at a
+// socket anywhere else mounted one directory and dialled into another: the
+// collector failed with "no such file or directory" before it ever reached
+// the permission problem the fixer exists to solve, and no part of the
+// chart disagreed with itself loudly enough to say why.
+func TestFalcoSocketPathsAllAgree(t *testing.T) {
 	const custom = "unix:///var/run/falco/custom.sock"
-	fixer, _ := falcoSocketFixer(t, helmTemplate(t, []string{"endpoints.falco=" + custom}))
+	const wantDir = "/var/run/falco"
+	// falco.enabled=false because the bundled subchart binds its own path;
+	// changing only one side is what validateBundled refuses (see
+	// TestFalcoSocketBundledMismatchFailsFast).
+	rendered := helmTemplate(t, []string{"endpoints.falco=" + custom, "falco.enabled=false"})
+
+	fixer, _ := falcoSocketFixer(t, rendered)
 	if fixer == nil {
 		t.Fatal("falco-socket-permissions container not rendered for a custom unix path")
 	}
 	if script := fixerScript(t, fixer); !strings.Contains(script, `SOCK="/var/run/falco/custom.sock"`) {
-		t.Errorf("fixer targets a different path than endpoints.falco; script:\n%s", script)
+		t.Error("fixer chmods a different path than endpoints.falco names")
 	}
+	for _, m := range fixer["volumeMounts"].([]any) {
+		mm := m.(map[string]any)
+		if mm["name"] == "falco-socket" && mm["mountPath"] != wantDir {
+			t.Errorf("fixer mountPath = %v, want %s", mm["mountPath"], wantDir)
+		}
+	}
+
+	ds := collectorDaemonSet(t, rendered)
+	podSpec := ds["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)
+	for _, v := range podSpec["volumes"].([]any) {
+		vm := v.(map[string]any)
+		if vm["name"] != "falco-socket" {
+			continue
+		}
+		hp := vm["hostPath"].(map[string]any)
+		if hp["path"] != wantDir {
+			t.Errorf("hostPath source = %v, want %s -- the volume points at a directory the collector never dials", hp["path"], wantDir)
+		}
+	}
+	for _, c := range podSpec["containers"].([]any) {
+		cm := c.(map[string]any)
+		if cm["name"] != "collector" {
+			continue
+		}
+		for _, m := range cm["volumeMounts"].([]any) {
+			mm := m.(map[string]any)
+			if mm["name"] == "falco-socket" && mm["mountPath"] != wantDir {
+				t.Errorf("collector mountPath = %v, want %s -- it would dial a path nothing is mounted at", mm["mountPath"], wantDir)
+			}
+		}
+		for _, e := range cm["env"].([]any) {
+			em := e.(map[string]any)
+			if em["name"] == "FALCO_SOCKET" && em["value"] != custom {
+				t.Errorf("FALCO_SOCKET = %v, want %s", em["value"], custom)
+			}
+		}
+	}
+}
+
+// collectorDaemonSet returns the collector DaemonSet document.
+func collectorDaemonSet(t *testing.T, rendered string) map[string]any {
+	t.Helper()
+	dec := yaml.NewDecoder(strings.NewReader(rendered))
+	for {
+		var doc map[string]any
+		if err := dec.Decode(&doc); err != nil {
+			break
+		}
+		if doc == nil || doc["kind"] != "DaemonSet" {
+			continue
+		}
+		meta, _ := doc["metadata"].(map[string]any)
+		if meta != nil && strings.Contains(fmt.Sprint(meta["name"]), "collector") {
+			return doc
+		}
+	}
+	t.Fatal("collector DaemonSet not found")
+	return nil
+}
+
+// TestFalcoSocketBundledMismatchFailsFast: with the bundled Falco enabled
+// there are two settings for one path (endpoints.falco and
+// falco.falco.grpc.bind_address) and nothing made them agree. Changing one
+// alone mounts a directory Falco never writes into, and the resulting
+// failure -- an unschedulable pod, or a fixer that times out waiting for a
+// socket that will never appear -- names nothing useful. Refuse at render.
+func TestFalcoSocketBundledMismatchFailsFast(t *testing.T) {
+	args := []string{"template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+		"--set", "endpoints.falco=unix:///var/run/falco/custom.sock",
+	}
+	cmd := exec.Command("helm", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatal("chart rendered with endpoints.falco and the bundled Falco's bind_address disagreeing; the collector would dial a socket Falco never creates")
+	}
+	if !strings.Contains(stderr.String(), "name different sockets") {
+		t.Errorf("failure message does not explain the mismatch: %s", stderr.String())
+	}
+	// Changing BOTH together is legitimate and must still render.
+	helmTemplate(t, []string{
+		"endpoints.falco=unix:///var/run/falco/custom.sock",
+		"falco.falco.grpc.bind_address=unix:///var/run/falco/custom.sock",
+	})
 }
 
 // TestChartKubeVersionFloorSupportsNativeSidecars: useNativeSidecar is
@@ -5035,6 +5229,17 @@ func TestChartKubeVersionFloorSupportsNativeSidecars(t *testing.T) {
 // assertable here, which is why _notes.tpl exists.
 func renderNotes(t *testing.T, sets []string) string {
 	t.Helper()
+	return renderNotesNS(t, sets, "")
+}
+
+// renderNotesInNamespace renders the notes as an install INTO ns.
+func renderNotesInNamespace(t *testing.T, ns string) string {
+	t.Helper()
+	return renderNotesNS(t, nil, ns)
+}
+
+func renderNotesNS(t *testing.T, sets []string, ns string) string {
+	t.Helper()
 	src := chartDir(t)
 	dst := filepath.Join(t.TempDir(), "olaitan")
 	if out, err := exec.Command("cp", "-r", src, dst).CombinedOutput(); err != nil {
@@ -5052,6 +5257,9 @@ data:
 		t.Fatalf("write probe template: %v", err)
 	}
 	args := []string{"template", "olaitan", dst, "--set", "secrets.redisPassword=test-password"}
+	if ns != "" {
+		args = append(args, "--namespace", ns)
+	}
 	for _, s := range sets {
 		args = append(args, "--set", s)
 	}
@@ -5096,13 +5304,42 @@ func TestNotesReportEverySourceAndItsReason(t *testing.T) {
 			t.Errorf("install notes never mention %q", want)
 		}
 	}
-	// Every OFF source must carry a reason on the following lines, not a
-	// bare "[OFF]".
-	if strings.Count(notes, "[OFF]") < 4 {
-		t.Errorf("expected the default install to report several sources OFF; notes:\n%s", notes)
+	// Every OFF source must carry a reason on the lines that follow, not a
+	// bare "[OFF]". Asserted structurally: the previous version counted
+	// "[OFF]" occurrences and grepped for one stock phrase, and passed
+	// while the applog sidecar shipped with no reason line at all.
+	lines := strings.Split(notes, "\n")
+	var offCount int
+	for i, l := range lines {
+		if !strings.Contains(l, "[OFF]") {
+			continue
+		}
+		offCount++
+		if i+1 >= len(lines) {
+			t.Errorf("%q is the last line; no reason follows", strings.TrimSpace(l))
+			continue
+		}
+		// The reason may sit after a blank line (the ENFORCEMENT block
+		// separates its explanation into a paragraph), so look ahead a
+		// little -- but not past the next source, which would let a
+		// reasonless entry borrow its neighbour's text.
+		var reasoned bool
+		for j := i + 1; j < len(lines) && j <= i+3; j++ {
+			nxt := strings.TrimSpace(lines[j])
+			if strings.Contains(nxt, "[OFF]") || strings.Contains(nxt, "[ON ]") || strings.Contains(nxt, "[ ? ]") {
+				break
+			}
+			if nxt != "" {
+				reasoned = true
+				break
+			}
+		}
+		if !reasoned {
+			t.Errorf("source %q is reported OFF with no reason after it", strings.TrimSpace(l))
+		}
 	}
-	if !strings.Contains(notes, "Off by default") {
-		t.Error("install notes report sources OFF without saying why")
+	if offCount < 4 {
+		t.Errorf("expected the default install to report several sources OFF, got %d", offCount)
 	}
 }
 
@@ -5174,6 +5411,14 @@ func TestNotesWarnWhenInstalledOutsideTheExcludedNamespace(t *testing.T) {
 	notes := renderNotes(t, nil)
 	if !strings.Contains(notes, "excluded_namespaces") {
 		t.Errorf("installing outside the olaitan namespace produced no warning; notes:\n%s", notes)
+	}
+	// And the negative case, without which a template that emitted the
+	// warning unconditionally would pass. Installed INTO olaitan there is
+	// nothing to warn about, and a warning that always fires is noise that
+	// trains operators to skip the section.
+	inNs := renderNotesInNamespace(t, "olaitan")
+	if strings.Contains(inNs, "! NAMESPACE") {
+		t.Errorf("namespace warning fired for an install into olaitan itself; notes:\n%s", inNs)
 	}
 }
 
@@ -5248,8 +5493,8 @@ func TestNotesTxtIsAThinIncludeOverTheTestablePartial(t *testing.T) {
 	if !strings.Contains(string(raw), `include "olaitan.notes"`) {
 		t.Error("NOTES.txt no longer includes the olaitan.notes partial")
 	}
-	if len(strings.TrimSpace(string(raw))) > 120 {
-		t.Errorf("NOTES.txt has grown a body of its own (%d bytes); the body belongs in _notes.tpl where the suite can render it", len(raw))
+	if n := len(strings.TrimSpace(string(raw))); n > 120 {
+		t.Errorf("NOTES.txt has grown a body of its own (%d bytes); the body belongs in _notes.tpl where the suite can render it", n)
 	}
 }
 

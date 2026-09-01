@@ -85,7 +85,7 @@ sources are on, which are off, and why.
 | Platform | Install | NetworkPolicy enforced | Audit webhook | Overlay |
 | --- | --- | --- | --- | --- |
 | kind | ✅ verified | ❌ no (kindnet accepts and ignores) | ✅ possible | `values-kind.yaml` |
-| kubeadm | ✅ verified | depends on your CNI | ✅ possible | (defaults) |
+| kubeadm | ⚠️ verified 2026-08-31, see note | depends on your CNI | ✅ possible | (defaults) |
 | k3s / k3d | template-verified | ✅ (kube-router) | ✅ possible | `values-k3s.yaml` |
 | minikube | template-verified | ❌ unless `--cni=calico` | ✅ possible | `values-minikube.yaml` |
 | EKS (EC2) | template-verified | ❌ until VPC CNI policy enabled | ❌ impossible | `values-eks.yaml` |
@@ -102,12 +102,34 @@ was run there. Rendering is not running, and the two are never blurred; the
 cited, per-platform detail is in
 [docs/platform-support-matrix.md](docs/platform-support-matrix.md).
 
-The three features that genuinely need a self-managed control plane -- the
-audit webhook, the containerd CRI sensor, the Calico flow adapter -- are all
-**off by default**, and a default render contains no hostPath mount from
-Olaitan's own templates. "Impossible" above means the K8s audit webhook
-specifically: no managed provider exposes `--audit-webhook-config-file`, so
-that one source cannot be turned on there at all. Everything else works.
+**The kubeadm caveat, stated here rather than only in the matrix.** The
+2026-08-31 kubeadm run established that the chart installs and every workload
+schedules. It also found that the collector could not attach to Falco's
+socket at all, so the primary detection source was dead on that cluster. That
+defect is fixed, and the fix has **not been re-run on kubeadm** -- it was
+verified in containers and on kind. Treat the kubeadm row as "installs, and
+the known blocker is fixed but unconfirmed there".
+
+"Impossible" above means the K8s audit webhook specifically, and it is the
+only capability with a hard platform limit: it needs
+`--audit-webhook-config-file` on kube-apiserver, and no managed provider
+exposes kube-apiserver flags. There is no workaround, only a different route
+in through the cloud's own log pipeline, which Olaitan does not implement yet.
+
+The other two optional sources are often described as needing a self-managed
+control plane. They do not. The containerd CRI sensor needs a **host socket**
+at a path that matches your runtime (see `values-k3s.yaml` and
+`values-eks.yaml`, which ship the right paths for those platforms), and the
+Calico flow adapter needs **Calico**. Both are off by default, and both are
+available on managed platforms.
+
+A default install does mount one hostPath from Olaitan's own templates: the
+directory holding Falco's gRPC socket, which the collector reads and a small
+root container writes to once per interval so a non-root collector can open
+it at all (see `falcoSocketPermissions` in `values.yaml`). That is the whole
+of Olaitan's own host access on a default render; the other thirteen hostPath
+mounts come from the bundled Falco subchart. Set `endpoints.falco` to a
+`tcp://` target and Olaitan mounts nothing from the host.
 
 ## How this differs from Falco alone
 
@@ -145,9 +167,13 @@ Read this section before trusting it with anything.
   pushes real traffic through a deny-all policy and tells you which world you
   are in.
 - **Falco's modern eBPF driver needs BTF (`CONFIG_DEBUG_INFO_BTF`) and kernel
-  5.8 or newer.** True of every current mainstream node image. On an older
-  kernel set `falco.driver.kind=kmod`; `hack/preflight.sh` reports the node
-  kernel so you can tell before installing.
+  5.8 or newer.** True of mainstream node images we have checked, and NOT
+  confirmed for AKS's Azure Ubuntu 5.15 and Azure Linux 3.0 images, which are
+  on the open-questions list in
+  [the support matrix](docs/platform-support-matrix.md). Check a node with
+  `bpftool feature probe kernel | grep ringbuf`. On a kernel without BTF, set
+  `falco.driver.kind=kmod`; `hack/preflight.sh` reports the node kernel so you
+  can tell before installing.
 - **Targets Kubernetes 1.29 and newer.** The chart's `kubeVersion` floor is
   `>=1.29.0`, and it is load-bearing rather than conservative: the collector's
   Falco-socket permission container is a native sidecar, which needs 1.29.

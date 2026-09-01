@@ -142,5 +142,14 @@ why that distinction earns its place.
 
 Sources: AWS EKS user guide + best practices, Azure AKS docs, Google GKE docs,
 Falco kernel/driver docs and chart 8.x changelog, Kubernetes audit documentation.
-Full citation list per platform in the research record at
-`.hermes/cache/delegation/subagent-summary-0-20260831_121650_725708.txt`.
+
+**On "every row is cited".** The per-platform claims above were researched
+against those first-party docs on 2026-08-30, and the specific facts each row
+rests on are restated inline in the platform overlays
+(`deploy/helm/olaitan/values-<platform>.yaml`), which is where an operator
+meets them. An earlier version of this line pointed at a per-platform research
+record under `.hermes/cache/`; that path is a scratch cache, is not in the
+repository, and is not reproducible by anyone reading this. Pointing at it was
+worse than pointing at nothing, so it is removed rather than quietly left in.
+Anything not confirmable in a vendor doc is in the UNCERTAIN list above and is
+not claimed in the table.

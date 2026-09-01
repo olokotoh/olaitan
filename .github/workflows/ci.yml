@@ -325,7 +325,9 @@ jobs:
 
       - name: Create cluster (minikube)
         if: matrix.distro == 'minikube'
-        uses: medyagh/setup-minikube@latest
+        # Pinned like the other actions in this file. An unpinned third-party
+        # action in a job that installs into a cluster is a supply-chain hole.
+        uses: medyagh/setup-minikube@v0.0.19
         with:
           kubernetes-version: v1.29.14
           driver: docker
@@ -395,10 +397,31 @@ jobs:
             kubectl -n olaitan logs -l app.kubernetes.io/component=collector --tail=50 --all-containers
             exit 1
           fi
-          # And prove the permission fixer did its job, rather than inferring
-          # it from the absence of an error.
+          # Positively assert the socket is in a state the collector can
+          # connect to, by reading it from inside the pod. The grep above is
+          # only the absence of one error string: a collector that attached
+          # to nothing at all (Falco never started, the sidecar crash-looped)
+          # would pass it. Connecting to a unix socket needs write
+          # permission, so the group must be the collector's and that group
+          # must have the write bit.
+          pod="$(kubectl -n olaitan get pod -l app.kubernetes.io/component=collector \
+                   -o jsonpath='{.items[0].metadata.name}')"
+          perms="$(kubectl -n olaitan exec "$pod" -c falco-socket-permissions -- \
+                     stat -c '%a %g' /run/falco/falco.sock)"
+          echo "falco.sock: $perms"
+          mode="$(echo "$perms" | cut -d' ' -f1)"
+          gid="$(echo "$perms" | cut -d' ' -f2)"
+          if [ "$gid" != "65532" ]; then
+            echo "::error::falco.sock group is $gid, not the collector's 65532 -- it cannot connect"
+            exit 1
+          fi
+          case "$(printf '%04d' "$mode" | cut -c3)" in
+            2|3|6|7) echo "socket is group-writable by the collector's group: OK" ;;
+            *) echo "::error::falco.sock is mode $mode; group $gid cannot write, so the collector cannot connect"
+               exit 1 ;;
+          esac
           kubectl -n olaitan logs -l app.kubernetes.io/component=collector \
-            -c falco-socket-permissions --tail=20 || true
+            -c falco-socket-permissions --tail=20
 
       # AC3: record the enforcement verdict per distribution. This is
       # deliberately NOT a pass/fail gate -- kindnet genuinely does not

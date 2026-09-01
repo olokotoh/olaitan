@@ -18,6 +18,14 @@ NOTES.txt is then a one-line include.
 {{- $cni := include "olaitan.networkPolicyProvider" . -}}
 {{- $unixFalco := include "olaitan.falcoSocket.isUnix" . -}}
 {{- $ns := .Release.Namespace -}}
+{{/*
+Nil-safe locals. These notes render on every helm install, so a values
+file that nulls a block it does not use must not turn a cosmetic
+template into an install blocker. `--set response=null` used to fail
+HERE, before anything else in the chart complained.
+*/}}
+{{- $netpol := default (dict) (default (dict) .Values.response).networkPolicy -}}
+{{- $nats := default (dict) .Values.nats -}}
 Olaitan {{ .Chart.AppVersion }} is installed as "{{ .Release.Name }}" in namespace {{ $ns }}.
 
   Platform   : {{ if $platform }}{{ $platform }}{{ else }}unknown{{ end }} ({{ $source }})
@@ -44,10 +52,15 @@ cannot see before you trust it.
 {{- end }}
 
 DETECTION SOURCES
-{{- if .Values.falco.enabled }}
+{{- if (default (dict) .Values.falco).enabled }}
   [ON ] Falco syscall events -- bundled Falco subchart, via {{ .Values.endpoints.falco }}
 {{- else }}
-  [ON ] Falco syscall events -- your own Falco, via {{ .Values.endpoints.falco }}
+  [ ? ] Falco syscall events -- ASSUMED, via {{ .Values.endpoints.falco }}
+         falco.enabled=false, so this chart deployed no Falco and has
+         established nothing about whether one is listening there. This is
+         the primary detection source: if nothing is at that address the
+         agent runs and sees almost nothing, quietly. Verify before you
+         trust it (see VERIFY THE INSTALL below).
 {{- end }}
 {{- if eq (include "olaitan.falcoSocket.fixerEnabled" .) "true" }}
          Falco creates that socket 0755 root:root and the collector runs as
@@ -60,7 +73,7 @@ DETECTION SOURCES
          "connect: permission denied", that is why: Falco's socket is
          0755 root:root and the collector (UID 65532) cannot attach.
 {{- end }}
-{{- if .Values.auditWebhook.enabled }}
+{{- if (default (dict) .Values.auditWebhook).enabled }}
   [ON ] Kubernetes audit webhook
   {{- if $managed }}
          WARNING: {{ $platform }} is a managed control plane. It does not expose
@@ -74,12 +87,20 @@ DETECTION SOURCES
          Impossible on {{ $platform }}, not merely off: a managed control plane does
          not expose --audit-webhook-config-file. Nothing you can set here
          turns this on.
+  {{- else if $platform }}
+         Off by default. On {{ $platform }} you control the API server, so it IS
+         available: auditWebhook.enabled=true plus hack/audit-apiserver-patch.yaml.
   {{- else }}
-         Off by default. You control this API server, so it IS available to
-         you: auditWebhook.enabled=true plus hack/audit-apiserver-patch.yaml.
+         Off by default, and whether you CAN turn it on depends on a
+         platform this chart could not identify. It needs
+         --audit-webhook-config-file on kube-apiserver, which self-managed
+         clusters expose and EKS, AKS and GKE do not. AKS in particular is
+         undetectable from inside the cluster, so an unidentified platform
+         may well be one where this is impossible. Set `platform` and these
+         notes will tell you which.
   {{- end }}
 {{- end }}
-{{- if .Values.containerdSensor.enabled }}
+{{- if (default (dict) .Values.containerdSensor).enabled }}
   [ON ] containerd CRI sensor -- {{ .Values.containerdSensor.socketPath }}
 {{- else }}
   [OFF] containerd CRI sensor
@@ -91,7 +112,7 @@ DETECTION SOURCES
          Off by default; needs a host socket path matching your runtime.
   {{- end }}
 {{- end }}
-{{- if .Values.calicoSensor.enabled }}
+{{- if (default (dict) .Values.calicoSensor).enabled }}
   [ON ] Calico CNI flow adapter
 {{- else }}
   [OFF] Calico CNI flow adapter
@@ -102,14 +123,17 @@ DETECTION SOURCES
          Off by default; requires Calico installed via the Tigera operator.
   {{- end }}
 {{- end }}
-{{- if .Values.applogSidecar.enabled }}
+{{- if (default (dict) .Values.applogSidecar).enabled }}
   [ON ] Application log sidecar -- injected by the admission webhook
 {{- else }}
   [OFF] Application log sidecar
+         Off by default; it injects a sidecar into your workloads through an
+         admission webhook, which is a bigger consent decision than the
+         other sources and is left to you.
 {{- end }}
 
 ENFORCEMENT
-{{- if .Values.response.networkPolicy.enabled }}
+{{- if $netpol.enabled }}
   [ON ] NetworkPolicy isolation -- Olaitan WILL write policies that cut traffic.
 
   Read this before you rely on it. Olaitan reports a workload QUARANTINED once
@@ -132,7 +156,7 @@ ENFORCEMENT
   two worlds you are in. If it reports NOT ENFORCED, set
   response.networkPolicy.enabled=false until you have a CNI that enforces --
   otherwise this tool will report containment it did not achieve.
-  {{- if not .Values.response.networkPolicy.clusterCidrs }}
+  {{- if not $netpol.clusterCidrs }}
 
   Also: response.networkPolicy.clusterCidrs is EMPTY. Set it to your real
   pod/service CIDRs before relying on this. Left empty, egress blocking under
@@ -149,8 +173,8 @@ ENFORCEMENT
 {{- end }}
 
 STORAGE
-{{- if .Values.nats.streamMaxBytesOverride }}
-  JetStream streams are capped at {{ .Values.nats.streamMaxBytesOverride }} bytes each, so they fit the
+{{- if $nats.streamMaxBytesOverride }}
+  JetStream streams are capped at {{ $nats.streamMaxBytesOverride }} bytes each, so they fit the
   default volume. For production retention, raise nats.persistence.size AND
   clear nats.streamMaxBytesOverride together -- the pairing is the point.
   Raising the volume alone leaves the cap in force; clearing the cap alone
