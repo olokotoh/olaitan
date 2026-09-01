@@ -1,0 +1,30 @@
+# k3s / k3d overlay.
+#
+#   helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan \
+#     -f values-k3s.yaml --namespace olaitan --create-namespace
+#
+# Deltas only. Template-verified, NOT verified.
+
+platform: k3s
+
+containerdSensor:
+  # THE k3s delta. k3s bundles its own containerd and puts the socket under
+  # /run/k3s/, not the standard path the chart defaults to. With the default
+  # path the hostPath mount (type: Directory) fails and the collector never
+  # schedules. Only relevant if you enable this sensor; it is off by default.
+  socketPath: /run/k3s/containerd/containerd.sock
+
+auditWebhook:
+  # AVAILABLE here, unlike the managed platforms: k3s runs its own API server
+  # and you can pass --audit-webhook-config-file via
+  # --kube-apiserver-arg. Still off by default because it needs the API server
+  # reconfigured; see hack/audit-apiserver-patch.yaml.
+  enabled: false
+
+# STORAGE. k3s ships local-path as the default StorageClass, so no override is
+# needed. It is node-local: a rescheduled NATS pod will not find its data on
+# another node. Single-node k3s is unaffected.
+#
+# NETWORKPOLICY. k3s bundles kube-router's policy controller and DOES enforce
+# by default, unlike kind. Confirm with hack/check-netpol-enforcement.sh before
+# enabling response.networkPolicy.

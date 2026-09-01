@@ -40,6 +40,23 @@ imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
+# Platform this chart is being installed on: eks, aks, gke, k3s, rke2,
+# openshift, kind, minikube, or "" to let the chart work it out.
+#
+# The chart detects what is genuinely detectable (OpenShift serves
+# security.openshift.io/v1; EKS, GKE, k3s and RKE2 stamp a vendor suffix
+# into the API server version) and reports "unknown" otherwise. AKS is
+# the case that cannot be detected at all: it reports an unmodified
+# upstream version and serves no distinguishing API group. Set this
+# explicitly there, and anywhere you would rather NOTES.txt state a fact
+# than an inference.
+#
+# It changes no behaviour on its own. Its whole job is to let NOTES.txt
+# tell you which detection sources are off and why, in your cluster's
+# terms, instead of printing the same generic text everywhere.
+# @schema type:string pattern:"eks|aks|gke|k3s|rke2|openshift|kind|minikube, or empty to auto-detect" effect:"platform reported by NOTES.txt and used to explain which sources are unavailable here" ref:NFR13
+platform: ""
+
 # --- Collector (Ring 1 DaemonSet) --------------------------------------
 # One pod per node; consumes Falco gRPC + Kubernetes audit + cgroup
 # signals, forwards enriched events to the aggregator over NATS.
@@ -494,6 +511,7 @@ applogSidecar:
   # SidecarContainers feature gate is disabled, set to false to
   # inject as a regular container instead, with the documented
   # trade-off that pod-termination semantics differ.
+  # @schema type:boolean effect:"inject the applog sidecar as a native sidecar (initContainer with restartPolicy: Always) rather than a regular container" ref:FR9
   useNativeSidecar: true
 
   # Namespace selector for the MutatingWebhookConfiguration.
@@ -1266,16 +1284,159 @@ ollama:
 # default; the legacy kernel module and `modern_ebpf` are alternatives
 # operators can override. gRPC output is required: that is how the
 # collector reads Falco events. [Source: architecture.md:130-131]
+# --- Falco socket permissions (Story 9.6) ------------------------------
+# Falco binds its gRPC socket and never chmods it, so the mode is whatever
+# the default umask leaves: 0777 & ~022 = 0755, owner root. Connecting to a
+# Unix socket requires WRITE permission on the socket inode, and the
+# collector runs as UID/GID 65532 per NFR11. It is neither the owner nor in
+# the owning group, so it can never attach:
+#
+#   collector: falco run: falco: sub (terminal, no retry): rpc error:
+#   code = Unavailable ... dial unix /run/falco/falco.sock:
+#   connect: permission denied
+#
+# Falco runs, the collector crash-loops, and NO syscall events are ingested.
+# Proven on a 3-node kubeadm cluster 2026-08-31 (Blocker 8). Invisible on
+# kind, where Falco and the collector end up sharing an effective identity
+# and the dial succeeds regardless -- which is why every prior test passed.
+#
+# There is no Falco config key for this (upstream falco.yaml exposes only
+# grpc.enabled / bind_address / threadiness and the mTLS cert paths;
+# falcosecurity/falco#1351 is the open request), so the chart fixes the mode
+# from the collector's own pod. It lives here rather than in the Falco pod
+# deliberately: an operator pointing endpoints.falco at their own Falco
+# DaemonSet needs the same fix, and falco.extra.initContainers would only
+# reach the bundled subchart.
+# --- OpenShift ---------------------------------------------------------
+# OpenShift admits pods against a SecurityContextConstraint, and the default
+# `restricted-v2` forbids hostPath volumes and pins the UID range. The
+# collector needs both exceptions: it bind-mounts Falco's socket directory,
+# and the falco-socket-permissions container runs as UID 0 to chmod the socket.
+# Without a matching SCC the DaemonSet is refused at admission with "unable to
+# validate against any security context constraint".
+openshift:
+  # Ships a RoleBinding granting the SCC below to the collector's
+  # ServiceAccount, scoped to the release namespace. Off by default because
+  # the referenced ClusterRole only exists on OpenShift; values-openshift.yaml
+  # turns it on.
+  # @schema type:boolean effect:"ship a RoleBinding granting the collector ServiceAccount the SCC named by openshift.scc (OpenShift only)" ref:NFR11
+  bindSCC: false
+  # `hostmount-anyuid` grants hostPath volumes and an unrestricted UID range,
+  # which is exactly what the collector needs and nothing more. Deliberately
+  # NOT `privileged`: Olaitan's containers are unprivileged, drop ALL
+  # capabilities and run read-only root filesystems. Falco's DaemonSet does
+  # need `privileged`, and the Falco subchart ships its own SCC for that.
+  # @schema type:string pattern:"an OpenShift SCC name" effect:"SCC granted to the collector ServiceAccount when openshift.bindSCC is true" ref:NFR11
+  scc: hostmount-anyuid
+
+falcoSocketPermissions:
+  # Off renders no permission container and no read-write host mount at
+  # all. Turn it off when your Falco already exposes a group-writable
+  # socket, or when you run your own Falco with a different arrangement.
+  # A tcp:// endpoints.falco forces it off regardless: there is no socket
+  # to chmod in that mode.
+  # @schema type:boolean effect:"hold Falco's gRPC socket at a mode the non-root collector can connect to; disabling reinstates the Blocker 8 crash-loop on clusters where Falco and the collector do not share an identity" ref:NFR11
+  enabled: true
+
+  # Use the native sidecar pattern (an initContainer with restartPolicy:
+  # Always, KEP-753), the same choice applogSidecar documents above. Note the
+  # version differs from applogSidecar's comment: SidecarContainers is alpha
+  # and OFF by default in 1.28, beta and ON from 1.29, so 1.29 is the real
+  # floor -- which is also this chart's kubeVersion floor, precisely because
+  # this sidecar is on the DEFAULT path (applogSidecar is not). Native is the default because it is ORDERED: the
+  # permission is in place before the collector's first dial, so the
+  # collector never crash-loops on startup.
+  #
+  # On clusters where the SidecarContainers feature gate is disabled, set
+  # to false to inject as a regular container instead. It still holds the
+  # permission for the life of the pod -- the trade-off is only ordering:
+  # the collector may make its first dial before the chmod lands, fail
+  # once, and be restarted by the kubelet into a working socket. Pod
+  # termination semantics differ too, as with applogSidecar.
+  #
+  # NOTE: Chart.yaml's kubeVersion floor is >=1.29, so native sidecars are
+  # available on every cluster this chart installs on. The false path
+  # exists for a 1.29+ cluster that has explicitly disabled the gate,
+  # which cannot be detected at render time.
+  # @schema type:boolean effect:"render the Falco socket permission holder as a native sidecar (ordered before the collector, so the socket is writable before its first dial) rather than a plain container; needs Kubernetes >=1.29" ref:NFR11
+  useNativeSidecar: true
+
+  # Target mode and group for the socket. 0660 + the collector's own GID
+  # is the tightest pair that works: root (Falco) keeps owner rw, the
+  # collector gets group rw, and nothing else on the node gains access.
+  # Widening to 0666 would hand every process on the node a Falco event
+  # stream.
+  # @schema type:string pattern:"octal file mode" effect:"mode applied to the Falco gRPC socket" ref:NFR11
+  socketMode: "0660"
+  # Must match the collector pod's runAsGroup (securityContext in
+  # daemonset.yaml). Changing one without the other silently reinstates
+  # the crash-loop, so the helm suite asserts the two agree.
+  # @schema type:integer effect:"group applied to the Falco gRPC socket; must equal the collector's runAsGroup" ref:NFR11
+  socketGroup: 65532
+  # How often to re-assert. A Falco restart deletes and recreates the
+  # socket at 0755, so this bounds the window in which a just-restarted
+  # Falco leaves the collector unable to reconnect.
+  # @schema type:integer minimum:1 effect:"seconds between permission re-assertions" ref:NFR11
+  intervalSeconds: 10
+  # How long to wait for the socket to appear before failing. Falco's
+  # driver load can take a minute or more on first start, so this is not
+  # a liveness signal -- it is the point at which "Falco is not coming"
+  # becomes more useful than waiting silently.
+  # @schema type:integer minimum:1 effect:"seconds to wait for the Falco socket to appear before failing" ref:NFR11
+  waitTimeoutSeconds: 180
+  # A shell, stat, chmod and chgrp. Any busybox-compatible image works.
+  # Air-gapped installs override the repository to their mirror (see
+  # values-airgapped.yaml).
+  image:
+    repository: busybox
+    tag: "1.37.0"
+    pullPolicy: IfNotPresent
+  # Deliberately tiny: this container sleeps almost all of the time.
+  resources:
+    limits:
+      cpu: 50m
+      memory: 32Mi
+    requests:
+      cpu: 5m
+      memory: 16Mi
+
 falco:
   enabled: true
   driver:
-    kind: ebpf
+    # `modern_ebpf` is CO-RE: one prebuilt probe that relocates itself against
+    # the running kernel's BTF. It needs NO kernel headers and compiles NOTHING
+    # at pod start.
+    #
+    # Epic 9: this was `ebpf`, the LEGACY driver, which runs falco-driver-loader
+    # to BUILD a probe on the node. On any node without kernel headers -- kind,
+    # minikube, Bottlerocket, Container-Optimized OS, most managed node images --
+    # the init container dies:
+    #
+    #   mount: /sys/kernel/debug: permission denied
+    #   make[1]: *** /lib/modules/<kernel>/build: No such file or directory
+    #   ERROR failed: failed to build all requested drivers
+    #
+    # Reproduced on kind (kernel 7.0.0-29-generic) before the change. Falco has
+    # defaulted to modern_ebpf since 0.40, and the bundled subchart is 8.0.2, so
+    # this default was inherited from an older chart and never revisited.
+    #
+    # Requires BTF (CONFIG_DEBUG_INFO_BTF) and kernel >= 5.8, true for every
+    # current mainstream node image. On an older kernel, set this back to `ebpf`
+    # (needs headers) or `kmod`. preflight.sh reports the node kernel so the
+    # operator can tell before installing.
+    kind: modern_ebpf
   # Falco's gRPC server -- both `grpc.enabled` and `grpc_output.enabled`
   # must be on for the collector to subscribe.
   falco:
     grpc:
       enabled: true
       bind_address: "unix:///run/falco/falco.sock"
+      # Falco creates this socket 0755 root:root and exposes no key to change
+      # that, so the non-root collector cannot connect to it (Blocker 8,
+      # found 2026-08-31 on 3-node kubeadm). FIXED in Story 9.6 by the
+      # `falcoSocketPermissions` block above, which re-applies 0660 + the
+      # collector's group from the collector's own pod. Set
+      # falcoSocketPermissions.enabled=false and this limitation comes back.
     grpc_output:
       enabled: true
 
@@ -1294,8 +1455,26 @@ nats:
   # does not return err 10047 ("not enough storage"). Production
   # leaves this empty and sizes nats.persistence.size to accommodate
   # the configured sum, rather than overriding fileStore.maxSize.
+  # Epic 9: this defaulted to "" (no override), which made the DEFAULT install
+  # unstartable on any cluster whose storage is smaller than the declared
+  # retention. streams.go declares EVENTS 10 GiB + EVENTS_RAW 50 GiB +
+  # THREATS 100 GiB = 160 GiB, while nats.persistence.size defaults to 10 Gi.
+  # JetStream reserves against the file store up front, so EVENTS_RAW alone
+  # exhausted the volume and the aggregator died on its first stream:
+  #
+  #   ensure stream EVENTS_RAW: nats: API error: code=500 err_code=10047
+  #   description=insufficient storage resources available
+  #
+  # Filed as issue #96 and previously treated as a kind/quickstart quirk. It is
+  # not: 160 GiB of declared retention against a 10 Gi default volume fails
+  # everywhere, and reproduced here on a healthy bound 10Gi PVC.
+  #
+  # 512 MiB x 11 streams = 5.5 GiB, which fits the 10 Gi default with headroom
+  # and matches the value CI already proved on kind. Operators running real
+  # retention raise nats.persistence.size AND clear this override together --
+  # the pairing is the point, and NOTES.txt says so at install time.
   # @schema type:string pattern:"byte count as a string (e.g. 1073741824), or empty for production sizing" effect:"per-stream JetStream MaxBytes override for small kind/CI PVCs; empty leaves production retention sized by nats.persistence.size" ref:NFR3
-  streamMaxBytesOverride: ""
+  streamMaxBytesOverride: "536870912"
 
 # Redis -- state store (per-workload baselines, FSM state, checkpoints).
 # Standalone architecture is enough for the single-aggregator MVP;

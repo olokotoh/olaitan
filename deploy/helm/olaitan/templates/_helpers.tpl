@@ -343,3 +343,367 @@ that work for in-namespace clients break for cross-namespace dialers.
 {{- define "olaitan.auditWebhookServiceFqdn" -}}
 {{- printf "%s-audit-webhook.%s.svc.cluster.local" (include "olaitan.fullname" .) .Release.Namespace -}}
 {{- end -}}
+
+{{/*
+Falco socket helpers (Story 9.6).
+
+`endpoints.falco` is either a unix:// path (the default: the collector
+opens the socket the node's Falco DaemonSet created) or a tcp:// target
+(an off-node Falco reached over the pod network). Everything the socket
+permission fixer renders is gated on the unix:// case, because there is
+no socket to chmod in the tcp:// case.
+*/}}
+{{- define "olaitan.falcoSocket.isUnix" -}}
+{{- if hasPrefix "unix://" .Values.endpoints.falco -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+Absolute path of the Falco gRPC socket, taken from the same value the
+collector dials so the fixer can never chmod a different file than the
+one that is failing.
+*/}}
+{{- define "olaitan.falcoSocket.path" -}}
+{{- trimPrefix "unix://" .Values.endpoints.falco -}}
+{{- end -}}
+
+{{/*
+Whether the Falco socket permission fixer renders at all.
+
+Off when the operator disabled it, and forced off for a tcp:// endpoint:
+there is no socket to chmod when Falco is reached over the pod network,
+so a tcp:// deployment must render neither the container nor the
+read-write host mount.
+*/}}
+{{- define "olaitan.falcoSocket.fixerEnabled" -}}
+{{- $fix := default (dict) .Values.falcoSocketPermissions -}}
+{{- if and $fix.enabled (include "olaitan.falcoSocket.isUnix" .) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+The Falco socket permission fixer container (Story 9.6).
+
+Defined once and injected into one of two lists by daemonset.yaml:
+`initContainers` with restartPolicy: Always (the native sidecar, ordered
+before the collector's first dial), or `containers` (a plain sidecar for
+clusters with the SidecarContainers gate disabled). The container body
+is identical either way -- only the placement and restartPolicy differ,
+which is why this is a shared template rather than two copies that could
+drift.
+
+Call with: (dict "ctx" $ "native" true|false)
+*/}}
+{{- define "olaitan.falcoSocket.fixerContainer" -}}
+{{- $ctx := .ctx -}}
+{{- $fix := $ctx.Values.falcoSocketPermissions -}}
+{{- $sock := include "olaitan.falcoSocket.path" $ctx -}}
+- name: falco-socket-permissions
+  image: "{{ $fix.image.repository }}:{{ $fix.image.tag }}"
+  imagePullPolicy: {{ $fix.image.pullPolicy }}
+  {{- if .native }}
+  # Native sidecar (KEP-753): an initContainers entry with
+  # restartPolicy: Always starts before the collector and keeps running
+  # beside it. Ordering is the reason this is the default -- the socket
+  # is already group-writable when the collector makes its first dial.
+  restartPolicy: Always
+  {{- end }}
+  command: ["/bin/sh", "-c"]
+  args:
+    - |
+      set -u
+      SOCK={{ $sock | quote }}
+      MODE={{ $fix.socketMode | quote }}
+      GID={{ $fix.socketGroup | toString | quote }}
+      INTERVAL={{ $fix.intervalSeconds | toString | quote }}
+      TIMEOUT={{ $fix.waitTimeoutSeconds | toString | quote }}
+
+      log() { echo "falco-socket-permissions: $*"; }
+
+      # Validate the injected values once, loudly. `set -u` is satisfied by
+      # an EMPTY variable, so an unquoted null (--set intervalSeconds=null)
+      # used to render `INTERVAL=` and turn the reconcile loop into a busy
+      # spin on `sleep ""` that never timed out and never logged why.
+      case "$INTERVAL" in ''|*[!0-9]*) log "FATAL: intervalSeconds must be a positive integer, got '$INTERVAL'"; exit 2 ;; esac
+      case "$TIMEOUT"  in ''|*[!0-9]*) log "FATAL: waitTimeoutSeconds must be a positive integer, got '$TIMEOUT'"; exit 2 ;; esac
+      case "$GID"      in ''|*[!0-9]*) log "FATAL: socketGroup must be a numeric GID, got '$GID'"; exit 2 ;; esac
+      # Octal digits only. YAML reads an unquoted 0660 as the INTEGER 660,
+      # which chmod would apply as mode 0432 -- group bits 3, still passing a
+      # naive group-writable check while granting the wrong permissions.
+      case "$MODE"     in ''|*[!0-7]*) log "FATAL: socketMode must be quoted octal digits (e.g. \"0660\"), got '$MODE'"; exit 2 ;; esac
+
+      log "holding $SOCK at mode $MODE group $GID, re-checking every ${INTERVAL}s"
+
+      # Wait for Falco to create the socket. Driver load can take a minute or
+      # more on first start, so a slow appearance is normal and only a total
+      # absence is worth failing on.
+      wait_for_socket() {
+        waited=0
+        [ -S "$SOCK" ] || log "waiting for $SOCK to appear (Falco may still be loading its driver; up to ${TIMEOUT}s)"
+        while [ ! -S "$SOCK" ]; do
+          if [ "$waited" -ge "$TIMEOUT" ]; then
+            log "$SOCK did not appear within ${TIMEOUT}s."
+            log "Is Falco running on this node, and is endpoints.falco the path it binds?"
+            return 1
+          fi
+          sleep 1
+          waited=$((waited + 1))
+        done
+        return 0
+      }
+
+      # Apply, then RE-READ from the filesystem and check the result.
+      # A previous attempt at this fix set a Falco config key that does not
+      # exist: the render looked right, Falco ignored it, and the socket
+      # stayed 0755. Reporting success without observing the outcome is how
+      # that would have shipped, so this verifies.
+      #
+      # Returns 0 applied and verified, 1 a real failure, 2 the socket
+      # vanished mid-check. The difference between 1 and 2 matters: 2 is what
+      # a Falco restart looks like from here, and treating it as a failure
+      # would exit the container and turn a five-second Falco roll into a
+      # CrashLoopBackOff whose backoff climbs to five minutes -- during which
+      # the socket sits at 0755 and the collector ingests nothing.
+      apply_once() {
+        before="$(stat -c '%a %u:%g' "$SOCK" 2>/dev/null)" || return 2
+        chgrp "$GID" "$SOCK" 2>/dev/null
+        chmod "$MODE" "$SOCK" 2>/dev/null
+        after="$(stat -c '%a %u:%g' "$SOCK" 2>/dev/null)" || return 2
+        [ "$before" != "$after" ] && log "$SOCK $before -> $after"
+
+        cur_gid="$(stat -c '%g' "$SOCK" 2>/dev/null)" || return 2
+        cur_mode="$(stat -c '%a' "$SOCK" 2>/dev/null)" || return 2
+
+        # BOTH properties the collector needs are checked, because either one
+        # alone is insufficient. Checking only the mode passed a socket left
+        # in the wrong group entirely (a mistyped socketGroup, or a dropped
+        # CAP_CHOWN making chgrp a no-op) while the collector stayed locked
+        # out -- the exact regression this container exists to prevent.
+        if [ "$cur_gid" != "$GID" ]; then
+          log "FAILED: $SOCK is group $cur_gid, not $GID. The collector cannot connect."
+          log "chgrp did not take effect. It needs CAP_CHOWN, which an admission"
+          log "policy may have stripped (OpenShift SCCs disallow added capabilities"
+          log "by default). Check falcoSocketPermissions.socketGroup matches the"
+          log "collector's runAsGroup, and that CHOWN survived admission."
+          return 1
+        fi
+
+        # Normalise before reading a digit by position: stat -c %a emits no
+        # leading zeros, so mode 7 prints "7" and mode 60 prints "60". Taking
+        # a fixed offset from the end of that read the OTHER digit as the
+        # group digit and reported success on a socket the group could not
+        # touch.
+        norm="$(printf '%04d' "$cur_mode" 2>/dev/null)"
+        case "$norm" in
+          [0-7][0-7][0-7][0-7]) : ;;
+          *) log "FAILED: cannot read a file mode from $SOCK (stat said '$cur_mode')"; return 1 ;;
+        esac
+        group_digit="$(printf '%s' "$norm" | cut -c3)"
+        case "$group_digit" in
+          2|3|6|7) return 0 ;;
+          *) log "FAILED: $SOCK is mode $cur_mode, so group $GID has no write permission."
+             log "Connecting to a unix socket requires write permission; the collector cannot attach."
+             return 1 ;;
+        esac
+      }
+
+      # Hold the permission for the life of the pod. A one-shot fix is not
+      # enough: a Falco restart deletes and recreates the socket at 0755, and
+      # an init container does not re-run when an app container restarts, so
+      # the collector would be locked out until its pod was recreated by hand.
+      while true; do
+        if [ ! -S "$SOCK" ]; then
+          wait_for_socket || exit 1
+        fi
+        apply_once
+        rc=$?
+        if [ "$rc" -eq 1 ]; then
+          exit 1
+        fi
+        sleep "$INTERVAL"
+      done
+  securityContext:
+    # Root, because only the socket's owner may chmod it and chgrp to a
+    # group the process is not in needs CAP_CHOWN. This container does
+    # nothing else: no network, no untrusted input, no long-lived
+    # parsing. Running the COLLECTOR as root was the rejected
+    # alternative -- that would put a root process on the hot path of
+    # untrusted event data, which NFR11 exists to prevent.
+    runAsUser: 0
+    runAsGroup: 0
+    runAsNonRoot: false
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+      add:
+        # CHOWN, and only CHOWN: chgrp to a group this process is not a
+        # member of. chmod itself needs nothing, because the socket is
+        # root-owned and so is this container.
+        #
+        # FOWNER was here as a hedge for a Falco running under a custom
+        # non-root securityContext, whose socket we would not own. Dropped:
+        # every added capability is another thing an admission policy has to
+        # allow (OpenShift SCCs disallow added capabilities by default, so
+        # each one is a separate hurdle), and the hedge covers a case the
+        # chart never creates. If you run Falco as non-root, chmod fails and
+        # this container says so and exits rather than looping quietly; add
+        # FOWNER here and to your SCC at that point.
+        - CHOWN
+    seccompProfile:
+      type: RuntimeDefault
+  resources:
+    {{- toYaml $fix.resources | nindent 4 }}
+  volumeMounts:
+    # Read-WRITE, unlike the collector's own mount. Changing an inode's
+    # mode is a write; a read-only bind mount would return EROFS.
+    - name: falco-socket
+      mountPath: {{ dir $sock | quote }}
+{{- end -}}
+
+{{/*
+Capability detection (Story 9.3).
+
+Until now the chart never consulted `.Capabilities` at all: it installed
+the same way everywhere and told the operator nothing about what it had
+concluded. These helpers exist so NOTES.txt can report what is ON, what
+is OFF and WHY, in the operator's own cluster's terms.
+
+A hard rule runs through all of them: never claim a platform we have not
+actually observed. `helm template` renders offline with a stub
+KubeVersion and an empty APIVersions set, and several real platforms
+carry no distinguishing marker at all, so "unknown" is a normal and
+honest answer. NOTES.txt says which of "declared" or "detected" it is
+using, and an operator who needs certainty sets `platform` explicitly.
+*/}}
+
+{{/*
+Platform identifier: one of eks, aks, gke, k3s, rke2, openshift, kind,
+minikube, or "" when it could not be established.
+
+Detection order is deliberate. An explicit `platform` value always wins,
+because the operator knows more than we can infer. After that, only
+signals that are genuinely diagnostic are used:
+
+  - security.openshift.io/v1 is served only by OpenShift.
+  - The API server's git version carries a vendor suffix on EKS
+    (v1.29.15-eks-...), GKE (v1.29.7-gke.1...), k3s (v1.29.4+k3s1) and
+    RKE2 (+rke2r1).
+
+AKS is deliberately absent: it reports an unmodified upstream version
+string and serves no distinguishing API group, so there is nothing to
+detect and guessing would be worse than saying "unknown". Operators on
+AKS set `platform: aks` (values-aks.yaml does).
+*/}}
+{{- define "olaitan.platform" -}}
+{{- if .Values.platform -}}
+{{- .Values.platform -}}
+{{- else if .Capabilities.APIVersions.Has "security.openshift.io/v1" -}}
+openshift
+{{- else -}}
+{{- $v := .Capabilities.KubeVersion.GitVersion | default .Capabilities.KubeVersion.Version | toString -}}
+{{- if contains "-eks" $v -}}eks
+{{- else if contains "-gke." $v -}}gke
+{{- else if contains "+k3s" $v -}}k3s
+{{- else if contains "+rke2" $v -}}rke2
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+How the platform was arrived at: "declared" (the operator set it),
+"detected" (we observed it), or "unknown". NOTES.txt prints this so an
+operator can tell an observation from an assumption.
+*/}}
+{{- define "olaitan.platformSource" -}}
+{{- if .Values.platform -}}declared
+{{- else if include "olaitan.platform" . -}}detected
+{{- else -}}unknown
+{{- end -}}
+{{- end -}}
+
+{{/*
+True on a managed control plane. This is the one capability question with
+a hard, non-negotiable answer: the K8s audit webhook needs
+`--audit-webhook-config-file` on kube-apiserver, and EKS, AKS and GKE do
+not expose kube-apiserver flags at all. No flag, no workaround, no
+support ticket. The setting is not "hard" on those platforms, it is
+inert, and an operator who turns it on gets silence rather than an error.
+*/}}
+{{- define "olaitan.isManagedControlPlane" -}}
+{{- if has (include "olaitan.platform" .) (list "eks" "aks" "gke") -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+A NetworkPolicy implementation we can actually see, or "" when we cannot.
+
+This is NOT a claim that policies are enforced. A cluster can serve these
+CRDs and still not enforce (and, more dangerously, can accept a
+NetworkPolicy object and silently ignore it -- proven on stock kind). The
+only honest test is the runtime probe in hack/check-netpol-enforcement.sh,
+which sends real traffic. This helper exists so NOTES.txt can say "we can
+see Calico here, but you have not proven enforcement" rather than
+implying either more or less than it knows.
+*/}}
+{{- define "olaitan.networkPolicyProvider" -}}
+{{- if or (.Capabilities.APIVersions.Has "crd.projectcalico.org/v1") (.Capabilities.APIVersions.Has "operator.tigera.io/v1") (.Capabilities.APIVersions.Has "projectcalico.org/v3") -}}Calico
+{{- else if .Capabilities.APIVersions.Has "cilium.io/v2" -}}Cilium
+{{- end -}}
+{{- end -}}
+
+{{/*
+Guard: when the BUNDLED Falco subchart is enabled, the socket the collector
+dials and the socket Falco binds must be the same file.
+
+There are two independent settings for one path -- `endpoints.falco` (what
+the collector opens, and now what the DaemonSet mounts) and
+`falco.falco.grpc.bind_address` (what Falco binds) -- and nothing made them
+agree. Change one and the hostPath mounts a directory Falco never writes
+into: with `type: Directory` the pod does not schedule at all if that
+directory is absent, or, if it happens to exist, the collector waits on a
+socket that will never appear and the permission fixer times out. Neither
+failure names the actual cause.
+
+Only checked when we own both sides. An operator running their own Falco
+(`falco.enabled=false`) is responsible for pointing `endpoints.falco` at
+whatever their DaemonSet binds, and we have no way to know what that is.
+*/}}
+{{- define "olaitan.falcoSocket.validateBundled" -}}
+{{- if and .Values.falco.enabled (include "olaitan.falcoSocket.isUnix" .) -}}
+{{- $bind := "" -}}
+{{- if .Values.falco.falco -}}
+{{- if .Values.falco.falco.grpc -}}
+{{- $bind = default "" .Values.falco.falco.grpc.bind_address -}}
+{{- end -}}
+{{- end -}}
+{{- if and $bind (ne $bind .Values.endpoints.falco) -}}
+{{- fail (printf "endpoints.falco (%s) and falco.falco.grpc.bind_address (%s) name different sockets, but the bundled Falco subchart is enabled. The collector would mount and dial a socket Falco never creates. Set both to the same unix:// path, or disable the bundled Falco (falco.enabled=false) if you run your own." .Values.endpoints.falco $bind) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The collector's GID, in one place.
+
+It was written twice: as a literal `runAsGroup: 65532` in the pod's
+securityContext, and as `falcoSocketPermissions.socketGroup` in values. The
+values comment claimed "changing one without the other silently reinstates
+the crash-loop, so the helm suite asserts they agree" -- but the suite only
+ever checked the DEFAULT render, so any non-default socketGroup sailed
+through every test and chgrp'd Falco's socket to a group the collector is
+not in. The permission holder then verified the mode, saw group-write, and
+reported success on a socket the collector still could not open.
+
+Now the daemonset renders this helper and the guard below refuses a
+disagreement at render time, so the comment is true.
+*/}}
+{{- define "olaitan.collector.runAsGroup" -}}65532{{- end -}}
+
+{{- define "olaitan.falcoSocket.validateGroup" -}}
+{{- if eq (include "olaitan.falcoSocket.fixerEnabled" .) "true" -}}
+{{- $want := include "olaitan.collector.runAsGroup" . -}}
+{{- $got := .Values.falcoSocketPermissions.socketGroup | toString -}}
+{{- if ne $got $want -}}
+{{- fail (printf "falcoSocketPermissions.socketGroup is %s but the collector runs as group %s. The socket would be chgrp'd to a group the collector is not a member of, and it still could not connect -- the exact failure this container exists to prevent, except silent, because the mode would look correct. Set socketGroup=%s, or disable the permission holder (falcoSocketPermissions.enabled=false) if you are managing the socket yourself." $got $want $want) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}

@@ -1,0 +1,57 @@
+# Azure AKS (Standard) overlay.
+#
+#   helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan \
+#     -f values-aks.yaml --namespace olaitan --create-namespace
+#
+# Deltas only, cited from docs/platform-support-matrix.md (researched
+# 2026-08-30 against the Azure AKS documentation). Template-verified, NOT
+# verified: the chart renders and validates for AKS, nothing here has been run
+# on one.
+#
+# AKS AUTOMATIC IS BLOCKED. It enforces Deployment Safeguards plus the Baseline
+# Pod Security Standards, and per Microsoft "the baseline Pod Security Standards
+# in AKS Automatic can't be turned off". Privileged containers, hostPath and
+# host namespaces are all refused at admission, so Falco cannot run. The only
+# escape hatch is excluding this namespace from Deployment Safeguards. Use AKS
+# Standard.
+
+# AKS is the one platform that cannot be auto-detected: it reports an
+# unmodified upstream API server version and serves no distinguishing API
+# group. Declaring it here is what lets NOTES.txt tell you the audit webhook is
+# impossible rather than merely off.
+platform: aks
+
+falco:
+  driver:
+    # UNCERTAIN, and worth checking before you rely on it: whether the
+    # Azure-flavoured Ubuntu 5.15 and Azure Linux 3.0 node kernels are built
+    # with CONFIG_DEBUG_INFO_BTF, which modern eBPF requires. Verify on a node:
+    #   bpftool feature probe kernel | grep "map_type ringbuf is available"
+    # If BTF is absent, fall back to driver.kind=kmod rather than `ebpf`, which
+    # needs headers AKS node images do not ship.
+    kind: modern_ebpf
+
+auditWebhook:
+  # IMPOSSIBLE on AKS. The API server is managed and does not expose
+  # --audit-webhook-config-file. AKS audit data leaves through Azure Monitor /
+  # Event Hub, which needs a pull adapter Olaitan does not implement yet
+  # (Falco's k8saudit-aks plugin is the documented cheap path).
+  enabled: false
+
+response:
+  networkPolicy:
+    # Left OFF. A stock AKS cluster is created with NO network policy engine,
+    # so policies are accepted and ignored. Selecting Azure NPM or Cilium at
+    # cluster-creation time is the only way to get enforcement, and it cannot
+    # be added to an existing cluster's node pools without recreation.
+    # Confirm with hack/check-netpol-enforcement.sh before enabling.
+    enabled: false
+
+# STORAGE. AKS ships a working `default` StorageClass, so no override is
+# needed. Do NOT try to patch it: "AKS reconciles the default storage classes
+# and will overwrite any changes you make."
+#
+# ADMISSION. Deployment Safeguards in Enforce mode also deny on best-practice
+# rules unrelated to privilege (missing resource limits, missing probes,
+# :latest image tags), so chart defaults can trip checks that have nothing to
+# do with Olaitan's privileges. Run Safeguards at level Warn first.

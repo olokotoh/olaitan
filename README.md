@@ -68,6 +68,69 @@ NetworkPolicies. Turning it on is a deliberate act, and you should set
 `response.networkPolicy.clusterCidrs` to your cluster's real CIDRs first or
 egress blocking under RESTRICTED will take DNS with it.
 
+Run this first, against whatever cluster you are pointed at:
+
+```bash
+hack/preflight.sh      # or: make preflight
+```
+
+It probes storage, privileged-workload admission, NetworkPolicy **enforcement**
+and each optional source, and prints `yes` / `no` / `BLOCKER` with the exact
+remedy flag for each. It changes nothing. After the install, the chart's
+`NOTES.txt` tells you the same thing from inside: what it detected, which
+sources are on, which are off, and why.
+
+### Where it runs
+
+| Platform | Install | NetworkPolicy enforced | Audit webhook | Overlay |
+| --- | --- | --- | --- | --- |
+| kind | ✅ verified | ❌ no (kindnet accepts and ignores) | ✅ possible | `values-kind.yaml` |
+| kubeadm | ⚠️ verified 2026-08-31, see note | depends on your CNI | ✅ possible | (defaults) |
+| k3s / k3d | template-verified | ✅ (kube-router) | ✅ possible | `values-k3s.yaml` |
+| minikube | template-verified | ❌ unless `--cni=calico` | ✅ possible | `values-minikube.yaml` |
+| EKS (EC2) | template-verified | ❌ until VPC CNI policy enabled | ❌ impossible | `values-eks.yaml` |
+| AKS Standard | template-verified | ❌ unless an engine was chosen | ❌ impossible | `values-aks.yaml` |
+| GKE Standard | template-verified | ✅ with Dataplane V2 | ❌ impossible | `values-gke.yaml` |
+| OpenShift | template-verified | ✅ (OVN-Kubernetes) | ✅ possible | `values-openshift.yaml` |
+| EKS Fargate | ❌ impossible | n/a | n/a | n/a |
+| AKS Automatic | ❌ blocked | n/a | n/a | n/a |
+| GKE Autopilot | ❌ blocked | n/a | n/a | n/a |
+
+`verified` means installed and observed on a live cluster of that type.
+`template-verified` means the chart renders and validates for it and nothing
+was run there. Rendering is not running, and the two are never blurred; the
+cited, per-platform detail is in
+[docs/platform-support-matrix.md](docs/platform-support-matrix.md).
+
+**The kubeadm caveat, stated here rather than only in the matrix.** The
+2026-08-31 kubeadm run established that the chart installs and every workload
+schedules. It also found that the collector could not attach to Falco's
+socket at all, so the primary detection source was dead on that cluster. That
+defect is fixed, and the fix has **not been re-run on kubeadm** -- it was
+verified in containers and on kind. Treat the kubeadm row as "installs, and
+the known blocker is fixed but unconfirmed there".
+
+"Impossible" above means the K8s audit webhook specifically, and it is the
+only capability with a hard platform limit: it needs
+`--audit-webhook-config-file` on kube-apiserver, and no managed provider
+exposes kube-apiserver flags. There is no workaround, only a different route
+in through the cloud's own log pipeline, which Olaitan does not implement yet.
+
+The other two optional sources are often described as needing a self-managed
+control plane. They do not. The containerd CRI sensor needs a **host socket**
+at a path that matches your runtime (see `values-k3s.yaml` and
+`values-eks.yaml`, which ship the right paths for those platforms), and the
+Calico flow adapter needs **Calico**. Both are off by default, and both are
+available on managed platforms.
+
+A default install does mount one hostPath from Olaitan's own templates: the
+directory holding Falco's gRPC socket, which the collector reads and a small
+root container writes to once per interval so a non-root collector can open
+it at all (see `falcoSocketPermissions` in `values.yaml`). That is the whole
+of Olaitan's own host access on a default render; the other thirteen hostPath
+mounts come from the bundled Falco subchart. Set `endpoints.falco` to a
+`tcp://` target and Olaitan mounts nothing from the host.
+
 ## How this differs from Falco alone
 
 Falco is one of Olaitan's five inputs, and an excellent one. The difference is
@@ -94,14 +157,26 @@ Read this section before trusting it with anything.
   yet.** The evaluation harness, scenarios and analysis pipeline are complete
   and reproducible, but the campaign that produces MTTD and FPR against a live
   cluster has not been run. Do not cite performance figures from this repo.
-- **Kubeadm clusters only.** Managed control planes (EKS, GKE, AKS) are out of
-  scope: the audit webhook needs `--audit-webhook-config-file` on the API
-  server, which managed providers do not expose, and the CNI flow adapter needs
-  Calico installed via the Tigera operator, which conflicts with cloud CNIs.
-- **Falco's eBPF driver needs kernel 6.5 or newer.** On older kernels the
-  subchart can fall back to the kernel module, but nothing here was measured
-  that way.
-- **Targets Kubernetes 1.29.** The chart's `kubeVersion` floor is `>=1.29.0`.
+- **NetworkPolicy enforcement is your CNI's job, not Olaitan's.** Olaitan
+  reports a workload `QUARANTINED` once it has written the policy. On a cluster
+  whose CNI does not enforce NetworkPolicy the API server accepts every policy
+  and the data plane ignores all of them, so the workload keeps full network
+  access while the tool says it is contained. Stock kind, stock EKS (VPC CNI)
+  and stock AKS all behave this way. Enforcement is **off by default** for this
+  reason. Before turning it on, run `hack/check-netpol-enforcement.sh`, which
+  pushes real traffic through a deny-all policy and tells you which world you
+  are in.
+- **Falco's modern eBPF driver needs BTF (`CONFIG_DEBUG_INFO_BTF`) and kernel
+  5.8 or newer.** True of mainstream node images we have checked, and NOT
+  confirmed for AKS's Azure Ubuntu 5.15 and Azure Linux 3.0 images, which are
+  on the open-questions list in
+  [the support matrix](docs/platform-support-matrix.md). Check a node with
+  `bpftool feature probe kernel | grep ringbuf`. On a kernel without BTF, set
+  `falco.driver.kind=kmod`; `hack/preflight.sh` reports the node kernel so you
+  can tell before installing.
+- **Targets Kubernetes 1.29 and newer.** The chart's `kubeVersion` floor is
+  `>=1.29.0`, and it is load-bearing rather than conservative: the collector's
+  Falco-socket permission container is a native sidecar, which needs 1.29.
 - **The LLM tier costs money and adds latency.** It is off by default for both
   reasons. Everything except tier-3 reasoning works with it disabled.
 - **The agent writes NetworkPolicies into your cluster when enforcement is on.**

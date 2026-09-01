@@ -5,6 +5,23 @@ canonical home of the project's Architectural Decision Records (ADRs):
 the load-bearing decisions and reusable patterns are recorded here so
 their rationale survives the people who made them.
 
+## A note on `[Source: architecture.md:NNN]` citations
+
+Comments across the chart and the Go source carry citations of the form
+`[Source: architecture.md:130-131]` or `[Source: prd.md#FR7]`. Those two
+documents are **not in this repository** and following the reference will
+not work.
+
+They are the planning artefacts for the academic project this code was
+built as, and they live alongside the thesis rather than the code. The
+citations are kept because they record *why* a given default or constraint
+exists and which requirement it traces to, which is worth more than a
+tidier comment. Read them as provenance, not as links.
+
+Everything a citation asserts that matters operationally is also stated in
+plain terms next to it, so no behaviour depends on having the source
+document. Where it is not, that is a documentation bug worth reporting.
+
 ## Architecture Decision Records
 
 Each ADR follows a consistent decision-record structure. The

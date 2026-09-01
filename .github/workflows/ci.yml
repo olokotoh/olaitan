@@ -238,8 +238,233 @@ jobs:
                 -schema-location default \
                 -skip CustomResourceDefinition
 
+      # Story 9.5 AC2: the platforms CI cannot run for free still have to be
+      # kept honest. Every shipped platform overlay is linted and rendered, and
+      # the render is schema-validated with kubeconform. This is the evidence
+      # behind the `template-verified` rows in docs/platform-support-matrix.md
+      # and the README's support table -- and it is ONLY that. Rendering is not
+      # running, and no row is promoted to `verified` on the strength of this
+      # step.
+      #
+      # Every overlay is checked at 1.29.0, the chart's kubeVersion floor,
+      # because that is the oldest API surface the chart claims to support and
+      # therefore the version at which a removed/renamed field would bite
+      # first. Deliberately not a per-platform minimum table: the vendors'
+      # supported-version windows move on their own schedule, and a number we
+      # cannot cite from their docs on the day CI runs would be a claim we have
+      # not earned.
+      - name: helm lint + kubeconform (platform overlays)
+        run: |
+          set -euo pipefail
+          fail=0
+          for o in kind minikube k3s eks aks gke openshift; do
+            echo "== platform overlay: $o =="
+            helm lint deploy/helm/olaitan \
+              -f "deploy/helm/olaitan/values-$o.yaml" \
+              --set secrets.redisPassword=ci-fake-password || fail=1
+            helm template deploy/helm/olaitan --generate-name \
+                -f "deploy/helm/olaitan/values-$o.yaml" \
+                --set secrets.redisPassword=ci-fake-password \
+              | kubeconform -strict -summary \
+                  -kubernetes-version 1.29.0 \
+                  -schema-location default \
+                  -skip CustomResourceDefinition || fail=1
+          done
+          exit $fail
+
       - name: Helm Go test suite
         run: go test ./deploy/helm/... -tags=helm -count=1 -v
+
+  # Story 9.5 AC1/AC3: portability claims backed by a job that fails when they
+  # break, so the support matrix cannot rot into fiction.
+  #
+  # This installs the chart the way a stranger would -- from the tree, with no
+  # flags beyond a password -- on three distributions that behave differently
+  # in the ways that have actually bitten: kind (no NetworkPolicy enforcement,
+  # no kernel headers), minikube (a different node image and CNI), k3s (its own
+  # bundled containerd at a non-standard socket path, and a policy controller
+  # that DOES enforce).
+  #
+  # The NetworkPolicy enforcement probe runs on each of them and its verdict is
+  # uploaded, so the enforcement column of docs/platform-support-matrix.md is
+  # generated from evidence rather than written by hand. The probe result does
+  # NOT fail the build: "kindnet does not enforce" is a true fact about kind,
+  # not a regression. What fails the build is a workload that never reaches
+  # Ready.
+  portability:
+    runs-on: ubuntu-latest
+    strategy:
+      # Never cancel the other two on the first failure: knowing that a change
+      # broke kind but not k3s is most of the diagnosis.
+      fail-fast: false
+      matrix:
+        distro: [kind, minikube, k3s]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      # Falco watches container lifecycle through inotify and dies with
+      # "could not initialize inotify handler" when the per-user instance limit
+      # is exhausted. GitHub runners ship a limit low enough to hit this, and
+      # it is a HOST limit invisible from kubectl -- the same trap
+      # hack/preflight.sh reports for local clusters.
+      - name: Raise inotify limits
+        run: |
+          sudo sysctl -w fs.inotify.max_user_instances=512
+          sudo sysctl -w fs.inotify.max_user_watches=524288
+
+      - name: Create cluster (kind)
+        if: matrix.distro == 'kind'
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: olaitan-portability
+          node_image: kindest/node:v1.29.14
+
+      - name: Create cluster (minikube)
+        if: matrix.distro == 'minikube'
+        # Pinned like the other actions in this file. An unpinned third-party
+        # action in a job that installs into a cluster is a supply-chain hole.
+        uses: medyagh/setup-minikube@v0.0.19
+        with:
+          kubernetes-version: v1.29.14
+          driver: docker
+          addons: storage-provisioner
+
+      - name: Create cluster (k3s)
+        if: matrix.distro == 'k3s'
+        run: |
+          # Fetch, then run. `curl | sh` executes a remote script nothing
+          # ever saw: the exact bytes are not in the log, so a failure (or a
+          # compromised upstream) leaves nothing to diagnose against. Writing
+          # it to disk first means the checksum and the script are both
+          # recoverable from the run.
+          curl -sfL https://get.k3s.io -o /tmp/k3s-install.sh
+          sha256sum /tmp/k3s-install.sh
+          INSTALL_K3S_VERSION=v1.29.14+k3s1 sh /tmp/k3s-install.sh
+          mkdir -p "$HOME/.kube"
+          sudo k3s kubectl config view --raw > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          echo "KUBECONFIG=$HOME/.kube/config" >> "$GITHUB_ENV"
+
+      - name: Preflight
+        run: |
+          # Informational: preflight exits 1 on a blocker, and "kindnet does
+          # not enforce NetworkPolicy" is a blocker it correctly reports on a
+          # cluster we install on anyway (enforcement is off by default). The
+          # output is the point, not the exit code.
+          hack/preflight.sh || true
+
+      - name: Fetch subchart dependencies
+        run: |
+          helm repo add falcosecurity https://falcosecurity.github.io/charts
+          helm repo add nats https://nats-io.github.io/k8s/helm/charts/
+          helm repo update
+          make helm-prepare
+          helm dependency update deploy/helm/olaitan
+
+      # The overlay for this distribution, exactly as an operator would use it.
+      # A typo in an overlay that makes it unusable fails here rather than in
+      # someone else's cluster.
+      - name: helm install
+        run: |
+          helm install olaitan deploy/helm/olaitan \
+            -f "deploy/helm/olaitan/values-${{ matrix.distro }}.yaml" \
+            --namespace olaitan --create-namespace \
+            --set secrets.redisPassword=ci-fake-password \
+            --wait --timeout 12m
+
+      # The actual assertion. Every workload the chart ships must reach Ready
+      # on every distribution, so a regression on any one of them fails the
+      # build. `helm install --wait` already covers most of this; the explicit
+      # rollout waits name WHICH workload stalled instead of timing out
+      # anonymously.
+      - name: Assert every workload is Ready
+        run: |
+          set -euo pipefail
+          kubectl -n olaitan rollout status ds/olaitan-collector --timeout=5m
+          kubectl -n olaitan rollout status deploy/olaitan-aggregator --timeout=5m
+          kubectl -n olaitan rollout status ds/olaitan-falco --timeout=5m
+          kubectl -n olaitan get pods -o wide
+
+      # Story 9.6 regression guard, and the reason this job exists at all.
+      # Falco creates its gRPC socket 0755 root:root; the collector runs as UID
+      # 65532 and cannot connect to it. On kind the two share an effective
+      # identity so the dial succeeds regardless, which is exactly why the
+      # defect survived every previous test -- so assert the collector's Falco
+      # source is actually live rather than trusting a Ready pod.
+      - name: Assert the collector attached to Falco
+        run: |
+          set -euo pipefail
+          if kubectl -n olaitan logs -l app.kubernetes.io/component=collector \
+               --tail=-1 --all-containers | grep -q "connect: permission denied"; then
+            echo "::error::collector cannot attach to Falco's socket (Blocker 8 regression)"
+            kubectl -n olaitan logs -l app.kubernetes.io/component=collector --tail=50 --all-containers
+            exit 1
+          fi
+          # Positively assert the socket is in a state the collector can
+          # connect to, by reading it from inside the pod. The grep above is
+          # only the absence of one error string: a collector that attached
+          # to nothing at all (Falco never started, the sidecar crash-looped)
+          # would pass it. Connecting to a unix socket needs write
+          # permission, so the group must be the collector's and that group
+          # must have the write bit.
+          pod="$(kubectl -n olaitan get pod -l app.kubernetes.io/component=collector \
+                   -o jsonpath='{.items[0].metadata.name}')"
+          perms="$(kubectl -n olaitan exec "$pod" -c falco-socket-permissions -- \
+                     stat -c '%a %g' /run/falco/falco.sock)"
+          echo "falco.sock: $perms"
+          mode="$(echo "$perms" | cut -d' ' -f1)"
+          gid="$(echo "$perms" | cut -d' ' -f2)"
+          if [ "$gid" != "65532" ]; then
+            echo "::error::falco.sock group is $gid, not the collector's 65532 -- it cannot connect"
+            exit 1
+          fi
+          case "$(printf '%04d' "$mode" | cut -c3)" in
+            2|3|6|7) echo "socket is group-writable by the collector's group: OK" ;;
+            *) echo "::error::falco.sock is mode $mode; group $gid cannot write, so the collector cannot connect"
+               exit 1 ;;
+          esac
+          kubectl -n olaitan logs -l app.kubernetes.io/component=collector \
+            -c falco-socket-permissions --tail=20
+
+      # AC3: record the enforcement verdict per distribution. This is
+      # deliberately NOT a pass/fail gate -- kindnet genuinely does not
+      # enforce, and failing the build for a true fact would teach us to
+      # ignore it. The artifact is what keeps the matrix's enforcement column
+      # honest.
+      - name: Probe NetworkPolicy enforcement
+        if: always()
+        run: |
+          mkdir -p portability-evidence
+          {
+            echo "distro: ${{ matrix.distro }}"
+            echo "date:   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "server: $(kubectl version -o json | grep -o '\"gitVersion\": *\"[^\"]*\"' | tail -1)"
+            echo "---"
+            hack/check-netpol-enforcement.sh 2>&1 || echo "exit=$?"
+          } | tee "portability-evidence/netpol-${{ matrix.distro }}.txt"
+
+      - name: Collect diagnostics on failure
+        if: failure()
+        run: |
+          mkdir -p portability-evidence
+          kubectl -n olaitan get pods -o wide > portability-evidence/pods.txt 2>&1 || true
+          kubectl -n olaitan describe pods > portability-evidence/describe.txt 2>&1 || true
+          kubectl -n olaitan logs -l app.kubernetes.io/component=collector \
+            --tail=200 --all-containers > portability-evidence/collector.txt 2>&1 || true
+          kubectl -n olaitan logs -l app.kubernetes.io/component=aggregator \
+            --tail=200 > portability-evidence/aggregator.txt 2>&1 || true
+
+      - name: Upload portability evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portability-${{ matrix.distro }}
+          path: portability-evidence/
+          if-no-files-found: warn
 
   # Docker image smoke test — verifies the Dockerfile + go.mod toolchain
   # parity (AC10) by building the image and running `version`.

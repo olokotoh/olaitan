@@ -6,9 +6,21 @@ type: application
 # Chart version: bumped on every chart-schema change. Independent of the
 # application (binary) version — appVersion tracks the Olaitan binary.
 version: 0.1.0
-# Tracks cmd/olaitan main.version ldflag default. When the Go binary's
-# baseline version moves, bump this and the image tag in lockstep.
-appVersion: "0.1.0"
+# The image tag used when values.yaml leaves image.tag empty (see the
+# "olaitan.image" helper). The release workflow overwrites BOTH fields from the
+# git tag at package time, so this value only governs installs straight from the
+# repository tree: which is exactly the path contributors take.
+#
+# Epic 9: this was pinned at "0.1.0" long after that tag stopped existing, so
+# `helm install ./deploy/helm/olaitan` reported STATUS: deployed and then sat in
+# ErrImagePull forever:
+#
+#     Failed to pull image "ghcr.io/olokotoh/olaitan:0.1.0": not found
+#
+# Published tags are `edge` (tip of main, pushed on every green main build) and
+# the release tags. `edge` is the only honest default for a tree install: it is
+# the image built from the code you are looking at.
+appVersion: "edge"
 
 # Olaitan uses networking.k8s.io/v1 NetworkPolicy (GA since 1.7),
 # projected-volume semantics that matured in 1.20+, and the
@@ -16,7 +28,17 @@ appVersion: "0.1.0"
 # (stable on every supported distribution from 1.19+, but exercised
 # operationally only on 1.29+ in our test matrix). 1.29 is the floor
 # for current LTS-tier clusters per the architecture's deployment-
-# surface note. Upper bound < 2.0.0 guards against silent install on a
+# surface note.
+#
+# Story 9.6 makes 1.29 a HARD floor rather than a conservative one: the
+# collector's falco-socket-permissions container is a native sidecar
+# (an initContainers entry with `restartPolicy: Always`), and the
+# SidecarContainers feature that honours that field landed in 1.29.
+# Below it the field is silently dropped and the collector pod hangs in
+# Init forever. Relaxing this constraint therefore requires defaulting
+# falcoSocketPermissions.useNativeSidecar to false in the same change.
+#
+# Upper bound < 2.0.0 guards against silent install on a
 # future K8s major where deprecated APIs the chart depends on may have
 # been removed.
 kubeVersion: ">=1.29.0 < 2.0.0"

@@ -1,0 +1,33 @@
+# minikube overlay (local evaluation).
+#
+#   helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan \
+#     -f values-minikube.yaml --namespace olaitan --create-namespace
+#
+# Deltas only. Template-verified, NOT verified.
+
+platform: minikube
+
+falco:
+  driver:
+    # minikube node images ship no kernel headers, so the legacy `ebpf`
+    # driver's build step dies at pod start.
+    kind: modern_ebpf
+
+response:
+  networkPolicy:
+    # OFF, and leave it off. minikube's default CNI does not enforce
+    # NetworkPolicy: the API accepts a deny-all and traffic keeps flowing, so
+    # Olaitan would report containment it never achieved. `minikube start
+    # --cni=calico` gets you real enforcement; verify with
+    # hack/check-netpol-enforcement.sh either way.
+    enabled: false
+
+# STORAGE. Enable the addon first if it is not already on:
+#   minikube addons enable storage-provisioner
+#
+# HOST LIMITS. Falco watches container lifecycle through inotify and dies with
+# "could not initialize inotify handler" when the per-user limit is exhausted
+# -- a HOST limit, invisible from kubectl, and easy to hit on a workstation
+# running several clusters:
+#   sudo sysctl -w fs.inotify.max_user_instances=512 fs.inotify.max_user_watches=524288
+# hack/preflight.sh reports the current values.

@@ -1,0 +1,41 @@
+# Google GKE (Standard) overlay.
+#
+#   helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan \
+#     -f values-gke.yaml --namespace olaitan --create-namespace
+#
+# Deltas only, cited from docs/platform-support-matrix.md (researched
+# 2026-08-30 against the Google GKE documentation). Template-verified, NOT
+# verified.
+#
+# GKE AUTOPILOT IS BLOCKED. The Warden validating admission webhook refuses
+# privileged containers outright, so Falco cannot run. Use GKE Standard.
+
+platform: gke
+
+falco:
+  driver:
+    # Container-Optimized OS ships no kernel headers, so the legacy `ebpf`
+    # driver's build step fails at pod start. modern_ebpf compiles nothing.
+    kind: modern_ebpf
+
+auditWebhook:
+  # IMPOSSIBLE on GKE. Managed API server, no --audit-webhook-config-file.
+  # GKE audit data leaves through Cloud Logging, which needs a pull adapter
+  # Olaitan does not implement yet (Falco's k8saudit-gke plugin is the
+  # documented cheap path).
+  enabled: false
+
+response:
+  networkPolicy:
+    # STILL off by default, and this is the one platform where that is a
+    # conservative choice rather than a necessary one: GKE Dataplane V2
+    # (Cilium) enforces NetworkPolicy with no add-on, so isolation actually
+    # works here out of the box. Turning enforcement on remains a deliberate
+    # act -- run hack/check-netpol-enforcement.sh to confirm Dataplane V2 is
+    # active on YOUR cluster (it is not on older Standard clusters), and set
+    # response.networkPolicy.clusterCidrs to your real pod/service CIDRs, or
+    # egress blocking under RESTRICTED will take DNS with it.
+    enabled: false
+
+# STORAGE. GKE ships a default balanced-PD StorageClass, so no override is
+# needed.
