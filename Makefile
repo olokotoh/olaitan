@@ -9,7 +9,7 @@ CONFIG_SRC       := config/olaitan.yaml
 AUDIT_POLICY_SRC := config/audit-policy-default.yaml
 CHART_FILES      := $(CHART_DIR)/files/olaitan.yaml $(CHART_DIR)/files/audit-policy-default.yaml
 
-.PHONY: build test lint olaitan-lint prereg-check analysis analysis-test docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics e2e-local-overlays eval-smoke scenarios-smoke capture-it e2e-local-down schemas helm-values-doc
+.PHONY: build test lint olaitan-lint prereg-check analysis analysis-test docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics e2e-local-overlays eval-smoke scenarios-smoke capture-it e2e-local-down schemas helm-values-doc preflight
 
 # envtest-bin downloads the kube-apiserver and etcd binaries that the
 # Story 1.11 posture-client integration tests (and any future
@@ -26,6 +26,16 @@ envtest-bin: bin/setup-envtest
 
 bin/setup-envtest:
 	GOBIN=$(CURDIR)/bin go install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION)
+
+# preflight (Story 9.1) answers "will this actually work on my cluster?"
+# BEFORE installing, against whatever context kubectl is pointed at. It is
+# the one target an evaluator should run first: Olaitan is a security tool,
+# so the worst outcome is not a failed install but a SUCCESSFUL one that
+# reports containment it never achieved. Exit 0 = can run (possibly
+# degraded), 1 = a hard blocker, 2 = probe inconclusive. Makes no changes
+# except a short-lived probe namespace, which it deletes.
+preflight:
+	@hack/preflight.sh
 
 build:
 	go build $(LDFLAGS) -o $(BINARY) ./cmd/olaitan
