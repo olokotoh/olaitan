@@ -60,6 +60,28 @@ info "distribution : $DISTRO"
 info "nodes        : $NODES   runtime: ${RUNTIME:-?}"
 info "os / kernel  : ${OSIMG:-?} / ${KERNEL:-?}"
 
+# ------------------------------------------------- Falco vs the node kernels
+# Story 10.1: a Falco release without falcosecurity/libs#3086 exits every few
+# minutes on kernel 7.x, and nothing in kubectl says why until you read the
+# previous container's log. Judge every distinct node kernel against the
+# pinned Falco (hack/falco-support.env) before installing.
+echo
+echo "${B}Falco driver${X}  ${D}(modern_ebpf against each node kernel)${X}"
+# shellcheck source=hack/lib/falco-kernel.sh
+. "$(dirname "$0")/lib/falco-kernel.sh"
+KERNELS="$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.nodeInfo.kernelVersion}{"\n"}{end}' 2>/dev/null | sort -u)"
+[ -n "$KERNELS" ] || KERNELS="$KERNEL"
+while IFS= read -r KERNEL; do
+  FK_OUT="$(falco_kernel_verdict "$KERNEL")"
+  case $? in
+    0) ok "$FK_OUT" ;;
+    1) bad "$(echo "$FK_OUT" | head -1 | sed 's/^BLOCKER //')"
+       echo "$FK_OUT" | tail -n +2 | while IFS= read -r l; do info "${l#        }"; done ;;
+    *) no "$(echo "$FK_OUT" | head -1)"
+       echo "$FK_OUT" | tail -n +2 | while IFS= read -r l; do info "$l"; done ;;
+  esac
+done <<< "$KERNELS"
+
 # ------------------------------------------------------------------ 1. storage
 echo
 echo "${B}1. Storage${X}  ${D}(NATS JetStream needs a PersistentVolume)${X}"

@@ -463,6 +463,12 @@ jobs:
             --tail=200 --all-containers > portability-evidence/collector.txt 2>&1 || true
           kubectl -n olaitan logs -l app.kubernetes.io/component=aggregator \
             --tail=200 > portability-evidence/aggregator.txt 2>&1 || true
+          # Story 10.1: a Falco crash names its cause only in the PREVIOUS
+          # container's log ("could not parse param ..."), so keep both.
+          kubectl -n olaitan logs -l app.kubernetes.io/name=falco -c falco \
+            --tail=200 > portability-evidence/falco.txt 2>&1 || true
+          kubectl -n olaitan logs -l app.kubernetes.io/name=falco -c falco \
+            --previous --tail=200 > portability-evidence/falco-previous.txt 2>&1 || true
 
       - name: Upload portability evidence
         if: always()

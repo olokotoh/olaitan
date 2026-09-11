@@ -1324,6 +1324,16 @@ openshift:
 
 falco:
   enabled: true
+  # Story 10.1: pin the Falco image, not only the chart. Falco 0.43.1 and
+  # 0.44.x exit every few minutes on kernel 7.x ("could not parse param ...
+  # type 223 (clone)" / "type 307 (openat)", falcosecurity/falco#3955): the
+  # modern_bpf per-CPU auxmap is overwritten when a BPF program is preempted.
+  # Fixed by falcosecurity/libs#3086, first shipped in 0.45.0-rc1. Soaked here
+  # on kernel 7.0 with 0 restarts. TODO: move to 0.45.0 GA when it ships
+  # (planned 2026-09-21). Keep in step with hack/falco-support.env; the helm
+  # suite fails if they differ.
+  image:
+    tag: "0.45.0-rc1"
   driver:
     # `modern_ebpf` is CO-RE: one prebuilt probe that relocates itself against
     # the running kernel's BTF. It needs NO kernel headers and compiles NOTHING
@@ -1339,7 +1349,7 @@ falco:
     #   ERROR failed: failed to build all requested drivers
     #
     # Reproduced on kind (kernel 7.0.0-29-generic) before the change. Falco has
-    # defaulted to modern_ebpf since 0.40, and the bundled subchart is 8.0.2, so
+    # defaulted to modern_ebpf since 0.40, and the bundled subchart was 8.0.2, so
     # this default was inherited from an older chart and never revisited.
     #
     # Requires BTF (CONFIG_DEBUG_INFO_BTF) and kernel >= 5.8, true for every
