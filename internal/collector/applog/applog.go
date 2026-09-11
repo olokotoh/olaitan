@@ -420,8 +420,11 @@ func (a *Adapter) Run(ctx context.Context) (runErr error) {
 	defer a.log.Info("applog: adapter stopped")
 
 	// Mark unhealthy at startup until the first successful publish
-	// flips it. Mirrors the audit / cri startup contract.
-	a.health.MarkUnhealthy(errors.New("applog: awaiting first event"))
+	// flips it (ErrAwaitingFirstEvent, which the sidecar heartbeat
+	// reports as "starting" rather than as a fault: a workload that has
+	// not logged yet is not a broken sensor). Mirrors the audit / cri
+	// startup contract.
+	a.health.MarkUnhealthy(ErrAwaitingFirstEvent)
 
 	lineCh := make(chan LineRecord, a.cfg.ChannelBuffer)
 
@@ -473,6 +476,13 @@ func (a *Adapter) Run(ctx context.Context) (runErr error) {
 // surfacing the panic as a runtime fault. The errgroup uses the
 // returned error to cancel sibling goroutines so the whole adapter
 // unwinds together.
+// ErrAwaitingFirstEvent is the health error the adapter carries between
+// start and its first successful publish. Story 10.10: the sidecar
+// heartbeat reports this as "starting", not as a fault, so a workload
+// that has simply not logged anything yet does not make the node's
+// applog source look broken.
+var ErrAwaitingFirstEvent = errors.New("applog: awaiting first event")
+
 var errPanic = errors.New("applog: goroutine panic recovered")
 
 // runWithRecover wraps fn so a panic inside any of the adapter's

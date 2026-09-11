@@ -154,15 +154,26 @@ func runApplogSidecar(ctx context.Context, args []string, stderr io.Writer) int 
 
 	// Story 10.10: report liveness and health to the collector on this node,
 	// the only way applog health is observable (nothing scrapes the sidecar).
-	go collectorapplog.RunHeartbeat(ctx, nc, collectorapplog.HeartbeatInterval, func() collectorapplog.Heartbeat {
-		healthy, _ := adapter.Health().Status()
+	hbSubject, err := collectorapplog.HeartbeatSubject(cfg.Pod.Node)
+	if err != nil {
+		log.Error("startup: applog heartbeat subject", "err", err, "node", cfg.Pod.Node)
+		return 1
+	}
+	started := time.Now().UnixNano()
+	go collectorapplog.RunHeartbeat(ctx, nc, hbSubject, collectorapplog.HeartbeatInterval, func() collectorapplog.Heartbeat {
+		healthy, herr := adapter.Health().Status()
 		return collectorapplog.Heartbeat{
 			Namespace: cfg.Pod.Namespace,
 			Pod:       cfg.Pod.Name,
 			Node:      cfg.Pod.Node,
 			Container: cfg.Container,
 			Healthy:   healthy,
-			Events:    adapter.EventsTotal(),
+			// Before the first line the adapter is unhealthy by
+			// construction; a quiet workload is not a broken sensor.
+			Starting: errors.Is(herr, collectorapplog.ErrAwaitingFirstEvent),
+			Started:  started,
+			Events:   adapter.EventsTotal(),
+			Engaged:  adapter.EngagedTotal(),
 		}
 	})
 

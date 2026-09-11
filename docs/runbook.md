@@ -100,9 +100,10 @@ The catalogue is organised by registering ring + story, in commit chronology so 
 - **Type:** gauge
 - **Unit:** count (sidecars)
 - **Labels:** `source` (constant `applog`), `state` (`live`, `stale`, `unhealthy`; cardinality 3). Registered only when `applogSidecar.enabled=true`.
-- **Help:** applog sidecars on this node, by heartbeat state. Each sidecar publishes a heartbeat on core-NATS `olaitan.health.applog` every 30s; the collector on the same node counts it `live` if heard within 90s, `stale` once silent longer than that, and forgets it after 10 minutes of silence (its pod is gone). `unhealthy` counts live sidecars reporting their own tail or publish path failing. `olaitan_source_healthy{source="applog"}` is 0 while any sidecar is stale or unhealthy, and 1 on a node with no applog workloads (nothing is failing; `state="live"` tells the two apart). `olaitan_sensor_events_total{source="applog"}` is the node's sum of sidecar event counts, kept monotonic across sidecar restarts.
+- **Help:** applog sidecars on this node, by heartbeat state. Each sidecar publishes a heartbeat on core-NATS `olaitan.health.applog.<node>` every 30s, and the collector on that node subscribes to its own node's subject only. It counts a sidecar `live` if heard within 90s, `stale` once silent longer than that, and retires it after 10 minutes of silence. A sidecar shutting down sends a final heartbeat and is dropped at once, so an ordinary rollout does not show as stale. `unhealthy` counts live sidecars reporting their own tail or publish path failing; a sidecar that has not seen its first log line yet is starting, not unhealthy, so a quiet workload never trips this. `olaitan_source_healthy{source="applog"}` is 0 while any sidecar is stale or unhealthy, and 1 on a node with no applog workloads (nothing is failing; `state="live"` tells the two apart). `olaitan_sensor_events_total{source="applog"}` is the node's sum of sidecar event counts, kept monotonic across sidecar restarts.
 - **Sample PromQL (aggregate):** `sum(olaitan_sensor_applog_sidecars) by (state)`.
 - **Sample PromQL (alert):** `sum(olaitan_sensor_applog_sidecars{state=~"stale|unhealthy"}) > 0` for 5 minutes (a sidecar has stopped reporting or cannot publish its logs).
+- **After upgrading to this version:** restart annotated workloads (`kubectl rollout restart`). Pods injected by the older webhook carry a sidecar with no `NATS_URL`; it exits at start and keeps crash-looping until the pod is recreated, and it sends no heartbeat, so it shows as neither live nor stale (it was never heard from at all).
 
 #### `olaitan_sensor_cri_translate_errors_total` and `olaitan_sensor_cri_publish_drops_total` (Story 1.8)
 
@@ -1744,8 +1745,10 @@ source outage; `rate(olaitan_sensor_events_total{source="audit"}[5m]) < 0.01 for
 
 **Expected audit-subject signal.** **Honest gap:** source health has NO
 dedicated NATS audit subject. Health is a Prometheus signal, and the
-`olaitan.health.*` subjects in the contract are reserved/ephemeral with no
-active producer in this build (`docs/nats-subjects.md`, Reserved subjects). The
+`olaitan.health.*` subjects in the contract are ephemeral, and the only
+producer in this build is the applog sidecar heartbeat added by Story 10.10
+(`olaitan.health.applog.<node>`), which feeds a gauge rather than an audit
+trail (`docs/nats-subjects.md`). The
 audit-equivalent signal for a source problem is therefore the per-source loss
 counter family above, not an `AUDIT.*` event. Do not subscribe a health subject;
 alert on the gauge.

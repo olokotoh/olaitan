@@ -95,6 +95,12 @@ func Inject(pod *corev1.Pod, opts InjectOptions) ([]byte, error) {
 	if opts.SidecarImage == "" {
 		return nil, errors.New("applog/inject: empty sidecar image")
 	}
+	// Story 10.10: a sidecar with no NATS address exits at start, and the
+	// pod carries a crash-looping container until it is recreated. Refuse
+	// here too, not only in NewWebhook, so no caller can produce one.
+	if opts.SidecarNATSURL == "" {
+		return nil, errors.New("applog/inject: empty sidecar NATS URL")
+	}
 
 	// Idempotency check.
 	if alreadyInjected(pod) {
