@@ -4,12 +4,16 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
 
+	natsjs "github.com/nats-io/nats.go/jetstream"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/olokotoh/olaitan/internal/collector/falco"
 	"github.com/olokotoh/olaitan/internal/config"
 	"github.com/olokotoh/olaitan/internal/metrics"
 	responseaudit "github.com/olokotoh/olaitan/internal/response/audit"
@@ -265,4 +269,77 @@ type nopTransitionPublisher struct{}
 
 func (nopTransitionPublisher) PublishAuditTransition(context.Context, responseaudit.AuditTransition) error {
 	return nil
+}
+
+// TestRegisterAdapterCounters_FalcoHTTPReceiver is Story 10.2's metrics AC:
+// the http_output receiver exports its request outcomes per status code,
+// the alerts it received (published or not) and the heartbeats that prove
+// Falco is alive. Every code series exists before its first request.
+func TestRegisterAdapterCounters_FalcoHTTPReceiver(t *testing.T) {
+	t.Parallel()
+	a, err := falco.New(falco.Config{
+		ListenAddr: "127.0.0.1:0",
+		Token:      "0123456789abcdef0123456789abcdef",
+		Hostname:   "node-a",
+	}, nopPublisher{}, quietTestLogger())
+	if err != nil {
+		t.Fatalf("falco.New: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/falco/wrong-token", strings.NewReader("{}"))
+	a.Handler().ServeHTTP(httptest.NewRecorder(), req)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g, gctx := errgroup.WithContext(ctx)
+	cfg := &config.Config{Metrics: config.MetricsConfig{Address: "127.0.0.1:0"}}
+	reg, err := startMetricsServer(gctx, g, quietTestLogger(), cfg, "node-a",
+		map[string]adapterMetrics{"falco": a}, nil)
+	if err != nil {
+		t.Fatalf("startMetricsServer: %v", err)
+	}
+	mfs, err := reg.Gatherer().Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	codes := map[string]float64{}
+	seen := map[string]bool{}
+	for _, mf := range mfs {
+		seen[mf.GetName()] = true
+		if mf.GetName() != "olaitan_sensor_falco_http_requests_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == "code" {
+					codes[lp.GetValue()] = m.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	for _, n := range []string{
+		"olaitan_sensor_falco_http_requests_total",
+		"olaitan_sensor_falco_alerts_received_total",
+		"olaitan_sensor_falco_heartbeats_total",
+		"olaitan_sensor_falco_publish_drops_total",
+	} {
+		if !seen[n] {
+			t.Errorf("metric family %s not registered", n)
+		}
+	}
+	for _, c := range falco.ResponseCodes {
+		if _, ok := codes[c]; !ok {
+			t.Errorf("no series for code=%s before its first request", c)
+		}
+	}
+	if codes["401"] != 1 {
+		t.Errorf("requests{code=401} = %v, want 1", codes["401"])
+	}
+	cancel()
+	_ = g.Wait()
+}
+
+type nopPublisher struct{}
+
+func (nopPublisher) PublishJS(context.Context, string, any, ...natsjs.PublishOpt) (*natsjs.PubAck, error) {
+	return &natsjs.PubAck{}, nil
 }

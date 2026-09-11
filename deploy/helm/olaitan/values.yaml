@@ -144,10 +144,20 @@ endpoints:
   nats: ""
   # Empty → "<release>-redis-master:6379" (subchart's primary Service).
   redis: ""
-  # Falco gRPC socket. Mounted via hostPath from the Falco DaemonSet;
-  # local-unix-socket is lower-latency than the TCP/gRPC mode.
-  # [Source: architecture.md:130]
-  falco: "unix:///run/falco/falco.sock"
+
+# Falco alert ingest (Story 10.2). Falco's http_output POSTs every alert to
+# the collector on this port, through the node-local <release>-falco-ingest
+# Service. This replaced the gRPC socket (endpoints.falco): Falco 0.44.0
+# removed its gRPC output, and every Falco that runs on kernel 7.x is newer.
+falcoIngest:
+  # @schema type:integer minimum:1 maximum:65535 effect:"collector port and falco-ingest Service port Falco posts alerts to; must match the port in falco.falco.http_output.url" ref:FR1
+  port: 8765
+  # Extra NetworkPolicy peers admitted to the ingest port, on top of the
+  # Falco pods the release policy already admits (this release's Falco, or
+  # with falco.enabled=false, Falco-labelled pods in any namespace). Standard
+  # `from:` entries, e.g. [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: falco}}}].
+  # @schema type:array effect:"additional NetworkPolicy peers allowed to post to the Falco ingest port" ref:NFR11
+  extraFrom: []
 
 # --- Operator-provided secrets ----------------------------------------
 # All three default to "" so the Secret always renders (downstream pods
@@ -165,6 +175,12 @@ secrets:
   # LLM provider API key (OpenAI/Anthropic/…). Empty by default; Epic 4
   # analyst ring refuses to start when analyst.provider=api with empty.
   llmApiKey: ""
+  # Story 10.2: shared secret Falco puts in its http_output URL path; the
+  # collector rejects any alert without it (401). Empty -> generated on
+  # first install and reused on upgrade, like the bundled Redis password.
+  # Set it only to share one token with a Falco you run yourself.
+  # @schema type:string pattern:"16+ characters of [A-Za-z0-9._~-], or empty to generate" effect:"token Falco must present to the collector's falco-ingest endpoint" ref:NFR8
+  falcoHttpToken: ""
   # Story 4.2 (FR36/NFR8): S3 credentials for the forensic capture uploader.
   # Empty by default; the controller refuses to start when
   # response.forensics.enabled=true with either empty. Provide via
@@ -1280,40 +1296,17 @@ ollama:
 #   - https://artifacthub.io/packages/helm/nats/nats
 #   - https://artifacthub.io/packages/helm/bitnami/redis
 
-# Falco -- host-level signal source (Ring 1). eBPF driver is the modern
-# default; the legacy kernel module and `modern_ebpf` are alternatives
-# operators can override. gRPC output is required: that is how the
-# collector reads Falco events. [Source: architecture.md:130-131]
-# --- Falco socket permissions (Story 9.6) ------------------------------
-# Falco binds its gRPC socket and never chmods it, so the mode is whatever
-# the default umask leaves: 0777 & ~022 = 0755, owner root. Connecting to a
-# Unix socket requires WRITE permission on the socket inode, and the
-# collector runs as UID/GID 65532 per NFR11. It is neither the owner nor in
-# the owning group, so it can never attach:
-#
-#   collector: falco run: falco: sub (terminal, no retry): rpc error:
-#   code = Unavailable ... dial unix /run/falco/falco.sock:
-#   connect: permission denied
-#
-# Falco runs, the collector crash-loops, and NO syscall events are ingested.
-# Proven on a 3-node kubeadm cluster 2026-08-31 (Blocker 8). Invisible on
-# kind, where Falco and the collector end up sharing an effective identity
-# and the dial succeeds regardless -- which is why every prior test passed.
-#
-# There is no Falco config key for this (upstream falco.yaml exposes only
-# grpc.enabled / bind_address / threadiness and the mTLS cert paths;
-# falcosecurity/falco#1351 is the open request), so the chart fixes the mode
-# from the collector's own pod. It lives here rather than in the Falco pod
-# deliberately: an operator pointing endpoints.falco at their own Falco
-# DaemonSet needs the same fix, and falco.extra.initContainers would only
-# reach the bundled subchart.
+# Falco -- host-level signal source (Ring 1). Falco POSTs its alerts to the
+# collector over http_output (Story 10.2); see the falco: block below and
+# falcoIngest above. [Source: architecture.md:130-131]
 # --- OpenShift ---------------------------------------------------------
 # OpenShift admits pods against a SecurityContextConstraint, and the default
-# `restricted-v2` forbids hostPath volumes and pins the UID range. The
-# collector needs both exceptions: it bind-mounts Falco's socket directory,
-# and the falco-socket-permissions container runs as UID 0 to chmod the socket.
-# Without a matching SCC the DaemonSet is refused at admission with "unable to
-# validate against any security context constraint".
+# `restricted-v2` pins the UID range and forbids hostPath volumes. The
+# collector runs as the fixed UID 65532, and with containerdSensor.enabled it
+# bind-mounts the containerd socket directory. Without a matching SCC the
+# DaemonSet is refused at admission with "unable to validate against any
+# security context constraint". (Since Story 10.2 the collector no longer
+# mounts Falco's socket: Falco reaches it over HTTP.)
 openshift:
   # Ships a RoleBinding granting the SCC below to the collector's
   # ServiceAccount, scoped to the release namespace. Off by default because
@@ -1328,77 +1321,6 @@ openshift:
   # need `privileged`, and the Falco subchart ships its own SCC for that.
   # @schema type:string pattern:"an OpenShift SCC name" effect:"SCC granted to the collector ServiceAccount when openshift.bindSCC is true" ref:NFR11
   scc: hostmount-anyuid
-
-falcoSocketPermissions:
-  # Off renders no permission container and no read-write host mount at
-  # all. Turn it off when your Falco already exposes a group-writable
-  # socket, or when you run your own Falco with a different arrangement.
-  # A tcp:// endpoints.falco forces it off regardless: there is no socket
-  # to chmod in that mode.
-  # @schema type:boolean effect:"hold Falco's gRPC socket at a mode the non-root collector can connect to; disabling reinstates the Blocker 8 crash-loop on clusters where Falco and the collector do not share an identity" ref:NFR11
-  enabled: true
-
-  # Use the native sidecar pattern (an initContainer with restartPolicy:
-  # Always, KEP-753), the same choice applogSidecar documents above. Note the
-  # version differs from applogSidecar's comment: SidecarContainers is alpha
-  # and OFF by default in 1.28, beta and ON from 1.29, so 1.29 is the real
-  # floor -- which is also this chart's kubeVersion floor, precisely because
-  # this sidecar is on the DEFAULT path (applogSidecar is not). Native is the default because it is ORDERED: the
-  # permission is in place before the collector's first dial, so the
-  # collector never crash-loops on startup.
-  #
-  # On clusters where the SidecarContainers feature gate is disabled, set
-  # to false to inject as a regular container instead. It still holds the
-  # permission for the life of the pod -- the trade-off is only ordering:
-  # the collector may make its first dial before the chmod lands, fail
-  # once, and be restarted by the kubelet into a working socket. Pod
-  # termination semantics differ too, as with applogSidecar.
-  #
-  # NOTE: Chart.yaml's kubeVersion floor is >=1.29, so native sidecars are
-  # available on every cluster this chart installs on. The false path
-  # exists for a 1.29+ cluster that has explicitly disabled the gate,
-  # which cannot be detected at render time.
-  # @schema type:boolean effect:"render the Falco socket permission holder as a native sidecar (ordered before the collector, so the socket is writable before its first dial) rather than a plain container; needs Kubernetes >=1.29" ref:NFR11
-  useNativeSidecar: true
-
-  # Target mode and group for the socket. 0660 + the collector's own GID
-  # is the tightest pair that works: root (Falco) keeps owner rw, the
-  # collector gets group rw, and nothing else on the node gains access.
-  # Widening to 0666 would hand every process on the node a Falco event
-  # stream.
-  # @schema type:string pattern:"octal file mode" effect:"mode applied to the Falco gRPC socket" ref:NFR11
-  socketMode: "0660"
-  # Must match the collector pod's runAsGroup (securityContext in
-  # daemonset.yaml). Changing one without the other silently reinstates
-  # the crash-loop, so the helm suite asserts the two agree.
-  # @schema type:integer effect:"group applied to the Falco gRPC socket; must equal the collector's runAsGroup" ref:NFR11
-  socketGroup: 65532
-  # How often to re-assert. A Falco restart deletes and recreates the
-  # socket at 0755, so this bounds the window in which a just-restarted
-  # Falco leaves the collector unable to reconnect.
-  # @schema type:integer minimum:1 effect:"seconds between permission re-assertions" ref:NFR11
-  intervalSeconds: 10
-  # How long to wait for the socket to appear before failing. Falco's
-  # driver load can take a minute or more on first start, so this is not
-  # a liveness signal -- it is the point at which "Falco is not coming"
-  # becomes more useful than waiting silently.
-  # @schema type:integer minimum:1 effect:"seconds to wait for the Falco socket to appear before failing" ref:NFR11
-  waitTimeoutSeconds: 180
-  # A shell, stat, chmod and chgrp. Any busybox-compatible image works.
-  # Air-gapped installs override the repository to their mirror (see
-  # values-airgapped.yaml).
-  image:
-    repository: busybox
-    tag: "1.37.0"
-    pullPolicy: IfNotPresent
-  # Deliberately tiny: this container sleeps almost all of the time.
-  resources:
-    limits:
-      cpu: 50m
-      memory: 32Mi
-    requests:
-      cpu: 5m
-      memory: 16Mi
 
 falco:
   enabled: true
@@ -1425,20 +1347,42 @@ falco:
     # (needs headers) or `kmod`. preflight.sh reports the node kernel so the
     # operator can tell before installing.
     kind: modern_ebpf
-  # Falco's gRPC server -- both `grpc.enabled` and `grpc_output.enabled`
-  # must be on for the collector to subscribe.
+  # Story 10.2: Falco reaches the collector over http_output. The chart
+  # checks these settings at render time (olaitan.falcoIngest.validate).
   falco:
-    grpc:
+    # http_output sends plain text unless this is on, and the collector
+    # accepts only JSON.
+    json_output: true
+    json_include_output_property: true
+    json_include_tags_property: true
+    http_output:
       enabled: true
-      bind_address: "unix:///run/falco/falco.sock"
-      # Falco creates this socket 0755 root:root and exposes no key to change
-      # that, so the non-root collector cannot connect to it (Blocker 8,
-      # found 2026-08-31 on 3-node kubeadm). FIXED in Story 9.6 by the
-      # `falcoSocketPermissions` block above, which re-applies 0660 + the
-      # collector's group from the collector's own pod. Set
-      # falcoSocketPermissions.enabled=false and this limitation comes back.
-    grpc_output:
+      # Two environment variables that FALCO expands from its own env (set
+      # in extra.env below): the collector's node-local ingest URL, then the
+      # token. The token never appears in the Falco ConfigMap.
+      url: "${OLAITAN_FALCO_URL}${OLAITAN_FALCO_TOKEN}"
+      # Reuse one connection instead of a TCP handshake per alert.
+      keep_alive: true
+    # Falco's periodic metrics snapshot travels the same http_output as a
+    # source "internal" event. The collector uses it as a heartbeat: it is
+    # how source_healthy{source="falco"} knows Falco is alive when no rule
+    # has fired. The collector's heartbeat timeout is 3x this interval.
+    metrics:
       enabled: true
+      interval: 1m
+      output_rule: true
+  extra:
+    # The Falco chart renders these through `tpl` in this release's context,
+    # so the Service FQDN and the Secret name follow the release name and
+    # namespace. The port must match falcoIngest.port (the guard checks).
+    env:
+      - name: OLAITAN_FALCO_URL
+        value: 'http://{{ include "olaitan.falcoIngest.releaseServiceName" . }}.{{ .Release.Namespace }}.svc:8765/falco/'
+      - name: OLAITAN_FALCO_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: '{{ include "olaitan.falcoIngest.releaseFullname" . }}-secrets'
+            key: falco-http-token
 
 # NATS with JetStream persistence -- inter-ring event bus. JetStream
 # provides the replay/checkpoint primitive that Story 2.7 + Story 3.1

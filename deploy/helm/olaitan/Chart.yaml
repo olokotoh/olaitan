@@ -30,13 +30,13 @@ appVersion: "edge"
 # for current LTS-tier clusters per the architecture's deployment-
 # surface note.
 #
-# Story 9.6 makes 1.29 a HARD floor rather than a conservative one: the
-# collector's falco-socket-permissions container is a native sidecar
-# (an initContainers entry with `restartPolicy: Always`), and the
-# SidecarContainers feature that honours that field landed in 1.29.
-# Below it the field is silently dropped and the collector pod hangs in
-# Init forever. Relaxing this constraint therefore requires defaulting
-# falcoSocketPermissions.useNativeSidecar to false in the same change.
+# 1.29 is also where the SidecarContainers feature (an initContainers
+# entry with `restartPolicy: Always`) is on by default, and the applog
+# sidecar defaults to that form (applogSidecar.useNativeSidecar=true).
+# Below 1.29 the field is silently dropped and an injected workload hangs
+# in Init. Relaxing this floor requires defaulting
+# applogSidecar.useNativeSidecar to false in the same change. (Story 9.6's
+# Falco socket sidecar was the other reason; Story 10.2 removed it.)
 #
 # Upper bound < 2.0.0 guards against silent install on a
 # future K8s major where deprecated APIs the chart depends on may have

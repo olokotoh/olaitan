@@ -1,63 +1,60 @@
-// Package falco implements the Olaitan agent's Falco gRPC sensor adapter.
+// Package falco implements the Olaitan agent's Falco sensor adapter.
 //
-// The adapter dials Falco's grpc_output service on a Unix or TCP socket,
-// reads `outputs.service.Sub` Response messages continuously, translates
-// each into a canonical schema.Event of source=falco / category=syscall,
-// and publishes to subjects.RawFalco via the project's NATS client with
-// JetStream at-least-once semantics.
+// Falco POSTs every alert to this adapter over HTTP (Falco's `http_output`
+// with `json_output: true`). The adapter authenticates the request,
+// decodes the body into the falcopb.Response model, translates it into a
+// canonical schema.Event of source=falco / category=syscall, and publishes
+// it to subjects.RawFalco with JetStream at-least-once semantics.
 //
-// Concurrency model: a single goroutine per Adapter handles connect,
-// stream consumption, translation, and publish. The architecture's
-// per-source per-node throughput budget (NFR1: 1000 events/sec/source)
-// fits comfortably into one goroutine; profiling-driven parallelism is
-// deferred to a future story if it ever becomes warranted.
+// Why HTTP and not gRPC: until Story 10.2 the adapter dialled Falco's gRPC
+// output over a Unix socket. Falco 0.44.0 removed the gRPC output and
+// server (falcosecurity/falco#3798), and every Falco release that runs on
+// kernel 7.x is newer than that (falcosecurity/falco#3955). http_output is
+// the upstream transport that remains. It also removes the hostPath socket
+// mount and the socket-permission sidecar the gRPC path needed.
 //
-// Lifecycle: Adapter.Run blocks until ctx is cancelled or a non-retryable
-// error escapes the retry loop. On any transient error (dial failure,
-// stream Recv error, persistent publish failure) the adapter marks the
-// source unhealthy via SourceHealth and re-enters the dial loop with the
-// configured exponential backoff. Transient publish failures are retried
-// inline (bounded) without tearing down the gRPC stream, so a brief NATS
-// hiccup does not lose the events Falco is emitting during the recovery
-// window. On ctx cancellation, Run returns nil promptly.
+// Authentication: Falco's http_output cannot send custom headers, so the
+// shared secret rides in the URL path, /falco/<token>. The chart generates
+// the token into the release Secret and hands it to Falco through an
+// environment variable that Falco expands inside its config file, so the
+// token never appears in a ConfigMap. Comparison is constant-time and the
+// token is never logged or echoed.
 //
-// Terminal errors: configuration mistakes that cannot be recovered by
-// retrying (EACCES on a Unix socket, gRPC Unauthenticated /
-// PermissionDenied) short-circuit the retry loop via retry.Permanent and
-// surface as a non-nil error from Run, so the parent process exits and
-// kubelet restarts the pod with a clear CrashLoopBackOff signal. Loud
-// failure for misconfig is the contract.
+// Liveness: a gRPC stream told the adapter when Falco went away; a series of
+// HTTP requests does not. Falco's periodic metrics snapshot (`metrics.enabled`
+// with `output_rule: true`) arrives through the same http_output. The adapter
+// treats it, and any real alert, as proof Falco is alive, and marks the source
+// unhealthy when neither has arrived within HeartbeatTimeout. Snapshots are
+// never published as security events.
 //
-// Source health: the adapter exposes its in-process source-health view
-// via Adapter.Health(). Story 1.12 binds this to the unified Prometheus
-// gauge `source_healthy{source="falco"}` (FR8). Bringing in the
-// Prometheus client library here would pre-empt Story 1.12's
-// metric-naming and endpoint-routing decisions for all five sources at
-// once, so this story stops at the in-process tracker per the FR8
-// ownership split documented in architecture.md (§ "Observability
-// surface").
+// Health is the AND of two things: Falco is alive, and alerts are getting
+// through. A transient publish failure keeps the source unhealthy until a
+// publish succeeds; a heartbeat alone cannot clear it, or a NATS outage would
+// read healthy between alerts while every alert was lost.
+//
+// Delivery: Falco does not retry a failed POST, so an alert that arrives
+// while NATS is down is lost at Falco. The handler still answers 503 so the
+// failure shows up in Falco's own log and in the request metrics here.
 package falco
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log/slog"
+	"mime"
+	"net"
+	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/keepalive"
-	"google.golang.org/grpc/status"
-
 	natsjs "github.com/nats-io/nats.go/jetstream"
 
-	"github.com/olokotoh/olaitan/internal/collector/falco/falcopb"
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
 	"github.com/olokotoh/olaitan/internal/ratelimit"
 	"github.com/olokotoh/olaitan/internal/retry"
@@ -66,77 +63,84 @@ import (
 	"github.com/olokotoh/olaitan/internal/subjects"
 )
 
+// pathPrefix is the route Falco posts to; the token follows it.
+const pathPrefix = "/falco/"
+
+// MinTokenLength is the shortest shared secret New accepts. The chart
+// generates 32 characters; anything under 16 is a placeholder.
+const MinTokenLength = 16
+
+// ResponseCodes is every status code the handler writes. The metrics layer
+// registers one series per code up front, so a code that has not happened
+// yet reads 0 rather than being absent.
+var ResponseCodes = []string{"204", "400", "401", "404", "405", "413", "415", "503"}
+
 // natsPublisher is the minimal NATS surface the adapter consumes.
 // *natsclient.Client (the production type) satisfies this implicitly,
 // and tests can supply a stub. The variadic opts let callers pass
-// jetstream.WithMsgID for server-side dedup on retry; an empty opts
-// slice matches the old call shape exactly.
+// jetstream.WithMsgID for server-side dedup on retry.
 type natsPublisher interface {
 	PublishJS(ctx context.Context, subject string, data any, opts ...natsjs.PublishOpt) (*natsjs.PubAck, error)
 }
 
 // HealthReader is preserved as an alias for callers that already speak
-// the falco-package name. The canonical interface is now
-// sourcehealth.Reader, which Adapter.Health returns directly.
+// the falco-package name. The canonical interface is sourcehealth.Reader,
+// which Adapter.Health returns directly.
 type HealthReader = sourcehealth.Reader
 
 // Config holds the runtime knobs for an Adapter.
 type Config struct {
-	// Endpoint is the gRPC target Falco's grpc_output is listening on.
-	// Defaults via the Helm chart to "unix:///run/falco/falco.sock".
-	Endpoint string
+	// ListenAddr is the host:port the receiver binds. The chart sets it
+	// from falcoIngest.containerPort.
+	ListenAddr string
+
+	// Token is the shared secret Falco puts in the URL path. Required,
+	// at least MinTokenLength characters, and must not contain '/'.
+	Token string
 
 	// Hostname is the node-level identifier the adapter records on every
 	// emitted Event.Pod.Node. The collector subcommand reads
 	// K8S_NODE_NAME from the downward API and passes it here.
 	Hostname string
 
-	// Retry is the backoff strategy used for connect / stream restart.
-	// Defaults to DefaultRetry() when zero-valued.
-	Retry retry.Strategy
+	// MaxPayloadBytes caps one request body. A Falco alert is a few KiB
+	// and a metrics snapshot about 4 KiB; the 1 MiB default fails a
+	// runaway rule loudly (413) instead of buffering it. The EVENTS_RAW
+	// stream enforces its own per-message cap after translation.
+	MaxPayloadBytes int64
 
-	// PublishRetry is the bounded inner retry used when a NATS publish
-	// fails transiently. The adapter retries the publish in place
-	// (without tearing down the gRPC stream) up to MaxAttempts times so
-	// a brief JetStream hiccup does not drop the events Falco is
-	// emitting during the recovery window. Defaults to
-	// DefaultPublishRetry() when zero-valued.
+	// HeartbeatTimeout is how long without a metrics snapshot or an
+	// alert before the source is marked unhealthy. Default 3m, three
+	// times the chart's 1m Falco metrics interval.
+	HeartbeatTimeout time.Duration
+
+	// PublishRetry is the bounded retry for transient NATS publish
+	// failures. Defaults to DefaultPublishRetry() when zero-valued.
 	PublishRetry retry.Strategy
 
-	// RateLimit is the Story 1.13 per-source per-node circuit breaker
-	// instance the adapter consults on every successful Recv before
-	// publish. Nil means a disabled fallback limiter is constructed in
-	// New(); a non-nil pre-constructed Limiter is the production path
-	// (main.go owns construction so the OnTransition callback can
-	// carry the source-aware slog logger and the hot-reload Subscribe
-	// callback can mutate the limiter's thresholds without a process
-	// restart per FR49).
+	// PublishWallClockBudget caps the total time one alert may spend in
+	// publishWithRetry. Default 12s.
+	PublishWallClockBudget time.Duration
+
+	// HTTP server timeouts. Defaults: 10s header, 30s read and write,
+	// 90s idle (longer than Falco's keep-alive reuse gap). ShutdownGrace
+	// is at least PublishWallClockBudget + 1s (13s by default).
+	ReadHeaderTimeout time.Duration
+	ReadTimeout       time.Duration
+	WriteTimeout      time.Duration
+	IdleTimeout       time.Duration
+	ShutdownGrace     time.Duration
+
+	// RateLimit is the Story 1.13 per-source per-node circuit breaker the
+	// adapter consults before every publish. Nil means a disabled
+	// fallback limiter is constructed in New(); main.go owns the
+	// production instance so the hot-reload callback can retune it.
 	RateLimit *ratelimit.Limiter
 }
 
-// DefaultRetry returns the connect-loop backoff strategy used by the
-// agent in production. 1s..60s with full equal-jitter and unlimited
-// attempts is the right shape for a long-lived DaemonSet adapter:
-// quick first reconnect, capped escalation to keep CPU at idle while
-// Falco is restarting, and never a permanent give-up that would leave
-// the source silently dead.
-func DefaultRetry() retry.Strategy {
-	return retry.Strategy{
-		Min:         1 * time.Second,
-		Max:         60 * time.Second,
-		Multiplier:  2.0,
-		Jitter:      1.0,
-		MaxAttempts: 0,
-	}
-}
-
-// DefaultPublishRetry returns the per-publish bounded retry strategy.
-// 100ms..1s, 3 attempts: combined with the per-attempt 2s deadline that
-// publishWithRetry now wraps around each PublishJS call, a transient
-// JetStream hiccup costs at most ~9s of stream consumption (3 attempts ×
-// 2s deadline + ~2.5s of jittered backoff between them) before the
-// outer dial loop takes over. The cap keeps the adapter from stalling
-// the gRPC Recv path indefinitely if NATS is genuinely down.
+// DefaultPublishRetry returns the per-publish bounded retry strategy:
+// 100ms..1s, 3 attempts. With the 2s per-attempt deadline a transient
+// JetStream hiccup costs at most ~9s before the handler answers 503.
 func DefaultPublishRetry() retry.Strategy {
 	return retry.Strategy{
 		Min:         100 * time.Millisecond,
@@ -147,56 +151,53 @@ func DefaultPublishRetry() retry.Strategy {
 	}
 }
 
-// publishAttemptTimeout caps a single PublishJS attempt. JetStream's
-// default publish-ack-wait is ~5s; without a per-attempt deadline a NATS
-// partition can stall a single PublishJS for ~5s before retry 2 starts.
-// The 2s ceiling keeps the bounded inner-retry path's worst case
-// predictable for the architecture's NFR1 budget.
+// publishAttemptTimeout caps a single PublishJS attempt so a NATS
+// partition cannot hold one attempt for JetStream's ~5s ack wait.
 const publishAttemptTimeout = 2 * time.Second
 
-// Adapter is the Falco gRPC sensor adapter. Construct with New; run
-// the per-instance goroutine via Run; observe health via Health.
+// Adapter is the Falco http_output receiver. Construct with New, run with
+// Run, observe with Health and the counter readers.
 type Adapter struct {
 	cfg    Config
 	pub    natsPublisher
 	log    *slog.Logger
 	health SourceHealth
 
-	// eventsPublished is the Story 1.12 Prometheus reader-side counter:
-	// incremented on every publishWithRetry success in the receive
-	// loop, never decremented, exposed via EventsTotal as the int64
-	// snapshot. Per guardrail 26 the metrics layer never owns a
-	// writeable counter; this atomic is the single source of truth.
-	eventsPublished atomic.Int64
-
-	// limiter is the Story 1.13 rate-limit circuit breaker consulted
-	// on the pre-publish path. Always non-nil after New (a disabled
-	// fallback is constructed when cfg.RateLimit is nil) so the Allow
-	// hot path can avoid a nil-check.
 	limiter *ratelimit.Limiter
 
-	// droppedBySampling counts events that the limiter elected to
-	// drop while engaged. Exposed via DroppedBySampling() as a future
-	// Prometheus counter (Story 1.18); the atomic is the single
-	// source of truth per guardrail 26.
+	// Counters are the single source of truth the metrics layer reads
+	// (guardrail 26: the metrics layer never owns a writeable counter).
+	eventsPublished   atomic.Int64
+	alertsReceived    atomic.Int64
+	heartbeats        atomic.Int64
 	droppedBySampling atomic.Int64
+	publishDrops      atomic.Int64
+	requests          map[string]*atomic.Uint64
 
-	// dialFn is a test seam: the production grpc.NewClient cannot be
-	// pointed at a bufconn dialer through public API alone. Tests
-	// override this; production callers leave it nil and the default
-	// dialer is used.
-	dialFn func(ctx context.Context, target string) (*grpc.ClientConn, error)
+	// lastSeenUnixNano is when Falco last proved it was alive. Zero
+	// means never.
+	lastSeenUnixNano atomic.Int64
 
-	// newClientFn is the gRPC client-stub constructor. Tests inject a
-	// hand-rolled implementation; production uses falcopb.NewServiceClient.
-	// The signature accepts grpc.ClientConnInterface (the interface the
-	// generated constructor takes); *grpc.ClientConn satisfies it.
-	newClientFn func(grpc.ClientConnInterface) falcopb.ServiceClient
+	// publishFailing is set by a transient publish failure and cleared
+	// only by a successful publish, so a heartbeat cannot mask a NATS
+	// outage.
+	publishFailing atomic.Bool
+
+	addrMu sync.Mutex
+	addr   string
+
+	// seq serialises everything after decode: the liveness mark, the rate
+	// limiter, the publish and the health update. net/http runs handlers
+	// concurrently; without this a late failed publish could overwrite
+	// health after a later success, and events could reorder. Falco's
+	// http_output sends one request at a time, so this costs nothing in
+	// practice and gives natural backpressure if it ever does not.
+	seq sync.Mutex
+
+	nowFn func() time.Time
 }
 
-// New constructs an Adapter. nc and log are required; cfg is validated.
-// nc may be a *natsclient.Client or any natsPublisher-satisfying type
-// (for tests).
+// New constructs an Adapter. nc is required; cfg is validated.
 func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 	if nc == nil {
 		return nil, errors.New("falco: new: nats publisher is nil")
@@ -204,22 +205,44 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	if cfg.Endpoint == "" {
-		return nil, errors.New("falco: new: config.Endpoint is empty")
+	if cfg.ListenAddr == "" {
+		return nil, errors.New("falco: new: config.ListenAddr is empty")
 	}
 	if cfg.Hostname == "" {
 		return nil, errors.New("falco: new: config.Hostname is empty")
 	}
-	// Substitute defaults when the corresponding strategy is the zero
-	// value, then validate the full struct so a partial misconfiguration
-	// (Min set, Multiplier unset, etc.) surfaces at New time rather than
-	// 1s into Run when the first Strategy.Do call would otherwise reject
-	// it.
-	if cfg.Retry.IsZero() {
-		cfg.Retry = DefaultRetry()
+	if len(cfg.Token) < MinTokenLength {
+		return nil, fmt.Errorf("falco: new: config.Token must be at least %d characters (got %d)", MinTokenLength, len(cfg.Token))
 	}
-	if err := cfg.Retry.Validate(); err != nil {
-		return nil, fmt.Errorf("falco: new: connect retry: %w", err)
+	if strings.ContainsAny(cfg.Token, "/?#% \t\r\n") {
+		return nil, errors.New("falco: new: config.Token must be a single URL path segment")
+	}
+	if cfg.MaxPayloadBytes <= 0 {
+		cfg.MaxPayloadBytes = 1 << 20
+	}
+	if cfg.HeartbeatTimeout <= 0 {
+		cfg.HeartbeatTimeout = 3 * time.Minute
+	}
+	if cfg.PublishWallClockBudget <= 0 {
+		cfg.PublishWallClockBudget = 12 * time.Second
+	}
+	if cfg.ReadHeaderTimeout <= 0 {
+		cfg.ReadHeaderTimeout = 10 * time.Second
+	}
+	if cfg.ReadTimeout <= 0 {
+		cfg.ReadTimeout = 30 * time.Second
+	}
+	if cfg.WriteTimeout <= 0 {
+		cfg.WriteTimeout = 30 * time.Second
+	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = 90 * time.Second
+	}
+	// Shutdown must outlast the detached publish budget: Run returning
+	// while a handler is still inside PublishJS lets main.go drain NATS
+	// under it. A shorter grace is raised rather than honoured.
+	if minGrace := cfg.PublishWallClockBudget + time.Second; cfg.ShutdownGrace < minGrace {
+		cfg.ShutdownGrace = minGrace
 	}
 	if cfg.PublishRetry.IsZero() {
 		cfg.PublishRetry = DefaultPublishRetry()
@@ -238,260 +261,300 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 		}
 		limiter = fallback
 	}
-	return &Adapter{
-		cfg:         cfg,
-		pub:         nc,
-		log:         log,
-		dialFn:      defaultDial,
-		newClientFn: falcopb.NewServiceClient,
-		limiter:     limiter,
-	}, nil
+	requests := make(map[string]*atomic.Uint64, len(ResponseCodes))
+	for _, c := range ResponseCodes {
+		requests[c] = new(atomic.Uint64)
+	}
+	a := &Adapter{
+		cfg:      cfg,
+		pub:      nc,
+		log:      log,
+		limiter:  limiter,
+		requests: requests,
+		nowFn:    time.Now,
+	}
+	a.health.MarkUnhealthy(errors.New("falco: no heartbeat or alert received from Falco yet"))
+	return a, nil
 }
 
-// Health returns the read-only source-health view. Story 1.12 binds
-// this to the Prometheus gauge `source_healthy{source="falco"}` (FR8).
-// Returning the narrow sourcehealth.Reader interface (rather than the
-// concrete *sourcehealth.Tracker) prevents callers outside this
-// package from reaching the mutator methods MarkHealthy /
-// MarkUnhealthy.
-func (a *Adapter) Health() sourcehealth.Reader {
-	return &a.health
+// Health returns the read-only source-health view, bound by the metrics
+// layer to source_healthy{source="falco"} (FR8).
+func (a *Adapter) Health() sourcehealth.Reader { return &a.health }
+
+// EventsTotal is the cumulative count of events published to
+// subjects.RawFalco (olaitan_sensor_events_total{source="falco"}).
+func (a *Adapter) EventsTotal() int64 { return a.eventsPublished.Load() }
+
+// AlertsReceivedTotal is the cumulative count of authenticated, decodable
+// alerts, published or not. The gap to EventsTotal is what sampling and
+// publish failures cost.
+func (a *Adapter) AlertsReceivedTotal() int64 { return a.alertsReceived.Load() }
+
+// HeartbeatsTotal is the cumulative count of Falco metrics snapshots.
+func (a *Adapter) HeartbeatsTotal() int64 { return a.heartbeats.Load() }
+
+// EngagedTotal is the cumulative count of rate-limit breaker engagements.
+func (a *Adapter) EngagedTotal() int64 { return a.limiter.EngagedTotal() }
+
+// DroppedBySampling is the cumulative count of alerts the engaged breaker
+// dropped.
+func (a *Adapter) DroppedBySampling() int64 { return a.droppedBySampling.Load() }
+
+// PublishDrops is the cumulative count of alerts dropped on a permanent
+// publish error (for example over the stream's per-message cap).
+func (a *Adapter) PublishDrops() int64 { return a.publishDrops.Load() }
+
+// RequestsByCode is the cumulative count of responses with the given
+// status code. Codes outside ResponseCodes read 0.
+func (a *Adapter) RequestsByCode(code string) uint64 {
+	if c := a.requests[code]; c != nil {
+		return c.Load()
+	}
+	return 0
 }
 
-// EventsTotal returns the cumulative count of events successfully
-// published to subjects.RawFalco. Story 1.12 binds this via
-// prometheus.NewCounterFunc to olaitan_sensor_events_total{source="falco"}.
-// Returning the int64 snapshot (not the atomic) keeps the metrics
-// layer a pure reader (guardrail 26).
-func (a *Adapter) EventsTotal() int64 {
-	return a.eventsPublished.Load()
+// Limiter returns the rate-limit breaker so main.go's hot-reload callback
+// can retune it without a restart (FR49).
+func (a *Adapter) Limiter() *ratelimit.Limiter { return a.limiter }
+
+// Addr is the bound listen address once Run has started, or "".
+func (a *Adapter) Addr() string {
+	a.addrMu.Lock()
+	defer a.addrMu.Unlock()
+	return a.addr
 }
 
-// EngagedTotal returns the cumulative count of rate-limit circuit
-// breaker engage transitions. Story 1.12's metrics.Registry.RegisterCounter
-// reads this via prometheus.NewCounterFunc to bind
-// olaitan_sensor_circuit_breaker_engaged_total{source="falco", node=...}.
-// Re-engage-during-cooldown is treated as a continuous engagement and
-// does not advance the counter (guardrail 29).
-func (a *Adapter) EngagedTotal() int64 {
-	return a.limiter.EngagedTotal()
+// Handler returns the adapter's HTTP handler. Run serves it; tests call
+// it directly.
+func (a *Adapter) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc(pathPrefix, a.handleAlert)
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		a.respond(w, http.StatusNotFound, "not found")
+	})
+	return mux
 }
 
-// DroppedBySampling returns the cumulative count of events the
-// limiter dropped during engagement. Story 1.18 will bind this via
-// prometheus.NewCounterFunc; the atomic is the single source of
-// truth (guardrail 26).
-func (a *Adapter) DroppedBySampling() int64 {
-	return a.droppedBySampling.Load()
-}
-
-// Limiter returns the rate-limit circuit breaker the adapter is
-// wired to. Used by cmd/olaitan/main.go's config.Manager.Subscribe
-// callback to push thresholds and sampling-rate changes through the
-// limiter's Update* mutators without a process restart per FR49.
-func (a *Adapter) Limiter() *ratelimit.Limiter {
-	return a.limiter
-}
-
-// Run blocks until ctx is cancelled. The retry strategy supplied via
-// Config governs reconnect cadence on Falco unavailability; it never
-// returns to the caller on a transient error, only on ctx-driven
-// cancellation. A non-transient configuration failure is surfaced
-// immediately as a non-nil error.
+// Run binds ListenAddr, serves until ctx is cancelled, then drains
+// in-flight requests for ShutdownGrace. A bind failure is returned.
 func (a *Adapter) Run(ctx context.Context) error {
-	a.log.Info("falco: adapter starting",
-		"endpoint", a.cfg.Endpoint,
-		"hostname", a.cfg.Hostname)
+	ln, err := net.Listen("tcp", a.cfg.ListenAddr)
+	if err != nil {
+		a.health.MarkUnhealthy(err)
+		return fmt.Errorf("falco: listen %q: %w", a.cfg.ListenAddr, err)
+	}
+	a.addrMu.Lock()
+	a.addr = ln.Addr().String()
+	a.addrMu.Unlock()
+	a.log.Info("falco: http_output receiver listening",
+		"addr", a.addr,
+		"hostname", a.cfg.Hostname,
+		"heartbeat_timeout", a.cfg.HeartbeatTimeout)
 	defer a.log.Info("falco: adapter stopped")
 
-	err := a.cfg.Retry.Do(ctx, func(ctx context.Context) error {
-		return a.connectAndConsume(ctx)
-	})
-	// Retry.Do returns ctx.Err() for ctx cancellation, which we treat as
-	// a clean shutdown rather than an error.
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return nil
+	srv := &http.Server{
+		Handler:           a.Handler(),
+		ReadHeaderTimeout: a.cfg.ReadHeaderTimeout,
+		ReadTimeout:       a.cfg.ReadTimeout,
+		WriteTimeout:      a.cfg.WriteTimeout,
+		IdleTimeout:       a.cfg.IdleTimeout,
+		// Keep the default server's "http: TLS handshake error" noise
+		// and friends out of stderr; route it through the adapter log.
+		ErrorLog: slog.NewLogLogger(a.log.Handler(), slog.LevelWarn),
 	}
-	return err
-}
 
-// connectAndConsume runs one dial-stream-consume iteration. Returns a
-// transient error when the stream tears down so the outer Retry.Do can
-// re-enter; returns ctx.Err() (or a retry.Permanent wrap) to signal a
-// terminal condition that should propagate out of Run.
-func (a *Adapter) connectAndConsume(ctx context.Context) error {
-	cc, err := a.dialFn(ctx, a.cfg.Endpoint)
-	if err != nil {
-		a.health.MarkUnhealthy(err)
-		if isTerminalConnectError(err) {
-			return retry.Permanent(fmt.Errorf("falco: dial %q (terminal, no retry): %w", a.cfg.Endpoint, err))
+	wdCtx, wdCancel := context.WithCancel(ctx)
+	defer wdCancel()
+	go a.runStalenessWatchdog(wdCtx)
+
+	serveErr := make(chan error, 1)
+	go func() {
+		err := srv.Serve(ln)
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
 		}
-		return fmt.Errorf("falco: dial %q: %w", a.cfg.Endpoint, err)
-	}
-	defer func() {
-		if cerr := cc.Close(); cerr != nil {
-			a.log.Warn("falco: grpc conn close", "err", cerr)
-		}
+		serveErr <- err
 	}()
 
-	client := a.newClientFn(cc)
-	stream, err := client.Sub(ctx)
-	if err != nil {
-		a.health.MarkUnhealthy(err)
-		if isTerminalConnectError(err) {
-			return retry.Permanent(fmt.Errorf("falco: sub (terminal, no retry): %w", err))
-		}
-		return fmt.Errorf("falco: sub: %w", err)
-	}
-	// Falco's Sub is bidi-streaming; the server starts emitting only
-	// after the client sends an initial Request. The Request message is
-	// empty (TODO upstream re: tags) but its arrival is the kickoff.
-	if err := stream.Send(&falcopb.Request{}); err != nil {
-		a.health.MarkUnhealthy(err)
-		if isTerminalConnectError(err) {
-			return retry.Permanent(fmt.Errorf("falco: stream send (terminal, no retry): %w", err))
-		}
-		return fmt.Errorf("falco: stream send: %w", err)
-	}
-	// The client side of the bidi stream sends exactly one Request
-	// message; closing it lets a strict server release request-side
-	// resources without affecting the server-to-client Recv path.
-	if err := stream.CloseSend(); err != nil {
-		// CloseSend failure is operationally non-fatal; the stream's
-		// Recv direction can still deliver. Log and continue so a
-		// transport quirk on this seam does not abort an otherwise-
-		// healthy adapter.
-		a.log.Debug("falco: stream close-send", "err", err)
-	}
-
-	// Note: MarkHealthy is deferred to the first successful Recv below,
-	// not called here. grpc.NewClient is lazy; a successful Send onto a
-	// fresh connection only buffers the message locally, so flipping the
-	// gauge to healthy at this point would lie about whether Falco is
-	// actually reachable. The first non-error Recv is the earliest
-	// moment we have evidence of byte traffic in both directions.
-
-	firstMessage := true
-	// Half-open transport detection is provided entirely by gRPC
-	// keepalive (see defaultDial: 30s ping + 10s timeout). The previous
-	// implementation also pre-checked ctx.Err before each Recv, but
-	// Recv itself honours ctx-cancel, so the pre-check only saved a
-	// couple of microseconds on the next iteration after cancellation
-	// has been observed. There is no concurrent watchdog goroutine.
-	for {
-		resp, err := stream.Recv()
+	select {
+	case err := <-serveErr:
 		if err != nil {
-			// Clean shutdown: gRPC wraps a cancelled context as a
-			// status error with codes.Canceled, which errors.Is does
-			// NOT recognise as context.Canceled (grpc-go #6862).
-			// Check ctx.Err and the gRPC status code so SIGTERM does
-			// not look like a transient transport fault in logs or
-			// the SourceHealth lastErr surface.
-			if ctx.Err() != nil || status.Code(err) == codes.Canceled {
-				return ctx.Err()
-			}
-			// io.EOF means Falco closed its side cleanly; retry so
-			// Falco restarts are handled. Mark unhealthy and let the
-			// outer retry loop dial again. (Smoothing the brief
-			// healthy=0 window during expected restarts is the
-			// alerting layer's job; see Story 1.12 alert-rule notes.)
-			if errors.Is(err, io.EOF) {
-				a.health.MarkUnhealthy(io.EOF)
-				return fmt.Errorf("falco: stream eof")
-			}
 			a.health.MarkUnhealthy(err)
-			if isTerminalConnectError(err) {
-				return retry.Permanent(fmt.Errorf("falco: stream recv (terminal, no retry): %w", err))
-			}
-			if status.Code(err) == codes.ResourceExhausted {
-				// A leftover collector instance still holding the
-				// gRPC subscription returns ResourceExhausted; let
-				// the dial loop sleep and re-enter so the old pod's
-				// terminationGracePeriodSeconds expires and clears
-				// the slot.
-				a.log.Warn("falco: stream recv resource-exhausted; backing off",
-					"err", err)
-			}
-			return fmt.Errorf("falco: stream recv: %w", err)
+			return fmt.Errorf("falco: serve: %w", err)
 		}
-
-		if firstMessage {
-			a.health.MarkHealthy()
-			a.log.Info("falco: stream connected", "endpoint", a.cfg.Endpoint)
-			firstMessage = false
+		return nil
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), a.cfg.ShutdownGrace)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			a.log.Warn("falco: shutdown grace expired", "err", err)
 		}
-		// MarkHealthy on subsequent Recvs was previously called here
-		// to "defend against a transient MarkUnhealthy from publish-
-		// retry leaving the gauge stuck false after recovery." That
-		// defence is fiction in the single-goroutine pipeline:
-		// publishWithRetry runs synchronously below, so MarkHealthy
-		// could not fire while a publish stalls. The bounded inner
-		// retry only flips the gauge unhealthy on persistent failure
-		// (which tears the stream and re-enters this connect path),
-		// at which point the next firstMessage flips it back. No
-		// per-Recv refresh is needed.
-
-		ev, err := Translate(resp, a.cfg.Hostname)
-		if err != nil {
-			// A single malformed message must not break the stream;
-			// log and skip. The source stays healthy because the
-			// connection is still alive.
-			a.log.Warn("falco: translate skipped malformed message",
-				"err", err, "rule", resp.GetRule())
-			continue
-		}
-
-		// Story 1.13: per-source rate-limit circuit breaker. When the
-		// breaker is engaged the limiter rolls FNV-1a(ev.ID) mod 100
-		// against the current sampling rate; events that lose the roll
-		// are dropped (counter incremented for Story 1.18 visibility),
-		// events that win are annotated so the downstream correlator
-		// and DFIR report writer can disclose the degradation honestly.
-		d := a.limiter.Allow(ev.ID)
-		if !d.Publish {
-			a.droppedBySampling.Add(1)
-			continue
-		}
-		if d.Sampled {
-			ev.Sampled = true
-			ev.SamplingRate = d.SamplingRate
-		}
-
-		if err := a.publishWithRetry(ctx, ev); err != nil {
-			if isPermanentPublishError(err) {
-				// Per-message terminal failure (e.g. payload too
-				// large for the EVENTS_RAW MaxMsgSize cap). Tearing
-				// the stream and re-dialling would just receive the
-				// same oversize message again from Falco's emitter
-				// and tight-loop; instead log+skip this single event
-				// and stay on the live stream. The gauge stays
-				// healthy because the connection is intact.
-				a.log.Error("falco: publish dropped (permanent, per-message)",
-					"err", err, "event_id", ev.ID, "summary_bytes", len(ev.Summary))
-				continue
-			}
-			// Persistent transient publish failure: NATS is genuinely
-			// unavailable. Tear the stream down so the outer dial
-			// loop can re-enter (during which Falco is the lossy
-			// component, but at-least-once is preserved across
-			// transient hiccups by publishWithRetry above).
-			a.health.MarkUnhealthy(err)
-			return fmt.Errorf("falco: publish: %w", err)
-		}
-		a.eventsPublished.Add(1)
+		<-serveErr
+		return nil
 	}
 }
 
-// publishWithRetry attempts to publish ev to subjects.RawFalco with
-// bounded retry. Each attempt is wrapped in a 2s per-attempt deadline
-// (publishAttemptTimeout) so a single PublishJS cannot stall past the
-// strategy's between-attempts cap. ev.ID is forwarded as the JetStream
-// Nats-Msg-Id header so a retry that the server already persisted on a
-// previous attempt is server-side deduplicated within the stream's
-// dedup window (default 2 min). A permanent server-side error (e.g.
-// "Maximum Payload Violation" / "message size exceeded") is wrapped in
-// retry.Permanent so the inner-retry exits immediately and the caller
-// can log+skip without tearing down the gRPC stream.
+// handleAlert serves POST /falco/<token>.
+func (a *Adapter) handleAlert(w http.ResponseWriter, r *http.Request) {
+	// Authenticate before looking at anything else, so an unauthenticated
+	// caller learns nothing about how the body would have been handled.
+	got := strings.TrimPrefix(r.URL.Path, pathPrefix)
+	if subtle.ConstantTimeCompare([]byte(got), []byte(a.cfg.Token)) != 1 {
+		a.log.Warn("falco: rejected request with a missing or wrong token",
+			"remote", r.RemoteAddr)
+		a.respond(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if r.Method != http.MethodPost {
+		a.respond(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
+		// Falco sends text/plain when json_output is off. The chart
+		// turns it on; this names the fix if someone turns it off.
+		a.log.Warn("falco: rejected non-JSON alert; is Falco's json_output enabled?",
+			"content_type", r.Header.Get("Content-Type"))
+		a.respond(w, http.StatusUnsupportedMediaType, "unsupported media type")
+		return
+	}
+
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, a.cfg.MaxPayloadBytes))
+	_ = r.Body.Close()
+	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			a.log.Warn("falco: rejected oversize alert", "max_bytes", a.cfg.MaxPayloadBytes)
+			a.respond(w, http.StatusRequestEntityTooLarge, "payload too large")
+			return
+		}
+		a.respond(w, http.StatusBadRequest, "bad request")
+		return
+	}
+
+	resp, err := DecodeHTTPOutput(body)
+	if err != nil {
+		a.log.Warn("falco: rejected undecodable alert", "err", err)
+		a.respond(w, http.StatusBadRequest, "bad request")
+		return
+	}
+
+	a.seq.Lock()
+	defer a.seq.Unlock()
+
+	// Anything well-formed from Falco proves it is alive.
+	a.sawFalco()
+	if resp.GetSource() == internalSource && resp.GetRule() == metricsSnapshotRule {
+		a.heartbeats.Add(1)
+		a.respond(w, http.StatusNoContent, "")
+		return
+	}
+	a.alertsReceived.Add(1)
+
+	ev, err := Translate(resp, a.cfg.Hostname)
+	if err != nil {
+		a.log.Warn("falco: translate rejected alert", "err", err, "rule", resp.GetRule())
+		a.respond(w, http.StatusBadRequest, "bad request")
+		return
+	}
+
+	// Story 1.13: per-source rate-limit circuit breaker. Sampled-out
+	// alerts are counted and acknowledged; Falco has nothing to retry.
+	d := a.limiter.Allow(ev.ID)
+	if !d.Publish {
+		a.droppedBySampling.Add(1)
+		a.respond(w, http.StatusNoContent, "")
+		return
+	}
+	if d.Sampled {
+		ev.Sampled = true
+		ev.SamplingRate = d.SamplingRate
+	}
+
+	// Detached from the request so Falco hanging up does not abort a
+	// publish already in its retry budget; bounded so a stuck NATS
+	// cannot orphan the goroutine.
+	pubCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), a.cfg.PublishWallClockBudget)
+	defer cancel()
+	if err := a.publishWithRetry(pubCtx, ev); err != nil {
+		if isPermanentPublishError(err) {
+			a.publishDrops.Add(1)
+			a.log.Error("falco: publish dropped (permanent, per-alert)",
+				"err", err, "event_id", ev.ID, "summary_bytes", len(ev.Summary))
+			a.respond(w, http.StatusNoContent, "")
+			return
+		}
+		a.publishFailing.Store(true)
+		a.health.MarkUnhealthy(fmt.Errorf("falco: publish: %w", err))
+		a.log.Warn("falco: publish failed transiently", "err", err, "event_id", ev.ID)
+		a.respond(w, http.StatusServiceUnavailable, "publish failed")
+		return
+	}
+	a.eventsPublished.Add(1)
+	a.publishFailing.Store(false)
+	a.health.MarkHealthy()
+	a.respond(w, http.StatusNoContent, "")
+}
+
+// sawFalco records that Falco is alive. It marks the source healthy only
+// when publishes are not failing: Falco being up says nothing about
+// whether its alerts reach NATS.
+func (a *Adapter) sawFalco() {
+	a.lastSeenUnixNano.Store(a.nowFn().UnixNano())
+	if !a.publishFailing.Load() {
+		a.health.MarkHealthy()
+	}
+}
+
+func (a *Adapter) respond(w http.ResponseWriter, code int, msg string) {
+	if c := a.requests[strconv.Itoa(code)]; c != nil {
+		c.Add(1)
+	}
+	if code == http.StatusNoContent {
+		w.WriteHeader(code)
+		return
+	}
+	http.Error(w, msg, code)
+}
+
+// runStalenessWatchdog calls checkStaleness every quarter timeout until
+// ctx is cancelled.
+func (a *Adapter) runStalenessWatchdog(ctx context.Context) {
+	t := time.NewTicker(a.cfg.HeartbeatTimeout / 4)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			a.checkStaleness()
+		}
+	}
+}
+
+// checkStaleness marks the source unhealthy when Falco has been silent
+// for longer than HeartbeatTimeout. It only overrides a healthy state, so
+// a more specific reason (a failing publish) is not replaced. A backward
+// clock step reads as fresh rather than fabricating an outage.
+func (a *Adapter) checkStaleness() {
+	last := a.lastSeenUnixNano.Load()
+	if last == 0 {
+		return
+	}
+	silent := a.nowFn().Sub(time.Unix(0, last))
+	if silent <= a.cfg.HeartbeatTimeout {
+		return
+	}
+	if healthy, _ := a.health.Status(); !healthy {
+		return
+	}
+	a.health.MarkUnhealthy(fmt.Errorf("falco: no heartbeat or alert for %s (timeout %s); is Falco running and is http_output pointed at this collector?",
+		silent.Round(time.Second), a.cfg.HeartbeatTimeout))
+}
+
+// publishWithRetry publishes ev to subjects.RawFalco with bounded retry.
+// ev.ID travels as the Nats-Msg-Id header, so a retry the server already
+// persisted is deduplicated within the stream's window. A permanent
+// server-side error exits the retry loop at once.
 func (a *Adapter) publishWithRetry(ctx context.Context, ev schema.Event) error {
 	return a.cfg.PublishRetry.Do(ctx, func(ctx context.Context) error {
 		attemptCtx, cancel := context.WithTimeout(ctx, publishAttemptTimeout)
@@ -508,96 +571,21 @@ func (a *Adapter) publishWithRetry(ctx context.Context, ev schema.Event) error {
 	})
 }
 
-// defaultDial dials target with insecure transport credentials (Falco's
-// gRPC plugin defaults to plaintext over a Unix socket); TLS for tcp://
-// targets is tracked as future work in deferred-decisions.md. Keepalive
-// parameters force the gRPC client to detect a half-open transport
-// (NIC drop, peer kernel-panic) by pinging every 30s with a 10s
-// timeout; without this a wedged TCP connection appears healthy
-// indefinitely because Recv produces neither an error nor a message.
-//
-// grpc.NewClient is intentionally lazy in modern grpc-go (>= 1.63);
-// connection establishment happens on the first RPC. Any apparent
-// "dial success" here is therefore not evidence the endpoint is
-// reachable; that determination lives in connectAndConsume's first
-// Recv.
-func defaultDial(_ context.Context, target string) (*grpc.ClientConn, error) {
-	return grpc.NewClient(
-		target,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                30 * time.Second,
-			Timeout:             10 * time.Second,
-			PermitWithoutStream: false,
-		}),
-	)
-}
-
-// isTerminalConnectError returns true when err represents a permanent
-// configuration mistake that cannot be fixed by retrying:
-//
-//   - fs.ErrPermission: EACCES on the Falco Unix socket. The pod will
-//     keep getting denied until an operator fixes the socket's
-//     permissions or the container's UID/GID.
-//   - gRPC codes.Unauthenticated: TLS auth failure on a tcp:// target.
-//   - gRPC codes.PermissionDenied: server-side RBAC denial.
-//
-// codes.ResourceExhausted is intentionally NOT terminal: a leftover
-// collector pod still holding the Falco gRPC subscription clears once
-// it terminates within terminationGracePeriodSeconds, so the new pod
-// should keep dialing with backoff. See connectAndConsume's explicit
-// log on ResourceExhausted for that path.
-//
-// errors.Is unwraps the gRPC status error chain to find a wrapped
-// fs.ErrPermission; status.Code reads the gRPC code directly. Both
-// checks tolerate nil err (returning false) so callers can use this
-// unconditionally on the failure branch.
-func isTerminalConnectError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, fs.ErrPermission) {
-		return true
-	}
-	switch status.Code(err) {
-	case codes.Unauthenticated, codes.PermissionDenied:
-		return true
-	}
-	// gRPC sometimes surfaces unix-socket EACCES as Unavailable with
-	// "permission denied" in the message; substring-match as a last
-	// line of defence so the pod CrashLoops loudly instead of looping
-	// silently at 60s cadence.
-	if strings.Contains(strings.ToLower(err.Error()), "permission denied") {
-		return true
-	}
-	return false
-}
-
 // isPermanentPublishError returns true when err from a JetStream
 // PublishJS call is a per-message terminal condition (the message
 // itself violates a stream-level invariant) rather than a transient
-// transport hiccup. The caller is expected to log+drop the offending
-// event and continue; tearing down the stream and re-dialing would
-// just have Falco re-emit the same oversize message and tight-loop.
-//
-// JetStream surfaces "maximum payload violation" / "message size
-// exceeded" / "max msgs per subject" with text bodies that vary across
-// nats-server versions; substring-match the lowercase message body
-// against the stable phrase fragments. nats.ErrMaxPayload is the
-// client-side guard for the connection's max_payload setting.
+// transport hiccup. JetStream's wording varies across nats-server
+// versions, so match the stable phrase fragments.
 func isPermanentPublishError(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "maximum payload") ||
+	return strings.Contains(msg, "maximum payload") ||
 		strings.Contains(msg, "max payload") ||
 		strings.Contains(msg, "message size exceeded") ||
 		strings.Contains(msg, "max msg size") ||
-		strings.Contains(msg, "payload too big") {
-		return true
-	}
-	return false
+		strings.Contains(msg, "payload too big")
 }
 
 // compile-time assertion: *natsclient.Client satisfies natsPublisher.

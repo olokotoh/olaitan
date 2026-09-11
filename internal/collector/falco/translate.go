@@ -15,7 +15,7 @@ import (
 )
 
 // minValidEventTime is the floor below which a Falco-supplied timestamp
-// is treated as garbage. Falco's grpc_output stamps events with the
+// is treated as garbage. Falco stamps events with the
 // node's wall clock; in practice a value before 2010 indicates either
 // an unset Timestamp{Seconds:0} (Unix epoch) or severe clock skew on
 // the node. Either way, downstream sliding-window correlation would

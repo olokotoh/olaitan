@@ -121,7 +121,7 @@ DRYRUN="$(kubectl -n "$NS" run psa-probe --image=busybox:1.36 --restart=Never --
 if echo "$DRYRUN" | grep -qi "violat\|forbidden\|denied"; then
   bad "privileged pods are REJECTED by admission"
   info "$(echo "$DRYRUN" | head -2 | tail -1 | cut -c1-100)"
-  info "Falco cannot run here. Use an external Falco (endpoints.falco) or a non-Autopilot cluster."
+  info "Falco cannot run here. Use your own Falco posting to the falco-ingest Service (falco.enabled=false) or a non-Autopilot cluster."
 else
   ok "privileged pods are admitted${PSA:+  (namespace PSA enforce=$PSA)}"
 fi

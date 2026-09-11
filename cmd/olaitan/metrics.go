@@ -221,10 +221,40 @@ func registerAdapterCounters(reg *metrics.Registry, source, nodeName string, ad 
 			return err
 		}
 	case *falco.Adapter:
-		// No additional per-adapter detail counters as of Story 1.6;
-		// the source_healthy gauge and sensor_events_total counter are
-		// sufficient. Listed in the switch for symmetry so a future
-		// addition lands here.
+		// Story 10.2: the http_output receiver. One series per status
+		// code, registered up front so a code that has not happened yet
+		// reads 0 instead of being absent. 401 climbing means something
+		// is posting with the wrong token; 503 means NATS refused
+		// publishes, and Falco does not retry, so those alerts are lost.
+		for _, c := range falco.ResponseCodes {
+			c := c
+			if err := reg.RegisterCounter(
+				"olaitan_sensor_falco_http_requests_total", source,
+				"Falco http_output requests answered by the collector, by HTTP status code (Story 10.2).",
+				prometheus.Labels{"code": c},
+				func() int64 { return int64(a.RequestsByCode(c)) },
+			); err != nil {
+				return fmt.Errorf("metrics: register falco_http_requests_total[%s]: %w", c, err)
+			}
+		}
+		if err := reg.RegisterCounter(
+			"olaitan_sensor_falco_alerts_received_total", source,
+			"Authenticated, decodable Falco alerts received, published or not; the gap to sensor_events_total is sampling plus publish failures (Story 10.2).",
+			nil, a.AlertsReceivedTotal); err != nil {
+			return err
+		}
+		if err := reg.RegisterCounter(
+			"olaitan_sensor_falco_heartbeats_total", source,
+			"Falco metrics snapshots received; they drive source_healthy{source=\"falco\"} and are never published as events (Story 10.2).",
+			nil, a.HeartbeatsTotal); err != nil {
+			return err
+		}
+		if err := reg.RegisterCounter(
+			"olaitan_sensor_falco_publish_drops_total", source,
+			"Falco alerts dropped on a permanent publish error, for example over the EVENTS_RAW per-message cap (Story 10.2).",
+			nil, a.PublishDrops); err != nil {
+			return err
+		}
 	case *applog.Adapter:
 		// Story 1.9 detail counters. Story 1.12 does NOT pass an applog
 		// Adapter into startCollectorRing's metricsSources because applog

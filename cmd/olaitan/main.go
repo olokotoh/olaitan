@@ -1873,15 +1873,15 @@ func isFSMFetchTimeout(err error) bool {
 }
 
 // startCollectorRing wires the Ring 1 sensor adapters into the supplied
-// errgroup. As of Story 1.7 the Falco gRPC adapter (Story 1.6) and the
-// Kubernetes audit-webhook receiver (Story 1.7) both land here;
-// Stories 1.8-1.10 will add cri, applog, and cni adapters by
-// following the same spawn pattern.
+// errgroup: the Falco http_output receiver (Story 1.6, moved off gRPC in
+// Story 10.2), the Kubernetes audit-webhook receiver (Story 1.7), and the
+// cri, applog and cni adapters (Stories 1.8-1.10) by the same pattern.
 //
 // Connection coordinates come from environment variables injected by
-// the Helm chart's downward API (see deploy/helm/olaitan/templates/
-// daemonset.yaml): NATS_URL for the bus, FALCO_SOCKET for the Falco
-// gRPC endpoint, K8S_NODE_NAME for the per-event Pod.Node identifier.
+// the Helm chart (see deploy/helm/olaitan/templates/daemonset.yaml):
+// NATS_URL for the bus, FALCO_LISTEN_ADDR for the address Falco posts
+// alerts to, FALCO_HTTP_TOKEN_FILE for the shared secret Falco puts in
+// the URL path, K8S_NODE_NAME for the per-event Pod.Node identifier.
 // The audit-webhook adapter is gated on cfg.Detection.Sources.Audit.
 // Enabled, so a chart deploy with the default
 // auditWebhook.enabled=false leaves the receiver dormant.
@@ -1896,9 +1896,13 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 	if natsURL == "" {
 		return errors.New("collector: NATS_URL env var is empty (set by Helm chart)")
 	}
-	falcoSocket := os.Getenv("FALCO_SOCKET")
-	if falcoSocket == "" {
-		return errors.New("collector: FALCO_SOCKET env var is empty (set by Helm chart)")
+	falcoListen := os.Getenv("FALCO_LISTEN_ADDR")
+	if falcoListen == "" {
+		return errors.New("collector: FALCO_LISTEN_ADDR env var is empty (set by Helm chart)")
+	}
+	falcoToken, err := readFalcoToken(os.Getenv("FALCO_HTTP_TOKEN_FILE"))
+	if err != nil {
+		return fmt.Errorf("collector: %w", err)
 	}
 	nodeName := os.Getenv("K8S_NODE_NAME")
 	if nodeName == "" {
@@ -1991,9 +1995,10 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 	}
 
 	adapter, err := falco.New(falco.Config{
-		Endpoint:  falcoSocket,
-		Hostname:  nodeName,
-		RateLimit: rateLimiters[string(schema.SourceFalco)],
+		ListenAddr: falcoListen,
+		Token:      falcoToken,
+		Hostname:   nodeName,
+		RateLimit:  rateLimiters[string(schema.SourceFalco)],
 	}, nc, log)
 	if err != nil {
 		closeNATS()
@@ -2174,7 +2179,7 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 	}
 
 	log.Info("collector: ring 1 wired",
-		"falco_socket", falcoSocket,
+		"falco_listen", falcoListen,
 		"node", nodeName,
 		"rate_limit_enabled", cfg.RateLimit.EnabledOrDefault(),
 		"rate_limit_threshold", cfg.RateLimit.ThresholdEventsPerSec,
@@ -2331,4 +2336,23 @@ func analystAPIKeyFromEnv(envName string) string {
 		return ""
 	}
 	return strings.TrimSpace(os.Getenv(envName))
+}
+
+// readFalcoToken reads the shared secret Falco puts in its http_output URL
+// path. The chart mounts the release Secret at /etc/olaitan/secrets, so
+// the token is read from a file rather than an env var: it stays out of
+// the process environment and out of `kubectl describe pod`.
+func readFalcoToken(path string) (string, error) {
+	if path == "" {
+		return "", errors.New("FALCO_HTTP_TOKEN_FILE env var is empty (set by Helm chart)")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read falco http token: %w", err)
+	}
+	tok := strings.TrimSpace(string(b))
+	if tok == "" {
+		return "", fmt.Errorf("falco http token file %s is empty", path)
+	}
+	return tok, nil
 }

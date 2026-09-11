@@ -349,6 +349,21 @@ jobs:
           chmod 600 "$HOME/.kube/config"
           echo "KUBECONFIG=$HOME/.kube/config" >> "$GITHUB_ENV"
 
+      # Test THIS change's binary, not the published edge image. Without this
+      # the job installed the PR's chart with main's collector, so any PR
+      # that changed both (Story 10.2: the Falco transport) could not pass,
+      # and a PR that broke only the binary could not fail.
+      - name: Build Olaitan image and load it into the cluster
+        run: |
+          make docker-build
+          tag=$(make -s version-tag)
+          case "${{ matrix.distro }}" in
+            kind)     kind load docker-image olaitan:"$tag" --name olaitan-portability ;;
+            minikube) minikube image load olaitan:"$tag" ;;
+            k3s)      docker save olaitan:"$tag" | sudo k3s ctr images import - ;;
+          esac
+          echo "OLAITAN_TAG=$tag" >> "$GITHUB_ENV"
+
       - name: Preflight
         run: |
           # Informational: preflight exits 1 on a blocker, and "kindnet does
@@ -374,6 +389,9 @@ jobs:
             -f "deploy/helm/olaitan/values-${{ matrix.distro }}.yaml" \
             --namespace olaitan --create-namespace \
             --set secrets.redisPassword=ci-fake-password \
+            --set image.repository=olaitan \
+            --set-string image.tag="$OLAITAN_TAG" \
+            --set image.pullPolicy=Never \
             --wait --timeout 12m
 
       # The actual assertion. Every workload the chart ships must reach Ready
@@ -389,46 +407,34 @@ jobs:
           kubectl -n olaitan rollout status ds/olaitan-falco --timeout=5m
           kubectl -n olaitan get pods -o wide
 
-      # Story 9.6 regression guard, and the reason this job exists at all.
-      # Falco creates its gRPC socket 0755 root:root; the collector runs as UID
-      # 65532 and cannot connect to it. On kind the two share an effective
-      # identity so the dial succeeds regardless, which is exactly why the
-      # defect survived every previous test -- so assert the collector's Falco
-      # source is actually live rather than trusting a Ready pod.
-      - name: Assert the collector attached to Falco
+      # Story 10.2: prove the collector actually hears Falco, rather than
+      # trusting a Ready pod. Falco posts its metrics snapshot every minute
+      # through the same http_output as alerts, and the collector turns it
+      # into source_healthy{source="falco"}. 1 means Falco's HTTP path, the
+      # token and the node-local Service all work; a climbing code="401"
+      # means Falco and the collector disagree on the token. Read through the
+      # API server's pod proxy because the collector image has no shell.
+      - name: Assert the collector hears Falco
         run: |
           set -euo pipefail
-          if kubectl -n olaitan logs -l app.kubernetes.io/component=collector \
-               --tail=-1 --all-containers | grep -q "connect: permission denied"; then
-            echo "::error::collector cannot attach to Falco's socket (Blocker 8 regression)"
-            kubectl -n olaitan logs -l app.kubernetes.io/component=collector --tail=50 --all-containers
-            exit 1
-          fi
-          # Positively assert the socket is in a state the collector can
-          # connect to, by reading it from inside the pod. The grep above is
-          # only the absence of one error string: a collector that attached
-          # to nothing at all (Falco never started, the sidecar crash-looped)
-          # would pass it. Connecting to a unix socket needs write
-          # permission, so the group must be the collector's and that group
-          # must have the write bit.
           pod="$(kubectl -n olaitan get pod -l app.kubernetes.io/component=collector \
                    -o jsonpath='{.items[0].metadata.name}')"
-          perms="$(kubectl -n olaitan exec "$pod" -c falco-socket-permissions -- \
-                     stat -c '%a %g' /run/falco/falco.sock)"
-          echo "falco.sock: $perms"
-          mode="$(echo "$perms" | cut -d' ' -f1)"
-          gid="$(echo "$perms" | cut -d' ' -f2)"
-          if [ "$gid" != "65532" ]; then
-            echo "::error::falco.sock group is $gid, not the collector's 65532 -- it cannot connect"
-            exit 1
-          fi
-          case "$(printf '%04d' "$mode" | cut -c3)" in
-            2|3|6|7) echo "socket is group-writable by the collector's group: OK" ;;
-            *) echo "::error::falco.sock is mode $mode; group $gid cannot write, so the collector cannot connect"
-               exit 1 ;;
-          esac
-          kubectl -n olaitan logs -l app.kubernetes.io/component=collector \
-            -c falco-socket-permissions --tail=20
+          for i in $(seq 1 30); do
+            m="$(kubectl get --raw "/api/v1/namespaces/olaitan/pods/${pod}:9090/proxy/metrics")"
+            if echo "$m" | grep -Eq '^olaitan_source_healthy\{[^}]*source="falco"[^}]*\} 1$'; then
+              echo "$m" | grep -E 'source_healthy|olaitan_sensor_falco_' || true
+              if echo "$m" | grep -Eq 'olaitan_sensor_falco_http_requests_total\{[^}]*code="401"[^}]*\} [1-9]'; then
+                echo "::error::the collector rejected Falco's token (401)"; exit 1
+              fi
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::no Falco heartbeat reached the collector in 5 minutes"
+          echo "$m" | grep -E 'source_healthy|olaitan_sensor_falco_' || true
+          kubectl -n olaitan logs -l app.kubernetes.io/name=falco -c falco --tail=40 || true
+          kubectl -n olaitan logs -l app.kubernetes.io/component=collector --tail=40 || true
+          exit 1
 
       # AC3: record the enforcement verdict per distribution. This is
       # deliberately NOT a pass/fail gate -- kindnet genuinely does not
@@ -625,17 +631,6 @@ jobs:
           # property AC2 wants. Verified locally with helm v3.16: a string
           # install + the harness upgrade yields a byte-identical manifest;
           # the bare-int install drifts both pod templates.
-          # endpoints.falco overridden to a tcp:// target: with the
-          # default unix:///run/falco/falco.sock the collector DaemonSet
-          # mounts /run/falco from the host as a `type: Directory`
-          # hostPath, which does not exist inside kind nodes (no Falco
-          # subchart, and even with it eBPF probes cannot load inside
-          # the kind container). The kubelet then keeps the pod in
-          # ContainerCreating forever. tcp:// skips the if-block in
-          # templates/daemonset.yaml so the hostPath is not requested;
-          # the collector pod starts and the Falco adapter dials tcp
-          # (it will fail and mark source_healthy{source=falco}=0 but
-          # the rest of the pipeline runs).
           helm install olaitan ./deploy/helm/olaitan \
             --set image.repository=olaitan \
             --set-string image.tag="$tag" \
@@ -644,7 +639,6 @@ jobs:
             --set baselines.warmupDuration=5s \
             --set secrets.redisPassword=ci-test \
             --set falco.enabled=false \
-            --set endpoints.falco=tcp://127.0.0.1:0 \
             --set-string nats.streamMaxBytesOverride=536870912 \
             --wait --timeout 5m
 
@@ -1045,7 +1039,6 @@ jobs:
             --set baselines.warmupDuration=5s \
             --set secrets.redisPassword=ci-test \
             --set falco.enabled=false \
-            --set endpoints.falco=tcp://127.0.0.1:0 \
             --set nats.streamMaxBytesOverride=33554432 \
             --set nats.config.jetstream.fileStore.maxSize=8Gi \
             --set probes.initialDelaySeconds=30 \
@@ -1152,7 +1145,6 @@ jobs:
             --set baselines.warmupDuration=5s \
             --set secrets.redisPassword=ci-test \
             --set falco.enabled=false \
-            --set endpoints.falco=tcp://127.0.0.1:0 \
             --set nats.streamMaxBytesOverride=536870912 \
             --wait --timeout 5m
 
@@ -1267,7 +1259,6 @@ jobs:
             --set image.pullPolicy=Never \
             --set secrets.redisPassword=ci-test \
             --set falco.enabled=false \
-            --set endpoints.falco=tcp://127.0.0.1:0 \
             --set-string nats.streamMaxBytesOverride=536870912 \
             "${extra[@]}" \
             -f "deploy/helm/olaitan/values-${{ matrix.overlay }}.yaml" \

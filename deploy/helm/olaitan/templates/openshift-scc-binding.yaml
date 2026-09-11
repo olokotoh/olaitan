@@ -3,60 +3,27 @@
 OpenShift SecurityContextConstraints binding (Story 9.4).
 
 OpenShift admits pods against an SCC, and the default `restricted-v2`
-forbids hostPath volumes and pins the UID range. Olaitan's collector
-needs both exceptions, for two specific and auditable reasons:
+pins the UID range and forbids hostPath volumes. Olaitan's collector needs
+those exceptions for specific, auditable reasons:
 
-  * hostPath -- it bind-mounts Falco's gRPC socket directory (and, when
-    containerdSensor is on, the CRI socket directory). restricted-v2
-    lists no hostPath in its allowed volume types, so the DaemonSet is
-    refused at admission with "unable to validate against any security
-    context constraint".
+  * a non-assigned UID -- the collector pins UID 65532 rather than
+    accepting OpenShift's per-namespace allocated range.
 
-  * a non-assigned UID -- the falco-socket-permissions container runs as
-    UID 0 to chmod the socket (Story 9.6), and the collector itself pins
-    UID 65532 rather than accepting OpenShift's per-namespace allocated
-    range.
+  * hostPath -- only when containerdSensor is on, for the CRI socket
+    directory. Since Story 10.2 Falco reaches the collector over HTTP, so
+    the default install mounts nothing from the host.
 
-`hostmount-anyuid` grants exactly those two. It is deliberately NOT
+`hostmount-anyuid` grants exactly those. It is deliberately NOT
 `privileged`: Olaitan's own containers are unprivileged, drop ALL
 capabilities and run with a read-only root filesystem, so binding
 `privileged` here would hand the collector far more than it uses. Falco's
 own DaemonSet does need `privileged` and the Falco subchart ships its own
 SCC for that -- this binding covers Olaitan's pods only.
 
-!! IT IS NOT SUFFICIENT ON ITS OWN, and this is stated here rather than
-discovered at admission. The shipped `hostmount-anyuid` SCC has
-`allowedCapabilities: null`, and OpenShift validates `capabilities.add`
-against that list, so the falco-socket-permissions container's request for
-CHOWN is rejected:
-
-    capabilities.add: Invalid value: "CHOWN": capability may not be added
-
-CHOWN is what chgrp needs, so without it the socket keeps Falco's group and
-the collector cannot connect. The container detects exactly this and exits
-non-zero with the reason rather than looping quietly, but the install still
-does not work until you do one of:
-
-  1. Add a custom SCC that is hostmount-anyuid plus CHOWN, and point
-     openshift.scc at it:
-
-       kind: SecurityContextConstraints
-       apiVersion: security.openshift.io/v1
-       metadata: { name: olaitan-hostmount-chown }
-       allowHostDirVolumePlugin: true
-       allowedCapabilities: ["CHOWN"]
-       requiredDropCapabilities: ["MKNOD"]
-       runAsUser: { type: RunAsAny }
-       seLinuxContext: { type: MustRunAs }
-       fsGroup: { type: RunAsAny }
-       supplementalGroups: { type: RunAsAny }
-       volumes: ["configMap","emptyDir","hostPath","projected","secret"]
-
-     then: --set openshift.scc=olaitan-hostmount-chown
-
-  2. Or turn the permission holder off (falcoSocketPermissions.enabled=false)
-     and arrange for Falco to expose a socket the collector's group can
-     already write.
+Until Story 10.2 this stock SCC was NOT sufficient: the Falco
+socket-permission container requested CHOWN, which hostmount-anyuid's
+`allowedCapabilities: null` rejects. That container no longer exists and
+no Olaitan container adds a capability, so the stock SCC now fits.
 
 NONE OF THIS HAS BEEN RUN. OpenShift is template-verified only: the chart
 renders and validates for it and no one has installed it on a real cluster.

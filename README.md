@@ -123,13 +123,12 @@ at a path that matches your runtime (see `values-k3s.yaml` and
 Calico flow adapter needs **Calico**. Both are off by default, and both are
 available on managed platforms.
 
-A default install does mount one hostPath from Olaitan's own templates: the
-directory holding Falco's gRPC socket, which the collector reads and a small
-root container writes to once per interval so a non-root collector can open
-it at all (see `falcoSocketPermissions` in `values.yaml`). That is the whole
-of Olaitan's own host access on a default render; the other thirteen hostPath
-mounts come from the bundled Falco subchart. Set `endpoints.falco` to a
-`tcp://` target and Olaitan mounts nothing from the host.
+A default install mounts nothing from the host in Olaitan's own templates.
+Falco posts its alerts to the collector over HTTP (`http_output`, through the
+node-local `<release>-falco-ingest` Service, with a generated token), so the
+collector needs no access to Falco's filesystem. Every hostPath mount on a
+default render comes from the bundled Falco subchart, which needs them to
+load its kernel driver.
 
 ## How this differs from Falco alone
 
@@ -175,8 +174,8 @@ Read this section before trusting it with anything.
   `falco.driver.kind=kmod`; `hack/preflight.sh` reports the node kernel so you
   can tell before installing.
 - **Targets Kubernetes 1.29 and newer.** The chart's `kubeVersion` floor is
-  `>=1.29.0`, and it is load-bearing rather than conservative: the collector's
-  Falco-socket permission container is a native sidecar, which needs 1.29.
+  `>=1.29.0`: the optional applog sidecar defaults to the native sidecar form,
+  which needs 1.29.
 - **The LLM tier costs money and adds latency.** It is off by default for both
   reasons. Everything except tier-3 reasoning works with it disabled.
 - **The agent writes NetworkPolicies into your cluster when enforcement is on.**

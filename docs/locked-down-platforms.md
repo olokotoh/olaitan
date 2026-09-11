@@ -12,6 +12,13 @@ without a test behind them say so.
 
 ## 0. URGENT, unrelated to the three platforms: Falco removed gRPC
 
+> **Status 2026-09-11: resolved by Story 10.2.** The collector now receives
+> Falco alerts over `http_output`, as recommended below, so the ceiling is
+> gone. It had also turned from latent to live: Falco 0.43.1 crashes every
+> few minutes on kernel 7.x, and the fix (falcosecurity/libs#3086) ships only
+> in 0.45.0-rc1 and later, all of which lack gRPC (Story 10.1 pins it). The
+> analysis below is kept as the record of why.
+
 **Olaitan's only syscall input is a Falco gRPC socket. Falco deleted gRPC in
 0.44.0.**
 
