@@ -5448,3 +5448,36 @@ func TestKindOverlayExemptsOnlyKindsMountHook(t *testing.T) {
 		t.Error("the default install carries the kind-only Falco exception")
 	}
 }
+
+// TestNetworkPolicyAllowsTheRealAPIServer: Story 10.3. The release policy
+// allowed only networkPolicy.apiServerCIDR (kubeadm's 10.96.0.1), so on k3s
+// (10.43.0.1) and minikube (endpoint port 8443), both of which enforce
+// NetworkPolicy, the aggregator could not reach the API server and resolved
+// no workload at all. The chart now reads the real Service IP and endpoints
+// at install time. `helm template` has no cluster to read, so this checks the
+// offline fallback renders, and that the template actually consults both
+// lookups; the portability job proves the live path on k3s and minikube.
+func TestNetworkPolicyAllowsTheRealAPIServer(t *testing.T) {
+	nps := decodeNetpols(t, helmTemplate(t, nil))
+	np := nps["olaitan"]
+	raw, err := yaml.Marshal(np.Spec.Egress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "10.96.0.1/32") || !strings.Contains(string(raw), "6443") {
+		t.Errorf("offline render lost the apiServerCIDR fallback: %s", raw)
+	}
+	tpl, err := os.ReadFile(filepath.Join(chartDir(t), "templates", "networkpolicy.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`lookup "v1" "Service" "default" "kubernetes"`,
+		`lookup "discovery.k8s.io/v1" "EndpointSlice" "default" "kubernetes"`,
+		`lookup "v1" "Endpoints" "default" "kubernetes"`,
+	} {
+		if !strings.Contains(string(tpl), want) {
+			t.Errorf("networkpolicy.yaml does not consult %s", want)
+		}
+	}
+}

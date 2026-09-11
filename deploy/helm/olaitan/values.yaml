@@ -248,10 +248,12 @@ networkPolicy:
   # Operators on eBPF dataplane MUST set this to the cluster's node CIDR
   # (e.g. "10.0.0.0/16"); otherwise pods never reach Ready.
   nodeCIDR: ""
-  # CIDR for the Kubernetes API server virtual IP. Default 10.96.0.1/32
-  # is the kubeadm 1.29 stock service-CIDR ClusterIP for the kubernetes
-  # Service. Override on clusters with a non-default service-CIDR. The
-  # aggregator's pod-patch path needs egress here.
+  # Extra API server address range allowed for egress. `helm install` and
+  # `helm upgrade` already allow the cluster's real `kubernetes` Service IP
+  # and API server endpoints, read at install time (Story 10.3). This is the
+  # fallback when there is no cluster to read (`helm template`, `--dry-run`,
+  # a rendered install manifest) and for an API server that can move (a
+  # managed control plane). 10.96.0.1/32 is kubeadm's and kind's Service IP.
   apiServerCIDR: "10.96.0.1/32"
   # Extra egress rules merged into the policy as-is. Operators populate
   # this with the LLM provider endpoints they actually use; values are

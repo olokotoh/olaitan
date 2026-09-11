@@ -128,21 +128,59 @@ spec:
         - protocol: TCP
           port: 53
     {{- /*
-    Kubernetes API server. The aggregator's pod-patch path (Ring 4
-    response) and ServiceAccount token review traffic both terminate at
-    the apiserver virtual IP. Default 10.96.0.1/32 matches the kubeadm
-    1.29 stock service-CIDR; override `networkPolicy.apiServerCIDR` for
-    clusters with a non-default service-CIDR.
+    Kubernetes API server. The correlator resolves every workload through
+    it, and the response ring patches pods through it, so without this rule
+    detection itself stops on any cluster that enforces NetworkPolicy.
+
+    NetworkPolicy is evaluated AFTER kube-proxy rewrites the Service IP to a
+    real API server endpoint on most CNIs, so allowing only the Service IP
+    is not enough. At install time the chart reads the cluster's actual
+    `kubernetes` Service IP and its endpoints (EndpointSlice, falling back
+    to Endpoints) and allows exactly those addresses and ports.
+
+    Story 10.3: this used to allow only networkPolicy.apiServerCIDR, a
+    kubeadm default (10.96.0.1). On k3s (10.43.0.1) and minikube (endpoint
+    on port 8443) every API call was refused, so the aggregator could not
+    resolve a single workload. Found by the portability job's real attack.
+
+    `lookup` returns nothing under `helm template` and `--dry-run`, and an
+    endpoint that moves (a managed control plane) is not tracked until the
+    next `helm upgrade`. In both cases networkPolicy.apiServerCIDR is the
+    fallback: set it to your API server's address range.
     */}}
-    {{- with .Values.networkPolicy.apiServerCIDR }}
+    {{- $apiIPs := list }}
+    {{- $apiPorts := list 443 6443 }}
+    {{- $svc := lookup "v1" "Service" "default" "kubernetes" }}
+    {{- if and $svc $svc.spec $svc.spec.clusterIP }}
+    {{- $apiIPs = append $apiIPs $svc.spec.clusterIP }}
+    {{- end }}
+    {{- $slice := lookup "discovery.k8s.io/v1" "EndpointSlice" "default" "kubernetes" }}
+    {{- if and $slice $slice.endpoints }}
+    {{- range $slice.endpoints }}{{- range .addresses }}{{- $apiIPs = append $apiIPs . }}{{- end }}{{- end }}
+    {{- range $slice.ports }}{{- if .port }}{{- $apiPorts = append $apiPorts (int .port) }}{{- end }}{{- end }}
+    {{- else }}
+    {{- $eps := lookup "v1" "Endpoints" "default" "kubernetes" }}
+    {{- if and $eps $eps.subsets }}
+    {{- range $eps.subsets }}
+    {{- range .addresses }}{{- $apiIPs = append $apiIPs .ip }}{{- end }}
+    {{- range .ports }}{{- $apiPorts = append $apiPorts (int .port) }}{{- end }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- $apiCIDRs := list }}
+    {{- range $apiIPs }}{{- $apiCIDRs = append $apiCIDRs (printf "%s/%s" . (ternary "128" "32" (contains ":" .))) }}{{- end }}
+    {{- with .Values.networkPolicy.apiServerCIDR }}{{- $apiCIDRs = append $apiCIDRs . }}{{- end }}
+    {{- if $apiCIDRs }}
     - to:
+        {{- range (uniq $apiCIDRs) }}
         - ipBlock:
             cidr: {{ . | quote }}
+        {{- end }}
       ports:
+        {{- range (uniq $apiPorts) }}
         - protocol: TCP
-          port: 443
-        - protocol: TCP
-          port: 6443
+          port: {{ . }}
+        {{- end }}
     {{- end }}
     {{- /* Intra-namespace traffic to NATS, Redis, Falco subcharts. */}}
     - to:
