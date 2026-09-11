@@ -1335,6 +1335,14 @@ falco:
   image:
     tag: "0.45.0-rc1"
   driver:
+    # The driver loader (used by kind=kmod, the fallback for nodes without
+    # BTF) defaults to the CHART's appVersion, 0.44.1, not image.tag. Pinned
+    # with it so a kmod fallback builds the fixed driver, not the pre-fix
+    # one under the pinned userspace (review of #133).
+    loader:
+      initContainer:
+        image:
+          tag: "0.45.0-rc1"
     # `modern_ebpf` is CO-RE: one prebuilt probe that relocates itself against
     # the running kernel's BTF. It needs NO kernel headers and compiles NOTHING
     # at pod start.

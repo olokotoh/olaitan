@@ -4,6 +4,7 @@ package helm_test
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -70,6 +71,22 @@ func TestFalcoPinIsTheOneRecorded(t *testing.T) {
 	}
 	if want := "docker.io/falcosecurity/falco:" + sup["FALCO_PINNED_VERSION"]; image != want {
 		t.Errorf("Falco image = %q, want %q (hack/falco-support.env)", image, want)
+	}
+
+	// Review of #133: the kmod/driver-loader fallback (for nodes without
+	// BTF) must build the driver from the same pinned release, or it runs
+	// the pre-fix driver under the pinned userspace.
+	kmod := helmTemplate(t, []string{"falco.driver.kind=kmod"})
+	kmodDS := docByKindName(t, kmod, "DaemonSet", "falco")
+	var loader string
+	for _, c := range kmodDS["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)["initContainers"].([]any) {
+		cm := c.(map[string]any)
+		if strings.Contains(fmt.Sprint(cm["image"]), "falco-driver-loader") {
+			loader, _ = cm["image"].(string)
+		}
+	}
+	if want := "docker.io/falcosecurity/falco-driver-loader:" + sup["FALCO_PINNED_VERSION"]; loader != want {
+		t.Errorf("driver-loader image with kind=kmod = %q, want %q", loader, want)
 	}
 
 	raw, err := os.ReadFile(filepath.Join(chartDir(t), "Chart.yaml"))
@@ -165,6 +182,28 @@ func TestPreflightFalcoKernelVerdict(t *testing.T) {
 		{"below the modern_ebpf floor", "4.18.0-553.el8_10.x86_64", nil, 3, "bpftool"},
 		{"unparseable", "", nil, 3, "could not read"},
 	}
+	// Review of #133: without the support file the verdict must be a
+	// caveat, never exit 1 (which preflight counts as a BLOCKER).
+	t.Run("support file missing", func(t *testing.T) {
+		dir := t.TempDir()
+		lib, _ := os.ReadFile(filepath.Join(repoRoot(t), "hack", "lib", "falco-kernel.sh"))
+		if err := os.MkdirAll(filepath.Join(dir, "lib"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "lib", "falco-kernel.sh"), lib, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command("bash", "-uc", `source lib/falco-kernel.sh && falco_kernel_verdict 6.8.0-45-generic`)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		code := 0
+		if ee, ok := err.(*exec.ExitError); ok {
+			code = ee.ExitCode()
+		}
+		if code != 3 || !strings.Contains(string(out), "falco-support.env") {
+			t.Errorf("missing support file: exit %d, output %q; want exit 3 naming the file", code, out)
+		}
+	})
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			out, code := verdict(t, tc.kernel, tc.env...)

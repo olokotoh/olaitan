@@ -37,7 +37,15 @@ _fk_ver_ge() {
 _fk_series() { printf '%s' "$1" | grep -oE '^[0-9]+\.[0-9]+'; }
 
 falco_kernel_verdict() {
-  local kernel="$1" series
+  local kernel="$1" series v
+  # A missing record is an unknown, not a failure: exit 3 (caveat), never
+  # 1, which preflight counts as a BLOCKER.
+  for v in FALCO_PINNED_VERSION FALCO_PREEMPT_FIX_VERSION FALCO_MIN_KERNEL FALCO_MAX_TESTED_KERNEL; do
+    if [ -z "${!v:-}" ]; then
+      echo "cannot judge the kernel: ${v} is not set (hack/falco-support.env missing or incomplete)"
+      return 3
+    fi
+  done
   series="$(_fk_series "$kernel")"
   if [ -z "$series" ]; then
     echo "could not read a kernel version from '${kernel}'; check the node before trusting Falco on it"
