@@ -31,11 +31,13 @@ var falcoPriorityRank = map[string]int{
 
 // falcoSeverity maps a Falco priority onto the OLT 0-100 severity scale
 // the score calculator reads (total = rule_weight 0.4 * max severity).
-// Warning 50 scores 20, the SUSPICIOUS band, on its own; even Critical
-// (90 -> 36) stays below RESTRICTED (40). Escalating further takes the
-// baseline or analyst tiers agreeing, which keeps the response graduated.
+// Warning 50 scores 20, the SUSPICIOUS band, on its own; Critical (90 ->
+// 36) and even Alert/Emergency (95 -> 38) stay below RESTRICTED (40).
+// Escalating further takes the baseline or analyst tiers agreeing, which
+// keeps the response graduated. Capped at 95, not 100: 0.4 x 100 is exactly
+// the RESTRICTED threshold, so one alert would have jumped two states.
 var falcoSeverity = map[string]int{
-	"warning": 50, "error": 75, "critical": 90, "alert": 100, "emergency": 100,
+	"warning": 50, "error": 75, "critical": 90, "alert": 95, "emergency": 95,
 }
 
 var mitreTechnique = regexp.MustCompile(`^T\d{4}(\.\d{3})?$`)

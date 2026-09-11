@@ -294,12 +294,31 @@ func (e *Engine) NoteReloadRejected() { e.reloadRejected.Add(1) }
 // a rule_match-triggered package that the engine must not
 // re-evaluate. Split out from handle() so unit tests can exercise
 // the guard contract without mocking jetstream.Msg (code-review P8).
+//
+// Story 10.3: a rule_match package whose matches ALL came from Falco
+// (RuleID "falco:...") is evaluated. A Falco alert opens such a package on
+// its own, and on a single-sensor install it is the only package there is;
+// skipping it meant no OLT rule could ever see a real Falco event. There is
+// no loop: the matches this engine emits are OLT rule IDs, and any package
+// carrying one is still skipped.
 func (e *Engine) applyReEntrancyGuard(pkg *schema.EvidencePackage) bool {
-	if pkg.Trigger.Type == trigger.TypeRuleMatch {
-		e.skippedSelf.Add(1)
-		return true
+	if pkg.Trigger.Type != trigger.TypeRuleMatch {
+		return false
 	}
-	return false
+	if len(pkg.RuleMatches) > 0 {
+		fromFalco := true
+		for _, m := range pkg.RuleMatches {
+			if !strings.HasPrefix(m.RuleID, "falco:") {
+				fromFalco = false
+				break
+			}
+		}
+		if fromFalco {
+			return false
+		}
+	}
+	e.skippedSelf.Add(1)
+	return true
 }
 
 // Run subscribes to subjects.EvidencePackages and dispatches matches

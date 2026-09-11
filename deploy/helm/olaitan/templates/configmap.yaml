@@ -197,7 +197,12 @@ data:
     {{- if not (mustRegexFind $pCs $cfg) }}{{- fail (printf "helm bridge: correlator.multi_signal_min_sources anchor not found (pattern %q)" $pCs) }}{{- end }}
     {{- $cfg = regexReplaceAll $pCs $cfg (printf "${1}multi_signal_min_sources: %d" (int $co.multiSignalMinSources)) }}
     {{- end }}
-    {{- with $co.falcoTriggerMinPriority }}
+    {{- /* Helm reads values files as YAML 1.1: an unquoted `off` arrives as
+           the boolean false (review of #134). Treat false as "off"; true
+           names no priority and is refused below. */ -}}
+    {{- $ftp := $co.falcoTriggerMinPriority }}
+    {{- if kindIs "bool" $ftp }}{{- if $ftp }}{{- fail "correlator.falcoTriggerMinPriority is the boolean true (an unquoted `on` or `yes`?); set a priority: off, warning, error, critical, alert or emergency" }}{{- else }}{{- $ftp = "off" }}{{- end }}{{- end }}
+    {{- with $ftp }}
     {{- if not (has (lower .) (list "off" "warning" "error" "critical" "alert" "emergency")) }}
     {{- fail (printf "correlator.falcoTriggerMinPriority must be off, warning, error, critical, alert or emergency (got %q); notice would open an investigation for every kubectl exec" .) }}
     {{- end }}

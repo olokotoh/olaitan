@@ -315,3 +315,40 @@ func TestIsExpectedFetchTimeout(t *testing.T) {
 type errStub string
 
 func (e errStub) Error() string { return string(e) }
+
+// TestApplyReEntrancyGuard_EvaluatesFalcoTriggeredPackages: Story 10.3
+// review. A Falco alert opens a rule_match package on its own; if the guard
+// skipped every rule_match, the OLT rules (and the canonical fields the
+// Falco translator now projects) would never see a real Falco event on a
+// single-sensor install. Falco-origin packages are evaluated. The engine's
+// own OLT matches are still skipped, so there is still no loop.
+func TestApplyReEntrancyGuard_EvaluatesFalcoTriggeredPackages(t *testing.T) {
+	e := &Engine{}
+	falco := schema.EvidencePackage{
+		PackageID:   "pkg-falco",
+		Trigger:     schema.EvidenceTrigger{Type: trigger.TypeRuleMatch},
+		RuleMatches: []schema.RuleMatch{{RuleID: "falco:Read sensitive file untrusted"}},
+	}
+	if e.applyReEntrancyGuard(&falco) {
+		t.Error("a Falco-triggered rule_match package was skipped; OLT rules would never see real Falco events")
+	}
+	own := schema.EvidencePackage{
+		PackageID:   "pkg-olt",
+		Trigger:     schema.EvidenceTrigger{Type: trigger.TypeRuleMatch},
+		RuleMatches: []schema.RuleMatch{{RuleID: "OLT-CRED-001"}},
+	}
+	if !e.applyReEntrancyGuard(&own) {
+		t.Error("the engine's own OLT rule_match package was evaluated; that is the loop the guard exists to stop")
+	}
+	mixed := schema.EvidencePackage{
+		PackageID:   "pkg-mixed",
+		Trigger:     schema.EvidenceTrigger{Type: trigger.TypeRuleMatch},
+		RuleMatches: []schema.RuleMatch{{RuleID: "falco:x"}, {RuleID: "OLT-CRED-001"}},
+	}
+	if !e.applyReEntrancyGuard(&mixed) {
+		t.Error("a package carrying any OLT match must stay skipped")
+	}
+	if got := e.skippedSelf.Load(); got != 2 {
+		t.Errorf("skippedSelf = %d, want 2 (only the OLT-bearing packages)", got)
+	}
+}

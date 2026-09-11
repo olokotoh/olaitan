@@ -32,9 +32,10 @@ and false-positive numbers; see [Unreleased](#unreleased).
   agreeing about a pod, and the default install runs one (Falco), so a real
   in-pod attack never got past the raw event stream. A Falco alert at
   Warning or above on a pod now starts an investigation on its own, as a
-  `rule_match` (Warning 50, Error 75, Critical 90, Alert/Emergency 100 on
-  the OLT scale, so one Warning alert moves a workload to SUSPICIOUS and
-  even a Critical alone stops below RESTRICTED). Tunable with
+  `rule_match` (Warning 50, Error 75, Critical 90, Alert/Emergency 95 on
+  the OLT scale, so one alert of any priority moves a workload to
+  SUSPICIOUS and never alone to RESTRICTED). Falco-triggered packages are
+  evaluated by the OLT rules engine. Tunable with
   `correlator.falcoTriggerMinPriority` (`off`, or `warning` upward). Falco's
   fields are also projected onto the OLT canonical names (`process.exe`,
   `file.path`, `network.dst_ip` ...), so OLT rules can match real Falco

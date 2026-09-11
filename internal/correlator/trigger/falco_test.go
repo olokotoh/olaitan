@@ -40,7 +40,9 @@ func TestFalcoRuleMatch(t *testing.T) {
 		t.Errorf("mitre tags = %v, want only the technique IDs", m.MitreTags)
 	}
 
-	for prio, want := range map[string]string{"ERROR": "75", "CRITICAL": "90", "ALERT": "100", "EMERGENCY": "100"} {
+	// Review of #134: 100 scored exactly 40 = RESTRICTED on one alert.
+	// One Falco alert alone must stay in SUSPICIOUS (0.4 x 95 = 38 < 40).
+	for prio, want := range map[string]string{"ERROR": "75", "CRITICAL": "90", "ALERT": "95", "EMERGENCY": "95"} {
 		if m, ok := FalcoRuleMatch(falcoEvent(t, "r", prio, nil, "syscall"), "warning"); !ok || m.Severity != want {
 			t.Errorf("%s -> %q ok=%v, want %s", prio, m.Severity, ok, want)
 		}

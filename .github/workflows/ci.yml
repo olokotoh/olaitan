@@ -451,7 +451,7 @@ jobs:
           sleep 10
           pw="$(kubectl -n olaitan get secret olaitan-secrets -o jsonpath='{.data.redis-password}' | base64 -d)"
           state() { kubectl -n olaitan exec olaitan-redis-master-0 -- redis-cli -a "$pw" --no-auth-warning \
-                      hget fsm:olaitan-e2e-attack/Deployment/victim current_state; }
+                      hget fsm:olaitan-e2e-attack/Deployment/victim current_state || true; }
           start=$(date +%s)
           kubectl -n olaitan-e2e-attack exec deploy/victim -- sh -c 'cat /etc/shadow > /dev/null'
           while [ $(( $(date +%s) - start )) -le 10 ]; do

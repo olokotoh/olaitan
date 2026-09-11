@@ -5481,3 +5481,29 @@ func TestNetworkPolicyAllowsTheRealAPIServer(t *testing.T) {
 		}
 	}
 }
+
+// TestFalcoTriggerOffUnquoted: review of #134. Helm reads values files as
+// YAML 1.1, so `falcoTriggerMinPriority: off` (unquoted) arrives as the
+// boolean false. It used to be skipped silently, leaving the trigger on.
+func TestFalcoTriggerOffUnquoted(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "off.yaml")
+	if err := os.WriteFile(f, []byte("correlator:\n  falcoTriggerMinPriority: off\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("helm", "template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password", "-f", f).CombinedOutput()
+	if err != nil {
+		t.Fatalf("render: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), `falco_trigger_min_priority: "off"`) {
+		t.Errorf("unquoted off in a values file did not switch the trigger off; rendered: %s", grepLine(string(out), "falco_trigger_min_priority"))
+	}
+	on := filepath.Join(t.TempDir(), "on.yaml")
+	if err := os.WriteFile(on, []byte("correlator:\n  falcoTriggerMinPriority: on\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("helm", "template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password", "-f", on).CombinedOutput(); err == nil || !strings.Contains(string(out), "falcoTriggerMinPriority") {
+		t.Errorf("unquoted `on` (boolean true) was accepted; it names no priority: %v\n%s", err, out)
+	}
+}
