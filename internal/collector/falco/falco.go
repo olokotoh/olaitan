@@ -22,10 +22,15 @@
 //
 // Liveness: a gRPC stream told the adapter when Falco went away; a series of
 // HTTP requests does not. Falco's periodic metrics snapshot (`metrics.enabled`
-// with `output_rule: true`) arrives through the same http_output as an event
-// with source "internal". The adapter treats it, and any real alert, as a
-// heartbeat, and marks the source unhealthy when neither has arrived within
-// HeartbeatTimeout. Snapshots are never published as security events.
+// with `output_rule: true`) arrives through the same http_output. The adapter
+// treats it, and any real alert, as proof Falco is alive, and marks the source
+// unhealthy when neither has arrived within HeartbeatTimeout. Snapshots are
+// never published as security events.
+//
+// Health is the AND of two things: Falco is alive, and alerts are getting
+// through. A transient publish failure keeps the source unhealthy until a
+// publish succeeds; a heartbeat alone cannot clear it, or a NATS outage would
+// read healthy between alerts while every alert was lost.
 //
 // Delivery: Falco does not retry a failed POST, so an alert that arrives
 // while NATS is down is lost at Falco. The handler still answers 503 so the
@@ -118,7 +123,8 @@ type Config struct {
 	PublishWallClockBudget time.Duration
 
 	// HTTP server timeouts. Defaults: 10s header, 30s read and write,
-	// 90s idle (longer than Falco's keep-alive reuse gap), 5s shutdown.
+	// 90s idle (longer than Falco's keep-alive reuse gap). ShutdownGrace
+	// is at least PublishWallClockBudget + 1s (13s by default).
 	ReadHeaderTimeout time.Duration
 	ReadTimeout       time.Duration
 	WriteTimeout      time.Duration
@@ -172,6 +178,11 @@ type Adapter struct {
 	// means never.
 	lastSeenUnixNano atomic.Int64
 
+	// publishFailing is set by a transient publish failure and cleared
+	// only by a successful publish, so a heartbeat cannot mask a NATS
+	// outage.
+	publishFailing atomic.Bool
+
 	addrMu sync.Mutex
 	addr   string
 
@@ -219,8 +230,11 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 	if cfg.IdleTimeout <= 0 {
 		cfg.IdleTimeout = 90 * time.Second
 	}
-	if cfg.ShutdownGrace <= 0 {
-		cfg.ShutdownGrace = 5 * time.Second
+	// Shutdown must outlast the detached publish budget: Run returning
+	// while a handler is still inside PublishJS lets main.go drain NATS
+	// under it. A shorter grace is raised rather than honoured.
+	if minGrace := cfg.PublishWallClockBudget + time.Second; cfg.ShutdownGrace < minGrace {
+		cfg.ShutdownGrace = minGrace
 	}
 	if cfg.PublishRetry.IsZero() {
 		cfg.PublishRetry = DefaultPublishRetry()
@@ -418,7 +432,7 @@ func (a *Adapter) handleAlert(w http.ResponseWriter, r *http.Request) {
 
 	// Anything well-formed from Falco proves it is alive.
 	a.sawFalco()
-	if resp.GetSource() == internalSource {
+	if resp.GetSource() == internalSource && resp.GetRule() == metricsSnapshotRule {
 		a.heartbeats.Add(1)
 		a.respond(w, http.StatusNoContent, "")
 		return
@@ -458,19 +472,26 @@ func (a *Adapter) handleAlert(w http.ResponseWriter, r *http.Request) {
 			a.respond(w, http.StatusNoContent, "")
 			return
 		}
+		a.publishFailing.Store(true)
 		a.health.MarkUnhealthy(fmt.Errorf("falco: publish: %w", err))
 		a.log.Warn("falco: publish failed transiently", "err", err, "event_id", ev.ID)
 		a.respond(w, http.StatusServiceUnavailable, "publish failed")
 		return
 	}
 	a.eventsPublished.Add(1)
+	a.publishFailing.Store(false)
+	a.health.MarkHealthy()
 	a.respond(w, http.StatusNoContent, "")
 }
 
-// sawFalco records that Falco is alive and marks the source healthy.
+// sawFalco records that Falco is alive. It marks the source healthy only
+// when publishes are not failing: Falco being up says nothing about
+// whether its alerts reach NATS.
 func (a *Adapter) sawFalco() {
 	a.lastSeenUnixNano.Store(a.nowFn().UnixNano())
-	a.health.MarkHealthy()
+	if !a.publishFailing.Load() {
+		a.health.MarkHealthy()
+	}
 }
 
 func (a *Adapter) respond(w http.ResponseWriter, code int, msg string) {

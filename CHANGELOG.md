@@ -32,7 +32,8 @@ and false-positive numbers; see [Unreleased](#unreleased).
   kernel 7.x are all newer. Falco's `http_output` now POSTs each alert to the
   collector through the node-local `<release>-falco-ingest` Service, with a
   generated token (`secrets.falcoHttpToken`, stored as `falco-http-token` in
-  the release Secret) in the URL path. `endpoints.falco` and
+  the release Secret) in the URL path. Works for any release name and
+  namespace; `falcoIngest.extraFrom` adds NetworkPolicy peers. `endpoints.falco` and
   `falcoSocketPermissions` are gone, and with them the collector's hostPath
   mount and the root socket-permission container. An operator running their
   own Falco points its `http_output.url` at the Service instead. Falco's

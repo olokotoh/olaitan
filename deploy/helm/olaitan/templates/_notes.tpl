@@ -61,7 +61,7 @@ DETECTION SOURCES
 {{- else }}
   [ ? ] Falco syscall events -- ASSUMED. falco.enabled=false, so this chart
          deployed no Falco and has established nothing about whether one is
-         posting alerts to http://{{ include "olaitan.falcoIngest.serviceName" . }}:{{ .Values.falcoIngest.port }}/falco/<token>
+         posting alerts to {{ include "olaitan.falcoIngest.baseURL" . }}<token>
          (token: key falco-http-token in Secret {{ include "olaitan.fullname" . }}-secrets).
          This is the primary detection source: without it the agent runs
          and sees almost nothing, quietly. Verify before you trust it (see

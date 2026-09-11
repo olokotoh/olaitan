@@ -35,6 +35,7 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 | Value | Type | Default | Valid range | Effect | Ref |
 |-------|------|---------|-------------|--------|-----|
 | `falcoIngest.port` | integer | `8765` | 1 to 65535 | collector port and falco-ingest Service port Falco posts alerts to; must match the port in falco.falco.http_output.url | FR1 |
+| `falcoIngest.extraFrom` | array | `[]` | - | additional NetworkPolicy peers allowed to post to the Falco ingest port | NFR11 |
 
 ## `secrets`
 

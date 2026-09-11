@@ -152,6 +152,12 @@ endpoints:
 falcoIngest:
   # @schema type:integer minimum:1 maximum:65535 effect:"collector port and falco-ingest Service port Falco posts alerts to; must match the port in falco.falco.http_output.url" ref:FR1
   port: 8765
+  # Extra NetworkPolicy peers admitted to the ingest port, on top of the
+  # Falco pods the release policy already admits (this release's Falco, or
+  # with falco.enabled=false, Falco-labelled pods in any namespace). Standard
+  # `from:` entries, e.g. [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: falco}}}].
+  # @schema type:array effect:"additional NetworkPolicy peers allowed to post to the Falco ingest port" ref:NFR11
+  extraFrom: []
 
 # --- Operator-provided secrets ----------------------------------------
 # All three default to "" so the Secret always renders (downstream pods
@@ -1342,9 +1348,7 @@ falco:
     # operator can tell before installing.
     kind: modern_ebpf
   # Story 10.2: Falco reaches the collector over http_output. The chart
-  # checks all three settings below against the release at render time
-  # (olaitan.falcoIngest.validate) and fails with the exact --set lines if
-  # they disagree, which happens when the release is not named `olaitan`.
+  # checks these settings at render time (olaitan.falcoIngest.validate).
   falco:
     # http_output sends plain text unless this is on, and the collector
     # accepts only JSON.
@@ -1353,12 +1357,10 @@ falco:
     json_include_tags_property: true
     http_output:
       enabled: true
-      # Subchart values cannot be templated, so this is a literal for the
-      # release name `olaitan`: <release>-falco-ingest resolves inside the
-      # namespace. ${OLAITAN_FALCO_TOKEN} is expanded by FALCO from its
-      # environment (set below from the release Secret), so the token
-      # never appears in the Falco ConfigMap.
-      url: "http://olaitan-falco-ingest:8765/falco/${OLAITAN_FALCO_TOKEN}"
+      # Two environment variables that FALCO expands from its own env (set
+      # in extra.env below): the collector's node-local ingest URL, then the
+      # token. The token never appears in the Falco ConfigMap.
+      url: "${OLAITAN_FALCO_URL}${OLAITAN_FALCO_TOKEN}"
       # Reuse one connection instead of a TCP handshake per alert.
       keep_alive: true
     # Falco's periodic metrics snapshot travels the same http_output as a
@@ -1370,12 +1372,16 @@ falco:
       interval: 1m
       output_rule: true
   extra:
+    # The Falco chart renders these through `tpl` in this release's context,
+    # so the Service FQDN and the Secret name follow the release name and
+    # namespace. The port must match falcoIngest.port (the guard checks).
     env:
+      - name: OLAITAN_FALCO_URL
+        value: 'http://{{ include "olaitan.falcoIngest.releaseFullname" . }}-falco-ingest.{{ .Release.Namespace }}.svc:8765/falco/'
       - name: OLAITAN_FALCO_TOKEN
         valueFrom:
           secretKeyRef:
-            # <release>-secrets, key falco-http-token (templates/secret.yaml).
-            name: olaitan-secrets
+            name: '{{ include "olaitan.falcoIngest.releaseFullname" . }}-secrets'
             key: falco-http-token
 
 # NATS with JetStream persistence -- inter-ring event bus. JetStream

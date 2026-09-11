@@ -287,7 +287,7 @@ data:
       keep_alive: true
       max_consecutive_timeouts: 5
       mtls: false
-      url: http://olaitan-falco-ingest:8765/falco/${OLAITAN_FALCO_TOKEN}
+      url: ${OLAITAN_FALCO_URL}${OLAITAN_FALCO_TOKEN}
       user_agent: falcosecurity/falco
     json_include_message_property: false
     json_include_output_fields_property: true
@@ -1768,7 +1768,7 @@ spec:
         app.kubernetes.io/name: falco
         app.kubernetes.io/instance: olaitan
       annotations:
-        checksum/config: 52af4f800d1e7375f4851d157de51ed2b385d0f5e72a91c98790a1d0fbfe1d2b
+        checksum/config: 57f9078610746c7e2124b45de5ae060393cf7bc300d3ea9f9de1d3d180f437ab
         checksum/rules: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
         checksum/certs: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
     spec:
@@ -1804,11 +1804,13 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: OLAITAN_FALCO_URL
+              value: http://olaitan-falco-ingest.default.svc:8765/falco/
             - name: OLAITAN_FALCO_TOKEN
               valueFrom:
                 secretKeyRef:
                   key: falco-http-token
-                  name: olaitan-secrets
+                  name: 'olaitan-secrets'
           tty: false
           ports:
             - containerPort: 8765

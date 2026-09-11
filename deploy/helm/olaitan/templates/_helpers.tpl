@@ -351,45 +351,68 @@ Falco POSTs each alert to the collector over HTTP (http_output). Falco
 0.44.0 removed the gRPC output the collector used to dial, and the Falco
 releases that run on kernel 7.x are all newer than that.
 
-The Falco subchart's values cannot be templated, so the URL Falco posts to
-(falco.falco.http_output.url) and the Secret its token comes from
-(falco.extra.env) are literals in values.yaml, written for the canonical
-release name `olaitan`. The guard below checks them against what this
-release actually renders, so a different release name fails at install
-with the exact values to set, instead of Falco posting into the void.
+Falco's http_output.url is "${OLAITAN_FALCO_URL}${OLAITAN_FALCO_TOKEN}",
+two environment variables Falco expands itself. Both come from
+falco.extra.env, which the Falco subchart renders through `tpl` in the
+SAME release context, so the Service FQDN and the Secret name follow the
+release name and namespace with nothing for the operator to set.
+
+The subchart cannot see this chart's values, so it names things with
+olaitan.falcoIngest.releaseFullname: the olaitan.fullname rule minus
+nameOverride/fullnameOverride. The guard below fails the render when those
+overrides make the two disagree, with the literal values to set instead.
 */}}
+{{- define "olaitan.falcoIngest.releaseFullname" -}}
+{{- if contains "olaitan" .Release.Name -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-olaitan" .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "olaitan.falcoIngest.serviceName" -}}
 {{- printf "%s-falco-ingest" (include "olaitan.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
-{{- define "olaitan.falcoIngest.url" -}}
-{{- printf "http://%s:%v/falco/${OLAITAN_FALCO_TOKEN}" (include "olaitan.falcoIngest.serviceName" .) .Values.falcoIngest.port -}}
+{{/* Base URL Falco posts to; the token is appended by Falco itself. */}}
+{{- define "olaitan.falcoIngest.baseURL" -}}
+{{- printf "http://%s.%s.svc:%v/falco/" (include "olaitan.falcoIngest.serviceName" .) .Release.Namespace .Values.falcoIngest.port -}}
 {{- end -}}
 
 {{- define "olaitan.falcoIngest.validate" -}}
 {{- if .Values.falco.enabled -}}
 {{- $f := default (dict) .Values.falco.falco -}}
 {{- $http := default (dict) $f.http_output -}}
-{{- $want := include "olaitan.falcoIngest.url" . -}}
 {{- if not $http.enabled -}}
 {{- fail "falco.falco.http_output.enabled is false, but it is the only way alerts reach the collector (Falco 0.44+ has no gRPC output). Leave it enabled, or set falco.enabled=false and send alerts from your own Falco." -}}
 {{- end -}}
 {{- if not $f.json_output -}}
 {{- fail "falco.falco.json_output is false. Falco would POST plain text and the collector would reject every alert with 415. Leave json_output enabled." -}}
 {{- end -}}
-{{- if ne (default "" $http.url | toString) $want -}}
-{{- fail (printf "falco.falco.http_output.url is %q but this release's collector receives Falco alerts at %q. The values file is written for the release name `olaitan`; for any other release name set (--set replaces the whole env entry, so all three env lines are needed):\n  --set-string falco.falco.http_output.url='%s'\n  --set falco.extra.env[0].name=OLAITAN_FALCO_TOKEN\n  --set falco.extra.env[0].valueFrom.secretKeyRef.name=%s-secrets\n  --set falco.extra.env[0].valueFrom.secretKeyRef.key=falco-http-token" (default "" $http.url | toString) $want $want (include "olaitan.fullname" .)) -}}
+{{- if ne (default "" $http.url | toString) "${OLAITAN_FALCO_URL}${OLAITAN_FALCO_TOKEN}" -}}
+{{- fail (printf "falco.falco.http_output.url is %q; it must be \"${OLAITAN_FALCO_URL}${OLAITAN_FALCO_TOKEN}\" so Falco posts to this release's collector with its token (both are set through falco.extra.env)." (default "" $http.url | toString)) -}}
 {{- end -}}
 {{- $secret := printf "%s-secrets" (include "olaitan.fullname" .) -}}
-{{- $found := false -}}
+{{- $url := "" -}}
+{{- $tokenRef := dict -}}
 {{- range (default (dict) .Values.falco.extra).env -}}
-{{- if and (eq .name "OLAITAN_FALCO_TOKEN") .valueFrom .valueFrom.secretKeyRef -}}
-{{- if and (eq .valueFrom.secretKeyRef.name $secret) (eq .valueFrom.secretKeyRef.key "falco-http-token") -}}
-{{- $found = true -}}
+{{- if eq .name "OLAITAN_FALCO_URL" -}}{{- $url = default "" .value | toString -}}{{- end -}}
+{{- if and (eq .name "OLAITAN_FALCO_TOKEN") .valueFrom .valueFrom.secretKeyRef -}}{{- $tokenRef = .valueFrom.secretKeyRef -}}{{- end -}}
 {{- end -}}
+{{- $templated := contains "olaitan.falcoIngest.releaseFullname" $url -}}
+{{- if $templated -}}
+{{- if ne (include "olaitan.fullname" .) (include "olaitan.falcoIngest.releaseFullname" .) -}}
+{{- fail (printf "nameOverride/fullnameOverride rename this release's resources to %q, which the Falco subchart cannot see. Set Falco's env explicitly:\n  --set-string falco.extra.env[0].value=%s\n  (and falco.extra.env[1].valueFrom.secretKeyRef.name=%s)" (include "olaitan.fullname" .) (include "olaitan.falcoIngest.baseURL" .) $secret) -}}
 {{- end -}}
+{{- if ne (toString .Values.falcoIngest.port) (regexFind ":[0-9]+/falco/" $url | trimPrefix ":" | trimSuffix "/falco/") -}}
+{{- fail (printf "falcoIngest.port is %v but falco.extra.env OLAITAN_FALCO_URL names another port; change both together." .Values.falcoIngest.port) -}}
 {{- end -}}
-{{- if not $found -}}
+{{- else if ne $url (include "olaitan.falcoIngest.baseURL" .) -}}
+{{- fail (printf "falco.extra.env OLAITAN_FALCO_URL is %q but this release's collector receives Falco alerts at %q." $url (include "olaitan.falcoIngest.baseURL" .)) -}}
+{{- end -}}
+{{- $refName := default "" $tokenRef.name | toString -}}
+{{- $refOK := or (eq $refName $secret) (and (contains "olaitan.falcoIngest.releaseFullname" $refName) (eq (include "olaitan.fullname" .) (include "olaitan.falcoIngest.releaseFullname" .))) -}}
+{{- if not (and $refOK (eq (default "" $tokenRef.key | toString) "falco-http-token")) -}}
 {{- fail (printf "falco.extra.env does not give Falco OLAITAN_FALCO_TOKEN from Secret %s key falco-http-token. Falco would post with an unexpanded token and every alert would be rejected with 401." $secret) -}}
 {{- end -}}
 {{- end -}}

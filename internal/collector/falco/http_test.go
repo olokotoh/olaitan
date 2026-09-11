@@ -509,3 +509,76 @@ func TestRun_ReportsABindFailure(t *testing.T) {
 		t.Error("Run succeeded on an unbindable address")
 	}
 }
+
+// --- review round 1 ------------------------------------------------------
+
+// Only Falco's metrics snapshot is a heartbeat. Other "internal" events,
+// such as "Falco internal: syscall event drop", are security signal (an
+// attacker can flood syscalls to blind Falco) and the gRPC path published
+// them. The body is the real snapshot fixture with the rule renamed, since
+// a drop alert cannot be provoked on demand.
+func TestHandler_InternalAlertOtherThanSnapshotIsPublished(t *testing.T) {
+	body := bytes.Replace(fixture(t, "http_output_metrics_snapshot.json"),
+		[]byte(`"rule":"Falco internal: metrics snapshot"`),
+		[]byte(`"rule":"Falco internal: syscall event drop"`), 1)
+	if bytes.Equal(body, fixture(t, "http_output_metrics_snapshot.json")) {
+		t.Fatal("fixture no longer carries the snapshot rule name")
+	}
+	pub := &recordingPub{}
+	a := newTestAdapter(t, pub, nil)
+	if rec := post(t, a, "/falco/"+testToken, "application/json", body); rec.Code != http.StatusNoContent {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if pub.count() != 1 {
+		t.Errorf("syscall-event-drop alert published %d times, want 1", pub.count())
+	}
+	if a.HeartbeatsTotal() != 0 {
+		t.Error("a drop alert was counted as a heartbeat")
+	}
+}
+
+// A heartbeat proves Falco is alive, not that alerts are getting through.
+// While NATS refuses publishes the source must stay unhealthy, however
+// many snapshots arrive; a successful publish is what clears it.
+func TestHealth_HeartbeatDoesNotMaskPublishFailure(t *testing.T) {
+	pub := &recordingPub{err: errors.New("nats: timeout")}
+	a := newTestAdapter(t, pub, nil)
+	snap := fixture(t, "http_output_metrics_snapshot.json")
+	alert := fixture(t, "http_output_alert.json")
+
+	post(t, a, "/falco/"+testToken, "application/json", snap)
+	if healthy, _ := a.Health().Status(); !healthy {
+		t.Fatal("first heartbeat did not mark healthy")
+	}
+	if rec := post(t, a, "/falco/"+testToken, "application/json", alert); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("alert code = %d, want 503", rec.Code)
+	}
+	post(t, a, "/falco/"+testToken, "application/json", snap)
+	if healthy, _ := a.Health().Status(); healthy {
+		t.Error("a heartbeat marked the source healthy while NATS is still refusing publishes")
+	}
+
+	pub.mu.Lock()
+	pub.err = nil
+	pub.mu.Unlock()
+	post(t, a, "/falco/"+testToken, "application/json", alert)
+	if healthy, _ := a.Health().Status(); !healthy {
+		t.Error("a successful publish did not restore health")
+	}
+}
+
+// Shutdown must outlast the detached publish budget, or main.go drains NATS
+// under a handler still inside PublishJS.
+func TestNew_ShutdownGraceCoversThePublishBudget(t *testing.T) {
+	a := newTestAdapter(t, &recordingPub{}, nil)
+	if a.cfg.ShutdownGrace <= a.cfg.PublishWallClockBudget {
+		t.Errorf("ShutdownGrace %s <= PublishWallClockBudget %s", a.cfg.ShutdownGrace, a.cfg.PublishWallClockBudget)
+	}
+	b := newTestAdapter(t, &recordingPub{}, func(c *Config) {
+		c.ShutdownGrace = time.Second
+		c.PublishWallClockBudget = 10 * time.Second
+	})
+	if b.cfg.ShutdownGrace <= b.cfg.PublishWallClockBudget {
+		t.Errorf("an explicit ShutdownGrace below the publish budget was kept: %s <= %s", b.cfg.ShutdownGrace, b.cfg.PublishWallClockBudget)
+	}
+}

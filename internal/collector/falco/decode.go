@@ -13,11 +13,15 @@ import (
 	"github.com/olokotoh/olaitan/internal/collector/falco/falcopb"
 )
 
-// internalSource is the `source` Falco stamps on its own events, the
-// periodic metrics snapshot among them. Those are not security signal:
-// the adapter consumes them as a liveness heartbeat and never publishes
-// them.
-const internalSource = "internal"
+// internalSource and metricsSnapshotRule identify Falco's periodic metrics
+// snapshot, which the adapter consumes as a liveness heartbeat and never
+// publishes. Only that rule: Falco's other internal events, such as
+// "Falco internal: syscall event drop", are security signal (flooding
+// syscalls is how an attacker blinds Falco) and are published like alerts.
+const (
+	internalSource      = "internal"
+	metricsSnapshotRule = "Falco internal: metrics snapshot"
+)
 
 // httpAlert is the JSON body Falco's http_output POSTs for one event when
 // json_output is true. Field names are Falco's, not ours.

@@ -26,7 +26,7 @@ Flag any DaemonSet, Deployment, or workload manifest that loosens these baseline
 
 ## Falco ingest
 
-- Falco reaches the collector over `http_output` (Falco 0.44 removed gRPC). The Falco subchart's `http_output.url`, `json_output` and the `OLAITAN_FALCO_TOKEN` env entry must stay consistent with the `<fullname>-falco-ingest` Service and `<fullname>-secrets`; `olaitan.falcoIngest.validate` fails the render when they are not. Flag any change that bypasses that guard.
+- Falco reaches the collector over `http_output` (Falco 0.44 removed gRPC). Its URL is `${OLAITAN_FALCO_URL}${OLAITAN_FALCO_TOKEN}`, both from `falco.extra.env`, which the Falco chart renders through `tpl` in the release context. `olaitan.falcoIngest.validate` fails the render on anything the subchart cannot see (nameOverride/fullnameOverride, a port change, json_output or http_output off). Flag any change that bypasses that guard.
 - The `falco-ingest` Service MUST keep `internalTrafficPolicy: Local`, so a node's alerts reach that node's collector and carry the right node name.
 - The token must never be rendered into a ConfigMap: Falco expands `${OLAITAN_FALCO_TOKEN}` itself. Covered by tests in `deploy/helm/helm_test.go`.
 

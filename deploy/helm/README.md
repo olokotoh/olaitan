@@ -59,7 +59,7 @@ rationale. The most common overrides:
 | Pin image tag | `--set image.tag=sha-abc1234` |
 | Use existing Redis | `--set redis.enabled=false --set endpoints.redis=my-redis.svc:6379` |
 | Use existing NATS | `--set nats.enabled=false --set endpoints.nats=nats://my-nats.svc:4222` |
-| Use existing Falco | `--set falco.enabled=false`, then point your Falco's `http_output.url` at `http://<fullname>-falco-ingest:8765/falco/<token>` with `json_output: true` (token: key `falco-http-token` in Secret `<fullname>-secrets`) |
+| Use existing Falco | `--set falco.enabled=false`, then set your Falco's `json_output: true` and `http_output.url` to `http://<fullname>-falco-ingest.<namespace>.svc:8765/falco/<token>` (token: key `falco-http-token` in Secret `<fullname>-secrets`). The release NetworkPolicy admits pods labelled `app.kubernetes.io/name: falco` from any namespace; add other peers with `falcoIngest.extraFrom` |
 | Larger report volume | `--set reports.size=10Gi` |
 | External reports PVC | `--set reports.externalPvc=true` (claim name: `<fullname>-reports` — for the canonical `helm install olaitan ...` this collapses to `olaitan-reports`; for any other release name, the prefix is `<release>-olaitan-`) |
 | Operator-managed secrets | `--set-file secrets.llmApiKey=./path/to/key.txt` |

@@ -652,12 +652,6 @@ func TestEndpointsTemplated(t *testing.T) {
 		"template", "foo", chartDir(t),
 		"--set", "secrets.redisPassword=test-password",
 		"--set", "redis.auth.existingSecret=foo-olaitan-secrets",
-		// Story 10.2: the override recipe the falco-ingest guard prints
-		// for a non-default release name, proven here to render.
-		"--set-string", "falco.falco.http_output.url=http://foo-olaitan-falco-ingest:8765/falco/${OLAITAN_FALCO_TOKEN}",
-		"--set", "falco.extra.env[0].name=OLAITAN_FALCO_TOKEN",
-		"--set", "falco.extra.env[0].valueFrom.secretKeyRef.name=foo-olaitan-secrets",
-		"--set", "falco.extra.env[0].valueFrom.secretKeyRef.key=falco-http-token",
 	}
 	cmd := exec.Command("helm", args...)
 	var stdout, stderr bytes.Buffer
@@ -4670,7 +4664,25 @@ func fixerScript(t *testing.T, fixer map[string]any) string {
 // These tests pin every piece of that path, because a break anywhere in it
 // is silent: Falco logs a failed POST and the agent sees nothing.
 
-const falcoIngestURL = "http://olaitan-falco-ingest:8765/falco/${OLAITAN_FALCO_TOKEN}"
+const falcoIngestURL = "${OLAITAN_FALCO_URL}${OLAITAN_FALCO_TOKEN}"
+
+// falcoEnv returns the bundled Falco container's env entries by name.
+func falcoEnv(t *testing.T, rendered string) map[string]map[string]any {
+	t.Helper()
+	falcoDS := docByKindName(t, rendered, "DaemonSet", "falco")
+	out := map[string]map[string]any{}
+	for _, c := range falcoDS["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)["containers"].([]any) {
+		cm := c.(map[string]any)
+		if cm["name"] != "falco" {
+			continue
+		}
+		for _, e := range cm["env"].([]any) {
+			em := e.(map[string]any)
+			out[fmt.Sprint(em["name"])] = em
+		}
+	}
+	return out
+}
 
 // docByKindName returns the first rendered document with the given kind
 // whose metadata.name contains nameSub.
@@ -4808,26 +4820,15 @@ func TestBundledFalcoPostsJSONToTheCollector(t *testing.T) {
 		t.Errorf("metrics = %v; the snapshot is the collector's Falco heartbeat, so it must be on and routed to outputs", metrics)
 	}
 
-	// Falco gets the token from the release Secret, and expands it into the
-	// URL itself: the rendered ConfigMap must hold only the placeholder.
-	falcoDS := docByKindName(t, rendered, "DaemonSet", "falco")
-	var tokenFromSecret bool
-	for _, c := range falcoDS["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)["containers"].([]any) {
-		cm := c.(map[string]any)
-		if cm["name"] != "falco" {
-			continue
-		}
-		for _, e := range cm["env"].([]any) {
-			em := e.(map[string]any)
-			if em["name"] != "OLAITAN_FALCO_TOKEN" {
-				continue
-			}
-			ref := em["valueFrom"].(map[string]any)["secretKeyRef"].(map[string]any)
-			tokenFromSecret = ref["name"] == "olaitan-secrets" && ref["key"] == "falco-http-token"
-		}
+	// Falco gets the URL and the token from its env, and expands both into
+	// the URL itself: the rendered ConfigMap holds only the placeholders.
+	env := falcoEnv(t, rendered)
+	if got := env["OLAITAN_FALCO_URL"]["value"]; got != "http://olaitan-falco-ingest.default.svc:8765/falco/" {
+		t.Errorf("OLAITAN_FALCO_URL = %v, want this release's namespace-qualified ingest Service", got)
 	}
-	if !tokenFromSecret {
-		t.Error("Falco container does not get OLAITAN_FALCO_TOKEN from olaitan-secrets/falco-http-token")
+	ref, _ := env["OLAITAN_FALCO_TOKEN"]["valueFrom"].(map[string]any)["secretKeyRef"].(map[string]any)
+	if ref["name"] != "olaitan-secrets" || ref["key"] != "falco-http-token" {
+		t.Errorf("OLAITAN_FALCO_TOKEN comes from %v, want olaitan-secrets/falco-http-token", ref)
 	}
 	tok := strings.Trim(strings.TrimPrefix(grepLine(rendered, "falco-http-token: "), "falco-http-token: "), `"`)
 	if len(tok) < 16 {
@@ -4870,43 +4871,89 @@ func TestFalcoHttpTokenLifecycle(t *testing.T) {
 	}
 }
 
-// TestFalcoIngestGuard: the subchart's URL and Secret name are literals for
-// release `olaitan`. Any mismatch must fail at render with the fix, rather
-// than install a Falco that posts to a Service that does not exist.
+// TestFalcoIngestFollowsTheRelease: the Falco chart renders extra.env
+// through tpl in this release's context, so ANY release name and namespace
+// must render with Falco pointed at that release's Service and Secret, with
+// no overrides. That includes `--generate-name`, which CI uses.
+func TestFalcoIngestFollowsTheRelease(t *testing.T) {
+	for _, tc := range []struct{ release, ns, fullname string }{
+		{"olaitan", "olaitan", "olaitan"},
+		{"foo", "sec", "foo-olaitan"},
+		{"my-olaitan", "x", "my-olaitan"},
+	} {
+		t.Run(tc.release, func(t *testing.T) {
+			cmd := exec.Command("helm", "template", tc.release, chartDir(t), "-n", tc.ns,
+				"--set", "secrets.redisPassword=test-password")
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+			if err := cmd.Run(); err != nil {
+				t.Fatalf("render failed: %v\n%s", err, stderr.String())
+			}
+			rendered := stdout.String()
+			env := falcoEnv(t, rendered)
+			wantURL := "http://" + tc.fullname + "-falco-ingest." + tc.ns + ".svc:8765/falco/"
+			if env["OLAITAN_FALCO_URL"]["value"] != wantURL {
+				t.Errorf("OLAITAN_FALCO_URL = %v, want %s", env["OLAITAN_FALCO_URL"]["value"], wantURL)
+			}
+			ref := env["OLAITAN_FALCO_TOKEN"]["valueFrom"].(map[string]any)["secretKeyRef"].(map[string]any)
+			if ref["name"] != tc.fullname+"-secrets" {
+				t.Errorf("token Secret = %v, want %s-secrets", ref["name"], tc.fullname)
+			}
+			svc := docByKindName(t, rendered, "Service", "falco-ingest")
+			if svc["metadata"].(map[string]any)["name"] != tc.fullname+"-falco-ingest" {
+				t.Errorf("ingest Service is %v, want %s-falco-ingest", svc["metadata"].(map[string]any)["name"], tc.fullname)
+			}
+		})
+	}
+	if out, err := exec.Command("helm", "template", chartDir(t), "--generate-name",
+		"--set", "secrets.redisPassword=test-password").CombinedOutput(); err != nil {
+		t.Errorf("--generate-name render failed: %v\n%s", err, out)
+	}
+}
+
+// TestFalcoIngestGuard: what the subchart cannot see must fail at render
+// with the fix, rather than install a Falco that posts into the void.
 func TestFalcoIngestGuard(t *testing.T) {
-	fails := func(t *testing.T, release, want string, extra ...string) {
+	fails := func(t *testing.T, want string, extra ...string) {
 		t.Helper()
-		args := append([]string{"template", release, chartDir(t), "--set", "secrets.redisPassword=test-password"}, extra...)
+		args := append([]string{"template", "olaitan", chartDir(t), "--set", "secrets.redisPassword=test-password"}, extra...)
 		cmd := exec.Command("helm", args...)
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		if err := cmd.Run(); err == nil {
-			t.Fatalf("rendered %s %v; want a failure mentioning %q", release, extra, want)
+			t.Fatalf("rendered with %v; want a failure mentioning %q", extra, want)
 		}
 		if !strings.Contains(stderr.String(), want) {
 			t.Errorf("failure does not say %q:\n%s", want, stderr.String())
 		}
 	}
-	t.Run("other release name", func(t *testing.T) {
-		fails(t, "foo", "--set-string falco.falco.http_output.url='http://foo-olaitan-falco-ingest:8765/falco/${OLAITAN_FALCO_TOKEN}'",
-			"--set", "redis.auth.existingSecret=foo-olaitan-secrets")
+	t.Run("fullnameOverride", func(t *testing.T) {
+		fails(t, "falco.extra.env[0].value=http://renamed-falco-ingest.default.svc:8765/falco/", "--set", "fullnameOverride=renamed")
+	})
+	t.Run("port changed alone", func(t *testing.T) {
+		fails(t, "falcoIngest.port is 9000", "--set", "falcoIngest.port=9000")
 	})
 	t.Run("json_output off", func(t *testing.T) {
-		fails(t, "olaitan", "json_output", "--set", "falco.falco.json_output=false")
+		fails(t, "json_output", "--set", "falco.falco.json_output=false")
 	})
 	t.Run("http_output off", func(t *testing.T) {
-		fails(t, "olaitan", "http_output.enabled", "--set", "falco.falco.http_output.enabled=false")
+		fails(t, "http_output.enabled", "--set", "falco.falco.http_output.enabled=false")
 	})
-	t.Run("token env pointing elsewhere", func(t *testing.T) {
-		fails(t, "olaitan", "OLAITAN_FALCO_TOKEN", "--set", "falco.extra.env[0].name=SOMETHING_ELSE")
+	t.Run("url not the two placeholders", func(t *testing.T) {
+		fails(t, "${OLAITAN_FALCO_URL}${OLAITAN_FALCO_TOKEN}", "--set-string", "falco.falco.http_output.url=http://elsewhere/")
 	})
-	// No bundled Falco: nothing to check, whatever the release name.
-	cmd := exec.Command("helm", "template", "foo", chartDir(t),
+	// The recipe the fullnameOverride failure prints must itself render.
+	cmd := exec.Command("helm", "template", "olaitan", chartDir(t),
 		"--set", "secrets.redisPassword=test-password",
-		"--set", "redis.auth.existingSecret=foo-olaitan-secrets",
-		"--set", "falco.enabled=false")
+		"--set", "fullnameOverride=renamed",
+		"--set", "redis.auth.existingSecret=renamed-secrets",
+		"--set-string", "falco.extra.env[0].name=OLAITAN_FALCO_URL",
+		"--set-string", "falco.extra.env[0].value=http://renamed-falco-ingest.default.svc:8765/falco/",
+		"--set-string", "falco.extra.env[1].name=OLAITAN_FALCO_TOKEN",
+		"--set-string", "falco.extra.env[1].valueFrom.secretKeyRef.name=renamed-secrets",
+		"--set-string", "falco.extra.env[1].valueFrom.secretKeyRef.key=falco-http-token")
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Errorf("falco.enabled=false under release foo failed: %v\n%s", err, out)
+		t.Errorf("the printed override recipe does not render: %v\n%s", err, out)
 	}
 }
 
@@ -4935,6 +4982,63 @@ func TestNetworkPolicyAdmitsFalcoToTheIngestPort(t *testing.T) {
 		}
 	}
 	t.Error("release NetworkPolicy has no ingress rule admitting the Falco pods")
+}
+
+// TestNetworkPolicyAdmitsAnOperatorsOwnFalco: with the bundled Falco off,
+// the operator's Falco usually runs in its own namespace. The release
+// policy must still let Falco-labelled pods reach the ingest port (the
+// token is the second gate), and take extra peers for anything else.
+func TestNetworkPolicyAdmitsAnOperatorsOwnFalco(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"falco.enabled=false",
+		"falcoIngest.extraFrom[0].namespaceSelector.matchLabels.team=sec",
+	})
+	var raw map[string]any
+	dec := yaml.NewDecoder(strings.NewReader(rendered))
+	for {
+		var doc map[string]any
+		if err := dec.Decode(&doc); err != nil {
+			break
+		}
+		// Exact name: the Redis subchart ships its own olaitan-redis policy.
+		if doc != nil && doc["kind"] == "NetworkPolicy" && doc["metadata"].(map[string]any)["name"] == "olaitan" {
+			raw = doc
+		}
+	}
+	if raw == nil {
+		t.Fatal("no release NetworkPolicy named olaitan")
+	}
+	var sawAnyNamespaceFalco, sawExtra bool
+	for _, in := range raw["spec"].(map[string]any)["ingress"].([]any) {
+		rule := in.(map[string]any)
+		ports, _ := rule["ports"].([]any)
+		onlyIngest := len(ports) == 1 && ports[0].(map[string]any)["port"] == 8765
+		from, _ := rule["from"].([]any)
+		for _, f := range from {
+			peer, _ := f.(map[string]any)
+			_, hasNS := peer["namespaceSelector"]
+			ns, _ := peer["namespaceSelector"].(map[string]any)
+			pod, _ := peer["podSelector"].(map[string]any)
+			podLabels, _ := pod["matchLabels"].(map[string]any)
+			nsLabels, _ := ns["matchLabels"].(map[string]any)
+			if hasNS && len(ns) == 0 && podLabels["app.kubernetes.io/name"] == "falco" && onlyIngest {
+				sawAnyNamespaceFalco = true
+			}
+			if nsLabels["team"] == "sec" && onlyIngest {
+				sawExtra = true
+			}
+		}
+	}
+	if !sawAnyNamespaceFalco {
+		t.Error("falco.enabled=false: no rule admits Falco pods from other namespaces to the ingest port")
+	}
+	if !sawExtra {
+		t.Error("falcoIngest.extraFrom peers are not rendered on the ingest port")
+	}
+	notes := renderNotes(t, []string{"falco.enabled=false"})
+	if !strings.Contains(notes, "olaitan-falco-ingest.default.svc:8765") {
+		t.Error("notes for an operator's own Falco do not give the namespace-qualified ingest address")
+	}
 }
 
 func TestNotesDescribeTheFalcoHTTPPath(t *testing.T) {
