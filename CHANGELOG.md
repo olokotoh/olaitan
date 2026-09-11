@@ -38,6 +38,16 @@ and false-positive numbers; see [Unreleased](#unreleased).
   deadline) as cancellation and stopped retrying, so one slow NATS publish
   or a dial timeout silently ended the containerd sensor for the life of
   the pod.
+- **The applog sidecar can reach NATS and is visible** (#139). The admission
+  webhook injected sidecars with no `NATS_URL`, so every injected sidecar
+  exited at start and no application log line ever reached EVENTS_RAW. The
+  webhook now requires `OLAITAN_WEBHOOK_SIDECAR_NATS_URL` (the chart sets it
+  to the release's NATS Service FQDN, or `endpoints.nats` when set) and passes
+  it to each sidecar. Nothing observed the sidecars either, so a dead one was
+  silent: each now publishes a 30s heartbeat on `olaitan.health.applog`, and
+  the collector on the same node reports `olaitan_source_healthy{source="applog"}`,
+  `olaitan_sensor_events_total{source="applog"}` and the new
+  `olaitan_sensor_applog_sidecars{state}` gauge.
 - **Falco is ON in every test** (#106). All six e2e Makefile targets and
   four CI jobs installed with Falco switched off, on the claim that its eBPF
   probe could not load inside kind. That was false on any BTF kernel, and it

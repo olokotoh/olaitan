@@ -34,6 +34,12 @@ type InjectOptions struct {
 	// OLAITAN_APPLOG_* env vars. Empty falls back to the adapter's
 	// compiled defaults. Stringly-typed so the chart can pass
 	// duration / int values verbatim; the adapter parses on start-up.
+	// SidecarNATSURL is the NATS address the sidecar publishes to. The
+	// sidecar runs in the workload's namespace, so it must be fully
+	// qualified. Story 10.10: it was never set, and the sidecar refuses to
+	// start without it.
+	SidecarNATSURL string
+
 	SidecarStdoutPath          string
 	SidecarStderrPath          string
 	SidecarChannelBuffer       string
@@ -261,6 +267,7 @@ func buildSidecarContainer(opts InjectOptions, peerContainerName string) (corev1
 		{Name: "K8S_POD_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}},
 		{Name: "K8S_NODE_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"}}},
 		{Name: "OLAITAN_TARGET_CONTAINER", Value: peerContainerName},
+		{Name: "NATS_URL", Value: opts.SidecarNATSURL},
 	}
 	// Forward chart-tuned sidecar runtime knobs. Empty values are not
 	// emitted so the adapter's compiled defaults stay in force.

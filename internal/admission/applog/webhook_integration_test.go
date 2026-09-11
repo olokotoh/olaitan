@@ -83,6 +83,7 @@ func TestIntegration_WebhookOverRealTLS(t *testing.T) {
 		TLSKeyFile:       "/tmp/unused.key",
 		UseNativeSidecar: true,
 		SidecarImage:     "ghcr.io/olokotoh/olaitan:dev",
+		SidecarNATSURL:   "nats://olaitan-nats.olaitan.svc:4222",
 	}
 	w, err := NewWebhook(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -163,6 +164,7 @@ func TestIntegration_TLSConfig_RequiresValidCert(t *testing.T) {
 		TLSKeyFile:       "/nonexistent/tls.key",
 		UseNativeSidecar: true,
 		SidecarImage:     "ghcr.io/olokotoh/olaitan:dev",
+		SidecarNATSURL:   "nats://olaitan-nats.olaitan.svc:4222",
 	}
 	w, err := NewWebhook(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {

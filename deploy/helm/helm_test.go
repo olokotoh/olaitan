@@ -5539,3 +5539,50 @@ func TestContainerdSensorGrantsTheSocketGroup(t *testing.T) {
 		}
 	}
 }
+
+// TestApplogWebhookGivesSidecarsANATSURL: Story 10.10. Injected sidecars run
+// in the WORKLOAD's namespace, so the NATS address must be fully qualified;
+// a short Service name would not resolve there.
+func TestApplogWebhookGivesSidecarsANATSURL(t *testing.T) {
+	envOf := func(sets []string) string {
+		rendered := helmTemplate(t, append([]string{"applogSidecar.enabled=true", "applogSidecar.tls.servingCert=Yw==", "applogSidecar.tls.servingKey=aw==", "applogSidecar.tls.caBundle=Yw=="}, sets...))
+		dep := docByKindName(t, rendered, "Deployment", "applog")
+		for _, c := range dep["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)["containers"].([]any) {
+			for _, e := range c.(map[string]any)["env"].([]any) {
+				em := e.(map[string]any)
+				if em["name"] == "OLAITAN_WEBHOOK_SIDECAR_NATS_URL" {
+					return fmt.Sprint(em["value"])
+				}
+			}
+		}
+		return ""
+	}
+	if got := envOf(nil); got != "nats://olaitan-nats.default.svc:4222" {
+		t.Errorf("sidecar NATS URL = %q, want the namespace-qualified NATS Service", got)
+	}
+	if got := envOf([]string{"endpoints.nats=nats://nats.infra.svc:4222"}); got != "nats://nats.infra.svc:4222" {
+		t.Errorf("an explicit endpoints.nats was not used: %q", got)
+	}
+}
+
+// TestCollectorKnowsWhetherApplogIsOn: Story 10.10. The collector tracks
+// applog sidecar heartbeats only when applog is enabled.
+func TestCollectorKnowsWhetherApplogIsOn(t *testing.T) {
+	envOf := func(sets []string) any {
+		pod := collectorDaemonSet(t, helmTemplate(t, sets))["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)
+		for _, c := range pod["containers"].([]any) {
+			for _, e := range c.(map[string]any)["env"].([]any) {
+				if em := e.(map[string]any); em["name"] == "OLAITAN_APPLOG_ENABLED" {
+					return em["value"]
+				}
+			}
+		}
+		return nil
+	}
+	if v := envOf(nil); v != "false" {
+		t.Errorf("OLAITAN_APPLOG_ENABLED default = %v, want \"false\"", v)
+	}
+	if v := envOf([]string{"applogSidecar.enabled=true", "applogSidecar.tls.servingCert=Yw==", "applogSidecar.tls.servingKey=aw==", "applogSidecar.tls.caBundle=Yw=="}); v != "true" {
+		t.Errorf("OLAITAN_APPLOG_ENABLED with applog on = %v, want \"true\"", v)
+	}
+}

@@ -362,6 +362,16 @@ olaitan.falcoIngest.releaseFullname: the olaitan.fullname rule minus
 nameOverride/fullnameOverride. The guard below fails the render when those
 overrides make the two disagree, with the literal values to set instead.
 */}}
+{{/* NATS URL resolvable from ANY namespace (applog sidecars run in the
+     workload's namespace). endpoints.nats wins when set. */}}
+{{- define "olaitan.endpoints.natsFQDN" -}}
+{{- if .Values.endpoints.nats -}}
+{{- .Values.endpoints.nats -}}
+{{- else -}}
+{{- printf "nats://%s-nats.%s.svc:4222" .Release.Name .Release.Namespace -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "olaitan.falcoIngest.releaseFullname" -}}
 {{- if contains "olaitan" .Release.Name -}}
 {{- .Release.Name | trunc 63 | trimSuffix "-" -}}
