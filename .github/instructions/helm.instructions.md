@@ -21,13 +21,14 @@ Flag any DaemonSet, Deployment, or workload manifest that loosens these baseline
 
 - Mounts default to `readOnly: true`. A read-write mount needs explicit justification in a code comment.
 - The only writable mount is the `/tmp` `emptyDir` required by the Go runtime for crash-trace artefacts.
-- `hostPath` mounts are a strong red flag. The Falco gRPC socket at `/run/falco` is the only legitimate hostPath mount in this chart, and it is read-only and gated on `endpoints.falco | hasPrefix "unix://"`.
+- `hostPath` mounts are a strong red flag. The containerd socket directory (read-only, gated on `containerdSensor.enabled`) is the only legitimate hostPath mount in Olaitan's own templates. The default render mounts nothing from the host; the bundled Falco subchart's mounts are Falco's own.
 - ConfigMap mounts use whole-directory mounts (`mountPath: /etc/olaitan/...`); do NOT introduce `subPath` because it breaks the chart's atomic-swap contract for hot-reload of rules.
 
-## Falco socket
+## Falco ingest
 
-- When `endpoints.falco` has prefix `unix://`, the collector DaemonSet MUST mount `/run/falco` as a hostPath read-only volume. Without this, the adapter dials a path that does not exist inside the pod and retries forever while the readiness probe stays green.
-- When `endpoints.falco` is `tcp://`, the hostPath mount MUST be omitted. Both branches are covered by tests in `deploy/helm/helm_test.go`.
+- Falco reaches the collector over `http_output` (Falco 0.44 removed gRPC). The Falco subchart's `http_output.url`, `json_output` and the `OLAITAN_FALCO_TOKEN` env entry must stay consistent with the `<fullname>-falco-ingest` Service and `<fullname>-secrets`; `olaitan.falcoIngest.validate` fails the render when they are not. Flag any change that bypasses that guard.
+- The `falco-ingest` Service MUST keep `internalTrafficPolicy: Local`, so a node's alerts reach that node's collector and carry the right node name.
+- The token must never be rendered into a ConfigMap: Falco expands `${OLAITAN_FALCO_TOKEN}` itself. Covered by tests in `deploy/helm/helm_test.go`.
 
 ## Secrets
 

@@ -70,6 +70,22 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "olaitan.selectorLabels" . | nindent 14 }}
+    {{- if .Values.falco.enabled }}
+    {{- /*
+    Story 10.2: the bundled Falco POSTs alerts to the collector. Its pods
+    carry the Falco chart's own name label, so the rule above does not
+    match them; without this, an enforcing CNI drops every alert. Scoped
+    to this release's Falco and to the ingest port only.
+    */}}
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: falco
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.falcoIngest.port }}
+    {{- end }}
     {{- /*
     Allow kubelet probe traffic from node IPs. Required when the CNI
     enforces NetworkPolicy on host-network traffic (Calico eBPF

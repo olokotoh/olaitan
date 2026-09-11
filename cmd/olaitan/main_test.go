@@ -258,11 +258,15 @@ func TestStartCollectorRing_WiresCalicoAdapter(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			natsSrv := startTestNATSForMain(t)
 			t.Setenv("NATS_URL", natsSrv.ClientURL())
-			// FALCO_SOCKET points at a non-existent path; falco.New
-			// only validates non-empty, so the adapter constructs
-			// fine. Run will fail on first dial but that is in a
-			// goroutine the test cancels before that happens.
-			t.Setenv("FALCO_SOCKET", "/dev/null")
+			// The Falco receiver binds an ephemeral loopback port and
+			// reads its token from a temp file, the way the chart hands
+			// it the mounted release Secret.
+			t.Setenv("FALCO_LISTEN_ADDR", "127.0.0.1:0")
+			tokFile := filepath.Join(t.TempDir(), "falco-http-token")
+			if err := os.WriteFile(tokFile, []byte("0123456789abcdef0123456789abcdef\n"), 0o400); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("FALCO_HTTP_TOKEN_FILE", tokFile)
 			t.Setenv("K8S_NODE_NAME", "test-node")
 
 			// Load the minimal valid config the existing writeTestConfig
@@ -686,5 +690,26 @@ func TestAnalystAPIKeyFromEnv(t *testing.T) {
 
 	if got := analystAPIKeyFromEnv(""); got != "" {
 		t.Errorf("empty env NAME should be empty, got %q", got)
+	}
+}
+
+func TestReadFalcoToken(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good")
+	if err := os.WriteFile(good, []byte("  0123456789abcdef0123456789abcdef\n"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	tok, err := readFalcoToken(good)
+	if err != nil || tok != "0123456789abcdef0123456789abcdef" {
+		t.Errorf("readFalcoToken(good) = %q, %v; want the trimmed token", tok, err)
+	}
+	empty := filepath.Join(dir, "empty")
+	if err := os.WriteFile(empty, []byte("\n"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	for name, path := range map[string]string{"unset": "", "missing": filepath.Join(dir, "nope"), "blank": empty} {
+		if _, err := readFalcoToken(path); err == nil {
+			t.Errorf("%s: readFalcoToken accepted it", name)
+		}
 	}
 }

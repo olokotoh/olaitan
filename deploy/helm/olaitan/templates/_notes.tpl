@@ -16,7 +16,6 @@ NOTES.txt is then a one-line include.
 {{- $source := include "olaitan.platformSource" . -}}
 {{- $managed := include "olaitan.isManagedControlPlane" . -}}
 {{- $cni := include "olaitan.networkPolicyProvider" . -}}
-{{- $unixFalco := include "olaitan.falcoSocket.isUnix" . -}}
 {{- $ns := .Release.Namespace -}}
 {{/*
 Nil-safe locals. These notes render on every helm install, so a values
@@ -53,25 +52,20 @@ cannot see before you trust it.
 
 DETECTION SOURCES
 {{- if (default (dict) .Values.falco).enabled }}
-  [ON ] Falco syscall events -- bundled Falco subchart, via {{ .Values.endpoints.falco }}
+  [ON ] Falco syscall events -- bundled Falco subchart, posting to the
+         node-local {{ include "olaitan.falcoIngest.serviceName" . }} Service on port {{ .Values.falcoIngest.port }}.
+         source_healthy{source="falco"} turns 1 on Falco's first heartbeat
+         (about a minute after it loads its driver). If it stays 0, check
+         olaitan_sensor_falco_http_requests_total{code="401"}: a token
+         mismatch between Falco and the collector shows up there.
 {{- else }}
-  [ ? ] Falco syscall events -- ASSUMED, via {{ .Values.endpoints.falco }}
-         falco.enabled=false, so this chart deployed no Falco and has
-         established nothing about whether one is listening there. This is
-         the primary detection source: if nothing is at that address the
-         agent runs and sees almost nothing, quietly. Verify before you
-         trust it (see VERIFY THE INSTALL below).
-{{- end }}
-{{- if eq (include "olaitan.falcoSocket.fixerEnabled" .) "true" }}
-         Falco creates that socket 0755 root:root and the collector runs as
-         UID 65532, so it could not connect to it. The
-         falco-socket-permissions {{ if .Values.falcoSocketPermissions.useNativeSidecar }}sidecar{{ else }}container{{ end }} holds it at {{ .Values.falcoSocketPermissions.socketMode }} group
-         {{ .Values.falcoSocketPermissions.socketGroup }}. If the collector ever logs "connect: permission denied",
-         look there first: it is the difference between events and silence.
-{{- else if $unixFalco }}
-         falcoSocketPermissions is OFF. If the collector logs
-         "connect: permission denied", that is why: Falco's socket is
-         0755 root:root and the collector (UID 65532) cannot attach.
+  [ ? ] Falco syscall events -- ASSUMED. falco.enabled=false, so this chart
+         deployed no Falco and has established nothing about whether one is
+         posting alerts to http://{{ include "olaitan.falcoIngest.serviceName" . }}:{{ .Values.falcoIngest.port }}/falco/<token>
+         (token: key falco-http-token in Secret {{ include "olaitan.fullname" . }}-secrets).
+         This is the primary detection source: without it the agent runs
+         and sees almost nothing, quietly. Verify before you trust it (see
+         VERIFY THE INSTALL below).
 {{- end }}
 {{- if (default (dict) .Values.auditWebhook).enabled }}
   [ON ] Kubernetes audit webhook

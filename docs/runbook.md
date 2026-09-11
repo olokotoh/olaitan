@@ -69,6 +69,24 @@ The catalogue is organised by registering ring + story, in commit chronology so 
 - **Sample PromQL (aggregate):** `sum(rate(olaitan_sensor_audit_rejected_total[5m])) by (reason)` (per-reason rejection rate).
 - **Sample PromQL (alert):** `rate(olaitan_sensor_audit_rejected_total{reason="decode_error"}[5m]) > 0.1` for 10 minutes (page on sustained decode failures suggesting an API-server payload schema change).
 
+#### `olaitan_sensor_falco_http_requests_total` (Story 10.2)
+
+- **Type:** counter
+- **Unit:** count
+- **Labels:** `source` (constant `falco`), `code` (HTTP status the collector answered Falco with: `204`, `400`, `401`, `404`, `405`, `413`, `415`, `503`; cardinality 8, every series registered at start)
+- **Help:** Falco http_output requests answered by the collector, by HTTP status code. `401` means a request arrived without the right token, which is how a token mismatch between Falco and the collector shows up. `503` means NATS refused the publish; Falco does not retry, so those alerts are lost. `415` means Falco's `json_output` is off.
+- **Sample PromQL (aggregate):** `sum(rate(olaitan_sensor_falco_http_requests_total[5m])) by (code)`.
+- **Sample PromQL (alert):** `rate(olaitan_sensor_falco_http_requests_total{code=~"401|503"}[5m]) > 0` for 5 minutes (alerts are being rejected or lost).
+
+#### `olaitan_sensor_falco_alerts_received_total`, `olaitan_sensor_falco_heartbeats_total` and `olaitan_sensor_falco_publish_drops_total` (Story 10.2)
+
+- **Type:** counter (one family each)
+- **Unit:** count
+- **Labels:** `source` (constant `falco`)
+- **Help:** `alerts_received` counts authenticated, decodable Falco alerts whether or not they were published; the gap to `olaitan_sensor_events_total{source="falco"}` is what rate-limit sampling and publish failures cost. `heartbeats` counts Falco's periodic metrics snapshots (`falco.falco.metrics.interval`, 1m by default); they drive `olaitan_source_healthy{source="falco"}`, which drops to 0 after 3 minutes of silence, and are never published as events. `publish_drops` counts alerts dropped on a permanent publish error, such as the EVENTS_RAW per-message cap.
+- **Sample PromQL (aggregate):** `rate(olaitan_sensor_falco_heartbeats_total[5m]) * 60` (snapshots per minute, 1 per node when healthy).
+- **Sample PromQL (alert):** `increase(olaitan_sensor_falco_heartbeats_total[5m]) == 0` (Falco is down, or cannot reach this node's collector).
+
 #### `olaitan_sensor_cri_translate_errors_total` and `olaitan_sensor_cri_publish_drops_total` (Story 1.8)
 
 - **Type:** counter (one family each)
@@ -1564,14 +1582,13 @@ helm install olaitan deploy/helm/olaitan \
   --set baselines.warmupDuration=5s \
   --set secrets.redisPassword=<redis-password> \
   --set falco.enabled=false \
-  --set endpoints.falco=tcp://127.0.0.1:0 \
   --set-string nats.streamMaxBytesOverride=536870912 \
   --wait --timeout 5m
 ```
 
 On a real (non-kind) cluster, drop the kind-only / evaluation-only flags
 (`image.pullPolicy=Never`, `evaluation.config=RS`, `baselines.warmupDuration=5s`,
-`falco.enabled=false`, `endpoints.falco`, `nats.streamMaxBytesOverride`) and
+`falco.enabled=false`, `nats.streamMaxBytesOverride`) and
 supply your own image registry, the `secrets.redisPassword`, and an
 `evaluation.config` (or no overlay) appropriate to the posture. The three
 posture overlays (`-f deploy/helm/olaitan/values-production.yaml` /

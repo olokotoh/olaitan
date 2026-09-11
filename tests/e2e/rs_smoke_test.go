@@ -126,9 +126,8 @@ func kubectl(t *testing.T, args ...string) string {
 // injects synthetic events directly into NATS via port-forward so the
 // collector DaemonSet is not on the critical path. Falco's eBPF probe
 // cannot load inside kind nodes (kind nodes are containers; eBPF is
-// host-scoped) and the collector pod is run with endpoints.falco set
-// to a tcp:// target so the /run/falco hostPath mount is skipped --
-// the collector starts but never connects to Falco. None of that
+// host-scoped), so the e2e targets install with falco.enabled=false
+// and the collector starts but receives no Falco alerts. None of that
 // blocks the aggregator-side pipeline the test exercises.
 func waitForPodsReady(t *testing.T) {
 	t.Helper()

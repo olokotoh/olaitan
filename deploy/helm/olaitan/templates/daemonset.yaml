@@ -1,13 +1,13 @@
 {{/*
-Ring 1 collector -- one pod per node, consumes Falco gRPC, K8s audit,
+Ring 1 collector -- one pod per node, receives Falco alerts, K8s audit,
 and cgroup signals; publishes enriched events to NATS.
 
 hostNetwork: false, hostPID: false. Falco already owns the host-level
-signal-capture side on each node; the collector talks to Falco through
-a gRPC socket mounted from the Falco pod's hostPath, so we stay inside
-the pod network namespace. This keeps the collector's blast radius
-small -- an auditor reviewing the pod spec sees no host-level escape
-surface.
+signal-capture side on each node and POSTs its alerts to this pod over
+HTTP through the node-local falco-ingest Service (Story 10.2), so the
+collector needs no host mount for Falco at all. An auditor reviewing the
+pod spec sees no host-level escape surface unless the containerd sensor
+is enabled.
 */}}
 {{- if .Values.containerdSensor.enabled }}
 {{- $sp := default "" .Values.containerdSensor.socketPath }}
@@ -76,8 +76,6 @@ spec:
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
-        # Rendered from olaitan.collector.runAsGroup so falcoSocketPermissions
-        # .socketGroup has a single source of truth to be checked against.
         runAsGroup: {{ include "olaitan.collector.runAsGroup" . }}
         fsGroup: 65532
         seccompProfile:
@@ -97,32 +95,8 @@ spec:
         {{- with .Values.collector.tolerations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- include "olaitan.falcoSocket.validateBundled" . }}
-      {{- include "olaitan.falcoSocket.validateGroup" . }}
-      {{- $falcoFix := include "olaitan.falcoSocket.fixerEnabled" . }}
-      {{- if and $falcoFix .Values.falcoSocketPermissions.useNativeSidecar }}
-      # Story 9.6 -- make Falco's gRPC socket reachable by a non-root collector.
-      #
-      # Falco binds the socket without chmod, so it lands 0755 root:root from
-      # the default umask. connect(2) on a Unix socket needs WRITE permission,
-      # and the collector is UID/GID 65532 (NFR11), so without this the dial
-      # fails with "permission denied" and the collector ingests nothing while
-      # Falco itself looks perfectly healthy. Upstream exposes no socket-mode
-      # setting (falcosecurity/falco#1351), so the mode is corrected here, from
-      # the collector's own pod rather than Falco's -- an operator pointing
-      # endpoints.falco at their own Falco DaemonSet needs the same fix, and
-      # falco.extra.initContainers would only reach the bundled subchart.
-      initContainers:
-        {{- include "olaitan.falcoSocket.fixerContainer" (dict "ctx" $ "native" true) | nindent 8 }}
-      {{- end }}
+      {{- include "olaitan.falcoIngest.validate" . }}
       containers:
-        {{- if and $falcoFix (not .Values.falcoSocketPermissions.useNativeSidecar) }}
-        # Story 9.6, non-native form: same container, injected here because the
-        # cluster has the SidecarContainers gate disabled. Unordered relative to
-        # the collector, so the collector's first dial may lose the race and be
-        # restarted once into a working socket.
-        {{- include "olaitan.falcoSocket.fixerContainer" (dict "ctx" $ "native" false) | nindent 8 }}
-        {{- end }}
         - name: collector
           image: {{ include "olaitan.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -148,6 +122,11 @@ spec:
               containerPort: {{ .Values.metrics.containerPort }}
               protocol: TCP
             {{- end }}
+            # Story 10.2: Falco's http_output posts every alert here, via
+            # the node-local falco-ingest Service.
+            - name: falco-ingest
+              containerPort: {{ .Values.falcoIngest.port }}
+              protocol: TCP
             {{- if .Values.auditWebhook.enabled }}
             # Story 1.7 audit-webhook receiver port. The kube-apiserver
             # dials this port via the Service FQDN baked into the
@@ -161,8 +140,12 @@ spec:
               value: {{ include "olaitan.endpoints.nats" . | quote }}
             - name: REDIS_ADDR
               value: {{ include "olaitan.endpoints.redis" . | quote }}
-            - name: FALCO_SOCKET
-              value: {{ .Values.endpoints.falco | quote }}
+            - name: FALCO_LISTEN_ADDR
+              value: {{ printf ":%v" .Values.falcoIngest.port | quote }}
+            # Read from the mounted release Secret (below), not an env
+            # var, so the token stays out of `kubectl describe pod`.
+            - name: FALCO_HTTP_TOKEN_FILE
+              value: /etc/olaitan/secrets/falco-http-token
             # Story 1.6: the Falco adapter records the node name on
             # every emitted Event.Pod.Node so host events without K8s
             # pod context still record where they were observed. Sourced
@@ -224,27 +207,6 @@ spec:
             # artefacts on crash which need a writable path.
             - name: tmp
               mountPath: /tmp
-            {{- if include "olaitan.falcoSocket.isUnix" . }}
-            # Falco gRPC socket bind-mounted from the host. The collector pod
-            # opens it via the FALCO_SOCKET env var. Read-only because the
-            # collector only ever connects (reads) -- never writes -- to the
-            # socket. connect(2) still works through a read-only mount: a
-            # readOnly volumeMount is MNT_READONLY, and the check that would
-            # reject a write (__mnt_want_write) is only taken on
-            # open-for-write paths, which connect(2) never takes. Mounted only
-            # when endpoints.falco is a unix:// target; tcp:// targets reach
-            # Falco over the pod network and need no host mount.
-            #
-            # The path is DERIVED from endpoints.falco rather than hardcoded.
-            # It used to be the literal /run/falco while FALCO_SOCKET followed
-            # the value, so pointing endpoints.falco at a socket in any other
-            # directory mounted one directory and dialled into another: the
-            # collector failed with "no such file or directory" and nothing in
-            # the chart disagreed with itself loudly enough to say why.
-            - name: falco-socket
-              mountPath: {{ dir (include "olaitan.falcoSocket.path" .) | quote }}
-              readOnly: true
-            {{- end }}
             {{- if .Values.auditWebhook.enabled }}
             # Story 1.7: receiver TLS material (serving cert+key plus
             # cluster-CA bundle for verifying the apiserver client
@@ -259,9 +221,8 @@ spec:
             # host. We mount the parent directory rather than the
             # socket file directly so a containerd restart that
             # removes-and-recreates the socket inode is observed by
-            # the agent without a remount. Same pattern as the Falco
-            # /run/falco socket mount above. Security boundary:
-            # privilege equivalent to the Falco mount; see
+            # the agent without a remount. Security boundary: this is
+            # the collector's only host mount; see
             # deploy/helm/olaitan/CRI.md for the threat model.
             - name: containerd-socket
               mountPath: {{ dir .Values.containerdSensor.socketPath | quote }}
@@ -299,17 +260,6 @@ spec:
             defaultMode: 0400
         - name: tmp
           emptyDir: {}
-        {{- if include "olaitan.falcoSocket.isUnix" . }}
-        # Source directory derived from endpoints.falco, so the volume, the
-        # collector's mount, the permission fixer's mount and FALCO_SOCKET all
-        # name the same place. type: Directory (not DirectoryOrCreate) so a
-        # node where Falco is not running fails visibly instead of
-        # materialising an empty directory the collector would wait on forever.
-        - name: falco-socket
-          hostPath:
-            path: {{ dir (include "olaitan.falcoSocket.path" .) | quote }}
-            type: Directory
-        {{- end }}
         {{- if .Values.auditWebhook.enabled }}
         - name: audit-tls
           secret:

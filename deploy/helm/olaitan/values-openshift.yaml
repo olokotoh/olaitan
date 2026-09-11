@@ -11,27 +11,20 @@
 platform: openshift
 
 openshift:
-  # Ships the RoleBinding the collector needs. Without an SCC that permits
-  # hostPath volumes and a non-assigned UID, the DaemonSet is refused at
-  # admission -- OpenShift's default restricted-v2 allows neither, and the
-  # collector needs both (Falco's socket directory is a hostPath, and the
-  # falco-socket-permissions container runs as UID 0 to chmod the socket).
+  # Ships the RoleBinding the collector needs. OpenShift's default
+  # restricted-v2 assigns a per-namespace UID range and forbids hostPath; the
+  # collector pins UID 65532, and with containerdSensor.enabled it mounts the
+  # containerd socket directory. Without an SCC allowing both, the DaemonSet
+  # is refused at admission.
   #
   # This replaces the manual step:
   #   oc adm policy add-scc-to-user hostmount-anyuid -z <release>-olaitan-collector
   bindSCC: true
   # hostmount-anyuid, not privileged. Olaitan's own containers are
   # unprivileged, drop ALL capabilities and run read-only root filesystems.
-  #
-  # !! READ templates/openshift-scc-binding.yaml BEFORE INSTALLING. The stock
-  # hostmount-anyuid SCC sets `allowedCapabilities: null`, and the
-  # falco-socket-permissions container asks for CHOWN (chgrp needs it), so
-  # admission REJECTS it with:
-  #   capabilities.add: Invalid value: "CHOWN": capability may not be added
-  # You need a custom SCC that is hostmount-anyuid plus CHOWN. The exact
-  # object is in that template's header comment; create it, then set
-  # openshift.scc to its name. Left at the stock name here because inventing
-  # a name for an SCC this chart cannot create would be worse.
+  # Since Story 10.2 nothing in the collector pod adds a capability (the
+  # falco-socket-permissions container that needed CHOWN is gone: Falco now
+  # reaches the collector over HTTP), so the stock SCC is sufficient.
   #
   # Nobody has run this on a live OpenShift cluster. It is template-verified.
   scc: hostmount-anyuid

@@ -278,7 +278,6 @@ e2e-local: helm-prepare helm-deps docker-build
 		--set baselines.warmupDuration=5s \
 		--set secrets.redisPassword=ci-test \
 		--set falco.enabled=false \
-		--set endpoints.falco=tcp://127.0.0.1:0 \
 		--set nats.streamMaxBytesOverride=1073741824 \
 		--wait --timeout 5m
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) go test -tags=e2e -v -count=1 ./tests/e2e/...
@@ -311,7 +310,6 @@ e2e-local-rslt: helm-prepare helm-deps docker-build
 		--set baselines.warmupDuration=5s \
 		--set secrets.redisPassword=ci-test \
 		--set falco.enabled=false \
-		--set endpoints.falco=tcp://127.0.0.1:0 \
 		--set nats.streamMaxBytesOverride=1073741824 \
 		--wait --timeout 5m
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) OLT_E2E_RSLT=1 go test -tags=e2e -v -count=1 ./tests/e2e/...
@@ -373,7 +371,6 @@ e2e-local-forensics: helm-prepare helm-deps docker-build
 		--set baselines.warmupDuration=5s \
 		--set secrets.redisPassword=ci-test \
 		--set falco.enabled=false \
-		--set endpoints.falco=tcp://127.0.0.1:0 \
 		--set nats.streamMaxBytesOverride=1073741824 \
 		--wait --timeout 5m
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) OLT_E2E_FORENSICS=1 go test -tags=e2e -v -count=1 -run TestKindSmoke_Forensics_FullSlice ./tests/e2e/...
@@ -401,7 +398,6 @@ e2e-local-overlays: helm-prepare helm-deps docker-build
 		--set image.pullPolicy=Never \
 		--set secrets.redisPassword=ci-test \
 		--set falco.enabled=false \
-		--set endpoints.falco=tcp://127.0.0.1:0 \
 		--set-string nats.streamMaxBytesOverride=536870912 \
 		-f $(CHART_DIR)/values-$(OVERLAY).yaml \
 		--wait --timeout 5m
@@ -444,7 +440,6 @@ eval-smoke: helm-prepare helm-deps docker-build
 		--set baselines.warmupDuration=5s \
 		--set secrets.redisPassword=ci-test \
 		--set falco.enabled=false \
-		--set endpoints.falco=tcp://127.0.0.1:0 \
 		--set-string nats.streamMaxBytesOverride=1073741824 \
 		--wait --timeout 5m
 	go build $(LDFLAGS) -o bin/olaitan-eval ./cmd/olaitan-eval
@@ -481,7 +476,6 @@ scenarios-smoke: helm-prepare helm-deps docker-build
 		--set baselines.warmupDuration=5s \
 		--set secrets.redisPassword=ci-test \
 		--set falco.enabled=false \
-		--set endpoints.falco=tcp://127.0.0.1:0 \
 		--set nats.streamMaxBytesOverride=1073741824 \
 		--wait --timeout 5m
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) go test -tags=e2e -v -count=1 -run 'TestKindSmoke_Scenarios' ./tests/e2e/...

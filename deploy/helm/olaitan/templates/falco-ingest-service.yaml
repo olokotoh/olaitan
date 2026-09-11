@@ -1,0 +1,32 @@
+{{/*
+Falco ingest Service (Story 10.2). Falco's http_output posts every alert
+to this Service, which routes to the collector on the SAME node.
+
+internalTrafficPolicy: Local keeps each node's alerts on that node: the
+Falco pod on node A reaches the collector on node A, never one elsewhere.
+That preserves the old hostPath-socket topology, where a collector only
+ever saw its own node's Falco, and it means a node with Falco but no
+collector drops its alerts at the Service rather than sending them to a
+collector that would stamp them with the wrong node name.
+
+Renders whenever the collector does. With falco.enabled=false it is the
+address an operator's own Falco posts to.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "olaitan.falcoIngest.serviceName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: falco-ingest
+spec:
+  type: ClusterIP
+  internalTrafficPolicy: Local
+  selector:
+    {{- include "olaitan.collector.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: falco-ingest
+      protocol: TCP
+      port: {{ .Values.falcoIngest.port }}
+      targetPort: falco-ingest

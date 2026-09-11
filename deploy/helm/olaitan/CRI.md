@@ -173,10 +173,10 @@ ecosystem has standardised on the Kyverno
 flagging this mount class; clusters running Kyverno will need an
 explicit exception for the Olaitan collector DaemonSet.
 
-This is privilege equivalent to what Falco's `/run/falco/falco.sock`
-mount already grants (Falco's Unix socket exposes equivalent
-privilege through Falco's own grpc surface), so the threat model is
-unchanged from the post-Story-1.6 baseline. The Olaitan threat model
+Since Story 10.2 this is the collector's ONLY host mount: Falco now
+reaches the collector over HTTP, so the Falco socket mount that used
+to sit alongside it is gone. Enabling the containerd sensor therefore
+adds host access the default install does not have; weigh it as such. The Olaitan threat model
 assumes an attacker who has compromised the agent pod has already
 won the per-node game; cluster-level isolation (RBAC, NetworkPolicy,
 audit subjects) is what limits blast radius from a node compromise.

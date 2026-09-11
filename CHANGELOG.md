@@ -25,6 +25,23 @@ and false-positive numbers; see [Unreleased](#unreleased).
   `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, issue templates, and a README
   rewritten for operators rather than examiners.
 
+### Changed
+
+- **BREAKING: Falco alerts now reach the collector over HTTP, not gRPC** (#104).
+  Falco 0.44.0 removed its gRPC output, and the Falco releases that stay up on
+  kernel 7.x are all newer. Falco's `http_output` now POSTs each alert to the
+  collector through the node-local `<release>-falco-ingest` Service, with a
+  generated token (`secrets.falcoHttpToken`, stored as `falco-http-token` in
+  the release Secret) in the URL path. `endpoints.falco` and
+  `falcoSocketPermissions` are gone, and with them the collector's hostPath
+  mount and the root socket-permission container. An operator running their
+  own Falco points its `http_output.url` at the Service instead. Falco's
+  periodic metrics snapshot is now the collector's Falco heartbeat. New
+  metrics: `olaitan_sensor_falco_http_requests_total{code}`,
+  `olaitan_sensor_falco_alerts_received_total`,
+  `olaitan_sensor_falco_heartbeats_total`,
+  `olaitan_sensor_falco_publish_drops_total`.
+
 ## [v1.0.0-rc3] - 2026-08-30
 
 ### Fixed

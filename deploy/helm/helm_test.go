@@ -253,6 +253,9 @@ func TestSubchartsDisabled(t *testing.T) {
 		"NetworkPolicy":         1,
 		"DaemonSet":             1,
 		"Deployment":            1,
+		// Story 10.2: the falco-ingest Service renders even with the
+		// Falco subchart off; it is where an operator's own Falco posts.
+		"Service": 1,
 	}
 	got := map[string]int{}
 	for _, m := range ms {
@@ -649,6 +652,12 @@ func TestEndpointsTemplated(t *testing.T) {
 		"template", "foo", chartDir(t),
 		"--set", "secrets.redisPassword=test-password",
 		"--set", "redis.auth.existingSecret=foo-olaitan-secrets",
+		// Story 10.2: the override recipe the falco-ingest guard prints
+		// for a non-default release name, proven here to render.
+		"--set-string", "falco.falco.http_output.url=http://foo-olaitan-falco-ingest:8765/falco/${OLAITAN_FALCO_TOKEN}",
+		"--set", "falco.extra.env[0].name=OLAITAN_FALCO_TOKEN",
+		"--set", "falco.extra.env[0].valueFrom.secretKeyRef.name=foo-olaitan-secrets",
+		"--set", "falco.extra.env[0].valueFrom.secretKeyRef.key=falco-http-token",
 	}
 	cmd := exec.Command("helm", args...)
 	var stdout, stderr bytes.Buffer
@@ -677,7 +686,7 @@ func TestEndpointsTemplated(t *testing.T) {
 // env var is empty" message at startup.
 func TestCollectorDaemonsetHasK8sNodeNameDownwardAPI(t *testing.T) {
 	args := []string{
-		"template", "olaitan-test", chartDir(t),
+		"template", "olaitan", chartDir(t),
 		"--set", "secrets.redisPassword=test-password",
 	}
 	cmd := exec.Command("helm", args...)
@@ -698,115 +707,6 @@ func TestCollectorDaemonsetHasK8sNodeNameDownwardAPI(t *testing.T) {
 	if !strings.Contains(rendered, want) {
 		t.Errorf("K8S_NODE_NAME downward-API env not rendered on collector daemonset; rendered output sample:\n%s",
 			snippet(rendered, "K8S_NODE_NAME"))
-	}
-}
-
-// TestCollectorDaemonsetMountsFalcoSocketWhenUnix verifies that the
-// collector DaemonSet bind-mounts /run/falco from the host when
-// endpoints.falco uses a unix:// scheme (the chart default). Without
-// this mount the FALCO_SOCKET env points at a path that is not visible
-// inside the pod, so every dial silently fails and the adapter loops
-// "Falco unreachable" forever; the bug is invisible until an operator
-// notices zero events. Guard tightly so a chart refactor that strips
-// the volume or volumeMount trips this test.
-func TestCollectorDaemonsetMountsFalcoSocketWhenUnix(t *testing.T) {
-	args := []string{
-		"template", "olaitan-test", chartDir(t),
-		"--set", "secrets.redisPassword=test-password",
-	}
-	cmd := exec.Command("helm", args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("helm template failed: %v\nstderr: %s", err, stderr.String())
-	}
-	rendered := stdout.String()
-	// Structural, not a text match: the paths are rendered through `quote`
-	// now that they are derived from endpoints.falco rather than written as
-	// literals, so asserting on exact YAML spelling breaks on a change that
-	// is not a defect.
-	assertCollectorFalcoSocket(t, rendered, "/run/falco", true)
-}
-
-// assertCollectorFalcoSocket checks that the collector's falco-socket
-// volume and mount both name wantDir, and that the collector's own mount is
-// read-only (wantReadOnly).
-func assertCollectorFalcoSocket(t *testing.T, rendered, wantDir string, wantReadOnly bool) {
-	t.Helper()
-	ds := collectorDaemonSet(t, rendered)
-	podSpec := ds["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)
-
-	var sawVolume bool
-	for _, v := range podSpec["volumes"].([]any) {
-		vm := v.(map[string]any)
-		if vm["name"] != "falco-socket" {
-			continue
-		}
-		sawVolume = true
-		hp, ok := vm["hostPath"].(map[string]any)
-		if !ok {
-			t.Fatal("falco-socket volume is not a hostPath")
-		}
-		if hp["path"] != wantDir {
-			t.Errorf("falco-socket hostPath = %v, want %s", hp["path"], wantDir)
-		}
-		if hp["type"] != "Directory" {
-			t.Errorf("falco-socket hostPath type = %v, want Directory (DirectoryOrCreate would materialise an empty dir on a node with no Falco)", hp["type"])
-		}
-	}
-	if !sawVolume {
-		t.Error("collector DaemonSet has no falco-socket volume")
-	}
-
-	var sawMount bool
-	for _, c := range podSpec["containers"].([]any) {
-		cm := c.(map[string]any)
-		if cm["name"] != "collector" {
-			continue
-		}
-		for _, m := range cm["volumeMounts"].([]any) {
-			mm := m.(map[string]any)
-			if mm["name"] != "falco-socket" {
-				continue
-			}
-			sawMount = true
-			if mm["mountPath"] != wantDir {
-				t.Errorf("collector falco-socket mountPath = %v, want %s", mm["mountPath"], wantDir)
-			}
-			if ro, _ := mm["readOnly"].(bool); ro != wantReadOnly {
-				t.Errorf("collector falco-socket mount readOnly = %v, want %v", ro, wantReadOnly)
-			}
-		}
-	}
-	if !sawMount {
-		t.Error("collector container does not mount falco-socket")
-	}
-}
-
-// TestCollectorDaemonsetSkipsFalcoSocketMountWhenTCP verifies that
-// when endpoints.falco is set to a tcp:// target (Falco gRPC over the
-// pod network rather than a host socket) the collector DaemonSet does
-// NOT bind-mount /run/falco. Avoiding an unnecessary host-path mount
-// keeps the collector's blast radius small in TCP-mode deployments;
-// the mount only makes sense when the target is a Unix-domain socket.
-func TestCollectorDaemonsetSkipsFalcoSocketMountWhenTCP(t *testing.T) {
-	args := []string{
-		"template", "olaitan-test", chartDir(t),
-		"--set", "secrets.redisPassword=test-password",
-		"--set", "endpoints.falco=tcp://falco.svc.cluster.local:5060",
-	}
-	cmd := exec.Command("helm", args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("helm template failed: %v\nstderr: %s", err, stderr.String())
-	}
-	rendered := stdout.String()
-	if strings.Contains(rendered, "falco-socket") {
-		t.Errorf("falco-socket volume/mount rendered for tcp:// endpoint; expected omission. Rendered sample:\n%s",
-			snippet(rendered, "falco-socket"))
 	}
 }
 
@@ -1368,7 +1268,7 @@ func indexNthLine(s string, n int) int {
 // on every node.
 func TestContainerdSensorEmptySocketPathFails(t *testing.T) {
 	args := []string{
-		"template", "olaitan-test", chartDir(t),
+		"template", "olaitan", chartDir(t),
 		"--set", "secrets.redisPassword=test-password",
 		"--set", "containerdSensor.enabled=true",
 		"--set", "containerdSensor.socketPath=",
@@ -1526,7 +1426,7 @@ func TestContainerdSensorHostPathTypeDirectory(t *testing.T) {
 // mount.
 func TestContainerdSocketPathFailsFast_RootOnly(t *testing.T) {
 	args := []string{
-		"template", "olaitan-test", chartDir(t),
+		"template", "olaitan", chartDir(t),
 		"--set", "secrets.redisPassword=test-password",
 		"--set", "containerdSensor.enabled=true",
 		"--set", "containerdSensor.socketPath=/foo",
@@ -1548,7 +1448,7 @@ func TestContainerdSocketPathFailsFast_RootOnly(t *testing.T) {
 // relative to the host's cwd, meaningless for hostPath).
 func TestContainerdSocketPathFailsFast_RelativePath(t *testing.T) {
 	args := []string{
-		"template", "olaitan-test", chartDir(t),
+		"template", "olaitan", chartDir(t),
 		"--set", "secrets.redisPassword=test-password",
 		"--set", "containerdSensor.enabled=true",
 		"--set", "containerdSensor.socketPath=run/containerd/containerd.sock",
@@ -1940,7 +1840,7 @@ func TestCalicoSensorPathA_SkipsTLSSecret(t *testing.T) {
 // with a clear message if calicoSensor.enabled=true but no TLS
 // material is supplied (neither Path A nor Path B).
 func TestCalicoSensorEnabled_RequiresTLS(t *testing.T) {
-	cmd := exec.Command("helm", "template", chartDir(t),
+	cmd := exec.Command("helm", "template", "olaitan", chartDir(t),
 		"--set", "redis.auth.password=test",
 		"--set", "secrets.redisPassword=test",
 		"--set", "calicoSensor.enabled=true",
@@ -2091,7 +1991,7 @@ func TestPostureConfigMapBridgesValues(t *testing.T) {
 // values above the 60s ceiling at render time, so a misconfigured
 // operator value never reaches the Go-side validator.
 func TestPostureCacheTTLAboveCeilingFails(t *testing.T) {
-	cmd := exec.Command("helm", "template", chartDir(t),
+	cmd := exec.Command("helm", "template", "olaitan", chartDir(t),
 		"--set", "secrets.redisPassword=test",
 		"--set", "posture.cacheTTL=120s",
 	)
@@ -2135,7 +2035,7 @@ func TestPostureCacheTTLMinuteFormAboveCeilingFails(t *testing.T) {
 	for _, ttl := range []string{"2m", "1m30s", "10m"} {
 		ttl := ttl
 		t.Run(ttl, func(t *testing.T) {
-			cmd := exec.Command("helm", "template", chartDir(t),
+			cmd := exec.Command("helm", "template", "olaitan", chartDir(t),
 				"--set", "secrets.redisPassword=test",
 				"--set", "posture.cacheTTL="+ttl,
 			)
@@ -3193,6 +3093,10 @@ func normaliseGolden(rendered string) string {
 	// churn 14 golden lines per permutation for no behavioural change.
 	out = regexp.MustCompile(`app\.kubernetes\.io/version: "(?:edge|[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.]+)?)"`).
 		ReplaceAllString(out, `app.kubernetes.io/version: "APP_VERSION_REDACTED"`)
+	// Story 10.2: the Falco http_output token is generated per render
+	// (TestFalcoHttpTokenLifecycle pins that), so it cannot be byte-stable.
+	out = regexp.MustCompile(`(?m)^(\s*falco-http-token: )"[^"]*"$`).
+		ReplaceAllString(out, `${1}"FALCO_TOKEN_REDACTED"`)
 	return out
 }
 
@@ -4747,98 +4651,6 @@ func configFromRender(t *testing.T, rendered string) *config.Config {
 	return cfg
 }
 
-// --- Story 9.6: Falco socket permissions ------------------------------
-//
-// Blocker 8: Falco binds its gRPC socket without chmod, so it lands 0755
-// root:root from the default umask. connect(2) on a Unix socket needs
-// WRITE permission and the collector is UID/GID 65532 (NFR11), so the
-// dial fails with "permission denied" and the collector ingests nothing
-// while Falco itself looks healthy. Reproduced on 3-node kubeadm
-// 2026-08-31; invisible on kind, where the two share an effective
-// identity, which is why every prior test passed. These tests pin the
-// chart side of the fix.
-
-// falcoSocketFixer returns the falco-socket-permissions container from
-// the collector DaemonSet and where it was found ("init" or "main"), or
-// nil when the chart rendered none. It searches both lists because the
-// container legitimately lives in either, depending on
-// falcoSocketPermissions.useNativeSidecar.
-func falcoSocketFixer(t *testing.T, rendered string) (map[string]any, string) {
-	t.Helper()
-	dec := yaml.NewDecoder(strings.NewReader(rendered))
-	for {
-		var doc map[string]any
-		err := dec.Decode(&doc)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			// Do not swallow this. A decode failure anywhere upstream in
-			// the render used to turn into "container not rendered" and a
-			// t.Fatal blaming Blocker 8, sending the reader after the
-			// wrong defect entirely.
-			t.Fatalf("rendered manifest failed to decode: %v", err)
-		}
-		if doc == nil || doc["kind"] != "DaemonSet" {
-			continue
-		}
-		meta, _ := doc["metadata"].(map[string]any)
-		if meta == nil || !strings.Contains(fmt.Sprint(meta["name"]), "collector") {
-			continue
-		}
-		spec, _ := doc["spec"].(map[string]any)
-		tmpl, _ := spec["template"].(map[string]any)
-		podSpec, _ := tmpl["spec"].(map[string]any)
-		for _, list := range []struct {
-			key   string
-			where string
-		}{{"initContainers", "init"}, {"containers", "main"}} {
-			items, _ := podSpec[list.key].([]any)
-			for _, c := range items {
-				cm, _ := c.(map[string]any)
-				if cm != nil && cm["name"] == "falco-socket-permissions" {
-					return cm, list.where
-				}
-			}
-		}
-		return nil, ""
-	}
-	return nil, ""
-}
-
-// TestFalcoSocketFixerRendersAsNativeSidecarByDefault is the core of
-// Story 9.6. restartPolicy: Always in initContainers is the native
-// sidecar (KEP-753), and the ordering it buys is why it is the default:
-// the socket is group-writable before the collector's first dial, so the
-// collector never crash-loops on startup.
-func TestFalcoSocketFixerRendersAsNativeSidecarByDefault(t *testing.T) {
-	fixer, where := falcoSocketFixer(t, helmTemplate(t, nil))
-	if fixer == nil {
-		t.Fatal("falco-socket-permissions container not rendered on the collector DaemonSet; the collector cannot attach to Falco's socket as non-root (Blocker 8)")
-	}
-	if where != "init" {
-		t.Errorf("fixer rendered in %q; the native sidecar form must be an initContainers entry", where)
-	}
-	if got := fixer["restartPolicy"]; got != "Always" {
-		t.Errorf("restartPolicy = %v, want Always. Without it the container is a one-shot: it would not re-run when the collector restarts, so a Falco restart (which recreates the socket at 0755) would lock the collector out permanently.", got)
-	}
-}
-
-// TestFalcoSocketFixerHoldsThePermissionRatherThanSettingItOnce guards
-// the property that a one-shot fix cannot provide. A Falco restart
-// deletes and recreates the socket at 0755; the fixer must re-assert on
-// an interval rather than exiting after a single chmod.
-func TestFalcoSocketFixerHoldsThePermissionRatherThanSettingItOnce(t *testing.T) {
-	fixer, _ := falcoSocketFixer(t, helmTemplate(t, nil))
-	if fixer == nil {
-		t.Fatal("falco-socket-permissions container not rendered")
-	}
-	script := fixerScript(t, fixer)
-	if !strings.Contains(script, "while true") || !strings.Contains(script, `sleep "$INTERVAL"`) {
-		t.Errorf("fixer script does not re-assert on an interval; a Falco restart would permanently break the collector's Falco source. Script:\n%s", script)
-	}
-}
-
 // fixerScript pulls the shell body out of the container's args.
 func fixerScript(t *testing.T, fixer map[string]any) string {
 	t.Helper()
@@ -4849,295 +4661,295 @@ func fixerScript(t *testing.T, fixer map[string]any) string {
 	return fmt.Sprint(args[0])
 }
 
-// TestFalcoSocketFixerIsRootWithMinimalCapabilities pins the security
-// posture. Root is required (only the socket's owner may chmod it, and
-// chgrp to a group we are not in needs CAP_CHOWN) but everything else is
-// dropped. The rejected alternative was running the COLLECTOR as root,
-// which would put a root process on the hot path of untrusted event
-// data -- exactly what NFR11 exists to prevent.
-func TestFalcoSocketFixerIsRootWithMinimalCapabilities(t *testing.T) {
-	fixer, _ := falcoSocketFixer(t, helmTemplate(t, nil))
-	if fixer == nil {
-		t.Fatal("falco-socket-permissions container not rendered")
-	}
-	sc, _ := fixer["securityContext"].(map[string]any)
-	if sc == nil {
-		t.Fatal("falco-socket-permissions has no securityContext")
-	}
-	if sc["runAsUser"] != 0 {
-		t.Errorf("runAsUser = %v, want 0 (chmod requires ownership of the socket)", sc["runAsUser"])
-	}
-	if sc["allowPrivilegeEscalation"] != false {
-		t.Errorf("allowPrivilegeEscalation = %v, want false", sc["allowPrivilegeEscalation"])
-	}
-	if sc["readOnlyRootFilesystem"] != true {
-		t.Errorf("readOnlyRootFilesystem = %v, want true", sc["readOnlyRootFilesystem"])
-	}
-	caps, _ := sc["capabilities"].(map[string]any)
-	if caps == nil {
-		t.Fatal("falco-socket-permissions drops no capabilities")
-	}
-	if drop := fmt.Sprint(caps["drop"]); !strings.Contains(drop, "ALL") {
-		t.Errorf("capabilities.drop = %v, want ALL", drop)
-	}
-	// Exactly one capability. CHOWN is what chgrp needs; chmod needs none,
-	// because the socket is root-owned and so is this container. Every
-	// added capability is a separate thing an admission policy must allow
-	// (OpenShift SCCs disallow added capabilities by default), so the list
-	// is asserted exhaustively rather than as a lower bound.
-	addList, _ := caps["add"].([]any)
-	if len(addList) != 1 || fmt.Sprint(addList[0]) != "CHOWN" {
-		t.Errorf("capabilities.add = %v, want exactly [CHOWN]", caps["add"])
-	}
-}
+// --- Story 10.2: Falco reaches the collector over http_output ---------
+//
+// Falco 0.44.0 removed its gRPC output (falcosecurity/falco#3798), and the
+// only Falco releases that stay up on kernel 7.x are newer than that
+// (falcosecurity/falco#3955). Falco now POSTs each alert to the collector
+// through a node-local Service, with a generated token in the URL path.
+// These tests pin every piece of that path, because a break anywhere in it
+// is silent: Falco logs a failed POST and the agent sees nothing.
 
-// TestFalcoSocketFixerMountIsWritableAndCollectorMountIsNot guards the
-// asymmetry that makes the fix safe: only the tiny root container gets
-// write access to the host path. The collector's own mount stays
-// read-only, which is correct even though it connects: a readOnly
-// volumeMount is MNT_READONLY, and the check that would reject a write
-// (__mnt_want_write) is only taken on open-for-write paths, which
-// connect(2) never takes. The mode bits were always the whole problem.
-func TestFalcoSocketFixerMountIsWritableAndCollectorMountIsNot(t *testing.T) {
-	rendered := helmTemplate(t, nil)
-	fixer, _ := falcoSocketFixer(t, rendered)
-	if fixer == nil {
-		t.Fatal("falco-socket-permissions container not rendered")
-	}
-	mounts, _ := fixer["volumeMounts"].([]any)
-	var found bool
-	for _, m := range mounts {
-		mm, _ := m.(map[string]any)
-		if mm == nil || mm["name"] != "falco-socket" {
+const falcoIngestURL = "http://olaitan-falco-ingest:8765/falco/${OLAITAN_FALCO_TOKEN}"
+
+// docByKindName returns the first rendered document with the given kind
+// whose metadata.name contains nameSub.
+func docByKindName(t *testing.T, rendered, kind, nameSub string) map[string]any {
+	t.Helper()
+	dec := yaml.NewDecoder(strings.NewReader(rendered))
+	for {
+		var doc map[string]any
+		if err := dec.Decode(&doc); err != nil {
+			break
+		}
+		if doc == nil || doc["kind"] != kind {
 			continue
 		}
-		found = true
-		if ro, ok := mm["readOnly"]; ok && ro == true {
-			t.Error("falco-socket mount on the permission fixer is readOnly; chmod would return EROFS")
+		meta, _ := doc["metadata"].(map[string]any)
+		if meta != nil && strings.Contains(fmt.Sprint(meta["name"]), nameSub) {
+			return doc
 		}
 	}
-	if !found {
-		t.Error("permission fixer does not mount falco-socket")
-	}
-	assertCollectorFalcoSocket(t, rendered, "/run/falco", true)
+	t.Fatalf("no %s named *%s* in the render", kind, nameSub)
+	return nil
 }
 
-// TestFalcoSocketFixerGroupMatchesCollectorRunAsGroup catches the silent
-// regression where someone changes one of the two numbers. If they drift
-// apart the socket is chgrp'd to a group the collector is not in, and
-// Blocker 8 returns looking like a healthy install.
-func TestFalcoSocketFixerGroupMatchesCollectorRunAsGroup(t *testing.T) {
+// renderedFalcoConfig returns the falco.yaml the bundled Falco will load.
+func renderedFalcoConfig(t *testing.T, rendered string) map[string]any {
+	t.Helper()
+	cm := docByKindName(t, rendered, "ConfigMap", "falco")
+	data, _ := cm["data"].(map[string]any)
+	raw, ok := data["falco.yaml"].(string)
+	if !ok {
+		t.Fatalf("Falco ConfigMap has no falco.yaml key; keys: %v", data)
+	}
+	var cfg map[string]any
+	if err := yaml.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatalf("parse falco.yaml: %v", err)
+	}
+	return cfg
+}
+
+func TestFalcoIngestServiceIsNodeLocal(t *testing.T) {
 	rendered := helmTemplate(t, nil)
-	fixer, _ := falcoSocketFixer(t, rendered)
-	if fixer == nil {
-		t.Fatal("falco-socket-permissions container not rendered")
+	svc := docByKindName(t, rendered, "Service", "falco-ingest")
+	spec := svc["spec"].(map[string]any)
+	// Local is the property that matters: node A's Falco must reach node
+	// A's collector, which stamps the event with node A's name.
+	if spec["internalTrafficPolicy"] != "Local" {
+		t.Errorf("internalTrafficPolicy = %v, want Local", spec["internalTrafficPolicy"])
 	}
-	if script := fixerScript(t, fixer); !strings.Contains(script, `GID="65532"`) {
-		t.Error("fixer script does not target GID 65532, the collector's runAsGroup")
+	if sel := spec["selector"].(map[string]any); sel["app.kubernetes.io/component"] != "collector" {
+		t.Errorf("falco-ingest selects %v, want the collector", sel)
 	}
-	assertContains(t, rendered, "runAsGroup: 65532", "collector pod securityContext must keep runAsGroup 65532")
-}
-
-// TestFalcoSocketFixerVerifiesItsOwnEffect is the AC the failed first
-// attempt bought. That attempt set grpc.unix_socket_mode in the Falco
-// values: the ConfigMap carried it, Falco ignored the key (it does not
-// exist upstream), the socket stayed 0755, and the fix would have
-// shipped as working. The script must re-read the mode from the
-// filesystem and exit non-zero when the change did not take.
-func TestFalcoSocketFixerVerifiesItsOwnEffect(t *testing.T) {
-	fixer, _ := falcoSocketFixer(t, helmTemplate(t, nil))
-	if fixer == nil {
-		t.Fatal("falco-socket-permissions container not rendered")
-	}
-	script := fixerScript(t, fixer)
-	// Assert the two checks themselves, not prose about them. The earlier
-	// version of this test looked for "stat -c", "return 1" and a message
-	// substring, all of which appear elsewhere in the script: deleting the
-	// entire verification block and keeping the log line would have passed
-	// it. Both properties the collector needs must be read back from the
-	// filesystem and compared.
-	if !strings.Contains(script, `[ "$cur_gid" != "$GID" ]`) {
-		t.Error("fixer never compares the socket's actual group against the target GID; a chgrp that silently failed (dropped CAP_CHOWN, wrong socketGroup) would be reported as success")
-	}
-	if !strings.Contains(script, "group_digit") || !strings.Contains(script, "2|3|6|7") {
-		t.Error("fixer never checks that the group has the write bit; connecting to a unix socket requires it")
-	}
-	// The mode must be normalised before a digit is read by position:
-	// stat -c %a emits no leading zeros, so mode 7 prints "7" and a fixed
-	// offset reads the OTHER digit as the group digit.
-	if !strings.Contains(script, `printf '%04d'`) {
-		t.Error("fixer reads the group digit by position without normalising the mode width")
-	}
-	// A vanished socket is a Falco restart, not a failure. Conflating them
-	// exits the container and turns a five-second roll into a
-	// CrashLoopBackOff that climbs to a five-minute backoff, during which
-	// the socket sits at 0755 and the collector ingests nothing.
-	if !strings.Contains(script, "return 2") || !strings.Contains(script, `[ "$rc" -eq 1 ]`) {
-		t.Error("fixer does not distinguish a transient socket disappearance from a real verification failure")
-	}
-	// An empty or non-numeric injected value must fail loudly, not turn the
-	// reconcile loop into a busy spin on `sleep ""`.
-	if !strings.Contains(script, "FATAL: intervalSeconds") {
-		t.Error("fixer does not validate its injected numeric values")
+	port := spec["ports"].([]any)[0].(map[string]any)
+	if port["port"] != 8765 || port["targetPort"] != "falco-ingest" {
+		t.Errorf("falco-ingest port = %v -> %v, want 8765 -> falco-ingest", port["port"], port["targetPort"])
 	}
 }
 
-// TestFalcoSocketGroupMustMatchCollectorRunAsGroup: values.yaml claims
-// "changing one without the other silently reinstates the crash-loop, so
-// the helm suite asserts the two agree". It did not: only the default
-// render was ever checked, so any non-default socketGroup passed every
-// test while chgrp'ing Falco's socket to a group the collector is not in.
-// The permission holder would then see group-write, report success, and
-// the collector would still be locked out.
-func TestFalcoSocketGroupMustMatchCollectorRunAsGroup(t *testing.T) {
-	args := []string{"template", "olaitan", chartDir(t),
-		"--set", "secrets.redisPassword=test-password",
-		"--set", "falcoSocketPermissions.socketGroup=1000",
-	}
-	cmd := exec.Command("helm", args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err == nil {
-		t.Fatal("chart rendered with socketGroup disagreeing with the collector's runAsGroup; the socket would be chgrp'd to a group the collector cannot use")
-	}
-	if !strings.Contains(stderr.String(), "the collector runs as group 65532") {
-		t.Errorf("failure message does not name the collector's actual group: %s", stderr.String())
-	}
-	// Disabling the holder makes the value irrelevant, so it must render.
-	helmTemplate(t, []string{
-		"falcoSocketPermissions.socketGroup=1000",
-		"falcoSocketPermissions.enabled=false",
-	})
-}
+func TestCollectorReceivesFalcoOverHTTPWithNoHostMount(t *testing.T) {
+	rendered := helmTemplate(t, nil)
+	pod := collectorDaemonSet(t, rendered)["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)
 
-// TestFalcoSocketFixerIsNeverSilent: found on a live kind cluster. While
-// Falco was still loading its driver the container produced no output at
-// all, so an operator debugging a collector that had not come up saw an
-// empty log and could not tell waiting from wedged. It must announce what
-// it holds, and say when it is waiting for a socket that is not there yet.
-func TestFalcoSocketFixerIsNeverSilent(t *testing.T) {
-	fixer, _ := falcoSocketFixer(t, helmTemplate(t, nil))
-	if fixer == nil {
-		t.Fatal("falco-socket-permissions container not rendered")
-	}
-	script := fixerScript(t, fixer)
-	for _, want := range []string{
-		`log "holding`,     // says what it is doing on startup
-		`log "waiting for`, // and distinguishes waiting from wedged
-	} {
-		if !strings.Contains(script, want) {
-			t.Errorf("fixer script is missing %q; an operator reading this container's log while Falco loads would see nothing at all", want)
+	// Default install: no hostPath at all and no permission sidecar. The
+	// socket mount was the collector's only default host access.
+	for _, v := range pod["volumes"].([]any) {
+		if _, ok := v.(map[string]any)["hostPath"]; ok {
+			t.Errorf("default collector still mounts a hostPath volume: %v", v)
 		}
 	}
+	if ic, ok := pod["initContainers"]; ok && ic != nil {
+		t.Errorf("collector still has init containers: %v", ic)
+	}
+
+	var c map[string]any
+	for _, x := range pod["containers"].([]any) {
+		if x.(map[string]any)["name"] == "collector" {
+			c = x.(map[string]any)
+		}
+	}
+	if c == nil {
+		t.Fatal("no collector container")
+	}
+	env := map[string]any{}
+	for _, e := range c["env"].([]any) {
+		em := e.(map[string]any)
+		env[fmt.Sprint(em["name"])] = em["value"]
+	}
+	if env["FALCO_LISTEN_ADDR"] != ":8765" {
+		t.Errorf("FALCO_LISTEN_ADDR = %v, want :8765", env["FALCO_LISTEN_ADDR"])
+	}
+	if env["FALCO_HTTP_TOKEN_FILE"] != "/etc/olaitan/secrets/falco-http-token" {
+		t.Errorf("FALCO_HTTP_TOKEN_FILE = %v", env["FALCO_HTTP_TOKEN_FILE"])
+	}
+	var sawPort, sawSecrets bool
+	for _, p := range c["ports"].([]any) {
+		pm := p.(map[string]any)
+		if pm["name"] == "falco-ingest" && pm["containerPort"] == 8765 {
+			sawPort = true
+		}
+	}
+	for _, m := range c["volumeMounts"].([]any) {
+		mm := m.(map[string]any)
+		if mm["name"] == "secrets" && mm["mountPath"] == "/etc/olaitan/secrets" {
+			sawSecrets = true
+		}
+	}
+	if !sawPort {
+		t.Error("collector does not expose the falco-ingest port")
+	}
+	if !sawSecrets {
+		t.Error("the release Secret holding falco-http-token is not mounted where FALCO_HTTP_TOKEN_FILE points")
+	}
+	if strings.Contains(rendered, "FALCO_SOCKET") || strings.Contains(rendered, "falco-socket-permissions") {
+		t.Error("render still carries the gRPC socket wiring")
+	}
 }
 
-// TestFalcoSocketFixerNonNativeIsAPlainContainer covers the fallback for
-// clusters that have disabled the SidecarContainers gate. The container
-// body must be identical -- it is the same shared template -- so the
-// permission is still HELD, not set once. Only ordering is given up.
-func TestFalcoSocketFixerNonNativeIsAPlainContainer(t *testing.T) {
-	native, _ := falcoSocketFixer(t, helmTemplate(t, nil))
-	plain, where := falcoSocketFixer(t, helmTemplate(t, []string{"falcoSocketPermissions.useNativeSidecar=false"}))
-	if plain == nil {
-		t.Fatal("falco-socket-permissions container not rendered with useNativeSidecar=false")
+func TestBundledFalcoPostsJSONToTheCollector(t *testing.T) {
+	rendered := helmTemplate(t, nil)
+	cfg := renderedFalcoConfig(t, rendered)
+	if cfg["json_output"] != true {
+		t.Errorf("json_output = %v; without it Falco posts plain text and the collector answers 415", cfg["json_output"])
 	}
-	if where != "main" {
-		t.Errorf("non-native fixer rendered in %q; it must be a regular entry in containers", where)
+	http, _ := cfg["http_output"].(map[string]any)
+	if http["enabled"] != true || http["url"] != falcoIngestURL || http["keep_alive"] != true {
+		t.Errorf("http_output = %v, want enabled, keep_alive, url %s", http, falcoIngestURL)
 	}
-	if _, ok := plain["restartPolicy"]; ok {
-		t.Errorf("a regular container must not carry restartPolicy; got %v", plain["restartPolicy"])
+	// Disabled on chart 8.x; the keys vanish with chart 9.x (Story 10.1).
+	for _, k := range []string{"grpc", "grpc_output"} {
+		if m, ok := cfg[k].(map[string]any); ok && m["enabled"] == true {
+			t.Errorf("%s is still enabled", k)
+		}
 	}
-	if fixerScript(t, plain) != fixerScript(t, native) {
-		t.Error("native and non-native forms render different scripts; they share one template precisely so they cannot drift")
+	metrics, _ := cfg["metrics"].(map[string]any)
+	if metrics["enabled"] != true || metrics["output_rule"] != true {
+		t.Errorf("metrics = %v; the snapshot is the collector's Falco heartbeat, so it must be on and routed to outputs", metrics)
 	}
-}
 
-// TestFalcoSocketFixerOmittedWhenDisabledOrTCP: no socket, no fixer, and
-// no read-write host mount. The tcp:// path must keep its smaller blast
-// radius exactly as TestCollectorDaemonsetSkipsFalcoSocketMountWhenTCP
-// asserts for the collector itself.
-func TestFalcoSocketFixerOmittedWhenDisabledOrTCP(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		sets []string
-	}{
-		{"disabled", []string{"falcoSocketPermissions.enabled=false"}},
-		{"tcp endpoint", []string{"endpoints.falco=tcp://falco.svc.cluster.local:5060"}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			rendered := helmTemplate(t, tc.sets)
-			if fixer, _ := falcoSocketFixer(t, rendered); fixer != nil {
-				t.Error("permission fixer rendered when it should not be")
+	// Falco gets the token from the release Secret, and expands it into the
+	// URL itself: the rendered ConfigMap must hold only the placeholder.
+	falcoDS := docByKindName(t, rendered, "DaemonSet", "falco")
+	var tokenFromSecret bool
+	for _, c := range falcoDS["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)["containers"].([]any) {
+		cm := c.(map[string]any)
+		if cm["name"] != "falco" {
+			continue
+		}
+		for _, e := range cm["env"].([]any) {
+			em := e.(map[string]any)
+			if em["name"] != "OLAITAN_FALCO_TOKEN" {
+				continue
 			}
-			if strings.Contains(rendered, "falco-socket-permissions") {
-				t.Errorf("falco-socket-permissions leaked into the render:\n%s",
-					snippet(rendered, "falco-socket-permissions"))
+			ref := em["valueFrom"].(map[string]any)["secretKeyRef"].(map[string]any)
+			tokenFromSecret = ref["name"] == "olaitan-secrets" && ref["key"] == "falco-http-token"
+		}
+	}
+	if !tokenFromSecret {
+		t.Error("Falco container does not get OLAITAN_FALCO_TOKEN from olaitan-secrets/falco-http-token")
+	}
+	tok := strings.Trim(strings.TrimPrefix(grepLine(rendered, "falco-http-token: "), "falco-http-token: "), `"`)
+	if len(tok) < 16 {
+		t.Fatalf("no generated token in the release Secret (got %q)", tok)
+	}
+	cmRaw := docByKindName(t, rendered, "ConfigMap", "falco")["data"].(map[string]any)["falco.yaml"].(string)
+	if strings.Contains(cmRaw, tok) {
+		t.Error("the Falco ConfigMap contains the token itself; it must carry only ${OLAITAN_FALCO_TOKEN}")
+	}
+}
+
+// TestFalcoHttpTokenLifecycle mirrors TestBundledRedisPasswordIsSupplied:
+// generated when empty, random per render, an explicit value wins, and a
+// value the collector would refuse fails at render instead.
+func TestFalcoHttpTokenLifecycle(t *testing.T) {
+	tokenOf := func(rendered string) string {
+		return strings.Trim(strings.TrimPrefix(grepLine(rendered, "falco-http-token: "), "falco-http-token: "), `"`)
+	}
+	a, b := tokenOf(helmTemplate(t, nil)), tokenOf(helmTemplate(t, nil))
+	if len(a) != 32 || a == b {
+		t.Errorf("generated tokens %q / %q: want 32 random characters per render", a, b)
+	}
+	const explicit = "operator-chosen-token-0001"
+	if got := tokenOf(helmTemplate(t, []string{"secrets.falcoHttpToken=" + explicit})); got != explicit {
+		t.Errorf("explicit token not honoured: %q", got)
+	}
+	for name, bad := range map[string]string{"short": "tooshort", "path chars": "abcdefghijklmnop/x"} {
+		t.Run(name, func(t *testing.T) {
+			cmd := exec.Command("helm", "template", "olaitan", chartDir(t),
+				"--set", "secrets.redisPassword=test-password",
+				"--set-string", "secrets.falcoHttpToken="+bad)
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			if err := cmd.Run(); err == nil {
+				t.Errorf("rendered with falcoHttpToken=%q", bad)
+			} else if !strings.Contains(stderr.String(), "falcoHttpToken") {
+				t.Errorf("failure does not name the setting: %s", stderr.String())
 			}
 		})
 	}
 }
 
-// TestFalcoSocketPathsAllAgree: the volume's hostPath source, the
-// collector's mount, the fixer's mount and FALCO_SOCKET must all name the
-// same directory, derived from endpoints.falco.
-//
-// They did not. The mount and the hostPath were the literal /run/falco
-// while FALCO_SOCKET followed the value, so pointing endpoints.falco at a
-// socket anywhere else mounted one directory and dialled into another: the
-// collector failed with "no such file or directory" before it ever reached
-// the permission problem the fixer exists to solve, and no part of the
-// chart disagreed with itself loudly enough to say why.
-func TestFalcoSocketPathsAllAgree(t *testing.T) {
-	const custom = "unix:///var/run/falco/custom.sock"
-	const wantDir = "/var/run/falco"
-	// falco.enabled=false because the bundled subchart binds its own path;
-	// changing only one side is what validateBundled refuses (see
-	// TestFalcoSocketBundledMismatchFailsFast).
-	rendered := helmTemplate(t, []string{"endpoints.falco=" + custom, "falco.enabled=false"})
+// TestFalcoIngestGuard: the subchart's URL and Secret name are literals for
+// release `olaitan`. Any mismatch must fail at render with the fix, rather
+// than install a Falco that posts to a Service that does not exist.
+func TestFalcoIngestGuard(t *testing.T) {
+	fails := func(t *testing.T, release, want string, extra ...string) {
+		t.Helper()
+		args := append([]string{"template", release, chartDir(t), "--set", "secrets.redisPassword=test-password"}, extra...)
+		cmd := exec.Command("helm", args...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err == nil {
+			t.Fatalf("rendered %s %v; want a failure mentioning %q", release, extra, want)
+		}
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("failure does not say %q:\n%s", want, stderr.String())
+		}
+	}
+	t.Run("other release name", func(t *testing.T) {
+		fails(t, "foo", "--set-string falco.falco.http_output.url='http://foo-olaitan-falco-ingest:8765/falco/${OLAITAN_FALCO_TOKEN}'",
+			"--set", "redis.auth.existingSecret=foo-olaitan-secrets")
+	})
+	t.Run("json_output off", func(t *testing.T) {
+		fails(t, "olaitan", "json_output", "--set", "falco.falco.json_output=false")
+	})
+	t.Run("http_output off", func(t *testing.T) {
+		fails(t, "olaitan", "http_output.enabled", "--set", "falco.falco.http_output.enabled=false")
+	})
+	t.Run("token env pointing elsewhere", func(t *testing.T) {
+		fails(t, "olaitan", "OLAITAN_FALCO_TOKEN", "--set", "falco.extra.env[0].name=SOMETHING_ELSE")
+	})
+	// No bundled Falco: nothing to check, whatever the release name.
+	cmd := exec.Command("helm", "template", "foo", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+		"--set", "redis.auth.existingSecret=foo-olaitan-secrets",
+		"--set", "falco.enabled=false")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Errorf("falco.enabled=false under release foo failed: %v\n%s", err, out)
+	}
+}
 
-	fixer, _ := falcoSocketFixer(t, rendered)
-	if fixer == nil {
-		t.Fatal("falco-socket-permissions container not rendered for a custom unix path")
+// TestNetworkPolicyAdmitsFalcoToTheIngestPort: the release NetworkPolicy
+// only admitted Olaitan's own pods. The Falco subchart's pods carry
+// app.kubernetes.io/name=falco, so on an enforcing CNI every alert would be
+// dropped before reaching the collector.
+func TestNetworkPolicyAdmitsFalcoToTheIngestPort(t *testing.T) {
+	nps := decodeNetpols(t, helmTemplate(t, nil))
+	np, ok := nps["olaitan"]
+	if !ok {
+		t.Fatalf("no release NetworkPolicy; have %v", nps)
 	}
-	if script := fixerScript(t, fixer); !strings.Contains(script, `SOCK="/var/run/falco/custom.sock"`) {
-		t.Error("fixer chmods a different path than endpoints.falco names")
-	}
-	for _, m := range fixer["volumeMounts"].([]any) {
-		mm := m.(map[string]any)
-		if mm["name"] == "falco-socket" && mm["mountPath"] != wantDir {
-			t.Errorf("fixer mountPath = %v, want %s", mm["mountPath"], wantDir)
+	for _, in := range np.Spec.Ingress {
+		for _, from := range in.From {
+			if from.PodSelector == nil || from.PodSelector.MatchLabels["app.kubernetes.io/name"] != "falco" {
+				continue
+			}
+			if from.PodSelector.MatchLabels["app.kubernetes.io/instance"] != "olaitan" {
+				t.Errorf("Falco rule is not scoped to this release: %v", from.PodSelector.MatchLabels)
+			}
+			if len(in.Ports) != 1 || in.Ports[0].Port != 8765 {
+				t.Errorf("Falco rule ports = %v, want only 8765", in.Ports)
+			}
+			return
 		}
 	}
+	t.Error("release NetworkPolicy has no ingress rule admitting the Falco pods")
+}
 
-	ds := collectorDaemonSet(t, rendered)
-	podSpec := ds["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)
-	for _, v := range podSpec["volumes"].([]any) {
-		vm := v.(map[string]any)
-		if vm["name"] != "falco-socket" {
-			continue
-		}
-		hp := vm["hostPath"].(map[string]any)
-		if hp["path"] != wantDir {
-			t.Errorf("hostPath source = %v, want %s -- the volume points at a directory the collector never dials", hp["path"], wantDir)
+func TestNotesDescribeTheFalcoHTTPPath(t *testing.T) {
+	notes := renderNotes(t, nil)
+	for _, want := range []string{"olaitan-falco-ingest", `code="401"`} {
+		if !strings.Contains(notes, want) {
+			t.Errorf("notes do not mention %q", want)
 		}
 	}
-	for _, c := range podSpec["containers"].([]any) {
-		cm := c.(map[string]any)
-		if cm["name"] != "collector" {
-			continue
-		}
-		for _, m := range cm["volumeMounts"].([]any) {
-			mm := m.(map[string]any)
-			if mm["name"] == "falco-socket" && mm["mountPath"] != wantDir {
-				t.Errorf("collector mountPath = %v, want %s -- it would dial a path nothing is mounted at", mm["mountPath"], wantDir)
-			}
-		}
-		for _, e := range cm["env"].([]any) {
-			em := e.(map[string]any)
-			if em["name"] == "FALCO_SOCKET" && em["value"] != custom {
-				t.Errorf("FALCO_SOCKET = %v, want %s", em["value"], custom)
-			}
-		}
+	if strings.Contains(notes, "falco-socket-permissions") {
+		t.Error("notes still describe the removed socket sidecar")
+	}
+	off := renderNotes(t, []string{"falco.enabled=false"})
+	if !strings.Contains(off, "falco-http-token") {
+		t.Error("with falco.enabled=false the notes do not tell the operator where the token for their own Falco lives")
 	}
 }
 
@@ -5162,39 +4974,12 @@ func collectorDaemonSet(t *testing.T, rendered string) map[string]any {
 	return nil
 }
 
-// TestFalcoSocketBundledMismatchFailsFast: with the bundled Falco enabled
-// there are two settings for one path (endpoints.falco and
-// falco.falco.grpc.bind_address) and nothing made them agree. Changing one
-// alone mounts a directory Falco never writes into, and the resulting
-// failure -- an unschedulable pod, or a fixer that times out waiting for a
-// socket that will never appear -- names nothing useful. Refuse at render.
-func TestFalcoSocketBundledMismatchFailsFast(t *testing.T) {
-	args := []string{"template", "olaitan", chartDir(t),
-		"--set", "secrets.redisPassword=test-password",
-		"--set", "endpoints.falco=unix:///var/run/falco/custom.sock",
-	}
-	cmd := exec.Command("helm", args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err == nil {
-		t.Fatal("chart rendered with endpoints.falco and the bundled Falco's bind_address disagreeing; the collector would dial a socket Falco never creates")
-	}
-	if !strings.Contains(stderr.String(), "name different sockets") {
-		t.Errorf("failure message does not explain the mismatch: %s", stderr.String())
-	}
-	// Changing BOTH together is legitimate and must still render.
-	helmTemplate(t, []string{
-		"endpoints.falco=unix:///var/run/falco/custom.sock",
-		"falco.falco.grpc.bind_address=unix:///var/run/falco/custom.sock",
-	})
-}
-
-// TestChartKubeVersionFloorSupportsNativeSidecars: useNativeSidecar is
-// only honoured from Kubernetes 1.29 (SidecarContainers). Below that the
-// restartPolicy field is dropped and the collector pod hangs in Init
-// forever, silently. A render-time guard cannot express this because
-// Chart.yaml already refuses the install -- so this pins the Chart.yaml
-// constraint itself, which is now load-bearing rather than conservative.
+// TestChartKubeVersionFloorSupportsNativeSidecars: applogSidecar
+// defaults to the native sidecar form (restartPolicy: Always on an init
+// container), which Kubernetes honours from 1.29 (SidecarContainers).
+// Below that the field is dropped and an injected pod hangs in Init
+// forever, silently. Chart.yaml's floor is what refuses those clusters,
+// so pin it here.
 func TestChartKubeVersionFloorSupportsNativeSidecars(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join(chartDir(t), "Chart.yaml"))
 	if err != nil {
@@ -5207,7 +4992,7 @@ func TestChartKubeVersionFloorSupportsNativeSidecars(t *testing.T) {
 		t.Fatalf("parse Chart.yaml: %v", err)
 	}
 	if !strings.Contains(chart.KubeVersion, ">=1.29") {
-		t.Errorf("kubeVersion = %q; the default falcoSocketPermissions.useNativeSidecar=true needs >=1.29. Relaxing this floor requires defaulting useNativeSidecar to false in the same change.", chart.KubeVersion)
+		t.Errorf("kubeVersion = %q; the default applogSidecar.useNativeSidecar=true needs >=1.29. Relaxing this floor requires defaulting it to false in the same change.", chart.KubeVersion)
 	}
 }
 

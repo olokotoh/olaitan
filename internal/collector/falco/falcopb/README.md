@@ -1,6 +1,13 @@
 # falcopb
 
-Vendored Falco gRPC output protocol bindings.
+Vendored Falco output message types.
+
+Since Story 10.2 the collector no longer speaks gRPC to Falco: Falco 0.44.0
+removed the gRPC output, and the collector now receives alerts from Falco's
+`http_output` (see `../decode.go`). The `Response` message is kept as the
+in-memory model the JSON body is decoded into, so `Translate`, event IDs and
+`Event.Raw` are identical to what the gRPC path produced. The gRPC client stub
+(`outputs_grpc.pb.go`) was deleted and `buf.gen.yaml` no longer generates it.
 
 ## Why vendored
 
@@ -49,5 +56,5 @@ outputs service in this single Go package.
 
 - `outputs.proto`: the `falco.outputs.service` gRPC service. `Sub(stream Request) -> stream Response` plus the `Get` unary fallback.
 - `schema.proto`: the `falco.schema.priority` and `falco.schema.source` enums referenced by `outputs.proto`.
-- `*_grpc.pb.go` and `*.pb.go`: generated bindings. Do not edit.
+- `*.pb.go`: generated message bindings. Do not edit.
 - `buf.{yaml,gen.yaml}`: buf config for re-generation.
