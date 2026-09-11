@@ -41,86 +41,67 @@ The apiserver-side wiring is operator-side (kubeadm
 
 ## Step-by-step: kubeadm 1.29
 
-### 1. Generate the receiver serving cert + signing CA
+### 1. Generate the certificates and pick an address the apiserver can reach
 
-The receiver listens at the Service FQDN. The chart helper
-`olaitan.auditWebhookServiceFqdn` builds it from the chart's
-`<fullname>` (which collapses to the release name when it equals the
-chart name) plus the namespace:
+Two things used to break here, both fixed in Story 10.8 (#137).
 
-```
-<fullname>-audit-webhook.<namespace>.svc.cluster.local
-```
+**The address.** The receiver listens in the collector DaemonSet, and the
+chart's audit Service now selects it. But kube-apiserver runs on the host
+network with the node's resolver, so on a self-managed cluster it cannot
+resolve `<fullname>-audit-webhook.<namespace>.svc.cluster.local`, which is
+the default in the kubeconfig. Choose one of:
 
-For the canonical install (`helm install olaitan ./deploy/helm/olaitan
---namespace olaitan ...`) this resolves to:
+- `auditWebhook.hostPort=<port>` plus
+  `auditWebhook.serverAddress=127.0.0.1:<port>`: each apiserver reaches its
+  own node's collector directly, with no cluster DNS and no Service in the
+  path. This is what kind and most self-managed clusters want.
+- `auditWebhook.serverAddress=<ClusterIP>`: a fixed Service ClusterIP the
+  node can route to. The serving cert needs a matching IP SAN.
+- The default (empty `serverAddress`): only where the apiserver uses
+  cluster DNS.
 
-```
-olaitan-audit-webhook.olaitan.svc.cluster.local
-```
+Both values are validated at render, so a typo fails the install rather
+than silently dropping every audit event.
 
-For non-canonical release names or namespaces, substitute as
-appropriate -- the cert SAN MUST match the rendered FQDN exactly.
-
-Generate a self-signed CA, sign a serving cert for that FQDN, and a
-client cert with `CN=kube-apiserver` for mTLS:
-
-```sh
-# Substitute these for non-canonical installs:
-RELEASE="olaitan"          # helm release name
-NAMESPACE="olaitan"        # install namespace
-SVC_FQDN="${RELEASE}-audit-webhook.${NAMESPACE}.svc.cluster.local"
-
-# CA
-openssl genpkey -algorithm ED25519 -out audit-ca.key
-openssl req -x509 -new -nodes -key audit-ca.key -subj "/CN=olaitan-audit-ca" \
-    -days 365 -out audit-ca.crt
-
-# Receiver serving cert
-openssl genpkey -algorithm ED25519 -out audit-server.key
-openssl req -new -key audit-server.key \
-    -subj "/CN=${SVC_FQDN}" \
-    -out audit-server.csr
-openssl x509 -req -in audit-server.csr -CA audit-ca.crt -CAkey audit-ca.key \
-    -CAcreateserial -days 365 -out audit-server.crt \
-    -extfile <(printf "subjectAltName=DNS:%s" "$SVC_FQDN")
-
-# Client cert (presented by the apiserver during mTLS).
-# CN MUST be "kube-apiserver" -- the receiver's TLS VerifyPeerCertificate
-# hook rejects any other CN by default. Override the allow-list via
-# Config.ClientCNAllow if your apiserver presents a different CN.
-openssl genpkey -algorithm ED25519 -out audit-client.key
-openssl req -new -key audit-client.key -subj "/CN=kube-apiserver" -out audit-client.csr
-openssl x509 -req -in audit-client.csr -CA audit-ca.crt -CAkey audit-ca.key \
-    -CAcreateserial -days 365 -out audit-client.crt
-```
-
-### 2. Extract the cluster CA
-
-The receiver requires-and-verifies the apiserver's client cert. On a
-kubeadm cluster the cluster CA at `/etc/kubernetes/pki/ca.crt` signs
-the apiserver components; extract and base64 it for the chart:
+**The CA.** The receiver verifies the apiserver's client certificate
+against `auditWebhook.clusterCAData` and pins its CN. This document used
+to sign the client certificate with a private audit CA while setting
+`clusterCAData` to the cluster's own root CA, so the receiver rejected
+every apiserver connection at the handshake. One CA signs both sides:
 
 ```sh
-sudo base64 -w0 /etc/kubernetes/pki/ca.crt > audit-cluster-ca.b64
+# <out-dir>, then every name the apiserver may dial (DNS names and IPs).
+hack/audit-webhook-certs.sh ./audit-certs \
+    olaitan-audit-webhook.olaitan.svc.cluster.local 127.0.0.1
 ```
 
-(The apiserver presents a client cert signed by the cluster CA when it
-calls webhook backends; the receiver pins that CA in its
-`tls.RequireAndVerifyClientCert` pool.)
+It writes `audit-ca.crt`, `audit-server.crt`/`.key`, `audit-client.crt`
+(`CN=kube-apiserver`, the CN the receiver pins) and
+`audit-webhook-values.yaml` with every field base64-encoded on one line.
+`AUDIT_CLIENT_CN` and `AUDIT_CERT_DAYS` override the CN and lifetime.
+
+### 2. (Optional) use your cluster's own CA instead
+
+If you would rather have the apiserver present a client certificate
+signed by the cluster CA, set `clusterCAData` to THAT CA (the one that
+signed the client certificate you are using), not to the audit CA:
+
+```sh
+sudo base64 -w0 /etc/kubernetes/pki/ca.crt   # -> auditWebhook.clusterCAData
+```
+
+`caBundle` stays the CA that signed the receiver's serving certificate.
+The two values answer different questions: `caBundle` is what the
+apiserver trusts, `clusterCAData` is what the receiver trusts.
 
 ### 3. Install the chart with audit-webhook enabled
 
 ```sh
 helm install olaitan ./deploy/helm/olaitan \
     --namespace olaitan --create-namespace \
-    --set auditWebhook.enabled=true \
-    --set-file auditWebhook.servingCert=<(base64 -w0 audit-server.crt) \
-    --set-file auditWebhook.servingKey=<(base64 -w0 audit-server.key) \
-    --set-file auditWebhook.caBundle=<(base64 -w0 audit-ca.crt) \
-    --set-file auditWebhook.apiserverClientCert=<(base64 -w0 audit-client.crt) \
-    --set-file auditWebhook.apiserverClientKey=<(base64 -w0 audit-client.key) \
-    --set-file auditWebhook.clusterCAData=<(cat audit-cluster-ca.b64) \
+    -f ./audit-certs/audit-webhook-values.yaml \
+    --set auditWebhook.hostPort=31443 \
+    --set auditWebhook.serverAddress=127.0.0.1:31443 \
     --set secrets.redisPassword=<dev-only>
 ```
 
