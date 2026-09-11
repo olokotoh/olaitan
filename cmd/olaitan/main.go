@@ -2355,18 +2355,46 @@ func readFalcoToken(path string) (string, error) {
 	return tok, nil
 }
 
-// runOptionalSource runs an optional sensor adapter inside the collector's
-// errgroup without letting its permanent failure take the other sources
-// down. The adapter has already marked its own source unhealthy, so the
-// failure stays visible as source_healthy{source=...} 0 and an ERROR log;
-// what changes is that Falco and the other adapters keep running. A clean
-// shutdown (context.Canceled, sometimes wrapped by retry.Do) is silent.
-func runOptionalSource(ctx context.Context, log *slog.Logger, source string, run func(context.Context) error) error {
-	err := run(ctx)
-	if err == nil || errors.Is(err, context.Canceled) {
-		return nil
+// optionalSourceBackoff is the wait before restarting a failed optional
+// source: 5s doubling to a 5 minute cap. A var so tests can shorten it.
+var optionalSourceBackoff = func(attempt int) time.Duration {
+	d := 5 * time.Second
+	for i := 1; i < attempt && d < 5*time.Minute; i++ {
+		d *= 2
 	}
-	log.Error("collector: optional source stopped permanently; the other sources keep running",
-		"source", source, "err", err)
-	return nil
+	if d > 5*time.Minute {
+		d = 5 * time.Minute
+	}
+	return d
+}
+
+// runOptionalSource runs an optional sensor adapter inside the collector's
+// errgroup without letting its failure take the other sources down, and
+// without giving up on it. The adapter marks its own source unhealthy, so a
+// failure stays visible as source_healthy{source=...} 0; here it is also
+// logged at ERROR and the adapter is restarted after a capped backoff. That
+// covers a terminal error that heals on its own (a CRI ResourceExhausted)
+// and one that heals on a config change. A source that returns nil while the
+// collector is still running is restarted as well. Only the collector's own
+// shutdown ends the loop, silently.
+func runOptionalSource(ctx context.Context, log *slog.Logger, source string, run func(context.Context) error) error {
+	for attempt := 1; ; attempt++ {
+		err := run(ctx)
+		if ctx.Err() != nil {
+			return nil
+		}
+		wait := optionalSourceBackoff(attempt)
+		if err != nil {
+			log.Error("collector: optional source failed; the other sources keep running, retrying",
+				"source", source, "err", err, "retry_in", wait)
+		} else {
+			log.Warn("collector: optional source returned while the collector is running; restarting",
+				"source", source, "retry_in", wait)
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(wait):
+		}
+	}
 }

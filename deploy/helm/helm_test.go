@@ -5530,4 +5530,12 @@ func TestContainerdSensorGrantsTheSocketGroup(t *testing.T) {
 	if _, ok := pod(nil)["supplementalGroups"]; ok {
 		t.Error("the default install (sensor off) grants a supplemental group it does not need")
 	}
+	// Review of #141: sprig's int turns a typo into 0, root's group.
+	for _, bad := range []string{"l001", "-1", ""} {
+		cmd := exec.Command("helm", "template", "olaitan", chartDir(t), "--set", "secrets.redisPassword=x",
+			"--set", "containerdSensor.enabled=true", "--set-string", "containerdSensor.socketGroup="+bad)
+		if out, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(out), "socketGroup") {
+			t.Errorf("socketGroup=%q rendered (or failed without naming it): %v %s", bad, err, out)
+		}
+	}
 }

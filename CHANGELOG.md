@@ -32,9 +32,12 @@ and false-positive numbers; see [Unreleased](#unreleased).
   collector joins the socket's group (`containerdSensor.socketGroup`,
   default 0) and stays UID 65532. A socket it cannot open is logged at
   ERROR and marks only the runtime source unhealthy; it used to crash-loop
-  the collector, Falco ingestion included. Also fixed: the sensor stopped
-  silently and permanently 10 seconds after start whenever its first dial
-  timed out (missing socket, containerd restarting, no permission).
+  the collector, Falco ingestion included; a failed optional sensor is now
+  restarted with capped backoff. Also fixed, for every adapter:
+  `retry.Do` treated an attempt's own timeout (a dial or a 2s publish
+  deadline) as cancellation and stopped retrying, so one slow NATS publish
+  or a dial timeout silently ended the containerd sensor for the life of
+  the pod.
 - **Falco is ON in every test** (#106). All six e2e Makefile targets and
   four CI jobs installed with Falco switched off, on the claim that its eBPF
   probe could not load inside kind. That was false on any BTF kernel, and it

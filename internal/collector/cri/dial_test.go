@@ -7,9 +7,12 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"google.golang.org/grpc"
 
 	"github.com/olokotoh/olaitan/internal/retry"
 )
@@ -84,9 +87,14 @@ func TestDefaultDial_TimeoutIsRetryableNotACancellation(t *testing.T) {
 	if isTerminalConnectError(err) {
 		t.Errorf("a dial timeout is terminal: %v", err)
 	}
+	// Review of #141: a fresh context, so the probe really sees ENOENT
+	// rather than the first dial's spent deadline.
 	missing := filepath.Join(t.TempDir(), "missing.sock")
-	if _, err := defaultDial(ctx, criDialTarget(missing)); err == nil || isTerminalConnectError(err) || errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("missing socket: err = %v, want a retryable non-context error", err)
+	mctx, mcancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer mcancel()
+	_, err = defaultDial(mctx, criDialTarget(missing))
+	if err == nil || isTerminalConnectError(err) || errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "no such file") {
+		t.Errorf("missing socket: err = %v, want a retryable, non-context 'no such file' error", err)
 	}
 }
 
@@ -104,12 +112,19 @@ func TestRun_KeepsRetryingWhileTheParentContextIsAlive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Review of #141: count real dial attempts (each makes two accepts:
+	// the probe and gRPC's own connect), not accepts.
+	var dials atomic.Int32
+	a.dialFn = func(ctx context.Context, target string) (*grpc.ClientConn, error) {
+		dials.Add(1)
+		return defaultDial(ctx, target)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 	defer cancel()
 	if err := a.Run(ctx); err != nil {
 		t.Errorf("Run = %v after its context ended, want nil", err)
 	}
-	if accepts.Load() < 4 {
-		t.Errorf("only %d connection attempts in 400ms; the adapter gave up after the first dial timeout", accepts.Load())
+	if dials.Load() < 4 || accepts.Load() < 4 {
+		t.Errorf("%d dials (%d accepts) in 400ms; the adapter gave up after an early dial timeout", dials.Load(), accepts.Load())
 	}
 }

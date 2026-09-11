@@ -718,23 +718,50 @@ func TestReadFalcoToken(t *testing.T) {
 // TestRunOptionalSource_PermanentFailureDoesNotStopTheCollector: Story 10.9.
 // A containerd socket the collector may not open returned a terminal EACCES,
 // which ended the collector's errgroup and crash-looped the pod, taking Falco
-// ingestion down with it. An optional source's permanent failure is now
-// logged loudly and leaves the other sources running.
+// ingestion down with it. An optional source's failure is logged at ERROR and
+// the source is restarted after a capped backoff (review of #141: stopping it
+// for good turned a transient ResourceExhausted, which used to heal on pod
+// restart, into a dead sensor in a Ready pod). A source that returns nil
+// while the collector is still running is restarted too.
 func TestRunOptionalSource_PermanentFailureDoesNotStopTheCollector(t *testing.T) {
 	var buf bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&buf, nil))
-	err := runOptionalSource(context.Background(), log, "runtime", func(context.Context) error {
-		return fmt.Errorf("cri: dial (terminal, no retry): %w", fs.ErrPermission)
+	orig := optionalSourceBackoff
+	optionalSourceBackoff = func(int) time.Duration { return time.Millisecond }
+	t.Cleanup(func() { optionalSourceBackoff = orig })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	err := runOptionalSource(ctx, log, "runtime", func(context.Context) error {
+		calls++
+		switch calls {
+		case 1:
+			return fmt.Errorf("cri: dial (terminal, no retry): %w", fs.ErrPermission)
+		case 2:
+			return nil // returned while the collector is running
+		default:
+			cancel()
+			<-ctx.Done()
+			return ctx.Err()
+		}
 	})
 	if err != nil {
 		t.Fatalf("runOptionalSource returned %v; a failed optional source must not end the errgroup", err)
+	}
+	if calls != 3 {
+		t.Errorf("source ran %d times, want 3 (restarted after the error and after the early nil)", calls)
 	}
 	out := buf.String()
 	if !strings.Contains(out, `"level":"ERROR"`) || !strings.Contains(out, `"source":"runtime"`) || !strings.Contains(out, "permission denied") {
 		t.Errorf("the failure was not logged at ERROR with its source and cause: %s", out)
 	}
-	buf.Reset()
-	if err := runOptionalSource(context.Background(), log, "runtime", func(context.Context) error { return context.Canceled }); err != nil || buf.Len() != 0 {
-		t.Errorf("clean shutdown: err=%v log=%q, want nil and silent", err, buf.String())
+	if !strings.Contains(out, "returned while the collector is running") {
+		t.Errorf("an early nil return was not reported: %s", out)
+	}
+	if strings.Count(out, "\n") != 2 {
+		t.Errorf("clean shutdown logged something: %s", out)
+	}
+	if optionalSourceBackoff == nil || orig(1) <= 0 || orig(50) > 5*time.Minute {
+		t.Errorf("default backoff must be positive and capped at 5m (got %s, %s)", orig(1), orig(50))
 	}
 }
