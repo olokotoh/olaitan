@@ -21,13 +21,15 @@ var (
 )
 
 // TestFalcoSourceIsLive is Story 10.4's proof that Falco is ON in every e2e
-// install. It runs in every e2e job. The collector marks Falco healthy only
+// install. Every e2e CI job and Makefile target includes it in its -run
+// filter (TestEveryE2EJobChecksFalcoIsLive keeps it that way). The collector marks Falco healthy only
 // when Falco's own metrics snapshot (or an alert) arrives over http_output,
 // so a green result means Falco loaded its driver inside kind, found the
 // node-local ingest Service, and presented the right token. Until Story
 // 10.4 every e2e target installed with Falco switched off and this path
 // never ran.
 func TestFalcoSourceIsLive(t *testing.T) {
+	requireKindCluster(t)
 	requirePodsExist(t, "app.kubernetes.io/component=collector")
 	requirePodsExist(t, "app.kubernetes.io/name=falco")
 	kubectl(t, "rollout", "status", "-n", defaultNamespace,

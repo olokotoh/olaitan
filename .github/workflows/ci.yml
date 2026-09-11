@@ -689,7 +689,7 @@ jobs:
             --wait --timeout 5m
 
       - name: Run smoke test
-        run: go test -tags=e2e -v -count=1 -run TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation ./tests/e2e/...
+        run: go test -tags=e2e -v -count=1 -run 'TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation|TestFalcoSourceIsLive' ./tests/e2e/...
 
       # Story 5.1 (AC5): the olaitan-eval harness smoke rides on the SAME
       # RS-arm bring-up above (Falco-off, NO LLM). It builds the
@@ -701,7 +701,7 @@ jobs:
         run: go build -o bin/olaitan-eval ./cmd/olaitan-eval
 
       - name: Run eval-harness smoke (Story 5.1 AC5)
-        run: go test -tags=e2e -v -count=1 -run TestEvalSmoke_S1_RS_OneTrial ./tests/e2e/...
+        run: go test -tags=e2e -v -count=1 -run 'TestEvalSmoke_S1_RS_OneTrial|TestFalcoSourceIsLive' ./tests/e2e/...
 
       # NOTE: the five-attack-scenario smoke (Story 5.2, TestKindSmoke_Scenarios*)
       # is NOT in this always-on job. It is label-gated in the `e2e-scenarios` job
@@ -1104,7 +1104,7 @@ jobs:
       - name: Run forensics smoke
         env:
           OLT_E2E_FORENSICS: "1"
-        run: go test -tags=e2e -v -count=1 -run TestKindSmoke_Forensics_FullSlice ./tests/e2e/...
+        run: go test -tags=e2e -v -count=1 -run 'TestKindSmoke_Forensics_FullSlice|TestFalcoSourceIsLive' ./tests/e2e/...
 
       - name: Debug logs on failure
         if: failure()
@@ -1214,7 +1214,7 @@ jobs:
       # Scoped by -run to the scenario tests. AC8 asserts the EVIDENCE-package
       # signal, NOT the full FSM-state attainment (Story 5.4 + the A1 gate, BI-8).
       - name: Run attack-scenario smoke (Story 5.2 AC8)
-        run: go test -tags=e2e -v -count=1 -run 'TestKindSmoke_Scenarios' ./tests/e2e/...
+        run: go test -tags=e2e -v -count=1 -run 'TestKindSmoke_Scenarios|TestFalcoSourceIsLive' ./tests/e2e/...
 
       - name: Debug logs on failure
         if: failure()
@@ -1338,7 +1338,7 @@ jobs:
         env:
           OLT_E2E_OVERLAYS: "1"
           OLT_E2E_OVERLAY: ${{ matrix.overlay }}
-        run: go test -tags=e2e -v -count=1 -run TestKindSmoke_Overlays_OperatorCommitments ./tests/e2e/...
+        run: go test -tags=e2e -v -count=1 -run 'TestKindSmoke_Overlays_OperatorCommitments|TestFalcoSourceIsLive' ./tests/e2e/...
 
       - name: Debug logs on failure
         if: failure()
