@@ -113,6 +113,11 @@ spec:
             # Sidecar runtime knobs forwarded through the webhook env
             # into the injected sidecar's OLAITAN_APPLOG_* env vars.
             # Story 1.9 D1+D2+H3: dead-knobs defect closure.
+            # Story 10.10: the NATS address every injected sidecar publishes
+            # to. Fully qualified, because the sidecar runs in the workload's
+            # namespace, where the short Service name does not resolve.
+            - name: OLAITAN_WEBHOOK_SIDECAR_NATS_URL
+              value: {{ include "olaitan.endpoints.natsFQDN" . | quote }}
             - name: OLAITAN_WEBHOOK_SIDECAR_STDOUT_PATH
               value: {{ .Values.applogSidecar.stdoutPath | quote }}
             - name: OLAITAN_WEBHOOK_SIDECAR_STDERR_PATH

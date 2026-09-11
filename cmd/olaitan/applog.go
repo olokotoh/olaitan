@@ -152,6 +152,20 @@ func runApplogSidecar(ctx context.Context, args []string, stderr io.Writer) int 
 		return 1
 	}
 
+	// Story 10.10: report liveness and health to the collector on this node,
+	// the only way applog health is observable (nothing scrapes the sidecar).
+	go collectorapplog.RunHeartbeat(ctx, nc, collectorapplog.HeartbeatInterval, func() collectorapplog.Heartbeat {
+		healthy, _ := adapter.Health().Status()
+		return collectorapplog.Heartbeat{
+			Namespace: cfg.Pod.Namespace,
+			Pod:       cfg.Pod.Name,
+			Node:      cfg.Pod.Node,
+			Container: cfg.Container,
+			Healthy:   healthy,
+			Events:    adapter.EventsTotal(),
+		}
+	})
+
 	log.Info("applog-sidecar: started",
 		"pod", cfg.Pod.Namespace+"/"+cfg.Pod.Name,
 		"container", cfg.Container,
@@ -267,6 +281,7 @@ func runApplogWebhook(ctx context.Context, args []string, stderr io.Writer) int 
 		// list so the sidecar container picks them up via the
 		// downward API at start-up. Empty values fall through to the
 		// adapter's own defaults.
+		SidecarNATSURL:             os.Getenv("OLAITAN_WEBHOOK_SIDECAR_NATS_URL"),
 		SidecarStdoutPath:          os.Getenv("OLAITAN_WEBHOOK_SIDECAR_STDOUT_PATH"),
 		SidecarStderrPath:          os.Getenv("OLAITAN_WEBHOOK_SIDECAR_STDERR_PATH"),
 		SidecarChannelBuffer:       os.Getenv("OLAITAN_WEBHOOK_SIDECAR_CHANNEL_BUFFER"),

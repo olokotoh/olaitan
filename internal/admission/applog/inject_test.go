@@ -348,3 +348,29 @@ func TestInject_NilPod_Errors(t *testing.T) {
 		t.Error("expected error on nil pod")
 	}
 }
+
+// TestInject_ForwardsNATSURL: Story 10.10. The sidecar refuses to start
+// without NATS_URL, and the injector never set it, so every injected sidecar
+// exited 1 and restart-looped while the app kept running.
+func TestInject_ForwardsNATSURL(t *testing.T) {
+	opts := defaultInjectOpts()
+	opts.SidecarNATSURL = "nats://olaitan-nats.olaitan.svc:4222"
+	patch, err := Inject(samplePod(), opts)
+	if err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+	var ops []jsonPatchOp
+	if err := json.Unmarshal(patch, &ops); err != nil {
+		t.Fatal(err)
+	}
+	sidecar := decodeInjectedSidecar(t, ops, "/spec/initContainers/-")
+	for _, e := range sidecar.Env {
+		if e.Name == "NATS_URL" {
+			if e.Value != opts.SidecarNATSURL {
+				t.Errorf("NATS_URL = %q, want %q", e.Value, opts.SidecarNATSURL)
+			}
+			return
+		}
+	}
+	t.Error("injected sidecar has no NATS_URL")
+}

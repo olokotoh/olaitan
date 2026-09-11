@@ -2106,6 +2106,9 @@ spec:
               value: "nats://olaitan-nats:4222"
             - name: REDIS_ADDR
               value: "olaitan-redis-master:6379"
+            # Story 10.10: track applog sidecar heartbeats only when applog is on.
+            - name: OLAITAN_APPLOG_ENABLED
+              value: "false"
             - name: FALCO_LISTEN_ADDR
               value: ":8765"
             # Read from the mounted release Secret (below), not an env

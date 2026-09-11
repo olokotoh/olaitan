@@ -9,10 +9,12 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	natsjs "github.com/nats-io/nats.go/jetstream"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/olokotoh/olaitan/internal/collector/applog"
 	"github.com/olokotoh/olaitan/internal/collector/falco"
 	"github.com/olokotoh/olaitan/internal/config"
 	"github.com/olokotoh/olaitan/internal/metrics"
@@ -333,6 +335,62 @@ func TestRegisterAdapterCounters_FalcoHTTPReceiver(t *testing.T) {
 	}
 	if codes["401"] != 1 {
 		t.Errorf("requests{code=401} = %v, want 1", codes["401"])
+	}
+	cancel()
+	_ = g.Wait()
+}
+
+// Story 10.10: the collector's applog sidecar tracker surfaces as the
+// applog source (source_healthy, sensor_events_total) plus a per-state
+// sidecar gauge, so an operator can see sidecars that went silent.
+func TestRegisterAdapterCounters_ApplogSidecarTracker(t *testing.T) {
+	t.Parallel()
+	tr := applog.NewSidecarTracker("node-a", time.Minute)
+	tr.Observe([]byte(`{"namespace":"shop","pod":"api-1","node":"node-a","healthy":true,"events":7}`))
+	tr.Observe([]byte(`{"namespace":"shop","pod":"api-2","node":"node-a","healthy":false,"events":2}`))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g, gctx := errgroup.WithContext(ctx)
+	cfg := &config.Config{Metrics: config.MetricsConfig{Address: "127.0.0.1:0"}}
+	reg, err := startMetricsServer(gctx, g, quietTestLogger(), cfg, "node-a",
+		map[string]adapterMetrics{"applog": tr}, nil)
+	if err != nil {
+		t.Fatalf("startMetricsServer: %v", err)
+	}
+	mfs, err := reg.Gatherer().Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	states := map[string]float64{}
+	var healthy, events float64 = -1, -1
+	for _, mf := range mfs {
+		for _, m := range mf.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			if labels["source"] != "applog" {
+				continue
+			}
+			switch mf.GetName() {
+			case "olaitan_sensor_applog_sidecars":
+				states[labels["state"]] = m.GetGauge().GetValue()
+			case "olaitan_source_healthy":
+				healthy = m.GetGauge().GetValue()
+			case "olaitan_sensor_events_total":
+				events = m.GetCounter().GetValue()
+			}
+		}
+	}
+	if states["live"] != 2 || states["stale"] != 0 || states["unhealthy"] != 1 {
+		t.Errorf("olaitan_sensor_applog_sidecars = %v, want live=2 stale=0 unhealthy=1", states)
+	}
+	if healthy != 0 {
+		t.Errorf("source_healthy{source=applog} = %v, want 0 while a sidecar reports unhealthy", healthy)
+	}
+	if events != 9 {
+		t.Errorf("sensor_events_total{source=applog} = %v, want 9", events)
 	}
 	cancel()
 	_ = g.Wait()

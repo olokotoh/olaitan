@@ -95,6 +95,15 @@ The catalogue is organised by registering ring + story, in commit chronology so 
 - **Sample PromQL (aggregate):** `rate(olaitan_sensor_falco_heartbeats_total[5m]) * 60` (snapshots per minute, 1 per node when healthy).
 - **Sample PromQL (alert):** `increase(olaitan_sensor_falco_heartbeats_total[5m]) == 0` (Falco is down, or cannot reach this node's collector).
 
+#### `olaitan_sensor_applog_sidecars` (Story 10.10)
+
+- **Type:** gauge
+- **Unit:** count (sidecars)
+- **Labels:** `source` (constant `applog`), `state` (`live`, `stale`, `unhealthy`; cardinality 3). Registered only when `applogSidecar.enabled=true`.
+- **Help:** applog sidecars on this node, by heartbeat state. Each sidecar publishes a heartbeat on core-NATS `olaitan.health.applog` every 30s; the collector on the same node counts it `live` if heard within 90s, `stale` once silent longer than that, and forgets it after 10 minutes of silence (its pod is gone). `unhealthy` counts live sidecars reporting their own tail or publish path failing. `olaitan_source_healthy{source="applog"}` is 0 while any sidecar is stale or unhealthy, and 1 on a node with no applog workloads (nothing is failing; `state="live"` tells the two apart). `olaitan_sensor_events_total{source="applog"}` is the node's sum of sidecar event counts, kept monotonic across sidecar restarts.
+- **Sample PromQL (aggregate):** `sum(olaitan_sensor_applog_sidecars) by (state)`.
+- **Sample PromQL (alert):** `sum(olaitan_sensor_applog_sidecars{state=~"stale|unhealthy"}) > 0` for 5 minutes (a sidecar has stopped reporting or cannot publish its logs).
+
 #### `olaitan_sensor_cri_translate_errors_total` and `olaitan_sensor_cri_publish_drops_total` (Story 1.8)
 
 - **Type:** counter (one family each)
