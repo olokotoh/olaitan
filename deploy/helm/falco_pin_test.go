@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -231,6 +232,153 @@ func TestPreflightRunsTheKernelCheck(t *testing.T) {
 	for _, want := range []string{"lib/falco-kernel.sh", `falco_kernel_verdict "$KERNEL"`, "BLOCKERS=$((BLOCKERS+1))"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("hack/preflight.sh does not contain %q", want)
+		}
+	}
+}
+
+// --- Story 10.4: Falco is never disabled to make a test pass ------------
+
+// TestNoTestPathDisablesFalco is the CI guard for Story 10.4. Every e2e
+// target used to install with falco.enabled=false, on the stated grounds
+// that Falco's eBPF probe cannot load inside kind. That was false on any
+// BTF kernel (Falco's modern_ebpf runs in kind; it has on every run since
+// Story 10.1), and it meant the Falco -> collector -> aggregator path was
+// never exercised by a test. The rule (olaitan CLAUDE.local.md): if Falco
+// breaks, fix Falco.
+func TestNoTestPathDisablesFalco(t *testing.T) {
+	root := repoRoot(t)
+	files := falcoGuardFiles(t, root)
+	if len(files) < 10 {
+		t.Fatalf("scanned only %d files; the guard is not looking where the tests live", len(files))
+	}
+	for _, f := range falcoDisabledFindings(t, root, files) {
+		t.Error(f)
+	}
+}
+
+// falcoGuardFiles is every file a test, CI job or install overlay reads:
+// the Makefile, all workflows, everything under tests/e2e and hack, and the
+// chart's overlay values files (e2e installs pass them with -f and the eval
+// harness applies them with helm upgrade --values).
+func falcoGuardFiles(t *testing.T, root string) []string {
+	t.Helper()
+	var files []string
+	for _, g := range []string{"Makefile", ".github/workflows/*.yml", ".github/workflows/*.yaml", "deploy/helm/olaitan/values-*.yaml"} {
+		m, err := filepath.Glob(filepath.Join(root, g))
+		if err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, m...)
+	}
+	for _, dir := range []string{"tests/e2e", "hack"} {
+		_ = filepath.WalkDir(filepath.Join(root, dir), func(p string, d os.DirEntry, err error) error {
+			if err == nil && !d.IsDir() {
+				files = append(files, p)
+			}
+			return nil
+		})
+	}
+	return files
+}
+
+var (
+	falcoDisableFlat = regexp.MustCompile(`falco\.enabled\s*[=:]\s*["']?false\b`)
+	falseKindClaims  = []string{
+		"eBPF probe is unavailable inside kind",
+		"eBPF is host-scoped",
+		"cannot load inside kind",
+		"does not have the\n// eBPF subsystem mounted",
+	}
+)
+
+// falcoDisabledFindings reports every way a file switches Falco off: the
+// flat dotted form in any quoting (--set falco.enabled='false'), and in YAML
+// files the nested form (falco: / enabled: false) at the top level.
+func falcoDisabledFindings(t *testing.T, root string, files []string) []string {
+	t.Helper()
+	var out []string
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rel, _ := filepath.Rel(root, f)
+		// preflight.sh tells an operator on a locked-down platform to run
+		// their own Falco; that is advice, not a test switching it off.
+		if rel != "hack/preflight.sh" {
+			for i, line := range strings.Split(string(raw), "\n") {
+				if falcoDisableFlat.MatchString(line) {
+					out = append(out, fmt.Sprintf("%s:%d disables Falco: %s", rel, i+1, strings.TrimSpace(line)))
+				}
+			}
+		}
+		if strings.HasSuffix(f, ".yaml") || strings.HasSuffix(f, ".yml") {
+			dec := yaml.NewDecoder(strings.NewReader(string(raw)))
+			for {
+				var doc map[string]any
+				if err := dec.Decode(&doc); err != nil {
+					break
+				}
+				if fm, ok := doc["falco"].(map[string]any); ok {
+					if en, ok := fm["enabled"].(bool); ok && !en {
+						out = append(out, fmt.Sprintf("%s disables Falco (falco.enabled: false)", rel))
+					}
+				}
+			}
+		}
+		for _, claim := range falseKindClaims {
+			if strings.Contains(string(raw), claim) {
+				out = append(out, fmt.Sprintf("%s repeats the false claim %q", rel, claim))
+			}
+		}
+	}
+	return out
+}
+
+// TestFalcoGuardCatchesEveryForm: review of #136. The first guard matched
+// only the flat unquoted form in a few globs.
+func TestFalcoGuardCatchesEveryForm(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel, body string) {
+		p := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("Makefile", "\thelm install x --set falco.enabled='false'\n")
+	write(".github/workflows/e2e.yaml", "jobs: {}\n")
+	write("deploy/helm/olaitan/values-eval-rs.yaml", "falco:\n  enabled: false\n")
+	write("tests/e2e/fixtures/deep/install.yaml", "falco:\n  enabled: false\n")
+	write("hack/preflight.sh", "echo 'use your own Falco (falco.enabled=false)'\n")
+	found := strings.Join(falcoDisabledFindings(t, root, falcoGuardFiles(t, root)), "\n")
+	for _, want := range []string{"Makefile:1", "values-eval-rs.yaml", "fixtures/deep/install.yaml"} {
+		if !strings.Contains(found, want) {
+			t.Errorf("guard missed %s; findings:\n%s", want, found)
+		}
+	}
+	if strings.Contains(found, "preflight.sh") {
+		t.Error("guard flagged preflight's operator advice")
+	}
+}
+
+// TestEveryE2EJobChecksFalcoIsLive: review of #136. Every CI job and
+// Makefile target that filters the e2e tests with -run must include
+// TestFalcoSourceIsLive, or the test that proves Falco reaches the collector
+// never runs in CI.
+func TestEveryE2EJobChecksFalcoIsLive(t *testing.T) {
+	root := repoRoot(t)
+	for _, f := range []string{".github/workflows/ci.yml", "Makefile"} {
+		raw, err := os.ReadFile(filepath.Join(root, f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, line := range strings.Split(string(raw), "\n") {
+			if strings.Contains(line, "go test -tags=e2e") && strings.Contains(line, " -run ") && !strings.Contains(line, "TestFalcoSourceIsLive") {
+				t.Errorf("%s:%d runs e2e tests without TestFalcoSourceIsLive: %s", f, i+1, strings.TrimSpace(line))
+			}
 		}
 	}
 }

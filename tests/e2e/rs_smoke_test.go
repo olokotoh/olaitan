@@ -12,17 +12,16 @@
 // `.github/workflows/ci.yml` (which boots a fresh kind cluster on each
 // run).
 //
-// # Why Falco is disabled in the smoke test
+// # Falco is ON, but these scenario events are still injected
 //
-// Falco's eBPF probe loads against the host kernel. Inside a kind
-// cluster the "host" is the kind container, which does not have the
-// eBPF subsystem mounted. Falco would log `failed to load probe` and
-// crash-loop. The chart install therefore sets `falco.enabled=false`
-// and this test publishes JSON-marshalled raw events directly to
-// `olaitan.events.raw.falco` -- the NATS subject Falco would publish
-// to in production. The pipeline's correlator, rule engine, and
-// baseline engine then process the events identically to a
-// Falco-driven path.
+// The chart install keeps Falco enabled (values-kind.yaml); its modern_ebpf
+// driver loads inside kind against the host kernel's BTF, and Story 10.4
+// switched Falco back on in every e2e target. This smoke
+// test still publishes its scenario as JSON-marshalled raw events to
+// `olaitan.events.raw.falco`, because it asserts the rules and baseline
+// engines on a controlled input. That injection is not an attack: Epic 11
+// (#112) replaces it with real attacks inside pods, and the portability job
+// already runs one (Story 10.3).
 //
 // # What the test does not validate
 //
@@ -123,12 +122,10 @@ func kubectl(t *testing.T, args ...string) string {
 
 // waitForPodsReady blocks until the aggregator pod reports Ready, up
 // to 120 seconds. Scoped to the aggregator only: the smoke test
-// injects synthetic events directly into NATS via port-forward so the
-// collector DaemonSet is not on the critical path. Falco's eBPF probe
-// cannot load inside kind nodes (kind nodes are containers; eBPF is
-// host-scoped), so the e2e targets install with falco.enabled=false
-// and the collector starts but receives no Falco alerts. None of that
-// blocks the aggregator-side pipeline the test exercises.
+// injects its scenario events directly into NATS via port-forward, so
+// the rules and baseline assertions depend only on the aggregator. The
+// collector and Falco run too (Falco is ON), and Falco's real alerts flow
+// alongside the injected events.
 func waitForPodsReady(t *testing.T) {
 	t.Helper()
 	requirePodsExist(t, "app.kubernetes.io/component=aggregator")
@@ -255,6 +252,7 @@ func applySyntheticWorkload(t *testing.T) string {
 // teardown is registered ONCE per process via syntheticNamespaceCleanupOnce.
 func applyScenarioWorkload(t *testing.T, deployName string) string {
 	t.Helper()
+	waitNamespaceNotTerminating(t, "tenant-acme")
 	manifest := `
 apiVersion: v1
 kind: Namespace
@@ -823,23 +821,17 @@ func TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation(t *testing.T) {
 		case evidence < 1:
 			lastErr = fmt.Errorf("correlator evidence packages = %v; want >= 1", evidence)
 		default:
-			// Source-health check on the sources the chart actually
-			// started. Falco is excluded explicitly because the chart-
-			// install sets `falco.enabled=false` for this smoke test;
-			// the falco adapter still registers but cannot dial its
-			// gRPC endpoint inside kind. The surviving sources must
-			// report healthy.
+			// Source-health check on the aggregator's registered sources.
+			// Falco's own source health is exported by the collector and
+			// asserted by TestFalcoSourceIsLive (falco_on_test.go).
 			sourceHealthy := metrics["olaitan_source_healthy"]
 			if sourceHealthy == nil {
 				assertionPassed = true // gauge not yet exposed; not load-bearing
 			} else {
 				lastErr = nil
 				for _, sample := range sourceHealthy.samples {
-					if sample.labels["source"] == "falco" {
-						continue
-					}
 					if sample.value != 1 {
-						lastErr = fmt.Errorf("source %q unhealthy (gauge=%v); all enabled non-falco sources must be healthy",
+						lastErr = fmt.Errorf("source %q unhealthy (gauge=%v); all enabled sources must be healthy",
 							sample.labels["source"], sample.value)
 						break
 					}
@@ -879,4 +871,28 @@ func TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation(t *testing.T) {
 		case <-time.After(assertionPollInterval):
 		}
 	}
+}
+
+// waitNamespaceNotTerminating blocks until ns is either Active or gone. An
+// earlier test's cleanup deletes tenant-acme without waiting, and applying a
+// Deployment into a namespace that is still terminating is refused
+// ("unable to create new content in namespace ... because it is being
+// terminated"). With Falco ON (Story 10.4) the namespace takes longer to
+// finalise, which turned this ordering race into a failure in
+// `make e2e-local`, where the smoke and scenario tests share one install.
+func waitNamespaceNotTerminating(t *testing.T, ns string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Minute)
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("kubectl", "get", "namespace", ns,
+			"-o", "jsonpath={.status.phase}").CombinedOutput()
+		if err != nil && strings.Contains(string(out), "NotFound") {
+			return
+		}
+		if err == nil && strings.TrimSpace(string(out)) != "Terminating" {
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
+	t.Fatalf("namespace %s still terminating after 3 minutes", ns)
 }
