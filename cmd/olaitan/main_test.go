@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -711,5 +712,29 @@ func TestReadFalcoToken(t *testing.T) {
 		if _, err := readFalcoToken(path); err == nil {
 			t.Errorf("%s: readFalcoToken accepted it", name)
 		}
+	}
+}
+
+// TestRunOptionalSource_PermanentFailureDoesNotStopTheCollector: Story 10.9.
+// A containerd socket the collector may not open returned a terminal EACCES,
+// which ended the collector's errgroup and crash-looped the pod, taking Falco
+// ingestion down with it. An optional source's permanent failure is now
+// logged loudly and leaves the other sources running.
+func TestRunOptionalSource_PermanentFailureDoesNotStopTheCollector(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, nil))
+	err := runOptionalSource(context.Background(), log, "runtime", func(context.Context) error {
+		return fmt.Errorf("cri: dial (terminal, no retry): %w", fs.ErrPermission)
+	})
+	if err != nil {
+		t.Fatalf("runOptionalSource returned %v; a failed optional source must not end the errgroup", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `"level":"ERROR"`) || !strings.Contains(out, `"source":"runtime"`) || !strings.Contains(out, "permission denied") {
+		t.Errorf("the failure was not logged at ERROR with its source and cause: %s", out)
+	}
+	buf.Reset()
+	if err := runOptionalSource(context.Background(), log, "runtime", func(context.Context) error { return context.Canceled }); err != nil || buf.Len() != 0 {
+		t.Errorf("clean shutdown: err=%v log=%q, want nil and silent", err, buf.String())
 	}
 }

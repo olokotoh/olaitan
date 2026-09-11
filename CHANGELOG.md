@@ -27,6 +27,14 @@ and false-positive numbers; see [Unreleased](#unreleased).
 
 ### Changed
 
+- **The containerd sensor works without root and can no longer take the
+  collector down** (#138). With `containerdSensor.enabled=true` the
+  collector joins the socket's group (`containerdSensor.socketGroup`,
+  default 0) and stays UID 65532. A socket it cannot open is logged at
+  ERROR and marks only the runtime source unhealthy; it used to crash-loop
+  the collector, Falco ingestion included. Also fixed: the sensor stopped
+  silently and permanently 10 seconds after start whenever its first dial
+  timed out (missing socket, containerd restarting, no permission).
 - **Falco is ON in every test** (#106). All six e2e Makefile targets and
   four CI jobs installed with Falco switched off, on the claim that its eBPF
   probe could not load inside kind. That was false on any BTF kernel, and it

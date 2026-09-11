@@ -2094,18 +2094,12 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 			return fmt.Errorf("collector: cri adapter: %w", cerr)
 		}
 		metricsSources[string(schema.SourceRuntime)] = criAdapter
+		// Story 10.9: the containerd sensor is optional. A permanent
+		// failure (EACCES on the socket) marks the runtime source
+		// unhealthy and is logged at ERROR, but no longer ends the
+		// errgroup and crash-loops the collector with Falco inside it.
 		g.Go(func() error {
-			if err := criAdapter.Run(ctx); err != nil {
-				// P22: clean shutdown surfaces context.Canceled
-				// (sometimes wrapped by retry.Do); treat as nil to
-				// keep errgroup.Wait quiet, matching the Story 1.6
-				// Falco / Story 1.7 audit pattern.
-				if errors.Is(err, context.Canceled) {
-					return nil
-				}
-				return fmt.Errorf("collector: cri run: %w", err)
-			}
-			return nil
+			return runOptionalSource(ctx, log, string(schema.SourceRuntime), criAdapter.Run)
 		})
 		log.Info("collector: ring 1 wired (containerd cri)",
 			"socket_path", criCfg.SocketPath)
@@ -2359,4 +2353,20 @@ func readFalcoToken(path string) (string, error) {
 		return "", fmt.Errorf("falco http token file %s is empty", path)
 	}
 	return tok, nil
+}
+
+// runOptionalSource runs an optional sensor adapter inside the collector's
+// errgroup without letting its permanent failure take the other sources
+// down. The adapter has already marked its own source unhealthy, so the
+// failure stays visible as source_healthy{source=...} 0 and an ERROR log;
+// what changes is that Falco and the other adapters keep running. A clean
+// shutdown (context.Canceled, sometimes wrapped by retry.Do) is silent.
+func runOptionalSource(ctx context.Context, log *slog.Logger, source string, run func(context.Context) error) error {
+	err := run(ctx)
+	if err == nil || errors.Is(err, context.Canceled) {
+		return nil
+	}
+	log.Error("collector: optional source stopped permanently; the other sources keep running",
+		"source", source, "err", err)
+	return nil
 }

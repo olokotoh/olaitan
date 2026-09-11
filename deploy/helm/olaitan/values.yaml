@@ -363,6 +363,12 @@ auditWebhook:
 # baseline.
 containerdSensor:
   enabled: false
+  # Group that owns the containerd socket; the collector joins it (as a
+  # supplemental group, still non-root) so it can connect. 0 matches stock
+  # containerd (0660 root:root) on kubeadm, kind and k3s. Check a node with
+  # `stat -c %g /run/containerd/containerd.sock`.
+  # @schema type:integer minimum:0 effect:"supplemental group the collector joins to open the containerd socket" ref:FR3
+  socketGroup: 0
 
   # Path on the host node to the containerd CRI socket. Default for
   # containerd 1.7 on a stock kubeadm 1.29 cluster. Operators using a
