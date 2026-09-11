@@ -349,6 +349,21 @@ jobs:
           chmod 600 "$HOME/.kube/config"
           echo "KUBECONFIG=$HOME/.kube/config" >> "$GITHUB_ENV"
 
+      # Test THIS change's binary, not the published edge image. Without this
+      # the job installed the PR's chart with main's collector, so any PR
+      # that changed both (Story 10.2: the Falco transport) could not pass,
+      # and a PR that broke only the binary could not fail.
+      - name: Build Olaitan image and load it into the cluster
+        run: |
+          make docker-build
+          tag=$(make -s version-tag)
+          case "${{ matrix.distro }}" in
+            kind)     kind load docker-image olaitan:"$tag" --name olaitan-portability ;;
+            minikube) minikube image load olaitan:"$tag" ;;
+            k3s)      docker save olaitan:"$tag" | sudo k3s ctr images import - ;;
+          esac
+          echo "OLAITAN_TAG=$tag" >> "$GITHUB_ENV"
+
       - name: Preflight
         run: |
           # Informational: preflight exits 1 on a blocker, and "kindnet does
@@ -374,6 +389,9 @@ jobs:
             -f "deploy/helm/olaitan/values-${{ matrix.distro }}.yaml" \
             --namespace olaitan --create-namespace \
             --set secrets.redisPassword=ci-fake-password \
+            --set image.repository=olaitan \
+            --set-string image.tag="$OLAITAN_TAG" \
+            --set image.pullPolicy=Never \
             --wait --timeout 12m
 
       # The actual assertion. Every workload the chart ships must reach Ready
