@@ -27,6 +27,13 @@ and false-positive numbers; see [Unreleased](#unreleased).
 
 ### Changed
 
+- **Falco is ON in every test** (#106). All six e2e Makefile targets and
+  four CI jobs installed with Falco switched off, on the claim that its eBPF
+  probe could not load inside kind. That was false on any BTF kernel, and it
+  meant the Falco path never ran under test. They now install with
+  `values-kind.yaml`; a new e2e test requires the collector to report
+  Falco healthy, and a helm-suite guard fails the build if a test path
+  switches Falco off again.
 - **A real attack now produces evidence on a default install** (#105). Until
   now the only thing that could start an investigation was two sensors
   agreeing about a pod, and the default install runs one (Falco), so a real

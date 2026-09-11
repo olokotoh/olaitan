@@ -1589,14 +1589,14 @@ helm install olaitan deploy/helm/olaitan \
   --set evaluation.config=RS \
   --set baselines.warmupDuration=5s \
   --set secrets.redisPassword=<redis-password> \
-  --set falco.enabled=false \
+  -f deploy/helm/olaitan/values-kind.yaml \
   --set-string nats.streamMaxBytesOverride=536870912 \
   --wait --timeout 5m
 ```
 
 On a real (non-kind) cluster, drop the kind-only / evaluation-only flags
 (`image.pullPolicy=Never`, `evaluation.config=RS`, `baselines.warmupDuration=5s`,
-`falco.enabled=false`, `nats.streamMaxBytesOverride`) and
+`values-kind.yaml`, `nats.streamMaxBytesOverride`) and
 supply your own image registry, the `secrets.redisPassword`, and an
 `evaluation.config` (or no overlay) appropriate to the posture. The three
 posture overlays (`-f deploy/helm/olaitan/values-production.yaml` /
@@ -1614,11 +1614,12 @@ app.kubernetes.io/name=olaitan` (all Running/Ready) and the aggregator startup
 log lines (`aggregator: ...` in `kubectl logs deploy/olaitan-aggregator`).
 
 **Expected metric response.** Scrape `:9090/metrics`:
-`olaitan_source_healthy{source}` appears for each of the five sources. With
-`falco.enabled=false` on kind, `olaitan_source_healthy{source="falco"}` reads
-`0` and the rest read `1` once their streams produce events; this is expected
-on kind (the Falco eBPF probe cannot load there). `olaitan_sensor_events_total`
-begins climbing as events flow.
+`olaitan_source_healthy{source}` appears for each of the five sources.
+`olaitan_source_healthy{source="falco"}` (on the collector) turns `1` on
+Falco's first metrics heartbeat, about a minute after Falco loads its
+modern_ebpf driver; Falco runs inside kind (Story 10.4). The rest read `1` once
+their streams produce events. `olaitan_sensor_events_total` begins climbing as
+events flow.
 
 **Expected audit-subject signal.** A bare install enables NO audit subjects:
 `response.audit.enabled` defaults `false`, so `AUDIT.*` carries no traffic until
@@ -1643,10 +1644,11 @@ command above on every change. The documented invocation was render-verified
   NATS-not-ready startup race. Pass a smaller
   `--set-string nats.streamMaxBytesOverride=536870912` (or `1073741824`) so the
   JetStream PVC fits the node, and re-run; the documented kind path uses this.
-- *The collector pod stays Pending on kind:* the Falco hostPath mount does not
-  exist inside kind nodes. `--set falco.enabled=false` (as above) drops the
-  hostPath so the collector starts; `source_healthy{source="falco"}=0` is then
-  expected and not a fault.
+- *`source_healthy{source="falco"}` stays `0`:* check
+  `olaitan_sensor_falco_http_requests_total{code="401"}` (a token mismatch),
+  the Falco pod's restart count and `kubectl logs ... -c falco --previous`
+  (a kernel/driver problem; `hack/preflight.sh` judges the node kernel), and
+  `falco_heartbeats_total` (Falco is not reaching this node's collector).
 - *Redis pod CrashLoopBackOff:* you omitted `--set secrets.redisPassword`; the
   Redis subchart requires it. Supply a value.
 
@@ -1749,8 +1751,8 @@ alert on the gauge.
   `olaitan_sensor_cni_consecutive_eofs`:* the Goldmane flow endpoint is
   unreachable; the gauge above `10` for 5 minutes is the alert. Verify Calico
   Goldmane is up.
-- *`source_healthy{source="falco"}=0` on kind/CI:* expected when
-  `falco.enabled=false`; not a fault.
+- *`source_healthy{source="falco"}=0` on kind/CI:* not expected since Story
+  10.4; Falco is ON in every install. Diagnose as above.
 
 ### 2.4 Missed-detection investigation via NATS audit subjects and package replay
 

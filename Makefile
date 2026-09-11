@@ -266,10 +266,11 @@ e2e-local: helm-prepare helm-deps docker-build
 		kind create cluster --name $(KIND_CLUSTER_NAME) --config hack/kind-config.yaml
 	kind load docker-image $(IMAGE):$(TAG) --name $(KIND_CLUSTER_NAME)
 	# Story 1.19 D6: instead of lying to JetStream about disk capacity
-	# via fileStore.maxSize=200GB, cap each stream's MaxBytes at 1 GiB
+	# via fileStore.maxSize=200GB, cap each stream's MaxBytes at 512 MiB
 	# via the OLT_NATS_STREAM_MAXBYTES_OVERRIDE env var (wired through
-	# nats.streamMaxBytesOverride). Sum of caps (3 streams) is 3 GiB,
-	# well under the kind node's PVC backing.
+	# nats.streamMaxBytesOverride). Eleven streams x 512 MiB = 5.5 GiB
+	# fits kind's 10 Gi volume; the old 1 GiB (11 GiB) did not, and bare
+	# --set float-coerced it (#109). --set-string, same as the CI e2e job.
 	helm install olaitan $(CHART_DIR) \
 		--set image.repository=$(IMAGE) \
 		--set-string image.tag=$(TAG) \
@@ -277,8 +278,8 @@ e2e-local: helm-prepare helm-deps docker-build
 		--set evaluation.config=RS \
 		--set baselines.warmupDuration=5s \
 		--set secrets.redisPassword=ci-test \
-		--set falco.enabled=false \
-		--set nats.streamMaxBytesOverride=1073741824 \
+		-f $(CHART_DIR)/values-kind.yaml \
+		--set-string nats.streamMaxBytesOverride=536870912 \
 		--wait --timeout 5m
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) go test -tags=e2e -v -count=1 ./tests/e2e/...
 
@@ -309,8 +310,8 @@ e2e-local-rslt: helm-prepare helm-deps docker-build
 		--set secrets.llmApiKey=fake-key \
 		--set baselines.warmupDuration=5s \
 		--set secrets.redisPassword=ci-test \
-		--set falco.enabled=false \
-		--set nats.streamMaxBytesOverride=1073741824 \
+		-f $(CHART_DIR)/values-kind.yaml \
+		--set-string nats.streamMaxBytesOverride=536870912 \
 		--wait --timeout 5m
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) OLT_E2E_RSLT=1 go test -tags=e2e -v -count=1 ./tests/e2e/...
 
@@ -370,8 +371,8 @@ e2e-local-forensics: helm-prepare helm-deps docker-build
 		--set secrets.s3SecretKey=olaitan-e2e-secret \
 		--set baselines.warmupDuration=5s \
 		--set secrets.redisPassword=ci-test \
-		--set falco.enabled=false \
-		--set nats.streamMaxBytesOverride=1073741824 \
+		-f $(CHART_DIR)/values-kind.yaml \
+		--set-string nats.streamMaxBytesOverride=536870912 \
 		--wait --timeout 5m
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) OLT_E2E_FORENSICS=1 go test -tags=e2e -v -count=1 -run TestKindSmoke_Forensics_FullSlice ./tests/e2e/...
 
@@ -397,7 +398,7 @@ e2e-local-overlays: helm-prepare helm-deps docker-build
 		--set-string image.tag=$(TAG) \
 		--set image.pullPolicy=Never \
 		--set secrets.redisPassword=ci-test \
-		--set falco.enabled=false \
+		-f $(CHART_DIR)/values-kind.yaml \
 		--set-string nats.streamMaxBytesOverride=536870912 \
 		-f $(CHART_DIR)/values-$(OVERLAY).yaml \
 		--wait --timeout 5m
@@ -439,8 +440,8 @@ eval-smoke: helm-prepare helm-deps docker-build
 		--set evaluation.config=RS \
 		--set baselines.warmupDuration=5s \
 		--set secrets.redisPassword=ci-test \
-		--set falco.enabled=false \
-		--set-string nats.streamMaxBytesOverride=1073741824 \
+		-f $(CHART_DIR)/values-kind.yaml \
+		--set-string nats.streamMaxBytesOverride=536870912 \
 		--wait --timeout 5m
 	go build $(LDFLAGS) -o bin/olaitan-eval ./cmd/olaitan-eval
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) go test -tags=e2e -v -count=1 -run TestEvalSmoke_S1_RS_OneTrial ./tests/e2e/...
@@ -475,8 +476,8 @@ scenarios-smoke: helm-prepare helm-deps docker-build
 		--set evaluation.config=RS \
 		--set baselines.warmupDuration=5s \
 		--set secrets.redisPassword=ci-test \
-		--set falco.enabled=false \
-		--set nats.streamMaxBytesOverride=1073741824 \
+		-f $(CHART_DIR)/values-kind.yaml \
+		--set-string nats.streamMaxBytesOverride=536870912 \
 		--wait --timeout 5m
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) go test -tags=e2e -v -count=1 -run 'TestKindSmoke_Scenarios' ./tests/e2e/...
 

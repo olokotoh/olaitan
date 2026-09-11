@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -231,6 +232,65 @@ func TestPreflightRunsTheKernelCheck(t *testing.T) {
 	for _, want := range []string{"lib/falco-kernel.sh", `falco_kernel_verdict "$KERNEL"`, "BLOCKERS=$((BLOCKERS+1))"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("hack/preflight.sh does not contain %q", want)
+		}
+	}
+}
+
+// --- Story 10.4: Falco is never disabled to make a test pass ------------
+
+// TestNoTestPathDisablesFalco is the CI guard for Story 10.4. Every e2e
+// target used to install with falco.enabled=false, on the stated grounds
+// that Falco's eBPF probe cannot load inside kind. That was false on any
+// BTF kernel (Falco's modern_ebpf runs in kind; it has on every run since
+// Story 10.1), and it meant the Falco -> collector -> aggregator path was
+// never exercised by a test. The rule (olaitan CLAUDE.local.md): if Falco
+// breaks, fix Falco.
+func TestNoTestPathDisablesFalco(t *testing.T) {
+	root := repoRoot(t)
+	disable := regexp.MustCompile(`falco\.enabled\s*[=:]\s*false`)
+	falseClaims := []string{
+		"eBPF probe is unavailable inside kind",
+		"eBPF is host-scoped",
+		"cannot load inside kind",
+		"does not have the\n// eBPF subsystem mounted",
+	}
+	var files []string
+	add := func(glob string) {
+		m, err := filepath.Glob(filepath.Join(root, glob))
+		if err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, m...)
+	}
+	add("Makefile")
+	add(".github/workflows/*.yml")
+	add("tests/e2e/*.go")
+	add("tests/e2e/fixtures/*")
+	add("hack/*.yaml")
+	add("hack/*.sh")
+	if len(files) < 5 {
+		t.Fatalf("scanned only %d files; the guard is not looking where the tests live", len(files))
+	}
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rel, _ := filepath.Rel(root, f)
+		for i, line := range strings.Split(string(raw), "\n") {
+			// preflight.sh tells an operator on a locked-down platform to
+			// run their own Falco; that is advice, not a test disabling it.
+			if rel == "hack/preflight.sh" {
+				continue
+			}
+			if disable.MatchString(line) {
+				t.Errorf("%s:%d disables Falco: %s", rel, i+1, strings.TrimSpace(line))
+			}
+		}
+		for _, claim := range falseClaims {
+			if strings.Contains(string(raw), claim) {
+				t.Errorf("%s repeats the false claim %q", rel, claim)
+			}
 		}
 	}
 }
