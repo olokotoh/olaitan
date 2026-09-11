@@ -269,6 +269,11 @@ type CorrelatorConfig struct {
 	MaxPackageBytes       *int         `yaml:"max_package_bytes,omitempty"`
 	MultiSignalMinSources *int         `yaml:"multi_signal_min_sources,omitempty"`
 	HighSeverityThreshold *int         `yaml:"high_severity_threshold,omitempty"`
+	// FalcoTriggerMinPriority is the Falco priority at and above which a
+	// Falco alert on a pod starts an investigation on its own (Story
+	// 10.3): off, warning, error, critical, alert or emergency. Empty
+	// means warning.
+	FalcoTriggerMinPriority string `yaml:"falco_trigger_min_priority,omitempty"`
 }
 
 // DefaultCorrelator returns Story 1.14's production defaults.
@@ -303,6 +308,15 @@ func (c CorrelatorConfig) MultiSignalMinSourcesOrDefault() int {
 	return *c.MultiSignalMinSources
 }
 
+// FalcoTriggerMinPriorityOrDefault returns the effective Falco trigger
+// floor, "warning" when omitted.
+func (c CorrelatorConfig) FalcoTriggerMinPriorityOrDefault() string {
+	if c.FalcoTriggerMinPriority == "" {
+		return "warning"
+	}
+	return strings.ToLower(c.FalcoTriggerMinPriority)
+}
+
 // HighSeverityThresholdOrDefault returns the effective severity
 // threshold, substituting the default when omitted.
 func (c CorrelatorConfig) HighSeverityThresholdOrDefault() int {
@@ -327,6 +341,14 @@ func (c CorrelatorConfig) validate() error {
 		if v < 0 || v > 100 {
 			return fmt.Errorf("detection.correlator.high_severity_threshold: must be in [0,100] (got %d)", v)
 		}
+	}
+	switch strings.ToLower(c.FalcoTriggerMinPriority) {
+	case "", "off", "warning", "error", "critical", "alert", "emergency":
+	default:
+		// Below warning, Notice rules such as "Terminal shell in
+		// container" fire on any kubectl exec and would open an
+		// investigation for every operator shell.
+		return fmt.Errorf("detection.correlator.falco_trigger_min_priority: want off, warning, error, critical, alert or emergency (got %q)", c.FalcoTriggerMinPriority)
 	}
 	return nil
 }

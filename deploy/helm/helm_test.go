@@ -2247,6 +2247,7 @@ func TestCorrelatorConfigMapBridgesValues(t *testing.T) {
 		"correlator.maxPackageBytes=131072",
 		"correlator.multiSignalMinSources=3",
 		"correlator.highSeverityThreshold=60",
+		"correlator.falcoTriggerMinPriority=critical",
 	})
 	idx := strings.Index(rendered, "correlator:")
 	if idx == -1 {
@@ -2261,6 +2262,7 @@ func TestCorrelatorConfigMapBridgesValues(t *testing.T) {
 		"max_package_bytes: 131072",
 		"multi_signal_min_sources: 3",
 		"high_severity_threshold: 60",
+		`falco_trigger_min_priority: "critical"`,
 	} {
 		if !strings.Contains(window, want) {
 			t.Errorf("rendered correlator block missing %q; got:\n%s", want, window)
@@ -2722,6 +2724,7 @@ func TestCorrelatorInvalidValuesFailFast(t *testing.T) {
 		{"cap", "correlator.maxPackageBytes=65536", "correlator.maxPackageBytes"},
 		{"sources", "correlator.multiSignalMinSources=1", "correlator.multiSignalMinSources"},
 		{"threshold", "correlator.highSeverityThreshold=101", "correlator.highSeverityThreshold"},
+		{"falco floor", "correlator.falcoTriggerMinPriority=notice", "correlator.falcoTriggerMinPriority"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -5419,4 +5422,88 @@ func firstLines(s string, n int) string {
 		lines = lines[:n]
 	}
 	return strings.Join(lines, "\n")
+}
+
+// TestKindOverlayExemptsOnlyKindsMountHook: Story 10.3. On kind, the
+// containerd hook /kind/bin/mount-product-files.sh runs mount inside every new
+// container, and Falco's Critical "Drop and execute new binary in container"
+// fires on each pod start. The kind overlay carries a narrow exception; the
+// default values must not, because real nodes do not run the hook.
+func TestKindOverlayExemptsOnlyKindsMountHook(t *testing.T) {
+	cmd := exec.Command("helm", "template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+		"-f", filepath.Join(chartDir(t), "values-kind.yaml"))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("render with values-kind.yaml: %v\n%s", err, out)
+	}
+	rules := docByKindName(t, string(out), "ConfigMap", "falco-rules")
+	body := fmt.Sprint(rules["data"])
+	for _, want := range []string{"Drop and execute new binary in container", "kind_mount_product_files_hook", "mount-product-f", "/usr/bin/mount", "exceptions: append"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("kind Falco rules ConfigMap is missing %q", want)
+		}
+	}
+	if strings.Contains(helmTemplate(t, nil), "kind_mount_product_files_hook") {
+		t.Error("the default install carries the kind-only Falco exception")
+	}
+}
+
+// TestNetworkPolicyAllowsTheRealAPIServer: Story 10.3. The release policy
+// allowed only networkPolicy.apiServerCIDR (kubeadm's 10.96.0.1), so on k3s
+// (10.43.0.1) and minikube (endpoint port 8443), both of which enforce
+// NetworkPolicy, the aggregator could not reach the API server and resolved
+// no workload at all. The chart now reads the real Service IP and endpoints
+// at install time. `helm template` has no cluster to read, so this checks the
+// offline fallback renders, and that the template actually consults both
+// lookups; the portability job proves the live path on k3s and minikube.
+func TestNetworkPolicyAllowsTheRealAPIServer(t *testing.T) {
+	nps := decodeNetpols(t, helmTemplate(t, nil))
+	np := nps["olaitan"]
+	raw, err := yaml.Marshal(np.Spec.Egress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "10.96.0.1/32") || !strings.Contains(string(raw), "6443") {
+		t.Errorf("offline render lost the apiServerCIDR fallback: %s", raw)
+	}
+	tpl, err := os.ReadFile(filepath.Join(chartDir(t), "templates", "networkpolicy.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`lookup "v1" "Service" "default" "kubernetes"`,
+		`lookup "discovery.k8s.io/v1" "EndpointSlice" "default" "kubernetes"`,
+		`lookup "v1" "Endpoints" "default" "kubernetes"`,
+	} {
+		if !strings.Contains(string(tpl), want) {
+			t.Errorf("networkpolicy.yaml does not consult %s", want)
+		}
+	}
+}
+
+// TestFalcoTriggerOffUnquoted: review of #134. Helm reads values files as
+// YAML 1.1, so `falcoTriggerMinPriority: off` (unquoted) arrives as the
+// boolean false. It used to be skipped silently, leaving the trigger on.
+func TestFalcoTriggerOffUnquoted(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "off.yaml")
+	if err := os.WriteFile(f, []byte("correlator:\n  falcoTriggerMinPriority: off\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("helm", "template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password", "-f", f).CombinedOutput()
+	if err != nil {
+		t.Fatalf("render: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), `falco_trigger_min_priority: "off"`) {
+		t.Errorf("unquoted off in a values file did not switch the trigger off; rendered: %s", grepLine(string(out), "falco_trigger_min_priority"))
+	}
+	on := filepath.Join(t.TempDir(), "on.yaml")
+	if err := os.WriteFile(on, []byte("correlator:\n  falcoTriggerMinPriority: on\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("helm", "template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password", "-f", on).CombinedOutput(); err == nil || !strings.Contains(string(out), "falcoTriggerMinPriority") {
+		t.Errorf("unquoted `on` (boolean true) was accepted; it names no priority: %v\n%s", err, out)
+	}
 }

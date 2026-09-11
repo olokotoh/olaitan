@@ -68,6 +68,15 @@ type Config struct {
 	// registry. When nil, the correlator runs without metrics (tests,
 	// multi-process eval harness, future eval-only deployments).
 	MetricsRegistry *metrics.Registry
+	// FalcoTriggerFloor is the Falco priority at and above which a Falco
+	// alert on a pod starts an investigation on its own (Story 10.3).
+	// "" means trigger.DefaultFalcoTriggerFloor ("warning"); "off"
+	// disables it.
+	FalcoTriggerFloor string
+	// ExcludedNamespaces (response.excluded_namespaces) never open a
+	// Falco-triggered investigation: Olaitan must not score its own pods
+	// or kube-system on a single alert.
+	ExcludedNamespaces []string
 }
 
 // Correlator owns the per-workload window and evidence publish path.
@@ -89,6 +98,16 @@ type Correlator struct {
 	// counter (Story 1.15 e.skippedSelf pattern at engine.go:225-233).
 	metrics                 correlatorMetrics
 	overflowSummarisedCount atomic.Int64
+
+	// Story 10.3. falcoFloor holds the trigger floor (a string);
+	// falcoFired dedupes one investigation per (workload, Falco rule) per
+	// window; windowNanos mirrors the window for that dedupe;
+	// hostEventsDropped counts events with no pod.
+	falcoFloor        atomic.Value
+	falcoFired        sync.Map // key workloadID + "\x00" + ruleID -> time.Time
+	windowNanos       atomic.Int64
+	hostEventsDropped atomic.Int64
+	excluded          atomic.Value // map[string]struct{}
 }
 
 type identityCacheEntry struct {
@@ -132,6 +151,12 @@ func New(cfg Config) (*Correlator, error) {
 		identityCacheTTL: ttl,
 	}
 	c.minSources.Store(int64(cfg.MultiSignalMinSources))
+	c.windowNanos.Store(int64(cfg.WindowDuration))
+	if err := trigger.ValidateFalcoTriggerFloor(cfg.FalcoTriggerFloor); err != nil {
+		return nil, fmt.Errorf("correlator: %w", err)
+	}
+	c.falcoFloor.Store(cfg.FalcoTriggerFloor)
+	c.SetExcludedNamespaces(cfg.ExcludedNamespaces)
 	if cfg.MetricsRegistry != nil {
 		if err := c.registerMetrics(cfg.MetricsRegistry); err != nil {
 			return nil, fmt.Errorf("correlator: register metrics: %w", err)
@@ -144,6 +169,7 @@ func New(cfg Config) (*Correlator, error) {
 func (c *Correlator) UpdateConfig(windowDuration time.Duration, minSources int) {
 	if windowDuration > 0 {
 		c.window.SetWindowDuration(windowDuration)
+		c.windowNanos.Store(int64(windowDuration))
 		ttl := windowDuration
 		if ttl > identityCacheTTLCeiling {
 			ttl = identityCacheTTLCeiling
@@ -154,6 +180,34 @@ func (c *Correlator) UpdateConfig(windowDuration time.Duration, minSources int) 
 		c.minSources.Store(int64(minSources))
 	}
 }
+
+// SetFalcoTriggerFloor hot-reloads the Falco trigger floor. An invalid
+// value is ignored (config validation rejects it before it gets here).
+func (c *Correlator) SetFalcoTriggerFloor(floor string) {
+	if trigger.ValidateFalcoTriggerFloor(floor) == nil {
+		c.falcoFloor.Store(floor)
+	}
+}
+
+// SetExcludedNamespaces replaces the namespaces whose Falco alerts never
+// start an investigation (hot-reloadable).
+func (c *Correlator) SetExcludedNamespaces(nss []string) {
+	m := make(map[string]struct{}, len(nss))
+	for _, ns := range nss {
+		m[ns] = struct{}{}
+	}
+	c.excluded.Store(m)
+}
+
+func (c *Correlator) isExcluded(ns string) bool {
+	m, _ := c.excluded.Load().(map[string]struct{})
+	_, ok := m[ns]
+	return ok
+}
+
+// HostEventsDropped is the cumulative count of events dropped because
+// they carry no Kubernetes pod (host processes, non-Kubernetes containers).
+func (c *Correlator) HostEventsDropped() int64 { return c.hostEventsDropped.Load() }
 
 // Run consumes the raw event JetStream hierarchy until ctx is cancelled.
 func (c *Correlator) Run(ctx context.Context) error {
@@ -240,6 +294,15 @@ func isExpectedFetchTimeout(err error) bool {
 // PodRef are treated as drop-and-continue so a malformed event cannot
 // tear down the ring.
 func (c *Correlator) AddEvent(ctx context.Context, ev schema.Event) (*schema.EvidencePackage, error) {
+	// Story 10.3: an event with no pod is a host process or a
+	// non-Kubernetes container. There is no workload to score or isolate,
+	// so it is dropped and counted. It used to be a WARN per event, which
+	// on a real node was several a second of noise.
+	if ev.Pod.Namespace == "" || ev.Pod.Name == "" {
+		c.hostEventsDropped.Add(1)
+		c.log.Debug("correlator: dropping event with no pod", "event_id", ev.ID, "source", ev.Source, "node", ev.Pod.Node)
+		return nil, nil
+	}
 	workloadID, identity, pod, err := c.resolveAndCacheIdentity(ctx, ev)
 	if err != nil {
 		// P14: validation errors are drop-and-continue. Surface them
@@ -252,17 +315,62 @@ func (c *Correlator) AddEvent(ctx context.Context, ev schema.Event) (*schema.Evi
 	if err != nil {
 		return nil, err
 	}
-	if !transitioned {
-		return nil, nil
+	var multi *schema.EvidencePackage
+	if transitioned {
+		tr := trigger.MultiSignal(snap, distinctSources(snap.Events), time.Now().UTC())
+		tr.ResolvedIdentity = &identity
+		// Pod is the cache-warm pod object captured at identity-resolution
+		// time. nil when the resolver took the no-kube or PodFallback path;
+		// the assembler degrades to its uncached resolveWorkload in that
+		// case. See trigger.Trigger.Pod and Story 1.14 P11.
+		tr.Pod = pod
+		if multi, err = c.publishTrigger(ctx, tr, snap); err != nil {
+			return nil, err
+		}
 	}
-	tr := trigger.MultiSignal(snap, distinctSources(snap.Events), time.Now().UTC())
+	// Story 10.3: a serious Falco alert starts an investigation on its own,
+	// once per (workload, rule) per window.
+	floor, _ := c.falcoFloor.Load().(string)
+	match, ok := trigger.FalcoRuleMatch(ev, floor)
+	if !ok || c.isExcluded(ev.Pod.Namespace) || !c.claimFalcoTrigger(workloadID, match.RuleID) {
+		return multi, nil
+	}
+	tr := trigger.RuleMatch(workloadID, match, time.Now().UTC())
 	tr.ResolvedIdentity = &identity
-	// Pod is the cache-warm pod object captured at identity-resolution
-	// time. nil when the resolver took the no-kube or PodFallback path;
-	// the assembler degrades to its uncached resolveWorkload in that
-	// case. See trigger.Trigger.Pod and Story 1.14 P11.
 	tr.Pod = pod
-	return c.publishTrigger(ctx, tr, snap)
+	pkg, err := c.publishTrigger(ctx, tr, snap)
+	if err != nil {
+		// Release the claim so the next alert can retry the publish.
+		c.falcoFired.Delete(workloadID + "\x00" + match.RuleID)
+		return multi, err
+	}
+	if multi != nil {
+		return multi, nil
+	}
+	return pkg, nil
+}
+
+// claimFalcoTrigger reports whether (workloadID, ruleID) may fire now, and
+// records the firing. A rule that already fired for this workload within
+// the window is part of the same investigation. Stale entries are pruned
+// on the way.
+func (c *Correlator) claimFalcoTrigger(workloadID, ruleID string) bool {
+	now := time.Now()
+	win := time.Duration(c.windowNanos.Load())
+	key := workloadID + "\x00" + ruleID
+	if prev, loaded := c.falcoFired.LoadOrStore(key, now); loaded {
+		if t, _ := prev.(time.Time); now.Sub(t) < win {
+			return false
+		}
+		c.falcoFired.Store(key, now)
+	}
+	c.falcoFired.Range(func(k, v any) bool {
+		if t, _ := v.(time.Time); now.Sub(t) >= win {
+			c.falcoFired.Delete(k)
+		}
+		return true
+	})
+	return true
 }
 
 // FireRuleMatch handles the future Story 1.15 external rule trigger input.

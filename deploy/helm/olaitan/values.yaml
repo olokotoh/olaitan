@@ -130,8 +130,16 @@ correlator:
   maxPackageBytes: 131072
   # @schema type:integer minimum:1 effect:"minimum distinct sources for a multi-signal EvidencePackage" ref:FR14
   multiSignalMinSources: 2
-  # @schema type:integer minimum:0 maximum:100 effect:"rule severity at or above which a single-signal package is still assembled" ref:FR14
+  # @schema type:integer minimum:0 maximum:100 effect:"event severity at or above which an event is kept first when a package overflows its size cap" ref:FR14
   highSeverityThreshold: 50
+  # Story 10.3: a Falco alert on a pod at or above this Falco priority
+  # starts an investigation on its own, as a rule_match (warning scores
+  # 20, the SUSPICIOUS band; even critical stays below RESTRICTED alone).
+  # Without it a single-sensor install never produces evidence. warning
+  # admits 17 of Falco's 24 default rules; notice is refused because a
+  # plain kubectl exec trips it.
+  # @schema type:string pattern:"off, warning, error, critical, alert or emergency" effect:"Falco priority at or above which one Falco alert on a pod starts an investigation" ref:FR14
+  falcoTriggerMinPriority: "warning"
 
 # --- Service endpoints -------------------------------------------------
 # Where Olaitan dials its dependencies. Empty by default -- the templates
@@ -240,10 +248,12 @@ networkPolicy:
   # Operators on eBPF dataplane MUST set this to the cluster's node CIDR
   # (e.g. "10.0.0.0/16"); otherwise pods never reach Ready.
   nodeCIDR: ""
-  # CIDR for the Kubernetes API server virtual IP. Default 10.96.0.1/32
-  # is the kubeadm 1.29 stock service-CIDR ClusterIP for the kubernetes
-  # Service. Override on clusters with a non-default service-CIDR. The
-  # aggregator's pod-patch path needs egress here.
+  # Extra API server address range allowed for egress. `helm install` and
+  # `helm upgrade` already allow the cluster's real `kubernetes` Service IP
+  # and API server endpoints, read at install time (Story 10.3). This is the
+  # fallback when there is no cluster to read (`helm template`, `--dry-run`,
+  # a rendered install manifest) and for an API server that can move (a
+  # managed control plane). 10.96.0.1/32 is kubeadm's and kind's Service IP.
   apiServerCIDR: "10.96.0.1/32"
   # Extra egress rules merged into the policy as-is. Operators populate
   # this with the LLM provider endpoints they actually use; values are

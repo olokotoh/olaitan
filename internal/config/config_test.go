@@ -551,6 +551,31 @@ func TestCorrelatorConfigOmittedSubstitutesDefault(t *testing.T) {
 	if got := cfg.Detection.Correlator.HighSeverityThresholdOrDefault(); got != 50 {
 		t.Errorf("HighSeverityThreshold: got %d, want 50", got)
 	}
+	if got := cfg.Detection.Correlator.FalcoTriggerMinPriorityOrDefault(); got != "warning" {
+		t.Errorf("FalcoTriggerMinPriority: got %q, want warning (Story 10.3 decision)", got)
+	}
+}
+
+// TestCorrelatorFalcoTriggerMinPriority: Story 10.3. The floor may be off
+// or warning upward; lower would let a plain kubectl exec (a Notice rule)
+// open an investigation every time.
+func TestCorrelatorFalcoTriggerMinPriority(t *testing.T) {
+	for _, v := range []string{"off", "warning", "critical"} {
+		body := strings.Replace(validYAML, "  baseline_window: 24h", "  baseline_window: 24h\n  correlator:\n    window_duration: 60s\n    falco_trigger_min_priority: "+v, 1)
+		cfg, err := config.Load(writeConfig(t, body))
+		if err != nil {
+			t.Fatalf("%s rejected: %v", v, err)
+		}
+		if got := cfg.Detection.Correlator.FalcoTriggerMinPriorityOrDefault(); got != v {
+			t.Errorf("got %q, want %q", got, v)
+		}
+	}
+	for _, v := range []string{"notice", "debug", "high"} {
+		body := strings.Replace(validYAML, "  baseline_window: 24h", "  baseline_window: 24h\n  correlator:\n    window_duration: 60s\n    falco_trigger_min_priority: "+v, 1)
+		if _, err := config.Load(writeConfig(t, body)); err == nil || !strings.Contains(err.Error(), "falco_trigger_min_priority") {
+			t.Errorf("%s: err = %v, want a falco_trigger_min_priority rejection", v, err)
+		}
+	}
 }
 
 func TestCorrelatorConfigExplicitKnobsHonoured(t *testing.T) {

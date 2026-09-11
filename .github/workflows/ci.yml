@@ -436,6 +436,38 @@ jobs:
           kubectl -n olaitan logs -l app.kubernetes.io/component=collector --tail=40 || true
           exit 1
 
+      # Story 10.3: the whole chain, on a real attack, with Falco ON and no
+      # event fabricated by the test. A fresh workload reads /etc/shadow;
+      # Falco's Warning rule "Read sensitive file untrusted" must reach the
+      # collector, become a rule_match evidence package, be scored, and move
+      # the workload's FSM state out of CLEAN, within the AC's 10 seconds.
+      - name: A real in-pod attack reaches the response FSM
+        run: |
+          set -euo pipefail
+          kubectl create namespace olaitan-e2e-attack
+          kubectl -n olaitan-e2e-attack create deployment victim --image=nginx:1.27-alpine
+          kubectl -n olaitan-e2e-attack rollout status deploy/victim --timeout=3m
+          # Let Falco's container plugin learn the new container.
+          sleep 10
+          pw="$(kubectl -n olaitan get secret olaitan-secrets -o jsonpath='{.data.redis-password}' | base64 -d)"
+          state() { kubectl -n olaitan exec olaitan-redis-master-0 -- redis-cli -a "$pw" --no-auth-warning \
+                      hget fsm:olaitan-e2e-attack/Deployment/victim current_state || true; }
+          start=$(date +%s)
+          kubectl -n olaitan-e2e-attack exec deploy/victim -- sh -c 'cat /etc/shadow > /dev/null'
+          while [ $(( $(date +%s) - start )) -le 10 ]; do
+            s="$(state)"
+            if [ -n "$s" ] && [ "$s" != "CLEAN" ]; then
+              echo "FSM state $s after $(( $(date +%s) - start ))s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::a real /etc/shadow read did not move the workload out of CLEAN within 10s"
+          kubectl -n olaitan exec deploy/olaitan-nats-box -- nats stream info EVIDENCE || true
+          kubectl -n olaitan logs -l app.kubernetes.io/name=falco -c falco --tail=40 | grep -i shadow || true
+          kubectl -n olaitan logs -l app.kubernetes.io/component=aggregator --tail=60 || true
+          exit 1
+
       # AC3: record the enforcement verdict per distribution. This is
       # deliberately NOT a pass/fail gate -- kindnet genuinely does not
       # enforce, and failing the build for a true fact would teach us to

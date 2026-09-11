@@ -27,6 +27,23 @@ and false-positive numbers; see [Unreleased](#unreleased).
 
 ### Changed
 
+- **A real attack now produces evidence on a default install** (#105). Until
+  now the only thing that could start an investigation was two sensors
+  agreeing about a pod, and the default install runs one (Falco), so a real
+  in-pod attack never got past the raw event stream. A Falco alert at
+  Warning or above on a pod now starts an investigation on its own, as a
+  `rule_match` (Warning 50, Error 75, Critical 90, Alert/Emergency 95 on
+  the OLT scale, so one alert of any priority moves a workload to
+  SUSPICIOUS and never alone to RESTRICTED). Falco-triggered packages are
+  evaluated by the OLT rules engine. Tunable with
+  `correlator.falcoTriggerMinPriority` (`off`, or `warning` upward). Falco's
+  fields are also projected onto the OLT canonical names (`process.exe`,
+  `file.path`, `network.dst_ip` ...), so OLT rules can match real Falco
+  events for the first time. Events with no pod are dropped and counted
+  (`olaitan_correlator_host_events_dropped_total`) instead of logged as a
+  WARN each. Excluded namespaces never open a Falco-triggered investigation.
+  The kind overlay exempts kind's own container-creation mount hook from
+  Falco's "Drop and execute new binary in container".
 - **Falco pinned to 0.45.0-rc1 (chart 9.1.0), the first release that stays up
   on kernel 7.x** (#103). 0.43.1 and 0.44.x exit every few minutes there
   (falcosecurity/falco#3955, fixed by falcosecurity/libs#3086). Soaked on

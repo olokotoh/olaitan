@@ -645,3 +645,67 @@ func (p *togglePub) PublishJS(_ context.Context, _ string, _ any, _ ...natsjs.Pu
 
 func (p *togglePub) maxInFlight() int { p.mu.Lock(); defer p.mu.Unlock(); return p.peak }
 func (p *togglePub) lastOK() bool     { p.mu.Lock(); defer p.mu.Unlock(); return p.last }
+
+// --- Story 10.3: canonical field projection -------------------------------
+
+// The OLT rules name fields canonically (process.exe, file.path,
+// user.username, network.dst_ip ...), and the rules resolver reads the
+// top-level keys of Event.Raw. Falco's fields lived only inside
+// output_fields, so no OLT rule could ever match a real Falco event
+// (deferred "BI-1" since Story 1.16). Translate now projects them.
+func TestTranslate_ProjectsCanonicalFieldsFromARealAlert(t *testing.T) {
+	resp, err := DecodeHTTPOutput(fixture(t, "http_output_alert.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev, err := Translate(resp, "kind-node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(ev.Raw, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for k, want := range map[string]string{
+		"process.exe":     "/bin/cat",
+		"process.name":    "cat",
+		"process.cmdline": "cat /etc/shadow",
+		"process.parent":  "sh",
+		"file.path":       "/etc/shadow",
+		"user.username":   "root",
+		"user.uid":        "0",
+		"container.id":    "26f85eff83d7",
+	} {
+		if raw[k] != want {
+			t.Errorf("Raw[%q] = %v, want %q", k, raw[k], want)
+		}
+	}
+	// The event has no network endpoint, so no network key is invented.
+	for _, k := range []string{"network.dst_ip", "network.dst_port"} {
+		if _, ok := raw[k]; ok {
+			t.Errorf("Raw has %s for a file event", k)
+		}
+	}
+	// Falco's own fields stay, for forensics and existing consumers.
+	if _, ok := raw["output_fields"]; !ok {
+		t.Error("output_fields was dropped")
+	}
+}
+
+func TestTranslate_ProjectsNetworkFieldsAndNotSocketNamesAsFiles(t *testing.T) {
+	body := []byte(`{"hostname":"n","output":"o","priority":"Notice","rule":"Outbound","source":"syscall","time":"2026-09-11T05:00:42Z",` +
+		`"output_fields":{"fd.name":"10.244.0.5:40000->169.254.169.254:80","fd.sip":"169.254.169.254","fd.sport":80,"fd.l4proto":"tcp","proc.exepath":"/usr/bin/curl"}}`)
+	resp, err := DecodeHTTPOutput(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev, _ := Translate(resp, "n")
+	var raw map[string]any
+	_ = json.Unmarshal(ev.Raw, &raw)
+	if raw["network.dst_ip"] != "169.254.169.254" || raw["network.dst_port"] != "80" || raw["network.protocol"] != "tcp" {
+		t.Errorf("network projection = %v / %v / %v", raw["network.dst_ip"], raw["network.dst_port"], raw["network.protocol"])
+	}
+	if _, ok := raw["file.path"]; ok {
+		t.Errorf("a socket name was projected as file.path: %v", raw["file.path"])
+	}
+}

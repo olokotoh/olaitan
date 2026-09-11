@@ -81,6 +81,16 @@ func (c *Correlator) registerMetrics(reg *metrics.Registry) error {
 	c.metrics.windowSizeBytes = h
 
 	if err := reg.RegisterCounter(
+		"olaitan_correlator_host_events_dropped_total",
+		"",
+		"Cumulative events dropped because they carry no Kubernetes pod: host processes and non-Kubernetes containers, which have no workload to score or isolate (Story 10.3).",
+		nil,
+		func() int64 { return c.hostEventsDropped.Load() },
+	); err != nil {
+		return err
+	}
+
+	if err := reg.RegisterCounter(
 		"olaitan_correlator_overflow_summarised_total",
 		"",
 		"Cumulative EvidencePackages whose Events slice was reduced by the assembler size-cap enforcement path (pkg.Overflow non-nil). Increment is one per publish, not per dropped event; for per-event accounting see pkg.Overflow.DroppedEventCount carried inline on the package.",
