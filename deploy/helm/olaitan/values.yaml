@@ -1377,7 +1377,7 @@ falco:
     # namespace. The port must match falcoIngest.port (the guard checks).
     env:
       - name: OLAITAN_FALCO_URL
-        value: 'http://{{ include "olaitan.falcoIngest.releaseFullname" . }}-falco-ingest.{{ .Release.Namespace }}.svc:8765/falco/'
+        value: 'http://{{ include "olaitan.falcoIngest.releaseServiceName" . }}.{{ .Release.Namespace }}.svc:8765/falco/'
       - name: OLAITAN_FALCO_TOKEN
         valueFrom:
           secretKeyRef:

@@ -181,7 +181,11 @@ func TestDecodeHTTPOutput_Rejects(t *testing.T) {
 		"no time":        `{"rule":"r","priority":"Warning","output":"o"}`,
 		"bad time":       `{"rule":"r","priority":"Warning","time":"yesterday","output":"o"}`,
 		"no rule":        `{"priority":"Warning","time":"2026-09-11T05:00:42Z","output":"o"}`,
-		"array body":     `[]`,
+		// Copilot review: Decoder.More() is false before a closing
+		// delimiter, so these slipped through.
+		"trailing brace":   `{"rule":"r","priority":"Warning","time":"2026-09-11T05:00:42Z","output":"o"}}`,
+		"trailing bracket": `{"rule":"r","priority":"Warning","time":"2026-09-11T05:00:42Z","output":"o"}]`,
+		"array body":       `[]`,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -582,3 +586,62 @@ func TestNew_ShutdownGraceCoversThePublishBudget(t *testing.T) {
 		t.Errorf("an explicit ShutdownGrace below the publish budget was kept: %s <= %s", b.cfg.ShutdownGrace, b.cfg.PublishWallClockBudget)
 	}
 }
+
+// Copilot review: net/http runs handlers concurrently. The publish and the
+// health update must stay sequenced, or a late failed publish can overwrite
+// health after a later success. Many concurrent alerts against a publisher
+// that fails every other call must leave health consistent with the LAST
+// publish outcome.
+func TestHandler_ConcurrentAlertsKeepHealthSequenced(t *testing.T) {
+	pub := &togglePub{}
+	a := newTestAdapter(t, pub, nil)
+	body := fixture(t, "http_output_alert.json")
+	var wg sync.WaitGroup
+	for i := 0; i < 64; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			post(t, a, "/falco/"+testToken, "application/json", body)
+		}()
+	}
+	wg.Wait()
+	if pub.maxInFlight() > 1 {
+		t.Errorf("%d publishes ran at once; the publish path must be sequential", pub.maxInFlight())
+	}
+	healthy, _ := a.Health().Status()
+	if last := pub.lastOK(); healthy != last {
+		t.Errorf("health=%v but the last publish ok=%v", healthy, last)
+	}
+}
+
+// togglePub fails every other publish and records how many run at once.
+type togglePub struct {
+	mu       sync.Mutex
+	n        int
+	inFlight int
+	peak     int
+	last     bool
+}
+
+func (p *togglePub) PublishJS(_ context.Context, _ string, _ any, _ ...natsjs.PublishOpt) (*natsjs.PubAck, error) {
+	p.mu.Lock()
+	p.inFlight++
+	if p.inFlight > p.peak {
+		p.peak = p.inFlight
+	}
+	p.n++
+	ok := p.n%2 == 0
+	p.mu.Unlock()
+	time.Sleep(time.Millisecond)
+	p.mu.Lock()
+	p.inFlight--
+	p.last = ok
+	p.mu.Unlock()
+	if !ok {
+		return nil, errors.New("nats: timeout")
+	}
+	return &natsjs.PubAck{}, nil
+}
+
+func (p *togglePub) maxInFlight() int { p.mu.Lock(); defer p.mu.Unlock(); return p.peak }
+func (p *togglePub) lastOK() bool     { p.mu.Lock(); defer p.mu.Unlock(); return p.last }

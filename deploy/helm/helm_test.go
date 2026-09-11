@@ -4880,6 +4880,10 @@ func TestFalcoIngestFollowsTheRelease(t *testing.T) {
 		{"olaitan", "olaitan", "olaitan"},
 		{"foo", "sec", "foo-olaitan"},
 		{"my-olaitan", "x", "my-olaitan"},
+		// Copilot review: Helm allows 53-character release names, and
+		// <name>-olaitan-falco-ingest then exceeds a 63-character DNS
+		// label. Both sides must truncate identically.
+		{strings.Repeat("r", 53), "x", strings.Repeat("r", 53) + "-olaitan"},
 	} {
 		t.Run(tc.release, func(t *testing.T) {
 			cmd := exec.Command("helm", "template", tc.release, chartDir(t), "-n", tc.ns,
@@ -4891,7 +4895,11 @@ func TestFalcoIngestFollowsTheRelease(t *testing.T) {
 			}
 			rendered := stdout.String()
 			env := falcoEnv(t, rendered)
-			wantURL := "http://" + tc.fullname + "-falco-ingest." + tc.ns + ".svc:8765/falco/"
+			svcName := tc.fullname + "-falco-ingest"
+			if len(svcName) > 63 {
+				svcName = strings.TrimSuffix(svcName[:63], "-")
+			}
+			wantURL := "http://" + svcName + "." + tc.ns + ".svc:8765/falco/"
 			if env["OLAITAN_FALCO_URL"]["value"] != wantURL {
 				t.Errorf("OLAITAN_FALCO_URL = %v, want %s", env["OLAITAN_FALCO_URL"]["value"], wantURL)
 			}
@@ -4899,9 +4907,26 @@ func TestFalcoIngestFollowsTheRelease(t *testing.T) {
 			if ref["name"] != tc.fullname+"-secrets" {
 				t.Errorf("token Secret = %v, want %s-secrets", ref["name"], tc.fullname)
 			}
-			svc := docByKindName(t, rendered, "Service", "falco-ingest")
-			if svc["metadata"].(map[string]any)["name"] != tc.fullname+"-falco-ingest" {
-				t.Errorf("ingest Service is %v, want %s-falco-ingest", svc["metadata"].(map[string]any)["name"], tc.fullname)
+			var svc map[string]any
+			dec := yaml.NewDecoder(strings.NewReader(rendered))
+			for {
+				var doc map[string]any
+				if err := dec.Decode(&doc); err != nil {
+					break
+				}
+				if doc == nil || doc["kind"] != "Service" {
+					continue
+				}
+				labels, _ := doc["metadata"].(map[string]any)["labels"].(map[string]any)
+				if labels["app.kubernetes.io/component"] == "falco-ingest" {
+					svc = doc
+				}
+			}
+			if svc == nil {
+				t.Fatal("no Service labelled app.kubernetes.io/component=falco-ingest")
+			}
+			if svc["metadata"].(map[string]any)["name"] != svcName {
+				t.Errorf("ingest Service is %v, want %s", svc["metadata"].(map[string]any)["name"], svcName)
 			}
 		})
 	}

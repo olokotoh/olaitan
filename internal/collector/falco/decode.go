@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -75,7 +76,9 @@ func DecodeHTTPOutput(body []byte) (*falcopb.Response, error) {
 	if err := dec.Decode(&in); err != nil {
 		return nil, fmt.Errorf("falco: decode: %w", err)
 	}
-	if dec.More() {
+	// Decoder.More() is false before a closing delimiter, so `{...}}`
+	// would pass it. Require end of input after the one object.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return nil, errors.New("falco: decode: trailing data after the alert object")
 	}
 	if in.Rule == "" {

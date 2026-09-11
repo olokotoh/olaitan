@@ -47,14 +47,18 @@ done
 buf generate
 ```
 
-`version.proto` is intentionally omitted: the adapter only consumes the
-`outputs.service.Sub` RPC; vendoring `version.proto` would create
-duplicate `request` and `response` Go types that conflict with the
-outputs service in this single Go package.
+Only the message types are generated (`buf.gen.yaml` has no gRPC plugin).
+The adapter uses `Response` as the model it decodes Falco's http_output JSON
+into; nothing dials a Falco gRPC service. Upstream Falco 0.44.0 deleted
+`outputs.proto` together with the gRPC output (falcosecurity/falco#3798), so
+re-vendor from the 0.43.1 tag, the last one that has it, or replace this
+package with a hand-written struct if the model ever needs to change.
+`version.proto` stays omitted: it would add duplicate `request` and
+`response` types to this single Go package.
 
 ## Files
 
-- `outputs.proto`: the `falco.outputs.service` gRPC service. `Sub(stream Request) -> stream Response` plus the `Get` unary fallback.
+- `outputs.proto`: upstream's `falco.outputs` definitions as of 0.43.1. Only the `Request`/`Response` messages are generated; the service block is inert.
 - `schema.proto`: the `falco.schema.priority` and `falco.schema.source` enums referenced by `outputs.proto`.
 - `*.pb.go`: generated message bindings. Do not edit.
 - `buf.{yaml,gen.yaml}`: buf config for re-generation.

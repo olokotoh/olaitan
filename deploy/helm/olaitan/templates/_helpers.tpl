@@ -370,6 +370,12 @@ overrides make the two disagree, with the literal values to set instead.
 {{- end -}}
 {{- end -}}
 
+{{/* The ingest Service name as the Falco subchart computes it: same
+     63-character truncation as serviceName, from releaseFullname. */}}
+{{- define "olaitan.falcoIngest.releaseServiceName" -}}
+{{- printf "%s-falco-ingest" (include "olaitan.falcoIngest.releaseFullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
 {{- define "olaitan.falcoIngest.serviceName" -}}
 {{- printf "%s-falco-ingest" (include "olaitan.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
@@ -399,7 +405,7 @@ overrides make the two disagree, with the literal values to set instead.
 {{- if eq .name "OLAITAN_FALCO_URL" -}}{{- $url = default "" .value | toString -}}{{- end -}}
 {{- if and (eq .name "OLAITAN_FALCO_TOKEN") .valueFrom .valueFrom.secretKeyRef -}}{{- $tokenRef = .valueFrom.secretKeyRef -}}{{- end -}}
 {{- end -}}
-{{- $templated := contains "olaitan.falcoIngest.releaseFullname" $url -}}
+{{- $templated := contains "olaitan.falcoIngest.releaseServiceName" $url -}}
 {{- if $templated -}}
 {{- if ne (include "olaitan.fullname" .) (include "olaitan.falcoIngest.releaseFullname" .) -}}
 {{- fail (printf "nameOverride/fullnameOverride rename this release's resources to %q, which the Falco subchart cannot see. Set Falco's env explicitly:\n  --set-string falco.extra.env[0].value=%s\n  (and falco.extra.env[1].valueFrom.secretKeyRef.name=%s)" (include "olaitan.fullname" .) (include "olaitan.falcoIngest.baseURL" .) $secret) -}}

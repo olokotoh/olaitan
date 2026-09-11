@@ -186,6 +186,14 @@ type Adapter struct {
 	addrMu sync.Mutex
 	addr   string
 
+	// seq serialises everything after decode: the liveness mark, the rate
+	// limiter, the publish and the health update. net/http runs handlers
+	// concurrently; without this a late failed publish could overwrite
+	// health after a later success, and events could reorder. Falco's
+	// http_output sends one request at a time, so this costs nothing in
+	// practice and gives natural backpressure if it ever does not.
+	seq sync.Mutex
+
 	nowFn func() time.Time
 }
 
@@ -429,6 +437,9 @@ func (a *Adapter) handleAlert(w http.ResponseWriter, r *http.Request) {
 		a.respond(w, http.StatusBadRequest, "bad request")
 		return
 	}
+
+	a.seq.Lock()
+	defer a.seq.Unlock()
 
 	// Anything well-formed from Falco proves it is alive.
 	a.sawFalco()
