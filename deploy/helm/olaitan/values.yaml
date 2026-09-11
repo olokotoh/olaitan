@@ -130,8 +130,16 @@ correlator:
   maxPackageBytes: 131072
   # @schema type:integer minimum:1 effect:"minimum distinct sources for a multi-signal EvidencePackage" ref:FR14
   multiSignalMinSources: 2
-  # @schema type:integer minimum:0 maximum:100 effect:"rule severity at or above which a single-signal package is still assembled" ref:FR14
+  # @schema type:integer minimum:0 maximum:100 effect:"event severity at or above which an event is kept first when a package overflows its size cap" ref:FR14
   highSeverityThreshold: 50
+  # Story 10.3: a Falco alert on a pod at or above this Falco priority
+  # starts an investigation on its own, as a rule_match (warning scores
+  # 20, the SUSPICIOUS band; even critical stays below RESTRICTED alone).
+  # Without it a single-sensor install never produces evidence. warning
+  # admits 17 of Falco's 24 default rules; notice is refused because a
+  # plain kubectl exec trips it.
+  # @schema type:string pattern:"off, warning, error, critical, alert or emergency" effect:"Falco priority at or above which one Falco alert on a pod starts an investigation" ref:FR14
+  falcoTriggerMinPriority: "warning"
 
 # --- Service endpoints -------------------------------------------------
 # Where Olaitan dials its dependencies. Empty by default -- the templates

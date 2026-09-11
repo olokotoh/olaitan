@@ -21,6 +21,10 @@ detection:
     max_package_bytes: 131072
     multi_signal_min_sources: 2
     high_severity_threshold: 50
+    # Story 10.3: a Falco alert on a pod at or above this priority starts
+    # an investigation on its own (a rule_match, severity 50 for warning
+    # up to 100). off, warning, error, critical, alert or emergency.
+    falco_trigger_min_priority: "warning"
   # Story 1.7: per-source adapter configuration. The audit-webhook
   # receiver is gated on enabled; chart deploys with
   # auditWebhook.enabled=false leave this block at its zero value and

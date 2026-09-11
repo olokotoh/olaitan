@@ -30,3 +30,29 @@ response:
 # first stream exhausts the volume (issue #96).
 #
 # HOST LIMITS. Same inotify caveat as minikube -- hack/preflight.sh reports it.
+
+# FALCO ON KIND (Story 10.3). A kind node is itself a container, and kind's
+# containerd runs an OCI hook, /kind/bin/mount-product-files.sh, inside every
+# new container while it is being created. The hook's `mount -o ro,bind ...`
+# executes from the node container's writable overlay layer, so Falco's
+# Critical rule "Drop and execute new binary in container" fires on EVERY pod
+# start, attributed to the new pod. Since a Falco Warning or above now starts
+# an investigation on its own, every rollout on kind would mark the workload
+# SUSPICIOUS. Observed live on nginx:1.27-alpine and on Olaitan's own pods.
+#
+# The exception is as narrow as the evidence: only when the parent is that
+# hook (process name truncated to 15 characters by the kernel) AND the binary
+# is mount or umount. Everything else the rule catches is still caught. Real
+# nodes do not run this hook, so the default values carry no exception.
+falco:
+  customRules:
+    olaitan-kind-exceptions.yaml: |-
+      - rule: Drop and execute new binary in container
+        exceptions:
+          - name: kind_mount_product_files_hook
+            fields: [proc.pname, proc.exepath]
+            comps: [=, in]
+            values:
+              - [mount-product-f, [/usr/bin/mount, /usr/bin/umount]]
+        override:
+          exceptions: append

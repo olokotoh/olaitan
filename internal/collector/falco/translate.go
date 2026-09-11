@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -105,6 +106,9 @@ func Translate(resp *falcopb.Response, hostname string) (schema.Event, error) {
 		"tags":           tags,
 		"source":         resp.GetSource(),
 		"falco_hostname": resp.GetHostname(),
+	}
+	for k, v := range canonicalFields(fields) {
+		rawPayload[k] = v
 	}
 	rawJSON, err := json.Marshal(rawPayload)
 	if err != nil {
@@ -247,4 +251,51 @@ func severityFromPriority(p falcopb.Priority) string {
 	default:
 		return "informational"
 	}
+}
+
+// canonicalFieldSources maps each OLT canonical field name to the Falco
+// output fields that can supply it, in preference order. Story 10.3: the
+// OLT rules and the rules resolver read canonical names from the top level
+// of Event.Raw, and Falco's fields lived only inside output_fields, so no
+// OLT rule could match a real Falco event. Only fields present in the
+// alert are projected; nothing is invented.
+var canonicalFieldSources = []struct {
+	canonical string
+	falco     []string
+}{
+	{"process.exe", []string{"proc.exepath", "proc.exe"}},
+	{"process.name", []string{"proc.name"}},
+	{"process.cmdline", []string{"proc.cmdline"}},
+	{"process.parent", []string{"proc.pname"}},
+	{"process.pid", []string{"proc.pid"}},
+	{"process.cap_effective", []string{"thread.cap_effective"}},
+	{"user.username", []string{"user.name"}},
+	{"user.uid", []string{"user.uid"}},
+	{"container.id", []string{"container.id"}},
+	{"network.dst_ip", []string{"fd.sip", "fd.rip"}},
+	{"network.dst_port", []string{"fd.sport", "fd.rport"}},
+	{"network.protocol", []string{"fd.l4proto"}},
+}
+
+// canonicalFields projects Falco output fields onto the OLT canonical
+// names. file.path comes from fd.name only when that is a filesystem path:
+// for a socket Falco renders fd.name as "ip:port->ip:port", which must not
+// match file rules.
+func canonicalFields(fields map[string]string) map[string]string {
+	out := make(map[string]string, len(canonicalFieldSources)+1)
+	for _, m := range canonicalFieldSources {
+		for _, f := range m.falco {
+			if v := fields[f]; v != "" && v != "<NA>" {
+				out[m.canonical] = v
+				break
+			}
+		}
+	}
+	for _, f := range []string{"fs.path.name", "fd.name"} {
+		if v := fields[f]; strings.HasPrefix(v, "/") {
+			out["file.path"] = v
+			break
+		}
+	}
+	return out
 }

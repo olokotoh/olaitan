@@ -69,6 +69,14 @@ The catalogue is organised by registering ring + story, in commit chronology so 
 - **Sample PromQL (aggregate):** `sum(rate(olaitan_sensor_audit_rejected_total[5m])) by (reason)` (per-reason rejection rate).
 - **Sample PromQL (alert):** `rate(olaitan_sensor_audit_rejected_total{reason="decode_error"}[5m]) > 0.1` for 10 minutes (page on sustained decode failures suggesting an API-server payload schema change).
 
+#### `olaitan_correlator_host_events_dropped_total` (Story 10.3)
+
+- **Type:** counter
+- **Unit:** count
+- **Labels:** none
+- **Help:** Events dropped by the correlator because they carry no Kubernetes pod: host processes and non-Kubernetes containers. There is no workload to score or isolate. On a busy node this is most of Falco's output, which is why it is a counter rather than a log line.
+- **Sample PromQL (aggregate):** `rate(olaitan_correlator_host_events_dropped_total[5m])`.
+
 #### `olaitan_sensor_falco_http_requests_total` (Story 10.2)
 
 - **Type:** counter

@@ -2247,6 +2247,7 @@ func TestCorrelatorConfigMapBridgesValues(t *testing.T) {
 		"correlator.maxPackageBytes=131072",
 		"correlator.multiSignalMinSources=3",
 		"correlator.highSeverityThreshold=60",
+		"correlator.falcoTriggerMinPriority=critical",
 	})
 	idx := strings.Index(rendered, "correlator:")
 	if idx == -1 {
@@ -2261,6 +2262,7 @@ func TestCorrelatorConfigMapBridgesValues(t *testing.T) {
 		"max_package_bytes: 131072",
 		"multi_signal_min_sources: 3",
 		"high_severity_threshold: 60",
+		`falco_trigger_min_priority: "critical"`,
 	} {
 		if !strings.Contains(window, want) {
 			t.Errorf("rendered correlator block missing %q; got:\n%s", want, window)
@@ -2722,6 +2724,7 @@ func TestCorrelatorInvalidValuesFailFast(t *testing.T) {
 		{"cap", "correlator.maxPackageBytes=65536", "correlator.maxPackageBytes"},
 		{"sources", "correlator.multiSignalMinSources=1", "correlator.multiSignalMinSources"},
 		{"threshold", "correlator.highSeverityThreshold=101", "correlator.highSeverityThreshold"},
+		{"falco floor", "correlator.falcoTriggerMinPriority=notice", "correlator.falcoTriggerMinPriority"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -5419,4 +5422,29 @@ func firstLines(s string, n int) string {
 		lines = lines[:n]
 	}
 	return strings.Join(lines, "\n")
+}
+
+// TestKindOverlayExemptsOnlyKindsMountHook: Story 10.3. On kind, the
+// containerd hook /kind/bin/mount-product-files.sh runs mount inside every new
+// container, and Falco's Critical "Drop and execute new binary in container"
+// fires on each pod start. The kind overlay carries a narrow exception; the
+// default values must not, because real nodes do not run the hook.
+func TestKindOverlayExemptsOnlyKindsMountHook(t *testing.T) {
+	cmd := exec.Command("helm", "template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+		"-f", filepath.Join(chartDir(t), "values-kind.yaml"))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("render with values-kind.yaml: %v\n%s", err, out)
+	}
+	rules := docByKindName(t, string(out), "ConfigMap", "falco-rules")
+	body := fmt.Sprint(rules["data"])
+	for _, want := range []string{"Drop and execute new binary in container", "kind_mount_product_files_hook", "mount-product-f", "/usr/bin/mount", "exceptions: append"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("kind Falco rules ConfigMap is missing %q", want)
+		}
+	}
+	if strings.Contains(helmTemplate(t, nil), "kind_mount_product_files_hook") {
+		t.Error("the default install carries the kind-only Falco exception")
+	}
 }

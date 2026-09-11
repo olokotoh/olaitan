@@ -28,7 +28,8 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 |-------|------|---------|-------------|--------|-----|
 | `correlator.windowDuration` | duration | `"60s"` | - | sliding correlation window per workload; signals within it assemble into one EvidencePackage | FR14 |
 | `correlator.multiSignalMinSources` | integer | `2` | minimum 1 | minimum distinct sources for a multi-signal EvidencePackage | FR14 |
-| `correlator.highSeverityThreshold` | integer | `50` | 0 to 100 | rule severity at or above which a single-signal package is still assembled | FR14 |
+| `correlator.highSeverityThreshold` | integer | `50` | 0 to 100 | event severity at or above which an event is kept first when a package overflows its size cap | FR14 |
+| `correlator.falcoTriggerMinPriority` | string | `"warning"` | off, warning, error, critical, alert or emergency | Falco priority at or above which one Falco alert on a pod starts an investigation | FR14 |
 
 ## `falcoIngest`
 
