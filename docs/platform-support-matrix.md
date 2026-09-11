@@ -94,7 +94,7 @@ and `hack/preflight.sh` judges every node kernel against it.
 | Kernel | Falco 0.43.1 / 0.44.x | Falco 0.45.0-rc1 (pinned) | Evidence |
 | --- | --- | --- | --- |
 | < 5.8 | depends on distro backports of BTF + BPF ring buffer | same | Falco kernel docs: "usually all versions `>=5.8` are enough" |
-| 5.8 to 6.x | runs | runs | upstream reports, no kernel-specific defect known |
+| 5.8 to 6.x | **mostly runs**; exits at start under minikube on GitHub's `6.17.0-1022-azure` runners (exit 2 within 1s, CI 2026-09-11; cause not captured) | runs, including that minikube runner | CI portability matrix; kind and k3s on the same runners pass with both |
 | **7.0** | ❌ **exits every few minutes** | ✅ **verified: 30 min soak, 0 restarts** (kind, 7.0.0-31-generic) | falcosecurity/falco#3955; reproduced here on 0.43.1: 12 restarts in 63 min |
 | > 7.0 | ❌ same defect reported on 7.1.2 | untested here; reported fixed on 7.2 in falcosecurity/falco#3955 | preflight prints a caveat |
 
