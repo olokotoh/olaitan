@@ -2113,7 +2113,10 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 	// applog source that is not there.
 	if os.Getenv("OLAITAN_APPLOG_ENABLED") == "true" {
 		tracker := collectorapplog.NewSidecarTracker(nodeName, 3*collectorapplog.HeartbeatInterval)
-		subj, serr := subjects.Health("applog")
+		// Node-scoped: this collector hears only its own node's
+		// sidecars, so a large cluster does not fan every heartbeat out
+		// to every collector.
+		subj, serr := collectorapplog.HeartbeatSubject(nodeName)
 		if serr != nil {
 			closeNATS()
 			return fmt.Errorf("collector: applog heartbeat subject: %w", serr)

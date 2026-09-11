@@ -5563,6 +5563,14 @@ func TestApplogWebhookGivesSidecarsANATSURL(t *testing.T) {
 	if got := envOf([]string{"endpoints.nats=nats://nats.infra.svc:4222"}); got != "nats://nats.infra.svc:4222" {
 		t.Errorf("an explicit endpoints.nats was not used: %q", got)
 	}
+	// A short override resolves for the collector and the aggregator, which
+	// run in this namespace, and for nothing else. Injected sidecars run in
+	// the workload's namespace, so it must fail at render rather than
+	// crash-loop every sidecar in the cluster.
+	if msg := helmTemplateExpectError(t, []string{"applogSidecar.enabled=true", "applogSidecar.tls.servingCert=Yw==",
+		"applogSidecar.tls.servingKey=aw==", "applogSidecar.tls.caBundle=Yw==", "endpoints.nats=nats://nats:4222"}); !strings.Contains(msg, "endpoints.nats") {
+		t.Errorf("a short endpoints.nats rendered, or failed without naming it: %s", msg)
+	}
 }
 
 // TestCollectorKnowsWhetherApplogIsOn: Story 10.10. The collector tracks

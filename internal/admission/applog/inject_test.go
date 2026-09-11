@@ -29,6 +29,17 @@ func defaultInjectOpts() InjectOptions {
 	return InjectOptions{
 		UseNativeSidecar: true,
 		SidecarImage:     "ghcr.io/olokotoh/olaitan:dev",
+		SidecarNATSURL:   "nats://olaitan-nats.olaitan.svc:4222",
+	}
+}
+
+// Story 10.10: a sidecar with no NATS address exits at start, so no caller
+// may produce one, webhook or not.
+func TestInject_EmptyNATSURL_Errors(t *testing.T) {
+	opts := defaultInjectOpts()
+	opts.SidecarNATSURL = ""
+	if _, err := Inject(samplePod(), opts); err == nil {
+		t.Error("Inject accepted an empty sidecar NATS URL")
 	}
 }
 

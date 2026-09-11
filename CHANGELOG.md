@@ -47,7 +47,9 @@ and false-positive numbers; see [Unreleased](#unreleased).
   silent: each now publishes a 30s heartbeat on `olaitan.health.applog`, and
   the collector on the same node reports `olaitan_source_healthy{source="applog"}`,
   `olaitan_sensor_events_total{source="applog"}` and the new
-  `olaitan_sensor_applog_sidecars{state}` gauge.
+  `olaitan_sensor_applog_sidecars{state}` gauge. After upgrading, restart
+  annotated workloads: pods injected by the older webhook keep the sidecar
+  with the empty address until they are recreated.
 - **Falco is ON in every test** (#106). All six e2e Makefile targets and
   four CI jobs installed with Falco switched off, on the claim that its eBPF
   probe could not load inside kind. That was false on any BTF kernel, and it
