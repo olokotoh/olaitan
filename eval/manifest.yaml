@@ -29,7 +29,7 @@ kubernetes_patch_version: 1.29.x
 # deploy/helm/olaitan/Chart.yaml (the corpus ships with the chart). Digest
 # verification of this corpus is deferred (allow-listed) until it is
 # harness-reachable (Story 5.x).
-falco_rule_corpus_tag: falco-chart-8.0.2
+falco_rule_corpus_tag: falco-chart-9.1.0
 
 # (4) Sigma corpus git SHA. The commit of the rules/ OLT Sigma corpus
 # (latest commit touching rules/ at envelope-creation time). Regenerate:

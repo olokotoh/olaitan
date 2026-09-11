@@ -168,7 +168,7 @@ metadata:
   name: olaitan-falco
   namespace: default
   labels:
-    helm.sh/chart: falco-8.0.2
+    helm.sh/chart: falco-9.1.0
     app.kubernetes.io/name: falco
     app.kubernetes.io/instance: olaitan
     app.kubernetes.io/version: "APP_VERSION_REDACTED"
@@ -272,7 +272,7 @@ metadata:
   name: olaitan-falco
   namespace: default
   labels:
-    helm.sh/chart: falco-8.0.2
+    helm.sh/chart: falco-9.1.0
     app.kubernetes.io/name: falco
     app.kubernetes.io/instance: olaitan
     app.kubernetes.io/version: "APP_VERSION_REDACTED"
@@ -299,6 +299,7 @@ data:
       modern_ebpf:
         buf_size_preset: 4
         cpus_for_each_buffer: 2
+        disable_iterators: false
         drop_failed_exit: false
     falco_libs:
       snaplen: 80
@@ -309,12 +310,6 @@ data:
       enabled: false
       filename: ./events.txt
       keep_alive: false
-    grpc:
-      bind_address: unix:///run/falco/falco.sock
-      enabled: false
-      threadiness: 0
-    grpc_output:
-      enabled: false
     http_output:
       ca_bundle: ""
       ca_cert: ""
@@ -427,7 +422,7 @@ metadata:
   name: olaitan-falco-falcoctl
   namespace: default
   labels:
-    helm.sh/chart: falco-8.0.2
+    helm.sh/chart: falco-9.1.0
     app.kubernetes.io/name: falco
     app.kubernetes.io/instance: olaitan
     app.kubernetes.io/version: "APP_VERSION_REDACTED"
@@ -450,7 +445,7 @@ data:
         pluginsDir: /plugins
         refs:
         - falco-rules:5
-        - ghcr.io/falcosecurity/plugins/plugin/container:0.6.3
+        - ghcr.io/falcosecurity/plugins/plugin/container:0.7.1
         resolveDeps: true
         rulesfilesDir: /rulesfiles
         stateDir: /artifactstate
@@ -1816,7 +1811,7 @@ metadata:
   name: olaitan-falco
   namespace: default
   labels:
-    helm.sh/chart: falco-8.0.2
+    helm.sh/chart: falco-9.1.0
     app.kubernetes.io/name: falco
     app.kubernetes.io/instance: olaitan
     app.kubernetes.io/version: "APP_VERSION_REDACTED"
@@ -1833,7 +1828,7 @@ spec:
         app.kubernetes.io/name: falco
         app.kubernetes.io/instance: olaitan
       annotations:
-        checksum/config: 57f9078610746c7e2124b45de5ae060393cf7bc300d3ea9f9de1d3d180f437ab
+        checksum/config: a72d6f229358572950c603eb17b8c4083d54a8e54645753b65053a36208e3f6c
         checksum/rules: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
         checksum/certs: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
     spec:
@@ -1845,7 +1840,7 @@ spec:
           key: node-role.kubernetes.io/control-plane
       containers:
         - name: falco
-          image: docker.io/falcosecurity/falco:0.43.1
+          image: docker.io/falcosecurity/falco:0.45.0-rc1
           imagePullPolicy: IfNotPresent
           resources:
             limits:
@@ -1935,9 +1930,8 @@ spec:
             - mountPath: /etc/falco/falco.yaml
               name: falco-yaml
               subPath: falco.yaml
-            
         - name: falcoctl-artifact-follow
-          image: docker.io/falcosecurity/falcoctl:0.12.2
+          image: docker.io/falcosecurity/falcoctl:0.13.0
           imagePullPolicy: IfNotPresent
           args:
             - artifact
@@ -1955,7 +1949,7 @@ spec:
               name: artifact-state-dir
       initContainers:
         - name: falcoctl-artifact-install
-          image: docker.io/falcosecurity/falcoctl:0.12.2
+          image: docker.io/falcosecurity/falcoctl:0.13.0
           imagePullPolicy: IfNotPresent
           args:
             - artifact
@@ -2028,7 +2022,6 @@ spec:
             items:
             - key: falco.yaml
               path: falco.yaml
-        
   updateStrategy:
     type: RollingUpdate
 ---

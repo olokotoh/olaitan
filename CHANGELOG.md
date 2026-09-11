@@ -27,6 +27,12 @@ and false-positive numbers; see [Unreleased](#unreleased).
 
 ### Changed
 
+- **Falco pinned to 0.45.0-rc1 (chart 9.1.0), the first release that stays up
+  on kernel 7.x** (#103). 0.43.1 and 0.44.x exit every few minutes there
+  (falcosecurity/falco#3955, fixed by falcosecurity/libs#3086). Soaked on
+  kernel 7.0 with 0 restarts. `hack/preflight.sh` now judges each node kernel
+  against the pin (`hack/falco-support.env`) and prints BLOCKER for a pairing
+  known to crash. Moves to 0.45.0 GA when it ships.
 - **BREAKING: Falco alerts now reach the collector over HTTP, not gRPC** (#104).
   Falco 0.44.0 removed its gRPC output, and the Falco releases that stay up on
   kernel 7.x are all newer. Falco's `http_output` now POSTs each alert to the

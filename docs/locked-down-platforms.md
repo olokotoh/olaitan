@@ -48,7 +48,7 @@ Upstream, verbatim:
   *"Implement the gRPC output as Falco Sidekick output"*. So there is no
   drop-in replacement and none is committed.
 
-**Why this is not yet on fire:** the chart pins `falco 8.0.2` = appVersion
+**Why this was not yet on fire (as of 2026-08-30; the chart now pins 9.1.0 with Falco 0.45.0-rc1):** the chart pinned `falco 8.0.2` = appVersion
 0.43.1, the last release that still has gRPC. Olaitan is *pinned to the final
 version that works*. The ceiling is real: any operator who bumps the subchart to
 9.x, or points `endpoints.falco` at their own Falco 0.44+, loses all syscall

@@ -33,7 +33,7 @@ stock EKS (VPC CNI) and stock AKS (no policy engine selected).
 
 | Platform | Install | Falco driver | NetworkPolicy enforced | Default StorageClass | Audit webhook | Overlay |
 | --- | --- | --- | --- | --- | --- | --- |
-| **kind** | ✅ verified | modern_ebpf | ❌ **no** (kindnet) | ✅ `standard` | ✅ possible | `values-kind.yaml` |
+| **kind** | ✅ verified | modern_ebpf (Falco 0.45.0-rc1) | ❌ **no** (kindnet) | ✅ `standard` | ✅ possible | `values-kind.yaml` |
 | **kubeadm** | ✅ verified | modern_ebpf | depends on CNI | depends | ✅ possible | (defaults) |
 | **k3s / k3d** | template-verified | modern_ebpf | ✅ (kube-router) | ✅ `local-path` | ✅ possible | `values-k3s.yaml` |
 | **minikube** | template-verified | modern_ebpf | ❌ unless `--cni=calico` | ✅ addon | ✅ possible | `values-minikube.yaml` |
@@ -81,6 +81,40 @@ so nobody promotes them on the strength of a job existing.
 
 These are platform policy, not Olaitan defects. Preflight must detect them and
 say so plainly rather than letting the operator discover it from a CrashLoop.
+
+---
+
+## Falco version and node kernel (Story 10.1)
+
+**Pinned: Falco `0.45.0-rc1` (image), chart `falcosecurity/falco` `9.1.0`,
+`modern_ebpf` driver.** The single record is `hack/falco-support.env`; the helm
+suite fails if the chart, this page or `eval/manifest.yaml` disagree with it,
+and `hack/preflight.sh` judges every node kernel against it.
+
+| Kernel | Falco 0.43.1 / 0.44.x | Falco 0.45.0-rc1 (pinned) | Evidence |
+| --- | --- | --- | --- |
+| < 5.8 | depends on distro backports of BTF + BPF ring buffer | same | Falco kernel docs: "usually all versions `>=5.8` are enough" |
+| 5.8 to 6.x | **mostly runs**; exits at start under minikube on GitHub's `6.17.0-1022-azure` runners (exit 2 within 1s, CI 2026-09-11; cause not captured) | runs, including that minikube runner | CI portability matrix; kind and k3s on the same runners pass with both |
+| **7.0** | ❌ **exits every few minutes** | ✅ **verified: 30 min soak, 0 restarts** (kind, 7.0.0-31-generic) | falcosecurity/falco#3955; reproduced here on 0.43.1: 12 restarts in 63 min |
+| > 7.0 | ❌ same defect reported on 7.1.2 | untested here; reported fixed on 7.2 in falcosecurity/falco#3955 | preflight prints a caveat |
+
+**Why 0.43.1 and 0.44.x crash on 7.x.** `could not parse param 2 (name) for
+event ... of type 307 (openat)` / `param 1 (exe) ... type 223 (clone)`, then
+Falco exits. The modern_bpf driver builds each event in a per-CPU "auxmap" and
+assumed a BPF program could not be preempted mid-event; on preemptible
+(`PREEMPT_DYNAMIC`) 7.x kernels it can, another program overwrites the buffer,
+and the parser reads a corrupted event (falcosecurity/libs#2719). Fixed by
+**falcosecurity/libs#3086** (two auxmaps per CPU with an in-use flag, merged
+2026-09-08), first shipped in libs `0.26.0-rc1` and so in Falco `0.45.0-rc1`
+(2026-09-09). Upstream tracks it in **falcosecurity/falco#3955** (milestone
+0.45.0).
+
+**Why an RC.** No stable release has the fix, and Falco `0.44.0` also removed
+the gRPC output (falcosecurity/falco#3798), so there was never a stable Falco
+that both runs on 7.x and matches the old transport. Olaitan moved to
+`http_output` in Story 10.2 for that reason. **TODO:** move to `0.45.0` GA when
+it ships (planned 2026-09-21) and update `hack/falco-support.env` in the same
+change.
 
 ---
 
