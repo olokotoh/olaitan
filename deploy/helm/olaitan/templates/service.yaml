@@ -23,7 +23,15 @@ metadata:
 spec:
   type: ClusterIP
   selector:
-    {{- include "olaitan.aggregator.selectorLabels" . | nindent 4 }}
+    {{- /*
+    Story 10.8 (#137, B1): the receiver listens in the COLLECTOR
+    DaemonSet (daemonset.yaml opens auditWebhook.containerPort and
+    cmd/olaitan/main.go serves it there), not in the aggregator. This
+    Service selected the aggregator, so every apiserver audit POST
+    reached a pod with nothing listening on that port and the audit
+    source never produced a single event.
+    */}}
+    {{- include "olaitan.collector.selectorLabels" . | nindent 4 }}
   ports:
     - name: webhook
       protocol: TCP

@@ -52,6 +52,13 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 | `probes.periodSeconds` | integer | `10` | minimum 1 | liveness/readiness probe period seconds | NFR24 |
 | `probes.failureThreshold` | integer | `3` | minimum 1 | consecutive probe failures before the pod is restarted | NFR24 |
 
+## `auditWebhook`
+
+| Value | Type | Default | Valid range | Effect | Ref |
+|-------|------|---------|-------------|--------|-----|
+| `auditWebhook.serverAddress` | string | `""` | - | address the kube-apiserver dials for the audit webhook (empty: the in-cluster Service FQDN) | FR5 |
+| `auditWebhook.hostPort` | integer | `0` | - | publish the audit receiver on the node at this hostPort (0: off) | FR5 |
+
 ## `containerdSensor`
 
 | Value | Type | Default | Valid range | Effect | Ref |

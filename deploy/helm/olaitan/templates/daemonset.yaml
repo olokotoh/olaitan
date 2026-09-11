@@ -146,11 +146,20 @@ spec:
               containerPort: {{ .Values.falcoIngest.port }}
               protocol: TCP
             {{- if .Values.auditWebhook.enabled }}
-            # Story 1.7 audit-webhook receiver port. The kube-apiserver
-            # dials this port via the Service FQDN baked into the
-            # audit kubeconfig (templates/audit-webhook-kubeconfig-secret.yaml).
+            {{- include "olaitan.auditWebhook.validate" . }}
+            # Story 1.7 audit-webhook receiver port, dialled by the
+            # kube-apiserver at the address in the audit kubeconfig
+            # (templates/audit-webhook-kubeconfig-secret.yaml).
+            #
+            # Story 10.8 (#137 B2): with auditWebhook.hostPort set, the
+            # receiver is also published on the node, so an apiserver on
+            # the host network reaches its OWN node's collector at
+            # 127.0.0.1 with no cluster DNS and no Service in the path.
             - name: audit-webhook
               containerPort: {{ .Values.auditWebhook.containerPort }}
+              {{- if ne (int (default 0 .Values.auditWebhook.hostPort)) 0 }}
+              hostPort: {{ int .Values.auditWebhook.hostPort }}
+              {{- end }}
               protocol: TCP
             {{- end }}
           env:

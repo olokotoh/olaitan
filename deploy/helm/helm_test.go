@@ -17,6 +17,9 @@ package helm_test
 
 import (
 	"bytes"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -4779,6 +4782,190 @@ func TestFalcoIngestServiceIsNodeLocal(t *testing.T) {
 	port := spec["ports"].([]any)[0].(map[string]any)
 	if port["port"] != 8765 || port["targetPort"] != "falco-ingest" {
 		t.Errorf("falco-ingest port = %v -> %v, want 8765 -> falco-ingest", port["port"], port["targetPort"])
+	}
+}
+
+// TestAuditWebhookKubeconfigCanTargetAnAddressTheAPIServerReaches:
+// Story 10.8 (#137, B2). kube-apiserver runs on the host network with the
+// node's resolver, so it cannot resolve a cluster-DNS name: the hardcoded
+// <fullname>-audit-webhook.<ns>.svc.cluster.local server URL was
+// unreachable on every self-managed cluster. auditWebhook.serverAddress
+// lets the operator point the apiserver at an address it can actually
+// reach (a fixed ClusterIP, or the node itself when hostPort is on).
+func TestAuditWebhookKubeconfigCanTargetAnAddressTheAPIServerReaches(t *testing.T) {
+	kubeconfigOf := func(sets []string) string {
+		rendered := helmTemplate(t, append(auditWebhookEnabledArgs(), sets...))
+		sec := docByKindName(t, rendered, "Secret", "audit-webhook-kubeconfig")
+		return fmt.Sprint(sec["stringData"].(map[string]any)["webhook-kubeconfig.yaml"])
+	}
+	// Default: unchanged, the in-cluster Service FQDN.
+	if got := kubeconfigOf(nil); !strings.Contains(got, "server: https://olaitan-audit-webhook.default.svc.cluster.local:8443/audit") {
+		t.Errorf("default server URL changed:\n%s", got)
+	}
+	// An IP the apiserver can dial, with the port the receiver serves.
+	if got := kubeconfigOf([]string{"auditWebhook.serverAddress=10.96.0.42"}); !strings.Contains(got, "server: https://10.96.0.42:8443/audit") {
+		t.Errorf("serverAddress ignored:\n%s", got)
+	}
+	// A node-local address with its own port (hostPort on the DaemonSet).
+	if got := kubeconfigOf([]string{"auditWebhook.serverAddress=127.0.0.1:31443"}); !strings.Contains(got, "server: https://127.0.0.1:31443/audit") {
+		t.Errorf("serverAddress with an explicit port ignored:\n%s", got)
+	}
+	// Garbage must fail at render, not at the apiserver hours later.
+	for _, bad := range []string{"https://10.96.0.42", "10.96.0.42/audit", "10.96.0.42:0", "10 .0.0.1", "10.96.0.42:99999"} {
+		if msg := helmTemplateExpectError(t, append(auditWebhookEnabledArgs(), "auditWebhook.serverAddress="+bad)); !strings.Contains(msg, "serverAddress") {
+			t.Errorf("serverAddress=%q was rejected without naming it: %s", bad, msg)
+		}
+	}
+}
+
+// TestAuditWebhookHostPortMakesTheReceiverNodeReachable: Story 10.8
+// (#137, B2). With hostPort set, the collector on every node publishes
+// the receiver on the node itself, so an apiserver on the host network
+// reaches its own node's receiver at 127.0.0.1 with no cluster DNS and no
+// Service in the path.
+func TestAuditWebhookHostPortMakesTheReceiverNodeReachable(t *testing.T) {
+	portsOf := func(sets []string) map[string]any {
+		pod := collectorDaemonSet(t, helmTemplate(t, append(auditWebhookEnabledArgs(), sets...)))["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)
+		for _, c := range pod["containers"].([]any) {
+			cm := c.(map[string]any)
+			if cm["name"] != "collector" {
+				continue
+			}
+			for _, prt := range cm["ports"].([]any) {
+				pm := prt.(map[string]any)
+				if pm["name"] == "audit-webhook" {
+					return pm
+				}
+			}
+		}
+		t.Fatal("no audit-webhook port on the collector container")
+		return nil
+	}
+	if p, ok := portsOf(nil)["hostPort"]; ok {
+		t.Errorf("the default install binds hostPort %v it was not asked for", p)
+	}
+	if p := portsOf([]string{"auditWebhook.hostPort=31443"})["hostPort"]; p != 31443 {
+		t.Errorf("hostPort = %v, want 31443", p)
+	}
+	for _, bad := range []string{"70000", "-1", "abc"} {
+		if msg := helmTemplateExpectError(t, append(auditWebhookEnabledArgs(), "auditWebhook.hostPort="+bad)); !strings.Contains(msg, "hostPort") {
+			t.Errorf("hostPort=%q was rejected without naming it: %s", bad, msg)
+		}
+	}
+}
+
+// TestAuditWebhookCertScriptProducesMaterialBothSidesAccept: Story 10.8
+// (#137, B3). AUDIT.md signed the apiserver's client certificate with a
+// private audit CA but told the operator to set clusterCAData to the
+// cluster's own root CA. The receiver verifies client certs against
+// clusterCAData (internal/collector/audit/audit.go), so the apiserver
+// was rejected at the handshake on every install that followed the
+// documentation. hack/audit-webhook-certs.sh now issues both sides from
+// one CA, and that CA is what clusterCAData carries.
+func TestAuditWebhookCertScriptProducesMaterialBothSidesAccept(t *testing.T) {
+	if _, err := exec.LookPath("openssl"); err != nil {
+		t.Skip("openssl not installed")
+	}
+	dir := t.TempDir()
+	_, thisFile, _, _ := runtime.Caller(0)
+	script := filepath.Join(filepath.Dir(thisFile), "..", "..", "hack", "audit-webhook-certs.sh")
+	cmd := exec.Command(script, dir, "olaitan-audit-webhook.olaitan.svc.cluster.local", "127.0.0.1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%s: %v\n%s", script, err, out)
+	}
+	valuesPath := filepath.Join(dir, "audit-webhook-values.yaml")
+	raw, err := os.ReadFile(valuesPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := map[string]string{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), ": ")
+		if ok {
+			fields[k] = strings.Trim(v, `"`)
+		}
+	}
+	decodeCert := func(field string) *x509.Certificate {
+		t.Helper()
+		der, err := base64.StdEncoding.DecodeString(fields[field])
+		if err != nil {
+			t.Fatalf("%s is not one line of base64: %v", field, err)
+		}
+		block, _ := pem.Decode(der)
+		if block == nil {
+			t.Fatalf("%s is not PEM", field)
+		}
+		c, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatalf("%s: %v", field, err)
+		}
+		return c
+	}
+	clientCA, serverCA := decodeCert("clusterCAData"), decodeCert("caBundle")
+	client, server := decodeCert("apiserverClientCert"), decodeCert("servingCert")
+
+	// The receiver verifies the apiserver's client cert against
+	// clusterCAData. This is the check that used to fail.
+	pool := x509.NewCertPool()
+	pool.AddCert(clientCA)
+	if _, err := client.Verify(x509.VerifyOptions{Roots: pool, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
+		t.Errorf("the apiserver client cert does not verify against clusterCAData: %v", err)
+	}
+	// And the receiver pins its CN.
+	if client.Subject.CommonName != "kube-apiserver" {
+		t.Errorf("client CN = %q, want kube-apiserver (auditWebhook.clientCNAllow)", client.Subject.CommonName)
+	}
+	// The apiserver verifies the receiver against caBundle, by the
+	// address it dialled.
+	pool = x509.NewCertPool()
+	pool.AddCert(serverCA)
+	for _, name := range []string{"olaitan-audit-webhook.olaitan.svc.cluster.local", "127.0.0.1"} {
+		if _, err := server.Verify(x509.VerifyOptions{Roots: pool, DNSName: name, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}); err != nil {
+			t.Errorf("the serving cert is not valid for %s: %v", name, err)
+		}
+	}
+	// And the chart accepts the file as written, with no hand-editing.
+	out, err := exec.Command("helm", "template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=x", "-f", valuesPath).CombinedOutput()
+	if err != nil {
+		t.Errorf("the chart rejected the generated values file: %v\n%s", err, out)
+	}
+}
+
+// TestAuditWebhookServiceSelectsTheReceiver: Story 10.8 (#137, B1). The
+// audit receiver listens in the collector DaemonSet, but the Service
+// selected the aggregator Deployment, so every apiserver audit POST went
+// to a pod with nothing listening and the audit source never produced an
+// event.
+func TestAuditWebhookServiceSelectsTheReceiver(t *testing.T) {
+	rendered := helmTemplate(t, auditWebhookEnabledArgs())
+	spec := docByKindName(t, rendered, "Service", "audit-webhook")["spec"].(map[string]any)
+	sel := spec["selector"].(map[string]any)
+	if sel["app.kubernetes.io/component"] != "collector" {
+		t.Errorf("the audit Service selects %v; the receiver runs in the collector DaemonSet", sel)
+	}
+	// The Service's own selector must match the collector pod template, or
+	// it has no endpoints at all.
+	pod := collectorDaemonSet(t, rendered)["spec"].(map[string]any)["template"].(map[string]any)
+	labels := pod["metadata"].(map[string]any)["labels"].(map[string]any)
+	for k, v := range sel {
+		if labels[k] != v {
+			t.Errorf("selector %s=%v does not match the collector pod label %v", k, v, labels[k])
+		}
+	}
+	// And the port it targets must be one the collector actually opens.
+	target := spec["ports"].([]any)[0].(map[string]any)["targetPort"]
+	var found bool
+	for _, c := range pod["spec"].(map[string]any)["containers"].([]any) {
+		for _, prt := range c.(map[string]any)["ports"].([]any) {
+			pm := prt.(map[string]any)
+			if pm["containerPort"] == target || pm["name"] == target {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Errorf("audit Service targetPort %v is not a port on any collector container", target)
 	}
 }
 

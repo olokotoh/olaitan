@@ -345,6 +345,58 @@ that work for in-namespace clients break for cross-namespace dialers.
 {{- end -}}
 
 {{/*
+Audit webhook server address (Story 10.8, #137 B2).
+
+kube-apiserver runs on the host network with the node's resolver, so it
+cannot resolve a cluster-DNS name: the Service FQDN below is unreachable
+on every self-managed cluster. auditWebhook.serverAddress overrides it
+with an address the apiserver can actually dial: a fixed ClusterIP whose
+serving cert carries a matching IP SAN, or 127.0.0.1:<hostPort> when the
+receiver is published on the node (auditWebhook.hostPort), which keeps
+each apiserver talking to its own node's collector.
+
+The address may carry its own port; without one, servicePort is used.
+*/}}
+{{- define "olaitan.auditWebhook.server" -}}
+{{- $addr := default "" .Values.auditWebhook.serverAddress | toString | trim -}}
+{{- if eq $addr "" -}}
+{{- printf "%s:%v" (include "olaitan.auditWebhookServiceFqdn" .) (int .Values.auditWebhook.servicePort) -}}
+{{- else if regexMatch "^[^:]+:[0-9]+$" $addr -}}
+{{- $addr -}}
+{{- else -}}
+{{- printf "%s:%v" $addr (int .Values.auditWebhook.servicePort) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "olaitan.auditWebhook.validate" -}}
+{{- if .Values.auditWebhook.enabled -}}
+{{- $addr := default "" .Values.auditWebhook.serverAddress | toString | trim -}}
+{{- if ne $addr "" -}}
+{{- /* host or host:port. No scheme, no path, no spaces: the value is
+       interpolated into the kubeconfig server URL. */ -}}
+{{- $host := regexFind "^[^:]+" $addr -}}
+{{- $port := $addr | regexFind ":[0-9]+$" | trimPrefix ":" -}}
+{{- if not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$" $addr) -}}
+{{- fail (printf "auditWebhook.serverAddress is %q: give a bare host or IP, optionally host:port, with no scheme and no path (for example 10.96.0.42 or 127.0.0.1:31443)." $addr) -}}
+{{- end -}}
+{{- if and (ne $port "") (or (lt (int $port) 1) (gt (int $port) 65535)) -}}
+{{- fail (printf "auditWebhook.serverAddress port is %q: want 1-65535." $port) -}}
+{{- end -}}
+{{- if eq $host "" -}}
+{{- fail (printf "auditWebhook.serverAddress is %q: no host." $addr) -}}
+{{- end -}}
+{{- end -}}
+{{- $hp := default 0 .Values.auditWebhook.hostPort -}}
+{{- if not (regexMatch "^[0-9]+$" (toString $hp)) -}}
+{{- fail (printf "auditWebhook.hostPort is %q: want a number in 1-65535, or 0 to leave the receiver off the node's network." (toString $hp)) -}}
+{{- end -}}
+{{- if and (ne (int $hp) 0) (or (lt (int $hp) 1) (gt (int $hp) 65535)) -}}
+{{- fail (printf "auditWebhook.hostPort is %v: want 1-65535, or 0 to leave the receiver off the node's network." $hp) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Falco ingest (Story 10.2).
 
 Falco POSTs each alert to the collector over HTTP (http_output). Falco
