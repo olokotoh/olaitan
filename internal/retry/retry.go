@@ -108,8 +108,13 @@ func (s Strategy) Do(ctx context.Context, op func(ctx context.Context) error) er
 		if err == nil {
 			return nil
 		}
-		// Treat ctx errors as terminal; do not retry past a cancelled context.
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		// Do not retry past a cancelled context: but only OUR context. An
+		// op's own per-attempt deadline (a publish or dial timeout) also
+		// surfaces as a context error while ctx is still alive, and that is
+		// an ordinary failure to retry. Treating it as cancellation ended
+		// callers' loops as if shut down (Story 10.9: one slow NATS publish
+		// stopped the CRI sensor for the life of the pod).
+		if ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 			return fmt.Errorf("retry: ctx cancelled during op: %w", err)
 		}
 		// Caller-signalled permanent error: bail out without retrying.

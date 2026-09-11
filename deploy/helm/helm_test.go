@@ -5507,3 +5507,35 @@ func TestFalcoTriggerOffUnquoted(t *testing.T) {
 		t.Errorf("unquoted `on` (boolean true) was accepted; it names no priority: %v\n%s", err, out)
 	}
 }
+
+// TestContainerdSensorGrantsTheSocketGroup: Story 10.9. The containerd
+// socket is 0660 root:root and the collector runs as 65532, so the dial
+// failed with EACCES. With the sensor on, the collector joins the socket's
+// group (containerdSensor.socketGroup, default 0) and stays non-root.
+func TestContainerdSensorGrantsTheSocketGroup(t *testing.T) {
+	pod := func(sets []string) map[string]any {
+		return collectorDaemonSet(t, helmTemplate(t, sets))["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)["securityContext"].(map[string]any)
+	}
+	on := pod([]string{"containerdSensor.enabled=true"})
+	groups, _ := on["supplementalGroups"].([]any)
+	if len(groups) != 1 || groups[0] != 0 {
+		t.Errorf("supplementalGroups = %v, want [0] (the containerd socket's group)", on["supplementalGroups"])
+	}
+	if on["runAsUser"] != 65532 || on["runAsNonRoot"] != true {
+		t.Errorf("the collector no longer runs as non-root 65532: %v", on)
+	}
+	if g, _ := pod([]string{"containerdSensor.enabled=true", "containerdSensor.socketGroup=1001"})["supplementalGroups"].([]any); len(g) != 1 || g[0] != 1001 {
+		t.Errorf("socketGroup override ignored: %v", g)
+	}
+	if _, ok := pod(nil)["supplementalGroups"]; ok {
+		t.Error("the default install (sensor off) grants a supplemental group it does not need")
+	}
+	// Review of #141: sprig's int turns a typo into 0, root's group.
+	for _, bad := range []string{"l001", "-1", ""} {
+		cmd := exec.Command("helm", "template", "olaitan", chartDir(t), "--set", "secrets.redisPassword=x",
+			"--set", "containerdSensor.enabled=true", "--set-string", "containerdSensor.socketGroup="+bad)
+		if out, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(out), "socketGroup") {
+			t.Errorf("socketGroup=%q rendered (or failed without naming it): %v %s", bad, err, out)
+		}
+	}
+}

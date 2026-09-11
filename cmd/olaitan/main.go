@@ -2094,18 +2094,12 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 			return fmt.Errorf("collector: cri adapter: %w", cerr)
 		}
 		metricsSources[string(schema.SourceRuntime)] = criAdapter
+		// Story 10.9: the containerd sensor is optional. A permanent
+		// failure (EACCES on the socket) marks the runtime source
+		// unhealthy and is logged at ERROR, but no longer ends the
+		// errgroup and crash-loops the collector with Falco inside it.
 		g.Go(func() error {
-			if err := criAdapter.Run(ctx); err != nil {
-				// P22: clean shutdown surfaces context.Canceled
-				// (sometimes wrapped by retry.Do); treat as nil to
-				// keep errgroup.Wait quiet, matching the Story 1.6
-				// Falco / Story 1.7 audit pattern.
-				if errors.Is(err, context.Canceled) {
-					return nil
-				}
-				return fmt.Errorf("collector: cri run: %w", err)
-			}
-			return nil
+			return runOptionalSource(ctx, log, string(schema.SourceRuntime), criAdapter.Run)
 		})
 		log.Info("collector: ring 1 wired (containerd cri)",
 			"socket_path", criCfg.SocketPath)
@@ -2359,4 +2353,48 @@ func readFalcoToken(path string) (string, error) {
 		return "", fmt.Errorf("falco http token file %s is empty", path)
 	}
 	return tok, nil
+}
+
+// optionalSourceBackoff is the wait before restarting a failed optional
+// source: 5s doubling to a 5 minute cap. A var so tests can shorten it.
+var optionalSourceBackoff = func(attempt int) time.Duration {
+	d := 5 * time.Second
+	for i := 1; i < attempt && d < 5*time.Minute; i++ {
+		d *= 2
+	}
+	if d > 5*time.Minute {
+		d = 5 * time.Minute
+	}
+	return d
+}
+
+// runOptionalSource runs an optional sensor adapter inside the collector's
+// errgroup without letting its failure take the other sources down, and
+// without giving up on it. The adapter marks its own source unhealthy, so a
+// failure stays visible as source_healthy{source=...} 0; here it is also
+// logged at ERROR and the adapter is restarted after a capped backoff. That
+// covers a terminal error that heals on its own (a CRI ResourceExhausted)
+// and one that heals on a config change. A source that returns nil while the
+// collector is still running is restarted as well. Only the collector's own
+// shutdown ends the loop, silently.
+func runOptionalSource(ctx context.Context, log *slog.Logger, source string, run func(context.Context) error) error {
+	for attempt := 1; ; attempt++ {
+		err := run(ctx)
+		if ctx.Err() != nil {
+			return nil
+		}
+		wait := optionalSourceBackoff(attempt)
+		if err != nil {
+			log.Error("collector: optional source failed; the other sources keep running, retrying",
+				"source", source, "err", err, "retry_in", wait)
+		} else {
+			log.Warn("collector: optional source returned while the collector is running; restarting",
+				"source", source, "retry_in", wait)
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(wait):
+		}
+	}
 }

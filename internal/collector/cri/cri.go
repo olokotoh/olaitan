@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -351,8 +352,10 @@ func (a *Adapter) Run(ctx context.Context) error {
 	<-watchdogDone
 
 	// Retry.Do returns ctx.Err() (wrapped) on cancellation, which we
-	// treat as clean shutdown rather than an error.
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	// treat as clean shutdown rather than an error, but only when OUR
+	// context is done. A context error from inside an attempt with our
+	// context alive is a failure, not a shutdown (Story 10.9).
+	if ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 		return nil
 	}
 	return err
@@ -606,7 +609,30 @@ func criDialTarget(socketPath string) string {
 // (terminal for this attempt), or dialCtx is done. On timeout the
 // connection is closed and a wrapped error is returned to the outer
 // retry loop. (grpc-go anti-patterns documentation, 2026.)
+//
+// Story 10.9: before the gRPC client, the socket is probed with a plain
+// connect(2). gRPC hides EACCES inside TransientFailure, so a socket the
+// collector may not open used to surface only as the dial deadline; now it
+// is returned as fs.ErrPermission (terminal, and logged with the path). A
+// missing or refusing socket stays retryable. And the dial's own deadline is
+// reported as errDialTimeout, never as a context error: retry.Do treats a
+// context error as cancellation and stops, which silently ended the sensor
+// for the life of the pod.
 func defaultDial(dialCtx context.Context, target string) (*grpc.ClientConn, error) {
+	if path, ok := strings.CutPrefix(target, "unix://"); ok {
+		var d net.Dialer
+		conn, perr := d.DialContext(dialCtx, "unix", path)
+		if perr != nil {
+			if errors.Is(perr, fs.ErrPermission) {
+				return nil, fmt.Errorf("socket %s: %w (the collector's user or supplemental group cannot open it; see containerdSensor.socketGroup)", path, perr)
+			}
+			if dialCtx.Err() != nil && errors.Is(dialCtx.Err(), context.Canceled) {
+				return nil, dialCtx.Err()
+			}
+			return nil, fmt.Errorf("socket %s: %s", path, perr.Error())
+		}
+		_ = conn.Close()
+	}
 	cc, err := grpc.NewClient(
 		target,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -623,10 +649,10 @@ func defaultDial(dialCtx context.Context, target string) (*grpc.ClientConn, erro
 		if !cc.WaitForStateChange(dialCtx, state) {
 			// dialCtx done before the state changed.
 			_ = cc.Close()
-			if cerr := dialCtx.Err(); cerr != nil {
-				return nil, fmt.Errorf("dial wait-for-ready: %w", cerr)
+			if cerr := dialCtx.Err(); errors.Is(cerr, context.Canceled) {
+				return nil, cerr
 			}
-			return nil, fmt.Errorf("dial wait-for-ready: state=%s", state)
+			return nil, fmt.Errorf("%w (last state %s)", errDialTimeout(target, 0), state)
 		}
 	}
 }
@@ -723,3 +749,12 @@ func isPermanentPublishError(err error) bool {
 
 // compile-time assertion: *natsclient.Client satisfies natsPublisher.
 var _ natsPublisher = (*natsclient.Client)(nil)
+
+// errDialTimeout is the dial's own deadline expiring. Deliberately not a
+// context error: see defaultDial.
+func errDialTimeout(target string, d time.Duration) error {
+	if d > 0 {
+		return fmt.Errorf("cri: dial %s: not ready within %s", target, d)
+	}
+	return fmt.Errorf("cri: dial %s: not ready within the dial timeout", target)
+}

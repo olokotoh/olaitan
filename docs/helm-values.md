@@ -52,6 +52,12 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 | `probes.periodSeconds` | integer | `10` | minimum 1 | liveness/readiness probe period seconds | NFR24 |
 | `probes.failureThreshold` | integer | `3` | minimum 1 | consecutive probe failures before the pod is restarted | NFR24 |
 
+## `containerdSensor`
+
+| Value | Type | Default | Valid range | Effect | Ref |
+|-------|------|---------|-------------|--------|-----|
+| `containerdSensor.socketGroup` | integer | `0` | minimum 0 | supplemental group the collector joins to open the containerd socket | FR3 |
+
 ## `applogSidecar`
 
 | Value | Type | Default | Valid range | Effect | Ref |

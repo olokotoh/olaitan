@@ -3,6 +3,7 @@ package retry
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -364,5 +365,37 @@ func TestStrategyDo_UnlimitedAttemptsTerminateOnSuccess(t *testing.T) {
 	}
 	if calls != 7 {
 		t.Errorf("op invocations: got %d, want 7", calls)
+	}
+}
+
+// TestStrategyDo_RetriesAnAttemptTimeoutWhileItsContextIsAlive: Story 10.9
+// review. Do treated ANY context error from op as cancellation, including an
+// op's own per-attempt deadline (a 2s publish timeout, a dial timeout) while
+// Do's context was alive. The caller's loop then ended as if shut down, which
+// killed the CRI sensor for the life of the pod on one slow publish.
+func TestStrategyDo_RetriesAnAttemptTimeoutWhileItsContextIsAlive(t *testing.T) {
+	s := Strategy{Min: time.Millisecond, Max: time.Millisecond, Multiplier: 1, MaxAttempts: 3}
+	calls := 0
+	err := s.Do(context.Background(), func(context.Context) error {
+		calls++
+		return fmt.Errorf("publish: %w", context.DeadlineExceeded)
+	})
+	if calls != 3 {
+		t.Errorf("op ran %d times, want 3: an attempt's own timeout must be retried", calls)
+	}
+	if err == nil || !strings.Contains(err.Error(), "max attempts") {
+		t.Errorf("err = %v, want max attempts exhausted", err)
+	}
+
+	// Do's own context ending is still a stop, at once.
+	ctx, cancel := context.WithCancel(context.Background())
+	calls = 0
+	err = s.Do(ctx, func(context.Context) error {
+		calls++
+		cancel()
+		return fmt.Errorf("publish: %w", context.Canceled)
+	})
+	if calls != 1 || !errors.Is(err, context.Canceled) {
+		t.Errorf("after its context was cancelled: calls=%d err=%v, want 1 call and a Canceled error", calls, err)
 	}
 }

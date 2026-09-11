@@ -10,6 +10,16 @@ pod spec sees no host-level escape surface unless the containerd sensor
 is enabled.
 */}}
 {{- if .Values.containerdSensor.enabled }}
+{{- /* Story 10.9 review: sprig's int turns a typo or an empty string into
+       0, root's group, silently. Require a non-negative integer. */ -}}
+{{- $sg := .Values.containerdSensor.socketGroup }}
+{{- if kindIs "string" $sg }}
+{{- if not (regexMatch "^[0-9]+$" $sg) }}
+{{- fail (printf "containerdSensor.socketGroup must be a non-negative integer GID (got %q); check a node with `stat -c %%g /run/containerd/containerd.sock`" $sg) }}
+{{- end }}
+{{- else if or (kindIs "invalid" $sg) (lt (int64 $sg) 0) }}
+{{- fail (printf "containerdSensor.socketGroup must be a non-negative integer GID (got %v)" $sg) }}
+{{- end }}
 {{- $sp := default "" .Values.containerdSensor.socketPath }}
 {{- if eq $sp "" }}
 {{- fail "containerdSensor.socketPath is required when containerdSensor.enabled=true. Default is /run/containerd/containerd.sock for stock containerd 1.7 on kubeadm; override only if your cluster uses a non-standard install layout. See deploy/helm/olaitan/CRI.md for guidance." }}
@@ -78,6 +88,14 @@ spec:
         runAsUser: 65532
         runAsGroup: {{ include "olaitan.collector.runAsGroup" . }}
         fsGroup: 65532
+        {{- if .Values.containerdSensor.enabled }}
+        # Story 10.9: the containerd socket is 0660 root:root on stock
+        # nodes, so the non-root collector joins the socket's group to
+        # connect(2). It stays UID 65532; group 0 only matters on the
+        # read-only socket mount, since the image's own filesystem is
+        # read-only. Set containerdSensor.socketGroup to your socket's GID.
+        supplementalGroups: [{{ int64 .Values.containerdSensor.socketGroup }}]
+        {{- end }}
         seccompProfile:
           type: RuntimeDefault
       {{- with .Values.collector.nodeSelector }}

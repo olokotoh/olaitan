@@ -113,28 +113,24 @@ source unhealthy after the configured `staleness_timeout` (default
   # Expected: srw-rw---- 1 root root ... /run/containerd/containerd.sock
   ```
 
-  The default mode `0660` requires the agent pod to either run as
-  root or share the socket's group. The current chart pod-spec runs
-  the collector as UID 65532 (nonroot). Operators have two choices:
+  The default mode `0660` needs the connecting process to be root or
+  in the socket's group. Since Story 10.9 the chart handles this without
+  root: with `containerdSensor.enabled=true` the collector pod joins
+  `containerdSensor.socketGroup` (default `0`, the group on stock
+  containerd) as a supplemental group and keeps running as UID 65532.
+  If your socket has a different group, set `socketGroup` to its GID
+  (`stat -c %g /run/containerd/containerd.sock`). Verified on kind
+  (containerd 2.x): the stream connects and pod creates arrive as
+  runtime events.
 
-  1. Override the collector container's `securityContext.runAsUser`
-     to 0 for the collector pod when the CRI sensor is enabled
-     (acceptable per NFR14: the agent already needs root for eBPF
-     probe loading via Falco). This is a chart override the operator
-     applies via their values overlay.
-  2. Change the socket's group ownership on each node and run the
-     pod with that group.
-
-  Future hardening: a follow-up story will add a chart-level
-  `containerdSensor.runAsRoot` toggle that flips the relevant
-  container's securityContext when enabled. For now, the default-
-  disabled `containerdSensor.enabled` keeps existing nonroot deploys
-  unaffected.
-
-- **Adapter logs `permission denied`.** Same root cause as above;
-  see the socket-mode discussion. The adapter treats EACCES as a
-  terminal error (`retry.Permanent`) so the pod CrashLoops loudly
-  rather than busy-looping.
+- **`optional source stopped permanently ... source=runtime ... permission denied`.**
+  The collector could not open the socket; the log names the path and
+  points at `socketGroup`. Since Story 10.9 this marks the runtime
+  source unhealthy (`olaitan_source_healthy{source="runtime"} 0`) but
+  no longer crash-loops the collector: Falco and the other sources keep
+  running. Before Story 10.9 the same condition silently stopped the
+  sensor ten seconds after start (the dial timeout was mistaken for a
+  shutdown).
 
 - **`cri: stream eof` followed by reconnect.** Expected behaviour
   during containerd restarts. The outer reconnect loop backs off
