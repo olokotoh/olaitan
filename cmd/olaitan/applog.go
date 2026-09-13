@@ -152,6 +152,34 @@ func runApplogSidecar(ctx context.Context, args []string, stderr io.Writer) int 
 		return 1
 	}
 
+	// Story 10.10: report liveness and health to the collector on this node,
+	// the only way applog health is observable (nothing scrapes the sidecar).
+	hbSubject, err := collectorapplog.HeartbeatSubject(cfg.Pod.Node)
+	if err != nil {
+		log.Error("startup: applog heartbeat subject", "err", err, "node", cfg.Pod.Node)
+		return 1
+	}
+	started := time.Now().UnixNano()
+	// Deferred after the NATS close, so it runs first: every return path
+	// publishes the departing heartbeat before the connection goes away.
+	stopHeartbeat := collectorapplog.StartHeartbeat(ctx, nc, hbSubject, collectorapplog.HeartbeatInterval, func() collectorapplog.Heartbeat {
+		healthy, herr := adapter.Health().Status()
+		return collectorapplog.Heartbeat{
+			Namespace: cfg.Pod.Namespace,
+			Pod:       cfg.Pod.Name,
+			Node:      cfg.Pod.Node,
+			Container: cfg.Container,
+			Healthy:   healthy,
+			// Before the first line the adapter is unhealthy by
+			// construction; a quiet workload is not a broken sensor.
+			Starting: errors.Is(herr, collectorapplog.ErrAwaitingFirstEvent),
+			Started:  started,
+			Events:   adapter.EventsTotal(),
+			Engaged:  adapter.EngagedTotal(),
+		}
+	})
+	defer stopHeartbeat()
+
 	log.Info("applog-sidecar: started",
 		"pod", cfg.Pod.Namespace+"/"+cfg.Pod.Name,
 		"container", cfg.Container,
@@ -267,6 +295,7 @@ func runApplogWebhook(ctx context.Context, args []string, stderr io.Writer) int 
 		// list so the sidecar container picks them up via the
 		// downward API at start-up. Empty values fall through to the
 		// adapter's own defaults.
+		SidecarNATSURL:             os.Getenv("OLAITAN_WEBHOOK_SIDECAR_NATS_URL"),
 		SidecarStdoutPath:          os.Getenv("OLAITAN_WEBHOOK_SIDECAR_STDOUT_PATH"),
 		SidecarStderrPath:          os.Getenv("OLAITAN_WEBHOOK_SIDECAR_STDERR_PATH"),
 		SidecarChannelBuffer:       os.Getenv("OLAITAN_WEBHOOK_SIDECAR_CHANNEL_BUFFER"),

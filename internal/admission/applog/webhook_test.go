@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	admissionv1 "k8s.io/api/admission/v1"
@@ -24,6 +25,7 @@ func newTestWebhook(t *testing.T) *Webhook {
 		TLSKeyFile:       "/tmp/test.key",
 		UseNativeSidecar: true,
 		SidecarImage:     "ghcr.io/olokotoh/olaitan:dev",
+		SidecarNATSURL:   "nats://olaitan-nats.olaitan.svc:4222",
 	}
 	w, err := NewWebhook(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -167,7 +169,7 @@ func TestWebhookHandler_HealthzOK(t *testing.T) {
 }
 
 func TestNewWebhook_RejectsEmptyTLSCert(t *testing.T) {
-	cfg := WebhookConfig{TLSKeyFile: "/k", SidecarImage: "x"}
+	cfg := WebhookConfig{TLSKeyFile: "/k", SidecarImage: "x", SidecarNATSURL: "nats://n:4222"}
 	_, err := NewWebhook(cfg, nil)
 	if err == nil {
 		t.Error("expected error for empty TLSCertFile")
@@ -175,7 +177,7 @@ func TestNewWebhook_RejectsEmptyTLSCert(t *testing.T) {
 }
 
 func TestNewWebhook_RejectsEmptySidecarImage(t *testing.T) {
-	cfg := WebhookConfig{TLSCertFile: "/c", TLSKeyFile: "/k"}
+	cfg := WebhookConfig{TLSCertFile: "/c", TLSKeyFile: "/k", SidecarNATSURL: "nats://n:4222"}
 	_, err := NewWebhook(cfg, nil)
 	if err == nil {
 		t.Error("expected error for empty SidecarImage")
@@ -210,5 +212,14 @@ func TestWebhookHandler_SkippedTotal_IncrementsOnNoAnnotation(t *testing.T) {
 	_ = sendReview(t, w, newAdmissionReview(pod))
 	if w.SkippedTotal() <= before {
 		t.Errorf("SkippedTotal did not increment: before=%d after=%d", before, w.SkippedTotal())
+	}
+}
+
+// TestNewWebhook_RejectsEmptySidecarNATSURL: Story 10.10. Better that the
+// webhook refuses to start than injects sidecars that can only crash.
+func TestNewWebhook_RejectsEmptySidecarNATSURL(t *testing.T) {
+	_, err := NewWebhook(WebhookConfig{TLSCertFile: "/c", TLSKeyFile: "/k", SidecarImage: "x"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "SidecarNATSURL") {
+		t.Errorf("err = %v, want a SidecarNATSURL rejection", err)
 	}
 }

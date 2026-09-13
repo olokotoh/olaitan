@@ -128,6 +128,10 @@ type WebhookConfig struct {
 	// injected sidecar container as OLAITAN_APPLOG_STDOUT_PATH /
 	// OLAITAN_APPLOG_STDERR_PATH env vars.
 	SidecarStdoutPath string
+
+	// SidecarNATSURL is forwarded to every injected sidecar as NATS_URL.
+	// Required: a sidecar without it exits at start (Story 10.10).
+	SidecarNATSURL    string
 	SidecarStderrPath string
 
 	// SidecarChannelBuffer is the bounded LineRecord channel capacity
@@ -212,6 +216,9 @@ func NewWebhook(cfg WebhookConfig, log *slog.Logger) (*Webhook, error) {
 	}
 	if cfg.TLSKeyFile == "" {
 		return nil, errors.New("applog/webhook: TLSKeyFile is empty")
+	}
+	if cfg.SidecarNATSURL == "" {
+		return nil, errors.New("applog/webhook: SidecarNATSURL is empty; injected sidecars cannot start without a NATS address (chart sets OLAITAN_WEBHOOK_SIDECAR_NATS_URL)")
 	}
 	if cfg.SidecarImage == "" {
 		return nil, errors.New("applog/webhook: SidecarImage is empty (chart must inject .Values.image)")
@@ -475,6 +482,7 @@ func (w *Webhook) review(review *admissionv1.AdmissionReview) *admissionv1.Admis
 		SidecarMemoryRequest:       w.cfg.SidecarMemoryRequest,
 		SidecarCPULimit:            w.cfg.SidecarCPULimit,
 		SidecarMemoryLimit:         w.cfg.SidecarMemoryLimit,
+		SidecarNATSURL:             w.cfg.SidecarNATSURL,
 		SidecarStdoutPath:          w.cfg.SidecarStdoutPath,
 		SidecarStderrPath:          w.cfg.SidecarStderrPath,
 		SidecarChannelBuffer:       w.cfg.SidecarChannelBuffer,

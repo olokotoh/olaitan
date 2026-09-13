@@ -362,6 +362,27 @@ olaitan.falcoIngest.releaseFullname: the olaitan.fullname rule minus
 nameOverride/fullnameOverride. The guard below fails the render when those
 overrides make the two disagree, with the literal values to set instead.
 */}}
+{{/* NATS URL resolvable from ANY namespace (applog sidecars run in the
+     workload's namespace, not this release's). endpoints.nats wins when
+     set, but it must be qualified enough to resolve there: the default
+     endpoints.nats is a short, namespace-local name, and a sidecar given
+     that address fails DNS in every other namespace and crash-loops,
+     which is the defect Story 10.10 exists to fix. Validated, not
+     silently rewritten: only the operator knows their own NATS. */}}
+{{- define "olaitan.endpoints.natsFQDN" -}}
+{{- if .Values.endpoints.nats -}}
+{{- $url := .Values.endpoints.nats | toString -}}
+{{- /* Drop any user:pass@ first: its colon would otherwise be read as the port separator. */ -}}
+{{- $host := $url | trimPrefix "nats://" | trimPrefix "tls://" | splitList "/" | first | splitList "@" | last | splitList ":" | first -}}
+{{- if and (not (contains "." $host)) (ne $host "localhost") -}}
+{{- fail (printf "endpoints.nats is %q: applog sidecars run in the WORKLOAD's namespace and cannot resolve the short name %q. Give a qualified address, for example %q." $url $host (printf "nats://%s.%s.svc:4222" $host .Release.Namespace)) -}}
+{{- end -}}
+{{- $url -}}
+{{- else -}}
+{{- printf "nats://%s.%s.svc:4222" (printf "%s-nats" .Release.Name | trunc 63 | trimSuffix "-") .Release.Namespace -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "olaitan.falcoIngest.releaseFullname" -}}
 {{- if contains "olaitan" .Release.Name -}}
 {{- .Release.Name | trunc 63 | trimSuffix "-" -}}

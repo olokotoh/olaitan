@@ -34,6 +34,12 @@ type InjectOptions struct {
 	// OLAITAN_APPLOG_* env vars. Empty falls back to the adapter's
 	// compiled defaults. Stringly-typed so the chart can pass
 	// duration / int values verbatim; the adapter parses on start-up.
+	// SidecarNATSURL is the NATS address the sidecar publishes to. The
+	// sidecar runs in the workload's namespace, so it must be fully
+	// qualified. Story 10.10: it was never set, and the sidecar refuses to
+	// start without it.
+	SidecarNATSURL string
+
 	SidecarStdoutPath          string
 	SidecarStderrPath          string
 	SidecarChannelBuffer       string
@@ -88,6 +94,12 @@ func Inject(pod *corev1.Pod, opts InjectOptions) ([]byte, error) {
 	}
 	if opts.SidecarImage == "" {
 		return nil, errors.New("applog/inject: empty sidecar image")
+	}
+	// Story 10.10: a sidecar with no NATS address exits at start, and the
+	// pod carries a crash-looping container until it is recreated. Refuse
+	// here too, not only in NewWebhook, so no caller can produce one.
+	if opts.SidecarNATSURL == "" {
+		return nil, errors.New("applog/inject: empty sidecar NATS URL")
 	}
 
 	// Idempotency check.
@@ -261,6 +273,7 @@ func buildSidecarContainer(opts InjectOptions, peerContainerName string) (corev1
 		{Name: "K8S_POD_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}},
 		{Name: "K8S_NODE_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"}}},
 		{Name: "OLAITAN_TARGET_CONTAINER", Value: peerContainerName},
+		{Name: "NATS_URL", Value: opts.SidecarNATSURL},
 	}
 	// Forward chart-tuned sidecar runtime knobs. Empty values are not
 	// emitted so the adapter's compiled defaults stay in force.
@@ -306,8 +319,10 @@ func buildSidecarContainer(opts InjectOptions, peerContainerName string) (corev1
 		// the Dockerfile's ENTRYPOINT (a future image-build refactor
 		// that wraps the binary in a launcher script would otherwise
 		// silently break the sidecar). Args carries the multi-call
-		// subcommand the binary dispatches on.
-		Command: []string{"olaitan"},
+		// subcommand the binary dispatches on. The path is absolute: the
+		// image is distroless with no PATH entry for /olaitan, so a bare
+		// "olaitan" fails at container init.
+		Command: []string{"/olaitan"},
 		Args:    []string{"applog-sidecar"},
 		Env:     env,
 		VolumeMounts: []corev1.VolumeMount{
