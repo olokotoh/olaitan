@@ -91,8 +91,10 @@ spec:
         - name: applog-injector
           image: {{ include "olaitan.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
+          # Absolute: the image is distroless with no PATH entry for
+          # /olaitan, so a bare "olaitan" fails at container init.
           command:
-            - olaitan
+            - /olaitan
           args:
             - applog-webhook
           ports:

@@ -319,8 +319,10 @@ func buildSidecarContainer(opts InjectOptions, peerContainerName string) (corev1
 		// the Dockerfile's ENTRYPOINT (a future image-build refactor
 		// that wraps the binary in a launcher script would otherwise
 		// silently break the sidecar). Args carries the multi-call
-		// subcommand the binary dispatches on.
-		Command: []string{"olaitan"},
+		// subcommand the binary dispatches on. The path is absolute: the
+		// image is distroless with no PATH entry for /olaitan, so a bare
+		// "olaitan" fails at container init.
+		Command: []string{"/olaitan"},
 		Args:    []string{"applog-sidecar"},
 		Env:     env,
 		VolumeMounts: []corev1.VolumeMount{

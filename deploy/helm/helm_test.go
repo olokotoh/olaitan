@@ -1525,6 +1525,45 @@ func TestApplogSidecarRenders_WhenEnabled(t *testing.T) {
 	}
 }
 
+// TestApplogWebhookCommandIsAbsolute: Story 10.10 live run. The image is
+// distroless with the binary at /olaitan and no PATH entry for it, so the
+// injector's bare "olaitan" failed at container init and the Deployment
+// crash-looped. Scoped to the injector Deployment: the collector and the
+// aggregator already say /olaitan, so a whole-render search proves nothing.
+func TestApplogWebhookCommandIsAbsolute(t *testing.T) {
+	args := append([]string{"nats.enabled=false", "redis.enabled=false"}, applogSidecarEnabledArgs()...)
+	var found bool
+	for _, m := range findByKind(parseManifests(t, helmTemplate(t, args)), "Deployment") {
+		if !strings.HasSuffix(m.Metadata.Name, "-applog-injector") {
+			continue
+		}
+		found = true
+		var d struct {
+			Spec struct {
+				Template struct {
+					Spec struct {
+						Containers []struct {
+							Name    string   `yaml:"name"`
+							Command []string `yaml:"command"`
+						} `yaml:"containers"`
+					} `yaml:"spec"`
+				} `yaml:"template"`
+			} `yaml:"spec"`
+		}
+		if err := m.Raw.Decode(&d); err != nil {
+			t.Fatalf("decode %s: %v", m.Metadata.Name, err)
+		}
+		for _, c := range d.Spec.Template.Spec.Containers {
+			if len(c.Command) != 1 || c.Command[0] != "/olaitan" {
+				t.Errorf("container %q command = %q, want [\"/olaitan\"]", c.Name, c.Command)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no applog-injector Deployment in render")
+	}
+}
+
 // TestApplogSidecarAbsent_WhenDisabled asserts none of the four
 // resources render when the gate is off (the default).
 func TestApplogSidecarAbsent_WhenDisabled(t *testing.T) {
