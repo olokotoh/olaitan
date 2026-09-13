@@ -47,9 +47,12 @@ and false-positive numbers; see [Unreleased](#unreleased).
   silent: each now publishes a 30s heartbeat on `olaitan.health.applog`, and
   the collector on the same node reports `olaitan_source_healthy{source="applog"}`,
   `olaitan_sensor_events_total{source="applog"}` and the new
-  `olaitan_sensor_applog_sidecars{state}` gauge. After upgrading, restart
-  annotated workloads: pods injected by the older webhook keep the sidecar
-  with the empty address until they are recreated.
+  `olaitan_sensor_applog_sidecars{state}` gauge. Neither the webhook nor the
+  sidecar could start in the first place: both ran a bare `olaitan`, which
+  the distroless image cannot resolve (`executable file not found in $PATH`),
+  so `applogSidecar.enabled=true` left the webhook crash-looping. Both now run
+  `/olaitan`. After upgrading, restart annotated workloads: pods injected by
+  the older webhook keep the old sidecar until they are recreated.
 - **Falco is ON in every test** (#106). All six e2e Makefile targets and
   four CI jobs installed with Falco switched off, on the claim that its eBPF
   probe could not load inside kind. That was false on any BTF kernel, and it

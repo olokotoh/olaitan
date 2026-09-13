@@ -385,3 +385,22 @@ func TestInject_ForwardsNATSURL(t *testing.T) {
 	}
 	t.Error("injected sidecar has no NATS_URL")
 }
+
+// TestInject_SidecarCommandIsAbsolute: Story 10.10 live run. The image is
+// distroless with the binary at /olaitan and no PATH entry for it, so a bare
+// "olaitan" fails at container init ("executable file not found in $PATH")
+// and the sidecar never starts.
+func TestInject_SidecarCommandIsAbsolute(t *testing.T) {
+	patch, err := Inject(samplePod(), defaultInjectOpts())
+	if err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+	var ops []jsonPatchOp
+	if err := json.Unmarshal(patch, &ops); err != nil {
+		t.Fatal(err)
+	}
+	sidecar := decodeInjectedSidecar(t, ops, "/spec/initContainers/-")
+	if len(sidecar.Command) != 1 || sidecar.Command[0] != "/olaitan" {
+		t.Errorf("sidecar Command = %q, want [\"/olaitan\"]", sidecar.Command)
+	}
+}
