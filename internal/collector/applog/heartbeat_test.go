@@ -74,6 +74,42 @@ func TestRunHeartbeat_FirstOneGoesOutBeforeTheFirstTick(t *testing.T) {
 	}
 }
 
+// TestStartHeartbeat_StopWaitsForTheDepartingHeartbeat: Story 10.10 review.
+// The sidecar ran RunHeartbeat in a goroutine nothing waited for, so on
+// shutdown it closed NATS and exited before the departing heartbeat went
+// out, and every rollout left its sidecars counted stale for ten minutes.
+// Once stop returns, the departing heartbeat must already be published.
+func TestStartHeartbeat_StopWaitsForTheDepartingHeartbeat(t *testing.T) {
+	snap := func() Heartbeat { return Heartbeat{Namespace: "shop", Pod: "api-1", Node: "n1"} }
+	lastIsDeparting := func(t *testing.T, pub *recordingCorePub) {
+		t.Helper()
+		n := pub.count()
+		if n == 0 {
+			t.Fatal("no heartbeat published before stop returned")
+		}
+		if last := pub.at(t, n-1); !last.Departing {
+			t.Errorf("last heartbeat before stop returned is not departing: %+v", last)
+		}
+	}
+
+	t.Run("stop on a live context", func(t *testing.T) {
+		pub := &recordingCorePub{}
+		stop := StartHeartbeat(context.Background(), pub, "olaitan.health.applog.n1", time.Hour, snap)
+		stop()
+		lastIsDeparting(t, pub)
+		stop() // a second stop is harmless
+	})
+
+	t.Run("stop after the parent context ended", func(t *testing.T) {
+		pub := &recordingCorePub{}
+		ctx, cancel := context.WithCancel(context.Background())
+		stop := StartHeartbeat(ctx, pub, "olaitan.health.applog.n1", time.Hour, snap)
+		cancel() // SIGTERM: the signal context ends before run returns
+		stop()
+		lastIsDeparting(t, pub)
+	})
+}
+
 func TestRunHeartbeat_RepeatsOnTheInterval(t *testing.T) {
 	pub := &recordingCorePub{}
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)

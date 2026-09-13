@@ -277,7 +277,22 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 	// hooks.
 	a.stdoutTailFn = a.defaultFileTail("stdout", cfg.StdoutPath)
 	a.stderrTailFn = a.defaultFileTail("stderr", cfg.StderrPath)
+	// Awaiting the first event from construction, not from Run: the
+	// sidecar's first heartbeat goes out before Run, and the zero
+	// (false, nil) would report a starting sidecar as unhealthy.
+	a.health.MarkUnhealthy(ErrAwaitingFirstEvent)
 	return a, nil
+}
+
+// noteDrop counts a dropped publish. Before any publish has landed the
+// adapter is no longer merely awaiting its first event, it is failing to
+// deliver one, so health says so: the heartbeat would otherwise keep
+// reporting "starting" while no event ever reaches JetStream.
+func (a *Adapter) noteDrop(perr error) {
+	a.publishDrops.Add(1)
+	if a.lastEventTime.Load() == nil {
+		a.health.MarkUnhealthy(fmt.Errorf("applog: publish failing before the first event: %w", perr))
+	}
 }
 
 // defaultFileTail returns a closure that invokes runFileTail with the
@@ -559,7 +574,7 @@ func (a *Adapter) consume(ctx context.Context, lineCh <-chan LineRecord) error {
 					return nil
 				}
 				if isPermanentPublishError(perr) {
-					a.publishDrops.Add(1)
+					a.noteDrop(perr)
 					a.log.Error("applog: publish dropped (permanent, per-event)",
 						"err", perr,
 						"event_id", ev.ID,
@@ -571,7 +586,7 @@ func (a *Adapter) consume(ctx context.Context, lineCh <-chan LineRecord) error {
 				// the operator via the staleness watchdog when no
 				// successful publish has stamped lastEventTime for the
 				// staleness window AND readerErrAt is also stale.
-				a.publishDrops.Add(1)
+				a.noteDrop(perr)
 				a.log.Error("applog: publish dropped (retry budget exhausted)",
 					"err", perr,
 					"event_id", ev.ID,

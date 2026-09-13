@@ -106,6 +106,31 @@ func RunHeartbeat(ctx context.Context, pub corePublisher, subject string, interv
 	}
 }
 
+// departWait bounds how long stop waits for the departing heartbeat, so a
+// wedged publish cannot hold up pod termination.
+const departWait = 2 * time.Second
+
+// StartHeartbeat runs RunHeartbeat in the background and returns stop, which
+// ends it and returns once the departing heartbeat has been published (or
+// departWait has passed). stop is safe to call more than once and after ctx
+// has ended. The sidecar defers stop ahead of its NATS close, so the
+// collector hears the goodbye instead of counting the sidecar stale.
+func StartHeartbeat(ctx context.Context, pub corePublisher, subject string, interval time.Duration, snapshot func() Heartbeat) (stop func()) {
+	hbCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		RunHeartbeat(hbCtx, pub, subject, interval, snapshot)
+	}()
+	return func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(departWait):
+		}
+	}
+}
+
 // forgetAfter drops a sidecar that has been silent this long without
 // saying goodbye: its pod is gone, and a deleted workload must not hold
 // the node's source unhealthy.

@@ -372,7 +372,8 @@ overrides make the two disagree, with the literal values to set instead.
 {{- define "olaitan.endpoints.natsFQDN" -}}
 {{- if .Values.endpoints.nats -}}
 {{- $url := .Values.endpoints.nats | toString -}}
-{{- $host := $url | trimPrefix "nats://" | trimPrefix "tls://" | splitList "/" | first | splitList ":" | first -}}
+{{- /* Drop any user:pass@ first: its colon would otherwise be read as the port separator. */ -}}
+{{- $host := $url | trimPrefix "nats://" | trimPrefix "tls://" | splitList "/" | first | splitList "@" | last | splitList ":" | first -}}
 {{- if and (not (contains "." $host)) (ne $host "localhost") -}}
 {{- fail (printf "endpoints.nats is %q: applog sidecars run in the WORKLOAD's namespace and cannot resolve the short name %q. Give a qualified address, for example %q." $url $host (printf "nats://%s.%s.svc:4222" $host .Release.Namespace)) -}}
 {{- end -}}

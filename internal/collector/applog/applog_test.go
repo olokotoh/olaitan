@@ -347,6 +347,62 @@ func TestRun_TerminalPublishErrorIsDropped(t *testing.T) {
 	<-runDone
 }
 
+// TestNew_StartsAwaitingFirstEvent: Story 10.10 review. The sidecar's first
+// heartbeat goes out as soon as the adapter exists, before Run. A new
+// adapter reporting the zero (false, nil) made that heartbeat say
+// "unhealthy" instead of "starting", so every sidecar start flapped its
+// node's applog source unhealthy until the next heartbeat.
+func TestNew_StartsAwaitingFirstEvent(t *testing.T) {
+	a := newTestAdapter(t, newStubPublisher())
+	healthy, err := a.Health().Status()
+	if healthy || !errors.Is(err, ErrAwaitingFirstEvent) {
+		t.Errorf("new adapter Status = (%v, %v), want (false, ErrAwaitingFirstEvent)", healthy, err)
+	}
+}
+
+// TestRun_PublishFailingBeforeFirstEventIsUnhealthy: Story 10.10 review. A
+// sidecar that reads lines but never lands one on JetStream stayed
+// "awaiting first event", which the heartbeat reports as starting, so the
+// collector showed applog healthy while no event ever arrived.
+func TestRun_PublishFailingBeforeFirstEventIsUnhealthy(t *testing.T) {
+	pub := newStubPublisher()
+	pub.setFailAlways(nats.ErrMaxPayload)
+	a := newTestAdapter(t, pub)
+
+	w, stdoutFn := pipeTailFn(t, a, "stdout")
+	a.stdoutTailFn = stdoutFn
+	a.stderrTailFn = func(ctx context.Context, sink chan<- LineRecord) error {
+		<-ctx.Done()
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- a.Run(ctx) }()
+
+	if _, err := w.Write([]byte("never-lands\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	deadline := time.After(3 * time.Second)
+	for a.PublishDrops() < 1 {
+		select {
+		case <-deadline:
+			cancel()
+			<-runDone
+			t.Fatalf("publish_drops never incremented")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	healthy, err := a.Health().Status()
+	cancel()
+	<-runDone
+	if healthy || err == nil || errors.Is(err, ErrAwaitingFirstEvent) {
+		t.Errorf("after a dropped publish and no success, Status = (%v, %v), want unhealthy with a publish error", healthy, err)
+	}
+}
+
 func TestRun_StalenessWatchdog_QuietButHealthy_DoesNotFlipUnhealthy(t *testing.T) {
 	pub := newStubPublisher()
 	cfg := Config{

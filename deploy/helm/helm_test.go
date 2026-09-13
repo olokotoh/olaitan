@@ -5612,6 +5612,24 @@ func TestApplogWebhookGivesSidecarsANATSURL(t *testing.T) {
 	}
 }
 
+// TestApplogWebhookAcceptsNATSURLWithCredentials: Story 10.10 review. The
+// short-name guard read the host as everything before the first colon, so
+// nats://user:pass@nats.infra.svc:4222 was judged to be the short name
+// "user" and a valid, qualified address failed the render.
+func TestApplogWebhookAcceptsNATSURLWithCredentials(t *testing.T) {
+	const url = "nats://user:pass@nats.infra.svc:4222"
+	rendered := helmTemplate(t, []string{"applogSidecar.enabled=true", "applogSidecar.tls.servingCert=Yw==",
+		"applogSidecar.tls.servingKey=aw==", "applogSidecar.tls.caBundle=Yw==", "endpoints.nats=" + url})
+	if !strings.Contains(rendered, `value: "`+url+`"`) {
+		t.Errorf("sidecar NATS URL with credentials not passed through unchanged\n%s", snippet(rendered, "OLAITAN_WEBHOOK_SIDECAR_NATS_URL"))
+	}
+	// Credentials must not hide a short host from the guard either.
+	if msg := helmTemplateExpectError(t, []string{"applogSidecar.enabled=true", "applogSidecar.tls.servingCert=Yw==",
+		"applogSidecar.tls.servingKey=aw==", "applogSidecar.tls.caBundle=Yw==", "endpoints.nats=nats://user:pass@nats:4222"}); !strings.Contains(msg, "endpoints.nats") {
+		t.Errorf("a short host behind credentials rendered, or failed without naming endpoints.nats: %s", msg)
+	}
+}
+
 // TestCollectorKnowsWhetherApplogIsOn: Story 10.10. The collector tracks
 // applog sidecar heartbeats only when applog is enabled.
 func TestCollectorKnowsWhetherApplogIsOn(t *testing.T) {

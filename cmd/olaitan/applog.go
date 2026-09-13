@@ -160,7 +160,9 @@ func runApplogSidecar(ctx context.Context, args []string, stderr io.Writer) int 
 		return 1
 	}
 	started := time.Now().UnixNano()
-	go collectorapplog.RunHeartbeat(ctx, nc, hbSubject, collectorapplog.HeartbeatInterval, func() collectorapplog.Heartbeat {
+	// Deferred after the NATS close, so it runs first: every return path
+	// publishes the departing heartbeat before the connection goes away.
+	stopHeartbeat := collectorapplog.StartHeartbeat(ctx, nc, hbSubject, collectorapplog.HeartbeatInterval, func() collectorapplog.Heartbeat {
 		healthy, herr := adapter.Health().Status()
 		return collectorapplog.Heartbeat{
 			Namespace: cfg.Pod.Namespace,
@@ -176,6 +178,7 @@ func runApplogSidecar(ctx context.Context, args []string, stderr io.Writer) int 
 			Engaged:  adapter.EngagedTotal(),
 		}
 	})
+	defer stopHeartbeat()
 
 	log.Info("applog-sidecar: started",
 		"pod", cfg.Pod.Namespace+"/"+cfg.Pod.Name,
