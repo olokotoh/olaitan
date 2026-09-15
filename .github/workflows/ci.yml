@@ -771,8 +771,8 @@ jobs:
 
       # MinIO is started as an explicit `docker run` step rather than a
       # `services:` container because GitHub Actions `services:` cannot
-      # override an image's command, and the official `minio/minio` image
-      # needs an explicit `server /data ...` command (it has no default
+      # override an image's command, and the official MinIO image
+      # (quay.io/minio/minio) needs an explicit `server /data ...` command (it has no default
       # server entrypoint). The previously-used `bitnami/minio:latest` tag
       # was pruned by Bitnami (manifest unknown), so we pin the official
       # image to a specific, verified-pullable RELEASE tag for
@@ -834,7 +834,7 @@ jobs:
           go-version: '1.26'
 
       # MinIO is started as an explicit `docker run` step (see the
-      # forensics-integration job rationale): the official minio/minio image
+      # forensics-integration job rationale): the official quay.io/minio/minio image
       # needs an explicit `server /data ...` command, pinned to a verified
       # RELEASE tag (never `latest`), pulled from quay.io because Docker Hub no
       # longer serves it. MinIO supports object lock + SSE-KMS, so a
