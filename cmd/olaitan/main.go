@@ -41,6 +41,7 @@ import (
 
 	"github.com/olokotoh/olaitan/internal/agent/prompts"
 	ollamaprovider "github.com/olokotoh/olaitan/internal/agent/provider/ollama"
+	collectorapplog "github.com/olokotoh/olaitan/internal/collector/applog"
 	"github.com/olokotoh/olaitan/internal/collector/audit"
 	"github.com/olokotoh/olaitan/internal/collector/cni"
 	"github.com/olokotoh/olaitan/internal/collector/cri"
@@ -2103,6 +2104,29 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 		})
 		log.Info("collector: ring 1 wired (containerd cri)",
 			"socket_path", criCfg.SocketPath)
+	}
+
+	// Story 10.10: applog sidecars run in workload pods and report over a
+	// core-NATS heartbeat; the collector tracks the ones on its node and
+	// exposes them as the applog source. Wired only when the chart says
+	// applog is on, so an install without it does not report a healthy
+	// applog source that is not there.
+	if os.Getenv("OLAITAN_APPLOG_ENABLED") == "true" {
+		tracker := collectorapplog.NewSidecarTracker(nodeName, 3*collectorapplog.HeartbeatInterval)
+		// Node-scoped: this collector hears only its own node's
+		// sidecars, so a large cluster does not fan every heartbeat out
+		// to every collector.
+		subj, serr := collectorapplog.HeartbeatSubject(nodeName)
+		if serr != nil {
+			closeNATS()
+			return fmt.Errorf("collector: applog heartbeat subject: %w", serr)
+		}
+		if serr := nc.Subscribe(ctx, subj, tracker.Observe); serr != nil {
+			closeNATS()
+			return fmt.Errorf("collector: applog heartbeat subscribe: %w", serr)
+		}
+		metricsSources[string(schema.SourceAppLog)] = tracker
+		log.Info("collector: applog sidecar heartbeats wired", "subject", subj)
 	}
 
 	// Story 1.10: Calico CNI flow adapter. Gated on the config block

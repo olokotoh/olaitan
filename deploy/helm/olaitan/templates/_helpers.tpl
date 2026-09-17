@@ -362,6 +362,48 @@ olaitan.falcoIngest.releaseFullname: the olaitan.fullname rule minus
 nameOverride/fullnameOverride. The guard below fails the render when those
 overrides make the two disagree, with the literal values to set instead.
 */}}
+{{/* NATS URL resolvable from ANY namespace (applog sidecars run in the
+     workload's namespace, not this release's). endpoints.nats wins when
+     set, but it must be qualified enough to resolve there: the default
+     endpoints.nats is a short, namespace-local name, and a sidecar given
+     that address fails DNS in every other namespace and crash-loops,
+     which is the defect Story 10.10 exists to fix. Validated, not
+     silently rewritten: only the operator knows their own NATS.
+
+     Every comma-separated server is checked. Any URL scheme is stripped
+     (nats, tls, ws, wss, in any case). A bracketed IPv6 host is read up to
+     its closing bracket, not its first colon. localhost and loopback are
+     rejected: inside a workload pod they are the pod itself, never NATS.
+     Credentials (user:pass@ or a user@ token) are rejected too: the
+     webhook copies this URL as a plain env var into every workload pod.
+     The message never echoes the URL, so the secret does not reach logs. */}}
+{{- define "olaitan.endpoints.natsFQDN" -}}
+{{- if .Values.endpoints.nats -}}
+{{- $url := .Values.endpoints.nats | toString -}}
+{{- range $server := splitList "," $url -}}
+{{- $rest := regexReplaceAll `(?i)^[a-z][a-z0-9+.-]*://` (trim $server) "" -}}
+{{- if contains "@" $rest -}}
+{{- fail "endpoints.nats contains credentials (user:pass@ or user@). With applogSidecar.enabled the webhook copies this URL as a plain env var into every workload pod, where anyone who can read a pod spec can read them. Remove them from the URL; NATS authentication for applog sidecars is tracked in Epic 14 (#130)." -}}
+{{- end -}}
+{{- $authority := $rest | splitList "/" | first -}}
+{{- $host := $authority | splitList ":" | first -}}
+{{- if hasPrefix "[" $authority -}}
+{{- $host = regexReplaceAll `^\[([^\]]*)\].*$` $authority "${1}" -}}
+{{- end -}}
+{{- $h := $host | lower | trimSuffix "." -}}
+{{- if or (eq $h "localhost") (hasSuffix ".localhost" $h) (regexMatch `^127\.` $h) (eq $h "::1") -}}
+{{- fail (printf "endpoints.nats server %q is loopback: inside a workload pod it is the pod itself, never NATS, so every applog sidecar would crash-loop. Give the qualified NATS Service address, for example %q." $host (printf "nats://%s-nats.%s.svc:4222" $.Release.Name $.Release.Namespace)) -}}
+{{- end -}}
+{{- if and (not (contains "." $h)) (not (contains ":" $h)) -}}
+{{- fail (printf "endpoints.nats is %q: applog sidecars run in the WORKLOAD's namespace and cannot resolve the short name %q. Give a qualified address, for example %q." $url $host (printf "nats://%s.%s.svc:4222" $host $.Release.Namespace)) -}}
+{{- end -}}
+{{- end -}}
+{{- $url -}}
+{{- else -}}
+{{- printf "nats://%s.%s.svc:4222" (printf "%s-nats" .Release.Name | trunc 63 | trimSuffix "-") .Release.Namespace -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "olaitan.falcoIngest.releaseFullname" -}}
 {{- if contains "olaitan" .Release.Name -}}
 {{- .Release.Name | trunc 63 | trimSuffix "-" -}}

@@ -1525,6 +1525,45 @@ func TestApplogSidecarRenders_WhenEnabled(t *testing.T) {
 	}
 }
 
+// TestApplogWebhookCommandIsAbsolute: Story 10.10 live run. The image is
+// distroless with the binary at /olaitan and no PATH entry for it, so the
+// injector's bare "olaitan" failed at container init and the Deployment
+// crash-looped. Scoped to the injector Deployment: the collector and the
+// aggregator already say /olaitan, so a whole-render search proves nothing.
+func TestApplogWebhookCommandIsAbsolute(t *testing.T) {
+	args := append([]string{"nats.enabled=false", "redis.enabled=false"}, applogSidecarEnabledArgs()...)
+	var found bool
+	for _, m := range findByKind(parseManifests(t, helmTemplate(t, args)), "Deployment") {
+		if !strings.HasSuffix(m.Metadata.Name, "-applog-injector") {
+			continue
+		}
+		found = true
+		var d struct {
+			Spec struct {
+				Template struct {
+					Spec struct {
+						Containers []struct {
+							Name    string   `yaml:"name"`
+							Command []string `yaml:"command"`
+						} `yaml:"containers"`
+					} `yaml:"spec"`
+				} `yaml:"template"`
+			} `yaml:"spec"`
+		}
+		if err := m.Raw.Decode(&d); err != nil {
+			t.Fatalf("decode %s: %v", m.Metadata.Name, err)
+		}
+		for _, c := range d.Spec.Template.Spec.Containers {
+			if len(c.Command) != 1 || c.Command[0] != "/olaitan" {
+				t.Errorf("container %q command = %q, want [\"/olaitan\"]", c.Name, c.Command)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no applog-injector Deployment in render")
+	}
+}
+
 // TestApplogSidecarAbsent_WhenDisabled asserts none of the four
 // resources render when the gate is off (the default).
 func TestApplogSidecarAbsent_WhenDisabled(t *testing.T) {
@@ -5537,5 +5576,122 @@ func TestContainerdSensorGrantsTheSocketGroup(t *testing.T) {
 		if out, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(out), "socketGroup") {
 			t.Errorf("socketGroup=%q rendered (or failed without naming it): %v %s", bad, err, out)
 		}
+	}
+}
+
+// TestApplogWebhookGivesSidecarsANATSURL: Story 10.10. Injected sidecars run
+// in the WORKLOAD's namespace, so the NATS address must be fully qualified;
+// a short Service name would not resolve there.
+func TestApplogWebhookGivesSidecarsANATSURL(t *testing.T) {
+	envOf := func(sets []string) string {
+		rendered := helmTemplate(t, append([]string{"applogSidecar.enabled=true", "applogSidecar.tls.servingCert=Yw==", "applogSidecar.tls.servingKey=aw==", "applogSidecar.tls.caBundle=Yw=="}, sets...))
+		dep := docByKindName(t, rendered, "Deployment", "applog")
+		for _, c := range dep["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)["containers"].([]any) {
+			for _, e := range c.(map[string]any)["env"].([]any) {
+				em := e.(map[string]any)
+				if em["name"] == "OLAITAN_WEBHOOK_SIDECAR_NATS_URL" {
+					return fmt.Sprint(em["value"])
+				}
+			}
+		}
+		return ""
+	}
+	if got := envOf(nil); got != "nats://olaitan-nats.default.svc:4222" {
+		t.Errorf("sidecar NATS URL = %q, want the namespace-qualified NATS Service", got)
+	}
+	if got := envOf([]string{"endpoints.nats=nats://nats.infra.svc:4222"}); got != "nats://nats.infra.svc:4222" {
+		t.Errorf("an explicit endpoints.nats was not used: %q", got)
+	}
+	// A short override resolves for the collector and the aggregator, which
+	// run in this namespace, and for nothing else. Injected sidecars run in
+	// the workload's namespace, so it must fail at render rather than
+	// crash-loop every sidecar in the cluster.
+	if msg := helmTemplateExpectError(t, []string{"applogSidecar.enabled=true", "applogSidecar.tls.servingCert=Yw==",
+		"applogSidecar.tls.servingKey=aw==", "applogSidecar.tls.caBundle=Yw==", "endpoints.nats=nats://nats:4222"}); !strings.Contains(msg, "endpoints.nats") {
+		t.Errorf("a short endpoints.nats rendered, or failed without naming it: %s", msg)
+	}
+}
+
+// TestApplogWebhookRejectsNATSURLWithCredentials: Story 10.10 review. The
+// webhook copies endpoints.nats into every injected sidecar as a plain env
+// var, so user:pass@ (or a bare user@ token) would sit readable in every
+// workload pod spec in the cluster. The render fails instead; NATS auth is
+// tracked in Epic 14 (#130).
+func TestApplogWebhookRejectsNATSURLWithCredentials(t *testing.T) {
+	for _, url := range []string{
+		"nats://user:pass@nats.infra.svc:4222",
+		"nats://token@nats.infra.svc:4222",
+		"nats://user:pa/ss@nats.infra.svc:4222",
+		"nats://nats-a.infra.svc:4222\\,nats://user:pass@nats-b.infra.svc:4222",
+	} {
+		msg := helmTemplateExpectError(t, []string{"applogSidecar.enabled=true", "applogSidecar.tls.servingCert=Yw==",
+			"applogSidecar.tls.servingKey=aw==", "applogSidecar.tls.caBundle=Yw==", "endpoints.nats=" + url})
+		if !strings.Contains(msg, "endpoints.nats") || !strings.Contains(msg, "credentials") || !strings.Contains(msg, "#130") {
+			t.Errorf("endpoints.nats=%s: want a failure naming endpoints.nats, credentials and #130, got: %s", url, msg)
+		}
+	}
+	// Without the applog sidecar nothing copies the URL into workload pods.
+	helmTemplate(t, []string{"endpoints.nats=nats://user:pass@nats.infra.svc:4222"})
+}
+
+// TestApplogWebhookNATSURLHostParsing: Story 10.10 review. The short-name
+// guard only knew the nats:// and tls:// schemes, read only the first of a
+// comma-separated server list, split a bracketed IPv6 host on its first
+// colon, and let localhost through, which inside a workload pod is the pod
+// itself and never NATS.
+func TestApplogWebhookNATSURLHostParsing(t *testing.T) {
+	base := []string{"applogSidecar.enabled=true", "applogSidecar.tls.servingCert=Yw==",
+		"applogSidecar.tls.servingKey=aw==", "applogSidecar.tls.caBundle=Yw=="}
+	for _, url := range []string{
+		"nats://nats.infra.svc:4222",
+		"ws://nats.infra.svc:8080",
+		"wss://nats.infra.svc:443",
+		"NATS://nats.infra.svc:4222",
+		"nats.infra.svc:4222",
+		"nats://10.0.0.5:4222",
+		"nats://[fd00::1]:4222",
+		"nats://nats-a.infra.svc:4222\\,nats://nats-b.infra.svc:4222",
+	} {
+		rendered := helmTemplate(t, append(append([]string{}, base...), "endpoints.nats="+url))
+		want := strings.ReplaceAll(url, "\\,", ",")
+		if !strings.Contains(rendered, `value: "`+want+`"`) {
+			t.Errorf("endpoints.nats=%s was not passed through unchanged\n%s", want, snippet(rendered, "OLAITAN_WEBHOOK_SIDECAR_NATS_URL"))
+		}
+	}
+	for _, url := range []string{
+		"ws://nats:8080",
+		"WSS://nats:443",
+		"nats://nats-a.infra.svc:4222\\,nats://nats-b:4222",
+		"nats://localhost:4222",
+		"nats://LOCALHOST:4222",
+		"nats://127.0.0.1:4222",
+		"nats://[::1]:4222",
+	} {
+		msg := helmTemplateExpectError(t, append(append([]string{}, base...), "endpoints.nats="+url))
+		if !strings.Contains(msg, "endpoints.nats") {
+			t.Errorf("endpoints.nats=%s: want a failure naming endpoints.nats, got: %s", url, msg)
+		}
+	}
+}
+
+// TestCollectorKnowsWhetherApplogIsOn: Story 10.10. The collector tracks
+// applog sidecar heartbeats only when applog is enabled.
+func TestCollectorKnowsWhetherApplogIsOn(t *testing.T) {
+	envOf := func(sets []string) any {
+		pod := collectorDaemonSet(t, helmTemplate(t, sets))["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)
+		for _, c := range pod["containers"].([]any) {
+			for _, e := range c.(map[string]any)["env"].([]any) {
+				if em := e.(map[string]any); em["name"] == "OLAITAN_APPLOG_ENABLED" {
+					return em["value"]
+				}
+			}
+		}
+		return nil
+	}
+	if v := envOf(nil); v != "false" {
+		t.Errorf("OLAITAN_APPLOG_ENABLED default = %v, want \"false\"", v)
+	}
+	if v := envOf([]string{"applogSidecar.enabled=true", "applogSidecar.tls.servingCert=Yw==", "applogSidecar.tls.servingKey=aw==", "applogSidecar.tls.caBundle=Yw=="}); v != "true" {
+		t.Errorf("OLAITAN_APPLOG_ENABLED with applog on = %v, want \"true\"", v)
 	}
 }

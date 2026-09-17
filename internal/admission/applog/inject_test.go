@@ -29,6 +29,17 @@ func defaultInjectOpts() InjectOptions {
 	return InjectOptions{
 		UseNativeSidecar: true,
 		SidecarImage:     "ghcr.io/olokotoh/olaitan:dev",
+		SidecarNATSURL:   "nats://olaitan-nats.olaitan.svc:4222",
+	}
+}
+
+// Story 10.10: a sidecar with no NATS address exits at start, so no caller
+// may produce one, webhook or not.
+func TestInject_EmptyNATSURL_Errors(t *testing.T) {
+	opts := defaultInjectOpts()
+	opts.SidecarNATSURL = ""
+	if _, err := Inject(samplePod(), opts); err == nil {
+		t.Error("Inject accepted an empty sidecar NATS URL")
 	}
 }
 
@@ -346,5 +357,85 @@ func TestInject_NilPod_Errors(t *testing.T) {
 	_, err := Inject(nil, defaultInjectOpts())
 	if err == nil {
 		t.Error("expected error on nil pod")
+	}
+}
+
+// TestInject_ForwardsNATSURL: Story 10.10. The sidecar refuses to start
+// without NATS_URL, and the injector never set it, so every injected sidecar
+// exited 1 and restart-looped while the app kept running.
+func TestInject_ForwardsNATSURL(t *testing.T) {
+	opts := defaultInjectOpts()
+	opts.SidecarNATSURL = "nats://olaitan-nats.olaitan.svc:4222"
+	patch, err := Inject(samplePod(), opts)
+	if err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+	var ops []jsonPatchOp
+	if err := json.Unmarshal(patch, &ops); err != nil {
+		t.Fatal(err)
+	}
+	sidecar := decodeInjectedSidecar(t, ops, "/spec/initContainers/-")
+	for _, e := range sidecar.Env {
+		if e.Name == "NATS_URL" {
+			if e.Value != opts.SidecarNATSURL {
+				t.Errorf("NATS_URL = %q, want %q", e.Value, opts.SidecarNATSURL)
+			}
+			return
+		}
+	}
+	t.Error("injected sidecar has no NATS_URL")
+}
+
+// TestInject_SidecarCommandIsAbsolute: Story 10.10 live run. The image is
+// distroless with the binary at /olaitan and no PATH entry for it, so a bare
+// "olaitan" fails at container init ("executable file not found in $PATH")
+// and the sidecar never starts.
+func TestInject_SidecarCommandIsAbsolute(t *testing.T) {
+	patch, err := Inject(samplePod(), defaultInjectOpts())
+	if err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+	var ops []jsonPatchOp
+	if err := json.Unmarshal(patch, &ops); err != nil {
+		t.Fatal(err)
+	}
+	sidecar := decodeInjectedSidecar(t, ops, "/spec/initContainers/-")
+	if len(sidecar.Command) != 1 || sidecar.Command[0] != "/olaitan" {
+		t.Errorf("sidecar Command = %q, want [\"/olaitan\"]", sidecar.Command)
+	}
+}
+
+// TestInject_NonNativeSidecar_ForwardsNATSURLAndAbsoluteCommand: Story 10.10
+// review. The NATS_URL and absolute-command tests only covered the native
+// sidecar (spec.initContainers). Clusters without KEP-753 get the sidecar
+// under spec.containers, and it needs the same address and the same
+// /olaitan command to start there.
+func TestInject_NonNativeSidecar_ForwardsNATSURLAndAbsoluteCommand(t *testing.T) {
+	opts := defaultInjectOpts()
+	opts.UseNativeSidecar = false
+	opts.SidecarNATSURL = "nats://olaitan-nats.olaitan.svc:4222"
+	patch, err := Inject(samplePod(), opts)
+	if err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+	var ops []jsonPatchOp
+	if err := json.Unmarshal(patch, &ops); err != nil {
+		t.Fatal(err)
+	}
+	sidecar := decodeInjectedSidecar(t, ops, "/spec/containers/-")
+	if len(sidecar.Command) != 1 || sidecar.Command[0] != "/olaitan" {
+		t.Errorf("sidecar Command = %q, want [\"/olaitan\"]", sidecar.Command)
+	}
+	var natsURL *corev1.EnvVar
+	for i := range sidecar.Env {
+		if sidecar.Env[i].Name == "NATS_URL" {
+			natsURL = &sidecar.Env[i]
+		}
+	}
+	if natsURL == nil {
+		t.Fatal("injected sidecar under spec.containers has no NATS_URL")
+	}
+	if natsURL.Value != opts.SidecarNATSURL {
+		t.Errorf("NATS_URL = %q, want %q", natsURL.Value, opts.SidecarNATSURL)
 	}
 }

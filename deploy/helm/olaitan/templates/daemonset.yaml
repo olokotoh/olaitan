@@ -158,6 +158,9 @@ spec:
               value: {{ include "olaitan.endpoints.nats" . | quote }}
             - name: REDIS_ADDR
               value: {{ include "olaitan.endpoints.redis" . | quote }}
+            # Story 10.10: track applog sidecar heartbeats only when applog is on.
+            - name: OLAITAN_APPLOG_ENABLED
+              value: {{ .Values.applogSidecar.enabled | toString | quote }}
             - name: FALCO_LISTEN_ADDR
               value: {{ printf ":%v" .Values.falcoIngest.port | quote }}
             # Read from the mounted release Secret (below), not an env

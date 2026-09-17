@@ -277,7 +277,22 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 	// hooks.
 	a.stdoutTailFn = a.defaultFileTail("stdout", cfg.StdoutPath)
 	a.stderrTailFn = a.defaultFileTail("stderr", cfg.StderrPath)
+	// Awaiting the first event from construction, not from Run: the
+	// sidecar's first heartbeat goes out before Run, and the zero
+	// (false, nil) would report a starting sidecar as unhealthy.
+	a.health.MarkUnhealthy(ErrAwaitingFirstEvent)
 	return a, nil
+}
+
+// noteDrop counts a dropped publish. Before any publish has landed the
+// adapter is no longer merely awaiting its first event, it is failing to
+// deliver one, so health says so: the heartbeat would otherwise keep
+// reporting "starting" while no event ever reaches JetStream.
+func (a *Adapter) noteDrop(perr error) {
+	a.publishDrops.Add(1)
+	if a.lastEventTime.Load() == nil {
+		a.health.MarkUnhealthy(fmt.Errorf("applog: publish failing before the first event: %w", perr))
+	}
 }
 
 // defaultFileTail returns a closure that invokes runFileTail with the
@@ -420,8 +435,11 @@ func (a *Adapter) Run(ctx context.Context) (runErr error) {
 	defer a.log.Info("applog: adapter stopped")
 
 	// Mark unhealthy at startup until the first successful publish
-	// flips it. Mirrors the audit / cri startup contract.
-	a.health.MarkUnhealthy(errors.New("applog: awaiting first event"))
+	// flips it (ErrAwaitingFirstEvent, which the sidecar heartbeat
+	// reports as "starting" rather than as a fault: a workload that has
+	// not logged yet is not a broken sensor). Mirrors the audit / cri
+	// startup contract.
+	a.health.MarkUnhealthy(ErrAwaitingFirstEvent)
 
 	lineCh := make(chan LineRecord, a.cfg.ChannelBuffer)
 
@@ -473,6 +491,13 @@ func (a *Adapter) Run(ctx context.Context) (runErr error) {
 // surfacing the panic as a runtime fault. The errgroup uses the
 // returned error to cancel sibling goroutines so the whole adapter
 // unwinds together.
+// ErrAwaitingFirstEvent is the health error the adapter carries between
+// start and its first successful publish. Story 10.10: the sidecar
+// heartbeat reports this as "starting", not as a fault, so a workload
+// that has simply not logged anything yet does not make the node's
+// applog source look broken.
+var ErrAwaitingFirstEvent = errors.New("applog: awaiting first event")
+
 var errPanic = errors.New("applog: goroutine panic recovered")
 
 // runWithRecover wraps fn so a panic inside any of the adapter's
@@ -549,7 +574,7 @@ func (a *Adapter) consume(ctx context.Context, lineCh <-chan LineRecord) error {
 					return nil
 				}
 				if isPermanentPublishError(perr) {
-					a.publishDrops.Add(1)
+					a.noteDrop(perr)
 					a.log.Error("applog: publish dropped (permanent, per-event)",
 						"err", perr,
 						"event_id", ev.ID,
@@ -561,7 +586,7 @@ func (a *Adapter) consume(ctx context.Context, lineCh <-chan LineRecord) error {
 				// the operator via the staleness watchdog when no
 				// successful publish has stamped lastEventTime for the
 				// staleness window AND readerErrAt is also stale.
-				a.publishDrops.Add(1)
+				a.noteDrop(perr)
 				a.log.Error("applog: publish dropped (retry budget exhausted)",
 					"err", perr,
 					"event_id", ev.ID,
