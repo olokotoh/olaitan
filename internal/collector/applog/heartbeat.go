@@ -87,19 +87,38 @@ type corePublisher interface {
 // publish is ignored: the next one retries, and a collector that stops
 // hearing a sidecar marks it stale, which is the signal an operator needs.
 func RunHeartbeat(ctx context.Context, pub corePublisher, subject string, interval time.Duration, snapshot func() Heartbeat) {
+	runHeartbeat(ctx, nil, pub, subject, interval, snapshot)
+}
+
+// runHeartbeat is RunHeartbeat with a quit channel. Closing quit ends the
+// loop without a goodbye unless ctx has also ended: only a graceful
+// shutdown (the parent context cancelled, e.g. SIGTERM) sends Departing.
+// A nil quit never fires.
+func runHeartbeat(ctx context.Context, quit <-chan struct{}, pub corePublisher, subject string, interval time.Duration, snapshot func() Heartbeat) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	depart := func() {
+		// The pod is going away (rollout, scale-down, drain). Say so,
+		// so the collector forgets this sidecar now rather than
+		// counting it stale for the next ten minutes.
+		hb := snapshot()
+		hb.Departing = true
+		_ = pub.Publish(subject, hb)
+	}
 	for {
 		_ = pub.Publish(subject, snapshot())
 		select {
 		case <-ctx.Done():
-			// The pod is going away (rollout, scale-down, drain). Say
-			// so on a context that is not already cancelled, so the
-			// collector forgets this sidecar now rather than counting
-			// it stale for the next ten minutes.
-			hb := snapshot()
-			hb.Departing = true
-			_ = pub.Publish(subject, hb)
+			depart()
+			return
+		case <-quit:
+			// The sidecar is exiting on its own. If the parent context
+			// also ended, this is still a graceful shutdown. Otherwise
+			// it is an error exit: stay silent, so a crash-looping
+			// sidecar goes stale instead of being forgotten.
+			if ctx.Err() != nil {
+				depart()
+			}
 			return
 		case <-t.C:
 		}
@@ -111,19 +130,22 @@ func RunHeartbeat(ctx context.Context, pub corePublisher, subject string, interv
 const departWait = 2 * time.Second
 
 // StartHeartbeat runs RunHeartbeat in the background and returns stop, which
-// ends it and returns once the departing heartbeat has been published (or
-// departWait has passed). stop is safe to call more than once and after ctx
+// ends it and returns once the loop has exited (or departWait has passed).
+// The departing heartbeat goes out only when ctx has ended by the time
+// stop is called (a graceful shutdown); stop on a live ctx is an error exit
+// and says no goodbye. stop is safe to call more than once and after ctx
 // has ended. The sidecar defers stop ahead of its NATS close, so the
 // collector hears the goodbye instead of counting the sidecar stale.
 func StartHeartbeat(ctx context.Context, pub corePublisher, subject string, interval time.Duration, snapshot func() Heartbeat) (stop func()) {
-	hbCtx, cancel := context.WithCancel(ctx)
+	quit := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		RunHeartbeat(hbCtx, pub, subject, interval, snapshot)
+		runHeartbeat(ctx, quit, pub, subject, interval, snapshot)
 	}()
+	var once sync.Once
 	return func() {
-		cancel()
+		once.Do(func() { close(quit) })
 		select {
 		case <-done:
 		case <-time.After(departWait):
@@ -202,7 +224,6 @@ func (t *SidecarTracker) Observe(body []byte) {
 	if !ok {
 		st = &sidecarState{started: hb.Started}
 		t.sidecars[key] = st
-		t.prune()
 	}
 	if st.started != hb.Started {
 		// A different run of the sidecar: its counters restarted, so
@@ -217,6 +238,11 @@ func (t *SidecarTracker) Observe(body []byte) {
 	st.healthy = hb.Healthy
 	st.starting = hb.Starting
 	st.gone = hb.Departing
+	if !ok {
+		// After lastSeen is set, so the new entry is never taken for a
+		// long-silent one.
+		t.prune()
+	}
 	t.cachedAt = time.Time{}
 }
 
@@ -230,18 +256,25 @@ func increment(now, prev int64) int64 {
 	return now
 }
 
-// prune bounds the watermark map, dropping the sidecars that departed
-// longest ago. Called with the lock held.
+// prune bounds the watermark map. It first retires sidecars silent past
+// forgetAfter (so the map stays bounded even when nothing scrapes the
+// collector), then drops the sidecars that departed longest ago. Retired
+// entries stay as watermarks until the map is over maxTracked. Called with
+// the lock held.
 func (t *SidecarTracker) prune() {
 	if len(t.sidecars) <= maxTracked {
 		return
 	}
+	now := t.now()
 	type entry struct {
 		key  string
 		seen time.Time
 	}
 	gone := make([]entry, 0, len(t.sidecars))
 	for k, st := range t.sidecars {
+		if !st.gone && now.Sub(st.lastSeen) > forgetAfter {
+			st.gone = true
+		}
 		if st.gone {
 			gone = append(gone, entry{k, st.lastSeen})
 		}

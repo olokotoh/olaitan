@@ -404,3 +404,38 @@ func TestInject_SidecarCommandIsAbsolute(t *testing.T) {
 		t.Errorf("sidecar Command = %q, want [\"/olaitan\"]", sidecar.Command)
 	}
 }
+
+// TestInject_NonNativeSidecar_ForwardsNATSURLAndAbsoluteCommand: Story 10.10
+// review. The NATS_URL and absolute-command tests only covered the native
+// sidecar (spec.initContainers). Clusters without KEP-753 get the sidecar
+// under spec.containers, and it needs the same address and the same
+// /olaitan command to start there.
+func TestInject_NonNativeSidecar_ForwardsNATSURLAndAbsoluteCommand(t *testing.T) {
+	opts := defaultInjectOpts()
+	opts.UseNativeSidecar = false
+	opts.SidecarNATSURL = "nats://olaitan-nats.olaitan.svc:4222"
+	patch, err := Inject(samplePod(), opts)
+	if err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+	var ops []jsonPatchOp
+	if err := json.Unmarshal(patch, &ops); err != nil {
+		t.Fatal(err)
+	}
+	sidecar := decodeInjectedSidecar(t, ops, "/spec/containers/-")
+	if len(sidecar.Command) != 1 || sidecar.Command[0] != "/olaitan" {
+		t.Errorf("sidecar Command = %q, want [\"/olaitan\"]", sidecar.Command)
+	}
+	var natsURL *corev1.EnvVar
+	for i := range sidecar.Env {
+		if sidecar.Env[i].Name == "NATS_URL" {
+			natsURL = &sidecar.Env[i]
+		}
+	}
+	if natsURL == nil {
+		t.Fatal("injected sidecar under spec.containers has no NATS_URL")
+	}
+	if natsURL.Value != opts.SidecarNATSURL {
+		t.Errorf("NATS_URL = %q, want %q", natsURL.Value, opts.SidecarNATSURL)
+	}
+}

@@ -160,8 +160,10 @@ func runApplogSidecar(ctx context.Context, args []string, stderr io.Writer) int 
 		return 1
 	}
 	started := time.Now().UnixNano()
-	// Deferred after the NATS close, so it runs first: every return path
-	// publishes the departing heartbeat before the connection goes away.
+	// Deferred after the NATS close, so it runs first: on a graceful
+	// shutdown (ctx cancelled) the departing heartbeat goes out before the
+	// connection goes away. An error exit on a live ctx sends no goodbye,
+	// so a crash-looping sidecar is counted stale, not forgotten.
 	stopHeartbeat := collectorapplog.StartHeartbeat(ctx, nc, hbSubject, collectorapplog.HeartbeatInterval, func() collectorapplog.Heartbeat {
 		healthy, herr := adapter.Health().Status()
 		return collectorapplog.Heartbeat{

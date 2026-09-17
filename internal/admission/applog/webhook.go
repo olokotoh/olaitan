@@ -121,6 +121,10 @@ type WebhookConfig struct {
 	SidecarCPULimit      string
 	SidecarMemoryLimit   string
 
+	// SidecarNATSURL is forwarded to every injected sidecar as NATS_URL.
+	// Required: a sidecar without it exits at start (Story 10.10).
+	SidecarNATSURL string
+
 	// SidecarStdoutPath / SidecarStderrPath override the sidecar's
 	// default cooperating-app stdout / stderr file paths. Empty falls
 	// back to the adapter's compiled defaults (/var/log/app/stdout.log,
@@ -128,10 +132,6 @@ type WebhookConfig struct {
 	// injected sidecar container as OLAITAN_APPLOG_STDOUT_PATH /
 	// OLAITAN_APPLOG_STDERR_PATH env vars.
 	SidecarStdoutPath string
-
-	// SidecarNATSURL is forwarded to every injected sidecar as NATS_URL.
-	// Required: a sidecar without it exits at start (Story 10.10).
-	SidecarNATSURL    string
 	SidecarStderrPath string
 
 	// SidecarChannelBuffer is the bounded LineRecord channel capacity

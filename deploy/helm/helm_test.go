@@ -5612,21 +5612,65 @@ func TestApplogWebhookGivesSidecarsANATSURL(t *testing.T) {
 	}
 }
 
-// TestApplogWebhookAcceptsNATSURLWithCredentials: Story 10.10 review. The
-// short-name guard read the host as everything before the first colon, so
-// nats://user:pass@nats.infra.svc:4222 was judged to be the short name
-// "user" and a valid, qualified address failed the render.
-func TestApplogWebhookAcceptsNATSURLWithCredentials(t *testing.T) {
-	const url = "nats://user:pass@nats.infra.svc:4222"
-	rendered := helmTemplate(t, []string{"applogSidecar.enabled=true", "applogSidecar.tls.servingCert=Yw==",
-		"applogSidecar.tls.servingKey=aw==", "applogSidecar.tls.caBundle=Yw==", "endpoints.nats=" + url})
-	if !strings.Contains(rendered, `value: "`+url+`"`) {
-		t.Errorf("sidecar NATS URL with credentials not passed through unchanged\n%s", snippet(rendered, "OLAITAN_WEBHOOK_SIDECAR_NATS_URL"))
+// TestApplogWebhookRejectsNATSURLWithCredentials: Story 10.10 review. The
+// webhook copies endpoints.nats into every injected sidecar as a plain env
+// var, so user:pass@ (or a bare user@ token) would sit readable in every
+// workload pod spec in the cluster. The render fails instead; NATS auth is
+// tracked in Epic 14 (#130).
+func TestApplogWebhookRejectsNATSURLWithCredentials(t *testing.T) {
+	for _, url := range []string{
+		"nats://user:pass@nats.infra.svc:4222",
+		"nats://token@nats.infra.svc:4222",
+		"nats://user:pa/ss@nats.infra.svc:4222",
+		"nats://nats-a.infra.svc:4222\\,nats://user:pass@nats-b.infra.svc:4222",
+	} {
+		msg := helmTemplateExpectError(t, []string{"applogSidecar.enabled=true", "applogSidecar.tls.servingCert=Yw==",
+			"applogSidecar.tls.servingKey=aw==", "applogSidecar.tls.caBundle=Yw==", "endpoints.nats=" + url})
+		if !strings.Contains(msg, "endpoints.nats") || !strings.Contains(msg, "credentials") || !strings.Contains(msg, "#130") {
+			t.Errorf("endpoints.nats=%s: want a failure naming endpoints.nats, credentials and #130, got: %s", url, msg)
+		}
 	}
-	// Credentials must not hide a short host from the guard either.
-	if msg := helmTemplateExpectError(t, []string{"applogSidecar.enabled=true", "applogSidecar.tls.servingCert=Yw==",
-		"applogSidecar.tls.servingKey=aw==", "applogSidecar.tls.caBundle=Yw==", "endpoints.nats=nats://user:pass@nats:4222"}); !strings.Contains(msg, "endpoints.nats") {
-		t.Errorf("a short host behind credentials rendered, or failed without naming endpoints.nats: %s", msg)
+	// Without the applog sidecar nothing copies the URL into workload pods.
+	helmTemplate(t, []string{"endpoints.nats=nats://user:pass@nats.infra.svc:4222"})
+}
+
+// TestApplogWebhookNATSURLHostParsing: Story 10.10 review. The short-name
+// guard only knew the nats:// and tls:// schemes, read only the first of a
+// comma-separated server list, split a bracketed IPv6 host on its first
+// colon, and let localhost through, which inside a workload pod is the pod
+// itself and never NATS.
+func TestApplogWebhookNATSURLHostParsing(t *testing.T) {
+	base := []string{"applogSidecar.enabled=true", "applogSidecar.tls.servingCert=Yw==",
+		"applogSidecar.tls.servingKey=aw==", "applogSidecar.tls.caBundle=Yw=="}
+	for _, url := range []string{
+		"nats://nats.infra.svc:4222",
+		"ws://nats.infra.svc:8080",
+		"wss://nats.infra.svc:443",
+		"NATS://nats.infra.svc:4222",
+		"nats.infra.svc:4222",
+		"nats://10.0.0.5:4222",
+		"nats://[fd00::1]:4222",
+		"nats://nats-a.infra.svc:4222\\,nats://nats-b.infra.svc:4222",
+	} {
+		rendered := helmTemplate(t, append(append([]string{}, base...), "endpoints.nats="+url))
+		want := strings.ReplaceAll(url, "\\,", ",")
+		if !strings.Contains(rendered, `value: "`+want+`"`) {
+			t.Errorf("endpoints.nats=%s was not passed through unchanged\n%s", want, snippet(rendered, "OLAITAN_WEBHOOK_SIDECAR_NATS_URL"))
+		}
+	}
+	for _, url := range []string{
+		"ws://nats:8080",
+		"WSS://nats:443",
+		"nats://nats-a.infra.svc:4222\\,nats://nats-b:4222",
+		"nats://localhost:4222",
+		"nats://LOCALHOST:4222",
+		"nats://127.0.0.1:4222",
+		"nats://[::1]:4222",
+	} {
+		msg := helmTemplateExpectError(t, append(append([]string{}, base...), "endpoints.nats="+url))
+		if !strings.Contains(msg, "endpoints.nats") {
+			t.Errorf("endpoints.nats=%s: want a failure naming endpoints.nats, got: %s", url, msg)
+		}
 	}
 }
 

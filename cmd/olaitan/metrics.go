@@ -263,7 +263,7 @@ func registerAdapterCounters(reg *metrics.Registry, source, nodeName string, ad 
 		}{{"live", a.Live}, {"stale", a.Stale}, {"unhealthy", a.Unhealthy}} {
 			if err := reg.RegisterGauge(
 				"olaitan_sensor_applog_sidecars", source,
-				"applog sidecars on this node by heartbeat state: live (heard within 90s), stale (silent, pod probably gone or stuck), unhealthy (live but reporting its own tail or publish path failing) (Story 10.10).",
+				"applog sidecars on this node by heartbeat state: live (heard within the stale threshold, 3 heartbeat intervals), stale (silent, pod probably gone or stuck), unhealthy (live but reporting its own tail or publish path failing) (Story 10.10).",
 				prometheus.Labels{"state": st.state}, st.read); err != nil {
 				return err
 			}

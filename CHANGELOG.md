@@ -55,9 +55,15 @@ and false-positive numbers; see [Unreleased](#unreleased).
   very first heartbeat, not unhealthy; it says goodbye before its NATS
   connection closes, so a rollout no longer leaves its sidecars counted
   stale; and a sidecar whose every publish fails reports unhealthy instead
-  of starting forever. `endpoints.nats` with credentials
-  (`nats://user:pass@host:4222`) now renders; the short-name guard used to
-  read `user` as the host. After upgrading, restart annotated workloads: pods injected by
+  of starting forever. A sidecar that exits on an error sends no goodbye, so a
+  crash-looping sidecar is counted stale. With `applogSidecar.enabled=true`,
+  the render now fails when any server in `endpoints.nats` is a short
+  (unqualified) name such as `nats://nats:4222` or a loopback address such as
+  `localhost`: the sidecar runs in the workload's namespace, where neither
+  reaches NATS. It also fails when `endpoints.nats` carries credentials
+  (`user:pass@` or `user@`), because the webhook would copy them as a plain
+  env var into every workload pod; NATS authentication is tracked in Epic 14
+  (#130). After upgrading, restart annotated workloads: pods injected by
   the older webhook keep the old sidecar until they are recreated.
 - **Falco is ON in every test** (#106). All six e2e Makefile targets and
   four CI jobs installed with Falco switched off, on the claim that its eBPF

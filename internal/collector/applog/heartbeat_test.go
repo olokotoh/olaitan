@@ -78,7 +78,8 @@ func TestRunHeartbeat_FirstOneGoesOutBeforeTheFirstTick(t *testing.T) {
 // The sidecar ran RunHeartbeat in a goroutine nothing waited for, so on
 // shutdown it closed NATS and exited before the departing heartbeat went
 // out, and every rollout left its sidecars counted stale for ten minutes.
-// Once stop returns, the departing heartbeat must already be published.
+// Once stop returns after a graceful shutdown (the parent context ended),
+// the departing heartbeat must already be published.
 func TestStartHeartbeat_StopWaitsForTheDepartingHeartbeat(t *testing.T) {
 	snap := func() Heartbeat { return Heartbeat{Namespace: "shop", Pod: "api-1", Node: "n1"} }
 	lastIsDeparting := func(t *testing.T, pub *recordingCorePub) {
@@ -92,14 +93,6 @@ func TestStartHeartbeat_StopWaitsForTheDepartingHeartbeat(t *testing.T) {
 		}
 	}
 
-	t.Run("stop on a live context", func(t *testing.T) {
-		pub := &recordingCorePub{}
-		stop := StartHeartbeat(context.Background(), pub, "olaitan.health.applog.n1", time.Hour, snap)
-		stop()
-		lastIsDeparting(t, pub)
-		stop() // a second stop is harmless
-	})
-
 	t.Run("stop after the parent context ended", func(t *testing.T) {
 		pub := &recordingCorePub{}
 		ctx, cancel := context.WithCancel(context.Background())
@@ -107,18 +100,54 @@ func TestStartHeartbeat_StopWaitsForTheDepartingHeartbeat(t *testing.T) {
 		cancel() // SIGTERM: the signal context ends before run returns
 		stop()
 		lastIsDeparting(t, pub)
+		n := pub.count()
+		stop() // a second stop is harmless
+		if pub.count() != n {
+			t.Errorf("a second stop published again: %d heartbeats, want %d", pub.count(), n)
+		}
 	})
 }
 
+// TestStartHeartbeat_ErrorExitDoesNotSayGoodbye: Story 10.10 review. The
+// sidecar defers stop on every return path. When the adapter fails while
+// the parent context is still live, the sidecar is crashing, not shutting
+// down: a departing heartbeat would make the collector forget it at once,
+// so a crash-looping sidecar would never be counted stale.
+func TestStartHeartbeat_ErrorExitDoesNotSayGoodbye(t *testing.T) {
+	pub := &recordingCorePub{}
+	stop := StartHeartbeat(context.Background(), pub, "olaitan.health.applog.n1", time.Hour, func() Heartbeat {
+		return Heartbeat{Namespace: "shop", Pod: "api-1", Node: "n1"}
+	})
+	stop()
+	stop() // a second stop is harmless
+	for i := 0; i < pub.count(); i++ {
+		if hb := pub.at(t, i); hb.Departing {
+			t.Errorf("heartbeat %d is departing after an error exit on a live context: %+v", i, hb)
+		}
+	}
+}
+
+// TestRunHeartbeat_RepeatsOnTheInterval waits on the heartbeat count with a
+// generous deadline instead of a fixed sleep, so a loaded CI runner that
+// delays the ticker does not fail it.
 func TestRunHeartbeat_RepeatsOnTheInterval(t *testing.T) {
 	pub := &recordingCorePub{}
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
-	defer cancel()
-	RunHeartbeat(ctx, pub, "olaitan.health.applog.n1", 25*time.Millisecond, func() Heartbeat {
-		return Heartbeat{Namespace: "shop", Pod: "api-1", Node: "n1", Healthy: true}
-	})
-	if pub.count() < 4 {
-		t.Errorf("%d heartbeats in 120ms at a 25ms interval", pub.count())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		RunHeartbeat(ctx, pub, "olaitan.health.applog.n1", 25*time.Millisecond, func() Heartbeat {
+			return Heartbeat{Namespace: "shop", Pod: "api-1", Node: "n1", Healthy: true}
+		})
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for pub.count() < 4 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	if got := pub.count(); got < 4 {
+		t.Errorf("%d heartbeats within 10s at a 25ms interval, want at least 4", got)
 	}
 }
 
@@ -266,5 +295,35 @@ func TestSidecarTracker_RetiredSidecarsAreBounded(t *testing.T) {
 	}
 	if tr.Live() != 0 {
 		t.Errorf("live = %d, want 0", tr.Live())
+	}
+}
+
+// TestSidecarTracker_SilentSidecarsAreBoundedWithoutScrapes: Story 10.10
+// review. Silent sidecars were only retired inside counts(), which runs on
+// a scrape, so with nothing scraping the collector every pod that died
+// without a goodbye stayed in the map for good. Observe must retire them
+// too and keep the map bounded.
+func TestSidecarTracker_SilentSidecarsAreBoundedWithoutScrapes(t *testing.T) {
+	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewSidecarTracker("n1", 90*time.Second)
+	tr.now = func() time.Time { return now }
+	for i := 0; i < maxTracked*4; i++ {
+		pod := "pod-" + time.Duration(i).String()
+		tr.Observe(heartbeatJSON(t, Heartbeat{Namespace: "shop", Pod: pod, Node: "n1", Started: 1, Healthy: true, Events: 1}))
+		now = now.Add(5 * time.Second)
+	}
+	tr.mu.Lock()
+	n := len(tr.sidecars)
+	tr.mu.Unlock()
+	if n > maxTracked+1 {
+		t.Errorf("tracking %d sidecars with no scrape, want at most %d", n, maxTracked+1)
+	}
+	// The ones heard from inside forgetAfter are still tracked, live or
+	// stale; only the ones silent past it were retired.
+	if got, want := tr.Live()+tr.Stale(), int64(forgetAfter/(5*time.Second)); got != want {
+		t.Errorf("live+stale = %d, want %d", got, want)
+	}
+	if tr.EventsTotal() != int64(maxTracked*4) {
+		t.Errorf("EventsTotal = %d, want %d", tr.EventsTotal(), maxTracked*4)
 	}
 }

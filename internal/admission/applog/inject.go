@@ -29,17 +29,18 @@ type InjectOptions struct {
 	SidecarCPULimit      string
 	SidecarMemoryLimit   string
 
-	// Sidecar runtime knobs forwarded from the chart through the
-	// webhook's env into the injected sidecar container as
-	// OLAITAN_APPLOG_* env vars. Empty falls back to the adapter's
-	// compiled defaults. Stringly-typed so the chart can pass
-	// duration / int values verbatim; the adapter parses on start-up.
-	// SidecarNATSURL is the NATS address the sidecar publishes to. The
+	// SidecarNATSURL is the NATS address the sidecar publishes to,
+	// injected as NATS_URL. Required: Inject rejects an empty value. The
 	// sidecar runs in the workload's namespace, so it must be fully
 	// qualified. Story 10.10: it was never set, and the sidecar refuses to
 	// start without it.
 	SidecarNATSURL string
 
+	// Sidecar runtime knobs forwarded from the chart through the
+	// webhook's env into the injected sidecar container as
+	// OLAITAN_APPLOG_* env vars. Empty falls back to the adapter's
+	// compiled defaults. Stringly-typed so the chart can pass
+	// duration / int values verbatim; the adapter parses on start-up.
 	SidecarStdoutPath          string
 	SidecarStderrPath          string
 	SidecarChannelBuffer       string
