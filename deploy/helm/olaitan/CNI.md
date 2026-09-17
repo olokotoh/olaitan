@@ -28,6 +28,12 @@ If the Deployment is absent, follow the operator install at
 https://github.com/projectcalico/calico/releases/tag/v3.31.5:
 
 ```bash
+# Since Calico v3.30 the operator's CRDs ship separately and the
+# operator does not install them itself. Without this first step the
+# custom resources below fail with "no matches for kind Installation in
+# version operator.tigera.io/v1".
+kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.5/manifests/operator-crds.yaml
+
 kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.5/manifests/tigera-operator.yaml
 kubectl rollout status -n tigera-operator deployment/tigera-operator --timeout=180s
 

@@ -104,6 +104,24 @@ ok "cluster ${cluster_name} reachable."
 # last-applied annotation, which is why upstream documents `create`. On
 # the refresh path the objects already exist, so install only what is
 # missing rather than failing on an AlreadyExists.
+# Since Calico v3.30 the operator's own CRDs ship in operator-crds.yaml,
+# not in tigera-operator.yaml, and the operator does not install them
+# itself. Without them the custom resources below fail with "no matches
+# for kind Installation in version operator.tigera.io/v1", which is how
+# this was found on a live kind cluster.
+if kc get crd installations.operator.tigera.io >/dev/null 2>&1; then
+    info "Tigera operator CRDs already present; leaving them alone."
+else
+    info "installing the Tigera operator CRDs, Calico ${calico_version}."
+    kc create -f "${manifests}/operator-crds.yaml"
+fi
+for crd in installations.operator.tigera.io goldmanes.operator.tigera.io whiskers.operator.tigera.io apiservers.operator.tigera.io; do
+    if ! kc wait --for=condition=Established "crd/${crd}" --timeout=120s >/dev/null 2>&1; then
+        die "CRD ${crd} was never established, so the Calico custom resources cannot be applied."
+    fi
+done
+ok "Tigera operator CRDs established."
+
 if kc -n tigera-operator get deployment tigera-operator >/dev/null 2>&1; then
     info "Tigera operator already installed; leaving it alone."
 else
@@ -166,8 +184,11 @@ for pair in "tls.crt:client.crt" "tls.key:client.key"; do
     fi
 done
 
+# The CA bundle is not bare PEM: Tigera prefixes each certificate with a
+# "# certificate name: ..." comment line, so the marker is looked for
+# anywhere in the file rather than on the first line.
 for f in ca.crt client.crt client.key; do
-    if ! head -n 1 "${out_dir}/${f}" | grep -q -- "-----BEGIN"; then
+    if ! grep -q -- "-----BEGIN" "${out_dir}/${f}"; then
         die "${out_dir}/${f} is not PEM. The cluster returned something unexpected; nothing here is usable."
     fi
 done
