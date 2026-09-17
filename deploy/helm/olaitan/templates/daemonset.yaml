@@ -155,10 +155,15 @@ spec:
             # receiver is also published on the node, so an apiserver on
             # the host network reaches its OWN node's collector at
             # 127.0.0.1 with no cluster DNS and no Service in the path.
+            # auditWebhook.hostIP (default 127.0.0.1) keeps that port off
+            # the node's other interfaces; empty binds all of them.
             - name: audit-webhook
               containerPort: {{ .Values.auditWebhook.containerPort }}
               {{- if ne (int (default 0 .Values.auditWebhook.hostPort)) 0 }}
               hostPort: {{ int .Values.auditWebhook.hostPort }}
+              {{- with (default "" .Values.auditWebhook.hostIP | toString | trim) }}
+              hostIP: {{ . | quote }}
+              {{- end }}
               {{- end }}
               protocol: TCP
             {{- end }}

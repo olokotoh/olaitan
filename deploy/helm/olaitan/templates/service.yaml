@@ -1,15 +1,16 @@
 {{/*
-Audit-webhook receiver Service. ClusterIP-only — the Kubernetes API
-server reaches this via a ValidatingWebhookConfiguration (template
-sibling), so external exposure is unnecessary and undesirable.
+Audit-webhook receiver Service. ClusterIP-only. It selects the collector
+DaemonSet pods, where the receiver listens on auditWebhook.containerPort
+(Story 1.7), and renders only when auditWebhook.enabled=true.
 
-Story 1.1 ships this Service template with the gate default-off
-(auditWebhook.enabled: false) so `helm template` rendering remains
-predictable. Story 1.7 (Kubernetes audit webhook receiver) will wire
-the matching containerPort onto the aggregator Deployment, flip the
-default gate on, and add the serving-cert wiring. Until then, this
-Service renders to nothing under default values.
-[Source: architecture.md:355-360 — Helm chart structure]
+kube-apiserver does not use this Service on a self-managed cluster: it
+runs on the host network with the node's resolver and cannot resolve the
+Service FQDN (Story 10.8, #137 B2). There it dials its own node's
+collector at auditWebhook.serverAddress through auditWebhook.hostPort
+(AUDIT.md). The Service stays the default kubeconfig target for clusters
+whose apiserver does use cluster DNS, and the in-cluster address for
+port-forwarding to the receiver.
+[Source: architecture.md:355-360 (Helm chart structure)]
 */}}
 {{- if .Values.auditWebhook.enabled -}}
 apiVersion: v1

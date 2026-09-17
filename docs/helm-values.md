@@ -57,7 +57,8 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 | Value | Type | Default | Valid range | Effect | Ref |
 |-------|------|---------|-------------|--------|-----|
 | `auditWebhook.serverAddress` | string | `""` | - | address the kube-apiserver dials for the audit webhook (empty: the in-cluster Service FQDN) | FR5 |
-| `auditWebhook.hostPort` | integer | `0` | - | publish the audit receiver on the node at this hostPort (0: off) | FR5 |
+| `auditWebhook.hostPort` | integer | `0` | 0 to 65535 | publish the audit receiver on the node at this hostPort (0: off) | FR5 |
+| `auditWebhook.hostIP` | string | `"127.0.0.1"` | - | node address the audit hostPort binds to (empty: every interface) | FR5 |
 
 ## `containerdSensor`
 
