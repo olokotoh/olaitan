@@ -1,0 +1,108 @@
+# Story 10.11 (#140 AC3): the east-west traffic fixture for the Calico
+# Goldmane flow adapter. Goldmane reports what Felix observed; a cluster
+# with no pod-to-pod traffic produces no FlowResult, so the adapter would
+# sit connected and silent and nothing would prove it works. This fixture
+# is the real traffic. No event is ever fabricated to stand in for it.
+#
+# A client pod requests a Service in the same namespace once a second.
+# Felix flushes flow records to Goldmane, which aggregates them over a
+# fixed 15s window, so the first flows appear roughly 30 to 60 seconds
+# after the client is Running.
+#
+# Apply it against a cluster built by hack/install-calico-kind.sh, after
+# the Olaitan chart is installed with the Path B values that script
+# writes:
+#
+#   kubectl apply -f tests/e2e/fixtures/calico-flow-traffic.yaml
+#   kubectl -n olaitan-flow-traffic wait --for=condition=Ready pod/client --timeout=180s
+#
+# Then expect events on olaitan.events.raw.network and
+# source_healthy{source="network"} 1 on the collector's metrics port.
+#
+# The namespace is its own, so `kubectl delete -f` takes the whole
+# fixture away and the flows stop.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: olaitan-flow-traffic
+  labels:
+    olaitan.io/fixture: calico-flow-traffic
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: target
+  namespace: olaitan-flow-traffic
+  labels:
+    app: target
+spec:
+  containers:
+    - name: target
+      # agnhost is the upstream Kubernetes e2e image and is already
+      # pulled by hack/check-netpol-enforcement.sh, so this fixture adds
+      # no new registry dependency.
+      image: registry.k8s.io/e2e-test-images/agnhost:2.47
+      command: ["/agnhost", "netexec", "--http-port=8080"]
+      ports:
+        - containerPort: 8080
+      securityContext:
+        allowPrivilegeEscalation: false
+        runAsNonRoot: true
+        runAsUser: 65532
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          cpu: 100m
+          memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: target
+  namespace: olaitan-flow-traffic
+spec:
+  selector:
+    app: target
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client
+  namespace: olaitan-flow-traffic
+  labels:
+    app: client
+spec:
+  containers:
+    - name: client
+      image: registry.k8s.io/e2e-test-images/agnhost:2.47
+      # Pod-to-SERVICE, not pod-to-pod: the request goes through the
+      # Service ClusterIP so the flow record carries the service name
+      # the adapter tags events with.
+      command:
+        - /bin/sh
+        - -c
+        - "while true; do /agnhost connect --timeout=5s target.olaitan-flow-traffic.svc:8080 || true; sleep 1; done"
+      securityContext:
+        allowPrivilegeEscalation: false
+        runAsNonRoot: true
+        runAsUser: 65532
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          cpu: 100m
+          memory: 128Mi

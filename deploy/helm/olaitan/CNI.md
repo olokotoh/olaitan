@@ -35,9 +35,48 @@ kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.5
 kubectl -n calico-system rollout status deployment/goldmane --timeout=300s
 ```
 
-The full bring-up sequence (kind cluster, traffic generator, fixture
-capture) is in `spikes/calico-flow/README.md` and was verified
-end-to-end during Story 1.3.
+There is no supported path without the operator. Goldmane is an
+operator-managed component: the Installation CR in
+`custom-resources.yaml` is what causes the operator to create the
+`goldmane` Deployment in `calico-system`, and with only
+`tigera-operator.yaml` applied there is nothing for the adapter to
+dial.
+
+### On kind: `hack/install-calico-kind.sh`
+
+The supported way to get a kind cluster the adapter can actually work
+against. It creates (or reuses) a kind cluster from
+`hack/kind-calico-config.yaml`, which disables kindnetd and sets the pod
+CIDR Calico's default IPPool claims, installs the pinned Tigera operator
+and custom resources, waits for Goldmane with a bounded timeout, and
+writes the Path B values file:
+
+```bash
+hack/install-calico-kind.sh ./calico-tls
+helm install olaitan deploy/helm/olaitan -f ./calico-tls/calico-values.yaml
+kubectl apply -f tests/e2e/fixtures/calico-flow-traffic.yaml
+```
+
+The e2e cluster config (`hack/kind-config.yaml`) is NOT usable here: it
+runs kindnetd, which ships no Goldmane and enforces no NetworkPolicy, so
+the release's Goldmane egress rule would be accepted and ignored.
+
+Overrides: `CLUSTER_NAME`, `KIND_NODE_IMAGE`, `CALICO_VERSION`,
+`KUBECONFIG`, `GOLDMANE_TIMEOUT`. The script reuses an existing cluster,
+so re-running it into a fresh output directory is the way to refresh the
+certificates after Tigera rotates them; it refuses to write into a
+directory that already holds certificate material, because replacing it
+in place would leave an installed release pointing at material nobody
+can account for.
+
+The traffic fixture matters. Goldmane reports what Felix observed, so a
+cluster with no east-west traffic produces no `FlowResult` and the
+adapter sits connected and silent. The fixture runs a real pod-to-Service
+request loop; the first flows land roughly 30 to 60 seconds later.
+
+The original spike bring-up (port-forward, fixture capture, benchmark)
+is in `spikes/calico-flow/README.md` and was verified end-to-end during
+Story 1.3.
 
 ## mTLS provisioning
 
@@ -67,11 +106,56 @@ rotation is automatic; the adapter loads TLS material from disk on
 every connect-loop iteration so a fresh Secret remount is picked up
 without an agent restart.
 
+#### Key names: the chart remaps them for you
+
+A cert-manager `Certificate` writes a `kubernetes.io/tls` Secret, whose
+keys are `tls.crt` and `tls.key`. The adapter opens
+`/etc/olaitan/cni/client.crt` and `/etc/olaitan/cni/client.key`
+(`config/olaitan.yaml`, `detection.sources.calico`), and a missing file
+is a terminal adapter error, so before Story 10.11 a Path A install
+CrashLooped the collector with `cni: tls load (terminal, no retry)`.
+The chart now projects the Secret through `items:` so the mount
+produces the names the adapter reads:
+
+| Secret key | File under `/etc/olaitan/cni` |
+|---|---|
+| `tls.crt` | `client.crt` |
+| `tls.key` | `client.key` |
+| `calicoSensor.tls.certManagerCAKey` (default `ca.crt`) | `ca.crt` |
+
+Nothing changes on Path B: the chart renders that Secret itself with
+the adapter's own key names, so it is mounted verbatim.
+
+**If the issuer does not publish `ca.crt`.** cert-manager always writes
+`tls.crt` and `tls.key`, but it writes `ca.crt` only when the issuer
+supplies a CA, and some issuers publish the bundle under another key.
+Name that key rather than renaming the Secret:
+
+```yaml
+calicoSensor:
+  tls:
+    certManagerSecretName: olaitan-cni-tls
+    certManagerCAKey: tigera-ca-bundle.crt
+```
+
+The adapter cannot verify Goldmane's serving certificate without a CA
+bundle, so an empty `certManagerCAKey` fails the render with a message
+naming the value, rather than mounting a volume the adapter rejects at
+run time. If the Secret carries no CA under any key, issue the
+Certificate from an issuer that sets one, or use Path B, where the CA
+bundle is supplied directly.
+
 ### Path B: operator-supplied PEMs (dev sandbox)
+
+On kind, `hack/install-calico-kind.sh` does all of this and writes the
+values file; the manual recipe below is for clusters it does not build.
 
 For evaluation runs the operator can extract the Tigera CA bundle
 plus a Tigera-issued client cert (the spike borrowed
-`whisker-backend-key-pair`):
+`whisker-backend-key-pair`). Mind the asymmetry: the CA bundle lives in
+a ConfigMap, so that jsonpath yields PEM and must be base64-encoded,
+while the client pair lives in a Secret, so the same jsonpath already
+yields base64 and must not be encoded twice:
 
 ```bash
 kubectl -n calico-system get configmap tigera-ca-bundle \
@@ -130,6 +214,8 @@ NetworkPolicy outside the chart must replicate this rule manually.
 | `cni: no flow for ... and connection not Ready` | Goldmane reachable but cluster is genuinely quiet | Watchdog is doing its job; consider whether a 10-minute staleness threshold is too tight for your cluster |
 | Chart render fails with `calicoSensor.tls.caBundle is required` | Path B selected but no PEM supplied | Either set `tls.certManagerSecretName` (Path A) or fill in all three Path B PEMs |
 | Agent pod CrashLoopBackOff with `cni: tls load (terminal, no retry): no such file` | Secret not mounted | Verify `kubectl describe pod` shows the `cni-tls` volume; check the chart's `calicoSensor.enabled` actually rendered the mount |
+| Path A pod stuck `ContainerCreating` with a Secret key error on the `cni-tls` volume | The cert-manager Secret has no key named by `calicoSensor.tls.certManagerCAKey` | `kubectl get secret <name> -o jsonpath='{.data}'` and set `certManagerCAKey` to the key that holds the CA bundle; see *Key names* above |
+| No `olaitan.events.raw.network` events although the adapter is connected and `source_healthy{source="network"}` is 1 | The cluster is quiet, so Goldmane has nothing to report | Apply `tests/e2e/fixtures/calico-flow-traffic.yaml` and wait 30 to 60 seconds for the first Felix flush plus Goldmane window |
 
 ## Known limitations
 

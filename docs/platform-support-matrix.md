@@ -34,6 +34,7 @@ stock EKS (VPC CNI) and stock AKS (no policy engine selected).
 | Platform | Install | Falco driver | NetworkPolicy enforced | Default StorageClass | Audit webhook | Overlay |
 | --- | --- | --- | --- | --- | --- | --- |
 | **kind** | ✅ verified | modern_ebpf (Falco 0.45.0-rc1) | ❌ **no** (kindnet) | ✅ `standard` | ✅ possible | `values-kind.yaml` |
+| **kind + Calico** | script, live run pending | modern_ebpf (Falco 0.45.0-rc1) | ✅ (Calico) | ✅ `standard` | ✅ possible | `values-kind.yaml` |
 | **kubeadm** | ✅ verified | modern_ebpf | depends on CNI | depends | ✅ possible | (defaults) |
 | **k3s / k3d** | template-verified | modern_ebpf | ✅ (kube-router) | ✅ `local-path` | ✅ possible | `values-k3s.yaml` |
 | **minikube** | template-verified | modern_ebpf | ❌ unless `--cni=calico` | ✅ addon | ✅ possible | `values-minikube.yaml` |
@@ -81,6 +82,38 @@ so nobody promotes them on the strength of a job existing.
 
 These are platform policy, not Olaitan defects. Preflight must detect them and
 say so plainly rather than letting the operator discover it from a CrashLoop.
+
+---
+
+## Calico and Goldmane: where the network flow source can run (Story 10.11)
+
+The Calico flow sensor (`calicoSensor`, FR4) reads the **Goldmane** gRPC API,
+which exists only on a Calico install done through the **Tigera operator** on
+Calico v3.31.5+. The legacy manifest install (`kubectl apply -f calico.yaml`)
+creates no Goldmane Deployment, so on such a cluster the source cannot be
+enabled at all. A platform's own CNI being "Calico-compatible" is not enough
+either; the question is whether `kubectl -n calico-system get deployment
+goldmane` returns something.
+
+| Platform | Goldmane available | How |
+| --- | --- | --- |
+| **kind + Calico** | ✅ | `hack/install-calico-kind.sh`, which installs the pinned operator and writes the Path B values |
+| **kubeadm** | ✅ | operator install; `hack/bootstrap-kubeadm.md` walks through it |
+| **minikube** | depends | `--cni=calico` uses the manifest install, so **no Goldmane**; the operator has to be installed on top |
+| **EKS / AKS / GKE / OpenShift** | UNCERTAIN | none of these run the Tigera operator by default and none was tested here |
+| **stock kind, k3s** | ❌ | kindnet and kube-router are not Calico |
+
+The `kind + Calico` row is the only one this repository gives a scripted path
+for. It is **not** marked verified: the script and the traffic fixture
+(`tests/e2e/fixtures/calico-flow-traffic.yaml`) are committed, but the live run
+that observes `olaitan.events.raw.network` events and
+`source_healthy{source="network"} 1` is outstanding, and the row will not say
+verified until that output exists.
+
+Note the interaction with the NetworkPolicy finding above: `kind + Calico` is
+also the only kind cluster where the release NetworkPolicy, including the
+adapter's own Goldmane egress rule, is actually enforced rather than merely
+accepted. `hack/check-netpol-enforcement.sh` is what settles that empirically.
 
 ---
 

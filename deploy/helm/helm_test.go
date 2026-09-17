@@ -26,8 +26,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -1869,6 +1871,212 @@ func TestCalicoSensorPathA_SkipsTLSSecret(t *testing.T) {
 		!strings.Contains(rendered, "secretName: external-cni-tls") {
 		t.Errorf("DaemonSet missing external-cni-tls Secret mount under Path A; sample:\n%s",
 			snippet(rendered, "cni-tls"))
+	}
+}
+
+// cniTLSVolume is the subset of the DaemonSet's `cni-tls` Secret
+// volume the Story 10.11 assertions inspect.
+type cniTLSVolume struct {
+	SecretName  string
+	DefaultMode int
+	// Items maps the file name the collector opens under
+	// /etc/olaitan/cni to the Secret key it is projected from. Empty
+	// when the volume carries no `items:` and the Secret's own keys
+	// become the file names.
+	Items map[string]string
+}
+
+// readCNITLSVolume pulls the DaemonSet's `cni-tls` volume out of a
+// rendered chart.
+func readCNITLSVolume(t *testing.T, rendered string) cniTLSVolume {
+	t.Helper()
+	var ds struct {
+		Spec struct {
+			Template struct {
+				Spec struct {
+					Volumes []struct {
+						Name   string `yaml:"name"`
+						Secret struct {
+							SecretName  string `yaml:"secretName"`
+							DefaultMode int    `yaml:"defaultMode"`
+							Items       []struct {
+								Key  string `yaml:"key"`
+								Path string `yaml:"path"`
+							} `yaml:"items"`
+						} `yaml:"secret"`
+					} `yaml:"volumes"`
+				} `yaml:"spec"`
+			} `yaml:"template"`
+		} `yaml:"spec"`
+	}
+	found := false
+	for _, m := range findByKind(parseManifests(t, rendered), "DaemonSet") {
+		// Falco ships its own DaemonSet; scope to the collector's.
+		if !strings.Contains(m.Metadata.Name, "collector") {
+			continue
+		}
+		if err := m.Raw.Decode(&ds); err != nil {
+			t.Fatalf("decoding the collector DaemonSet: %v", err)
+		}
+		found = true
+		break
+	}
+	if !found {
+		t.Fatalf("rendered chart carries no collector DaemonSet")
+	}
+	for _, v := range ds.Spec.Template.Spec.Volumes {
+		if v.Name != "cni-tls" {
+			continue
+		}
+		out := cniTLSVolume{
+			SecretName:  v.Secret.SecretName,
+			DefaultMode: v.Secret.DefaultMode,
+			Items:       map[string]string{},
+		}
+		for _, it := range v.Secret.Items {
+			out.Items[it.Path] = it.Key
+		}
+		return out
+	}
+	t.Fatalf("the collector DaemonSet carries no cni-tls volume; sample:\n%s",
+		snippet(rendered, "cni-tls"))
+	return cniTLSVolume{}
+}
+
+// cniTLSFileNames returns the file names the collector actually finds
+// under /etc/olaitan/cni. With an `items:` projection those are the
+// item paths; without one they are the keys of the Secret the chart
+// itself renders. A volume with neither is a configuration the chart
+// cannot vouch for, and the helper says so.
+func cniTLSFileNames(t *testing.T, rendered string) []string {
+	t.Helper()
+	vol := readCNITLSVolume(t, rendered)
+	if len(vol.Items) > 0 {
+		names := make([]string, 0, len(vol.Items))
+		for path := range vol.Items {
+			names = append(names, path)
+		}
+		sort.Strings(names)
+		return names
+	}
+	for _, m := range findByKind(parseManifests(t, rendered), "Secret") {
+		if m.Metadata.Name != vol.SecretName {
+			continue
+		}
+		var sec struct {
+			Data map[string]string `yaml:"data"`
+		}
+		if err := m.Raw.Decode(&sec); err != nil {
+			t.Fatalf("decoding Secret %s: %v", vol.SecretName, err)
+		}
+		names := make([]string, 0, len(sec.Data))
+		for k := range sec.Data {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		return names
+	}
+	t.Fatalf("the cni-tls volume mounts Secret %q with no items: projection and the chart does not render that Secret, "+
+		"so the file names under /etc/olaitan/cni are whatever the external Secret happens to carry", vol.SecretName)
+	return nil
+}
+
+// adapterCNIFileNames is what internal/collector/cni opens on every
+// connect-loop iteration, as pinned by config/olaitan.yaml
+// (detection.sources.calico.ca_bundle_path, client_cert_path,
+// client_key_path). A missing file is a terminal adapter error, so the
+// mount has to produce exactly these names.
+var adapterCNIFileNames = []string{"ca.crt", "client.crt", "client.key"}
+
+// TestCalicoSensorPathAMountsTheFileNamesTheAdapterReads is the Story
+// 10.11 AC2 regression. A cert-manager Certificate writes its Secret
+// with the kubernetes.io/tls keys tls.crt and tls.key, never
+// client.crt and client.key. Mounting that Secret unprojected left
+// the collector with no /etc/olaitan/cni/client.crt, which the
+// adapter treats as terminal, so the agent CrashLooped on Path A. The
+// volume must remap the cert-manager keys onto the names the adapter
+// opens.
+func TestCalicoSensorPathAMountsTheFileNamesTheAdapterReads(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"calicoSensor.enabled=true",
+		"calicoSensor.tls.certManagerSecretName=external-cni-tls",
+	})
+	got := cniTLSFileNames(t, rendered)
+	if !reflect.DeepEqual(got, adapterCNIFileNames) {
+		t.Errorf("Path A puts %v under /etc/olaitan/cni, adapter opens %v", got, adapterCNIFileNames)
+	}
+	vol := readCNITLSVolume(t, rendered)
+	wantItems := map[string]string{
+		"client.crt": "tls.crt",
+		"client.key": "tls.key",
+		"ca.crt":     "ca.crt",
+	}
+	if !reflect.DeepEqual(vol.Items, wantItems) {
+		t.Errorf("Path A projection is %v, want %v", vol.Items, wantItems)
+	}
+	// 0400 = owner read-only, as for every other key-material volume
+	// in the DaemonSet. 256 is 0400 in decimal.
+	if vol.DefaultMode != 256 {
+		t.Errorf("Path A cni-tls defaultMode is %d, want 256 (0400)", vol.DefaultMode)
+	}
+}
+
+// TestCalicoSensorPathBMountsTheFileNamesTheAdapterReads holds the
+// other path to the same invariant so the two cannot drift: Path B
+// renders the Secret itself with the adapter's own key names, so the
+// unprojected mount is already correct and must stay that way.
+func TestCalicoSensorPathBMountsTheFileNamesTheAdapterReads(t *testing.T) {
+	rendered := helmTemplate(t, calicoSensorPathBArgs())
+	got := cniTLSFileNames(t, rendered)
+	if !reflect.DeepEqual(got, adapterCNIFileNames) {
+		t.Errorf("Path B puts %v under /etc/olaitan/cni, adapter opens %v", got, adapterCNIFileNames)
+	}
+	vol := readCNITLSVolume(t, rendered)
+	if len(vol.Items) != 0 {
+		t.Errorf("Path B should mount the chart-rendered Secret verbatim, got projection %v", vol.Items)
+	}
+	if vol.SecretName != "olaitan-cni-tls" {
+		t.Errorf("Path B mounts Secret %q, want olaitan-cni-tls", vol.SecretName)
+	}
+	if vol.DefaultMode != 256 {
+		t.Errorf("Path B cni-tls defaultMode is %d, want 256 (0400)", vol.DefaultMode)
+	}
+}
+
+// TestCalicoSensorPathACABundleKeyIsConfigurable asserts an operator
+// whose issuer publishes the CA under a key other than ca.crt can
+// name it, rather than the chart hardcoding a key cert-manager only
+// populates when the issuer supplies one.
+func TestCalicoSensorPathACABundleKeyIsConfigurable(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"calicoSensor.enabled=true",
+		"calicoSensor.tls.certManagerSecretName=external-cni-tls",
+		"calicoSensor.tls.certManagerCAKey=tigera-ca-bundle.crt",
+	})
+	vol := readCNITLSVolume(t, rendered)
+	if vol.Items["ca.crt"] != "tigera-ca-bundle.crt" {
+		t.Errorf("ca.crt is projected from %q, want tigera-ca-bundle.crt", vol.Items["ca.crt"])
+	}
+}
+
+// TestCalicoSensorPathAEmptyCAKeyFailsRender asserts the chart says
+// so plainly rather than mounting a volume with no CA bundle, which
+// the adapter would only report as a terminal TLS load error at run
+// time.
+func TestCalicoSensorPathAEmptyCAKeyFailsRender(t *testing.T) {
+	cmd := exec.Command("helm", "template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password",
+		"--set", "calicoSensor.enabled=true",
+		"--set", "calicoSensor.tls.certManagerSecretName=external-cni-tls",
+		"--set", "calicoSensor.tls.certManagerCAKey=",
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("expected helm template to fail with an empty calicoSensor.tls.certManagerCAKey")
+	}
+	if !strings.Contains(stderr.String(), "calicoSensor.tls.certManagerCAKey") {
+		t.Errorf("expected the failure to name calicoSensor.tls.certManagerCAKey; stderr:\n%s", stderr.String())
 	}
 }
 

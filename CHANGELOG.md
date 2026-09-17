@@ -20,6 +20,20 @@ and false-positive numbers; see [Unreleased](#unreleased).
 
 ### Added
 
+- **A kind cluster the Calico flow sensor can actually run against**
+  (#140). `hack/install-calico-kind.sh` creates or reuses a kind cluster
+  from `hack/kind-calico-config.yaml` (kindnetd off, Calico's pod CIDR),
+  installs the pinned Tigera operator and custom resources so Goldmane
+  exists, waits for it with a bounded timeout, and writes the Path B
+  `calicoSensor.tls` values from the `tigera-ca-bundle` ConfigMap and
+  the `whisker-backend-key-pair` Secret. It reuses an existing cluster,
+  which is the certificate-refresh path, and refuses to write over
+  certificate material it did not create.
+  `tests/e2e/fixtures/calico-flow-traffic.yaml` supplies the real
+  pod-to-Service traffic Goldmane needs before it reports anything.
+  `docs/helm-values.md` now documents the whole `calicoSensor` block,
+  which it previously omitted entirely.
+
 - Repository hygiene for public use: `SECURITY.md` documenting the agent's
   blast radius and the LLM tier's prompt-injection threat model,
   `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, issue templates, and a README
@@ -112,6 +126,18 @@ and false-positive numbers; see [Unreleased](#unreleased).
   `olaitan_sensor_falco_publish_drops_total`.
 
 ### Fixed
+
+- **A cert-manager-issued certificate now works for the Calico flow
+  sensor** (#140). Path A mounted the cert-manager Secret unchanged, but
+  a `kubernetes.io/tls` Secret carries `tls.crt` and `tls.key` while the
+  adapter opens `/etc/olaitan/cni/client.crt` and `client.key`, and a
+  missing file there is terminal, so every Path A install CrashLooped
+  the collector. The volume projects the cert-manager keys onto the
+  names the adapter reads. `calicoSensor.tls.certManagerCAKey` (default
+  `ca.crt`) names the key that holds the Tigera CA bundle, for issuers
+  that publish it elsewhere; an empty value fails the render instead of
+  producing a mount the adapter rejects at run time. Path B is
+  unchanged.
 
 - **The audit webhook can actually receive an event** (#137). Three
   defects meant the kube-apiserver never reached the receiver on a

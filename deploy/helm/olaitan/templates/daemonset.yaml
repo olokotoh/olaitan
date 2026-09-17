@@ -322,6 +322,25 @@ spec:
             # on a single mount via this if/else.
             {{- if .Values.calicoSensor.tls.certManagerSecretName }}
             secretName: {{ .Values.calicoSensor.tls.certManagerSecretName | quote }}
+            # Story 10.11 AC2: a cert-manager Certificate writes a
+            # kubernetes.io/tls Secret, whose keys are tls.crt and
+            # tls.key. The adapter opens client.crt and client.key
+            # (config/olaitan.yaml detection.sources.calico), and a
+            # missing file is a terminal error, so Path A used to
+            # CrashLoop the collector. Project the cert-manager keys
+            # onto the names the adapter reads. Path B renders its own
+            # Secret with those names already and needs no projection.
+            items:
+              - key: tls.crt
+                path: client.crt
+              - key: tls.key
+                path: client.key
+              # ca.crt is only populated when the issuer supplies a CA,
+              # and some issuers publish it under another key, so the
+              # source key is a value rather than a chart constant. See
+              # CNI.md "Path A".
+              - key: {{ required "calicoSensor.tls.certManagerCAKey must name the key in the cert-manager Secret that holds the Tigera CA bundle (default ca.crt); the adapter cannot verify Goldmane without it. See CNI.md." .Values.calicoSensor.tls.certManagerCAKey | quote }}
+                path: ca.crt
             {{- else }}
             secretName: {{ include "olaitan.fullname" . }}-cni-tls
             {{- end }}

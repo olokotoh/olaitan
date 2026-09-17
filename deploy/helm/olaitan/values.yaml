@@ -463,15 +463,18 @@ containerdSensor:
 # provisioning paths are supported (Path A cert-manager, Path B
 # operator-supplied) -- see CNI.md.
 calicoSensor:
+  # @schema type:boolean effect:"enable the Calico Goldmane flow sensor; bridges detection.sources.calico.enabled too" ref:FR4
   enabled: false
 
   # gRPC target for the Calico Goldmane Service. Default matches the
   # Tigera operator's v3.31.5 install layout. Operators with
   # non-default cluster install paths override here.
+  # @schema type:string effect:"host:port of the Calico Goldmane gRPC Service" ref:FR4
   goldmaneAddr: "goldmane.calico-system.svc:7443"
 
   # TLS SNI / verify name presented during the mTLS handshake. Default
   # matches the cert the Tigera operator issues for Goldmane.
+  # @schema type:string effect:"TLS SNI / verify name presented during the Goldmane mTLS handshake" ref:FR4
   serverName: "goldmane.calico-system.svc"
 
   # FlowStreamRequest knobs. StartTimeGte is negative for "relative
@@ -482,11 +485,14 @@ calicoSensor:
   # to the chart default of -60. Goldmane requires AggregationInterval
   # to be exactly 15s per the same proto contract (line 100: "It
   # must always be 15s.").
+  # @schema type:integer maximum:0 effect:"stream start offset in seconds; negative replays that many seconds, 0 means now" ref:FR4
   startTimeGte: -60
+  # @schema type:integer minimum:15 maximum:15 effect:"Goldmane aggregation interval in seconds; its proto contract pins this at 15" ref:FR4
   aggregationInterval: 15
 
   # gRPC dial timeout for the initial wait-for-ready handshake.
   # Bridged into detection.sources.calico.dial_timeout.
+  # @schema type:duration effect:"gRPC dial timeout for the initial wait-for-ready handshake" ref:FR4
   dialTimeout: "10s"
 
   # Staleness watchdog threshold. Goldmane flow records are quiet by
@@ -494,6 +500,7 @@ calicoSensor:
   # FlowResults, so the watchdog only flips MarkUnhealthy when
   # staleness AND a non-Ready connection coincide. Bridged into
   # detection.sources.calico.staleness_timeout.
+  # @schema type:duration effect:"flow silence after which the watchdog marks the source unhealthy, but only while the connection is not Ready" ref:FR8
   stalenessTimeout: "10m"
 
   # Per-event marshalled size cap. The default of 196608 bytes (192
@@ -501,6 +508,7 @@ calicoSensor:
   # MaxMsgSize ceiling. Events exceeding this cap are log+dropped at
   # translate time. Floor 4096; ceiling 262144 (256 KiB). Bridged
   # into detection.sources.calico.max_event_bytes.
+  # @schema type:integer minimum:4096 maximum:262144 effect:"per-event marshalled size cap; larger events are log+dropped at translate time" ref:FR4
   maxEventBytes: 196608
 
   # Outer connect-loop backoff strategy used when the gRPC dial, mTLS
@@ -544,9 +552,26 @@ calicoSensor:
   # The chart fails render when calicoSensor.enabled=true and neither
   # path is configured. See CNI.md for the full provisioning recipe.
   tls:
+    # @schema type:string effect:"name of the cert-manager-issued Secret to mount for Goldmane mTLS (empty: Path B, operator-supplied PEMs)" ref:FR4
     certManagerSecretName: ""
+
+    # Path A only. Key inside the cert-manager Secret that holds the
+    # Tigera CA bundle the adapter verifies Goldmane's serving cert
+    # against. cert-manager always writes tls.crt and tls.key, which the
+    # chart projects onto client.crt and client.key; it writes ca.crt
+    # only when the issuer supplies a CA, and some issuers publish the
+    # bundle under a different key. Name that key here. The adapter
+    # cannot verify Goldmane without a CA, so an empty value fails
+    # render rather than mounting a volume the adapter rejects at run
+    # time.
+    # @schema type:string effect:"Path A key inside the cert-manager Secret holding the Tigera CA bundle, projected to ca.crt" ref:FR4
+    certManagerCAKey: "ca.crt"
+
+    # @schema type:string effect:"Path B base64-encoded Tigera CA bundle PEM" ref:FR4
     caBundle: ""
+    # @schema type:string effect:"Path B base64-encoded client certificate PEM signed by the Tigera CA" ref:FR4
     clientCert: ""
+    # @schema type:string effect:"Path B base64-encoded client private key PEM" ref:FR4
     clientKey: ""
 
 # --- application log sidecar (FR5) -----------------------------------

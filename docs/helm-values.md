@@ -66,6 +66,24 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 |-------|------|---------|-------------|--------|-----|
 | `containerdSensor.socketGroup` | integer | `0` | minimum 0 | supplemental group the collector joins to open the containerd socket | FR3 |
 
+## `calicoSensor`
+
+| Value | Type | Default | Valid range | Effect | Ref |
+|-------|------|---------|-------------|--------|-----|
+| `calicoSensor.enabled` | boolean | `false` | - | enable the Calico Goldmane flow sensor; bridges detection.sources.calico.enabled too | FR4 |
+| `calicoSensor.goldmaneAddr` | string | `"goldmane.calico-system.svc:7443"` | - | host:port of the Calico Goldmane gRPC Service | FR4 |
+| `calicoSensor.serverName` | string | `"goldmane.calico-system.svc"` | - | TLS SNI / verify name presented during the Goldmane mTLS handshake | FR4 |
+| `calicoSensor.startTimeGte` | integer | `-60` | maximum 0 | stream start offset in seconds; negative replays that many seconds, 0 means now | FR4 |
+| `calicoSensor.aggregationInterval` | integer | `15` | 15 to 15 | Goldmane aggregation interval in seconds; its proto contract pins this at 15 | FR4 |
+| `calicoSensor.dialTimeout` | duration | `"10s"` | - | gRPC dial timeout for the initial wait-for-ready handshake | FR4 |
+| `calicoSensor.stalenessTimeout` | duration | `"10m"` | - | flow silence after which the watchdog marks the source unhealthy, but only while the connection is not Ready | FR8 |
+| `calicoSensor.maxEventBytes` | integer | `196608` | 4096 to 262144 | per-event marshalled size cap; larger events are log+dropped at translate time | FR4 |
+| `calicoSensor.tls.certManagerSecretName` | string | `""` | - | name of the cert-manager-issued Secret to mount for Goldmane mTLS (empty: Path B, operator-supplied PEMs) | FR4 |
+| `calicoSensor.tls.certManagerCAKey` | string | `"ca.crt"` | - | Path A key inside the cert-manager Secret holding the Tigera CA bundle, projected to ca.crt | FR4 |
+| `calicoSensor.tls.caBundle` | string | `""` | - | Path B base64-encoded Tigera CA bundle PEM | FR4 |
+| `calicoSensor.tls.clientCert` | string | `""` | - | Path B base64-encoded client certificate PEM signed by the Tigera CA | FR4 |
+| `calicoSensor.tls.clientKey` | string | `""` | - | Path B base64-encoded client private key PEM | FR4 |
+
 ## `applogSidecar`
 
 | Value | Type | Default | Valid range | Effect | Ref |
