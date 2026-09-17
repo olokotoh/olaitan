@@ -330,16 +330,26 @@ spec:
             # CrashLoop the collector. Project the cert-manager keys
             # onto the names the adapter reads. Path B renders its own
             # Secret with those names already and needs no projection.
+            #
+            # All three source keys are values, not chart constants. The
+            # cert-manager defaults (tls.crt / tls.key / ca.crt) are the
+            # common case, but a Secret assembled by hand, copied from
+            # another namespace, or written by something that is not
+            # cert-manager can carry the same material under other names,
+            # and hardcoding two of the three turned such a Secret from
+            # "works unprojected" into "hangs in ContainerCreating".
+            # Every one is checked against the Secret-key charset by
+            # olaitan.secretKeyName, so a bad name fails the render with
+            # a message rather than at pod admission without one.
             items:
-              - key: tls.crt
+              - key: {{ include "olaitan.secretKeyName" (dict "value" .Values.calicoSensor.tls.certManagerCertKey "name" "calicoSensor.tls.certManagerCertKey") | quote }}
                 path: client.crt
-              - key: tls.key
+              - key: {{ include "olaitan.secretKeyName" (dict "value" .Values.calicoSensor.tls.certManagerKeyKey "name" "calicoSensor.tls.certManagerKeyKey") | quote }}
                 path: client.key
               # ca.crt is only populated when the issuer supplies a CA,
-              # and some issuers publish it under another key, so the
-              # source key is a value rather than a chart constant. See
+              # and some issuers publish it under another key. See
               # CNI.md "Path A".
-              - key: {{ required "calicoSensor.tls.certManagerCAKey must name the key in the cert-manager Secret that holds the Tigera CA bundle (default ca.crt); the adapter cannot verify Goldmane without it. See CNI.md." .Values.calicoSensor.tls.certManagerCAKey | quote }}
+              - key: {{ include "olaitan.secretKeyName" (dict "value" .Values.calicoSensor.tls.certManagerCAKey "name" "calicoSensor.tls.certManagerCAKey") | quote }}
                 path: ca.crt
             {{- else }}
             secretName: {{ include "olaitan.fullname" . }}-cni-tls

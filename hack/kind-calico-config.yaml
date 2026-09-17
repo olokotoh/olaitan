@@ -22,11 +22,19 @@ networking:
   # plugin once the Installation CR is applied, so bootstrap pods sit
   # without a network until then. That is expected, not a failure.
   disableDefaultCNI: true
-  # Calico's own default IPPool CIDR. The Installation CR shipped in
-  # the operator's custom-resources.yaml claims 192.168.0.0/16, so the
-  # cluster pod CIDR has to match or the CNI hands out addresses the
-  # node does not route.
-  podSubnet: "192.168.0.0/16"
+  # The cluster pod CIDR, and the single source of truth for it:
+  # hack/install-calico-kind.sh reads this line and gives Calico's
+  # Installation an ipPools cidr to match. The two MUST agree. Calico's
+  # own default IPPool claims 192.168.0.0/16, so leaving that as the
+  # podSubnet and applying the upstream custom-resources.yaml unchanged
+  # is the one pairing that happens to line up, but it puts pod
+  # addresses in a range that collides with the RFC 1918 block most
+  # home and office networks already use, and a developer on such a
+  # network loses routes to their own LAN. 10.244.0.0/16 is kind's own
+  # default and collides with nothing here. Change this value and the
+  # script follows it; change it in only one place and Calico hands out
+  # addresses outside the cluster's podCIDR.
+  podSubnet: "10.244.0.0/16"
   serviceSubnet: "10.96.0.0/16"
 nodes:
   - role: control-plane

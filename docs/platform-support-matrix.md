@@ -34,7 +34,7 @@ stock EKS (VPC CNI) and stock AKS (no policy engine selected).
 | Platform | Install | Falco driver | NetworkPolicy enforced | Default StorageClass | Audit webhook | Overlay |
 | --- | --- | --- | --- | --- | --- | --- |
 | **kind** | ✅ verified | modern_ebpf (Falco 0.45.0-rc1) | ❌ **no** (kindnet) | ✅ `standard` | ✅ possible | `values-kind.yaml` |
-| **kind + Calico** | script, live run pending | modern_ebpf (Falco 0.45.0-rc1) | ✅ (Calico) | ✅ `standard` | ✅ possible | `values-kind.yaml` |
+| **kind + Calico** | ✅ verified 2026-09-17 | modern_ebpf (Falco 0.45.0-rc1) | ✅ **proven** (Calico) | ✅ `standard` | untested here | `values-kind.yaml` |
 | **kubeadm** | ✅ verified | modern_ebpf | depends on CNI | depends | ✅ possible | (defaults) |
 | **k3s / k3d** | template-verified | modern_ebpf | ✅ (kube-router) | ✅ `local-path` | ✅ possible | `values-k3s.yaml` |
 | **minikube** | template-verified | modern_ebpf | ❌ unless `--cni=calico` | ✅ addon | ✅ possible | `values-minikube.yaml` |
@@ -51,10 +51,17 @@ reason. CI lints and `kubeconform`-validates all seven on every run against the
 chart's `kubeVersion` floor (1.29.0), which is the evidence behind the
 `template-verified` rows and **the only thing they claim**.
 
-The two `verified` rows are separate, and neither rests on CI:
+The `verified` rows are separate, and none rests on CI:
 
 - **kind** is installed and observed on every e2e run, and again by hand on
   2026-09-01 for Story 9.6.
+- **kind + Calico** was installed and observed by hand on 2026-09-17 for
+  Story 10.11; what that run established is set out under *Calico and
+  Goldmane* below. Its audit-webhook column says `untested here` on
+  purpose: `hack/kind-calico-config.yaml` wires no
+  `--audit-webhook-config-file`, so nothing on that cluster exercised the
+  audit path, and kind being capable of it is not the same as it having
+  been done.
 - **kubeadm** was installed by hand on a real 3-node cluster on 2026-08-31.
   Note what that run actually established: the chart installs and every
   workload schedules, but the collector could not attach to Falco's socket
@@ -104,16 +111,37 @@ goldmane` returns something.
 | **stock kind, k3s** | ❌ | kindnet and kube-router are not Calico |
 
 The `kind + Calico` row is the only one this repository gives a scripted path
-for. It is **not** marked verified: the script and the traffic fixture
-(`tests/e2e/fixtures/calico-flow-traffic.yaml`) are committed, but the live run
-that observes `olaitan.events.raw.network` events and
-`source_healthy{source="network"} 1` is outstanding, and the row will not say
-verified until that output exists.
+for, and it is the only one that has been run. **Live on 2026-09-17**, on a
+cluster built by `hack/install-calico-kind.sh` (kind node image v1.30.0,
+Calico v3.31.5) with Falco `0.45.0-rc1` ON and the release installed from the
+Path B values the script wrote:
 
-Note the interaction with the NetworkPolicy finding above: `kind + Calico` is
-also the only kind cluster where the release NetworkPolicy, including the
-adapter's own Goldmane egress rule, is actually enforced rather than merely
-accepted. `hack/check-netpol-enforcement.sh` is what settles that empirically.
+- `tests/e2e/fixtures/calico-flow-traffic.yaml` was applied first. Without it
+  the cluster is quiet and Goldmane reports nothing, so the fixture is part of
+  the evidence, not a convenience.
+- pod-to-Service flow events arrived on `olaitan.events.raw.network`.
+- `olaitan_sensor_events_total{source="network"}` reached 127.
+- `olaitan_source_healthy{source="network"}` was 1.
+- Falco stayed healthy throughout; it is never switched off for this.
+- `hack/check-netpol-enforcement.sh` reported `NetworkPolicy IS ENFORCED`,
+  which is what settles the enforcement half empirically. `kind + Calico` is
+  the only kind cluster where the release NetworkPolicy, the adapter's own
+  Goldmane egress rule included, is actually enforced rather than merely
+  accepted.
+
+What that run does **not** establish, and what this row therefore does not
+claim: it was one cluster, with a single control-plane node, on the kind plus
+Calico path only. Nothing about multi-node Calico, about any other platform in
+the Goldmane table, or about the audit webhook follows from it.
+
+**Pending re-run.** After that run the cluster pod CIDR in
+`hack/kind-calico-config.yaml` moved from Calico's 192.168.0.0/16 default to
+10.244.0.0/16, and the install script now substitutes a matching `ipPools`
+cidr into the Installation. The traffic fixture also became a pair of
+Deployments. The observations above were made before those two changes, on a
+cluster that cannot be migrated in place (an IPPool CIDR is immutable), so the
+same run is being repeated on a freshly created cluster. This note stays here
+until it has been.
 
 ---
 
