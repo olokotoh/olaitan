@@ -111,7 +111,8 @@ goldmane` returns something.
 | **stock kind, k3s** | ❌ | kindnet and kube-router are not Calico |
 
 The `kind + Calico` row is the only one this repository gives a scripted path
-for, and it is the only one that has been run. **Live on 2026-09-17**, on a
+for, and it is the only one that has been run. **Live on 2026-09-17**, re-run end to end after the pod CIDR moved to
+10.244.0.0/16 and the fixture became a pair of Deployments, on a
 cluster built by `hack/install-calico-kind.sh` (kind node image v1.30.0,
 Calico v3.31.5) with Falco `0.45.0-rc1` ON and the release installed from the
 Path B values the script wrote:
@@ -120,7 +121,7 @@ Path B values the script wrote:
   the cluster is quiet and Goldmane reports nothing, so the fixture is part of
   the evidence, not a convenience.
 - pod-to-Service flow events arrived on `olaitan.events.raw.network`.
-- `olaitan_sensor_events_total{source="network"}` reached 127.
+- `olaitan_sensor_events_total{source="network"}` reached 149.
 - `olaitan_source_healthy{source="network"}` was 1.
 - Falco stayed healthy throughout; it is never switched off for this.
 - `hack/check-netpol-enforcement.sh` reported `NetworkPolicy IS ENFORCED`,
@@ -134,14 +135,7 @@ claim: it was one cluster, with a single control-plane node, on the kind plus
 Calico path only. Nothing about multi-node Calico, about any other platform in
 the Goldmane table, or about the audit webhook follows from it.
 
-**Pending re-run.** After that run the cluster pod CIDR in
-`hack/kind-calico-config.yaml` moved from Calico's 192.168.0.0/16 default to
-10.244.0.0/16, and the install script now substitutes a matching `ipPools`
-cidr into the Installation. The traffic fixture also became a pair of
-Deployments. The observations above were made before those two changes, on a
-cluster that cannot be migrated in place (an IPPool CIDR is immutable), so the
-same run is being repeated on a freshly created cluster. This note stays here
-until it has been.
+
 
 ---
 
