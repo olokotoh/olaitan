@@ -291,6 +291,33 @@ auditWebhook:
   # 'server' URL the apiserver dials.
   containerPort: 8443
 
+  # Story 10.8 (#137 B2). Address the kube-apiserver dials, written into
+  # the audit kubeconfig. Empty means the in-cluster Service FQDN, which
+  # only works where the apiserver uses cluster DNS; on a self-managed
+  # cluster the apiserver runs on the host network with the node's
+  # resolver and cannot resolve it. There, set 127.0.0.1:<hostPort> with
+  # hostPort below (see AUDIT.md). A bare host or IP, optionally
+  # host:port, with no scheme and no path; bracket an IPv6 address
+  # ([fd00::1]:8443). A loopback address must dial hostPort. Validated at
+  # render.
+  # @schema type:string effect:"address the kube-apiserver dials for the audit webhook (empty: the in-cluster Service FQDN)" ref:FR5
+  serverAddress: ""
+
+  # Publish the receiver on each node at this port, so an apiserver on
+  # the host network reaches its own node's collector. 0 leaves the
+  # receiver off the node's network. Needs serverAddress set to dial it
+  # and collector.runOnControlPlane=true, since the apiserver runs on a
+  # control-plane node. Validated at render.
+  # @schema type:integer minimum:0 maximum:65535 effect:"publish the audit receiver on the node at this hostPort (0: off)" ref:FR5
+  hostPort: 0
+
+  # Node address hostPort is bound to. The default keeps the receiver on
+  # the node's loopback only, which is all the apiserver dials; empty
+  # binds every interface of the node. Only rendered with hostPort set.
+  # Validated at render.
+  # @schema type:string effect:"node address the audit hostPort binds to (empty: every interface)" ref:FR5
+  hostIP: "127.0.0.1"
+
   # base64-encoded PEM bytes of the CA that signed the receiver's
   # serving cert. The apiserver kubeconfig embeds this as
   # certificate-authority-data so the apiserver trusts the receiver

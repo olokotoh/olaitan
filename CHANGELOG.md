@@ -111,6 +111,23 @@ and false-positive numbers; see [Unreleased](#unreleased).
   `olaitan_sensor_falco_heartbeats_total`,
   `olaitan_sensor_falco_publish_drops_total`.
 
+### Fixed
+
+- **The audit webhook can actually receive an event** (#137). Three
+  defects meant the kube-apiserver never reached the receiver on a
+  self-managed cluster, so `source_healthy{source="audit"}` was never 1.
+  The audit Service selected the aggregator while the receiver listens in
+  the collector DaemonSet; the kubeconfig hardcoded a cluster-DNS name the
+  apiserver cannot resolve on the host network (`auditWebhook.serverAddress`
+  and `auditWebhook.hostPort` now give it an address it can reach, both
+  validated at render); and AUDIT.md signed the apiserver's client
+  certificate with a private CA while pointing `clusterCAData` at the
+  cluster CA, so mTLS failed. `hack/audit-webhook-certs.sh` issues both
+  sides from one CA and writes a values file the chart accepts as is.
+  `auditWebhook.hostIP` (default `127.0.0.1`) keeps the node port off the
+  node's other interfaces, and the render fails when `serverAddress`,
+  `hostPort` and `collector.runOnControlPlane` do not agree.
+
 ## [v1.0.0-rc3] - 2026-08-30
 
 ### Fixed

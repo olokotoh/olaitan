@@ -17,6 +17,9 @@ package helm_test
 
 import (
 	"bytes"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -4779,6 +4782,428 @@ func TestFalcoIngestServiceIsNodeLocal(t *testing.T) {
 	port := spec["ports"].([]any)[0].(map[string]any)
 	if port["port"] != 8765 || port["targetPort"] != "falco-ingest" {
 		t.Errorf("falco-ingest port = %v -> %v, want 8765 -> falco-ingest", port["port"], port["targetPort"])
+	}
+}
+
+// TestAuditWebhookKubeconfigCanTargetAnAddressTheAPIServerReaches:
+// Story 10.8 (#137, B2). kube-apiserver runs on the host network with the
+// node's resolver, so it cannot resolve a cluster-DNS name: the hardcoded
+// <fullname>-audit-webhook.<ns>.svc.cluster.local server URL was
+// unreachable on every self-managed cluster. auditWebhook.serverAddress
+// lets the operator point the apiserver at an address it can actually
+// reach (the node itself, with hostPort on).
+func TestAuditWebhookKubeconfigCanTargetAnAddressTheAPIServerReaches(t *testing.T) {
+	kubeconfigOf := func(sets []string) string {
+		rendered := helmTemplate(t, append(auditWebhookEnabledArgs(), sets...))
+		sec := docByKindName(t, rendered, "Secret", "audit-webhook-kubeconfig")
+		return fmt.Sprint(sec["stringData"].(map[string]any)["webhook-kubeconfig.yaml"])
+	}
+	// Default: unchanged, the in-cluster Service FQDN.
+	if got := kubeconfigOf(nil); !strings.Contains(got, "server: https://olaitan-audit-webhook.default.svc.cluster.local:8443/audit") {
+		t.Errorf("default server URL changed:\n%s", got)
+	}
+	// An IP the apiserver can dial, with the port the receiver serves.
+	if got := kubeconfigOf([]string{"auditWebhook.serverAddress=10.96.0.42"}); !strings.Contains(got, "server: https://10.96.0.42:8443/audit") {
+		t.Errorf("serverAddress ignored:\n%s", got)
+	}
+	// A node-local address with its own port (hostPort on the DaemonSet).
+	if got := kubeconfigOf(nodeLocalAuditArgs("31443")); !strings.Contains(got, "server: https://127.0.0.1:31443/audit") {
+		t.Errorf("serverAddress with an explicit port ignored:\n%s", got)
+	}
+	// Garbage must fail at render, not at the apiserver hours later.
+	for _, bad := range []string{"https://10.96.0.42", "10.96.0.42/audit", "10.96.0.42:0", "10 .0.0.1", "10.96.0.42:99999", "fd00::1", "[fd00::1", "[fd00::1]:0", "[not-hex]:8443"} {
+		if msg := helmTemplateExpectError(t, append(auditWebhookEnabledArgs(), "auditWebhook.serverAddress="+bad)); !strings.Contains(msg, "serverAddress") {
+			t.Errorf("serverAddress=%q was rejected without naming it: %s", bad, msg)
+		}
+	}
+}
+
+// TestAuditWebhookHostPortMakesTheReceiverNodeReachable: Story 10.8
+// (#137, B2). With hostPort set, the collector on every node publishes
+// the receiver on the node itself, so an apiserver on the host network
+// reaches its own node's receiver at 127.0.0.1 with no cluster DNS and no
+// Service in the path.
+func TestAuditWebhookHostPortMakesTheReceiverNodeReachable(t *testing.T) {
+	portsOf := func(sets []string) map[string]any {
+		return collectorAuditWebhookPort(t, helmTemplate(t, append(auditWebhookEnabledArgs(), sets...)))
+	}
+	if p, ok := portsOf(nil)["hostPort"]; ok {
+		t.Errorf("the default install binds hostPort %v it was not asked for", p)
+	}
+	if p := portsOf(nodeLocalAuditArgs("31443"))["hostPort"]; p != 31443 {
+		t.Errorf("hostPort = %v, want 31443", p)
+	}
+	for _, bad := range []string{"70000", "-1", "abc"} {
+		sets := append(auditWebhookEnabledArgs(), "auditWebhook.hostPort="+bad,
+			"auditWebhook.serverAddress=127.0.0.1:31443", "collector.runOnControlPlane=true")
+		if msg := helmTemplateExpectError(t, sets); !strings.Contains(msg, "hostPort") {
+			t.Errorf("hostPort=%q was rejected without naming it: %s", bad, msg)
+		}
+	}
+}
+
+// TestAuditWebhookCertScriptProducesMaterialBothSidesAccept: Story 10.8
+// (#137, B3). AUDIT.md signed the apiserver's client certificate with a
+// private audit CA but told the operator to set clusterCAData to the
+// cluster's own root CA. The receiver verifies client certs against
+// clusterCAData (internal/collector/audit/audit.go), so the apiserver
+// was rejected at the handshake on every install that followed the
+// documentation. hack/audit-webhook-certs.sh now issues both sides from
+// one CA, and that CA is what clusterCAData carries.
+func TestAuditWebhookCertScriptProducesMaterialBothSidesAccept(t *testing.T) {
+	if _, err := exec.LookPath("openssl"); err != nil {
+		t.Skip("openssl not installed")
+	}
+	dir := t.TempDir()
+	_, thisFile, _, _ := runtime.Caller(0)
+	script := filepath.Join(filepath.Dir(thisFile), "..", "..", "hack", "audit-webhook-certs.sh")
+	cmd := exec.Command(script, dir, "olaitan-audit-webhook.olaitan.svc.cluster.local", "127.0.0.1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%s: %v\n%s", script, err, out)
+	}
+	valuesPath := filepath.Join(dir, "audit-webhook-values.yaml")
+	raw, err := os.ReadFile(valuesPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := map[string]string{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), ": ")
+		if ok {
+			fields[k] = strings.Trim(v, `"`)
+		}
+	}
+	decodeCert := func(field string) *x509.Certificate {
+		t.Helper()
+		der, err := base64.StdEncoding.DecodeString(fields[field])
+		if err != nil {
+			t.Fatalf("%s is not one line of base64: %v", field, err)
+		}
+		block, _ := pem.Decode(der)
+		if block == nil {
+			t.Fatalf("%s is not PEM", field)
+		}
+		c, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatalf("%s: %v", field, err)
+		}
+		return c
+	}
+	clientCA, serverCA := decodeCert("clusterCAData"), decodeCert("caBundle")
+	client, server := decodeCert("apiserverClientCert"), decodeCert("servingCert")
+
+	// The receiver verifies the apiserver's client cert against
+	// clusterCAData. This is the check that used to fail.
+	pool := x509.NewCertPool()
+	pool.AddCert(clientCA)
+	if _, err := client.Verify(x509.VerifyOptions{Roots: pool, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
+		t.Errorf("the apiserver client cert does not verify against clusterCAData: %v", err)
+	}
+	// And the receiver pins its CN.
+	if client.Subject.CommonName != "kube-apiserver" {
+		t.Errorf("client CN = %q, want kube-apiserver (the receiver's default ClientCNAllow)", client.Subject.CommonName)
+	}
+	// The apiserver verifies the receiver against caBundle, by the
+	// address it dialled.
+	pool = x509.NewCertPool()
+	pool.AddCert(serverCA)
+	for _, name := range []string{"olaitan-audit-webhook.olaitan.svc.cluster.local", "127.0.0.1"} {
+		if _, err := server.Verify(x509.VerifyOptions{Roots: pool, DNSName: name, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}); err != nil {
+			t.Errorf("the serving cert is not valid for %s: %v", name, err)
+		}
+	}
+	// And the chart accepts the file as written, with no hand-editing.
+	out, err := exec.Command("helm", "template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=x", "-f", valuesPath).CombinedOutput()
+	if err != nil {
+		t.Errorf("the chart rejected the generated values file: %v\n%s", err, out)
+	}
+}
+
+// TestAuditWebhookServiceSelectsTheReceiver: Story 10.8 (#137, B1). The
+// audit receiver listens in the collector DaemonSet, but the Service
+// selected the aggregator Deployment, so every apiserver audit POST went
+// to a pod with nothing listening and the audit source never produced an
+// event.
+func TestAuditWebhookServiceSelectsTheReceiver(t *testing.T) {
+	rendered := helmTemplate(t, auditWebhookEnabledArgs())
+	spec := docByKindName(t, rendered, "Service", "audit-webhook")["spec"].(map[string]any)
+	sel := spec["selector"].(map[string]any)
+	if sel["app.kubernetes.io/component"] != "collector" {
+		t.Errorf("the audit Service selects %v; the receiver runs in the collector DaemonSet", sel)
+	}
+	// The Service's own selector must match the collector pod template, or
+	// it has no endpoints at all.
+	pod := collectorDaemonSet(t, rendered)["spec"].(map[string]any)["template"].(map[string]any)
+	labels := pod["metadata"].(map[string]any)["labels"].(map[string]any)
+	for k, v := range sel {
+		if labels[k] != v {
+			t.Errorf("selector %s=%v does not match the collector pod label %v", k, v, labels[k])
+		}
+	}
+	// And the port it targets must be one the collector actually opens.
+	target := spec["ports"].([]any)[0].(map[string]any)["targetPort"]
+	var found bool
+	for _, c := range pod["spec"].(map[string]any)["containers"].([]any) {
+		for _, prt := range c.(map[string]any)["ports"].([]any) {
+			pm := prt.(map[string]any)
+			if pm["containerPort"] == target || pm["name"] == target {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Errorf("audit Service targetPort %v is not a port on any collector container", target)
+	}
+}
+
+// nodeLocalAuditArgs is the supported node-reachable wiring (AUDIT.md):
+// the receiver published on the node at hostPort, the apiserver dialling
+// its own node's collector on loopback, and a collector scheduled onto
+// the control-plane node where the apiserver runs.
+func nodeLocalAuditArgs(port string) []string {
+	return []string{
+		"auditWebhook.hostPort=" + port,
+		"auditWebhook.serverAddress=127.0.0.1:" + port,
+		"collector.runOnControlPlane=true",
+	}
+}
+
+// collectorAuditWebhookPort returns the audit-webhook port entry of the
+// collector container in a rendered chart.
+func collectorAuditWebhookPort(t *testing.T, rendered string) map[string]any {
+	t.Helper()
+	pod := collectorDaemonSet(t, rendered)["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)
+	for _, c := range pod["containers"].([]any) {
+		cm := c.(map[string]any)
+		if cm["name"] != "collector" {
+			continue
+		}
+		for _, prt := range cm["ports"].([]any) {
+			pm := prt.(map[string]any)
+			if pm["name"] == "audit-webhook" {
+				return pm
+			}
+		}
+	}
+	t.Fatal("no audit-webhook port on the collector container")
+	return nil
+}
+
+// TestAuditWebhookHostPortNeedsACollectorOnTheControlPlane: Story 10.8
+// review. The apiserver dials 127.0.0.1:<hostPort> on its OWN node, which
+// is a control-plane node. The collector DaemonSet skips tainted
+// control-plane nodes unless collector.runOnControlPlane=true, so a
+// hostPort install without it renders cleanly and then never receives an
+// event. It must fail at render instead.
+func TestAuditWebhookHostPortNeedsACollectorOnTheControlPlane(t *testing.T) {
+	msg := helmTemplateExpectError(t, append(auditWebhookEnabledArgs(),
+		"auditWebhook.hostPort=31443", "auditWebhook.serverAddress=127.0.0.1:31443"))
+	if !strings.Contains(msg, "collector.runOnControlPlane") {
+		t.Errorf("hostPort without a collector on the control plane was rejected without naming collector.runOnControlPlane: %s", msg)
+	}
+	// With it, the same wiring renders.
+	helmTemplate(t, append(auditWebhookEnabledArgs(), nodeLocalAuditArgs("31443")...))
+}
+
+// TestAuditWebhookServerAddressAndHostPortAgree: Story 10.8 review. Each
+// value was validated alone, so a loopback serverAddress with no hostPort,
+// a loopback port different from hostPort, or a hostPort nothing dials all
+// rendered and then silently dropped every audit event.
+func TestAuditWebhookServerAddressAndHostPortAgree(t *testing.T) {
+	cases := []struct {
+		name string
+		sets []string
+		want string
+	}{
+		{"loopback without hostPort", []string{"auditWebhook.serverAddress=127.0.0.1:31443", "collector.runOnControlPlane=true"}, "hostPort"},
+		{"loopback without a port uses servicePort, which is not hostPort", []string{"auditWebhook.serverAddress=127.0.0.1", "auditWebhook.hostPort=31443", "collector.runOnControlPlane=true"}, "hostPort"},
+		{"loopback port differs from hostPort", []string{"auditWebhook.serverAddress=127.0.0.1:31444", "auditWebhook.hostPort=31443", "collector.runOnControlPlane=true"}, "hostPort"},
+		{"other loopback address without hostPort", []string{"auditWebhook.serverAddress=127.1.2.3:31443", "collector.runOnControlPlane=true"}, "hostPort"},
+		{"hostPort with no serverAddress", []string{"auditWebhook.hostPort=31443", "collector.runOnControlPlane=true"}, "serverAddress"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			msg := helmTemplateExpectError(t, append(auditWebhookEnabledArgs(), c.sets...))
+			if !strings.Contains(msg, c.want) {
+				t.Errorf("rejected without naming %s: %s", c.want, msg)
+			}
+		})
+	}
+	// A loopback address with no port is fine when servicePort IS hostPort.
+	helmTemplate(t, append(auditWebhookEnabledArgs(),
+		"auditWebhook.serverAddress=127.0.0.1", "auditWebhook.hostPort=8443", "collector.runOnControlPlane=true"))
+}
+
+// TestAuditWebhookPortsRejectLeadingZeros: Story 10.8 review. Sprig's int
+// parses a leading zero as octal, so hostPort "0100" rendered hostPort: 64
+// and "080" (not valid octal) silently became 0, dropping the hostPort
+// altogether. A port with a leading zero must fail at render.
+func TestAuditWebhookPortsRejectLeadingZeros(t *testing.T) {
+	for _, bad := range []string{"080", "0100"} {
+		sets := append(auditWebhookEnabledArgs(), "collector.runOnControlPlane=true",
+			"auditWebhook.hostPort="+bad, "auditWebhook.serverAddress=127.0.0.1:100")
+		if msg := helmTemplateExpectError(t, sets); !strings.Contains(msg, "hostPort") {
+			t.Errorf("hostPort=%q was rejected without naming it: %s", bad, msg)
+		}
+	}
+	for _, bad := range []string{"10.96.0.42:0100", "h:08443", "[fd00::1]:08443"} {
+		if msg := helmTemplateExpectError(t, append(auditWebhookEnabledArgs(), "auditWebhook.serverAddress="+bad)); !strings.Contains(msg, "serverAddress") {
+			t.Errorf("serverAddress=%q was rejected without naming it: %s", bad, msg)
+		}
+	}
+}
+
+// TestAuditWebhookServerAddressAcceptsBracketedIPv6: Story 10.8 review.
+// An IPv6-only or dual-stack control plane dials the receiver over IPv6,
+// which in a URL authority must be bracketed.
+func TestAuditWebhookServerAddressAcceptsBracketedIPv6(t *testing.T) {
+	kubeconfigOf := func(addr string) string {
+		rendered := helmTemplate(t, append(auditWebhookEnabledArgs(), "auditWebhook.serverAddress="+addr))
+		sec := docByKindName(t, rendered, "Secret", "audit-webhook-kubeconfig")
+		return fmt.Sprint(sec["stringData"].(map[string]any)["webhook-kubeconfig.yaml"])
+	}
+	if got := kubeconfigOf("[fd00::1]:9443"); !strings.Contains(got, "server: https://[fd00::1]:9443/audit") {
+		t.Errorf("bracketed IPv6 with a port not used as given:\n%s", got)
+	}
+	if got := kubeconfigOf("[fd00::1]"); !strings.Contains(got, "server: https://[fd00::1]:8443/audit") {
+		t.Errorf("bracketed IPv6 without a port did not get servicePort:\n%s", got)
+	}
+}
+
+// TestAuditWebhookHostIPBindsTheNodePortToLoopback: Story 10.8 review.
+// hostPort alone publishes the receiver on every interface of every node,
+// while the apiserver only ever dials it on loopback. auditWebhook.hostIP
+// (default 127.0.0.1) keeps the published port off the node's other
+// interfaces; an empty hostIP binds all interfaces.
+func TestAuditWebhookHostIPBindsTheNodePortToLoopback(t *testing.T) {
+	portOf := func(sets ...string) map[string]any {
+		return collectorAuditWebhookPort(t, helmTemplate(t, append(append(auditWebhookEnabledArgs(), nodeLocalAuditArgs("31443")...), sets...)))
+	}
+	if ip := portOf()["hostIP"]; ip != "127.0.0.1" {
+		t.Errorf("default hostIP = %v, want 127.0.0.1", ip)
+	}
+	if ip := portOf("auditWebhook.hostIP=10.0.0.5")["hostIP"]; ip != "10.0.0.5" {
+		t.Errorf("hostIP = %v, want 10.0.0.5", ip)
+	}
+	if ip, ok := portOf("auditWebhook.hostIP=")["hostIP"]; ok {
+		t.Errorf("empty hostIP still rendered hostIP %v; empty means every interface", ip)
+	}
+	// No hostPort, no hostIP: the field is meaningless without it.
+	if ip, ok := collectorAuditWebhookPort(t, helmTemplate(t, auditWebhookEnabledArgs()))["hostIP"]; ok {
+		t.Errorf("hostIP %v rendered without a hostPort", ip)
+	}
+	for _, bad := range []string{"localhost", "127.0.0.256", "10.0.0.5:80"} {
+		sets := append(append(auditWebhookEnabledArgs(), nodeLocalAuditArgs("31443")...), "auditWebhook.hostIP="+bad)
+		if msg := helmTemplateExpectError(t, sets); !strings.Contains(msg, "hostIP") {
+			t.Errorf("hostIP=%q was rejected without naming it: %s", bad, msg)
+		}
+	}
+}
+
+// TestAuditWebhookCertScriptIsSafeByDefault: Story 10.8 review. The cert
+// script writes a CA private key: it must not be world-readable, must not
+// silently replace a CA already in use, must mark the CA as a CA, must
+// cover IPv6 addresses with an IP SAN, and must reject input that would
+// produce a broken certificate instead of hiding openssl's complaint.
+func TestAuditWebhookCertScriptIsSafeByDefault(t *testing.T) {
+	if _, err := exec.LookPath("openssl"); err != nil {
+		t.Skip("openssl not installed")
+	}
+	_, thisFile, _, _ := runtime.Caller(0)
+	script := filepath.Join(filepath.Dir(thisFile), "..", "..", "hack", "audit-webhook-certs.sh")
+	run := func(env []string, args ...string) (string, error) {
+		cmd := exec.Command(script, args...)
+		cmd.Env = append(os.Environ(), env...)
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+
+	dir := t.TempDir()
+	if out, err := run(nil, dir, "olaitan-audit-webhook.olaitan.svc", "127.0.0.1", "fd00::1"); err != nil {
+		t.Fatalf("%s: %v\n%s", script, err, out)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := info.Mode().Perm(); perm&0o077 != 0 {
+			t.Errorf("%s is mode %v; every output carries or embeds key material and must be owner-only", e.Name(), perm)
+		}
+	}
+	readCert := func(name string) *x509.Certificate {
+		t.Helper()
+		raw, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		block, _ := pem.Decode(raw)
+		if block == nil {
+			t.Fatalf("%s is not PEM", name)
+		}
+		c, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	ca, server := readCert("audit-ca.crt"), readCert("audit-server.crt")
+	if !ca.BasicConstraintsValid || !ca.IsCA {
+		t.Errorf("CA certificate does not carry basicConstraints CA:TRUE")
+	}
+	if ca.KeyUsage != x509.KeyUsageCertSign|x509.KeyUsageCRLSign {
+		t.Errorf("CA keyUsage = %v, want keyCertSign|cRLSign only", ca.KeyUsage)
+	}
+	for _, ext := range ca.Extensions {
+		// 2.5.29.19 basicConstraints, 2.5.29.15 keyUsage.
+		if id := ext.Id.String(); (id == "2.5.29.19" || id == "2.5.29.15") && !ext.Critical {
+			t.Errorf("CA extension %s is not critical", id)
+		}
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(ca)
+	if _, err := server.Verify(x509.VerifyOptions{Roots: pool, DNSName: "fd00::1", KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}); err != nil {
+		t.Errorf("the serving cert has no IP SAN for fd00::1: %v", err)
+	}
+
+	// A second run into the same directory would mint a new CA and orphan
+	// every certificate the old one signed.
+	before, _ := os.ReadFile(filepath.Join(dir, "audit-ca.key"))
+	if out, err := run(nil, dir); err == nil || !strings.Contains(out, "audit-ca") {
+		t.Errorf("a second run over an existing CA succeeded or did not say why: err=%v\n%s", err, out)
+	}
+	if after, _ := os.ReadFile(filepath.Join(dir, "audit-ca.key")); !bytes.Equal(before, after) {
+		t.Errorf("the existing CA key was overwritten")
+	}
+
+	bad := []struct {
+		name string
+		env  []string
+		args []string
+		want string
+	}{
+		{"CN with a slash", []string{"AUDIT_CLIENT_CN=kube/apiserver"}, nil, "AUDIT_CLIENT_CN"},
+		{"days zero", []string{"AUDIT_CERT_DAYS=0"}, nil, "AUDIT_CERT_DAYS"},
+		{"days not a number", []string{"AUDIT_CERT_DAYS=1y"}, nil, "AUDIT_CERT_DAYS"},
+		{"empty server name", nil, []string{""}, "server name"},
+		{"IPv4 octet over 255", nil, []string{"127.0.0.256"}, "127.0.0.256"},
+	}
+	for _, b := range bad {
+		t.Run(b.name, func(t *testing.T) {
+			d := t.TempDir()
+			out, err := run(b.env, append([]string{d}, b.args...)...)
+			if err == nil || !strings.Contains(out, b.want) {
+				t.Errorf("accepted, or rejected without naming %s: err=%v\n%s", b.want, err, out)
+			}
+			if _, statErr := os.Stat(filepath.Join(d, "audit-ca.key")); statErr == nil {
+				t.Errorf("wrote a CA key before rejecting the input")
+			}
+		})
 	}
 }
 

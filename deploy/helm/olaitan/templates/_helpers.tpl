@@ -345,6 +345,86 @@ that work for in-namespace clients break for cross-namespace dialers.
 {{- end -}}
 
 {{/*
+Audit webhook server address (Story 10.8, #137 B2).
+
+kube-apiserver runs on the host network with the node's resolver, so it
+cannot resolve a cluster-DNS name: the Service FQDN below is unreachable
+on every self-managed cluster. auditWebhook.serverAddress overrides it
+with an address the apiserver can actually dial: 127.0.0.1:<hostPort>,
+with the receiver published on the node (auditWebhook.hostPort), which
+keeps each apiserver talking to its own node's collector.
+
+The address may carry its own port; without one, servicePort is used. An
+IPv6 address is bracketed, as in a URL: [fd00::1] or [fd00::1]:8443.
+*/}}
+{{- define "olaitan.auditWebhook.server" -}}
+{{- $addr := default "" .Values.auditWebhook.serverAddress | toString | trim -}}
+{{- if eq $addr "" -}}
+{{- printf "%s:%v" (include "olaitan.auditWebhookServiceFqdn" .) (int .Values.auditWebhook.servicePort) -}}
+{{- else if regexMatch ":[0-9]+$" $addr -}}
+{{- $addr -}}
+{{- else -}}
+{{- printf "%s:%v" $addr (int .Values.auditWebhook.servicePort) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Validation for the address the apiserver dials and the node port that
+serves it (Story 10.8). Each value is checked on its own first, then
+against the others, because the failure mode of a mismatch is silent:
+the chart renders, the apiserver dials nothing, and the audit source
+never produces an event.
+
+Ports are matched as strings before any int conversion: Sprig's int reads
+a leading zero as octal, so "0100" would become 64 and "080" would become
+0 without a word.
+*/}}
+{{- define "olaitan.auditWebhook.validate" -}}
+{{- if .Values.auditWebhook.enabled -}}
+{{- $addr := default "" .Values.auditWebhook.serverAddress | toString | trim -}}
+{{- $host := "" -}}
+{{- $port := "" -}}
+{{- if ne $addr "" -}}
+{{- /* host, [ipv6], host:port or [ipv6]:port. No scheme, no path, no
+       spaces: the value is interpolated into the kubeconfig server URL. */ -}}
+{{- if not (regexMatch "^([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\\[[0-9A-Fa-f]*:[0-9A-Fa-f]*:[0-9A-Fa-f:.]*\\])(:[0-9]{1,5})?$" $addr) -}}
+{{- fail (printf "auditWebhook.serverAddress is %q: give a bare host or IP, optionally host:port, with no scheme and no path (for example 127.0.0.1:31443, or [fd00::1]:31443 for IPv6)." $addr) -}}
+{{- end -}}
+{{- $host = regexFind "^(\\[[^\\]]*\\]|[^:]+)" $addr -}}
+{{- $port = $addr | trimPrefix $host | trimPrefix ":" -}}
+{{- if and (ne $port "") (or (not (regexMatch "^[1-9][0-9]*$" $port)) (gt (int $port) 65535)) -}}
+{{- fail (printf "auditWebhook.serverAddress port is %q: want 1-65535 with no leading zero." $port) -}}
+{{- end -}}
+{{- end -}}
+{{- $hp := default 0 .Values.auditWebhook.hostPort | toString -}}
+{{- if or (not (regexMatch "^(0|[1-9][0-9]*)$" $hp)) (gt (int $hp) 65535) -}}
+{{- fail (printf "auditWebhook.hostPort is %q: want a number in 1-65535 with no leading zero, or 0 to leave the receiver off the node's network." $hp) -}}
+{{- end -}}
+{{- $hostIP := default "" .Values.auditWebhook.hostIP | toString | trim -}}
+{{- if and (ne $hostIP "") (not (or (regexMatch "^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$" $hostIP) (regexMatch "^[0-9A-Fa-f]*:[0-9A-Fa-f]*:[0-9A-Fa-f:.]*$" $hostIP))) -}}
+{{- fail (printf "auditWebhook.hostIP is %q: want an IP address with no port (default 127.0.0.1), or empty to bind every interface." $hostIP) -}}
+{{- end -}}
+{{- if ne $hp "0" -}}
+{{- if eq $addr "" -}}
+{{- fail (printf "auditWebhook.hostPort is %s but auditWebhook.serverAddress is empty, so the apiserver still dials the Service FQDN and nothing uses the node port. Set auditWebhook.serverAddress=127.0.0.1:%s." $hp $hp) -}}
+{{- end -}}
+{{- if not .Values.collector.runOnControlPlane -}}
+{{- fail (printf "auditWebhook.hostPort is %s, so each kube-apiserver dials the collector on its own control-plane node, but collector.runOnControlPlane is false and no collector runs there. Set collector.runOnControlPlane=true." $hp) -}}
+{{- end -}}
+{{- end -}}
+{{- if or (regexMatch "^127\\.[0-9]+\\.[0-9]+\\.[0-9]+$" $host) (eq $host "[::1]") -}}
+{{- $dialled := $port | default (toString (int .Values.auditWebhook.servicePort)) -}}
+{{- if eq $hp "0" -}}
+{{- fail (printf "auditWebhook.serverAddress is %q, a loopback address the apiserver dials on its own node, but auditWebhook.hostPort is 0 so nothing listens there. Set auditWebhook.hostPort=%s." $addr $dialled) -}}
+{{- end -}}
+{{- if ne $dialled $hp -}}
+{{- fail (printf "auditWebhook.serverAddress is %q, which dials port %s on the node, but auditWebhook.hostPort is %s. The two ports must match." $addr $dialled $hp) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Falco ingest (Story 10.2).
 
 Falco POSTs each alert to the collector over HTTP (http_output). Falco
