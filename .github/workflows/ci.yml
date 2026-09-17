@@ -771,19 +771,21 @@ jobs:
 
       # MinIO is started as an explicit `docker run` step rather than a
       # `services:` container because GitHub Actions `services:` cannot
-      # override an image's command, and the official `minio/minio` image
-      # needs an explicit `server /data ...` command (it has no default
+      # override an image's command, and the official MinIO image
+      # (quay.io/minio/minio) needs an explicit `server /data ...` command (it has no default
       # server entrypoint). The previously-used `bitnami/minio:latest` tag
       # was pruned by Bitnami (manifest unknown), so we pin the official
       # image to a specific, verified-pullable RELEASE tag for
-      # reproducibility (never `latest`).
+      # reproducibility (never `latest`). The image is pulled from quay.io:
+      # MinIO removed `minio/minio` from Docker Hub ("pull access denied"),
+      # while quay.io/minio/minio still serves the same RELEASE tags.
       - name: Start MinIO
         run: |
           docker run -d --name minio \
             -p 9000:9000 -p 9001:9001 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:RELEASE.2025-04-22T22-12-26Z \
+            quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z \
             server /data --console-address :9001
 
       # Bounded wait-for-ready loop (~30s) polling the MinIO liveness
@@ -832,9 +834,10 @@ jobs:
           go-version: '1.26'
 
       # MinIO is started as an explicit `docker run` step (see the
-      # forensics-integration job rationale): the official minio/minio image
+      # forensics-integration job rationale): the official quay.io/minio/minio image
       # needs an explicit `server /data ...` command, pinned to a verified
-      # RELEASE tag (never `latest`). MinIO supports object lock + SSE-KMS, so a
+      # RELEASE tag (never `latest`), pulled from quay.io because Docker Hub no
+      # longer serves it. MinIO supports object lock + SSE-KMS, so a
       # single MinIO instance backs the object-lock-enabled report bucket the
       # suite creates in its TestMain setup.
       - name: Start MinIO
@@ -843,7 +846,7 @@ jobs:
             -p 9000:9000 -p 9001:9001 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:RELEASE.2025-04-22T22-12-26Z \
+            quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z \
             server /data --console-address :9001
 
       # Bounded wait-for-ready loop (~30s) polling the MinIO liveness endpoint

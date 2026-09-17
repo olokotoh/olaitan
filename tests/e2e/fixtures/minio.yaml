@@ -37,8 +37,9 @@ spec:
           # Pinned to a specific verified-pullable RELEASE tag (never latest),
           # mirroring the forensics-integration CI job's image-pinning
           # discipline. The official minio image has no default server
-          # entrypoint, so the server command is explicit.
-          image: minio/minio:RELEASE.2024-10-13T13-34-11Z
+          # entrypoint, so the server command is explicit. Pulled from quay.io:
+          # MinIO removed minio/minio from Docker Hub.
+          image: quay.io/minio/minio:RELEASE.2024-10-13T13-34-11Z
           imagePullPolicy: IfNotPresent
           args: ["server", "/data", "--console-address", ":9001"]
           env:
