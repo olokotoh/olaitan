@@ -80,3 +80,13 @@ analysis/.venv/
 analysis/**/.pytest_cache/
 build/
 dist/
+
+# Story 10.11: the Goldmane mTLS material hack/install-calico-kind.sh
+# writes. client.key can authenticate to Goldmane, so nothing in this
+# family may ever reach a commit. The script's own documentation points
+# the out-dir OUTSIDE the repository; these rules are the second line of
+# defence for the run that took the default anyway.
+*.key
+*.pem
+calico-tls/
+calico-values.yaml

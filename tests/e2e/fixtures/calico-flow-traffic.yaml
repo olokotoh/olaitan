@@ -1,0 +1,176 @@
+# Story 10.11 (#140 AC3): the east-west traffic fixture for the Calico
+# Goldmane flow adapter. Goldmane reports what Felix observed; a cluster
+# with no pod-to-pod traffic produces no FlowResult, so the adapter would
+# sit connected and silent and nothing would prove it works. This fixture
+# is the real traffic. No event is ever fabricated to stand in for it.
+#
+# What it actually does: a client opens a TCP connection to a Service
+# ClusterIP once a second (`agnhost connect`, a plain TCP dial and close,
+# NOT an HTTP request) and the target answers on the same port. That is
+# enough for Felix to record a flow, which is what the adapter reads;
+# Goldmane's FlowResult is an L3/L4 record and carries no HTTP semantics,
+# so nothing downstream would be any better off for a real GET.
+#
+# Felix flushes flow records to Goldmane, which aggregates them over a
+# fixed 15s window, so the first flows appear roughly 30 to 60 seconds
+# after the client is Running.
+#
+# Both halves are Deployments, not bare Pods. A bare Pod that is evicted,
+# or whose node is drained, is simply gone, and the traffic stops with
+# it while the fixture still looks applied. A Deployment is rescheduled
+# and the flows come back.
+#
+# Apply it against a cluster built by hack/install-calico-kind.sh, after
+# the Olaitan chart is installed with the Path B values that script
+# writes:
+#
+#   kubectl apply -f tests/e2e/fixtures/calico-flow-traffic.yaml
+#   kubectl -n olaitan-flow-traffic rollout status deployment/target --timeout=180s
+#   kubectl -n olaitan-flow-traffic rollout status deployment/client --timeout=180s
+#
+# Then expect events on olaitan.events.raw.network and
+# source_healthy{source="network"} 1 on the collector's metrics port.
+#
+# If no events arrive, check the client first:
+#
+#   kubectl -n olaitan-flow-traffic logs deployment/client
+#   kubectl -n olaitan-flow-traffic get pods
+#
+# A client that cannot reach the Service at all exits, so its restart
+# count climbs and the failure is visible in `get pods` instead of being
+# swallowed. Silence from the adapter then means the adapter, not the
+# fixture.
+#
+# The namespace is its own, so `kubectl delete -f` takes the whole
+# fixture away and the flows stop.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: olaitan-flow-traffic
+  labels:
+    olaitan.io/fixture: calico-flow-traffic
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: target
+  namespace: olaitan-flow-traffic
+  labels:
+    app: target
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: target
+  template:
+    metadata:
+      labels:
+        app: target
+    spec:
+      containers:
+        - name: target
+          # agnhost is the upstream Kubernetes e2e image and is already
+          # pulled by hack/check-netpol-enforcement.sh, so this fixture
+          # adds no new registry dependency.
+          image: registry.k8s.io/e2e-test-images/agnhost:2.47
+          command: ["/agnhost", "netexec", "--http-port=8080"]
+          ports:
+            - containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 65532
+            # netexec serves from memory and writes nothing, so the
+            # root filesystem can be read-only. A fixture that ships
+            # with a writable rootfs is a fixture an operator copies
+            # into something that matters.
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: target
+  namespace: olaitan-flow-traffic
+spec:
+  selector:
+    app: target
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: client
+  namespace: olaitan-flow-traffic
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: client
+  template:
+    metadata:
+      labels:
+        app: client
+    spec:
+      containers:
+        - name: client
+          image: registry.k8s.io/e2e-test-images/agnhost:2.47
+          # Pod-to-SERVICE, not pod-to-pod: the connection goes through
+          # the Service ClusterIP so the flow record carries the service
+          # name the adapter tags events with.
+          #
+          # A failed dial is NOT swallowed. The previous `|| true` meant
+          # a client that could reach nothing at all looked exactly like
+          # a healthy one, and the only symptom was an adapter that
+          # reported no flows, which points the investigation at the
+          # wrong component. Ten consecutive failures is a client that
+          # is generating no traffic, so it exits and the restart count
+          # says so.
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -u
+              fails=0
+              while true; do
+                if /agnhost connect --timeout=5s target.olaitan-flow-traffic.svc:8080; then
+                  fails=0
+                else
+                  fails=$((fails + 1))
+                  echo "connect to target.olaitan-flow-traffic.svc:8080 failed (${fails} in a row)" >&2
+                  if [ "${fails}" -ge 10 ]; then
+                    echo "10 consecutive failures: this fixture is generating no traffic, so Goldmane has nothing to report. Exiting so the restart count makes that visible." >&2
+                    exit 1
+                  fi
+                fi
+                sleep 1
+              done
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 65532
+            # The loop above needs no writable path either.
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi

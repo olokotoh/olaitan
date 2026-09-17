@@ -463,15 +463,18 @@ containerdSensor:
 # provisioning paths are supported (Path A cert-manager, Path B
 # operator-supplied) -- see CNI.md.
 calicoSensor:
+  # @schema type:boolean effect:"enable the Calico Goldmane flow sensor; bridges detection.sources.calico.enabled too" ref:FR4
   enabled: false
 
   # gRPC target for the Calico Goldmane Service. Default matches the
   # Tigera operator's v3.31.5 install layout. Operators with
   # non-default cluster install paths override here.
+  # @schema type:string effect:"host:port of the Calico Goldmane gRPC Service" ref:FR4
   goldmaneAddr: "goldmane.calico-system.svc:7443"
 
   # TLS SNI / verify name presented during the mTLS handshake. Default
   # matches the cert the Tigera operator issues for Goldmane.
+  # @schema type:string effect:"TLS SNI / verify name presented during the Goldmane mTLS handshake" ref:FR4
   serverName: "goldmane.calico-system.svc"
 
   # FlowStreamRequest knobs. StartTimeGte is negative for "relative
@@ -482,11 +485,14 @@ calicoSensor:
   # to the chart default of -60. Goldmane requires AggregationInterval
   # to be exactly 15s per the same proto contract (line 100: "It
   # must always be 15s.").
+  # @schema type:integer maximum:0 effect:"stream start offset in seconds; negative replays that many seconds, 0 means now" ref:FR4
   startTimeGte: -60
+  # @schema type:integer minimum:15 maximum:15 effect:"Goldmane aggregation interval in seconds; its proto contract pins this at 15" ref:FR4
   aggregationInterval: 15
 
   # gRPC dial timeout for the initial wait-for-ready handshake.
   # Bridged into detection.sources.calico.dial_timeout.
+  # @schema type:duration effect:"gRPC dial timeout for the initial wait-for-ready handshake" ref:FR4
   dialTimeout: "10s"
 
   # Staleness watchdog threshold. Goldmane flow records are quiet by
@@ -494,6 +500,7 @@ calicoSensor:
   # FlowResults, so the watchdog only flips MarkUnhealthy when
   # staleness AND a non-Ready connection coincide. Bridged into
   # detection.sources.calico.staleness_timeout.
+  # @schema type:duration effect:"flow silence after which the watchdog marks the source unhealthy, but only while the connection is not Ready" ref:FR8
   stalenessTimeout: "10m"
 
   # Per-event marshalled size cap. The default of 196608 bytes (192
@@ -501,6 +508,7 @@ calicoSensor:
   # MaxMsgSize ceiling. Events exceeding this cap are log+dropped at
   # translate time. Floor 4096; ceiling 262144 (256 KiB). Bridged
   # into detection.sources.calico.max_event_bytes.
+  # @schema type:integer minimum:4096 maximum:262144 effect:"per-event marshalled size cap; larger events are log+dropped at translate time" ref:FR4
   maxEventBytes: 196608
 
   # Outer connect-loop backoff strategy used when the gRPC dial, mTLS
@@ -508,10 +516,15 @@ calicoSensor:
   # backoff; max_attempts=0 means unlimited. Bridged into
   # detection.sources.calico.connect_retry.
   connectRetry:
+    # @schema type:duration effect:"first connect-loop backoff delay after a failed dial, handshake or stream open" ref:FR4
     min: "1s"
+    # @schema type:duration effect:"ceiling the connect-loop backoff delay grows to" ref:FR4
     max: "60s"
+    # @schema type:number minimum:1 effect:"factor the connect-loop backoff delay is multiplied by after each failure" ref:FR4
     multiplier: 2.0
+    # @schema type:number minimum:0 maximum:1 effect:"equal-jitter fraction applied to each connect-loop backoff delay" ref:FR4
     jitter: 1.0
+    # @schema type:integer minimum:0 effect:"connect attempts before the adapter gives up; 0 means retry forever" ref:FR4
     maxAttempts: 0
 
   # Per-publish bounded retry strategy. Combined with the per-attempt
@@ -519,10 +532,15 @@ calicoSensor:
   # stream loop log+drops. Bridged into
   # detection.sources.calico.publish_retry.
   publishRetry:
+    # @schema type:duration effect:"first backoff delay before a publish of a translated flow event is retried" ref:FR4
     min: "100ms"
+    # @schema type:duration effect:"ceiling the per-publish backoff delay grows to" ref:FR4
     max: "1s"
+    # @schema type:number minimum:1 effect:"factor the per-publish backoff delay is multiplied by after each failed publish" ref:FR4
     multiplier: 2.0
+    # @schema type:number minimum:0 maximum:1 effect:"equal-jitter fraction applied to each per-publish backoff delay" ref:FR4
     jitter: 1.0
+    # @schema type:integer minimum:1 effect:"publish attempts per event before the stream loop log+drops it" ref:FR4
     maxAttempts: 3
 
   # TLS material. Goldmane enforces mTLS; the agent presents a client
@@ -544,9 +562,40 @@ calicoSensor:
   # The chart fails render when calicoSensor.enabled=true and neither
   # path is configured. See CNI.md for the full provisioning recipe.
   tls:
+    # @schema type:string effect:"name of the cert-manager-issued Secret to mount for Goldmane mTLS (empty: Path B, operator-supplied PEMs)" ref:FR4
     certManagerSecretName: ""
+
+    # Path A only. Key inside the cert-manager Secret that holds the
+    # Tigera CA bundle the adapter verifies Goldmane's serving cert
+    # against. cert-manager always writes tls.crt and tls.key, which the
+    # chart projects onto client.crt and client.key; it writes ca.crt
+    # only when the issuer supplies a CA, and some issuers publish the
+    # bundle under a different key. Name that key here. The adapter
+    # cannot verify Goldmane without a CA, so an empty value fails
+    # render rather than mounting a volume the adapter rejects at run
+    # time.
+    # @schema type:string effect:"Path A key inside the cert-manager Secret holding the Tigera CA bundle, projected to ca.crt" ref:FR4
+    certManagerCAKey: "ca.crt"
+
+    # Path A only. Keys inside the mounted Secret that hold the client
+    # certificate and its private key. cert-manager always writes
+    # tls.crt and tls.key, which is why those are the defaults, but a
+    # Secret built by hand, copied from another namespace, or written by
+    # something that is not cert-manager can carry the same material
+    # under other names. Name them here rather than rebuilding the
+    # Secret. All three key names are validated against the charset a
+    # Kubernetes Secret key can use, so a typo fails the render instead
+    # of leaving the pod in ContainerCreating.
+    # @schema type:string effect:"Path A key inside the mounted Secret holding the client certificate, projected to client.crt" ref:FR4
+    certManagerCertKey: "tls.crt"
+    # @schema type:string effect:"Path A key inside the mounted Secret holding the client private key, projected to client.key" ref:FR4
+    certManagerKeyKey: "tls.key"
+
+    # @schema type:string effect:"Path B base64-encoded Tigera CA bundle PEM" ref:FR4
     caBundle: ""
+    # @schema type:string effect:"Path B base64-encoded client certificate PEM signed by the Tigera CA" ref:FR4
     clientCert: ""
+    # @schema type:string effect:"Path B base64-encoded client private key PEM" ref:FR4
     clientKey: ""
 
 # --- application log sidecar (FR5) -----------------------------------

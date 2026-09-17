@@ -20,6 +20,27 @@ and false-positive numbers; see [Unreleased](#unreleased).
 
 ### Added
 
+- **A kind cluster the Calico flow sensor can actually run against**
+  (#140). `hack/install-calico-kind.sh` creates or reuses a kind cluster
+  from `hack/kind-calico-config.yaml` (kindnetd off, pod CIDR
+  10.244.0.0/16), installs the pinned Tigera operator and an Installation
+  whose IPPool CIDR is substituted to match that pod CIDR, so Goldmane
+  exists and pods get addresses the cluster routes. It waits for Goldmane
+  with a bounded timeout and writes the Path B `calicoSensor.tls` values
+  from the operator's CA bundle and client key pair. It reuses an existing
+  cluster, which is the certificate-refresh path, refuses to reuse one
+  that is not this config, and refuses to write over certificate material
+  it did not create. **The client identity on this path is borrowed from
+  Calico's own observability UI, so Goldmane cannot tell the two consumers
+  apart: dev sandbox only, and CNI.md says why at length.**
+  `tests/e2e/fixtures/calico-flow-traffic.yaml` supplies the real traffic
+  Goldmane needs before it reports anything: a client Deployment opening a
+  TCP connection to a Service ClusterIP once a second, which is what a
+  Goldmane flow record is made of. A client that reaches nothing exits
+  rather than looping silently. `docs/helm-values.md` now carries the
+  whole `calicoSensor` block, all 26 values including the `connectRetry`
+  and `publishRetry` knobs; it previously carried none of them.
+
 - Repository hygiene for public use: `SECURITY.md` documenting the agent's
   blast radius and the LLM tier's prompt-injection threat model,
   `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, issue templates, and a README
@@ -112,6 +133,21 @@ and false-positive numbers; see [Unreleased](#unreleased).
   `olaitan_sensor_falco_publish_drops_total`.
 
 ### Fixed
+
+- **A cert-manager-issued certificate now works for the Calico flow
+  sensor** (#140). Path A mounted the cert-manager Secret unchanged, but
+  a `kubernetes.io/tls` Secret carries `tls.crt` and `tls.key` while the
+  adapter opens `/etc/olaitan/cni/client.crt` and `client.key`, and a
+  missing file there is terminal, so every Path A install CrashLooped
+  the collector. The volume projects the cert-manager keys onto the
+  names the adapter reads. All three source keys are values, not chart
+  constants: `calicoSensor.tls.certManagerCertKey` (default `tls.crt`),
+  `certManagerKeyKey` (default `tls.key`) and `certManagerCAKey` (default
+  `ca.crt`), so a Secret that is not from cert-manager, which used to work
+  because it was mounted unprojected, can still be mapped. Each is checked
+  at render against the charset a Kubernetes Secret key can hold, so a bad
+  name fails with a message naming the value instead of leaving the pod in
+  `ContainerCreating`. Path B is unchanged.
 
 - **The audit webhook can actually receive an event** (#137). Three
   defects meant the kube-apiserver never reached the receiver on a

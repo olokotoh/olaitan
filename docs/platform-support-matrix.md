@@ -34,6 +34,7 @@ stock EKS (VPC CNI) and stock AKS (no policy engine selected).
 | Platform | Install | Falco driver | NetworkPolicy enforced | Default StorageClass | Audit webhook | Overlay |
 | --- | --- | --- | --- | --- | --- | --- |
 | **kind** | ✅ verified | modern_ebpf (Falco 0.45.0-rc1) | ❌ **no** (kindnet) | ✅ `standard` | ✅ possible | `values-kind.yaml` |
+| **kind + Calico** | ✅ verified 2026-09-17 | modern_ebpf (Falco 0.45.0-rc1) | ✅ **proven** (Calico) | ✅ `standard` | untested here | `values-kind.yaml` |
 | **kubeadm** | ✅ verified | modern_ebpf | depends on CNI | depends | ✅ possible | (defaults) |
 | **k3s / k3d** | template-verified | modern_ebpf | ✅ (kube-router) | ✅ `local-path` | ✅ possible | `values-k3s.yaml` |
 | **minikube** | template-verified | modern_ebpf | ❌ unless `--cni=calico` | ✅ addon | ✅ possible | `values-minikube.yaml` |
@@ -50,10 +51,17 @@ reason. CI lints and `kubeconform`-validates all seven on every run against the
 chart's `kubeVersion` floor (1.29.0), which is the evidence behind the
 `template-verified` rows and **the only thing they claim**.
 
-The two `verified` rows are separate, and neither rests on CI:
+The `verified` rows are separate, and none rests on CI:
 
 - **kind** is installed and observed on every e2e run, and again by hand on
   2026-09-01 for Story 9.6.
+- **kind + Calico** was installed and observed by hand on 2026-09-17 for
+  Story 10.11; what that run established is set out under *Calico and
+  Goldmane* below. Its audit-webhook column says `untested here` on
+  purpose: `hack/kind-calico-config.yaml` wires no
+  `--audit-webhook-config-file`, so nothing on that cluster exercised the
+  audit path, and kind being capable of it is not the same as it having
+  been done.
 - **kubeadm** was installed by hand on a real 3-node cluster on 2026-08-31.
   Note what that run actually established: the chart installs and every
   workload schedules, but the collector could not attach to Falco's socket
@@ -81,6 +89,53 @@ so nobody promotes them on the strength of a job existing.
 
 These are platform policy, not Olaitan defects. Preflight must detect them and
 say so plainly rather than letting the operator discover it from a CrashLoop.
+
+---
+
+## Calico and Goldmane: where the network flow source can run (Story 10.11)
+
+The Calico flow sensor (`calicoSensor`, FR4) reads the **Goldmane** gRPC API,
+which exists only on a Calico install done through the **Tigera operator** on
+Calico v3.31.5+. The legacy manifest install (`kubectl apply -f calico.yaml`)
+creates no Goldmane Deployment, so on such a cluster the source cannot be
+enabled at all. A platform's own CNI being "Calico-compatible" is not enough
+either; the question is whether `kubectl -n calico-system get deployment
+goldmane` returns something.
+
+| Platform | Goldmane available | How |
+| --- | --- | --- |
+| **kind + Calico** | ✅ | `hack/install-calico-kind.sh`, which installs the pinned operator and writes the Path B values |
+| **kubeadm** | ✅ | operator install; `hack/bootstrap-kubeadm.md` walks through it |
+| **minikube** | depends | `--cni=calico` uses the manifest install, so **no Goldmane**; the operator has to be installed on top |
+| **EKS / AKS / GKE / OpenShift** | UNCERTAIN | none of these run the Tigera operator by default and none was tested here |
+| **stock kind, k3s** | ❌ | kindnet and kube-router are not Calico |
+
+The `kind + Calico` row is the only one this repository gives a scripted path
+for, and it is the only one that has been run. **Live on 2026-09-17**, re-run end to end after the pod CIDR moved to
+10.244.0.0/16 and the fixture became a pair of Deployments, on a
+cluster built by `hack/install-calico-kind.sh` (kind node image v1.30.0,
+Calico v3.31.5) with Falco `0.45.0-rc1` ON and the release installed from the
+Path B values the script wrote:
+
+- `tests/e2e/fixtures/calico-flow-traffic.yaml` was applied first. Without it
+  the cluster is quiet and Goldmane reports nothing, so the fixture is part of
+  the evidence, not a convenience.
+- pod-to-Service flow events arrived on `olaitan.events.raw.network`.
+- `olaitan_sensor_events_total{source="network"}` reached 149.
+- `olaitan_source_healthy{source="network"}` was 1.
+- Falco stayed healthy throughout; it is never switched off for this.
+- `hack/check-netpol-enforcement.sh` reported `NetworkPolicy IS ENFORCED`,
+  which is what settles the enforcement half empirically. `kind + Calico` is
+  the only kind cluster where the release NetworkPolicy, the adapter's own
+  Goldmane egress rule included, is actually enforced rather than merely
+  accepted.
+
+What that run does **not** establish, and what this row therefore does not
+claim: it was one cluster, with a single control-plane node, on the kind plus
+Calico path only. Nothing about multi-node Calico, about any other platform in
+the Goldmane table, or about the audit webhook follows from it.
+
+
 
 ---
 

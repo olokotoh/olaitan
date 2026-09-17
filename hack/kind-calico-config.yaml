@@ -1,0 +1,51 @@
+# kind cluster config for the Story 10.11 Calico / Goldmane bring-up
+# (hack/install-calico-kind.sh).
+#
+# hack/kind-config.yaml is the e2e cluster and runs kindnetd, which
+# accepts NetworkPolicy objects and enforces nothing and ships no
+# Goldmane. Neither the Calico flow adapter (FR4) nor the release
+# NetworkPolicy can be exercised on it, so this sibling config replaces
+# the default CNI with Calico instead.
+#
+# Used by:
+#   `hack/install-calico-kind.sh` (developer and evaluation workflow)
+#
+# Falco stays ON in every install against this cluster, exactly as on
+# the e2e cluster; nothing here turns a sensor off.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+# Cluster name is supplied via `kind create cluster --name ...` from the
+# script so its CLUSTER_NAME override is the single source of truth; do
+# not embed the name here or the override is silently ignored.
+networking:
+  # Calico replaces kindnetd. The Tigera operator installs the CNI
+  # plugin once the Installation CR is applied, so bootstrap pods sit
+  # without a network until then. That is expected, not a failure.
+  disableDefaultCNI: true
+  # The cluster pod CIDR, and the single source of truth for it:
+  # hack/install-calico-kind.sh reads this line and gives Calico's
+  # Installation an ipPools cidr to match. The two MUST agree. Calico's
+  # own default IPPool claims 192.168.0.0/16, so leaving that as the
+  # podSubnet and applying the upstream custom-resources.yaml unchanged
+  # is the one pairing that happens to line up, but it puts pod
+  # addresses in a range that collides with the RFC 1918 block most
+  # home and office networks already use, and a developer on such a
+  # network loses routes to their own LAN. 10.244.0.0/16 is kind's own
+  # default and collides with nothing here. Change this value and the
+  # script follows it; change it in only one place and Calico hands out
+  # addresses outside the cluster's podCIDR.
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/16"
+nodes:
+  - role: control-plane
+    # Same kubelet resource budget as hack/kind-config.yaml, so a
+    # containerised cluster on a developer machine does not OOM. Calico
+    # plus Goldmane plus the Olaitan chart is a heavier load than the
+    # e2e cluster carries, and the reservation is what keeps the node
+    # responsive rather than merely alive.
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            system-reserved: "cpu=200m,memory=512Mi"

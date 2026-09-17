@@ -640,3 +640,33 @@ implying either more or less than it knows.
 The collector's GID, in one place. Rendered into the pod securityContext.
 */}}
 {{- define "olaitan.collector.runAsGroup" -}}65532{{- end -}}
+
+{{/*
+Validate a value that names a key inside an existing Kubernetes Secret,
+and return it.
+
+Used by the Path A `cni-tls` projection (Story 10.11), where three values
+name keys in a Secret the chart does not own. Checking only for a
+non-empty string is not enough: a value with a slash, a space or a shell
+metacharacter renders a syntactically valid volume that the apiserver
+rejects when the pod is admitted, and the operator sees an opaque
+ContainerCreating with the reason buried in the pod events. The charset
+below is the one Kubernetes accepts for a Secret key (letters, digits,
+'-', '_' and '.'), and 253 is its length ceiling.
+
+Call with a dict: (dict "value" <the value> "name" "<the values.yaml path>").
+*/}}
+{{- define "olaitan.secretKeyName" -}}
+{{- $v := .value | toString -}}
+{{- $n := .name -}}
+{{- if eq $v "" -}}
+{{- fail (printf "%s is empty: it must name the key inside the cert-manager Secret that holds this file. The adapter cannot start without all three. See deploy/helm/olaitan/CNI.md." $n) -}}
+{{- end -}}
+{{- if gt (len $v) 253 -}}
+{{- fail (printf "%s is %d characters: a Kubernetes Secret key is at most 253. See deploy/helm/olaitan/CNI.md." $n (len $v)) -}}
+{{- end -}}
+{{- if not (regexMatch "^[-._a-zA-Z0-9]+$" $v) -}}
+{{- fail (printf "%s is %q: a Kubernetes Secret key may contain only letters, digits, '-', '_' and '.'. A name outside that set cannot exist in a Secret, so the mount would be rejected at pod admission rather than at render. See deploy/helm/olaitan/CNI.md." $n $v) -}}
+{{- end -}}
+{{- $v -}}
+{{- end -}}

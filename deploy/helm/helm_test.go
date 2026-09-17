@@ -26,8 +26,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -1869,6 +1871,337 @@ func TestCalicoSensorPathA_SkipsTLSSecret(t *testing.T) {
 		!strings.Contains(rendered, "secretName: external-cni-tls") {
 		t.Errorf("DaemonSet missing external-cni-tls Secret mount under Path A; sample:\n%s",
 			snippet(rendered, "cni-tls"))
+	}
+}
+
+// cniTLSVolume is the subset of the DaemonSet's `cni-tls` Secret
+// volume the Story 10.11 assertions inspect.
+type cniTLSVolume struct {
+	SecretName  string
+	DefaultMode int
+	// Items maps the file name the collector opens under
+	// /etc/olaitan/cni to the Secret key it is projected from. Empty
+	// when the volume carries no `items:` and the Secret's own keys
+	// become the file names.
+	Items map[string]string
+}
+
+// readCNITLSVolume pulls the DaemonSet's `cni-tls` volume out of a
+// rendered chart.
+func readCNITLSVolume(t *testing.T, rendered string) cniTLSVolume {
+	t.Helper()
+	type cniTLSDaemonSet struct {
+		Spec struct {
+			Template struct {
+				Spec struct {
+					Volumes []struct {
+						Name   string `yaml:"name"`
+						Secret struct {
+							SecretName  string `yaml:"secretName"`
+							DefaultMode int    `yaml:"defaultMode"`
+							Items       []struct {
+								Key  string `yaml:"key"`
+								Path string `yaml:"path"`
+							} `yaml:"items"`
+						} `yaml:"secret"`
+					} `yaml:"volumes"`
+				} `yaml:"spec"`
+			} `yaml:"template"`
+		} `yaml:"spec"`
+	}
+	// Falco ships its own DaemonSet and so may any future subchart, so
+	// match the collector by its exact rendered name rather than by a
+	// substring: "collector" would also match a subchart DaemonSet that
+	// merely carries the word, and decoding a second document into a
+	// shared struct would leave the fields of the first behind.
+	const collectorDaemonSet = "olaitan-collector"
+	var ds cniTLSDaemonSet
+	found := false
+	for _, m := range findByKind(parseManifests(t, rendered), "DaemonSet") {
+		if m.Metadata.Name != collectorDaemonSet {
+			continue
+		}
+		if err := m.Raw.Decode(&ds); err != nil {
+			t.Fatalf("decoding the collector DaemonSet: %v", err)
+		}
+		found = true
+		break
+	}
+	if !found {
+		t.Fatalf("rendered chart carries no DaemonSet named %q", collectorDaemonSet)
+	}
+	for _, v := range ds.Spec.Template.Spec.Volumes {
+		if v.Name != "cni-tls" {
+			continue
+		}
+		out := cniTLSVolume{
+			SecretName:  v.Secret.SecretName,
+			DefaultMode: v.Secret.DefaultMode,
+			Items:       map[string]string{},
+		}
+		for _, it := range v.Secret.Items {
+			out.Items[it.Path] = it.Key
+		}
+		return out
+	}
+	t.Fatalf("the collector DaemonSet carries no cni-tls volume; sample:\n%s",
+		snippet(rendered, "cni-tls"))
+	return cniTLSVolume{}
+}
+
+// cniTLSFileNames returns the file names the collector actually finds
+// under /etc/olaitan/cni. With an `items:` projection those are the
+// item paths; without one they are the keys of the Secret the chart
+// itself renders. A volume with neither is a configuration the chart
+// cannot vouch for, and the helper says so.
+func cniTLSFileNames(t *testing.T, rendered string) []string {
+	t.Helper()
+	vol := readCNITLSVolume(t, rendered)
+	if len(vol.Items) > 0 {
+		names := make([]string, 0, len(vol.Items))
+		for path := range vol.Items {
+			names = append(names, path)
+		}
+		sort.Strings(names)
+		return names
+	}
+	for _, m := range findByKind(parseManifests(t, rendered), "Secret") {
+		if m.Metadata.Name != vol.SecretName {
+			continue
+		}
+		var sec struct {
+			Data map[string]string `yaml:"data"`
+		}
+		if err := m.Raw.Decode(&sec); err != nil {
+			t.Fatalf("decoding Secret %s: %v", vol.SecretName, err)
+		}
+		names := make([]string, 0, len(sec.Data))
+		for k := range sec.Data {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		return names
+	}
+	t.Fatalf("the cni-tls volume mounts Secret %q with no items: projection and the chart does not render that Secret, "+
+		"so the file names under /etc/olaitan/cni are whatever the external Secret happens to carry", vol.SecretName)
+	return nil
+}
+
+// cniMountDir is where the chart mounts the Goldmane mTLS material; the
+// three adapter paths all live under it.
+const cniMountDir = "/etc/olaitan/cni"
+
+// adapterCNIFileNames reads the file names internal/collector/cni opens
+// on every connect-loop iteration straight out of config/olaitan.yaml
+// (detection.sources.calico.ca_bundle_path, client_cert_path,
+// client_key_path). A missing file is a terminal adapter error, so the
+// mount has to produce exactly these names.
+//
+// This is deliberately NOT a hand-copied literal. Story 10.11 exists
+// because the chart mount and the adapter's paths had drifted apart; a
+// constant here would have stayed green through exactly that drift. Read
+// the real config, so renaming a path in the adapter's config fails these
+// tests until the chart's projection follows.
+func adapterCNIFileNames(t *testing.T) []string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatalf("runtime.Caller(0) failed, cannot resolve config/olaitan.yaml")
+	}
+	path := filepath.Join(filepath.Dir(thisFile), "..", "..", "config", "olaitan.yaml")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	var cfg struct {
+		Detection struct {
+			Sources struct {
+				Calico struct {
+					CABundlePath   string `yaml:"ca_bundle_path"`
+					ClientCertPath string `yaml:"client_cert_path"`
+					ClientKeyPath  string `yaml:"client_key_path"`
+				} `yaml:"calico"`
+			} `yaml:"sources"`
+		} `yaml:"detection"`
+	}
+	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("parsing %s: %v", path, err)
+	}
+	c := cfg.Detection.Sources.Calico
+	names := make([]string, 0, 3)
+	for field, p := range map[string]string{
+		"ca_bundle_path":   c.CABundlePath,
+		"client_cert_path": c.ClientCertPath,
+		"client_key_path":  c.ClientKeyPath,
+	} {
+		if p == "" {
+			t.Fatalf("config/olaitan.yaml has no detection.sources.calico.%s", field)
+		}
+		dir, file := filepath.Split(p)
+		if filepath.Clean(dir) != cniMountDir {
+			t.Fatalf("detection.sources.calico.%s is %q, which is outside the chart's %s mount; "+
+				"the chart cannot produce that file", field, p, cniMountDir)
+		}
+		names = append(names, file)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// TestCalicoSensorPathAMountsTheFileNamesTheAdapterReads is the Story
+// 10.11 AC2 regression. A cert-manager Certificate writes its Secret
+// with the kubernetes.io/tls keys tls.crt and tls.key, never
+// client.crt and client.key. Mounting that Secret unprojected left
+// the collector with no /etc/olaitan/cni/client.crt, which the
+// adapter treats as terminal, so the agent CrashLooped on Path A. The
+// volume must remap the cert-manager keys onto the names the adapter
+// opens.
+func TestCalicoSensorPathAMountsTheFileNamesTheAdapterReads(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"calicoSensor.enabled=true",
+		"calicoSensor.tls.certManagerSecretName=external-cni-tls",
+	})
+	got := cniTLSFileNames(t, rendered)
+	want := adapterCNIFileNames(t)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Path A puts %v under %s, adapter opens %v", got, cniMountDir, want)
+	}
+	vol := readCNITLSVolume(t, rendered)
+	wantItems := map[string]string{
+		"client.crt": "tls.crt",
+		"client.key": "tls.key",
+		"ca.crt":     "ca.crt",
+	}
+	if !reflect.DeepEqual(vol.Items, wantItems) {
+		t.Errorf("Path A projection is %v, want %v", vol.Items, wantItems)
+	}
+	// 0400 = owner read-only, as for every other key-material volume
+	// in the DaemonSet. 256 is 0400 in decimal.
+	if vol.DefaultMode != 256 {
+		t.Errorf("Path A cni-tls defaultMode is %d, want 256 (0400)", vol.DefaultMode)
+	}
+}
+
+// TestCalicoSensorPathBMountsTheFileNamesTheAdapterReads holds the
+// other path to the same invariant so the two cannot drift: Path B
+// renders the Secret itself with the adapter's own key names, so the
+// unprojected mount is already correct and must stay that way.
+func TestCalicoSensorPathBMountsTheFileNamesTheAdapterReads(t *testing.T) {
+	rendered := helmTemplate(t, calicoSensorPathBArgs())
+	got := cniTLSFileNames(t, rendered)
+	want := adapterCNIFileNames(t)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Path B puts %v under %s, adapter opens %v", got, cniMountDir, want)
+	}
+	vol := readCNITLSVolume(t, rendered)
+	if len(vol.Items) != 0 {
+		t.Errorf("Path B should mount the chart-rendered Secret verbatim, got projection %v", vol.Items)
+	}
+	if vol.SecretName != "olaitan-cni-tls" {
+		t.Errorf("Path B mounts Secret %q, want olaitan-cni-tls", vol.SecretName)
+	}
+	if vol.DefaultMode != 256 {
+		t.Errorf("Path B cni-tls defaultMode is %d, want 256 (0400)", vol.DefaultMode)
+	}
+}
+
+// TestCalicoSensorPathACABundleKeyIsConfigurable asserts an operator
+// whose issuer publishes the CA under a key other than ca.crt can
+// name it, rather than the chart hardcoding a key cert-manager only
+// populates when the issuer supplies one.
+func TestCalicoSensorPathACABundleKeyIsConfigurable(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"calicoSensor.enabled=true",
+		"calicoSensor.tls.certManagerSecretName=external-cni-tls",
+		"calicoSensor.tls.certManagerCAKey=tigera-ca-bundle.crt",
+	})
+	vol := readCNITLSVolume(t, rendered)
+	if vol.Items["ca.crt"] != "tigera-ca-bundle.crt" {
+		t.Errorf("ca.crt is projected from %q, want tigera-ca-bundle.crt", vol.Items["ca.crt"])
+	}
+}
+
+// TestCalicoSensorPathAEmptyCAKeyFailsRender asserts the chart says
+// so plainly rather than mounting a volume with no CA bundle, which
+// the adapter would only report as a terminal TLS load error at run
+// time.
+func TestCalicoSensorPathAEmptyCAKeyFailsRender(t *testing.T) {
+	// helmTemplateExpectError, not a hand-rolled exec: the hand-rolled
+	// version asserted only "the render failed", which an unrelated
+	// chart-wide failure (a missing subchart, a typo in another value)
+	// would satisfy just as well. The helper renders the same way every
+	// other test does, so the only difference from a green render is the
+	// value under test.
+	stderr := helmTemplateExpectError(t, []string{
+		"calicoSensor.enabled=true",
+		"calicoSensor.tls.certManagerSecretName=external-cni-tls",
+		"calicoSensor.tls.certManagerCAKey=",
+	})
+	if !strings.Contains(stderr, "calicoSensor.tls.certManagerCAKey") {
+		t.Errorf("expected the failure to name calicoSensor.tls.certManagerCAKey; stderr:\n%s", stderr)
+	}
+}
+
+// TestCalicoSensorPathAClientKeyNamesAreConfigurable covers the Path A
+// half the chart used to hardcode. cert-manager writes tls.crt and
+// tls.key, but a hand-built kubernetes.io/tls Secret, a Secret copied
+// out of another namespace, or a Secret written by something that is not
+// cert-manager at all can carry the client pair under other keys. Before
+// this, such a Secret rendered a mount whose items named keys the Secret
+// does not have, and the pod hung in ContainerCreating.
+func TestCalicoSensorPathAClientKeyNamesAreConfigurable(t *testing.T) {
+	rendered := helmTemplate(t, []string{
+		"calicoSensor.enabled=true",
+		"calicoSensor.tls.certManagerSecretName=external-cni-tls",
+		"calicoSensor.tls.certManagerCertKey=goldmane-client.crt",
+		"calicoSensor.tls.certManagerKeyKey=goldmane-client.key",
+		"calicoSensor.tls.certManagerCAKey=tigera-ca-bundle.crt",
+	})
+	vol := readCNITLSVolume(t, rendered)
+	want := map[string]string{
+		"client.crt": "goldmane-client.crt",
+		"client.key": "goldmane-client.key",
+		"ca.crt":     "tigera-ca-bundle.crt",
+	}
+	if !reflect.DeepEqual(vol.Items, want) {
+		t.Errorf("Path A projection is %v, want %v", vol.Items, want)
+	}
+	// Whatever the source keys are called, the file names the adapter
+	// opens must not move.
+	got := cniTLSFileNames(t, rendered)
+	if !reflect.DeepEqual(got, adapterCNIFileNames(t)) {
+		t.Errorf("Path A with renamed source keys puts %v under %s, adapter opens %v",
+			got, cniMountDir, adapterCNIFileNames(t))
+	}
+}
+
+// TestCalicoSensorPathAKeyNamesAreValidatedAsSecretKeys asserts the three
+// Path A key names are checked against the charset a Kubernetes Secret
+// key can actually use, not merely for being non-empty. A value with a
+// slash or a space renders a syntactically valid volume that the
+// apiserver rejects at pod admission, which surfaces as an opaque
+// ContainerCreating rather than as a message naming the value.
+func TestCalicoSensorPathAKeyNamesAreValidatedAsSecretKeys(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		why   string
+	}{
+		{"tls/crt", "a slash is not allowed in a Secret key"},
+		{"tls crt", "a space is not allowed in a Secret key"},
+		{"tls$crt", "a shell metacharacter is not allowed in a Secret key"},
+	} {
+		for _, knob := range []string{"certManagerCAKey", "certManagerCertKey", "certManagerKeyKey"} {
+			name := "calicoSensor.tls." + knob
+			stderr := helmTemplateExpectError(t, []string{
+				"calicoSensor.enabled=true",
+				"calicoSensor.tls.certManagerSecretName=external-cni-tls",
+				name + "=" + tc.value,
+			})
+			if !strings.Contains(stderr, name) {
+				t.Errorf("%s=%q (%s): expected the failure to name the value; stderr:\n%s",
+					name, tc.value, tc.why, stderr)
+			}
+		}
 	}
 }
 

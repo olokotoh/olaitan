@@ -66,6 +66,36 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 |-------|------|---------|-------------|--------|-----|
 | `containerdSensor.socketGroup` | integer | `0` | minimum 0 | supplemental group the collector joins to open the containerd socket | FR3 |
 
+## `calicoSensor`
+
+| Value | Type | Default | Valid range | Effect | Ref |
+|-------|------|---------|-------------|--------|-----|
+| `calicoSensor.enabled` | boolean | `false` | - | enable the Calico Goldmane flow sensor; bridges detection.sources.calico.enabled too | FR4 |
+| `calicoSensor.goldmaneAddr` | string | `"goldmane.calico-system.svc:7443"` | - | host:port of the Calico Goldmane gRPC Service | FR4 |
+| `calicoSensor.serverName` | string | `"goldmane.calico-system.svc"` | - | TLS SNI / verify name presented during the Goldmane mTLS handshake | FR4 |
+| `calicoSensor.startTimeGte` | integer | `-60` | maximum 0 | stream start offset in seconds; negative replays that many seconds, 0 means now | FR4 |
+| `calicoSensor.aggregationInterval` | integer | `15` | 15 to 15 | Goldmane aggregation interval in seconds; its proto contract pins this at 15 | FR4 |
+| `calicoSensor.dialTimeout` | duration | `"10s"` | - | gRPC dial timeout for the initial wait-for-ready handshake | FR4 |
+| `calicoSensor.stalenessTimeout` | duration | `"10m"` | - | flow silence after which the watchdog marks the source unhealthy, but only while the connection is not Ready | FR8 |
+| `calicoSensor.maxEventBytes` | integer | `196608` | 4096 to 262144 | per-event marshalled size cap; larger events are log+dropped at translate time | FR4 |
+| `calicoSensor.connectRetry.min` | duration | `"1s"` | - | first connect-loop backoff delay after a failed dial, handshake or stream open | FR4 |
+| `calicoSensor.connectRetry.max` | duration | `"60s"` | - | ceiling the connect-loop backoff delay grows to | FR4 |
+| `calicoSensor.connectRetry.multiplier` | number | `2.0` | minimum 1 | factor the connect-loop backoff delay is multiplied by after each failure | FR4 |
+| `calicoSensor.connectRetry.jitter` | number | `1.0` | 0 to 1 | equal-jitter fraction applied to each connect-loop backoff delay | FR4 |
+| `calicoSensor.connectRetry.maxAttempts` | integer | `0` | minimum 0 | connect attempts before the adapter gives up; 0 means retry forever | FR4 |
+| `calicoSensor.publishRetry.min` | duration | `"100ms"` | - | first backoff delay before a publish of a translated flow event is retried | FR4 |
+| `calicoSensor.publishRetry.max` | duration | `"1s"` | - | ceiling the per-publish backoff delay grows to | FR4 |
+| `calicoSensor.publishRetry.multiplier` | number | `2.0` | minimum 1 | factor the per-publish backoff delay is multiplied by after each failed publish | FR4 |
+| `calicoSensor.publishRetry.jitter` | number | `1.0` | 0 to 1 | equal-jitter fraction applied to each per-publish backoff delay | FR4 |
+| `calicoSensor.publishRetry.maxAttempts` | integer | `3` | minimum 1 | publish attempts per event before the stream loop log+drops it | FR4 |
+| `calicoSensor.tls.certManagerSecretName` | string | `""` | - | name of the cert-manager-issued Secret to mount for Goldmane mTLS (empty: Path B, operator-supplied PEMs) | FR4 |
+| `calicoSensor.tls.certManagerCAKey` | string | `"ca.crt"` | - | Path A key inside the cert-manager Secret holding the Tigera CA bundle, projected to ca.crt | FR4 |
+| `calicoSensor.tls.certManagerCertKey` | string | `"tls.crt"` | - | Path A key inside the mounted Secret holding the client certificate, projected to client.crt | FR4 |
+| `calicoSensor.tls.certManagerKeyKey` | string | `"tls.key"` | - | Path A key inside the mounted Secret holding the client private key, projected to client.key | FR4 |
+| `calicoSensor.tls.caBundle` | string | `""` | - | Path B base64-encoded Tigera CA bundle PEM | FR4 |
+| `calicoSensor.tls.clientCert` | string | `""` | - | Path B base64-encoded client certificate PEM signed by the Tigera CA | FR4 |
+| `calicoSensor.tls.clientKey` | string | `""` | - | Path B base64-encoded client private key PEM | FR4 |
+
 ## `applogSidecar`
 
 | Value | Type | Default | Valid range | Effect | Ref |
