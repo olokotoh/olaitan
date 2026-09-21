@@ -90,3 +90,7 @@ dist/
 *.pem
 calico-tls/
 calico-values.yaml
+
+# Story 10.5: audit mTLS material bind-mounted into the kind-full
+# control-plane node. Holds the apiserver client key; never committable.
+hack/.audit-full/

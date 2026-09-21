@@ -18,6 +18,12 @@
 #   CALICO_VERSION   Calico / Tigera release     (default v3.31.5, floor v3.30)
 #   KUBECONFIG       kubeconfig to create and read the cluster through
 #   GOLDMANE_TIMEOUT seconds to wait for Goldmane (default 600)
+#   KIND_CONFIG      kind config to create from  (default
+#                    hack/kind-calico-config.yaml). Story 10.5 passes
+#                    hack/kind-full.yaml so the full profile reuses this
+#                    Calico bring-up rather than duplicating it. Any
+#                    config given here MUST set disableDefaultCNI and
+#                    carry a podSubnet, which is read out of it below.
 #
 # The pod CIDR is NOT an environment override: it has to agree between
 # the kind cluster and Calico's IPPool, so hack/kind-calico-config.yaml
@@ -99,7 +105,7 @@ for f in ca.crt client.crt client.key calico-values.yaml; do
 done
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-kind_config="${script_dir}/kind-calico-config.yaml"
+kind_config="${KIND_CONFIG:-${script_dir}/kind-calico-config.yaml}"
 [ -f "$kind_config" ] || die "kind config not found at ${kind_config}."
 
 # One source of truth for the pod CIDR: the kind config. Calico's

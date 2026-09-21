@@ -85,6 +85,7 @@ sources are on, which are off, and why.
 | Platform | Install | NetworkPolicy enforced | Audit webhook | Overlay |
 | --- | --- | --- | --- | --- |
 | kind | ✅ verified | ❌ no (kindnet accepts and ignores) | ✅ possible | `values-kind.yaml` |
+| **kind-full** (reference) | ✅ verified | ✅ yes (Calico) | ✅ enabled | `values-full.yaml` |
 | kubeadm | ⚠️ verified 2026-08-31, see note | depends on your CNI | ✅ possible | (defaults) |
 | k3s / k3d | template-verified | ✅ (kube-router) | ✅ possible | `values-k3s.yaml` |
 | minikube | template-verified | ❌ unless `--cni=calico` | ✅ possible | `values-minikube.yaml` |
@@ -95,6 +96,26 @@ sources are on, which are off, and why.
 | EKS Fargate | ❌ impossible | n/a | n/a | n/a |
 | AKS Automatic | ❌ blocked | n/a | n/a | n/a |
 | GKE Autopilot | ❌ blocked | n/a | n/a | n/a |
+
+**kind-full is the reference profile: the one place all five sources run at
+once.** Every other row above runs some subset. `values-kind.yaml` leaves the
+audit webhook, the containerd sensor, the Calico flow adapter and the applog
+sidecar at their chart defaults of off, so the full combination had never been
+exercised together until this profile existed. Bring it up with:
+
+```
+hack/install-full-kind.sh <scratch-dir-outside-this-repo>
+```
+
+That script exists because the ordering is not obvious: on kind the
+kube-apiserver is a static pod that refuses to start when its audit policy or
+webhook kubeconfig is missing, so both files have to be written before
+`kind create cluster` runs, which in turn means the audit CA must be generated
+before any node exists to have an IP. The profile therefore points the
+apiserver at `127.0.0.1:8443` through `auditWebhook.hostPort`, which is
+knowable in advance and stable across recreations. Set `WORKERS=1` on a host
+under about 16GB; the profile still installs, but pod traffic stops crossing
+a node boundary and the Calico flow adapter sees less.
 
 `verified` means installed and observed on a live cluster of that type.
 `template-verified` means the chart renders and validates for it and nothing
