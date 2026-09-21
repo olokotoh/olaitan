@@ -85,7 +85,7 @@ sources are on, which are off, and why.
 | Platform | Install | NetworkPolicy enforced | Audit webhook | Overlay |
 | --- | --- | --- | --- | --- |
 | kind | ✅ verified | ❌ no (kindnet accepts and ignores) | ✅ possible | `values-kind.yaml` |
-| **kind-full** (reference) | ✅ verified | ✅ yes (Calico) | ✅ enabled | `values-full.yaml` |
+| **kind-full** (reference) | ⚠️ verified 2026-09-21, see note | ✅ yes (Calico) | ✅ enabled | `values-full.yaml` |
 | kubeadm | ⚠️ verified 2026-08-31, see note | depends on your CNI | ✅ possible | (defaults) |
 | k3s / k3d | template-verified | ✅ (kube-router) | ✅ possible | `values-k3s.yaml` |
 | minikube | template-verified | ❌ unless `--cni=calico` | ✅ possible | `values-minikube.yaml` |
@@ -116,6 +116,15 @@ apiserver at `127.0.0.1:8443` through `auditWebhook.hostPort`, which is
 knowable in advance and stable across recreations. Set `WORKERS=1` on a host
 under about 16GB; the profile still installs, but pod traffic stops crossing
 a node boundary and the Calico flow adapter sees less.
+
+**The kind-full caveat, stated here rather than only in the matrix.** The
+2026-09-21 run was made with `WORKERS=1`, so what is verified is one
+control-plane plus one worker. The committed default in `hack/kind-full.yaml`
+is two workers; it renders and the node list is generated from the same file,
+but that shape has not itself been booted. Treat the row as "verified with one
+worker; the two-worker default is unexercised". Prerequisites the script needs
+beyond the usual: `openssl`, and `python3` with PyYAML if you set `WORKERS`.
+The release installs into the `default` namespace, matching the e2e suite.
 
 `verified` means installed and observed on a live cluster of that type.
 `template-verified` means the chart renders and validates for it and nothing

@@ -4,8 +4,13 @@
 # profile the README documents as the reference install, and the only one
 # where all five sources run together.
 #
-#   helm install olaitan deploy/helm/olaitan \
-#     -f deploy/helm/olaitan/values-full.yaml
+#   hack/install-full-kind.sh <scratch-dir-outside-this-repo>
+#
+# Do NOT install this file on its own. It is one of FOUR values files: the
+# other three carry per-install key material (audit mTLS, Calico Goldmane
+# mTLS, applog webhook serving cert) that cannot live in a committed profile,
+# and the chart fails render without them. The script generates all three and
+# passes them, in the one order that works.
 #
 # Why this file exists: values-kind.yaml leaves auditWebhook,
 # containerdSensor, calicoSensor and applogSidecar at their chart defaults
@@ -13,10 +18,16 @@
 # whole system at once, and the five-source combination had never been
 # exercised on a live cluster.
 #
-# Falco is not switched on here because it is not switched off anywhere:
-# falco.enabled defaults to true and Story 10.4 made that invariant a test
-# (tests/e2e/falco_on_test.go). This file must never introduce
-# falco.enabled: false.
+# Falco is not switched on here because it is not switched off anywhere: the
+# chart default is already true, and Story 10.4 made that invariant a test
+# (tests/e2e/falco_on_test.go plus the deploy/helm guard that scans every
+# values overlay, Makefile target, workflow, hack/ and tests/e2e/ file for
+# any way of turning Falco off). This profile must never switch Falco off.
+#
+# That guard matches on text, so do not spell the disabling key and the
+# value "false" next to each other even inside a comment: this file tripped
+# the guard on its first CI run doing exactly that, which is the guard
+# working correctly rather than a false positive.
 
 # --- Source 1: Falco ---------------------------------------------------
 # Nothing to set. The chart default already installs Falco and points its

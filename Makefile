@@ -9,7 +9,7 @@ CONFIG_SRC       := config/olaitan.yaml
 AUDIT_POLICY_SRC := config/audit-policy-default.yaml
 CHART_FILES      := $(CHART_DIR)/files/olaitan.yaml $(CHART_DIR)/files/audit-policy-default.yaml
 
-.PHONY: build test lint olaitan-lint prereg-check analysis analysis-test docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics e2e-local-overlays eval-smoke scenarios-smoke capture-it e2e-local-down schemas helm-values-doc preflight
+.PHONY: e2e-full e2e-full-down build test lint olaitan-lint prereg-check analysis analysis-test docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics e2e-local-overlays eval-smoke scenarios-smoke capture-it e2e-local-down schemas helm-values-doc preflight
 
 # envtest-bin downloads the kube-apiserver and etcd binaries that the
 # Story 1.11 posture-client integration tests (and any future
@@ -490,6 +490,37 @@ scenarios-smoke: helm-prepare helm-deps docker-build
 # always-on integration-inproc CI job.
 capture-it:
 	go test -tags=integration -race -count=1 ./internal/eval/capture/...
+
+# Story 10.5: the kind-full reference profile, the one cluster where all five
+# sources run at once on a CNI that actually enforces NetworkPolicy.
+#
+# Unlike every other e2e target this does NOT reuse the kindnet e2e cluster:
+# the audit webhook needs apiserver flags, and NetworkPolicy enforcement needs
+# a real CNI, neither of which the e2e cluster has. hack/install-full-kind.sh
+# owns the bring-up because the ordering is load-bearing (the apiserver is a
+# static pod that will not start without its audit policy and kubeconfig, so
+# both must exist before the cluster does).
+#
+# OUT_DIR receives private key material and MUST be outside this repo.
+# WORKERS=1 on a host under about 16GB; the profile still installs but pod
+# traffic stops crossing a node boundary.
+FULL_CLUSTER_NAME ?= olaitan-full
+FULL_OUT_DIR ?= $(HOME)/.olaitan-full
+FULL_WORKERS ?= 2
+
+.PHONY: e2e-full e2e-full-down
+e2e-full:
+	CLUSTER_NAME=$(FULL_CLUSTER_NAME) WORKERS=$(FULL_WORKERS) \
+		KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig \
+		hack/install-full-kind.sh $(FULL_OUT_DIR)
+	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig \
+		KIND_CLUSTER_NAME=$(FULL_CLUSTER_NAME) OLT_E2E_FULL=1 \
+		go test -tags=e2e -v -count=1 -run 'TestFullProfileAllFiveSourcesHealthy|TestFalcoSourceIsLive' ./tests/e2e/...
+	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig hack/check-netpol-enforcement.sh
+
+e2e-full-down:
+	kind delete cluster --name $(FULL_CLUSTER_NAME) || true
+	rm -rf hack/.audit-full
 
 e2e-local-down:
 	kind delete cluster --name $(KIND_CLUSTER_NAME)
