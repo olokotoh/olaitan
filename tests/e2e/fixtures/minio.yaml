@@ -47,6 +47,21 @@ spec:
               value: "olaitan-e2e"
             - name: MINIO_ROOT_PASSWORD
               value: "olaitan-e2e-secret"
+            # Story 10.7. The config validator requires kms_key_alias whenever
+            # forensics or the report archive is enabled (a HIGH finding from
+            # the Story 4.2 round-1 review: without an alias the uploader skips
+            # the SSE-KMS PUT directive and persists UNREDACTED bundles relying
+            # only on a bucket default that may not exist). That guard made the
+            # shipped validator unsatisfiable against this fixture, which ran
+            # with no KMS at all: set the alias and MinIO rejects the PUT,
+            # leave it empty and config load fails.
+            #
+            # MINIO_KMS_SECRET_KEY is MinIO's built-in single-key KMS, intended
+            # for exactly this (development and test). The key name must match
+            # the kms_key_alias the chart is given. NOT for production, where a
+            # real KES/KMS backend belongs.
+            - name: MINIO_KMS_SECRET_KEY
+              value: "olaitan-e2e-key:b2xhaXRhbi1lMmUtdGVzdC1rbXMta2V5LTMyYnl0ZXM="
           ports:
             - containerPort: 9000
             - containerPort: 9001
