@@ -29,12 +29,34 @@ stock EKS (VPC CNI) and stock AKS (no policy engine selected).
 
 ---
 
+### kind-full, the reference profile
+
+`hack/kind-full.yaml` plus `values-full.yaml`, brought up by
+`hack/install-full-kind.sh` (or `make e2e-full`). It is the only supported
+combination where all five sources run at once on a CNI that actually enforces
+NetworkPolicy, and it is the row the README points at as the reference.
+
+What "verified 2026-09-21" covers, precisely:
+
+- The run used `WORKERS=1`, so one control-plane and one worker. The committed
+  default in `hack/kind-full.yaml` is two workers; that shape renders and the
+  node list is derived from the same file, but it has not been booted.
+- The worker node's Falco did not start on the verification host, which had
+  `fs.inotify.max_user_instances` at the default 128 with most already in use.
+  All five sources reported healthy, but Falco's contribution came from the
+  control-plane node alone.
+- The audit webhook reaches the collector over `127.0.0.1:8443` via
+  `auditWebhook.hostPort`, because on kind the apiserver is a host-network
+  static pod that cannot resolve an in-cluster Service FQDN, and its audit
+  kubeconfig must exist before the cluster does.
+
 ## Support matrix
 
 | Platform | Install | Falco driver | NetworkPolicy enforced | Default StorageClass | Audit webhook | Overlay |
 | --- | --- | --- | --- | --- | --- | --- |
 | **kind** | ✅ verified | modern_ebpf (Falco 0.45.0-rc1) | ❌ **no** (kindnet) | ✅ `standard` | ✅ possible | `values-kind.yaml` |
 | **kind + Calico** | ✅ verified 2026-09-17 | modern_ebpf (Falco 0.45.0-rc1) | ✅ **proven** (Calico) | ✅ `standard` | untested here | `values-kind.yaml` |
+| **kind-full** (reference) | ⚠️ verified 2026-09-21, see note | modern_ebpf (Falco 0.45.0-rc1) | ✅ **proven** (Calico) | ✅ `standard` | ✅ **enabled** | `values-full.yaml` |
 | **kubeadm** | ✅ verified | modern_ebpf | depends on CNI | depends | ✅ possible | (defaults) |
 | **k3s / k3d** | template-verified | modern_ebpf | ✅ (kube-router) | ✅ `local-path` | ✅ possible | `values-k3s.yaml` |
 | **minikube** | template-verified | modern_ebpf | ❌ unless `--cni=calico` | ✅ addon | ✅ possible | `values-minikube.yaml` |

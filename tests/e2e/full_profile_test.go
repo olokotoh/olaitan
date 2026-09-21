@@ -10,11 +10,15 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/olokotoh/olaitan/internal/subjects"
+
+	"github.com/nats-io/nats.go"
+	"sync"
 )
 
 // fullProfileSources is Story 10.5's five-source contract for the
@@ -73,13 +77,7 @@ func TestFullProfileAllFiveSourcesHealthy(t *testing.T) {
 	// entirely, so a green result would prove nothing. Assert the profile
 	// itself: the audit webhook is off in every other values overlay, so its
 	// presence is a reliable marker that values-full.yaml is what is installed.
-	if out := kubectl(t, "get", "daemonset", defaultReleaseName+"-collector",
-		"-n", defaultNamespace,
-		"-o", `jsonpath={range .spec.template.spec.containers[*].ports[*]}{.name}={.hostPort} {end}`,
-	); !strings.Contains(out, "audit-webhook=") {
-		t.Fatalf("this cluster is not running the full profile: the collector has no audit-webhook hostPort (got %q).\n"+
-			"Bring it up with hack/install-full-kind.sh, or run `make e2e-full`.", strings.TrimSpace(out))
-	}
+	requireFullProfile(t)
 
 	requirePodsExist(t, "app.kubernetes.io/component=collector")
 
@@ -229,105 +227,162 @@ func grepLines(body, substr string) string {
 // ingests at least one event caused by a real action (exec, API call,
 // container start, network flow, log line)".
 //
-// The distinction this test exists to enforce: a non-zero counter is NOT
-// evidence of AC2. On a freshly installed cluster every one of these counters
-// climbs on its own, from kubelet and controller-manager API chatter, Goldmane's
-// ambient flow export, Falco's background rules and the container churn of the
-// install itself. Epic 10 was opened because evidence of exactly that shape
-// turned out not to mean what it appeared to mean, so this test performs one
-// deliberate action per source and asserts THAT source's counter moved.
+// This asserts on event CONTENT, not on counters, and the distinction is the
+// whole point. Two earlier versions of this test compared per-source counter
+// deltas before and after the actions. Both passed while the actions were
+// silently not happening: one dialled a Service that does not exist in this
+// chart, another ran an exec that could not fire the Falco rule it named. The
+// counters moved anyway, because audit, network and falco all climb
+// continuously from kubelet chatter, Goldmane's ambient flow export and
+// Falco's own metrics snapshots. A delta over a four-minute window proves
+// only that the cluster was alive.
 //
-// Counters are summed across every collector pod, because each source is
-// node-local: the action may land on any node.
+// Epic 10 exists because evidence of exactly that shape was found not to mean
+// what it appeared to mean, so the only acceptable standard here is an event
+// that names something this test created. Every action is tagged with a
+// per-run marker and each source must yield a raw event carrying it.
 func TestFullProfileEachSourceIngestsARealAction(t *testing.T) {
 	if os.Getenv("OLT_E2E_FULL") == "" {
 		t.Skip("full-profile smoke skipped; set OLT_E2E_FULL=1 (make e2e-full) to run")
 	}
 	requireKindCluster(t)
+	requireFullProfile(t)
 	requirePodsExist(t, "app.kubernetes.io/component=collector")
 
-	names := collectorPodNames(t)
-	ports := forwardCollectors(t, names)
+	runID := fmt.Sprintf("%d", time.Now().UnixNano()%1e9)
+	podName := "ac2-probe-" + runID
+	peerName := "ac2-peer-" + runID
+	logMarker := "ac2-log-" + runID
 
-	// Fail loudly if a collector cannot be scraped at all. Silently summing
-	// over a subset is how the first two attempts at this test produced
-	// confident, wrong answers about sources that live on the other node.
-	for i, name := range names {
-		if fullProfileScrape(ports[i]) == "" {
-			t.Fatalf("collector %s returned no metrics; the per-source sums would be taken over a subset of nodes and mean nothing", name)
-		}
+	// Subscribe BEFORE acting. The raw subjects are Ring 1 -> Ring 2, i.e.
+	// what each sensor actually published, which is the earliest point where
+	// "this source ingested this event" is answerable.
+	portForward(t, "svc/"+defaultReleaseName+"-nats", natsLocalPort, "4222")
+	nc, err := nats.Connect("nats://localhost:" + natsLocalPort)
+	if err != nil {
+		t.Fatalf("nats connect: %v", err)
 	}
+	t.Cleanup(nc.Close)
 
-	before := sumEventsBySource(t, ports)
-
-	// --- the deliberate actions, one per source -----------------------------
-
-	// runtime (containerd lifecycle) + applog (log line): one pod does both.
-	// The sidecar tails /var/log/app/stdout.log specifically, not *.log.
-	t.Cleanup(func() {
-		_ = exec.Command("kubectl", "delete", "pod", "ac2-probe",
-			"-n", defaultNamespace, "--ignore-not-found", "--wait=false").Run()
+	var mu sync.Mutex
+	hits := map[string]string{} // source -> the raw event that carried the marker
+	sub, err := nc.Subscribe(subjects.RawPrefix+">", func(m *nats.Msg) {
+		body := string(m.Data)
+		if !strings.Contains(body, podName) && !strings.Contains(body, logMarker) {
+			return
+		}
+		source := strings.TrimPrefix(m.Subject, subjects.RawPrefix)
+		mu.Lock()
+		if _, seen := hits[source]; !seen {
+			hits[source] = body
+		}
+		mu.Unlock()
 	})
-	kubectlApply(t, ac2ProbePodManifest)
-	kubectl(t, "wait", "--for=condition=Ready", "pod/ac2-probe",
-		"-n", defaultNamespace, "--timeout=180s")
-
-	// falco: a terminal shell in a container is one of Falco's stock rules,
-	// so this is an alert the default ruleset is guaranteed to raise.
-	_ = exec.Command("kubectl", "exec", "-n", defaultNamespace, "ac2-probe",
-		"-c", "app", "--", "/bin/sh", "-c", "id").Run()
-
-	// audit: a deliberate, attributable API call. A Secret read is audited at
-	// RequestResponse by the shipped policy, so it cannot be confused with a
-	// kubelet watch.
-	_ = exec.Command("kubectl", "get", "secrets", "-n", defaultNamespace).Run()
-
-	// network (Calico flow): pod-to-pod traffic the cluster would not otherwise
-	// generate. Reaching the collector's own metrics port is enough to produce
-	// a flow record.
-	_ = exec.Command("kubectl", "exec", "-n", defaultNamespace, "ac2-probe",
-		"-c", "app", "--", "wget", "-q", "-T", "5", "-O", "/dev/null",
-		"http://"+defaultReleaseName+"-aggregator."+defaultNamespace+".svc:9090/metrics").Run()
-
-	// --- assert each source moved -------------------------------------------
-	// Falco's metrics interval is 1m and Goldmane's flow window is comparable,
-	// so allow three intervals for the slow sources rather than reading once.
-	deadline := time.Now().Add(4 * time.Minute)
-	var after map[string]float64
-	pending := map[string]bool{}
-	for _, s := range fullProfileSources {
-		pending[s.source] = true
+	if err != nil {
+		t.Fatalf("nats subscribe: %v", err)
 	}
-	for time.Now().Before(deadline) && len(pending) > 0 {
-		after = sumEventsBySource(t, ports)
-		for source := range pending {
-			if after[source] > before[source] {
-				delete(pending, source)
-			}
-		}
-		if len(pending) == 0 {
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+
+	// --- the deliberate actions, each carrying the marker -------------------
+
+	t.Cleanup(func() {
+		_ = exec.Command("kubectl", "delete", "pod", podName, peerName,
+			"-n", defaultNamespace, "--ignore-not-found",
+			"--grace-period=0", "--force").Run()
+	})
+
+	// runtime (container start) + applog (log line), plus a peer to flow to.
+	kubectlApply(t, fmt.Sprintf(ac2PeerPodTemplate, peerName))
+	kubectlApply(t, fmt.Sprintf(ac2ProbePodTemplate, podName, logMarker))
+	for _, pod := range []string{peerName, podName} {
+		mustAction(t, "pod ready: "+pod,
+			"kubectl", "wait", "--for=condition=Ready", "pod/"+pod,
+			"-n", defaultNamespace, "--timeout=180s")
+	}
+
+	// falco: the stock "Terminal shell in container" rule conditions on
+	// proc.tty != 0, so the exec MUST allocate a tty or the rule cannot match.
+	mustAction(t, "falco: terminal shell in container",
+		"kubectl", "exec", "-t", "-n", defaultNamespace, podName,
+		"-c", "app", "--", "/bin/sh", "-c", "id")
+
+	// audit: a single-object get, which the shipped policy records at
+	// RequestResponse (a list is only Metadata), naming this pod.
+	mustAction(t, "audit: get the probe pod",
+		"kubectl", "get", "pod", podName, "-n", defaultNamespace, "-o", "name")
+
+	// network: a real pod-to-pod flow, probe -> peer, on a path nothing else
+	// in the cluster takes. Two earlier targets were wrong in instructive
+	// ways: olaitan-aggregator has no Service in this chart (NXDOMAIN, no flow
+	// at all), and the audit webhook is correctly firewalled by this very
+	// profile's NetworkPolicy to kube-system and the apiserver, so an ordinary
+	// pod times out reaching it. Neither probe pod carries the release labels,
+	// so the release policy does not select them and the flow is unimpeded.
+	peerIP := strings.TrimSpace(kubectl(t, "get", "pod", peerName,
+		"-n", defaultNamespace, "-o", "jsonpath={.status.podIP}"))
+	if peerIP == "" {
+		t.Fatal("peer pod has no IP; cannot generate a pod-to-pod flow")
+	}
+	mustAction(t, "network: pod-to-pod request to "+peerIP,
+		"kubectl", "exec", "-n", defaultNamespace, podName,
+		"-c", "app", "--", "wget", "-q", "-T", "10", "-O", "/dev/null",
+		"http://"+peerIP+":8080/")
+
+	// --- wait for each source to publish an event naming the marker ---------
+	// Falco's and Goldmane's export intervals are about a minute, so allow
+	// several before concluding a source did not ingest the action.
+	deadline := time.Now().Add(5 * time.Minute)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got := len(hits)
+		mu.Unlock()
+		if got == len(fullProfileSources) {
 			break
 		}
-		time.Sleep(10 * time.Second)
+		time.Sleep(5 * time.Second)
 	}
 
-	for _, s := range fullProfileSources {
-		delta := after[s.source] - before[s.source]
-		if delta <= 0 {
-			t.Errorf("source %q ingested no event after a deliberate action: %.0f -> %.0f (delta %.0f)",
-				s.source, before[s.source], after[s.source], delta)
+	mu.Lock()
+	defer mu.Unlock()
+	for _, src := range fullProfileSources {
+		body, ok := hits[src.source]
+		if !ok {
+			t.Errorf("source %q published no raw event naming %q: the deliberate action for this source was not ingested",
+				src.source, podName)
 			continue
 		}
-		t.Logf("source %-8s %.0f -> %.0f (+%.0f)", s.source, before[s.source], after[s.source], delta)
+		t.Logf("source %-8s ingested an event naming the probe (%d bytes)", src.source, len(body))
 	}
 }
 
-const ac2ProbePodManifest = `
+// ac2PeerPodTemplate is the flow destination: a trivial HTTP listener. It
+// carries no release labels, so the release NetworkPolicy does not select it.
+const ac2PeerPodTemplate = `
 apiVersion: v1
 kind: Pod
 metadata:
-  name: ac2-probe
-  namespace: default
+  name: %s
+spec:
+  containers:
+    - name: peer
+      image: busybox:1.36
+      command: ["/bin/sh","-c"]
+      args:
+        - |
+          mkdir -p /www && echo ok > /www/index.html
+          httpd -f -p 8080 -h /www
+      ports:
+        - containerPort: 8080
+`
+
+// ac2ProbePodTemplate takes the pod name and the log marker. It writes to
+// /var/log/app/stdout.log specifically: the sidecar tails that path and
+// stderr.log, not *.log.
+const ac2ProbePodTemplate = `
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
   annotations:
     olaitan.io/log-sidecar: "enabled"
 spec:
@@ -337,26 +392,44 @@ spec:
       command: ["/bin/sh","-c"]
       args:
         - |
+          mkdir -p /var/log/app
           i=0
           while true; do
             i=$((i+1))
-            echo "{\"level\":\"warn\",\"msg\":\"ac2 deliberate log line $i\"}" >> /var/log/app/stdout.log
+            echo "{\"level\":\"warn\",\"msg\":\"%s line $i\"}" >> /var/log/app/stdout.log
             sleep 2
           done
 `
 
-// collectorPodNames returns every collector pod, in a stable order.
-func collectorPodNames(t *testing.T) []string {
+// requireFullProfile fails unless this cluster runs values-full.yaml. Only
+// that profile gives the collector an audit-webhook hostPort, so it is a
+// reliable marker. requireKindCluster alone is not enough: it only checks a
+// cluster of the expected NAME exists, never that kubectl points at it.
+func requireFullProfile(t *testing.T) {
 	t.Helper()
-	names := strings.Fields(strings.TrimSpace(kubectl(t,
-		"get", "pods", "-n", defaultNamespace,
-		"-l", "app.kubernetes.io/component=collector",
-		"-o", "jsonpath={range .items[*]}{.metadata.name} {end}")))
-	if len(names) == 0 {
-		t.Fatal("no collector pods found")
+	out, err := exec.Command("kubectl", "get", "daemonset",
+		defaultReleaseName+"-collector", "-n", defaultNamespace,
+		"-o", `jsonpath={.spec.template.spec.containers[*].ports[?(@.name=="audit-webhook")].hostPort}`,
+	).Output()
+	hostPort, convErr := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil || convErr != nil || hostPort <= 0 {
+		t.Fatalf("this cluster is not running the full profile: the collector DaemonSet has no audit-webhook hostPort (got %q).\n"+
+			"Only values-full.yaml sets it. Bring the cluster up with `make e2e-full`.",
+			strings.TrimSpace(string(out)))
 	}
-	sort.Strings(names)
-	return names
+}
+
+// mustAction runs a deliberate action and fails the test if it did not happen.
+// Swallowing the error here would surface four minutes later as "source X
+// ingested no event", pointing the reader at the sensor instead of the probe.
+func mustAction(t *testing.T, what string, name string, args ...string) {
+	t.Helper()
+	out, err := exec.Command(name, args...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s: the deliberate action itself failed, so the assertion below would be meaningless: %v\n%s",
+			what, err, out)
+	}
+	t.Logf("action ok: %s", what)
 }
 
 // kubectlApply pipes a manifest to `kubectl apply -f -`.
@@ -367,25 +440,4 @@ func kubectlApply(t *testing.T, manifest string) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("kubectl apply failed: %v\n%s", err, out)
 	}
-}
-
-var eventsTotalRE = regexp.MustCompile(
-	`(?m)^olaitan_sensor_events_total\{[^}]*source="([a-z]+)"[^}]*\} ([0-9.e+]+)$`)
-
-// sumEventsBySource totals olaitan_sensor_events_total across every collector,
-// because each source is node-local and a deliberate action lands on one node.
-func sumEventsBySource(t *testing.T, ports []int) map[string]float64 {
-	t.Helper()
-	totals := map[string]float64{}
-	for _, port := range ports {
-		for _, m := range eventsTotalRE.FindAllStringSubmatch(
-			fullProfileScrape(port), -1) {
-			v, err := strconv.ParseFloat(m[2], 64)
-			if err != nil {
-				continue
-			}
-			totals[m[1]] += v
-		}
-	}
-	return totals
 }

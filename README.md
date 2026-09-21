@@ -123,8 +123,16 @@ control-plane plus one worker. The committed default in `hack/kind-full.yaml`
 is two workers; it renders and the node list is generated from the same file,
 but that shape has not itself been booted. Treat the row as "verified with one
 worker; the two-worker default is unexercised". Prerequisites the script needs
-beyond the usual: `openssl`, and `python3` with PyYAML if you set `WORKERS`.
-The release installs into the `default` namespace, matching the e2e suite.
+beyond the usual: `openssl`, and `python3` with PyYAML (`make e2e-full` always
+passes `WORKERS`, so PyYAML is required on that path). The release installs
+into the `default` namespace, matching the e2e suite.
+
+One more thing the row does not convey on its own: on the verification host
+the WORKER node's Falco did not start, because the host had
+`fs.inotify.max_user_instances` at its default of 128 with most of it already
+consumed. "Five sources healthy" was therefore satisfied with Falco running on
+the control-plane node only. Raise the inotify limits before reading a
+single-node Falco result as a two-node one.
 
 `verified` means installed and observed on a live cluster of that type.
 `template-verified` means the chart renders and validates for it and nothing

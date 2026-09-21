@@ -101,7 +101,16 @@ spec:
 {{- with .Values.networkPolicy.apiServerCIDR }}{{- $apiCIDRs = append $apiCIDRs . }}{{- end }}
 {{- $apiIngressCIDRs := list }}
 {{- range $apiIngressIPs }}{{- $apiIngressCIDRs = append $apiIngressCIDRs (printf "%s/%s" . (ternary "128" "32" (contains ":" .))) }}{{- end }}
-{{- with .Values.networkPolicy.apiServerCIDR }}{{- $apiIngressCIDRs = append $apiIngressCIDRs . }}{{- end }}
+{{- /*
+  networkPolicy.apiServerCIDR is deliberately NOT appended here. Its
+  documented kubeadm value is the kubernetes Service ClusterIP (10.96.0.1),
+  and excluding a ClusterIP from ingress sources while re-admitting it through
+  the operator-supplied fallback would enforce the rule against the value we
+  discover and waive it for the value we are handed. Operators whose apiserver
+  reaches pods from an address the EndpointSlice does not list set
+  networkPolicy.apiServerIngressCIDR instead.
+  */}}
+{{- with .Values.networkPolicy.apiServerIngressCIDR }}{{- $apiIngressCIDRs = append $apiIngressCIDRs . }}{{- end }}
   policyTypes:
     - Ingress
     - Egress

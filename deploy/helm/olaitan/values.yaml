@@ -255,6 +255,22 @@ networkPolicy:
   # a rendered install manifest) and for an API server that can move (a
   # managed control plane). 10.96.0.1/32 is kubeadm's and kind's Service IP.
   apiServerCIDR: "10.96.0.1/32"
+  # Story 10.5. Extra API server address range allowed for INGRESS, i.e. the
+  # address the kube-apiserver connects FROM when it dials this release's two
+  # webhook listeners (the audit receiver and the applog admission webhook).
+  #
+  # Deliberately separate from apiServerCIDR above, which is an egress
+  # DESTINATION and whose documented value is the kubernetes Service ClusterIP.
+  # A ClusterIP is a virtual destination that DNAT rewrites before routing, so
+  # it can never be the source of an inbound connection; admitting it on
+  # ingress would make the rendered policy claim something it does not mean.
+  #
+  # Usually unnecessary: the chart reads the apiserver's real endpoint
+  # addresses at install time. Set this where those cannot be read (RBAC) or
+  # where the apiserver egresses from a different address than it is
+  # registered under.
+  # @schema type:string effect:"extra source CIDR allowed to reach the audit and applog webhook ports on ingress" ref:FR5
+  apiServerIngressCIDR: ""
   # Extra egress rules merged into the policy as-is. Operators populate
   # this with the LLM provider endpoints they actually use; values are
   # raw NetworkPolicyEgressRule objects so the full schema is available

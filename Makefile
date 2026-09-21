@@ -506,21 +506,42 @@ capture-it:
 # traffic stops crossing a node boundary.
 FULL_CLUSTER_NAME ?= olaitan-full
 FULL_OUT_DIR ?= $(HOME)/.olaitan-full
-FULL_WORKERS ?= 2
+# 1, matching what has actually been booted and what the README claims. The
+# committed hack/kind-full.yaml default is 2; raise this to exercise it.
+FULL_WORKERS ?= 1
 
+# Same prerequisites as every sibling e2e target: without helm-prepare the
+# chart installs with no rules or prompts, without helm-deps the subcharts do
+# not resolve, and without docker-build + kind load the cluster pulls the last
+# PUBLISHED image instead of the working tree, so a green run would say
+# nothing about the code under test.
 .PHONY: e2e-full e2e-full-down
-e2e-full:
+e2e-full: helm-prepare helm-deps docker-build
 	CLUSTER_NAME=$(FULL_CLUSTER_NAME) WORKERS=$(FULL_WORKERS) \
 		KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig \
 		hack/install-full-kind.sh $(FULL_OUT_DIR)
+	kind load docker-image $(IMAGE):$(TAG) --name $(FULL_CLUSTER_NAME)
+	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig \
+		helm upgrade --install olaitan $(CHART_DIR) -n default \
+		--set-string image.repository=$(IMAGE) \
+		--set-string image.tag=$(TAG) \
+		--set image.pullPolicy=Never \
+		-f $(CHART_DIR)/values-full.yaml \
+		-f $(FULL_OUT_DIR)/calico/calico-values.yaml \
+		-f $(FULL_OUT_DIR)/audit-certs/audit-webhook-values.yaml \
+		-f $(FULL_OUT_DIR)/applog-certs/applog-values.yaml \
+		--wait --timeout 12m
 	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig \
 		KIND_CLUSTER_NAME=$(FULL_CLUSTER_NAME) OLT_E2E_FULL=1 \
-		go test -tags=e2e -v -count=1 -run 'TestFullProfileAllFiveSourcesHealthy|TestFalcoSourceIsLive' ./tests/e2e/...
+		go test -tags=e2e -v -count=1 -run 'TestFullProfile|TestFalcoSourceIsLive' ./tests/e2e/...
 	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig hack/check-netpol-enforcement.sh
 
+# Removes FULL_OUT_DIR too. It holds the audit CA and the apiserver client
+# key; leaving it behind also leaves a Calico marker file that would make the
+# next e2e-full skip cluster creation and install into nothing.
 e2e-full-down:
 	kind delete cluster --name $(FULL_CLUSTER_NAME) || true
-	rm -rf hack/.audit-full
+	rm -rf hack/.audit-full $(FULL_OUT_DIR)
 
 e2e-local-down:
 	kind delete cluster --name $(KIND_CLUSTER_NAME)
