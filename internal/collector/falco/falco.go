@@ -175,6 +175,13 @@ func DefaultPublishRetry() retry.Strategy {
 const (
 	DefaultBufferMaxAlerts = 4096
 	DefaultBufferMaxBytes  = 16 << 20
+
+	// BufferWarnBytes is the byte bound above which New logs a Warn at
+	// start. A queued event costs at least its marshalled size plus Go
+	// overhead, on top of the NATS client's own reconnect buffer, so a
+	// bound this large needs a raised collector memory limit or the pod
+	// can be OOMKilled mid-outage and lose the whole queue.
+	BufferWarnBytes = 64 << 20
 )
 
 // publishAttemptTimeout caps a single PublishJS attempt so a NATS
@@ -264,6 +271,10 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 	}
 	if cfg.BufferMaxBytes == 0 {
 		cfg.BufferMaxBytes = DefaultBufferMaxBytes
+	}
+	if cfg.BufferMaxBytes > BufferWarnBytes {
+		log.Warn("falco: ingest buffer byte bound is large; raise the collector memory limit by about 2x the bound above the 16 MiB default, or an OOMKill during a NATS outage loses the whole buffer",
+			"buffer_max_bytes", cfg.BufferMaxBytes, "warn_above_bytes", BufferWarnBytes)
 	}
 	if cfg.ShutdownDrain <= 0 {
 		cfg.ShutdownDrain = 10 * time.Second

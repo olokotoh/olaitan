@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -255,5 +257,33 @@ func TestNew_BufferDefaults(t *testing.T) {
 	a := newTestAdapter(t, &outagePub{}, nil)
 	if a.cfg.BufferMaxAlerts != 4096 || a.cfg.BufferMaxBytes != 16<<20 || a.cfg.ShutdownDrain != 10*time.Second {
 		t.Errorf("defaults = %d alerts, %d bytes, drain %s; want 4096, 16 MiB, 10s", a.cfg.BufferMaxAlerts, a.cfg.BufferMaxBytes, a.cfg.ShutdownDrain)
+	}
+}
+
+// Review round 3 (R3-3): the queue lives in the collector's memory, so a
+// byte bound far above the default can OOMKill the pod mid-outage and lose
+// the whole buffer. New must say so at start instead of failing silently.
+func TestNew_WarnsWhenBufferMaxBytesIsLarge(t *testing.T) {
+	for name, tc := range map[string]struct {
+		maxBytes int
+		warn     bool
+	}{
+		"default":             {0, false},
+		"at the warn line":    {BufferWarnBytes, false},
+		"above the warn line": {BufferWarnBytes + 1, true},
+		"1 GiB":               {1 << 30, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var logs bytes.Buffer
+			log := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			cfg := Config{ListenAddr: ":8765", Token: testToken, Hostname: "n", BufferMaxBytes: tc.maxBytes}
+			if _, err := New(cfg, &recordingPub{}, log); err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			got := strings.Contains(logs.String(), "level=WARN") && strings.Contains(logs.String(), "memory")
+			if got != tc.warn {
+				t.Errorf("warned=%v, want %v; log:\n%s", got, tc.warn, logs.String())
+			}
+		})
 	}
 }

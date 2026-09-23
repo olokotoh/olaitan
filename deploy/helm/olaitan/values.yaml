@@ -173,6 +173,11 @@ falcoIngest:
   # the oldest alerts are dropped and counted in
   # olaitan_sensor_falco_buffer_dropped_total. Per collector pod; the 16 MiB
   # default fits the collector's 256Mi limit. In memory: a crash loses it.
+  # Raising maxBytes: raise collector.resources.limits.memory by about 2x the
+  # extra bytes above the 16 MiB default (a queued event costs more than its
+  # marshalled size, and the NATS client buffers another 8 MiB while
+  # reconnecting), or the pod can be OOMKilled mid-outage and lose the whole
+  # queue. The collector logs a Warn at start when maxBytes is over 64 MiB.
   buffer:
     # @schema type:integer minimum:1 effect:"most Falco alerts a collector pod queues while NATS is unavailable before dropping the oldest" ref:FR1
     maxAlerts: 4096
