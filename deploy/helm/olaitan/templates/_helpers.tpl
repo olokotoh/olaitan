@@ -698,3 +698,36 @@ never reaches it.
 {{- end -}}
 {{- $v -}}
 {{- end -}}
+
+{{/*
+Issue #148: pod-template checksum of a chart-rendered TLS Secret.
+
+The applog injector and the audit receiver load their serving cert once, at
+start-up. A `helm upgrade` that changes only the Secret therefore leaves the
+running pods serving the old cert, and the applog webhook (failurePolicy
+Ignore) fails open: Pods are admitted with no sidecar and nothing says so.
+A checksum on the pod template turns a changed Secret into a changed pod
+template, so the controller rolls the pods.
+
+The hash covers the rendered Secret's `data` and nothing else: its labels
+carry helm.sh/chart, which moves on every chart-version bump, and hashing
+them would roll the collector DaemonSet on upgrades that changed no cert.
+toJson sorts map keys, so the hash is stable across renders.
+
+Call only where the chart renders the Secret. A Secret the chart does not
+render (cert-manager Path A for applog, calicoSensor.tls.certManagerSecretName
+for Calico) changes outside helm, so a render-time checksum cannot see it;
+see APPLOG.md and CNI.md for how those paths reload.
+
+Usage: include "olaitan.tlsSecretChecksum" (dict "root" $ "template" "audit-webhook-tls-secret.yaml")
+*/}}
+{{- define "olaitan.tlsSecretChecksum" -}}
+{{- $secret := include (print .root.Template.BasePath "/" .template) .root | fromYaml -}}
+{{- if hasKey $secret "Error" -}}
+{{- fail (printf "olaitan.tlsSecretChecksum: %s did not render as one YAML document: %s" .template $secret.Error) -}}
+{{- end -}}
+{{- if not $secret.data -}}
+{{- fail (printf "olaitan.tlsSecretChecksum: %s rendered no Secret data; the caller must gate on the same condition as the Secret" .template) -}}
+{{- end -}}
+{{- $secret.data | toJson | sha256sum -}}
+{{- end -}}

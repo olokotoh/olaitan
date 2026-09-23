@@ -179,6 +179,49 @@ every Pod cluster-wide. Threat model:
   - Path B operators are expected to rotate the manually-provided
     Secret periodically.
 
+### Rotating the serving cert
+
+The injector reads `tls.crt` and `tls.key` once, when it starts. A
+running injector never picks up a new certificate from its mounted
+Secret, even after the kubelet has refreshed the files.
+
+- **Path B (manual).** The injector Deployment's pod template carries a
+  `checksum/applog-tls` annotation: the sha256 of the data of the Secret
+  the chart renders. A `helm upgrade` that changes
+  `applogSidecar.tls.servingCert` or `servingKey` changes the checksum,
+  so the Deployment rolls on its own; no `kubectl rollout restart` is
+  needed. Upgrades that change no cert leave the checksum, and the
+  pods, alone. `applogSidecar.tls.caBundle` is not part of the checksum:
+  it lives on the MutatingWebhookConfiguration, which the apiserver
+  reads, not in the Secret the injector mounts.
+
+  A new cert signed by the **same** CA needs one upgrade and has no
+  gap. A new **CA** needs care, because the MutatingWebhookConfiguration
+  switches to the new caBundle at once while old injector pods keep
+  serving the old cert until the rollout replaces them; any Pod
+  admitted in that window gets no sidecar. For a gap-free CA change,
+  use three upgrades:
+  1. set `caBundle` to the old and new CA PEMs concatenated (base64 of
+     both), cert unchanged;
+  2. set `servingCert` / `servingKey` to the pair the new CA signed
+     (the injector rolls);
+  3. set `caBundle` to the new CA alone.
+- **Path A (cert-manager).** cert-manager writes the Secret, not helm,
+  so a render-time checksum cannot see a renewal and the chart does not
+  add one. After cert-manager renews the Certificate, restart the
+  injector (`kubectl -n <namespace> rollout restart deploy -l
+  app.kubernetes.io/component=applog-injector`) or run a Secret-watching
+  reloader against it. In-process reload is
+  tracked in #157.
+
+This matters more than it looks: the webhook ships
+`failurePolicy: Ignore`, so while the injector serves a certificate the
+apiserver no longer trusts, every Pod is admitted **without** a sidecar.
+The webhook handler is never called, so the injector logs no admission;
+the only traces are Go's `http: TLS handshake error ... bad certificate`
+lines on the injector's stderr and a `failed calling webhook` line in
+the kube-apiserver log (issue #148).
+
 ## Troubleshooting
 
 - **Sidecar not injected after annotation**: check the webhook logs

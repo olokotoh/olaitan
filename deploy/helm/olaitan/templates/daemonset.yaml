@@ -66,11 +66,26 @@ spec:
              metrics.scrapeAnnotations so a Prometheus-Operator-driven
              deployment can disable them and rely on a ServiceMonitor
              resource (future Story 1.18 follow-up). */ -}}
-      {{- if and .Values.metrics .Values.metrics.scrapeAnnotations }}
+      {{- /* Issue #148: checksums of the chart-rendered TLS Secrets this
+             DaemonSet mounts, so rotating one rolls the collector. The
+             audit receiver reads its serving cert once, at start-up.
+             Calico Path A mounts a Secret helm does not render, so it
+             gets no checksum (see CNI.md). */ -}}
+      {{- $scrape := and .Values.metrics .Values.metrics.scrapeAnnotations }}
+      {{- $cniPathB := and .Values.calicoSensor.enabled (not .Values.calicoSensor.tls.certManagerSecretName) }}
+      {{- if or $scrape .Values.auditWebhook.enabled $cniPathB }}
       annotations:
+        {{- if $scrape }}
         prometheus.io/scrape: "true"
         prometheus.io/port: {{ .Values.metrics.containerPort | quote }}
         prometheus.io/path: "/metrics"
+        {{- end }}
+        {{- if .Values.auditWebhook.enabled }}
+        checksum/audit-tls: {{ include "olaitan.tlsSecretChecksum" (dict "root" . "template" "audit-webhook-tls-secret.yaml") | quote }}
+        {{- end }}
+        {{- if $cniPathB }}
+        checksum/cni-tls: {{ include "olaitan.tlsSecretChecksum" (dict "root" . "template" "cni-tls-secret.yaml") | quote }}
+        {{- end }}
       {{- end }}
     spec:
       serviceAccountName: {{ include "olaitan.collector.serviceAccountName" . }}

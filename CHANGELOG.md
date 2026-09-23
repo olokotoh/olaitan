@@ -134,6 +134,20 @@ and false-positive numbers; see [Unreleased](#unreleased).
 
 ### Fixed
 
+- **Rotating a chart-rendered TLS cert now restarts the pods that serve
+  it** (#148). The applog injector and the audit receiver read their
+  serving cert once, at start-up, so a `helm upgrade` that changed only
+  the cert left them serving the old one; for the applog webhook
+  (`failurePolicy: Ignore`) that meant pods admitted with no sidecar and
+  no admission logged. The Calico adapter re-reads its files only on its next
+  reconnect. The injector Deployment now carries
+  `checksum/applog-tls` and the collector DaemonSet `checksum/audit-tls`
+  and `checksum/cni-tls` (Calico Path B): the sha256 of the rendered
+  Secret's data, so only a cert change rolls the pods, not a
+  chart-version bump. Secrets the chart does not render (applog
+  cert-manager Path A, `calicoSensor.tls.certManagerSecretName`) get no
+  checksum; APPLOG.md and CNI.md say how those reload.
+
 - **A cert-manager-issued certificate now works for the Calico flow
   sensor** (#140). Path A mounted the cert-manager Secret unchanged, but
   a `kubernetes.io/tls` Secret carries `tls.crt` and `tls.key` while the

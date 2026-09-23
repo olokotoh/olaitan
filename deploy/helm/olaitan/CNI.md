@@ -151,7 +151,9 @@ calicoSensor:
 The chart mounts the cert-manager-issued Secret directly. Cert
 rotation is automatic; the adapter loads TLS material from disk on
 every connect-loop iteration so a fresh Secret remount is picked up
-without an agent restart.
+without an agent restart. Because helm does not render this Secret,
+the collector carries no checksum annotation for it on Path A: a
+render-time hash could never see a cert-manager renewal.
 
 #### Key names: the chart remaps them for you
 
@@ -247,7 +249,16 @@ these values and mounts it at `/etc/olaitan/cni/`.
 
 **Caveat: Path B is not rotation-aware.** When the Tigera-issued
 Secret rotates, the operator must re-extract the new material and
-`helm upgrade` the chart. Path A is the production target.
+`helm upgrade` the chart. Path A is the production target. The
+collector DaemonSet's pod template carries a `checksum/cni-tls`
+annotation (the sha256 of the data of the chart-rendered
+`<fullname>-cni-tls` Secret), so new PEM values roll the collector and
+take effect at once, and an upgrade that changes no PEM leaves it
+running. Without the roll the adapter would still pick the new files up,
+but only on its next reconnect to Goldmane, and an established stream
+can last indefinitely. The cost is that the roll restarts the whole
+collector, so every source it runs on that node, the audit receiver
+included, has a brief gap while its pod is replaced.
 
 #### Borrowed identity: the collector authenticates to Goldmane AS Whisker
 
