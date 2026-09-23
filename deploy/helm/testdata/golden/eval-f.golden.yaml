@@ -2052,6 +2052,12 @@ spec:
             # var, so the token stays out of `kubectl describe pod`.
             - name: FALCO_HTTP_TOKEN_FILE
               value: /etc/olaitan/secrets/falco-http-token
+            # Issue #135: bounds of the queue between Falco and NATS.
+            # int64 keeps a large --set value out of scientific notation.
+            - name: FALCO_BUFFER_MAX_ALERTS
+              value: "4096"
+            - name: FALCO_BUFFER_MAX_BYTES
+              value: "16777216"
             # Story 1.6: the Falco adapter records the node name on
             # every emitted Event.Pod.Node so host events without K8s
             # pod context still record where they were observed. Sourced
