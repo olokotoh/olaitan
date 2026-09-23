@@ -256,3 +256,20 @@ func TestReportArchiveTargetIsRerunnable(t *testing.T) {
 		t.Error("report-archive-full-values.yaml header must say the overlay persists and that `make e2e-full` restores the profile")
 	}
 }
+
+// TestFullProfileVariablesDefinedOnce: e2e-full-report-archive once carried
+// its own copies of Story 10.5's FULL_CLUSTER_NAME / FULL_OUT_DIR defaults so
+// it could land before 10.5. Two `?=` definitions can drift apart silently
+// (the first one wins), so there must be exactly one of each.
+func TestFullProfileVariablesDefinedOnce(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join(repoRoot(t), "Makefile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []string{"FULL_CLUSTER_NAME", "FULL_OUT_DIR"} {
+		n := len(regexp.MustCompile(`(?m)^`+v+`\s*\?=`).FindAllString(string(b), -1))
+		if n != 1 {
+			t.Errorf("Makefile defines %s %d times, want exactly 1", v, n)
+		}
+	}
+}

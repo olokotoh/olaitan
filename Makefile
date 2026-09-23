@@ -389,9 +389,8 @@ e2e-local-forensics: helm-prepare helm-deps docker-build
 # Falco kind-hook exception. Any later `helm upgrade --reuse-values` (for
 # example a Story 10.6 real-LLM run) inherits them and would talk to
 # fake-llm without saying so. make e2e-full restores the profile, because it
-# upgrades without --reuse-values.
-FULL_CLUSTER_NAME ?= olaitan-full
-FULL_OUT_DIR ?= $(HOME)/.olaitan-full
+# upgrades without --reuse-values. FULL_CLUSTER_NAME and FULL_OUT_DIR are
+# defined once, with the Story 10.5 e2e-full target below.
 .PHONY: e2e-full-report-archive
 e2e-full-report-archive: helm-prepare helm-deps docker-build
 	kind get clusters | grep -qx '$(FULL_CLUSTER_NAME)' || \
