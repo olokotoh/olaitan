@@ -32,14 +32,22 @@
 // publish succeeds; a heartbeat alone cannot clear it, or a NATS outage would
 // read healthy between alerts while every alert was lost.
 //
-// Delivery: Falco does not retry a failed POST, so an alert that arrives
-// while NATS is down is lost at Falco. The handler still answers 503 so the
-// failure shows up in Falco's own log and in the request metrics here.
+// Delivery (issue #135): Falco does not retry a failed POST, so the handler
+// must not tie an alert's fate to NATS being up at that moment. It answers
+// 204 once the alert is in a bounded in-memory queue (BufferMaxAlerts and
+// BufferMaxBytes, 4096 alerts and 16 MiB by default). One worker drains the
+// queue in arrival order and retries each alert with backoff until NATS takes
+// it. When a new alert does not fit, the oldest queued alerts are dropped and
+// counted (BufferDropped). On shutdown the listener stops first, then the
+// worker drains for up to ShutdownDrain and whatever is left is logged and
+// counted (ShutdownLost). The queue is in memory, so a collector crash still
+// loses what it holds; a disk-backed queue would be the next step.
 package falco
 
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -114,17 +122,29 @@ type Config struct {
 	// times the chart's 1m Falco metrics interval.
 	HeartbeatTimeout time.Duration
 
-	// PublishRetry is the bounded retry for transient NATS publish
-	// failures. Defaults to DefaultPublishRetry() when zero-valued.
+	// PublishRetry is the worker's backoff between publish attempts for
+	// one alert. Defaults to DefaultPublishRetry() when zero-valued. With
+	// MaxAttempts > 0 the worker still does not give up on the alert: it
+	// waits Max and runs the strategy again. Only a permanent error or
+	// shutdown ends the retries.
 	PublishRetry retry.Strategy
 
-	// PublishWallClockBudget caps the total time one alert may spend in
-	// publishWithRetry. Default 12s.
-	PublishWallClockBudget time.Duration
+	// BufferMaxAlerts and BufferMaxBytes bound the queue between the
+	// handler and the publish worker (issue #135). Bytes are the
+	// marshalled event size. Defaults 4096 and 16 MiB. The alert the
+	// worker is publishing is outside both bounds.
+	BufferMaxAlerts int
+	BufferMaxBytes  int
+
+	// ShutdownDrain is how long shutdown keeps publishing what the queue
+	// holds after the listener has stopped. Default 10s, so 5s HTTP grace
+	// plus this plus main.go's 10s NATS drain fits the pod's 30s
+	// termination grace.
+	ShutdownDrain time.Duration
 
 	// HTTP server timeouts. Defaults: 10s header, 30s read and write,
-	// 90s idle (longer than Falco's keep-alive reuse gap). ShutdownGrace
-	// is at least PublishWallClockBudget + 1s (13s by default).
+	// 90s idle (longer than Falco's keep-alive reuse gap), 5s shutdown
+	// grace (handlers only enqueue, so they finish at once).
 	ReadHeaderTimeout time.Duration
 	ReadTimeout       time.Duration
 	WriteTimeout      time.Duration
@@ -138,18 +158,24 @@ type Config struct {
 	RateLimit *ratelimit.Limiter
 }
 
-// DefaultPublishRetry returns the per-publish bounded retry strategy:
-// 100ms..1s, 3 attempts. With the 2s per-attempt deadline a transient
-// JetStream hiccup costs at most ~9s before the handler answers 503.
+// DefaultPublishRetry returns the worker's retry strategy: 100ms doubling
+// to 2s with full jitter, no attempt limit. The 2s cap means the queue
+// starts draining within about 2s of NATS coming back.
 func DefaultPublishRetry() retry.Strategy {
 	return retry.Strategy{
 		Min:         100 * time.Millisecond,
-		Max:         1 * time.Second,
+		Max:         2 * time.Second,
 		Multiplier:  2.0,
 		Jitter:      1.0,
-		MaxAttempts: 3,
+		MaxAttempts: 0,
 	}
 }
+
+// Buffer defaults (issue #135).
+const (
+	DefaultBufferMaxAlerts = 4096
+	DefaultBufferMaxBytes  = 16 << 20
+)
 
 // publishAttemptTimeout caps a single PublishJS attempt so a NATS
 // partition cannot hold one attempt for JetStream's ~5s ack wait.
@@ -172,7 +198,16 @@ type Adapter struct {
 	heartbeats        atomic.Int64
 	droppedBySampling atomic.Int64
 	publishDrops      atomic.Int64
+	bufferDropped     atomic.Int64
+	shutdownLost      atomic.Int64
 	requests          map[string]*atomic.Uint64
+
+	// buf is the bounded queue the handler fills and the worker drains.
+	buf *alertBuffer
+
+	// dropEpisode is set by the first buffer drop after a successful
+	// publish, so a full buffer logs once per outage, not once per alert.
+	dropEpisode atomic.Bool
 
 	// lastSeenUnixNano is when Falco last proved it was alive. Zero
 	// means never.
@@ -187,11 +222,9 @@ type Adapter struct {
 	addr   string
 
 	// seq serialises everything after decode: the liveness mark, the rate
-	// limiter, the publish and the health update. net/http runs handlers
-	// concurrently; without this a late failed publish could overwrite
-	// health after a later success, and events could reorder. Falco's
-	// http_output sends one request at a time, so this costs nothing in
-	// practice and gives natural backpressure if it ever does not.
+	// limiter and the enqueue, so alerts queue in the order the breaker
+	// saw them. Health after a publish is written only by the single
+	// worker, so a late failure cannot overwrite a later success.
 	seq sync.Mutex
 
 	nowFn func() time.Time
@@ -223,8 +256,17 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 	if cfg.HeartbeatTimeout <= 0 {
 		cfg.HeartbeatTimeout = 3 * time.Minute
 	}
-	if cfg.PublishWallClockBudget <= 0 {
-		cfg.PublishWallClockBudget = 12 * time.Second
+	if cfg.BufferMaxAlerts < 0 || cfg.BufferMaxBytes < 0 {
+		return nil, errors.New("falco: new: buffer bounds must not be negative")
+	}
+	if cfg.BufferMaxAlerts == 0 {
+		cfg.BufferMaxAlerts = DefaultBufferMaxAlerts
+	}
+	if cfg.BufferMaxBytes == 0 {
+		cfg.BufferMaxBytes = DefaultBufferMaxBytes
+	}
+	if cfg.ShutdownDrain <= 0 {
+		cfg.ShutdownDrain = 10 * time.Second
 	}
 	if cfg.ReadHeaderTimeout <= 0 {
 		cfg.ReadHeaderTimeout = 10 * time.Second
@@ -238,11 +280,8 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 	if cfg.IdleTimeout <= 0 {
 		cfg.IdleTimeout = 90 * time.Second
 	}
-	// Shutdown must outlast the detached publish budget: Run returning
-	// while a handler is still inside PublishJS lets main.go drain NATS
-	// under it. A shorter grace is raised rather than honoured.
-	if minGrace := cfg.PublishWallClockBudget + time.Second; cfg.ShutdownGrace < minGrace {
-		cfg.ShutdownGrace = minGrace
+	if cfg.ShutdownGrace <= 0 {
+		cfg.ShutdownGrace = 5 * time.Second
 	}
 	if cfg.PublishRetry.IsZero() {
 		cfg.PublishRetry = DefaultPublishRetry()
@@ -271,6 +310,7 @@ func New(cfg Config, nc natsPublisher, log *slog.Logger) (*Adapter, error) {
 		log:      log,
 		limiter:  limiter,
 		requests: requests,
+		buf:      newAlertBuffer(cfg.BufferMaxAlerts, cfg.BufferMaxBytes),
 		nowFn:    time.Now,
 	}
 	a.health.MarkUnhealthy(errors.New("falco: no heartbeat or alert received from Falco yet"))
@@ -304,6 +344,22 @@ func (a *Adapter) DroppedBySampling() int64 { return a.droppedBySampling.Load() 
 // publish error (for example over the stream's per-message cap).
 func (a *Adapter) PublishDrops() int64 { return a.publishDrops.Load() }
 
+// BufferDropped is the cumulative count of alerts dropped because the
+// queue was full (the oldest go first) or because one alert was larger
+// than the whole byte bound.
+func (a *Adapter) BufferDropped() int64 { return a.bufferDropped.Load() }
+
+// BufferDepth is the number of alerts queued for publish, not counting
+// the one the worker is publishing.
+func (a *Adapter) BufferDepth() int64 { n, _ := a.buf.stats(); return int64(n) }
+
+// BufferBytes is the marshalled size of the queued alerts.
+func (a *Adapter) BufferBytes() int64 { _, b := a.buf.stats(); return int64(b) }
+
+// ShutdownLost is how many queued alerts shutdown could not publish
+// within ShutdownDrain. They are also logged at Error.
+func (a *Adapter) ShutdownLost() int64 { return a.shutdownLost.Load() }
+
 // RequestsByCode is the cumulative count of responses with the given
 // status code. Codes outside ResponseCodes read 0.
 func (a *Adapter) RequestsByCode(code string) uint64 {
@@ -335,8 +391,10 @@ func (a *Adapter) Handler() http.Handler {
 	return mux
 }
 
-// Run binds ListenAddr, serves until ctx is cancelled, then drains
-// in-flight requests for ShutdownGrace. A bind failure is returned.
+// Run binds ListenAddr, starts the publish worker, and serves until ctx is
+// cancelled. Shutdown stops the listener (ShutdownGrace), closes the queue,
+// then lets the worker drain it for up to ShutdownDrain; the remainder is
+// counted in ShutdownLost. A bind failure is returned.
 func (a *Adapter) Run(ctx context.Context) error {
 	ln, err := net.Listen("tcp", a.cfg.ListenAddr)
 	if err != nil {
@@ -349,8 +407,20 @@ func (a *Adapter) Run(ctx context.Context) error {
 	a.log.Info("falco: http_output receiver listening",
 		"addr", a.addr,
 		"hostname", a.cfg.Hostname,
-		"heartbeat_timeout", a.cfg.HeartbeatTimeout)
+		"heartbeat_timeout", a.cfg.HeartbeatTimeout,
+		"buffer_max_alerts", a.cfg.BufferMaxAlerts,
+		"buffer_max_bytes", a.cfg.BufferMaxBytes)
 	defer a.log.Info("falco: adapter stopped")
+
+	// The worker gets its own context: it must outlive ctx to drain the
+	// queue after the listener stops.
+	workerCtx, stopWorker := context.WithCancel(context.Background())
+	defer stopWorker()
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		a.runWorker(workerCtx)
+	}()
 
 	srv := &http.Server{
 		Handler:           a.Handler(),
@@ -378,6 +448,7 @@ func (a *Adapter) Run(ctx context.Context) error {
 
 	select {
 	case err := <-serveErr:
+		a.drainOnShutdown(stopWorker, workerDone)
 		if err != nil {
 			a.health.MarkUnhealthy(err)
 			return fmt.Errorf("falco: serve: %w", err)
@@ -390,7 +461,36 @@ func (a *Adapter) Run(ctx context.Context) error {
 			a.log.Warn("falco: shutdown grace expired", "err", err)
 		}
 		<-serveErr
+		a.drainOnShutdown(stopWorker, workerDone)
 		return nil
+	}
+}
+
+// drainOnShutdown closes the queue so no new alert is accepted, gives the
+// worker ShutdownDrain to publish what is left, then counts and logs any
+// alert it could not publish. It returns once the worker has exited, so
+// main.go never closes NATS under a publish.
+func (a *Adapter) drainOnShutdown(stopWorker context.CancelFunc, workerDone <-chan struct{}) {
+	a.buf.close()
+	queued, _ := a.buf.stats()
+	timer := time.AfterFunc(a.cfg.ShutdownDrain, stopWorker)
+	<-workerDone
+	timer.Stop()
+	var lost int64
+	for {
+		if _, ok := a.buf.tryTake(); !ok {
+			break
+		}
+		lost++
+	}
+	if lost > 0 {
+		a.shutdownLost.Add(lost)
+		a.log.Error("falco: shutdown lost buffered alerts that NATS did not accept in time",
+			"lost", lost, "drain_budget", a.cfg.ShutdownDrain)
+		return
+	}
+	if queued > 0 {
+		a.log.Info("falco: shutdown drained the alert buffer", "alerts", queued)
 	}
 }
 
@@ -470,29 +570,112 @@ func (a *Adapter) handleAlert(w http.ResponseWriter, r *http.Request) {
 		ev.SamplingRate = d.SamplingRate
 	}
 
-	// Detached from the request so Falco hanging up does not abort a
-	// publish already in its retry budget; bounded so a stuck NATS
-	// cannot orphan the goroutine.
-	pubCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), a.cfg.PublishWallClockBudget)
-	defer cancel()
-	if err := a.publishWithRetry(pubCtx, ev); err != nil {
-		if isPermanentPublishError(err) {
+	size, err := marshalledSize(ev)
+	if err != nil {
+		a.log.Error("falco: alert does not marshal", "err", err, "rule", resp.GetRule())
+		a.respond(w, http.StatusBadRequest, "bad request")
+		return
+	}
+	if size > a.cfg.BufferMaxBytes {
+		// Can never fit, even in an empty queue. Counted with the other
+		// buffer drops; the queue is left alone.
+		a.bufferDropped.Add(1)
+		a.log.Error("falco: alert larger than the whole buffer byte bound, dropped",
+			"event_id", ev.ID, "bytes", size, "max_bytes", a.cfg.BufferMaxBytes, "rule", resp.GetRule())
+		a.respond(w, http.StatusNoContent, "")
+		return
+	}
+	dropped, ok := a.buf.push(bufferedAlert{ev: ev, size: size})
+	if !ok {
+		// Shutdown has begun. Falco logs the 503, so the loss is visible
+		// on both sides.
+		a.respond(w, http.StatusServiceUnavailable, "shutting down")
+		return
+	}
+	if dropped > 0 {
+		a.bufferDropped.Add(int64(dropped))
+		if a.dropEpisode.CompareAndSwap(false, true) {
+			depth, bytes := a.buf.stats()
+			a.log.Error("falco: alert buffer full, dropping the oldest alerts; is NATS down? (logged once per outage, see olaitan_sensor_falco_buffer_dropped_total)",
+				"depth", depth, "bytes", bytes,
+				"max_alerts", a.cfg.BufferMaxAlerts, "max_bytes", a.cfg.BufferMaxBytes)
+		}
+	}
+	a.respond(w, http.StatusNoContent, "")
+}
+
+// marshalledSize is the size of ev as PublishJS will send it.
+func marshalledSize(ev schema.Event) (int, error) {
+	b, err := json.Marshal(ev)
+	return len(b), err
+}
+
+// runWorker publishes queued alerts one at a time, in order, until ctx
+// ends or the queue is closed and empty. An alert it was holding when ctx
+// ended goes back to the head of the queue so shutdown can count it.
+func (a *Adapter) runWorker(ctx context.Context) {
+	for {
+		it, ok := a.buf.take(ctx)
+		if !ok {
+			return
+		}
+		if !a.deliver(ctx, it.ev) {
+			a.buf.requeue(it)
+			return
+		}
+	}
+}
+
+// deliver publishes ev until NATS takes it or rejects it permanently (both
+// return true), or ctx ends (false). A transient failure marks the source
+// unhealthy at once; only a success clears it.
+func (a *Adapter) deliver(ctx context.Context, ev schema.Event) bool {
+	for {
+		err := a.publishWithRetry(ctx, ev)
+		switch {
+		case err == nil:
+			// Health first, then the counter, so a reader that sees the
+			// count also sees the health it implies.
+			if a.publishFailing.Swap(false) {
+				depth, _ := a.buf.stats()
+				a.log.Info("falco: publishing again after a NATS failure", "queued", depth)
+			}
+			a.dropEpisode.Store(false)
+			a.health.MarkHealthy()
+			a.eventsPublished.Add(1)
+			return true
+		case isPermanentPublishError(err):
 			a.publishDrops.Add(1)
 			a.log.Error("falco: publish dropped (permanent, per-alert)",
 				"err", err, "event_id", ev.ID, "summary_bytes", len(ev.Summary))
-			a.respond(w, http.StatusNoContent, "")
-			return
+			return true
+		case ctx.Err() != nil:
+			return false
 		}
-		a.publishFailing.Store(true)
-		a.health.MarkUnhealthy(fmt.Errorf("falco: publish: %w", err))
-		a.log.Warn("falco: publish failed transiently", "err", err, "event_id", ev.ID)
-		a.respond(w, http.StatusServiceUnavailable, "publish failed")
-		return
+		// A strategy with MaxAttempts gave up on this round. The alert
+		// is not dropped; wait the backoff cap and go again.
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(a.cfg.PublishRetry.Max):
+		}
 	}
-	a.eventsPublished.Add(1)
-	a.publishFailing.Store(false)
-	a.health.MarkHealthy()
-	a.respond(w, http.StatusNoContent, "")
+}
+
+// markPublishFailing records a transient publish failure. It logs only on
+// the transition, so an outage is one Warn, not one per retry.
+//
+// The flag is set before health is marked, and sawFalco re-checks it after
+// marking healthy, so a heartbeat handled concurrently cannot leave the
+// source healthy while publishes fail.
+func (a *Adapter) markPublishFailing(err error, ev schema.Event) {
+	wasFailing := a.publishFailing.Swap(true)
+	a.health.MarkUnhealthy(fmt.Errorf("falco: publish: %w", err))
+	if !wasFailing {
+		depth, _ := a.buf.stats()
+		a.log.Warn("falco: publish failing, holding alerts in the buffer and retrying",
+			"err", err, "event_id", ev.ID, "queued", depth)
+	}
 }
 
 // sawFalco records that Falco is alive. It marks the source healthy only
@@ -502,6 +685,11 @@ func (a *Adapter) sawFalco() {
 	a.lastSeenUnixNano.Store(a.nowFn().UnixNano())
 	if !a.publishFailing.Load() {
 		a.health.MarkHealthy()
+		// The worker runs outside a.seq. If it started failing between
+		// the check and the mark, undo the mark (see markPublishFailing).
+		if a.publishFailing.Load() {
+			a.health.MarkUnhealthy(errors.New("falco: publish: failing, alerts held in the buffer"))
+		}
 	}
 }
 
@@ -551,7 +739,7 @@ func (a *Adapter) checkStaleness() {
 		silent.Round(time.Second), a.cfg.HeartbeatTimeout))
 }
 
-// publishWithRetry publishes ev to subjects.RawFalco with bounded retry.
+// publishWithRetry publishes ev to subjects.RawFalco with the retry strategy.
 // ev.ID travels as the Nats-Msg-Id header, so a retry the server already
 // persisted is deduplicated within the stream's window. A permanent
 // server-side error exits the retry loop at once.
@@ -566,6 +754,9 @@ func (a *Adapter) publishWithRetry(ctx context.Context, ev schema.Event) error {
 		}
 		if isPermanentPublishError(err) {
 			return retry.Permanent(err)
+		}
+		if ctx.Err() == nil {
+			a.markPublishFailing(err, ev)
 		}
 		return err
 	})

@@ -82,7 +82,7 @@ The catalogue is organised by registering ring + story, in commit chronology so 
 - **Type:** counter
 - **Unit:** count
 - **Labels:** `source` (constant `falco`), `code` (HTTP status the collector answered Falco with: `204`, `400`, `401`, `404`, `405`, `413`, `415`, `503`; cardinality 8, every series registered at start)
-- **Help:** Falco http_output requests answered by the collector, by HTTP status code. `401` means a request arrived without the right token, which is how a token mismatch between Falco and the collector shows up. `503` means NATS refused the publish; Falco does not retry, so those alerts are lost. `415` means Falco's `json_output` is off.
+- **Help:** Falco http_output requests answered by the collector, by HTTP status code. `401` means a request arrived without the right token, which is how a token mismatch between Falco and the collector shows up. `503` means the collector was shutting down and did not take the alert; Falco does not retry, so that alert is lost. Since issue #135 a NATS outage no longer causes `503`: alerts wait in the collector's buffer (see `olaitan_sensor_falco_buffer_dropped_total`). `415` means Falco's `json_output` is off.
 - **Sample PromQL (aggregate):** `sum(rate(olaitan_sensor_falco_http_requests_total[5m])) by (code)`.
 - **Sample PromQL (alert):** `rate(olaitan_sensor_falco_http_requests_total{code=~"401|503"}[5m]) > 0` for 5 minutes (alerts are being rejected or lost).
 
@@ -94,6 +94,15 @@ The catalogue is organised by registering ring + story, in commit chronology so 
 - **Help:** `alerts_received` counts authenticated, decodable Falco alerts whether or not they were published; the gap to `olaitan_sensor_events_total{source="falco"}` is what rate-limit sampling and publish failures cost. `heartbeats` counts Falco's periodic metrics snapshots (`falco.falco.metrics.interval`, 1m by default); they drive `olaitan_source_healthy{source="falco"}`, which drops to 0 after 3 minutes of silence, and are never published as events. `publish_drops` counts alerts dropped on a permanent publish error, such as the EVENTS_RAW per-message cap.
 - **Sample PromQL (aggregate):** `rate(olaitan_sensor_falco_heartbeats_total[5m]) * 60` (snapshots per minute, 1 per node when healthy).
 - **Sample PromQL (alert):** `increase(olaitan_sensor_falco_heartbeats_total[5m]) == 0` (Falco is down, or cannot reach this node's collector).
+
+#### `olaitan_sensor_falco_buffer_dropped_total`, `olaitan_sensor_falco_buffer_depth` and `olaitan_sensor_falco_buffer_bytes` (issue #135)
+
+- **Type:** counter (`buffer_dropped_total`), gauge (`buffer_depth`, `buffer_bytes`)
+- **Unit:** count (alerts), bytes
+- **Labels:** `source` (constant `falco`)
+- **Help:** The collector answers Falco as soon as an alert is in a bounded in-memory queue, and one worker publishes the queue to EVENTS_RAW in order, retrying each alert (100ms backoff doubling to 2s) until NATS takes it. So a NATS restart or outage delays alerts instead of losing them. `buffer_depth` and `buffer_bytes` are what is queued now (the alert being published is not counted). The bound is `falcoIngest.buffer.maxAlerts` (4096) and `falcoIngest.buffer.maxBytes` (16 MiB of marshalled events) per collector pod. When a new alert does not fit, the oldest queued alerts are dropped and `buffer_dropped_total` counts each one; an alert larger than the whole byte bound is dropped on arrival and counted too. The first drop of an outage is logged at Error once. On shutdown the collector stops listening, then publishes what is queued for up to 10s and logs at Error how many it could not publish. The queue is in memory: a collector crash or OOM loses what it holds.
+- **Sample PromQL (aggregate):** `max(olaitan_sensor_falco_buffer_depth) by (pod)`.
+- **Sample PromQL (alert):** `increase(olaitan_sensor_falco_buffer_dropped_total[5m]) > 0` (alerts were lost: NATS was unavailable longer than the buffer covers; raise the bound or fix NATS), and `olaitan_sensor_falco_buffer_depth > 0` for 5 minutes (NATS is not taking publishes).
 
 #### `olaitan_sensor_applog_sidecars` (Story 10.10)
 

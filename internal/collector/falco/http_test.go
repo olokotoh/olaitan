@@ -86,6 +86,18 @@ func newTestAdapter(t *testing.T, pub natsPublisher, mut func(*Config)) *Adapter
 	return a
 }
 
+// newRunningAdapter is newTestAdapter with the publish worker running, for
+// tests that check what reached NATS. The worker stops at test cleanup.
+func newRunningAdapter(t *testing.T, pub natsPublisher, mut func(*Config)) *Adapter {
+	t.Helper()
+	a := newTestAdapter(t, pub, mut)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); a.runWorker(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+	return a
+}
+
 func post(t *testing.T, a *Adapter, path, ctype string, body []byte) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
@@ -276,11 +288,12 @@ func TestNew_RateLimitFallbackAndCallerLimiter(t *testing.T) {
 
 func TestHandler_AcceptsARealAlertAndPublishesIt(t *testing.T) {
 	pub := &recordingPub{}
-	a := newTestAdapter(t, pub, nil)
+	a := newRunningAdapter(t, pub, nil)
 	rec := post(t, a, "/falco/"+testToken, "application/json", fixture(t, "http_output_alert.json"))
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("code = %d, want 204; body %q", rec.Code, rec.Body.String())
 	}
+	waitFor(t, "the publish", func() bool { return a.EventsTotal() == 1 })
 	if pub.count() != 1 || pub.subjects[0] != subjects.RawFalco {
 		t.Fatalf("published %d events to %v, want 1 to %s", pub.count(), pub.subjects, subjects.RawFalco)
 	}
@@ -362,30 +375,16 @@ func TestHandler_RejectsBadRequests(t *testing.T) {
 	})
 }
 
-func TestHandler_TransientPublishFailureIs503(t *testing.T) {
-	pub := &recordingPub{err: errors.New("nats: timeout")}
-	a := newTestAdapter(t, pub, nil)
-	rec := post(t, a, "/falco/"+testToken, "application/json", fixture(t, "http_output_alert.json"))
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("code = %d, want 503", rec.Code)
-	}
-	if a.EventsTotal() != 0 {
-		t.Error("a failed publish was counted as published")
-	}
-	if healthy, _ := a.Health().Status(); healthy {
-		t.Error("source reported healthy while NATS is refusing publishes")
-	}
-}
-
 func TestHandler_PermanentPublishFailureDropsWithoutRetryLoop(t *testing.T) {
 	pub := &recordingPub{err: errors.New("nats: maximum payload exceeded")}
-	a := newTestAdapter(t, pub, nil)
+	a := newRunningAdapter(t, pub, nil)
 	rec := post(t, a, "/falco/"+testToken, "application/json", fixture(t, "http_output_alert.json"))
 	// Falco does not retry, so a non-2xx gains nothing; the drop is logged
-	// and counted instead.
+	// and counted instead, and the worker moves on instead of retrying.
 	if rec.Code != http.StatusNoContent {
 		t.Errorf("code = %d, want 204", rec.Code)
 	}
+	waitFor(t, "the permanent drop", func() bool { return a.PublishDrops() == 1 })
 	if a.PublishDrops() != 1 {
 		t.Errorf("PublishDrops = %d, want 1", a.PublishDrops())
 	}
@@ -397,13 +396,14 @@ func TestHandler_RateLimitedAlertIsAcceptedAndCounted(t *testing.T) {
 		t.Fatal(err)
 	}
 	pub := &recordingPub{}
-	a := newTestAdapter(t, pub, func(c *Config) { c.RateLimit = l })
+	a := newRunningAdapter(t, pub, func(c *Config) { c.RateLimit = l })
 	for i := 0; i < 5; i++ {
 		body := bytes.Replace(fixture(t, "http_output_alert.json"), []byte("544857414"), []byte("54485741"+string(rune('0'+i))), 1)
 		if rec := post(t, a, "/falco/"+testToken, "application/json", body); rec.Code != http.StatusNoContent {
 			t.Fatalf("alert %d: code = %d", i, rec.Code)
 		}
 	}
+	waitFor(t, "every allowed alert published", func() bool { return int64(pub.count())+a.DroppedBySampling() == 5 })
 	if a.DroppedBySampling() == 0 {
 		t.Error("an engaged breaker with sampling 0 dropped nothing")
 	}
@@ -493,8 +493,8 @@ func TestRun_ServesOverRealHTTP(t *testing.T) {
 		t.Fatalf("POST: %v", err)
 	}
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent || pub.count() != 1 {
-		t.Errorf("status %d, published %d", resp.StatusCode, pub.count())
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("status %d", resp.StatusCode)
 	}
 	cancel()
 	select {
@@ -504,6 +504,9 @@ func TestRun_ServesOverRealHTTP(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Run did not return after cancellation")
+	}
+	if pub.count() != 1 {
+		t.Errorf("published %d after a clean shutdown, want 1", pub.count())
 	}
 }
 
@@ -529,10 +532,11 @@ func TestHandler_InternalAlertOtherThanSnapshotIsPublished(t *testing.T) {
 		t.Fatal("fixture no longer carries the snapshot rule name")
 	}
 	pub := &recordingPub{}
-	a := newTestAdapter(t, pub, nil)
+	a := newRunningAdapter(t, pub, nil)
 	if rec := post(t, a, "/falco/"+testToken, "application/json", body); rec.Code != http.StatusNoContent {
 		t.Fatalf("code = %d", rec.Code)
 	}
+	waitFor(t, "the publish", func() bool { return a.EventsTotal() == 1 })
 	if pub.count() != 1 {
 		t.Errorf("syscall-event-drop alert published %d times, want 1", pub.count())
 	}
@@ -545,45 +549,28 @@ func TestHandler_InternalAlertOtherThanSnapshotIsPublished(t *testing.T) {
 // While NATS refuses publishes the source must stay unhealthy, however
 // many snapshots arrive; a successful publish is what clears it.
 func TestHealth_HeartbeatDoesNotMaskPublishFailure(t *testing.T) {
-	pub := &recordingPub{err: errors.New("nats: timeout")}
-	a := newTestAdapter(t, pub, nil)
+	pub := &outagePub{down: true}
+	a := newRunningAdapter(t, pub, nil)
 	snap := fixture(t, "http_output_metrics_snapshot.json")
-	alert := fixture(t, "http_output_alert.json")
 
 	post(t, a, "/falco/"+testToken, "application/json", snap)
 	if healthy, _ := a.Health().Status(); !healthy {
 		t.Fatal("first heartbeat did not mark healthy")
 	}
-	if rec := post(t, a, "/falco/"+testToken, "application/json", alert); rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("alert code = %d, want 503", rec.Code)
+	if rec := post(t, a, "/falco/"+testToken, "application/json", alertN(t, 1)); rec.Code != http.StatusNoContent {
+		t.Fatalf("alert code = %d, want 204 (queued)", rec.Code)
 	}
+	waitFor(t, "a failed publish", func() bool { return pub.nAttempts() > 0 })
+	waitFor(t, "unhealthy", func() bool { healthy, _ := a.Health().Status(); return !healthy })
 	post(t, a, "/falco/"+testToken, "application/json", snap)
 	if healthy, _ := a.Health().Status(); healthy {
 		t.Error("a heartbeat marked the source healthy while NATS is still refusing publishes")
 	}
 
-	pub.mu.Lock()
-	pub.err = nil
-	pub.mu.Unlock()
-	post(t, a, "/falco/"+testToken, "application/json", alert)
-	if healthy, _ := a.Health().Status(); !healthy {
-		t.Error("a successful publish did not restore health")
-	}
-}
-
-// Shutdown must outlast the detached publish budget, or main.go drains NATS
-// under a handler still inside PublishJS.
-func TestNew_ShutdownGraceCoversThePublishBudget(t *testing.T) {
-	a := newTestAdapter(t, &recordingPub{}, nil)
-	if a.cfg.ShutdownGrace <= a.cfg.PublishWallClockBudget {
-		t.Errorf("ShutdownGrace %s <= PublishWallClockBudget %s", a.cfg.ShutdownGrace, a.cfg.PublishWallClockBudget)
-	}
-	b := newTestAdapter(t, &recordingPub{}, func(c *Config) {
-		c.ShutdownGrace = time.Second
-		c.PublishWallClockBudget = 10 * time.Second
-	})
-	if b.cfg.ShutdownGrace <= b.cfg.PublishWallClockBudget {
-		t.Errorf("an explicit ShutdownGrace below the publish budget was kept: %s <= %s", b.cfg.ShutdownGrace, b.cfg.PublishWallClockBudget)
+	pub.setDown(false)
+	waitFor(t, "health restored by a successful publish", func() bool { healthy, _ := a.Health().Status(); return healthy })
+	if a.EventsTotal() != 1 {
+		t.Errorf("EventsTotal = %d, want 1 (the queued alert, delivered late)", a.EventsTotal())
 	}
 }
 
@@ -594,17 +581,18 @@ func TestNew_ShutdownGraceCoversThePublishBudget(t *testing.T) {
 // publish outcome.
 func TestHandler_ConcurrentAlertsKeepHealthSequenced(t *testing.T) {
 	pub := &togglePub{}
-	a := newTestAdapter(t, pub, nil)
-	body := fixture(t, "http_output_alert.json")
+	a := newRunningAdapter(t, pub, nil)
 	var wg sync.WaitGroup
 	for i := 0; i < 64; i++ {
 		wg.Add(1)
-		go func() {
+		go func(i int) {
 			defer wg.Done()
-			post(t, a, "/falco/"+testToken, "application/json", body)
-		}()
+			post(t, a, "/falco/"+testToken, "application/json", alertN(t, i))
+		}(i)
 	}
 	wg.Wait()
+	// Every failed publish is retried, so all 64 get through.
+	waitFor(t, "64 publishes", func() bool { return a.EventsTotal() == 64 })
 	if pub.maxInFlight() > 1 {
 		t.Errorf("%d publishes ran at once; the publish path must be sequential", pub.maxInFlight())
 	}

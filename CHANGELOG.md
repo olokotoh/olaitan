@@ -20,6 +20,22 @@ and false-positive numbers; see [Unreleased](#unreleased).
 
 ### Added
 
+- **A NATS outage no longer loses Falco alerts** (#135). Falco's
+  `http_output` does not retry a failed POST, and the collector used to
+  publish inside the request and answer `503` after about 9s of NATS
+  refusing, so every alert raised during a NATS restart was gone. The
+  collector now answers once the alert is in a bounded in-memory queue
+  (`falcoIngest.buffer.maxAlerts`, default 4096, and
+  `falcoIngest.buffer.maxBytes`, default 16 MiB of marshalled events, per
+  collector pod) and one worker publishes it to EVENTS_RAW in order,
+  retrying with backoff until NATS takes it. When the queue is full the
+  oldest alerts are dropped and counted in
+  `olaitan_sensor_falco_buffer_dropped_total`; `olaitan_sensor_falco_buffer_depth`
+  and `olaitan_sensor_falco_buffer_bytes` show what is waiting. Shutdown
+  stops listening, drains for up to 10s and logs what it could not publish.
+  `503` from the Falco ingest now means only "shutting down". The queue is
+  in memory, so a collector crash still loses what it holds.
+
 - **A kind cluster the Calico flow sensor can actually run against**
   (#140). `hack/install-calico-kind.sh` creates or reuses a kind cluster
   from `hack/kind-calico-config.yaml` (kindnetd off, pod CIDR

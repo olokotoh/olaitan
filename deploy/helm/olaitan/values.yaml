@@ -166,6 +166,18 @@ falcoIngest:
   # `from:` entries, e.g. [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: falco}}}].
   # @schema type:array effect:"additional NetworkPolicy peers allowed to post to the Falco ingest port" ref:NFR11
   extraFrom: []
+  # Issue #135: Falco's http_output does not retry, so the collector answers
+  # Falco once an alert is in this bounded in-memory queue and one worker
+  # publishes it to NATS, retrying until NATS takes it. A NATS restart or
+  # outage then delays alerts instead of losing them. When the queue is full
+  # the oldest alerts are dropped and counted in
+  # olaitan_sensor_falco_buffer_dropped_total. Per collector pod; the 16 MiB
+  # default fits the collector's 256Mi limit. In memory: a crash loses it.
+  buffer:
+    # @schema type:integer minimum:1 effect:"most Falco alerts a collector pod queues while NATS is unavailable before dropping the oldest" ref:FR1
+    maxAlerts: 4096
+    # @schema type:integer minimum:1 effect:"most bytes (marshalled events) a collector pod queues for NATS before dropping the oldest Falco alerts" ref:FR1
+    maxBytes: 16777216
 
 # --- Operator-provided secrets ----------------------------------------
 # All three default to "" so the Secret always renders (downstream pods
