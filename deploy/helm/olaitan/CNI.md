@@ -249,12 +249,16 @@ these values and mounts it at `/etc/olaitan/cni/`.
 
 **Caveat: Path B is not rotation-aware.** When the Tigera-issued
 Secret rotates, the operator must re-extract the new material and
-`helm upgrade` the chart. Path A is the production target. That
-upgrade takes effect by itself: the collector DaemonSet's pod template
-carries a `checksum/cni-tls` annotation (the sha256 of the data of the
-chart-rendered `<release>-cni-tls` Secret), so new PEM values roll the
-collector without a manual restart, and an upgrade that changes no PEM
-leaves it running.
+`helm upgrade` the chart. Path A is the production target. The
+collector DaemonSet's pod template carries a `checksum/cni-tls`
+annotation (the sha256 of the data of the chart-rendered
+`<release>-cni-tls` Secret), so new PEM values roll the collector and
+take effect at once, and an upgrade that changes no PEM leaves it
+running. Without the roll the adapter would still pick the new files up,
+but only on its next reconnect to Goldmane, and an established stream
+can last indefinitely. The cost is that the roll restarts the whole
+collector, so every source it runs on that node, the audit receiver
+included, has a brief gap while its pod is replaced.
 
 #### Borrowed identity: the collector authenticates to Goldmane AS Whisker
 

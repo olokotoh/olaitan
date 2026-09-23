@@ -3,9 +3,14 @@
 package helm_test
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -88,6 +93,9 @@ type checksumCase struct {
 	// rotate lists the values whose change must roll the workload: every
 	// key the rendered Secret carries.
 	rotate []string
+	// ignore lists values of the same source that are NOT in the mounted
+	// Secret, so changing them must leave the checksum alone.
+	ignore []string
 }
 
 func checksumCases() []checksumCase {
@@ -99,6 +107,9 @@ func checksumCases() []checksumCase {
 			workload:   "olaitan-applog-injector",
 			annotation: "checksum/applog-tls",
 			rotate:     []string{"applogSidecar.tls.servingCert", "applogSidecar.tls.servingKey"},
+			// D3: caBundle lives on the MutatingWebhookConfiguration,
+			// which the apiserver reads; the injector never does.
+			ignore: []string{"applogSidecar.tls.caBundle"},
 		},
 		{
 			name:       "audit",
@@ -107,6 +118,9 @@ func checksumCases() []checksumCase {
 			workload:   "olaitan-collector",
 			annotation: "checksum/audit-tls",
 			rotate:     []string{"auditWebhook.servingCert", "auditWebhook.servingKey", "auditWebhook.clusterCAData"},
+			// The apiserver-side material goes into the kubeconfig Secret
+			// the apiserver reads, not into the receiver's mount.
+			ignore: []string{"auditWebhook.caBundle", "auditWebhook.apiserverClientCert", "auditWebhook.apiserverClientKey"},
 		},
 		{
 			name:       "calico-path-b",
@@ -143,6 +157,89 @@ func TestTLSSecretChangeRollsTheMountingWorkload(t *testing.T) {
 				if after == before {
 					t.Errorf("changing %s left %s at %q: the pods would keep the old material", key, tc.annotation, before)
 				}
+			}
+			for _, key := range tc.ignore {
+				args := replaceSet(tc.base, key, "cm90YXRlZA==")
+				after := podTemplateAnnotations(t, helmTemplate(t, args), tc.kind, tc.workload)[tc.annotation]
+				if after != before {
+					t.Errorf("changing %s (not in the mounted Secret) moved %s from %q to %q: a needless rollout", key, tc.annotation, before, after)
+				}
+			}
+		})
+	}
+}
+
+// TestTLSChecksumsOnOneDaemonSetMoveIndependently: with the audit
+// receiver and Calico Path B both on, the collector carries both
+// checksums (and the scrape annotations), and rotating one source's
+// material moves only that source's checksum.
+func TestTLSChecksumsOnOneDaemonSetMoveIndependently(t *testing.T) {
+	base := append(append(append([]string{}, noSubcharts...), auditWebhookEnabledArgs()...), calicoSensorPathBArgs()...)
+	before := podTemplateAnnotations(t, helmTemplate(t, base), "DaemonSet", "olaitan-collector")
+	for _, k := range []string{"checksum/audit-tls", "checksum/cni-tls", "prometheus.io/scrape"} {
+		if before[k] == "" {
+			t.Fatalf("collector annotations = %v, missing %s", before, k)
+		}
+	}
+	for _, step := range []struct{ key, moves, stays string }{
+		{"auditWebhook.servingCert", "checksum/audit-tls", "checksum/cni-tls"},
+		{"calicoSensor.tls.clientCert", "checksum/cni-tls", "checksum/audit-tls"},
+	} {
+		after := podTemplateAnnotations(t, helmTemplate(t, replaceSet(base, step.key, "cm90YXRlZA==")), "DaemonSet", "olaitan-collector")
+		if after[step.moves] == before[step.moves] {
+			t.Errorf("changing %s left %s unchanged", step.key, step.moves)
+		}
+		if after[step.stays] != before[step.stays] {
+			t.Errorf("changing %s moved %s too", step.key, step.stays)
+		}
+	}
+}
+
+// TestTLSChecksumSurvivesChartVersionBump renders a copy of the chart
+// whose only change is Chart.yaml's version. The Secrets' helm.sh/chart
+// label moves; the checksums must not, or every chart upgrade would roll
+// the collector and the injector with no cert change.
+func TestTLSChecksumSurvivesChartVersionBump(t *testing.T) {
+	bumped := filepath.Join(t.TempDir(), "olaitan")
+	if err := os.CopyFS(bumped, os.DirFS(chartDir(t))); err != nil {
+		t.Fatalf("copy chart: %v", err)
+	}
+	chartYAML := filepath.Join(bumped, "Chart.yaml")
+	raw, err := os.ReadFile(chartYAML)
+	if err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile(`(?m)^version:.*$`)
+	if !re.Match(raw) {
+		t.Fatal("Chart.yaml has no version line")
+	}
+	if err := os.WriteFile(chartYAML, re.ReplaceAll(raw, []byte("version: 99.0.0-checksumtest")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	render := func(dir string, sets []string) string {
+		args := []string{"template", "olaitan", dir, "--set", "secrets.redisPassword=test-password"}
+		for _, s := range sets {
+			args = append(args, "--set", s)
+		}
+		var out, errb bytes.Buffer
+		cmd := exec.Command("helm", args...)
+		cmd.Stdout, cmd.Stderr = &out, &errb
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("helm template %s: %v\n%s", dir, err, errb.String())
+		}
+		return out.String()
+	}
+	for _, tc := range checksumCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			orig := render(chartDir(t), tc.base)
+			bump := render(bumped, tc.base)
+			if !strings.Contains(bump, "helm.sh/chart: olaitan-99.0.0-checksumtest") {
+				t.Fatalf("bumped render does not carry the bumped chart label, so this test proves nothing")
+			}
+			a := podTemplateAnnotations(t, orig, tc.kind, tc.workload)[tc.annotation]
+			b := podTemplateAnnotations(t, bump, tc.kind, tc.workload)[tc.annotation]
+			if a == "" || a != b {
+				t.Errorf("%s = %q on the chart and %q after a version-only bump", tc.annotation, a, b)
 			}
 		})
 	}

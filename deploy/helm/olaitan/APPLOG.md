@@ -191,9 +191,21 @@ Secret, even after the kubelet has refreshed the files.
   `applogSidecar.tls.servingCert` or `servingKey` changes the checksum,
   so the Deployment rolls on its own; no `kubectl rollout restart` is
   needed. Upgrades that change no cert leave the checksum, and the
-  pods, alone. Rotate the cert and `applogSidecar.tls.caBundle` in the
-  same upgrade: the new pods serve the new cert, and the
-  MutatingWebhookConfiguration must already trust its CA.
+  pods, alone. `applogSidecar.tls.caBundle` is not part of the checksum:
+  it lives on the MutatingWebhookConfiguration, which the apiserver
+  reads, not in the Secret the injector mounts.
+
+  A new cert signed by the **same** CA needs one upgrade and has no
+  gap. A new **CA** needs care, because the MutatingWebhookConfiguration
+  switches to the new caBundle at once while old injector pods keep
+  serving the old cert until the rollout replaces them; any Pod
+  admitted in that window gets no sidecar. For a gap-free CA change,
+  use three upgrades:
+  1. set `caBundle` to the old and new CA PEMs concatenated (base64 of
+     both), cert unchanged;
+  2. set `servingCert` / `servingKey` to the pair the new CA signed
+     (the injector rolls);
+  3. set `caBundle` to the new CA alone.
 - **Path A (cert-manager).** cert-manager writes the Secret, not helm,
   so a render-time checksum cannot see a renewal and the chart does not
   add one. After cert-manager renews the Certificate, restart the

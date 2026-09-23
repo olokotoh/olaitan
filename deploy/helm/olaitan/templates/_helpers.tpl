@@ -723,6 +723,9 @@ Usage: include "olaitan.tlsSecretChecksum" (dict "root" $ "template" "audit-webh
 */}}
 {{- define "olaitan.tlsSecretChecksum" -}}
 {{- $secret := include (print .root.Template.BasePath "/" .template) .root | fromYaml -}}
+{{- if hasKey $secret "Error" -}}
+{{- fail (printf "olaitan.tlsSecretChecksum: %s did not render as one YAML document: %s" .template $secret.Error) -}}
+{{- end -}}
 {{- if not $secret.data -}}
 {{- fail (printf "olaitan.tlsSecretChecksum: %s rendered no Secret data; the caller must gate on the same condition as the Secret" .template) -}}
 {{- end -}}
