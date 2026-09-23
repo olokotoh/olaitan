@@ -200,7 +200,7 @@ spec:
             # "insufficient storage" on a constrained NATS PVC. This was masked in
             # lighter arms where the aggregator usually created the streams first.
             - name: OLT_NATS_STREAM_MAXBYTES_OVERRIDE
-              value: {{ . | quote }}
+              value: {{ include "olaitan.natsStreamMaxBytesOverride" $ | quote }}
             {{- end }}
           livenessProbe:
             httpGet:

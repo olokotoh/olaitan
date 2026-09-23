@@ -3,6 +3,12 @@
 # the fake-LLM fixture (fake-llm.yaml). Layered with `helm upgrade
 # --reuse-values` by `make e2e-full-report-archive`; never installed alone.
 #
+# The overlay persists: after the target runs, the kind-full release keeps
+# the fake-LLM endpoints, the 5s warm-up, the archive and the Falco exception
+# below. A later `helm upgrade --reuse-values` inherits all of them.
+# Running make e2e-full restores the profile, because it upgrades without
+# --reuse-values.
+#
 # forensics.enabled stays OFF on purpose. That is the operator this story is
 # for: someone who wants an archived report without full forensic capture.
 # The S3 credentials must still reach the aggregator (AC1).

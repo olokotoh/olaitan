@@ -383,6 +383,13 @@ e2e-local-forensics: helm-prepare helm-deps docker-build
 # MinIO dev-KMS and fake-LLM fixtures, then runs the gated e2e test. The test
 # attacks for real (a /etc/shadow read inside a fresh pod) and publishes
 # nothing to NATS. Needs the kind-full cluster up first (`make e2e-full`).
+#
+# The overlay STAYS in the shared kind-full release after this target: the
+# fake-LLM endpoints, the 5s baseline warm-up, the report archive and the
+# Falco kind-hook exception. Any later `helm upgrade --reuse-values` (for
+# example a Story 10.6 real-LLM run) inherits them and would talk to
+# fake-llm without saying so. make e2e-full restores the profile, because it
+# upgrades without --reuse-values.
 FULL_CLUSTER_NAME ?= olaitan-full
 FULL_OUT_DIR ?= $(HOME)/.olaitan-full
 .PHONY: e2e-full-report-archive
@@ -395,6 +402,10 @@ e2e-full-report-archive: helm-prepare helm-deps docker-build
 	kind load docker-image $(IMAGE):$(TAG) olaitan:dev --name $(FULL_CLUSTER_NAME)
 	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig kubectl apply -n default \
 		-f tests/e2e/fixtures/fake-llm.yaml -f tests/e2e/fixtures/minio.yaml
+	# An unchanged apply does not restart fake-llm (olaitan:dev, pullPolicy
+	# Never), so a rerun would test the previous build. Restart it.
+	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig kubectl rollout restart deploy/fake-llm -n default
+	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig kubectl rollout status deploy/fake-llm -n default --timeout=180s
 	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig kubectl wait -n default \
 		--for=condition=available --timeout=180s deploy/fake-llm deploy/minio
 	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig kubectl exec -n default deploy/minio -- sh -c '\
@@ -410,6 +421,7 @@ e2e-full-report-archive: helm-prepare helm-deps docker-build
 	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig \
 		KIND_CLUSTER_NAME=$(FULL_CLUSTER_NAME) OLT_E2E_FULL=1 OLT_E2E_REPORT_ARCHIVE=1 \
 		go test -tags=e2e -v -count=1 -timeout 15m -run 'TestReportArchive_RealIncidentOnFullProfile|TestFalcoSourceIsLive' ./tests/e2e/...
+	@echo 'NOTE: the report-archive overlay stays in the release (fake-LLM, 5s warm-up, archive on); make e2e-full restores the kind-full profile.'
 
 # Story 6.6 (AC5): the deployment-posture overlay smoke. Installs ONE posture
 # overlay (default air-gapped, the richest commitment surface: in-cluster ollama

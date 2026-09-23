@@ -129,7 +129,10 @@ func fakeLLMVerdict(role, eventID string) string {
 	case "dfir":
 		// report.v1 requires exactly one property: narrative
 		// (additionalProperties is false, so nothing else may be sent).
-		return `{"narrative":"The workload read a ServiceAccount token and then opened an external connection. The controller escalated it from CLEAN to SUSPICIOUS and then to RESTRICTED as the threat score crossed each configured threshold, and the recorded containment actions were applied. No further technique was evidenced beyond what the assessment records."}`
+		// The text is labelled as fixture output and asserts no incident
+		// facts: it lands in archived reports quoted as live evidence, and
+		// canned facts would contradict the real incident (Story 10.7).
+		return `{"narrative":"This is a fixture narrative from the fake LLM; no model interpreted this incident. The timeline, containment actions and ATT&CK annotations in this report are assembled by the controller from recorded evidence, and are the only factual sections."}`
 	case "l2":
 		return fmt.Sprintf(`{"verdict":"confirmed","verified_evidence":[{"event_id":%q,"finding":"credential read confirmed by ancestry"}],"confidence":78}`, eventID)
 	case "senior":

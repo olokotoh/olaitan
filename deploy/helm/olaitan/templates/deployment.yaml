@@ -137,8 +137,9 @@ spec:
             # Story 4.2 (FR36/NFR8): project the S3 credentials into the env
             # vars the S3 uploaders read. Only mounted when something actually
             # uploads, so a deployment with neither carries no S3 credentials.
-            # An empty value makes wireForensicsController fail fast at startup
-            # (the REDIS_PASSWORD precedent).
+            # An empty value makes the enabled consumer fail fast at startup
+            # (wireForensicsController for forensics, wireReportArchive for
+            # the report archive; the REDIS_PASSWORD precedent).
             #
             # Story 10.7: reportArchive is the SECOND consumer of this bucket
             # and is gated by its own flag. Until this story the condition read
@@ -180,7 +181,7 @@ spec:
             # streamConfigs sum (160 GiB). Production deployments leave
             # this empty and size the NATS PVC instead.
             - name: OLT_NATS_STREAM_MAXBYTES_OVERRIDE
-              value: {{ . | quote }}
+              value: {{ include "olaitan.natsStreamMaxBytesOverride" $ | quote }}
             {{- end }}
             {{- range .Values.aggregator.extraEnv }}
             # Operator-supplied aggregator environment (PR #92 review: the

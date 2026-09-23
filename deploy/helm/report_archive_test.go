@@ -3,7 +3,9 @@
 package helm_test
 
 import (
+	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -61,20 +63,96 @@ func TestForensicsStillGetsS3CredentialsAlone(t *testing.T) {
 	}
 }
 
-// TestStreamMaxBytesOverrideSurvivesSet is AC2. `--set` parses a bare integer
-// as a float64, so a large byte count renders in scientific notation
-// (5.36870912e+08) and NATS rejects it. The chart's own default is already a
-// quoted string; the defect is that an operator following the documented
-// `--set` route gets the float. The value must reach the rendered config as
-// plain digits whichever route is used.
-func TestStreamMaxBytesOverrideSurvivesSet(t *testing.T) {
-	out := helmTemplate(t, []string{"nats.streamMaxBytesOverride=536870912"})
-	if strings.Contains(out, "5.36870912e+08") || strings.Contains(out, "5.36870912e8") {
-		t.Error("--set nats.streamMaxBytesOverride=536870912 rendered in scientific notation; " +
-			"NATS cannot parse it. Type the value as a string in the schema, or parse the float.")
+// streamOverrideEnv returns the value of every OLT_NATS_STREAM_MAXBYTES_OVERRIDE
+// env entry in the rendered manifests, one per workload that carries it.
+func streamOverrideEnv(rendered string) []string {
+	re := regexp.MustCompile(`- name: OLT_NATS_STREAM_MAXBYTES_OVERRIDE\s*\n\s*value:\s*(.*)`)
+	var got []string
+	for _, m := range re.FindAllStringSubmatch(rendered, -1) {
+		got = append(got, strings.TrimSpace(m[1]))
 	}
-	if !strings.Contains(out, "536870912") {
-		t.Error("--set nats.streamMaxBytesOverride=536870912 did not reach the rendered manifest as plain digits")
+	return got
+}
+
+// helmRender runs `helm template` with raw extra args (so a test can use -f
+// and --set-json, not only --set) and returns stdout, stderr and the error.
+func helmRender(t *testing.T, extra ...string) (string, string, error) {
+	t.Helper()
+	args := append([]string{"template", "olaitan", chartDir(t),
+		"--set", "secrets.redisPassword=test-password"}, extra...)
+	cmd := exec.Command("helm", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	return stdout.String(), stderr.String(), err
+}
+
+// TestStreamMaxBytesOverrideSurvivesEveryRoute is AC2. The aggregator
+// (internal/nats/streams.go) parses OLT_NATS_STREAM_MAXBYTES_OVERRIDE with
+// strconv.ParseInt and, on failure, silently drops the cap. A values file
+// (-f, the normal operator route) and --set-json both hand Helm an unquoted
+// integer as float64, and `quote` then renders "5.36870912e+08", so the cap
+// vanished without any error and streams got production MaxBytes on a small
+// PVC. `--set` happens to parse bare integers as int64 in Helm 3.16, which is
+// why a --set-only probe looked clean. Every route must render plain digits.
+//
+// The value is deliberately NOT the chart default (536870912), so the check
+// cannot pass by the operator's value being ignored.
+func TestStreamMaxBytesOverrideSurvivesEveryRoute(t *testing.T) {
+	const want = `"1073741824"`
+	valuesFile := filepath.Join(t.TempDir(), "override.yaml")
+	if err := os.WriteFile(valuesFile, []byte("nats:\n  streamMaxBytesOverride: 1073741824\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	routes := map[string][]string{
+		"--set":        {"--set", "nats.streamMaxBytesOverride=1073741824"},
+		"--set-string": {"--set-string", "nats.streamMaxBytesOverride=1073741824"},
+		"--set-json":   {"--set-json", "nats.streamMaxBytesOverride=1073741824"},
+		"-f values":    {"-f", valuesFile},
+	}
+	for name, args := range routes {
+		t.Run(name, func(t *testing.T) {
+			out, stderr, err := helmRender(t, args...)
+			if err != nil {
+				t.Fatalf("helm template %v failed: %v\n%s", args, err, stderr)
+			}
+			got := streamOverrideEnv(out)
+			// Two consumers: the aggregator Deployment and the collector DaemonSet.
+			if len(got) != 2 {
+				t.Fatalf("want OLT_NATS_STREAM_MAXBYTES_OVERRIDE on the Deployment and the DaemonSet (2), got %d: %v", len(got), got)
+			}
+			for _, v := range got {
+				if v != want {
+					t.Errorf("%s: OLT_NATS_STREAM_MAXBYTES_OVERRIDE rendered as %s, want %s; "+
+						"streams.go ParseInt would reject it and silently drop the cap", name, v, want)
+				}
+			}
+		})
+	}
+}
+
+// TestStreamMaxBytesOverrideRejectsNonDigits: a value that cannot be a byte
+// count must fail the install instead of rendering something the aggregator
+// silently ignores.
+func TestStreamMaxBytesOverrideRejectsNonDigits(t *testing.T) {
+	for _, bad := range []string{"512Mi", "-1", "1.5", "0"} {
+		_, stderr, err := helmRender(t, "--set-string", "nats.streamMaxBytesOverride="+bad)
+		if err == nil {
+			t.Errorf("nats.streamMaxBytesOverride=%q rendered; want a fail-fast error", bad)
+			continue
+		}
+		if !strings.Contains(stderr, "streamMaxBytesOverride") {
+			t.Errorf("nats.streamMaxBytesOverride=%q failed without naming the value: %s", bad, stderr)
+		}
+	}
+	// Empty stays the production path: no env var at all.
+	out, stderr, err := helmRender(t, "--set-string", "nats.streamMaxBytesOverride=")
+	if err != nil {
+		t.Fatalf("empty override must render: %v\n%s", err, stderr)
+	}
+	if got := streamOverrideEnv(out); len(got) != 0 {
+		t.Errorf("empty override must render no OLT_NATS_STREAM_MAXBYTES_OVERRIDE, got %v", got)
 	}
 }
 
@@ -117,5 +195,64 @@ func TestFixtureKMSKeyMatchesEveryAlias(t *testing.T) {
 				t.Errorf("%s passes kms_key_alias %q, but the MinIO fixture's KMS only knows %q", rel, f[1], key)
 			}
 		}
+	}
+}
+
+// makeTarget returns the recipe of one Makefile target: its rule line and
+// every following tab-indented line.
+func makeTarget(t *testing.T, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(repoRoot(t), "Makefile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(b), "\n")
+	for i, l := range lines {
+		if !strings.HasPrefix(l, name+":") {
+			continue
+		}
+		out := []string{l}
+		for _, r := range lines[i+1:] {
+			if !strings.HasPrefix(r, "\t") {
+				break
+			}
+			out = append(out, r)
+		}
+		return strings.Join(out, "\n")
+	}
+	t.Fatalf("Makefile has no %s target", name)
+	return ""
+}
+
+// TestReportArchiveTargetIsRerunnable covers two review findings on the
+// e2e-full-report-archive target (Story 10.7 round 1).
+//
+// fake-llm.yaml runs image olaitan:dev with imagePullPolicy Never, so after
+// `kind load` of a new build an unchanged `kubectl apply` leaves the old pod
+// (and the old fake-LLM binary) running. The target must restart it.
+//
+// The target layers its overlay with --reuse-values, so the fake-LLM
+// endpoints, the 5s warm-up and the archive stay in the shared kind-full
+// release afterwards. A later run that also reuses values (Story 10.6's
+// real-LLM run) would talk to fake-llm without saying so. The target must
+// tell the operator that, and how to restore the profile.
+func TestReportArchiveTargetIsRerunnable(t *testing.T) {
+	recipe := makeTarget(t, "e2e-full-report-archive")
+	load := strings.Index(recipe, "kind load docker-image")
+	restart := strings.Index(recipe, "rollout restart deploy/fake-llm")
+	status := strings.Index(recipe, "rollout status deploy/fake-llm")
+	if load < 0 || restart < load || status < restart {
+		t.Errorf("e2e-full-report-archive must `kubectl rollout restart deploy/fake-llm` and wait on `rollout status` after `kind load`, "+
+			"or a rerun tests the previous fake-LLM binary (load=%d restart=%d status=%d)", load, restart, status)
+	}
+	if !strings.Contains(recipe, "overlay stays in the release") || !strings.Contains(recipe, "make e2e-full restores") {
+		t.Error("e2e-full-report-archive must print that its overlay stays in the kind-full release and that `make e2e-full` restores the profile")
+	}
+	b, err := os.ReadFile(filepath.Join(repoRoot(t), "tests/e2e/fixtures/report-archive-full-values.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "make e2e-full restores") {
+		t.Error("report-archive-full-values.yaml header must say the overlay persists and that `make e2e-full` restores the profile")
 	}
 }
