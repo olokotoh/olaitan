@@ -209,16 +209,18 @@ Secret, even after the kubelet has refreshed the files.
 - **Path A (cert-manager).** cert-manager writes the Secret, not helm,
   so a render-time checksum cannot see a renewal and the chart does not
   add one. After cert-manager renews the Certificate, restart the
-  injector (`kubectl rollout restart deploy/<release>-applog-injector`)
-  or run a Secret-watching reloader against it. In-process reload is
+  injector (`kubectl -n <namespace> rollout restart deploy -l
+  app.kubernetes.io/component=applog-injector`) or run a Secret-watching
+  reloader against it. In-process reload is
   tracked in #157.
 
 This matters more than it looks: the webhook ships
 `failurePolicy: Ignore`, so while the injector serves a certificate the
-apiserver no longer trusts, every Pod is admitted **without** a sidecar,
-the injector logs nothing (the request never reaches it), and the only
-trace is a `failed calling webhook` line in the kube-apiserver log
-(issue #148).
+apiserver no longer trusts, every Pod is admitted **without** a sidecar.
+The webhook handler is never called, so the injector logs no admission;
+the only traces are Go's `http: TLS handshake error ... bad certificate`
+lines on the injector's stderr and a `failed calling webhook` line in
+the kube-apiserver log (issue #148).
 
 ## Troubleshooting
 

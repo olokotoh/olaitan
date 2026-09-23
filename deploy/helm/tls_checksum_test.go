@@ -22,7 +22,7 @@ import (
 // volume, but the running process keeps serving the certificate it read at
 // start-up. The applog MutatingWebhookConfiguration is failurePolicy:
 // Ignore, so a stale serving cert fails open: every Pod is admitted with no
-// sidecar and nothing is logged by the injector. Seen live during Story
+// sidecar and the injector's handler is never called. Seen live during Story
 // 10.5: 7m48s of silent non-injection until a manual rollout restart.
 //
 // The fix is a checksum of the rendered Secret's data on the pod template
@@ -107,7 +107,7 @@ func checksumCases() []checksumCase {
 			workload:   "olaitan-applog-injector",
 			annotation: "checksum/applog-tls",
 			rotate:     []string{"applogSidecar.tls.servingCert", "applogSidecar.tls.servingKey"},
-			// D3: caBundle lives on the MutatingWebhookConfiguration,
+			// caBundle lives on the MutatingWebhookConfiguration,
 			// which the apiserver reads; the injector never does.
 			ignore: []string{"applogSidecar.tls.caBundle"},
 		},
@@ -309,6 +309,13 @@ func TestTLSChecksumAbsentWhenChartDoesNotRenderTheSecret(t *testing.T) {
 			kind: "DaemonSet", workload: "olaitan-collector", annotation: "checksum/cni-tls",
 		},
 		{
+			name: "calico Path A with audit on",
+			args: append(append(append([]string{}, noSubcharts...), auditWebhookEnabledArgs()...),
+				"calicoSensor.enabled=true",
+				"calicoSensor.tls.certManagerSecretName=external-cni-tls"),
+			kind: "DaemonSet", workload: "olaitan-collector", annotation: "checksum/cni-tls",
+		},
+		{
 			name: "audit disabled",
 			args: noSubcharts,
 			kind: "DaemonSet", workload: "olaitan-collector", annotation: "checksum/audit-tls",
@@ -356,4 +363,18 @@ func sha256OfSortedJSON(t *testing.T, data map[string]string) string {
 	}
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
+}
+
+// TestAuditChecksumWithCalicoPathA: the mixed branch of the collector's
+// annotation gate. Audit on with Calico on Path A renders the audit
+// checksum and no CNI checksum.
+func TestAuditChecksumWithCalicoPathA(t *testing.T) {
+	args := append(append(append([]string{}, noSubcharts...), auditWebhookEnabledArgs()...),
+		"calicoSensor.enabled=true",
+		"calicoSensor.tls.certManagerSecretName=external-cni-tls",
+		"metrics.scrapeAnnotations=false")
+	ann := podTemplateAnnotations(t, helmTemplate(t, args), "DaemonSet", "olaitan-collector")
+	if len(ann) != 1 || ann["checksum/audit-tls"] == "" {
+		t.Errorf("collector annotations = %v, want exactly checksum/audit-tls", ann)
+	}
 }

@@ -139,7 +139,7 @@ and false-positive numbers; see [Unreleased](#unreleased).
   serving cert once, at start-up, so a `helm upgrade` that changed only
   the cert left them serving the old one; for the applog webhook
   (`failurePolicy: Ignore`) that meant pods admitted with no sidecar and
-  nothing logged. The Calico adapter re-reads its files only on its next
+  no admission logged. The Calico adapter re-reads its files only on its next
   reconnect. The injector Deployment now carries
   `checksum/applog-tls` and the collector DaemonSet `checksum/audit-tls`
   and `checksum/cni-tls` (Calico Path B): the sha256 of the rendered
