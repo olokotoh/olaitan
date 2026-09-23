@@ -664,9 +664,14 @@ func (a *Adapter) deliver(ctx context.Context, ev schema.Event) bool {
 
 // markPublishFailing records a transient publish failure. It logs only on
 // the transition, so an outage is one Warn, not one per retry.
+//
+// The flag is set before health is marked, and sawFalco re-checks it after
+// marking healthy, so a heartbeat handled concurrently cannot leave the
+// source healthy while publishes fail.
 func (a *Adapter) markPublishFailing(err error, ev schema.Event) {
+	wasFailing := a.publishFailing.Swap(true)
 	a.health.MarkUnhealthy(fmt.Errorf("falco: publish: %w", err))
-	if !a.publishFailing.Swap(true) {
+	if !wasFailing {
 		depth, _ := a.buf.stats()
 		a.log.Warn("falco: publish failing, holding alerts in the buffer and retrying",
 			"err", err, "event_id", ev.ID, "queued", depth)
@@ -680,6 +685,11 @@ func (a *Adapter) sawFalco() {
 	a.lastSeenUnixNano.Store(a.nowFn().UnixNano())
 	if !a.publishFailing.Load() {
 		a.health.MarkHealthy()
+		// The worker runs outside a.seq. If it started failing between
+		// the check and the mark, undo the mark (see markPublishFailing).
+		if a.publishFailing.Load() {
+			a.health.MarkUnhealthy(errors.New("falco: publish: failing, alerts held in the buffer"))
+		}
 	}
 }
 
