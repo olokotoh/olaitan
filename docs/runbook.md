@@ -1079,6 +1079,41 @@ client (no SDK, no external egress).
   empty model degrades to rules-only at startup, and a wrong name
   surfaces as a PERMANENT 404 on every call (a 404 from Ollama means
   "model not provisioned", not a transient outage).
+- **Chart-managed pull (Story 10.6), for clusters that CAN reach the
+  registry.** `ollama.pull.models: [<model>]` plus
+  `ollama.persistence.{enabled,create}: true` makes the chart provision the
+  model itself: a Job (`<release>-ollama-pull-<hash>`) runs a loopback-only
+  `ollama pull` into a chart-created RWO claim, under its own NetworkPolicy
+  (DNS and TCP 443 egress, no ingress), and the server waits in a
+  `wait-for-models` init container until every model is on disk, so
+  `helm install --wait` returns only when the model can answer. The serving
+  pod's egress stays declared and empty: the download happens in the Job's
+  pod, never in the server's. Both set `OLLAMA_NOPRUNE`, because a server
+  start otherwise deletes blobs that no manifest references yet, which is
+  what a pull in progress looks like. The Job name hashes the image and the
+  model list, so changing the list creates a new Job rather than failing the
+  upgrade on an immutable pod template. `values-full.yaml` uses this with
+  `qwen2.5:3b-instruct`; the air-gapped overlay does not (nothing to pull
+  from). If the Job fails, `kubectl logs job/<release>-ollama-pull-<hash>`
+  shows the `ollama pull` output, and the server stays in `Init` with
+  "waiting for model" in the `wait-for-models` log.
+- **Structured output.** The provider sends each role's JSON Schema as
+  Ollama's native `format` (Ollama 0.5 or newer; the chart pins 0.9.0 by
+  digest), so decoding is constrained to schema-shaped replies. This is
+  what makes a 3B model reliably schema-valid; the runners still validate
+  every reply and still enforce the cited-event rule a grammar cannot
+  express.
+- **CPU timeouts.** The per-role budgets (30s L1, 30s L2, 60s Senior) are
+  calibrated for a hosted model. On CPU, raise them with
+  `aggregator.extraEnv` `OLT_LLM_ROLE_TIMEOUT_MULTIPLIER` (values-full sets
+  10). The chain runs inline in the FSM consumer, so a slow model delays
+  FSM evaluation behind it; the circuit breaker (FR51) bounds a burst.
+- **Startup warning on the local path.** The aggregator warns when
+  `analyst.score_cap` (file default 35) exceeds 25 on the local provider.
+  Since Story 3.8 the per-role cap is `min(family cap, score_cap)`, so an
+  ollama role is capped at 25 either way; `values-full.yaml` deliberately
+  leaves `score_cap` unset so the live Story 10.6 proof exercises the
+  code-enforced cap, and the warning is expected there.
 - **Context-window pairing.** The provider never sends
   `options.num_ctx`; the EFFECTIVE context window is the server-side
   `num_ctx` (small by default regardless of model capability). The

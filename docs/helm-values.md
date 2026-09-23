@@ -188,6 +188,18 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 | `analyst.local.endpoint` | string | `""` | - | Ollama endpoint for the local provider (air-gapped); empty keeps file-side default http://ollama:11434 | FR48 |
 | `analyst.local.model` | string | `""` | - | Ollama model for the local provider; must be a model the operator provisioned (no cross-model default) | FR48 |
 
+## `ollama`
+
+| Value | Type | Default | Valid range | Effect | Ref |
+|-------|------|---------|-------------|--------|-----|
+| `ollama.image.digest` | string | `"sha256:2ea3b768a8f2dcd4d910f838d79702bb952089414dd578146619c0a939647ac6"` | sha256:<64 hex>, or empty for tag-only | image digest the in-cluster Ollama is pinned to | NFR31 |
+| `ollama.persistence.create` | boolean | `false` | - | create the Ollama model claim in the chart when no existingClaim is named | FR48 |
+| `ollama.persistence.size` | string | `"10Gi"` | - | size of the chart-created Ollama model claim | FR48 |
+| `ollama.persistence.storageClassName` | string | `""` | - | storageClassName of the chart-created Ollama model claim; empty uses the cluster default | FR48 |
+| `ollama.pull.models` | array | `[]` | - | Ollama models the chart pulls into the model volume; empty pulls nothing (operator-provisioned, air-gapped) | FR48 |
+| `ollama.pull.backoffLimit` | integer | `4` | minimum 0 | retries of the model pull Job before it is marked failed | FR48 |
+| `ollama.pull.activeDeadlineSeconds` | integer | `1800` | minimum 1 | seconds the model pull Job may run before it is killed | FR48 |
+
 ## `openshift`
 
 | Value | Type | Default | Valid range | Effect | Ref |

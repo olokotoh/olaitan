@@ -1,0 +1,42 @@
+# values-llm-claude.yaml -- Story 10.6: route the analyst chain to Claude
+# instead of the in-cluster model.
+#
+# Layer it AFTER a profile, and supply the key through the chart Secret,
+# never in a values file:
+#
+#   helm upgrade --install olaitan deploy/helm/olaitan \
+#     -f deploy/helm/olaitan/values-full.yaml ...the full profile's files... \
+#     -f deploy/helm/olaitan/values-llm-claude.yaml \
+#     --set-file secrets.llmApiKey=./anthropic-key.txt
+#
+# (or let an external-secrets operator write llm-api-key into the release's
+# <fullname>-secrets Secret). With no key the chain does not start and the
+# controller runs rules and baselines only (NFR27), loudly, in its log.
+#
+# Every role uses the claude family: trust cap 35, enforced in code. The
+# model is left to the provider's own default; pin one per role with
+# analyst.l1_model / l2_model / senior_model (for example a small model for
+# L1 and L2 and a larger one for Senior). On values-full the in-cluster
+# Ollama stays up and analyst.local.model stays set, so each role falls
+# back to it when Claude is unreachable after the 3-strike retry (FR28).
+analyst:
+  provider: api
+  l1_provider: claude
+  l2_provider: claude
+  senior_provider: claude
+
+aggregator:
+  extraEnv:
+    # A hosted model answers in seconds; keep a little slack over the
+    # Claude-calibrated budgets rather than the CPU-model 10x of values-full.
+    - name: OLT_LLM_ROLE_TIMEOUT_MULTIPLIER
+      value: "2"
+
+# The aggregator must reach the hosted endpoint. Port-scoped, because the
+# vendor's addresses are not stable; narrow it to your egress proxy or a
+# CIDR if you have one.
+networkPolicy:
+  extraEgress:
+    - ports:
+        - protocol: TCP
+          port: 443

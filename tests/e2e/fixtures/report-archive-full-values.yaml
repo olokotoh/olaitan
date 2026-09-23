@@ -4,9 +4,9 @@
 # --reuse-values` by `make e2e-full-report-archive`; never installed alone.
 #
 # The overlay persists: after the target runs, the kind-full release keeps
-# the fake-LLM endpoints, the 5s warm-up, the archive and the Falco exception
-# below. A later `helm upgrade --reuse-values` inherits all of them.
-# Running make e2e-full restores the profile, because it upgrades without
+# the fake-LLM endpoints, the 5s warm-up and the archive. A later
+# `helm upgrade --reuse-values` inherits all of them. Running
+# make e2e-full restores the profile, because it upgrades without
 # --reuse-values.
 #
 # forensics.enabled stays OFF on purpose. That is the operator this story is
@@ -51,24 +51,6 @@ secrets:
   llmApiKey: fake-key
   s3AccessKey: olaitan-e2e
   s3SecretKey: olaitan-e2e-secret
-# The kind mount-product-files hook exception, copied verbatim from
-# values-kind.yaml (Story 10.3; read the reasoning there). values-full.yaml
-# does not layer values-kind.yaml, since that file switches NetworkPolicy
-# enforcement off, so on kind-full "Drop and execute new binary in container"
-# fires on every pod start and opens an incident for the victim BEFORE the
-# attack runs. The settling controller finalises one incident per non-CLEAN
-# episode, so the report would then describe container start-up, not the
-# attack. The exception is as narrow as in values-kind.yaml; the rule still
-# catches everything else. It belongs in values-full.yaml itself (Story 10.5).
-falco:
-  customRules:
-    olaitan-kind-exceptions.yaml: |-
-      - rule: Drop and execute new binary in container
-        exceptions:
-          - name: kind_mount_product_files_hook
-            fields: [proc.pname, proc.exepath]
-            comps: [=, in]
-            values:
-              - [mount-product-f, [/usr/bin/mount, /usr/bin/umount]]
-        override:
-          exceptions: append
+# The kind mount-product-files Falco exception this overlay used to carry
+# now lives in values-full.yaml itself (Story 10.6, as the Story 10.7 review
+# asked), so the release this overlay is layered on already has it.

@@ -1,0 +1,46 @@
+# values-llm-deepseek.yaml -- Story 10.6: route the analyst chain to
+# DeepSeek instead of the in-cluster model.
+#
+# Layer it AFTER a profile, and supply the key through the chart Secret,
+# never in a values file:
+#
+#   helm upgrade --install olaitan deploy/helm/olaitan \
+#     -f deploy/helm/olaitan/values-full.yaml ...the full profile's files... \
+#     -f deploy/helm/olaitan/values-llm-deepseek.yaml \
+#     --set-file secrets.llmApiKey=./deepseek-key.txt
+#
+# (or let an external-secrets operator write llm-api-key into the release's
+# <fullname>-secrets Secret). With no key the chain does not start and the
+# controller runs rules and baselines only (NFR27), loudly, in its log.
+#
+# DeepSeek speaks the OpenAI chat-completions API, so every role uses the
+# openai family: trust cap 30, enforced in code. On values-full the
+# in-cluster Ollama stays up and analyst.local.model stays set, so each
+# role falls back to it when DeepSeek is unreachable after the 3-strike
+# retry (FR28), and AUDIT_ASSESSMENTS records which provider answered.
+analyst:
+  provider: api
+  api:
+    endpoint: "https://api.deepseek.com/v1"
+  l1_provider: openai
+  l1_model: deepseek-chat
+  l2_provider: openai
+  l2_model: deepseek-chat
+  senior_provider: openai
+  senior_model: deepseek-chat
+
+aggregator:
+  extraEnv:
+    # A hosted model answers in seconds; keep a little slack over the
+    # Claude-calibrated budgets rather than the CPU-model 10x of values-full.
+    - name: OLT_LLM_ROLE_TIMEOUT_MULTIPLIER
+      value: "2"
+
+# The aggregator must reach the hosted endpoint. Port-scoped, because the
+# vendor's addresses are not stable; narrow it to your egress proxy or a
+# CIDR if you have one.
+networkPolicy:
+  extraEgress:
+    - ports:
+        - protocol: TCP
+          port: 443

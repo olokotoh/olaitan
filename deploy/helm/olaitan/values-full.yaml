@@ -114,3 +114,93 @@ response:
     clusterCidrs:
       - "10.244.0.0/16"
       - "10.96.0.0/16"
+
+# --- The LLM analyst tier (Story 10.6) ---------------------------------
+# A real model, in-cluster, with no API key. Every chain role (L1, L2,
+# Senior) routes to the local provider, which the chart points at its own
+# Ollama Service. The trust cap for this family is 25 and is enforced in
+# code, not here (cmd/olaitan/analyst_chain.go roleScoreCap).
+#
+# Model: qwen2.5:3b-instruct (Q4_K_M, about 1.9 GB). The strongest JSON and
+# instruction follower at the 3B size, fast enough on 8 CPU cores, and
+# small enough to sit in memory next to every other component of this
+# profile. The provider also sends each role's JSON Schema as Ollama's
+# native `format`, so decoding is constrained to schema-valid replies.
+# Licence note: the 3B Qwen2.5 weights are under the Qwen Research licence
+# (the 0.5B/1.5B/7B/14B/32B sizes are Apache-2.0). For commercial use,
+# change BOTH analyst.local.model and ollama.pull.models, for example to
+# qwen2.5:7b-instruct (Apache-2.0, about twice as slow on CPU).
+#
+# DeepSeek or Claude instead: layer values-llm-deepseek.yaml or
+# values-llm-claude.yaml after this file and put the key in the chart
+# Secret (--set-file secrets.llmApiKey=...). This in-cluster model then
+# stays on as the FR28 fallback for every role.
+analyst:
+  provider: local
+  local:
+    # Must name a model in ollama.pull.models below.
+    model: "qwen2.5:3b-instruct"
+
+ollama:
+  enabled: true
+  pull:
+    models:
+      - "qwen2.5:3b-instruct"
+  persistence:
+    enabled: true
+    create: true
+    size: 10Gi
+  extraEnv:
+    # The evidence package, the role schema and (for L2 and Senior) the
+    # earlier verdicts must all fit, or Ollama silently truncates the
+    # FRONT of the prompt, which is where the system prompt lives.
+    - name: OLLAMA_CONTEXT_LENGTH
+      value: "8192"
+    # Keep the model resident: a cold load costs seconds on every call.
+    - name: OLLAMA_KEEP_ALIVE
+      value: "-1"
+    # One chain runs at a time (the FSM consumer is single-threaded), so
+    # parallel slots would only multiply the KV cache.
+    - name: OLLAMA_NUM_PARALLEL
+      value: "1"
+    - name: OLLAMA_MAX_LOADED_MODELS
+      value: "1"
+  resources:
+    # No CPU limit on purpose: inference should use every idle core.
+    requests:
+      cpu: "2"
+      memory: 3Gi
+    limits:
+      memory: 6Gi
+
+aggregator:
+  extraEnv:
+    # The per-role LLM budgets (30s L1, 30s L2, 60s Senior) are calibrated
+    # for a hosted model. A 3B model on shared CPU reads a few thousand
+    # prompt tokens per role before it writes a word, so the budgets are
+    # scaled (DW3.8-1): 300s L1, 300s L2, 600s Senior.
+    - name: OLT_LLM_ROLE_TIMEOUT_MULTIPLIER
+      value: "10"
+
+# --- Falco on kind (moved here from the Story 10.7 overlay) -------------
+# The kind mount-product-files hook exception, copied verbatim from
+# values-kind.yaml (Story 10.3; read the reasoning there). This profile does
+# not layer values-kind.yaml, since that file switches NetworkPolicy
+# enforcement off, so without this "Drop and execute new binary in
+# container" fires on every pod start and opens an incident for the new pod
+# before anything has happened to it. The exception is as narrow as in
+# values-kind.yaml; the rule still catches everything else. The Story 10.7
+# review deferred it here, and Story 10.6 needs it too: the incident the
+# real model is asked about must be the attack, not container start-up.
+falco:
+  customRules:
+    olaitan-kind-exceptions.yaml: |-
+      - rule: Drop and execute new binary in container
+        exceptions:
+          - name: kind_mount_product_files_hook
+            fields: [proc.pname, proc.exepath]
+            comps: [=, in]
+            values:
+              - [mount-product-f, [/usr/bin/mount, /usr/bin/umount]]
+        override:
+          exceptions: append

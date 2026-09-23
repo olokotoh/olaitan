@@ -48,10 +48,20 @@ spec:
     the default render is byte-identical when ollama is disabled.
     */}}
     {{- if (default (dict) .Values.ollama).enabled }}
+    {{- /*
+    Story 10.6: the model pull Job's pod carries the same shared labels, so
+    it is excluded for the same reason; its own policy
+    (ollama-pull-job.yaml) is the whole of what it may do. Only added when
+    a pull is configured, so the air-gapped render is unchanged.
+    */}}
     matchExpressions:
       - key: app.kubernetes.io/component
         operator: NotIn
+        {{- if include "olaitan.ollama.pullModels" . }}
+        values: ["ollama", "ollama-pull"]
+        {{- else }}
         values: ["ollama"]
+        {{- end }}
     {{- end }}
 {{- /*
   Story 10.5: the API server CIDR discovery is computed ONCE here because

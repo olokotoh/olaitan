@@ -77,6 +77,62 @@ app.kubernetes.io/component: ollama
 {{- end -}}
 
 {{/*
+Story 10.6: the Ollama image reference, repository:tag plus @digest when
+ollama.image.digest is set. One helper so the server, its wait init
+container and the model pull Job can never run different images against
+the same model volume.
+*/}}
+{{- define "olaitan.ollama.image" -}}
+{{- $img := .Values.ollama.image -}}
+{{- $ref := printf "%s:%s" $img.repository (required "ollama.image.tag is required (an empty tag renders a broken image reference)" $img.tag) -}}
+{{- with $img.digest -}}
+{{- if not (regexMatch "^sha256:[a-f0-9]{64}$" .) -}}
+{{- fail (printf "ollama.image.digest must be sha256:<64 lowercase hex> (got %q)" .) -}}
+{{- end -}}
+{{- $ref = printf "%s@%s" $ref . -}}
+{{- end -}}
+{{- $ref -}}
+{{- end -}}
+
+{{/*
+Story 10.6: the model claim the server (and the pull Job) mount, or ""
+when persistence is off. existingClaim wins; create names the
+chart-created claim; enabled with neither is the Story 3.4 fail-fast.
+*/}}
+{{- define "olaitan.ollama.claimName" -}}
+{{- $p := default (dict) .Values.ollama.persistence -}}
+{{- if $p.enabled -}}
+{{- if $p.existingClaim -}}{{ $p.existingClaim }}
+{{- else if $p.create -}}{{ include "olaitan.fullname" . }}-ollama-models
+{{- else -}}{{ fail "ollama.persistence.existingClaim is required when ollama.persistence.enabled=true and ollama.persistence.create=false (provision the claim with the pre-pulled model, or set create: true)" }}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Story 10.6: space-separated model pull list, "" when nothing is pulled.
+Fails the render when a pull has nowhere to keep the model: it would land
+in the pull pod's own filesystem, vanish with it, and leave the server
+waiting forever. Model names are validated so the list can be passed to a
+shell loop safely.
+*/}}
+{{- define "olaitan.ollama.pullModels" -}}
+{{- $o := default (dict) .Values.ollama -}}
+{{- $models := default (list) (default (dict) $o.pull).models -}}
+{{- if and $o.enabled $models -}}
+{{- if not (default (dict) $o.persistence).enabled -}}
+{{- fail "ollama.pull.models needs ollama.persistence.enabled=true (with create: true or an existingClaim): a pulled model must land on a volume the server reads" -}}
+{{- end -}}
+{{- range $models -}}
+{{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._/-]*(:[A-Za-z0-9._-]+)?$" (toString .)) -}}
+{{- fail (printf "ollama.pull.models entry %q is not a model reference (name[:tag])" (toString .)) -}}
+{{- end -}}
+{{- end -}}
+{{- join " " $models -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 ServiceAccount name helpers. Each ring has its own SA so the RBAC grant
 stays ring-scoped (Dev Notes § "RBAC: Role vs ClusterRole split"). The
 SA name is deterministic from the fullname -- it is not a user-tunable

@@ -1,0 +1,41 @@
+{{/*
+Story 10.6: the model pull Job's own NetworkPolicy (see
+ollama-pull-job.yaml for why the pull is a separate pod). DNS and TCP 443
+egress, no ingress. The release policy excludes this pod's component, so
+this is the whole of what the pull pod may do.
+*/}}
+{{- $o := default (dict) .Values.ollama -}}
+{{- if and $o.enabled (include "olaitan.ollama.pullModels" .) }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "olaitan.fullname" . }}-ollama-pull
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ollama-pull
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "olaitan.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: ollama-pull
+  policyTypes:
+    - Ingress
+    - Egress
+  # No ingress rules: nothing dials the pull pod (its server is loopback-only).
+  ingress: []
+  egress:
+    # Resolve the model registry.
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Fetch the manifest and layers. The registry redirects layer
+    # downloads to a CDN whose addresses are not stable, so the rule is
+    # port-scoped rather than address-scoped; the pod lives only for the
+    # pull and has no credentials and no ServiceAccount token.
+    - ports:
+        - protocol: TCP
+          port: 443
+{{- end }}
