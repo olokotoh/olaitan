@@ -94,6 +94,8 @@ func fakeLLMRole(body string) string {
 	// hypothesis block, so generic "l2"/"l1_hypothesis" substrings are NOT
 	// reliable -- only the instruction phrase identifies the role.
 	switch {
+	case strings.Contains(b, "produce the interpretive analyst narrative"):
+		return "dfir"
 	case strings.Contains(b, "senior analyst finalising"):
 		return "senior"
 	case strings.Contains(b, "verify the l1 analyst's hypothesis"):
@@ -124,6 +126,13 @@ func fakeLLMEventID(body string) string {
 // FSM ThreatScore (AC7).
 func fakeLLMVerdict(role, eventID string) string {
 	switch role {
+	case "dfir":
+		// report.v1 requires exactly one property: narrative
+		// (additionalProperties is false, so nothing else may be sent).
+		// The text is labelled as fixture output and asserts no incident
+		// facts: it lands in archived reports quoted as live evidence, and
+		// canned facts would contradict the real incident (Story 10.7).
+		return `{"narrative":"This is a fixture narrative from the fake LLM; no model interpreted this incident. The timeline, containment actions and ATT&CK annotations in this report are assembled by the controller from recorded evidence, and are the only factual sections."}`
 	case "l2":
 		return fmt.Sprintf(`{"verdict":"confirmed","verified_evidence":[{"event_id":%q,"finding":"credential read confirmed by ancestry"}],"confidence":78}`, eventID)
 	case "senior":

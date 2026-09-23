@@ -670,3 +670,31 @@ Call with a dict: (dict "value" <the value> "name" "<the values.yaml path>").
 {{- end -}}
 {{- $v -}}
 {{- end -}}
+
+{{/*
+Story 10.7 (AC2): nats.streamMaxBytesOverride rendered as plain digits.
+Both consumers (aggregator Deployment, collector DaemonSet) parse
+OLT_NATS_STREAM_MAXBYTES_OVERRIDE with strconv.ParseInt and silently drop
+the cap on anything else. A values file (-f) and --set-json hand Helm an
+unquoted integer as float64, which `quote` renders as "5.36870912e+08";
+`--set` parses it as int64 and `--set-string` keeps it a string. This helper
+turns a whole float64 back into digits and fails the install on anything
+that is not a positive integer byte count, so no route can drop the cap
+without a word. Callers guard with `with`, so empty (production sizing)
+never reaches it.
+*/}}
+{{- define "olaitan.natsStreamMaxBytesOverride" -}}
+{{- $v := .Values.nats.streamMaxBytesOverride -}}
+{{- if kindIs "float64" $v -}}
+{{- if ne (floor $v) $v -}}
+{{- fail (printf "nats.streamMaxBytesOverride must be a whole byte count, got %v" $v) -}}
+{{- end -}}
+{{- $v = printf "%.0f" $v -}}
+{{- else -}}
+{{- $v = toString $v -}}
+{{- end -}}
+{{- if not (regexMatch "^[1-9][0-9]*$" $v) -}}
+{{- fail (printf "nats.streamMaxBytesOverride must be a positive byte count in plain digits (for example \"536870912\"), or empty for production sizing; got %q" $v) -}}
+{{- end -}}
+{{- $v -}}
+{{- end -}}

@@ -363,7 +363,7 @@ e2e-local-forensics: helm-prepare helm-deps docker-build
 		--set response.reportArchive.s3Endpoint=minio:9000 \
 		--set response.reportArchive.s3UseSsl=false \
 		--set 'forensics.s3.bucket=olaitan-reports' \
-		--set 'forensics.s3.kms_key_alias=alias/olaitan-e2e' \
+		--set 'forensics.s3.kms_key_alias=olaitan-e2e-key' \
 		--set forensics.settling_window_seconds=10 \
 		--set notifications.enabled=true \
 		--set notifications.webhook_url=http://notification-sink:8080/ \
@@ -375,6 +375,52 @@ e2e-local-forensics: helm-prepare helm-deps docker-build
 		--set-string nats.streamMaxBytesOverride=536870912 \
 		--wait --timeout 5m
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) OLT_E2E_FORENSICS=1 go test -tags=e2e -v -count=1 -run 'TestKindSmoke_Forensics_FullSlice|TestFalcoSourceIsLive' ./tests/e2e/...
+
+# Story 10.7 (AC4): a REAL incident on the Story 10.5 kind-full cluster
+# produces an archived report whose sha256 equals its object key. Layers the
+# report archive (forensics OFF, which is the point of the story) onto the
+# running full-profile release with --reuse-values, against the in-cluster
+# MinIO dev-KMS and fake-LLM fixtures, then runs the gated e2e test. The test
+# attacks for real (a /etc/shadow read inside a fresh pod) and publishes
+# nothing to NATS. Needs the kind-full cluster up first (`make e2e-full`).
+#
+# The overlay STAYS in the shared kind-full release after this target: the
+# fake-LLM endpoints, the 5s baseline warm-up, the report archive and the
+# Falco kind-hook exception. Any later `helm upgrade --reuse-values` (for
+# example a Story 10.6 real-LLM run) inherits them and would talk to
+# fake-llm without saying so. make e2e-full restores the profile, because it
+# upgrades without --reuse-values. FULL_CLUSTER_NAME and FULL_OUT_DIR are
+# defined once, with the Story 10.5 e2e-full target below.
+.PHONY: e2e-full-report-archive
+e2e-full-report-archive: helm-prepare helm-deps docker-build
+	kind get clusters | grep -qx '$(FULL_CLUSTER_NAME)' || \
+		{ echo 'kind cluster $(FULL_CLUSTER_NAME) not found; run make e2e-full first' >&2; exit 1; }
+	# fake-llm.yaml runs olaitan:dev, so the build under test is loaded under
+	# that name too.
+	docker tag $(IMAGE):$(TAG) olaitan:dev
+	kind load docker-image $(IMAGE):$(TAG) olaitan:dev --name $(FULL_CLUSTER_NAME)
+	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig kubectl apply -n default \
+		-f tests/e2e/fixtures/fake-llm.yaml -f tests/e2e/fixtures/minio.yaml
+	# An unchanged apply does not restart fake-llm (olaitan:dev, pullPolicy
+	# Never), so a rerun would test the previous build. Restart it.
+	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig kubectl rollout restart deploy/fake-llm -n default
+	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig kubectl rollout status deploy/fake-llm -n default --timeout=180s
+	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig kubectl wait -n default \
+		--for=condition=available --timeout=180s deploy/fake-llm deploy/minio
+	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig kubectl exec -n default deploy/minio -- sh -c '\
+		mc alias set local http://localhost:9000 olaitan-e2e olaitan-e2e-secret && \
+		mc mb --ignore-existing --with-lock local/olaitan-reports'
+	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig \
+		helm upgrade olaitan $(CHART_DIR) -n default --reuse-values \
+		--set-string image.repository=$(IMAGE) \
+		--set-string image.tag=$(TAG) \
+		--set image.pullPolicy=Never \
+		-f tests/e2e/fixtures/report-archive-full-values.yaml \
+		--wait --timeout 12m
+	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig \
+		KIND_CLUSTER_NAME=$(FULL_CLUSTER_NAME) OLT_E2E_FULL=1 OLT_E2E_REPORT_ARCHIVE=1 \
+		go test -tags=e2e -v -count=1 -timeout 15m -run 'TestReportArchive_RealIncidentOnFullProfile|TestFalcoSourceIsLive' ./tests/e2e/...
+	@echo 'NOTE: the report-archive overlay stays in the release (fake-LLM, 5s warm-up, archive on); make e2e-full restores the kind-full profile.'
 
 # Story 6.6 (AC5): the deployment-posture overlay smoke. Installs ONE posture
 # overlay (default air-gapped, the richest commitment surface: in-cluster ollama

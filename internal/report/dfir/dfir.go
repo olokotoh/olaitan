@@ -93,13 +93,14 @@ var inlineWriteRetry = retry.Strategy{
 // attempts are exhausted on a schema violation the runner fails closed.
 const dfirSchemaAttempts = 2
 
-// dfirUserInstruction is the fixed user-turn task statement. The per-provider
-// SYSTEM prompt is the Story 3.13 ConfigMap-mounted dfir.txt; the user turn is
+// UserInstruction is the fixed user-turn task statement. It is exported so
+// the fake-LLM fixture test (cmd/olaitan) routes on the real text (Story
+// 10.7). The per-provider SYSTEM prompt is the Story 3.13 ConfigMap-mounted dfir.txt; the user turn is
 // code-owned and stable. The provider appends the redacted evidence package and
 // the output-contract (schema) instruction after this text. Per the REDACTION
 // CONTRACT this text NEVER carries raw evidence: the incident evidence travels
 // exclusively on Request.Package.
-const dfirUserInstruction = "Produce the interpretive analyst narrative for the finalised incident " +
+const UserInstruction = "Produce the interpretive analyst narrative for the finalised incident " +
 	"described by the redacted runtime evidence package and the control-plane prior_assessment record. " +
 	"Return a single JSON document conforming to the supplied schema, carrying ONLY the narrative field. " +
 	"The factual sections (kill-chain timeline, containment actions, MITRE ATT&CK annotations) are " +
@@ -777,7 +778,7 @@ func (a *Agent) callAndValidate(ctx context.Context, inc Incident, spec PromptSp
 	req := provider.Request{
 		Role:    provider.RoleDFIR,
 		Package: inc.Package,
-		Prompt:  provider.Prompt{System: spec.System, User: dfirUserInstruction},
+		Prompt:  provider.Prompt{System: spec.System, User: UserInstruction},
 		// Defensive copy: the embedded backing array is shared with the
 		// compiled validator; a misbehaving provider mutating req.Schema in
 		// place must not corrupt every later call.

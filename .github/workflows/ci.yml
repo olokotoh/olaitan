@@ -1087,7 +1087,7 @@ jobs:
             --set response.reportArchive.s3Endpoint=minio:9000 \
             --set response.reportArchive.s3UseSsl=false \
             --set 'forensics.s3.bucket=olaitan-reports' \
-            --set 'forensics.s3.kms_key_alias=alias/olaitan-e2e' \
+            --set 'forensics.s3.kms_key_alias=olaitan-e2e-key' \
             --set forensics.settling_window_seconds=10 \
             --set notifications.enabled=true \
             --set notifications.webhook_url=http://notification-sink:8080/ \

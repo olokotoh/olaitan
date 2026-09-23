@@ -353,7 +353,7 @@ func TestGenerate_RedactionContract(t *testing.T) {
 	if _, _, err := a.Generate(context.Background(), inc); err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
-	if fp.got.Prompt.User != dfirUserInstruction {
+	if fp.got.Prompt.User != UserInstruction {
 		t.Error("the user prompt must be the fixed instruction (no evidence interpolation)")
 	}
 	if fp.got.Role != provider.RoleDFIR {
