@@ -1,0 +1,68 @@
+# Story 10.7 AC4: switch the report archive on, on top of a running Story 10.5
+# full-profile release, against the in-cluster MinIO fixture (minio.yaml) and
+# the fake-LLM fixture (fake-llm.yaml). Layered with `helm upgrade
+# --reuse-values` by `make e2e-full-report-archive`; never installed alone.
+#
+# forensics.enabled stays OFF on purpose. That is the operator this story is
+# for: someone who wants an archived report without full forensic capture.
+# The S3 credentials must still reach the aggregator (AC1).
+evaluation:
+  config: RSLT-full
+analyst:
+  l1_provider: openai
+  l2_provider: openai
+  senior_provider: openai
+  dfir_provider: openai
+  l1_model: fake
+  l2_model: fake
+  senior_model: fake
+  dfir_model: fake
+  api:
+    endpoint: http://fake-llm:8080/v1
+response:
+  forensics:
+    enabled: false
+  settling:
+    enabled: true
+  dfir:
+    enabled: true
+  reportArchive:
+    enabled: true
+    s3Endpoint: minio:9000
+    s3UseSsl: false
+forensics:
+  s3:
+    bucket: olaitan-reports
+    # MUST equal the key name in minio.yaml's MINIO_KMS_SECRET_KEY
+    # ("<name>:<base64 key>"). MinIO's built-in single-key KMS knows exactly
+    # one key and rejects an SSE-KMS PUT naming any other.
+    kms_key_alias: olaitan-e2e-key
+  settling_window_seconds: 10
+baselines:
+  warmupDuration: 5s
+secrets:
+  # Fixture-only values, matching minio.yaml and fake-llm.yaml.
+  llmApiKey: fake-key
+  s3AccessKey: olaitan-e2e
+  s3SecretKey: olaitan-e2e-secret
+# The kind mount-product-files hook exception, copied verbatim from
+# values-kind.yaml (Story 10.3; read the reasoning there). values-full.yaml
+# does not layer values-kind.yaml, since that file switches NetworkPolicy
+# enforcement off, so on kind-full "Drop and execute new binary in container"
+# fires on every pod start and opens an incident for the victim BEFORE the
+# attack runs. The settling controller finalises one incident per non-CLEAN
+# episode, so the report would then describe container start-up, not the
+# attack. The exception is as narrow as in values-kind.yaml; the rule still
+# catches everything else. It belongs in values-full.yaml itself (Story 10.5).
+falco:
+  customRules:
+    olaitan-kind-exceptions.yaml: |-
+      - rule: Drop and execute new binary in container
+        exceptions:
+          - name: kind_mount_product_files_hook
+            fields: [proc.pname, proc.exepath]
+            comps: [=, in]
+            values:
+              - [mount-product-f, [/usr/bin/mount, /usr/bin/umount]]
+        override:
+          exceptions: append

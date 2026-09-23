@@ -467,31 +467,30 @@ func (c *Correlator) resolveAndCacheIdentity(ctx context.Context, ev schema.Even
 }
 
 func (c *Correlator) resolveIdentityUncached(ctx context.Context, ref schema.PodRef) (string, schema.WorkloadIdentity, *corev1.Pod, error) {
+	// Story 10.7. Validate the ref as a key BEFORE asking the apiserver. A ref
+	// the key layer rejects (a Goldmane aggregate such as "coredns-abc-*", or
+	// the "-" namespace of a non-pod endpoint) cannot name a real pod, since
+	// Kubernetes names are a strict subset of the allowed token characters,
+	// and every branch below would reject it anyway. Rejected refs are not
+	// cached, so without this each one cost a rate-limited Pod GET and the
+	// correlator fell behind the event stream on a five-source install.
+	fallbackID, err := keys.PodFallbackID(ref.Namespace, ref.Name)
+	if err != nil {
+		return "", schema.WorkloadIdentity{}, nil, err
+	}
 	if c.kube == nil {
-		id, err := keys.PodFallbackID(ref.Namespace, ref.Name)
-		if err != nil {
-			return "", schema.WorkloadIdentity{}, nil, err
-		}
-		return id, schema.WorkloadIdentity{Namespace: ref.Namespace, OwnerKind: "Pod", OwnerName: ref.Name, PodName: ref.Name}, nil, nil
+		return fallbackID, schema.WorkloadIdentity{Namespace: ref.Namespace, OwnerKind: "Pod", OwnerName: ref.Name, PodName: ref.Name}, nil, nil
 	}
 	pod, err := c.kube.CoreV1().Pods(ref.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			id, ferr := keys.PodFallbackID(ref.Namespace, ref.Name)
-			if ferr != nil {
-				return "", schema.WorkloadIdentity{}, nil, ferr
-			}
-			return id, schema.WorkloadIdentity{Namespace: ref.Namespace, OwnerKind: "Pod", OwnerName: ref.Name, PodName: ref.Name}, nil, nil
+			return fallbackID, schema.WorkloadIdentity{Namespace: ref.Namespace, OwnerKind: "Pod", OwnerName: ref.Name, PodName: ref.Name}, nil, nil
 		}
 		return "", schema.WorkloadIdentity{}, nil, fmt.Errorf("resolve pod %s/%s: %w", ref.Namespace, ref.Name, err)
 	}
 	identity, err := posture.ResolveWorkloadIdentity(ctx, c.kube, pod)
 	if err != nil {
-		id, ferr := keys.PodFallbackID(ref.Namespace, ref.Name)
-		if ferr != nil {
-			return "", schema.WorkloadIdentity{}, nil, ferr
-		}
-		return id, schema.WorkloadIdentity{Namespace: ref.Namespace, OwnerKind: "Pod", OwnerName: ref.Name, PodName: ref.Name}, pod, nil
+		return fallbackID, schema.WorkloadIdentity{Namespace: ref.Namespace, OwnerKind: "Pod", OwnerName: ref.Name, PodName: ref.Name}, pod, nil
 	}
 	if identity.OwnerKind == "Pod" {
 		id, ferr := keys.PodFallbackID(identity.Namespace, identity.OwnerName)

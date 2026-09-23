@@ -3,6 +3,9 @@
 package helm_test
 
 import (
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -72,5 +75,47 @@ func TestStreamMaxBytesOverrideSurvivesSet(t *testing.T) {
 	}
 	if !strings.Contains(out, "536870912") {
 		t.Error("--set nats.streamMaxBytesOverride=536870912 did not reach the rendered manifest as plain digits")
+	}
+}
+
+// TestFixtureKMSKeyMatchesEveryAlias is AC3, found by the AC4 live run. The
+// MinIO fixture's built-in KMS knows exactly one key, named in
+// MINIO_KMS_SECRET_KEY as "<name>:<base64>", and rejects an SSE-KMS PUT that
+// names any other. The fixture shipped the key "olaitan-e2e-key" while the
+// forensics target and CI job still passed "alias/olaitan-e2e", so the
+// validator was satisfiable on paper and every archive PUT would still have
+// failed. Every place that points the chart at this fixture must name the
+// fixture's key.
+func TestFixtureKMSKeyMatchesEveryAlias(t *testing.T) {
+	root := repoRoot(t)
+	read := func(rel string) string {
+		b, err := os.ReadFile(filepath.Join(root, rel))
+		if err != nil {
+			t.Fatalf("read %s: %v", rel, err)
+		}
+		return string(b)
+	}
+
+	m := regexp.MustCompile(`MINIO_KMS_SECRET_KEY\s*\n\s*value:\s*"([^":]+):`).FindStringSubmatch(read("tests/e2e/fixtures/minio.yaml"))
+	if m == nil {
+		t.Fatal("tests/e2e/fixtures/minio.yaml has no MINIO_KMS_SECRET_KEY \"<name>:<key>\" value")
+	}
+	key := m[1]
+
+	aliasRE := regexp.MustCompile(`kms_key_alias[=:]\s*'?"?([^'"\s\\]+)`)
+	for _, rel := range []string{
+		"Makefile",
+		".github/workflows/ci.yml",
+		"tests/e2e/fixtures/report-archive-full-values.yaml",
+	} {
+		found := aliasRE.FindAllStringSubmatch(read(rel), -1)
+		if len(found) == 0 {
+			t.Errorf("%s sets no kms_key_alias; this guard expects it to point the chart at the MinIO fixture", rel)
+		}
+		for _, f := range found {
+			if f[1] != key {
+				t.Errorf("%s passes kms_key_alias %q, but the MinIO fixture's KMS only knows %q", rel, f[1], key)
+			}
+		}
 	}
 }
