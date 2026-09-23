@@ -207,6 +207,14 @@ or `auditWebhook.hostPort`:
 Until both steps are done the apiserver keeps dialling with the old
 address and certificates, and the receiver rejects or never sees it.
 
+The receiver side needs no manual step. The receiver reads its serving
+cert and client CA once, when it starts, so the collector DaemonSet's
+pod template carries a `checksum/audit-tls` annotation: the sha256 of
+the data of the `<release>-audit-tls` Secret the chart renders. Changing
+`auditWebhook.servingCert`, `servingKey` or `clusterCAData` changes the
+checksum and the DaemonSet rolls on its own. Upgrades that change no
+cert leave the collector running.
+
 ### 5. Verify
 
 Confirm the apiserver is dialling the receiver successfully:

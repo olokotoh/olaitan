@@ -79,6 +79,15 @@ spec:
       labels:
         {{- include "olaitan.labels" . | nindent 8 }}
         app.kubernetes.io/component: applog-injector
+      {{- /* Issue #148: the injector reads its serving cert once, at
+             start-up, so a rotated Path B cert must roll the pods or the
+             webhook (failurePolicy Ignore) silently stops injecting.
+             Path A's Secret is written by cert-manager, not by helm, so
+             no render-time checksum can track it. */ -}}
+      {{- if not .Values.applogSidecar.tls.certManagerEnabled }}
+      annotations:
+        checksum/applog-tls: {{ include "olaitan.tlsSecretChecksum" (dict "root" . "template" "applog-webhook-tls-secret.yaml") | quote }}
+      {{- end }}
     spec:
       securityContext:
         runAsNonRoot: true

@@ -179,6 +179,35 @@ every Pod cluster-wide. Threat model:
   - Path B operators are expected to rotate the manually-provided
     Secret periodically.
 
+### Rotating the serving cert
+
+The injector reads `tls.crt` and `tls.key` once, when it starts. A
+running injector never picks up a new certificate from its mounted
+Secret, even after the kubelet has refreshed the files.
+
+- **Path B (manual).** The injector Deployment's pod template carries a
+  `checksum/applog-tls` annotation: the sha256 of the data of the Secret
+  the chart renders. A `helm upgrade` that changes
+  `applogSidecar.tls.servingCert` or `servingKey` changes the checksum,
+  so the Deployment rolls on its own; no `kubectl rollout restart` is
+  needed. Upgrades that change no cert leave the checksum, and the
+  pods, alone. Rotate the cert and `applogSidecar.tls.caBundle` in the
+  same upgrade: the new pods serve the new cert, and the
+  MutatingWebhookConfiguration must already trust its CA.
+- **Path A (cert-manager).** cert-manager writes the Secret, not helm,
+  so a render-time checksum cannot see a renewal and the chart does not
+  add one. After cert-manager renews the Certificate, restart the
+  injector (`kubectl rollout restart deploy/<release>-applog-injector`)
+  or run a Secret-watching reloader against it. In-process reload is
+  tracked in #157.
+
+This matters more than it looks: the webhook ships
+`failurePolicy: Ignore`, so while the injector serves a certificate the
+apiserver no longer trusts, every Pod is admitted **without** a sidecar,
+the injector logs nothing (the request never reaches it), and the only
+trace is a `failed calling webhook` line in the kube-apiserver log
+(issue #148).
+
 ## Troubleshooting
 
 - **Sidecar not injected after annotation**: check the webhook logs
