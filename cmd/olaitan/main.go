@@ -1913,6 +1913,16 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 	if nodeName == "" {
 		return errors.New("collector: K8S_NODE_NAME env var is empty (set by Helm chart's downward API)")
 	}
+	// Issue #135: the Falco alert buffer bounds. Unset means the adapter
+	// default (4096 alerts, 16 MiB).
+	falcoBufAlerts, err := envNonNegativeInt("FALCO_BUFFER_MAX_ALERTS")
+	if err != nil {
+		return fmt.Errorf("collector: %w", err)
+	}
+	falcoBufBytes, err := envNonNegativeInt("FALCO_BUFFER_MAX_BYTES")
+	if err != nil {
+		return fmt.Errorf("collector: %w", err)
+	}
 
 	// metricsSources collects every constructed adapter so the metrics
 	// surface can bind them once at the end. Each insertion uses the
@@ -2004,6 +2014,9 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 		Token:      falcoToken,
 		Hostname:   nodeName,
 		RateLimit:  rateLimiters[string(schema.SourceFalco)],
+		// Issue #135: bounded queue between Falco's http_output and NATS.
+		BufferMaxAlerts: falcoBufAlerts,
+		BufferMaxBytes:  falcoBufBytes,
 	}, nc, log)
 	if err != nil {
 		closeNATS()
@@ -2377,6 +2390,20 @@ func readFalcoToken(path string) (string, error) {
 		return "", fmt.Errorf("falco http token file %s is empty", path)
 	}
 	return tok, nil
+}
+
+// envNonNegativeInt reads an optional integer env var. Unset or blank is
+// 0 (the caller's default); anything else must parse as an integer >= 0.
+func envNonNegativeInt(name string) (int, error) {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("%s=%q is not a non-negative integer", name, v)
+	}
+	return n, nil
 }
 
 // optionalSourceBackoff is the wait before restarting a failed optional

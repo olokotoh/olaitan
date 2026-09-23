@@ -323,6 +323,9 @@ func TestRegisterAdapterCounters_FalcoHTTPReceiver(t *testing.T) {
 		"olaitan_sensor_falco_alerts_received_total",
 		"olaitan_sensor_falco_heartbeats_total",
 		"olaitan_sensor_falco_publish_drops_total",
+		"olaitan_sensor_falco_buffer_dropped_total",
+		"olaitan_sensor_falco_buffer_depth",
+		"olaitan_sensor_falco_buffer_bytes",
 	} {
 		if !seen[n] {
 			t.Errorf("metric family %s not registered", n)

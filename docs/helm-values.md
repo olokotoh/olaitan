@@ -37,6 +37,8 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 |-------|------|---------|-------------|--------|-----|
 | `falcoIngest.port` | integer | `8765` | 1 to 65535 | collector port and falco-ingest Service port Falco posts alerts to; must match the port in falco.falco.http_output.url | FR1 |
 | `falcoIngest.extraFrom` | array | `[]` | - | additional NetworkPolicy peers allowed to post to the Falco ingest port | NFR11 |
+| `falcoIngest.buffer.maxAlerts` | integer | `4096` | minimum 1 | most Falco alerts a collector pod queues while NATS is unavailable before dropping the oldest | FR1 |
+| `falcoIngest.buffer.maxBytes` | integer | `16777216` | minimum 1 | most bytes (marshalled events) a collector pod queues for NATS before dropping the oldest Falco alerts | FR1 |
 
 ## `secrets`
 

@@ -765,3 +765,19 @@ func TestRunOptionalSource_PermanentFailureDoesNotStopTheCollector(t *testing.T)
 		t.Errorf("default backoff must be positive and capped at 5m (got %s, %s)", orig(1), orig(50))
 	}
 }
+
+// Issue #135: the Falco buffer bounds come from the chart as env vars.
+func TestEnvNonNegativeInt(t *testing.T) {
+	const name = "OLT_TEST_FALCO_BUFFER"
+	for _, tc := range []struct {
+		val     string
+		want    int
+		wantErr bool
+	}{{"", 0, false}, {"  ", 0, false}, {"4096", 4096, false}, {" 16777216 ", 16777216, false}, {"0", 0, false}, {"-1", 0, true}, {"1e3", 0, true}, {"lots", 0, true}} {
+		t.Setenv(name, tc.val)
+		got, err := envNonNegativeInt(name)
+		if (err != nil) != tc.wantErr || got != tc.want {
+			t.Errorf("%q: got %d, %v; want %d, err=%v", tc.val, got, err, tc.want, tc.wantErr)
+		}
+	}
+}

@@ -224,8 +224,9 @@ func registerAdapterCounters(reg *metrics.Registry, source, nodeName string, ad 
 		// Story 10.2: the http_output receiver. One series per status
 		// code, registered up front so a code that has not happened yet
 		// reads 0 instead of being absent. 401 climbing means something
-		// is posting with the wrong token; 503 means NATS refused
-		// publishes, and Falco does not retry, so those alerts are lost.
+		// is posting with the wrong token; 503 means the collector was
+		// shutting down and did not take the alert (issue #135: a NATS
+		// outage no longer causes 503, alerts wait in the buffer).
 		for _, c := range falco.ResponseCodes {
 			c := c
 			if err := reg.RegisterCounter(
@@ -253,6 +254,25 @@ func registerAdapterCounters(reg *metrics.Registry, source, nodeName string, ad 
 			"olaitan_sensor_falco_publish_drops_total", source,
 			"Falco alerts dropped on a permanent publish error, for example over the EVENTS_RAW per-message cap (Story 10.2).",
 			nil, a.PublishDrops); err != nil {
+			return err
+		}
+		// Issue #135: the bounded buffer between http_output and NATS.
+		if err := reg.RegisterCounter(
+			"olaitan_sensor_falco_buffer_dropped_total", source,
+			"Falco alerts dropped because the collector's alert buffer was full (oldest first) or one alert exceeded the whole byte bound; nonzero means NATS was unavailable longer than the buffer covers (issue #135).",
+			nil, a.BufferDropped); err != nil {
+			return err
+		}
+		if err := reg.RegisterGauge(
+			"olaitan_sensor_falco_buffer_depth", source,
+			"Falco alerts queued in the collector waiting for NATS, not counting the one being published (issue #135).",
+			nil, a.BufferDepth); err != nil {
+			return err
+		}
+		if err := reg.RegisterGauge(
+			"olaitan_sensor_falco_buffer_bytes", source,
+			"Marshalled size in bytes of the Falco alerts queued in the collector (issue #135).",
+			nil, a.BufferBytes); err != nil {
 			return err
 		}
 	case *applog.SidecarTracker:
