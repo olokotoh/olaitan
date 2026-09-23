@@ -146,7 +146,12 @@ and false-positive numbers; see [Unreleased](#unreleased).
   Secret's data, so only a cert change rolls the pods, not a
   chart-version bump. Secrets the chart does not render (applog
   cert-manager Path A, `calicoSensor.tls.certManagerSecretName`) get no
-  checksum; APPLOG.md and CNI.md say how those reload.
+  checksum; APPLOG.md and CNI.md say how those reload. APPLOG.md and
+  AUDIT.md give the upgrade order for a CA change (old and new CA, then
+  the new cert, then the new CA alone). Under applog
+  `failurePolicy: Fail` that order is mandatory, because the injector's
+  own pods pass through its webhook (#159). AUDIT.md also states the
+  cost of the collector roll: a brief gap for every source on the node.
 
 - **A cert-manager-issued certificate now works for the Calico flow
   sensor** (#140). Path A mounted the cert-manager Secret unchanged, but
