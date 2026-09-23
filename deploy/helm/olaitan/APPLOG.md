@@ -206,6 +206,19 @@ Secret, even after the kubelet has refreshed the files.
   2. set `servingCert` / `servingKey` to the pair the new CA signed
      (the injector rolls);
   3. set `caBundle` to the new CA alone.
+
+  With `applogSidecar.webhook.failurePolicy: Fail` these three steps
+  are mandatory, not a nicety: never change `caBundle` and
+  `servingCert` in the same upgrade. The MutatingWebhookConfiguration
+  has no objectSelector and its namespaceSelector skips only
+  `kube-system` and `kube-public`, so the injector's own pods go through
+  it too. If the apiserver stops trusting the cert the old injector
+  pods serve, it rejects every Pod CREATE in every other namespace,
+  the injector's own replacement pods included. The roll that would
+  fix it then stalls, and no Pod can be created until the CA change is
+  rolled back (`helm rollback`, or patching `caBundle` on the
+  MutatingWebhookConfiguration by hand). Exempting the injector from
+  its own webhook is tracked in #159.
 - **Path A (cert-manager).** cert-manager writes the Secret, not helm,
   so a render-time checksum cannot see a renewal and the chart does not
   add one. After cert-manager renews the Certificate, restart the

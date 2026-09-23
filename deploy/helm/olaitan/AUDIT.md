@@ -213,7 +213,34 @@ pod template carries a `checksum/audit-tls` annotation: the sha256 of
 the data of the `<fullname>-audit-tls` Secret the chart renders. Changing
 `auditWebhook.servingCert`, `servingKey` or `clusterCAData` changes the
 checksum and the DaemonSet rolls on its own. Upgrades that change no
-cert leave the collector running.
+cert leave the collector running. The cost is that the roll restarts
+the whole collector, one node at a time, so every source it runs on
+that node, not only the audit receiver, has a brief gap while its pod
+is replaced.
+
+A new serving cert signed by the **same** CA needs only that one
+upgrade. A serving cert from a **new** CA needs the apiserver to trust
+the new CA before the new pod serves it, or the apiserver rejects the
+receiver as soon as the roll reaches the node. `auditWebhook.caBundle`
+lives in the kubeconfig the apiserver reads at start, not in the
+`<fullname>-audit-tls` Secret, so changing it does not roll the
+collector. Rotate the CA in three upgrades:
+
+1. set `caBundle` to the old and new CA PEMs concatenated (base64 of
+   both), serving cert unchanged; then copy the kubeconfig to every
+   control-plane host and restart kube-apiserver (the two steps at the
+   top of this section);
+2. set `servingCert` / `servingKey` to the pair the new CA signed (the
+   collector rolls);
+3. set `caBundle` to the new CA alone, then copy and restart again.
+
+In short: old and new CA in the apiserver kubeconfig, then the new
+serving cert, then the new CA alone.
+
+The same ordering applies the other way round to `clusterCAData`, the
+CA the receiver uses to verify the apiserver's client cert: set it to
+the old and new CA first (the collector rolls), then switch the
+apiserver's client cert, then set it to the new CA alone.
 
 ### 5. Verify
 
