@@ -85,6 +85,7 @@ sources are on, which are off, and why.
 | Platform | Install | NetworkPolicy enforced | Audit webhook | Overlay |
 | --- | --- | --- | --- | --- |
 | kind | ✅ verified | ❌ no (kindnet accepts and ignores) | ✅ possible | `values-kind.yaml` |
+| **kind-full** (reference) | ⚠️ verified 2026-09-21, see note | ✅ yes (Calico) | ✅ enabled | `values-full.yaml` |
 | kubeadm | ⚠️ verified 2026-08-31, see note | depends on your CNI | ✅ possible | (defaults) |
 | k3s / k3d | template-verified | ✅ (kube-router) | ✅ possible | `values-k3s.yaml` |
 | minikube | template-verified | ❌ unless `--cni=calico` | ✅ possible | `values-minikube.yaml` |
@@ -95,6 +96,43 @@ sources are on, which are off, and why.
 | EKS Fargate | ❌ impossible | n/a | n/a | n/a |
 | AKS Automatic | ❌ blocked | n/a | n/a | n/a |
 | GKE Autopilot | ❌ blocked | n/a | n/a | n/a |
+
+**kind-full is the reference profile: the one place all five sources run at
+once.** Every other row above runs some subset. `values-kind.yaml` leaves the
+audit webhook, the containerd sensor, the Calico flow adapter and the applog
+sidecar at their chart defaults of off, so the full combination had never been
+exercised together until this profile existed. Bring it up with:
+
+```
+hack/install-full-kind.sh <scratch-dir-outside-this-repo>
+```
+
+That script exists because the ordering is not obvious: on kind the
+kube-apiserver is a static pod that refuses to start when its audit policy or
+webhook kubeconfig is missing, so both files have to be written before
+`kind create cluster` runs, which in turn means the audit CA must be generated
+before any node exists to have an IP. The profile therefore points the
+apiserver at `127.0.0.1:8443` through `auditWebhook.hostPort`, which is
+knowable in advance and stable across recreations. Set `WORKERS=1` on a host
+under about 16GB; the profile still installs, but pod traffic stops crossing
+a node boundary and the Calico flow adapter sees less.
+
+**The kind-full caveat, stated here rather than only in the matrix.** The
+2026-09-21 run was made with `WORKERS=1`, so what is verified is one
+control-plane plus one worker. The committed default in `hack/kind-full.yaml`
+is two workers; it renders and the node list is generated from the same file,
+but that shape has not itself been booted. Treat the row as "verified with one
+worker; the two-worker default is unexercised". Prerequisites the script needs
+beyond the usual: `openssl`, and `python3` with PyYAML (`make e2e-full` always
+passes `WORKERS`, so PyYAML is required on that path). The release installs
+into the `default` namespace, matching the e2e suite.
+
+One more thing the row does not convey on its own: on the verification host
+the WORKER node's Falco did not start, because the host had
+`fs.inotify.max_user_instances` at its default of 128 with most of it already
+consumed. "Five sources healthy" was therefore satisfied with Falco running on
+the control-plane node only. Raise the inotify limits before reading a
+single-node Falco result as a two-node one.
 
 `verified` means installed and observed on a live cluster of that type.
 `template-verified` means the chart renders and validates for it and nothing

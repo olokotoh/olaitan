@@ -52,6 +52,12 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 | `probes.periodSeconds` | integer | `10` | minimum 1 | liveness/readiness probe period seconds | NFR24 |
 | `probes.failureThreshold` | integer | `3` | minimum 1 | consecutive probe failures before the pod is restarted | NFR24 |
 
+## `networkPolicy`
+
+| Value | Type | Default | Valid range | Effect | Ref |
+|-------|------|---------|-------------|--------|-----|
+| `networkPolicy.apiServerIngressCIDR` | string | `""` | - | extra source CIDR allowed to reach the audit and applog webhook ports on ingress | FR5 |
+
 ## `auditWebhook`
 
 | Value | Type | Default | Valid range | Effect | Ref |

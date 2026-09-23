@@ -1,0 +1,93 @@
+# kind cluster config for the Story 10.5 "full profile" reference cluster:
+# the one cluster on which all five sources run at once.
+#
+# Used by:
+#   `hack/install-full-kind.sh` (developer, evaluation and CI workflow)
+#   `deploy/helm/olaitan/values-full.yaml` (the matching chart profile)
+#
+# Relationship to its two siblings:
+#   hack/kind-config.yaml        -- e2e cluster, kindnetd, single node.
+#                                   Accepts NetworkPolicy, enforces nothing.
+#   hack/kind-calico-config.yaml -- Story 10.11 Calico/Goldmane bring-up,
+#                                   single node, no audit webhook.
+#   hack/kind-full.yaml (this)   -- Calico AND the audit webhook AND more
+#                                   than one node, so the containerd sensor
+#                                   and the applog sidecar are exercised
+#                                   across a real scheduling boundary
+#                                   rather than on a single node where
+#                                   every pod is node-local by accident.
+#
+# Falco stays ON here exactly as on the other two clusters. Nothing in this
+# file turns a sensor off.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+# Cluster name comes from `kind create cluster --name ...` so the script's
+# CLUSTER_NAME override stays the single source of truth; do not embed the
+# name here or that override is silently ignored.
+networking:
+  # Calico replaces kindnetd, same as hack/kind-calico-config.yaml. The
+  # Tigera operator installs the CNI plugin once the Installation CR is
+  # applied, so bootstrap pods sit without a network until then. That is
+  # expected, not a failure.
+  disableDefaultCNI: true
+  # Must match the ipPools cidr the Tigera Installation is given, and must
+  # match response.networkPolicy.clusterCidrs in values-full.yaml. Three
+  # places, one value. 10.244.0.0/16 is kind's own default and collides
+  # with nothing; Calico's stock 192.168.0.0/16 default would collide with
+  # the RFC 1918 range most home and office LANs already use.
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/16"
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      # Same kubelet reservation as the sibling configs so a containerised
+      # cluster on a developer machine stays responsive rather than merely
+      # alive. Calico plus Goldmane plus Falco plus the Olaitan chart is
+      # the heaviest load of the three clusters.
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            system-reserved: "cpu=200m,memory=512Mi"
+      # Audit webhook wiring (Story 10.8). On kind the apiserver is a
+      # static pod, so the policy and the webhook kubeconfig are mounted
+      # in from the host via extraMounts below rather than patched in with
+      # hack/audit-apiserver-patch.yaml, which is the kubeadm path for a
+      # self-managed cluster. Both routes set the same four flags.
+      #
+      # audit-webhook-batch-max-wait matches the patch file (10s) so the
+      # receiver sees the same batching behaviour on kind as on kubeadm.
+      - |
+        kind: ClusterConfiguration
+        apiServer:
+          extraArgs:
+            audit-policy-file: /etc/kubernetes/audit/policy.yaml
+            audit-webhook-config-file: /etc/kubernetes/audit/webhook-kubeconfig.yaml
+            audit-webhook-batch-max-size: "400"
+            audit-webhook-batch-max-wait: 10s
+          extraVolumes:
+            - name: audit
+              hostPath: /etc/kubernetes/audit
+              mountPath: /etc/kubernetes/audit
+              readOnly: true
+              pathType: Directory
+    extraMounts:
+      # hack/install-full-kind.sh writes policy.yaml and
+      # webhook-kubeconfig.yaml into hack/.audit-full/ on the host before
+      # `kind create cluster`, because the apiserver static pod refuses to
+      # start if either file is missing. The directory must therefore exist
+      # and be populated BEFORE the cluster is created, not after.
+      - hostPath: ./hack/.audit-full
+        containerPath: /etc/kubernetes/audit
+        readOnly: true
+  # Two workers, not one. The containerd sensor and the applog sidecar are
+  # per-node concerns: on a single-node cluster every pod is co-located with
+  # the collector by accident, and a sensor that only ever works node-locally
+  # still passes. Two workers force the DaemonSet to prove itself on a node
+  # that is not the control-plane, and give the Calico flow sensor genuine
+  # pod-to-pod traffic that crosses a node boundary.
+  #
+  # On a memory-constrained host (under ~16GB) drop to a single worker: the
+  # profile still installs, but cross-node flows stop being exercised.
+  - role: worker
+  - role: worker

@@ -53,6 +53,64 @@ spec:
         operator: NotIn
         values: ["ollama"]
     {{- end }}
+{{- /*
+  Story 10.5: the API server CIDR discovery is computed ONCE here because
+  BOTH directions need it. Egress has used it since Story 10.3 (the
+  aggregator could not reach the apiserver). Ingress needs it because the
+  kube-apiserver DIALS two of this release's listeners: the audit webhook
+  receiver and the applog admission webhook. On a self-managed control
+  plane the apiserver is a host-network static pod, so Calico sees its
+  traffic as coming from the NODE, not from a workload endpoint in
+  kube-system, and a namespaceSelector for kube-system never matches it.
+  The applog MutatingWebhookConfiguration ships failurePolicy: Ignore, so
+  the resulting timeout is SILENT: pods are admitted with no sidecar and
+  no error anywhere except the apiserver log. Found on kind-full, where
+  the EndpointSlice for the default/kubernetes Service resolves to the
+  control-plane node address.
+  */}}
+{{- $apiIPs := list }}
+{{- /*
+  $apiIngressIPs is the subset usable as a SOURCE address. The kubernetes
+  Service ClusterIP is a virtual destination that DNAT rewrites before the
+  packet is routed; it can never appear as the source of an inbound
+  connection, so admitting it on ingress is noise that makes the rendered
+  policy claim something it does not mean. Egress keeps it, because there it
+  is exactly the destination being dialled.
+  */}}
+{{- $apiIngressIPs := list }}
+{{- $apiPorts := list 443 6443 }}
+{{- $svc := lookup "v1" "Service" "default" "kubernetes" }}
+{{- if and $svc $svc.spec $svc.spec.clusterIP }}
+{{- $apiIPs = append $apiIPs $svc.spec.clusterIP }}
+{{- end }}
+{{- $slice := lookup "discovery.k8s.io/v1" "EndpointSlice" "default" "kubernetes" }}
+{{- if and $slice $slice.endpoints }}
+{{- range $slice.endpoints }}{{- range .addresses }}{{- $apiIPs = append $apiIPs . }}{{- $apiIngressIPs = append $apiIngressIPs . }}{{- end }}{{- end }}
+{{- range $slice.ports }}{{- if .port }}{{- $apiPorts = append $apiPorts (int .port) }}{{- end }}{{- end }}
+{{- else }}
+{{- $eps := lookup "v1" "Endpoints" "default" "kubernetes" }}
+{{- if and $eps $eps.subsets }}
+{{- range $eps.subsets }}
+{{- range .addresses }}{{- $apiIPs = append $apiIPs .ip }}{{- $apiIngressIPs = append $apiIngressIPs .ip }}{{- end }}
+{{- range .ports }}{{- $apiPorts = append $apiPorts (int .port) }}{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- $apiCIDRs := list }}
+{{- range $apiIPs }}{{- $apiCIDRs = append $apiCIDRs (printf "%s/%s" . (ternary "128" "32" (contains ":" .))) }}{{- end }}
+{{- with .Values.networkPolicy.apiServerCIDR }}{{- $apiCIDRs = append $apiCIDRs . }}{{- end }}
+{{- $apiIngressCIDRs := list }}
+{{- range $apiIngressIPs }}{{- $apiIngressCIDRs = append $apiIngressCIDRs (printf "%s/%s" . (ternary "128" "32" (contains ":" .))) }}{{- end }}
+{{- /*
+  networkPolicy.apiServerCIDR is deliberately NOT appended here. Its
+  documented kubeadm value is the kubernetes Service ClusterIP (10.96.0.1),
+  and excluding a ClusterIP from ingress sources while re-admitting it through
+  the operator-supplied fallback would enforce the rule against the value we
+  discover and waive it for the value we are handed. Operators whose apiserver
+  reaches pods from an address the EndpointSlice does not list set
+  networkPolicy.apiServerIngressCIDR instead.
+  */}}
+{{- with .Values.networkPolicy.apiServerIngressCIDR }}{{- $apiIngressCIDRs = append $apiIngressCIDRs . }}{{- end }}
   policyTypes:
     - Ingress
     - Egress
@@ -62,9 +120,41 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: kube-system
+        {{- /*
+        Story 10.5: plus the apiserver's own addresses. A host-network
+        apiserver is not a workload endpoint, so the kube-system selector
+        above does not admit it. Harmless where the selector already
+        matches; load-bearing on every self-managed control plane.
+        */}}
+        {{- range (uniq $apiIngressCIDRs) }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
       ports:
         - protocol: TCP
           port: {{ .Values.auditWebhook.containerPort }}
+    {{- end }}
+    {{- /*
+    Story 10.5: the applog admission webhook. The apiserver dials the
+    injector Service on CREATE for every Pod in a selected namespace. Until
+    this story nothing ran applogSidecar.enabled together with a CNI that
+    actually enforces NetworkPolicy, so the gap never showed: kindnet
+    accepts policy and enforces nothing. With Calico the call times out at
+    5s and failurePolicy: Ignore admits the Pod with no sidecar, silently.
+    */}}
+    {{- if .Values.applogSidecar.enabled }}
+    {{- $applogPort := (default (dict) .Values.applogSidecar.webhook).port | default 8443 }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+        {{- range (uniq $apiIngressCIDRs) }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ $applogPort }}
     {{- end }}
     - from:
         - podSelector:
@@ -148,28 +238,6 @@ spec:
     next `helm upgrade`. In both cases networkPolicy.apiServerCIDR is the
     fallback: set it to your API server's address range.
     */}}
-    {{- $apiIPs := list }}
-    {{- $apiPorts := list 443 6443 }}
-    {{- $svc := lookup "v1" "Service" "default" "kubernetes" }}
-    {{- if and $svc $svc.spec $svc.spec.clusterIP }}
-    {{- $apiIPs = append $apiIPs $svc.spec.clusterIP }}
-    {{- end }}
-    {{- $slice := lookup "discovery.k8s.io/v1" "EndpointSlice" "default" "kubernetes" }}
-    {{- if and $slice $slice.endpoints }}
-    {{- range $slice.endpoints }}{{- range .addresses }}{{- $apiIPs = append $apiIPs . }}{{- end }}{{- end }}
-    {{- range $slice.ports }}{{- if .port }}{{- $apiPorts = append $apiPorts (int .port) }}{{- end }}{{- end }}
-    {{- else }}
-    {{- $eps := lookup "v1" "Endpoints" "default" "kubernetes" }}
-    {{- if and $eps $eps.subsets }}
-    {{- range $eps.subsets }}
-    {{- range .addresses }}{{- $apiIPs = append $apiIPs .ip }}{{- end }}
-    {{- range .ports }}{{- $apiPorts = append $apiPorts (int .port) }}{{- end }}
-    {{- end }}
-    {{- end }}
-    {{- end }}
-    {{- $apiCIDRs := list }}
-    {{- range $apiIPs }}{{- $apiCIDRs = append $apiCIDRs (printf "%s/%s" . (ternary "128" "32" (contains ":" .))) }}{{- end }}
-    {{- with .Values.networkPolicy.apiServerCIDR }}{{- $apiCIDRs = append $apiCIDRs . }}{{- end }}
     {{- if $apiCIDRs }}
     - to:
         {{- range (uniq $apiCIDRs) }}
