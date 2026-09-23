@@ -12,13 +12,13 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/olokotoh/olaitan/internal/subjects"
-
 	"github.com/nats-io/nats.go"
-	"sync"
+
+	"github.com/olokotoh/olaitan/internal/subjects"
 )
 
 // fullProfileSources is Story 10.5's five-source contract for the
@@ -268,10 +268,10 @@ func TestFullProfileEachSourceIngestsARealAction(t *testing.T) {
 	hits := map[string]string{} // source -> the raw event that carried the marker
 	sub, err := nc.Subscribe(subjects.RawPrefix+">", func(m *nats.Msg) {
 		body := string(m.Data)
-		if !strings.Contains(body, podName) && !strings.Contains(body, logMarker) {
+		source := strings.TrimPrefix(m.Subject, subjects.RawPrefix)
+		if !ac2Match(source, body, podName, logMarker) {
 			return
 		}
-		source := strings.TrimPrefix(m.Subject, subjects.RawPrefix)
 		mu.Lock()
 		if _, seen := hits[source]; !seen {
 			hits[source] = body
@@ -300,11 +300,17 @@ func TestFullProfileEachSourceIngestsARealAction(t *testing.T) {
 			"-n", defaultNamespace, "--timeout=180s")
 	}
 
-	// falco: the stock "Terminal shell in container" rule conditions on
-	// proc.tty != 0, so the exec MUST allocate a tty or the rule cannot match.
-	mustAction(t, "falco: terminal shell in container",
-		"kubectl", "exec", "-t", "-n", defaultNamespace, podName,
-		"-c", "app", "--", "/bin/sh", "-c", "id")
+	// falco: read /etc/shadow, which fires the stock "Read sensitive file
+	// untrusted" rule. An earlier version used "Terminal shell in container"
+	// via `kubectl exec -t`, but that rule conditions on proc.tty != 0 and
+	// kubectl never allocates a tty here: without -i it forces TTY off, and
+	// with -i it still refuses because a test's stdin is not a terminal
+	// (kubectl pkg/cmd/exec SetupTTY). The rule could not fire, and the
+	// Falco event that satisfied the old matcher came from some other rule
+	// naming the same pod. ac2Match now requires this rule by name.
+	mustAction(t, "falco: "+ac2FalcoRule,
+		"kubectl", "exec", "-n", defaultNamespace, podName,
+		"-c", "app", "--", "cat", "/etc/shadow")
 
 	// audit: a single-object get, which the shipped policy records at
 	// RequestResponse (a list is only Metadata), naming this pod.
@@ -334,9 +340,9 @@ func TestFullProfileEachSourceIngestsARealAction(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Minute)
 	for time.Now().Before(deadline) {
 		mu.Lock()
-		got := len(hits)
+		done := ac2Complete(hits)
 		mu.Unlock()
-		if got == len(fullProfileSources) {
+		if done {
 			break
 		}
 		time.Sleep(5 * time.Second)
@@ -353,6 +359,37 @@ func TestFullProfileEachSourceIngestsARealAction(t *testing.T) {
 		}
 		t.Logf("source %-8s ingested an event naming the probe (%d bytes)", src.source, len(body))
 	}
+}
+
+// ac2FalcoRule is the stock Falco rule the AC2 Falco action fires. Reading
+// /etc/shadow matches it without a tty, which kubectl cannot give a test.
+const ac2FalcoRule = "Read sensitive file untrusted"
+
+// ac2Match reports whether a raw event on source was caused by this run's
+// deliberate action. Every source must name the probe pod (or, for applog,
+// carry the log marker). Falco must additionally name ac2FalcoRule: the probe
+// runs a shell loop and gets a sidecar injected, so other rules can name the
+// same pod, and only the rule the action fires attributes the event to it.
+func ac2Match(source, body, podName, logMarker string) bool {
+	if !strings.Contains(body, podName) && !strings.Contains(body, logMarker) {
+		return false
+	}
+	if source == "falco" {
+		return strings.Contains(body, podName) && strings.Contains(body, ac2FalcoRule)
+	}
+	return true
+}
+
+// ac2Complete reports whether every source in the five-source contract has a
+// hit. It counts only those sources: the raw wildcard can deliver subjects
+// outside the contract, and len(hits) would let the wait end early.
+func ac2Complete(hits map[string]string) bool {
+	for _, s := range fullProfileSources {
+		if _, ok := hits[s.source]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // ac2PeerPodTemplate is the flow destination: a trivial HTTP listener. It

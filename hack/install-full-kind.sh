@@ -149,7 +149,10 @@ b64() {
 # kubeconfig with an empty client key straight into the apiserver. Every value
 # is therefore materialised here, where `|| die` actually terminates the run.
 b64_or_die() {
-    b64 "$1" || die "cannot read $1, needed to build the audit kubeconfig. The certificate directory is incomplete; delete ${cert_dir} and re-run so the material is regenerated."
+    # Name the directory the missing file is in. Both the audit and the applog
+    # material go through here, and pointing an applog failure at the audit
+    # directory would send the operator to delete the wrong keys.
+    b64 "$1" || die "cannot read $1 (missing or empty). Its certificate directory is incomplete; delete $(dirname "$1") and re-run so the material is regenerated."
 }
 
 audit_ca_b64="$(b64_or_die "${cert_dir}/audit-ca.crt")"
@@ -205,10 +208,22 @@ info "wrote ${audit_mount}/{policy.yaml,webhook-kubeconfig.yaml}"
 applog_dir="${out_dir}/applog-certs"
 applog_svc="${release}-applog-injector.${namespace}.svc"
 
-if [ -e "${applog_dir}/tls.crt" ]; then
+# Same completeness rule as the audit material above: reuse only when every
+# file consumed below is present and non-empty. Keying on tls.crt alone let a
+# zero-byte cert from an interrupted openssl take the reuse branch and then die
+# in b64_or_die on every later run.
+applog_complete=true
+for f in ca.crt tls.crt tls.key; do
+    [ -s "${applog_dir}/${f}" ] || applog_complete=false
+done
+
+if [ "$applog_complete" = true ]; then
     info "reusing the applog webhook cert already in ${applog_dir}"
 else
     info "generating applog webhook CA + serving cert for ${applog_svc}"
+    # Nothing outside this directory trusts an incomplete CA yet, so
+    # discarding a partial one loses nothing.
+    rm -rf "$applog_dir"
     mkdir -p "$applog_dir"
     # A CA and a serving cert it signs, NOT one self-signed cert used as
     # its own caBundle. A self-signed cert carries CA:TRUE but, once
