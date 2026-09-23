@@ -6453,3 +6453,41 @@ func TestCollectorKnowsWhetherApplogIsOn(t *testing.T) {
 		t.Errorf("OLAITAN_APPLOG_ENABLED with applog on = %v, want \"true\"", v)
 	}
 }
+
+// TestFalcoIngestBufferDocs pins review round 3 of issue #135: the buffer
+// byte bound lives in collector memory, so the values file and runbook must
+// tie a raised bound to a raised memory limit, and the sample "alerts are
+// queueing" alert must only fire while publishes are failing, not on every
+// busy but healthy node where the queue briefly holds an alert.
+func TestFalcoIngestBufferDocs(t *testing.T) {
+	values, err := os.ReadFile(filepath.Join(chartDir(t), "values.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runbook, err := os.ReadFile(filepath.Join(chartDir(t), "..", "..", "..", "docs", "runbook.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := string(values)
+	i := strings.Index(v, "\nfalcoIngest:")
+	j := strings.Index(v[i:], "\n    maxBytes:")
+	if i < 0 || j < 0 {
+		t.Fatal("falcoIngest.buffer.maxBytes not found in values.yaml")
+	}
+	if block := v[i : i+j]; !strings.Contains(block, "collector.resources.limits.memory") {
+		t.Error("values.yaml falcoIngest.buffer does not tell operators to raise collector.resources.limits.memory with maxBytes")
+	}
+	r := string(runbook)
+	if !strings.Contains(r, "collector.resources.limits.memory") {
+		t.Error("runbook does not tie falcoIngest.buffer.maxBytes to collector.resources.limits.memory")
+	}
+	if strings.Contains(r, "`olaitan_sensor_falco_buffer_depth > 0` for 5 minutes") {
+		t.Error("runbook still has the ungated buffer_depth alert that fires on healthy busy nodes")
+	}
+	if !strings.Contains(r, `olaitan_sensor_falco_buffer_depth > 0 and on(pod) olaitan_source_healthy{source="falco"} == 0`) {
+		t.Error("runbook buffer_depth alert is not gated on the falco source being unhealthy")
+	}
+	if !strings.Contains(r, "Duplicates window") {
+		t.Error("runbook does not state that an outage longer than the EVENTS_RAW Duplicates window can store an alert twice")
+	}
+}
