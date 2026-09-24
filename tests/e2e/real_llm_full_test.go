@@ -77,9 +77,26 @@ const (
 // realLLMWant is what the audit record must attribute every role to.
 type realLLMWant struct {
 	Provider string
-	Model    string
-	Cap      int
+	// Model is the id the record must carry: what the vendor reports it
+	// served, which for a known alias is not the configured id.
+	Model string
+	// Configured is the configured id when it differs from Model (an
+	// alias); empty otherwise.
+	Configured string
+	Cap        int
 }
+
+// servedAs maps a configured model id that a vendor treats as an ALIAS to
+// the id the vendor reports serving. The audit record stores the reported
+// id (the provider records the response's own `model` field), so the test
+// must expect that id. Seen live in Story 10.6: DeepSeek answers
+// `deepseek-chat` as `deepseek-flash` in non-thinking mode. Requesting
+// `deepseek-flash` directly selects its thinking mode (effort "high" by
+// default), whose reasoning exhausted the 4096-token output ceiling and
+// truncated L2 (stop_reason "length"), so the overlay keeps the alias.
+// Update this table if the vendor re-points the alias; a stale entry fails
+// AC2 loudly rather than passing.
+var servedAs = map[string]string{"deepseek-chat": "deepseek-flash"}
 
 // modelSchemas are the compiled model output contracts, keyed by the audit
 // record field they validate.
@@ -331,6 +348,9 @@ func wantFromConfig(cfg *config.Config) (realLLMWant, error) {
 			return realLLMWant{}, fmt.Errorf("analyst.%s_model %q differs from l1's %q: this test proves one model at a time", r.name, model, want.Model)
 		}
 	}
+	if served, ok := servedAs[want.Model]; ok && want.Provider != "ollama" {
+		want.Configured, want.Model = want.Model, served
+	}
 	if a.ScoreCap > 0 && a.ScoreCap < want.Cap {
 		return realLLMWant{}, fmt.Errorf("analyst.score_cap %d is tighter than the %s family cap %d: AC3 would test the operator ceiling, not the family cap", a.ScoreCap, want.Provider, want.Cap)
 	}
@@ -370,7 +390,11 @@ func TestRealLLM_RealIncidentOnFullProfile(t *testing.T) {
 	schemas := loadModelSchemas(t)
 
 	want := configuredChain(t)
-	t.Logf("configured chain: every role -> provider %q model %q (cap %d)", want.Provider, want.Model, want.Cap)
+	if want.Configured != "" {
+		t.Logf("configured chain: every role -> provider %q model %q, which the vendor serves as %q (cap %d)", want.Provider, want.Configured, want.Model, want.Cap)
+	} else {
+		t.Logf("configured chain: every role -> provider %q model %q (cap %d)", want.Provider, want.Model, want.Cap)
+	}
 
 	budget := realLLMBudgetHosted
 	if want.Provider == "ollama" {

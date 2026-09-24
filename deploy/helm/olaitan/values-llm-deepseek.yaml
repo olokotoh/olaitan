@@ -23,21 +23,25 @@
 # role falls back to it when DeepSeek is unreachable after the 3-strike
 # retry (FR28), and AUDIT_ASSESSMENTS records which provider answered.
 #
-# Model id: deepseek-flash, the id DeepSeek's /models endpoint lists
-# (DeepSeek-V4.1-Flash). The older `deepseek-chat` still answers, but as an
-# alias: the response names deepseek-flash, and the audit record stores
-# what the vendor says served the call, so a `deepseek-chat` configuration
-# would never match its own provenance (seen live in the Story 10.6 run).
+# Model id: deepseek-chat. DeepSeek's /models endpoint now lists only
+# deepseek-flash (DeepSeek-V4.1-Flash) and deepseek-v4-pro; deepseek-chat
+# is an alias it answers as deepseek-flash in NON-thinking mode, and the
+# audit record stores the id the vendor reports (deepseek-flash). Asking
+# for deepseek-flash directly selects its thinking mode (effort "high" by
+# default): in the Story 10.6 live run its reasoning used up the 4096-token
+# output ceiling and L2 came back truncated (stop_reason "length"), three
+# times, then fell back to Ollama. So the alias stays until the provider
+# can set a reasoning effort or a larger ceiling.
 analyst:
   provider: api
   api:
     endpoint: "https://api.deepseek.com/v1"
   l1_provider: openai
-  l1_model: deepseek-flash
+  l1_model: deepseek-chat
   l2_provider: openai
-  l2_model: deepseek-flash
+  l2_model: deepseek-chat
   senior_provider: openai
-  senior_model: deepseek-flash
+  senior_model: deepseek-chat
 
 aggregator:
   extraEnv:

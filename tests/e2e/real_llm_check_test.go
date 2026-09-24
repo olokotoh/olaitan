@@ -174,9 +174,18 @@ func TestRealLLMWantFollowsTheConfiguredFamily(t *testing.T) {
 			c.Analyst.Provider = "api"
 			c.Analyst.API.Endpoint = "https://api.deepseek.com/v1"
 			c.Analyst.L1Provider, c.Analyst.L2Provider, c.Analyst.SeniorProvider = "openai", "openai", "openai"
-			c.Analyst.L1Model, c.Analyst.L2Model, c.Analyst.SeniorModel = "deepseek-chat", "deepseek-chat", "deepseek-chat"
+			c.Analyst.L1Model, c.Analyst.L2Model, c.Analyst.SeniorModel = "deepseek-v4-pro", "deepseek-v4-pro", "deepseek-v4-pro"
 			c.Analyst.Local.Model = "qwen2.5:3b-instruct" // the FR28 fallback stays configured
-		}), realLLMWant{Provider: "openai", Model: "deepseek-chat", Cap: 30}},
+		}), realLLMWant{Provider: "openai", Model: "deepseek-v4-pro", Cap: 30}},
+		// deepseek-chat is a vendor alias: DeepSeek answers it as
+		// deepseek-flash (non-thinking), and the audit record stores the
+		// model the vendor reports. The record must name that served id.
+		{"deepseek overlay as shipped: the deepseek-chat alias", cfg(func(c *config.Config) {
+			c.Analyst.Provider = "api"
+			c.Analyst.API.Endpoint = "https://api.deepseek.com/v1"
+			c.Analyst.L1Provider, c.Analyst.L2Provider, c.Analyst.SeniorProvider = "openai", "openai", "openai"
+			c.Analyst.L1Model, c.Analyst.L2Model, c.Analyst.SeniorModel = "deepseek-chat", "deepseek-chat", "deepseek-chat"
+		}), realLLMWant{Provider: "openai", Model: "deepseek-flash", Configured: "deepseek-chat", Cap: 30}},
 		{"claude overlay: model from analyst.api.model", cfg(func(c *config.Config) {
 			c.Analyst.Provider = "api"
 			c.Analyst.L1Provider, c.Analyst.L2Provider, c.Analyst.SeniorProvider = "claude", "claude", "claude"
