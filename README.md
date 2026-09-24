@@ -64,9 +64,16 @@ With Docker, [kind](https://kind.sigs.k8s.io/), helm and kubectl installed:
 kind create cluster --name olaitan
 helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan \
   --version 1.0.0-rc4 \
-  --namespace olaitan --create-namespace
+  --namespace olaitan --create-namespace --wait --timeout 10m
 kubectl -n olaitan wait pod --all --for=condition=Ready --timeout=10m
 ```
+
+Both waits are needed. `kubectl wait` only sees pods that already exist, so
+straight after a plain `helm install` it fails with `no matching resources
+found`. `helm --wait` makes sure every pod exists, but it counts a DaemonSet
+as ready with one pod unavailable, so on one node it can return while the
+collector is still restarting (it restarts until NATS is up). The
+`kubectl wait` after it is the real check.
 
 That is the whole default install, Falco included: on a single-node cluster,
 six pods (Falco and the collector, one each per node; the aggregator; NATS;
