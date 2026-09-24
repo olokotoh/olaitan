@@ -91,6 +91,12 @@ func kindClusterName() string {
 // the kind harness up.
 func requireKindCluster(t *testing.T) {
 	t.Helper()
+	// Story 10.6 review (P7): the CI step that runs this package's
+	// checker unit tests sets OLT_E2E_NO_CLUSTER, so no cluster test can
+	// run there, even one a -run filter selects by accident.
+	if os.Getenv("OLT_E2E_NO_CLUSTER") != "" {
+		t.Skip("OLT_E2E_NO_CLUSTER is set: cluster tests skipped")
+	}
 	out, err := exec.Command("kind", "get", "clusters").Output()
 	if err != nil {
 		t.Skipf("kind binary not available or `kind get clusters` failed: %v", err)

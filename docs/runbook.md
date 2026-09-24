@@ -77,6 +77,14 @@ The catalogue is organised by registering ring + story, in commit chronology so 
 - **Help:** Events dropped by the correlator because they carry no Kubernetes pod: host processes and non-Kubernetes containers. There is no workload to score or isolate. On a busy node this is most of Falco's output, which is why it is a counter rather than a log line.
 - **Sample PromQL (aggregate):** `rate(olaitan_correlator_host_events_dropped_total[5m])`.
 
+#### `olaitan_correlator_never_scored_events_dropped_total` (Story 10.6)
+
+- **Type:** counter
+- **Unit:** count
+- **Labels:** none
+- **Help:** Events dropped by the correlator because their pod is in a namespace listed in `detection.correlator.never_scored_namespaces` (by default `olaitan`, plus the release namespace when `correlator.neverScoreReleaseNamespace` is on). Such a workload is never scored by any path: no multi-signal package, no rule or baseline match, no Falco trigger. A steady non-zero rate is normal; it is Olaitan's own pods talking. kube-system is not on this list: it is in `response.excluded_namespaces`, which means never isolated, and it is still correlated and scored.
+- **Sample PromQL (aggregate):** `rate(olaitan_correlator_never_scored_events_dropped_total[5m])`.
+
 #### `olaitan_sensor_falco_http_requests_total` (Story 10.2)
 
 - **Type:** counter
@@ -1079,6 +1087,100 @@ client (no SDK, no external egress).
   empty model degrades to rules-only at startup, and a wrong name
   surfaces as a PERMANENT 404 on every call (a 404 from Ollama means
   "model not provisioned", not a transient outage).
+- **Chart-managed pull (Story 10.6), for clusters that CAN reach the
+  registry.** `ollama.pull.models: [<model>]` plus
+  `ollama.persistence.{enabled,create}: true` makes the chart provision the
+  model itself: a Job (`<release>-ollama-pull-<hash>`) runs a loopback-only
+  `ollama pull` into a chart-created RWO claim, under its own NetworkPolicy
+  (DNS and TCP 443 egress, no ingress), and the server waits in a
+  `wait-for-models` init container until every model is on disk, so
+  `helm install --wait` returns only when the model can answer. The serving
+  pod's egress stays declared and empty: the download happens in the Job's
+  pod, never in the server's. Both set `OLLAMA_NOPRUNE`, because a server
+  start otherwise deletes blobs that no manifest references yet, which is
+  what a pull in progress looks like. The Job name hashes the image, the
+  model list and the expected model IDs, so changing any of them creates a
+  new Job rather than failing the upgrade on an immutable pod template. The
+  Job pod carries a required podAffinity to the server pod
+  (`kubernetes.io/hostname`), because both mount the same ReadWriteOnce
+  claim: on attachable block storage (EBS, PD, Azure Disk) two pods on two
+  nodes would hit Multi-Attach. `values-full.yaml` uses this with
+  `qwen2.5:3b-instruct`; the air-gapped overlay does not (nothing to pull
+  from).
+- **Model ID pin.** The image is pinned by digest, but a model is pulled by
+  a registry tag that can be re-pushed. `ollama.pull.expectedIds` pins the
+  ID `ollama list` shows per model; the pull Job compares after the pull and
+  fails on drift ("has ID ..., want ..."). `values-full.yaml` pins
+  `qwen2.5:3b-instruct` to `357c53fb659c`, the ID the Story 10.6 live run
+  pulled, and the real-LLM e2e checks the same ID. After checking new
+  weights on purpose, update the ID in values-full.yaml and here.
+- **A failed pull Job.** `kubectl logs job/<release>-ollama-pull-<hash>`
+  shows the `ollama pull` output. A failed Job is NOT retried by
+  `helm upgrade`: the same inputs give the same Job name and spec, so helm
+  leaves the Failed Job alone. The server's `wait-for-models` init container
+  gives up `ollama.pull.activeDeadlineSeconds` + 300s after it starts (2100s
+  by default), prints the exact Job name, and exits non-zero, so the pod
+  shows `Init:Error` / `Init:CrashLoopBackOff` instead of waiting forever.
+  To recover, fix the cause (egress, registry, disk), then
+  `kubectl -n <ns> delete job <release>-ollama-pull-<hash>` and run the same
+  `helm upgrade` again; it recreates the Job.
+- **Structured output.** The provider sends each role's JSON Schema as
+  Ollama's native `format` (Ollama 0.5 or newer; the chart pins 0.9.0 by
+  digest), so decoding is constrained to schema-shaped replies. This is
+  what makes a 3B model reliably schema-valid; the runners still validate
+  every reply and still enforce the cited-event rule a grammar cannot
+  express.
+- **CPU latency, measured (Story 10.6).** On an AWS m6i.2xlarge (8 vCPU,
+  no GPU) running the whole kind-full profile, `qwen2.5:3b-instruct` reads
+  prompts at about 17 to 27 tokens/s and writes at about 8.5 tokens/s. A
+  chain role's prompt is 8k to 10k tokens, so each role spends about 5 to
+  10 minutes on the prompt alone (8k at 27 tokens/s to 10k at 17 tokens/s)
+  plus about 35 seconds writing: 15 to 30 minutes per incident, and
+  incidents queue behind each other. No full Ollama chain has completed in
+  a live run yet; only one direct L1 call was measured end to end. That is fine to
+  prove the tier works with no key; for real-time use, schedule Ollama on
+  a GPU node (`ollama.nodeSelector`, `ollama.tolerations`, a GPU resource
+  in `ollama.resources`) or switch to a hosted model (below).
+- **CPU timeouts.** The per-role budgets (30s L1, 30s L2, 60s Senior) are
+  calibrated for a hosted model. On CPU, raise them with
+  `aggregator.extraEnv` `OLT_LLM_ROLE_TIMEOUT_MULTIPLIER` (values-full sets
+  30: 900s, 900s, 1800s, which covers the slow end of the measured numbers
+  above, about 10.5 minutes, with margin; it also sets
+  `OLLAMA_CONTEXT_LENGTH` to 16384 because the prompts outgrow 8192). The
+  chain runs inline in the FSM consumer, so a slow model delays FSM
+  evaluation behind it; the circuit breaker (FR51) bounds a burst.
+- **Hosted model, key out of band (Story 10.6).** Layer
+  `values-llm-deepseek.yaml` (openai family, cap 30) or
+  `values-llm-claude.yaml` (claude family, cap 35) after the profile.
+  Create the key Secret yourself (`kubectl create secret generic
+  olaitan-llm-key --from-file=llm-api-key=/dev/stdin`, key on stdin) and
+  set `secrets.llmApiKeyExistingSecret=olaitan-llm-key`; the aggregator
+  then reads `llm-api-key` from that Secret, and the key never appears in
+  helm values or `helm get values`. The in-cluster model stays configured
+  as every role's FR28 fallback, and `AUDIT_ASSESSMENTS` records which
+  provider answered, but on CPU that fallback cannot finish: the overlay's
+  `aggregator.extraEnv` replaces the profile's (Helm replaces lists), so
+  every role, the Ollama fallback included, gets the hosted multiplier 2
+  (60s, 60s, 120s) against 5 to 10 minutes per role. The live DeepSeek run
+  2 showed exactly this. It needs a GPU node or per-provider budgets
+  (DW10.6-1). `make e2e-full-real-llm-deepseek` runs the real-attack
+  proof this way.
+- **Self-exclusion on kind-full (Story 10.6).** The profile installs into
+  `default` and sets `correlator.neverScoreReleaseNamespace: true`, which
+  adds the release namespace to `detection.correlator.never_scored_namespaces`.
+  The correlator drops every event from a never-scored namespace before it
+  is windowed, so no path (multi-signal, rule, baseline, Falco trigger)
+  opens an investigation of Olaitan's own pods; the drops are counted in
+  `olaitan_correlator_never_scored_events_dropped_total`. This is a
+  separate list from `response.excluded_namespaces` on purpose: that one
+  (kube-system, olaitan) means never isolated, and kube-system is still
+  detected and scored.
+- **Startup warning on the local path.** The aggregator warns when
+  `analyst.score_cap` (file default 35) exceeds 25 on the local provider.
+  Since Story 3.8 the per-role cap is `min(family cap, score_cap)`, so an
+  ollama role is capped at 25 either way; `values-full.yaml` deliberately
+  leaves `score_cap` unset so the live Story 10.6 proof exercises the
+  code-enforced cap, and the warning is expected there.
 - **Context-window pairing.** The provider never sends
   `options.num_ctx`; the EFFECTIVE context window is the server-side
   `num_ctx` (small by default regardless of model capability). The

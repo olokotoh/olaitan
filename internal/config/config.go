@@ -274,6 +274,12 @@ type CorrelatorConfig struct {
 	// 10.3): off, warning, error, critical, alert or emergency. Empty
 	// means warning.
 	FalcoTriggerMinPriority string `yaml:"falco_trigger_min_priority,omitempty"`
+	// NeverScoredNamespaces are namespaces whose events the correlator
+	// drops before the window, so no path opens an investigation there
+	// (Story 10.6): Olaitan's own namespace, so it never scores itself.
+	// Distinct from response.excluded_namespaces, which is never ENFORCED
+	// but still detected (kube-system).
+	NeverScoredNamespaces []string `yaml:"never_scored_namespaces,omitempty"`
 }
 
 // DefaultCorrelator returns Story 1.14's production defaults.
@@ -349,6 +355,14 @@ func (c CorrelatorConfig) validate() error {
 		// container" fire on any kubectl exec and would open an
 		// investigation for every operator shell.
 		return fmt.Errorf("detection.correlator.falco_trigger_min_priority: want off, warning, error, critical, alert or emergency (got %q)", c.FalcoTriggerMinPriority)
+	}
+	for i, ns := range c.NeverScoredNamespaces {
+		if ns == "" {
+			return fmt.Errorf("detection.correlator.never_scored_namespaces[%d]: empty entry not allowed", i)
+		}
+		if strings.TrimSpace(ns) != ns {
+			return fmt.Errorf("detection.correlator.never_scored_namespaces[%d]: leading/trailing whitespace in %q", i, ns)
+		}
 	}
 	return nil
 }

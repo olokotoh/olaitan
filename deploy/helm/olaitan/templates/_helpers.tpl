@@ -77,6 +77,101 @@ app.kubernetes.io/component: ollama
 {{- end -}}
 
 {{/*
+Story 10.6: the Ollama image reference, repository:tag plus @digest when
+ollama.image.digest is set. One helper so the server, its wait init
+container and the model pull Job can never run different images against
+the same model volume.
+*/}}
+{{- define "olaitan.ollama.image" -}}
+{{- $img := .Values.ollama.image -}}
+{{- $ref := printf "%s:%s" $img.repository (required "ollama.image.tag is required (an empty tag renders a broken image reference)" $img.tag) -}}
+{{- with $img.digest -}}
+{{- if not (regexMatch "^sha256:[a-f0-9]{64}$" .) -}}
+{{- fail (printf "ollama.image.digest must be sha256:<64 lowercase hex> (got %q)" .) -}}
+{{- end -}}
+{{- $ref = printf "%s@%s" $ref . -}}
+{{- end -}}
+{{- $ref -}}
+{{- end -}}
+
+{{/*
+Story 10.6: the model claim the server (and the pull Job) mount, or ""
+when persistence is off. existingClaim wins; create names the
+chart-created claim; enabled with neither is the Story 3.4 fail-fast.
+*/}}
+{{- define "olaitan.ollama.claimName" -}}
+{{- $p := default (dict) .Values.ollama.persistence -}}
+{{- if $p.enabled -}}
+{{- if $p.existingClaim -}}{{ $p.existingClaim }}
+{{- else if $p.create -}}{{ include "olaitan.fullname" . }}-ollama-models
+{{- else -}}{{ fail "ollama.persistence.existingClaim is required when ollama.persistence.enabled=true and ollama.persistence.create=false (provision the claim with the pre-pulled model, or set create: true)" }}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Story 10.6: space-separated model pull list, "" when nothing is pulled.
+Fails the render when a pull has nowhere to keep the model: it would land
+in the pull pod's own filesystem, vanish with it, and leave the server
+waiting forever. Model names are validated so the list can be passed to a
+shell loop safely.
+*/}}
+{{- define "olaitan.ollama.pullModels" -}}
+{{- $o := default (dict) .Values.ollama -}}
+{{- $models := default (list) (default (dict) $o.pull).models -}}
+{{- if and $o.enabled $models -}}
+{{- if not (default (dict) $o.persistence).enabled -}}
+{{- fail "ollama.pull.models needs ollama.persistence.enabled=true (with create: true or an existingClaim): a pulled model must land on a volume the server reads" -}}
+{{- end -}}
+{{- range $models -}}
+{{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._/-]*(:[A-Za-z0-9._-]+)?$" (toString .)) -}}
+{{- fail (printf "ollama.pull.models entry %q is not a model reference (name[:tag])" (toString .)) -}}
+{{- end -}}
+{{- end -}}
+{{- join " " $models -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Story 10.6 review (P6): space-separated model=ID pairs from
+ollama.pull.expectedIds, "" when none. The pull Job checks `ollama list`
+against them after the pull and fails on drift: the image is pinned by
+digest, but a model tag can be re-pushed. Each key must be a pulled model
+and each ID the 12 hex characters of the `ollama list` ID column.
+*/}}
+{{- define "olaitan.ollama.pullExpect" -}}
+{{- $pull := default (dict) (default (dict) .Values.ollama).pull -}}
+{{- $ids := default (dict) $pull.expectedIds -}}
+{{- $models := list -}}
+{{- range (default (list) $pull.models) }}{{ $models = append $models (toString .) }}{{ end -}}
+{{- $out := list -}}
+{{- range $m := keys $ids | sortAlpha -}}
+{{- $id := toString (get $ids $m) -}}
+{{- if not (has $m $models) -}}
+{{- fail (printf "ollama.pull.expectedIds names %q, which is not in ollama.pull.models" $m) -}}
+{{- end -}}
+{{- if not (regexMatch "^[a-f0-9]{12}$" $id) -}}
+{{- fail (printf "ollama.pull.expectedIds[%q] must be the 12 lowercase hex characters of the `ollama list` ID column, quoted (got %q)" $m $id) -}}
+{{- end -}}
+{{- $out = append $out (printf "%s=%s" $m $id) -}}
+{{- end -}}
+{{- join " " $out -}}
+{{- end -}}
+
+{{/*
+Story 10.6: the model pull Job's name. It carries a hash of the image, the
+model list and the expected IDs: a Job's pod template is immutable, so a
+change must be a new Job, and the same inputs must be the same Job so a
+no-change upgrade leaves the finished one alone. Shared with the server's
+wait-for-models container, which names the Job when it gives up.
+*/}}
+{{- define "olaitan.ollama.pullJobName" -}}
+{{- $in := printf "%s|%s" (include "olaitan.ollama.image" .) (include "olaitan.ollama.pullModels" .) -}}
+{{- with include "olaitan.ollama.pullExpect" . }}{{ $in = printf "%s|%s" $in . }}{{ end -}}
+{{- printf "%s-ollama-pull-%s" (include "olaitan.fullname" . | trunc 40 | trimSuffix "-") ($in | sha256sum | trunc 10) -}}
+{{- end -}}
+
+{{/*
 ServiceAccount name helpers. Each ring has its own SA so the RBAC grant
 stays ring-scoped (Dev Notes § "RBAC: Role vs ClusterRole split"). The
 SA name is deterministic from the fullname -- it is not a user-tunable

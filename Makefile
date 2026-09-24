@@ -9,7 +9,7 @@ CONFIG_SRC       := config/olaitan.yaml
 AUDIT_POLICY_SRC := config/audit-policy-default.yaml
 CHART_FILES      := $(CHART_DIR)/files/olaitan.yaml $(CHART_DIR)/files/audit-policy-default.yaml
 
-.PHONY: e2e-full e2e-full-down build test lint olaitan-lint prereg-check analysis analysis-test docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics e2e-local-overlays eval-smoke scenarios-smoke capture-it e2e-local-down schemas helm-values-doc preflight
+.PHONY: e2e-full e2e-full-down e2e-full-real-llm build test lint olaitan-lint prereg-check analysis analysis-test docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics e2e-local-overlays eval-smoke scenarios-smoke capture-it e2e-local-down schemas helm-values-doc preflight
 
 # envtest-bin downloads the kube-apiserver and etcd binaries that the
 # Story 1.11 posture-client integration tests (and any future
@@ -385,8 +385,9 @@ e2e-local-forensics: helm-prepare helm-deps docker-build
 # nothing to NATS. Needs the kind-full cluster up first (`make e2e-full`).
 #
 # The overlay STAYS in the shared kind-full release after this target: the
-# fake-LLM endpoints, the 5s baseline warm-up, the report archive and the
-# Falco kind-hook exception. Any later `helm upgrade --reuse-values` (for
+# fake-LLM endpoints, the 5s baseline warm-up and the report archive (the
+# Falco kind-hook exception is part of values-full.yaml since Story 10.6).
+# Any later `helm upgrade --reuse-values` (for
 # example a Story 10.6 real-LLM run) inherits them and would talk to
 # fake-llm without saying so. make e2e-full restores the profile, because it
 # upgrades without --reuse-values. FULL_CLUSTER_NAME and FULL_OUT_DIR are
@@ -555,6 +556,13 @@ FULL_OUT_DIR ?= $(HOME)/.olaitan-full
 # 1, matching what has actually been booted and what the README claims. The
 # committed hack/kind-full.yaml default is 2; raise this to exercise it.
 FULL_WORKERS ?= 1
+# The values files a kind-full install is made of, in the one order that
+# works (hack/install-full-kind.sh generates the last three). One definition
+# so e2e-full and e2e-full-real-llm install exactly the same profile.
+FULL_HELM_VALUES = -f $(CHART_DIR)/values-full.yaml \
+	-f $(FULL_OUT_DIR)/calico/calico-values.yaml \
+	-f $(FULL_OUT_DIR)/audit-certs/audit-webhook-values.yaml \
+	-f $(FULL_OUT_DIR)/applog-certs/applog-values.yaml
 
 # Same prerequisites as every sibling e2e target: without helm-prepare the
 # chart installs with no rules or prompts, without helm-deps the subcharts do
@@ -572,15 +580,73 @@ e2e-full: helm-prepare helm-deps docker-build
 		--set-string image.repository=$(IMAGE) \
 		--set-string image.tag=$(TAG) \
 		--set image.pullPolicy=Never \
-		-f $(CHART_DIR)/values-full.yaml \
-		-f $(FULL_OUT_DIR)/calico/calico-values.yaml \
-		-f $(FULL_OUT_DIR)/audit-certs/audit-webhook-values.yaml \
-		-f $(FULL_OUT_DIR)/applog-certs/applog-values.yaml \
-		--wait --timeout 12m
+		$(FULL_HELM_VALUES) \
+		--wait --timeout 15m
 	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig \
 		KIND_CLUSTER_NAME=$(FULL_CLUSTER_NAME) OLT_E2E_FULL=1 \
 		go test -tags=e2e -v -count=1 -run 'TestFullProfile|TestFalcoSourceIsLive' ./tests/e2e/...
 	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig hack/check-netpol-enforcement.sh
+
+# Story 10.6: a REAL incident on kind-full is investigated by the profile's
+# real in-cluster model, and the AUDIT.assessments record proves AC1-AC3
+# (schema-valid L1, L2 and Senior output; configured provider and model
+# recorded; raw confidence above the ollama cap of 25 capped to 25). The
+# test attacks for real (an /etc/shadow read inside a fresh pod) and
+# publishes nothing to NATS.
+#
+# Upgrades WITHOUT --reuse-values, from the same $(FULL_HELM_VALUES) as
+# e2e-full, so it never inherits the fake-LLM overlay e2e-full-report-archive
+# leaves in the shared release. Needs the kind-full cluster up first
+# (`make e2e-full`). The model is pulled by the chart on first install; on a
+# 3B CPU model one chain run takes minutes, hence the long test timeout.
+.PHONY: e2e-full-real-llm
+e2e-full-real-llm: helm-prepare helm-deps docker-build
+	kind get clusters | grep -qx '$(FULL_CLUSTER_NAME)' || \
+		{ echo 'kind cluster $(FULL_CLUSTER_NAME) not found; run make e2e-full first' >&2; exit 1; }
+	kind load docker-image $(IMAGE):$(TAG) --name $(FULL_CLUSTER_NAME)
+	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig \
+		helm upgrade --install olaitan $(CHART_DIR) -n default \
+		--set-string image.repository=$(IMAGE) \
+		--set-string image.tag=$(TAG) \
+		--set image.pullPolicy=Never \
+		$(FULL_HELM_VALUES) \
+		--wait --timeout 15m
+	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig \
+		KIND_CLUSTER_NAME=$(FULL_CLUSTER_NAME) OLT_E2E_FULL=1 OLT_E2E_REAL_LLM=1 \
+		go test -tags=e2e -v -count=1 -timeout 60m -run 'TestRealLLM_RealIncidentOnFullProfile|TestFalcoSourceIsLive' ./tests/e2e/...
+
+# Story 10.6: the same real-incident test, against DeepSeek instead of the
+# in-cluster model. Restores the profile like e2e-full-real-llm (no
+# --reuse-values), layers values-llm-deepseek.yaml, and reads the key from a
+# Secret you create out of band BEFORE running this, so the key never goes
+# through make, helm values or a file in this repo:
+#
+#   kubectl -n default create secret generic olaitan-llm-key \
+#     --from-file=llm-api-key=/dev/stdin < <file holding the key>
+#
+# The test derives the expected provider (openai), model (deepseek-chat,
+# which DeepSeek serves and records as deepseek-flash) and
+# trust cap (30) from the live release's config, so nothing here names them.
+LLM_KEY_SECRET ?= olaitan-llm-key
+.PHONY: e2e-full-real-llm-deepseek
+e2e-full-real-llm-deepseek: helm-prepare helm-deps docker-build
+	kind get clusters | grep -qx '$(FULL_CLUSTER_NAME)' || \
+		{ echo 'kind cluster $(FULL_CLUSTER_NAME) not found; run make e2e-full first' >&2; exit 1; }
+	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig kubectl -n default get secret $(LLM_KEY_SECRET) -o name >/dev/null || \
+		{ echo 'Secret $(LLM_KEY_SECRET) not found in default; create it first (see the comment above this target)' >&2; exit 1; }
+	kind load docker-image $(IMAGE):$(TAG) --name $(FULL_CLUSTER_NAME)
+	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig \
+		helm upgrade --install olaitan $(CHART_DIR) -n default \
+		--set-string image.repository=$(IMAGE) \
+		--set-string image.tag=$(TAG) \
+		--set image.pullPolicy=Never \
+		$(FULL_HELM_VALUES) \
+		-f $(CHART_DIR)/values-llm-deepseek.yaml \
+		--set-string secrets.llmApiKeyExistingSecret=$(LLM_KEY_SECRET) \
+		--wait --timeout 15m
+	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig \
+		KIND_CLUSTER_NAME=$(FULL_CLUSTER_NAME) OLT_E2E_FULL=1 OLT_E2E_REAL_LLM=1 \
+		go test -tags=e2e -v -count=1 -timeout 20m -run 'TestRealLLM_RealIncidentOnFullProfile|TestFalcoSourceIsLive' ./tests/e2e/...
 
 # Removes FULL_OUT_DIR too. It holds the audit CA and the apiserver client
 # key; leaving it behind also leaves a Calico marker file that would make the

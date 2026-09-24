@@ -117,6 +117,49 @@ knowable in advance and stable across recreations. Set `WORKERS=1` on a host
 under about 16GB; the profile still installs, but pod traffic stops crossing
 a node boundary and the Calico flow adapter sees less.
 
+**kind-full also runs the LLM analyst tier for real (Story 10.6).** The
+profile pulls `qwen2.5:3b-instruct` into an in-cluster Ollama (image pinned by
+digest, model on a chart-created volume) and routes the L1, L2 and Senior
+roles to it, so no API key is needed and nothing leaves the cluster at
+inference time. Only the short-lived pull Job may reach the internet (DNS and
+HTTPS); the serving pod keeps an empty egress policy. The trust cap for this
+model family is 25, enforced in code.
+
+**The in-cluster model is slow on CPU, and that is measured, not guessed.**
+On an 8 vCPU AWS m6i.2xlarge with no GPU, running beside the whole profile,
+`qwen2.5:3b-instruct` reads a prompt at about 17 to 27 tokens/s and writes at
+about 8.5 tokens/s. A chain role's prompt is 8k to 10k tokens, so each role
+spends about 5 to 10 minutes just reading it, plus about 35 seconds writing:
+15 to 30 minutes per incident, with incidents queued one after another. That proves
+the tier runs with no key; it does not keep up with a live cluster. For
+real-time use, give Ollama a GPU node, or use a hosted model: layer one
+overlay after the profile and supply the key out of band, in a Secret you
+create yourself, so it never passes through helm values:
+
+```
+kubectl -n default create secret generic olaitan-llm-key --from-file=llm-api-key=/dev/stdin < key.txt
+-f deploy/helm/olaitan/values-llm-deepseek.yaml --set secrets.llmApiKeyExistingSecret=olaitan-llm-key
+-f deploy/helm/olaitan/values-llm-claude.yaml   --set secrets.llmApiKeyExistingSecret=olaitan-llm-key
+```
+
+(`--set-file secrets.llmApiKey=./key.txt` also works, but then the key is in
+the release's values.) The in-cluster model stays configured as the fallback
+for every role, but on CPU that fallback cannot finish: the overlay sets the
+hosted budget (60s to 120s per role) for every provider, the fallback
+included. A working fallback needs a GPU node or per-provider budgets
+(deferred). The `fake-llm` fixture is for unit and CI tests only and is not
+part of any profile. `make e2e-full-real-llm` (in-cluster model) and
+`make e2e-full-real-llm-deepseek` (DeepSeek, key from the Secret above) prove
+the tier on a live cluster: a real in-pod attack, then schema-valid L1, L2
+and Senior output from the model, the configured provider and model recorded
+in `AUDIT.assessments`, and the model's own confidence capped at its family's
+trust cap (ollama 25, openai 30, claude 35). The profile raises the per-role
+LLM timeouts thirtyfold for the CPU model, and never scores its own namespace
+(`correlator.neverScoreReleaseNamespace`) so Olaitan does not investigate its
+own pods ahead of a real incident. The 3B Qwen2.5 weights are under the Qwen Research licence, so for commercial use
+switch `analyst.local.model` and `ollama.pull.models` to an Apache-2.0 size
+such as `qwen2.5:7b-instruct`.
+
 **The kind-full caveat, stated here rather than only in the matrix.** The
 2026-09-21 run was made with `WORKERS=1`, so what is verified is one
 control-plane plus one worker. The committed default in `hack/kind-full.yaml`
@@ -215,7 +258,9 @@ Read this section before trusting it with anything.
   `>=1.29.0`: the optional applog sidecar defaults to the native sidecar form,
   which needs 1.29.
 - **The LLM tier costs money and adds latency.** It is off by default for both
-  reasons. Everything except tier-3 reasoning works with it disabled.
+  reasons. Everything except tier-3 reasoning works with it disabled. The
+  kind-full reference profile turns it on with an in-cluster CPU model: no
+  money, but minutes of latency per investigation.
 - **The agent writes NetworkPolicies into your cluster when enforcement is on.**
   Review [SECURITY.md](SECURITY.md) for the blast radius and the guards that
   bound it.

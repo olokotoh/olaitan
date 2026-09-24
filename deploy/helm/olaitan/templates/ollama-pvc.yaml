@@ -1,0 +1,31 @@
+{{/*
+Story 10.6: the chart-created Ollama model claim. Rendered only when the
+in-cluster Ollama is on, persistence is on, create is set and no
+existingClaim names an operator-provisioned one (that route, the
+air-gapped one, is unchanged). ReadWriteOnce is enough because RWO is a
+per-node, not per-pod, restriction, and the pull Job pod carries a
+required podAffinity to the server pod (same kubernetes.io/hostname), so
+both mount the claim on one node on any storage class, not only on a
+node-local provisioner such as kind local-path.
+*/}}
+{{- $o := default (dict) .Values.ollama -}}
+{{- $p := default (dict) $o.persistence -}}
+{{- if and $o.enabled $p.enabled $p.create (not $p.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "olaitan.fullname" . }}-ollama-models
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ollama
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ required "ollama.persistence.size is required when ollama.persistence.create=true" $p.size | quote }}
+  {{- with $p.storageClassName }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+{{- end }}

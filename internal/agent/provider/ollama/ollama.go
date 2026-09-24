@@ -294,11 +294,20 @@ func (p *Provider) SupportsStreaming() bool { return false }
 // and load-bearing (the server defaults to streaming); options carries
 // num_predict ONLY (no sampling, no num_ctx, no keep_alive - Story 3.4
 // BI-2.1).
+//
+// Format (Story 10.6) carries the role's JSON Schema as Ollama's native
+// structured-output constraint (Ollama >= 0.5): decoding is limited to
+// replies that match it, which is what makes a 3B CPU model reliably
+// schema-valid. It is omitted when the request has no schema, and never
+// sent as a string (a string is the legacy "json" mode name). The schema
+// still rides in the user turn; the runners still validate every reply
+// and enforce the cross-document event_id rule a grammar cannot express.
 type chatRequest struct {
-	Model    string        `json:"model"`
-	Messages []chatMessage `json:"messages"`
-	Stream   bool          `json:"stream"`
-	Options  chatOptions   `json:"options"`
+	Model    string          `json:"model"`
+	Messages []chatMessage   `json:"messages"`
+	Stream   bool            `json:"stream"`
+	Format   json.RawMessage `json:"format,omitempty"`
+	Options  chatOptions     `json:"options"`
 }
 
 type chatMessage struct {
@@ -377,10 +386,22 @@ func (p *Provider) Analyse(ctx context.Context, req provider.Request) (provider.
 	}
 	msgs = append(msgs, chatMessage{Role: "user", Content: content})
 
+	var format json.RawMessage
+	if len(req.Schema) > 0 {
+		if !json.Valid(req.Schema) {
+			// A schema that is not JSON is a caller bug: it can never be
+			// sent as the format constraint, and no retry changes it.
+			status = provider.StatusPermanent
+			return provider.Response{}, errors.New("ollama: role schema is not valid JSON")
+		}
+		format = json.RawMessage(req.Schema)
+	}
+
 	body, err := json.Marshal(chatRequest{
 		Model:    p.model,
 		Messages: msgs,
 		Stream:   false,
+		Format:   format,
 		Options:  chatOptions{NumPredict: p.numPredict},
 	})
 	if err != nil {

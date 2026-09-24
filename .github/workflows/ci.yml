@@ -104,6 +104,15 @@ jobs:
       - name: Test
         run: make test
 
+      # The e2e package's checker and matcher tests need no cluster, but they
+      # carry the e2e build tag, so `make test` skips them and every e2e job
+      # filters them out with -run (Story 10.6 review, P7). OLT_E2E_NO_CLUSTER
+      # makes every cluster test skip (requireKindCluster), which is also why
+      # TestEveryE2EJobChecksFalcoIsLive does not ask this line for the Falco
+      # liveness test: nothing here touches a cluster.
+      - name: e2e checker unit tests (no cluster)
+        run: OLT_E2E_NO_CLUSTER=1 go test -tags=e2e -count=1 -run 'TestRealLLMCheck|TestRealLLMWant|TestOllamaListID|TestAC2' ./tests/e2e/...
+
       - name: Install golangci-lint
         run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.1.6
 

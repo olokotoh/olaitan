@@ -140,6 +140,18 @@ correlator:
   # plain kubectl exec trips it.
   # @schema type:string pattern:"off, warning, error, critical, alert or emergency" effect:"Falco priority at or above which one Falco alert on a pod starts an investigation" ref:FR14
   falcoTriggerMinPriority: "warning"
+  # Story 10.6: add the release namespace to
+  # detection.correlator.never_scored_namespaces (shipped: olaitan), so
+  # Olaitan never scores its own pods when it is installed somewhere other
+  # than `olaitan`. Its events are then dropped before correlation, by every
+  # path. Everything else in that namespace is never scored either, which is
+  # why it is off by default; the kind-full profile, which installs into
+  # `default` and attacks from its own namespaces, turns it on. This is not
+  # response.excluded_namespaces (config-file only): that list is never
+  # isolated but still detected, which is why kube-system is on it and not
+  # here.
+  # @schema type:boolean effect:"never score workloads in the release namespace (added to detection.correlator.never_scored_namespaces)" ref:FR47
+  neverScoreReleaseNamespace: false
 
 # --- Service endpoints -------------------------------------------------
 # Where Olaitan dials its dependencies. Empty by default -- the templates
@@ -200,6 +212,13 @@ secrets:
   # LLM provider API key (OpenAI/Anthropic/…). Empty by default; Epic 4
   # analyst ring refuses to start when analyst.provider=api with empty.
   llmApiKey: ""
+  # Story 10.6: name of a Secret you create yourself, holding the key under
+  # `llm-api-key`. When set, the aggregator reads the LLM key from it
+  # instead of from llmApiKey, so the key never passes through helm values,
+  # a values file or `helm get values`:
+  #   kubectl create secret generic my-llm-key --from-file=llm-api-key=/dev/stdin < key
+  # @schema type:string pattern:"Secret name in the release namespace, or empty for the chart Secret" effect:"Secret the aggregator reads llm-api-key from instead of secrets.llmApiKey" ref:NFR8
+  llmApiKeyExistingSecret: ""
   # Story 10.2: shared secret Falco puts in its http_output URL path; the
   # collector rejects any alert without it (401). Empty -> generated on
   # first install and reused on upgrade, like the bundled Redis password.
@@ -1395,9 +1414,15 @@ ollama:
   enabled: false
   image:
     repository: ollama/ollama
-    # Pinned tag, never latest (reproducibility hygiene, NFR31); mirror
-    # by digest in production registries for tamper-proofing.
+    # Pinned tag, never latest (reproducibility hygiene, NFR31).
     tag: "0.9.0"
+    # Story 10.6: the multi-arch index digest of ollama/ollama:0.9.0,
+    # rendered as repository:tag@digest, so a re-pushed tag cannot change
+    # what runs (tamper-proofing; the tag alone is only hygiene). Keep it
+    # in step with tag. Mirroring by digest (crane copy, skopeo copy
+    # --all) preserves it; empty renders the tag alone.
+    # @schema type:string pattern:"sha256:<64 hex>, or empty for tag-only" effect:"image digest the in-cluster Ollama is pinned to" ref:NFR31
+    digest: "sha256:2ea3b768a8f2dcd4d910f838d79702bb952089414dd578146619c0a939647ac6"
     pullPolicy: IfNotPresent
   resources: {}
   # Extra environment for the Ollama server, e.g. OLLAMA_CONTEXT_LENGTH
@@ -1406,12 +1431,48 @@ ollama:
   extraEnv: []
   nodeSelector: {}
   tolerations: []
-  # Model volume (mounted at /root/.ollama). The chart does NOT create
-  # the claim: provision it with the pre-pulled model and reference it
-  # here (model provisioning is operator-owned).
+  # Model volume (mounted at /root/.ollama). Either name a claim you
+  # provisioned with the pre-pulled model (existingClaim, the air-gapped
+  # route), or set create: true and the chart creates an RWO claim of
+  # size. existingClaim wins when both are set.
   persistence:
     enabled: false
     existingClaim: ""
+    # Story 10.6: chart-created model claim, for a profile that pulls its
+    # own model (see pull below).
+    # @schema type:boolean effect:"create the Ollama model claim in the chart when no existingClaim is named" ref:FR48
+    create: false
+    # @schema type:string effect:"size of the chart-created Ollama model claim" ref:FR48
+    size: 10Gi
+    # @schema type:string effect:"storageClassName of the chart-created Ollama model claim; empty uses the cluster default" ref:FR48
+    storageClassName: ""
+  # Story 10.6: models the chart pulls into the model volume, e.g.
+  # ["qwen2.5:3b-instruct"]. Empty (the default, and the air-gapped
+  # overlay) pulls nothing: model provisioning stays operator-owned and the
+  # serving pod keeps its declared-empty egress.
+  #
+  # Non-empty renders a Job that runs a private `ollama serve` plus
+  # `ollama pull` into the volume, under its own NetworkPolicy (DNS and TCP
+  # 443 egress only, no ingress), and an init container in the server that
+  # waits until every listed model is on disk, so `helm install --wait`
+  # returns only once the model can answer. The serving pod itself still
+  # has no egress. Needs persistence.enabled. The Job name carries a hash
+  # of the image and this list: changing the list creates a new Job rather
+  # than failing an upgrade on an immutable pod template.
+  pull:
+    # @schema type:array effect:"Ollama models the chart pulls into the model volume; empty pulls nothing (operator-provisioned, air-gapped)" ref:FR48
+    models: []
+    # @schema type:integer minimum:0 effect:"retries of the model pull Job before it is marked failed" ref:FR48
+    backoffLimit: 4
+    # @schema type:integer minimum:1 effect:"seconds the model pull Job may run before it is killed; the server's wait for the models gives up 300s after it" ref:FR48
+    activeDeadlineSeconds: 1800
+    # Story 10.6 review: the ID `ollama list` shows for each pulled model,
+    # keyed by model name, e.g. {"qwen2.5:3b-instruct": "357c53fb659c"}
+    # (quote the ID). The pull Job fails when the pulled weights have
+    # another ID: a model tag can be re-pushed, the image digest cannot.
+    # Empty checks nothing.
+    # @schema type:object effect:"expected `ollama list` ID per pulled model; the pull Job fails on drift" ref:NFR31
+    expectedIds: {}
 
 # --- Subchart overrides ------------------------------------------------
 # Only opinions we impose on the downstream charts live here -- upstream

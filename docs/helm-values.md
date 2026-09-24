@@ -30,6 +30,7 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 | `correlator.multiSignalMinSources` | integer | `2` | minimum 1 | minimum distinct sources for a multi-signal EvidencePackage | FR14 |
 | `correlator.highSeverityThreshold` | integer | `50` | 0 to 100 | event severity at or above which an event is kept first when a package overflows its size cap | FR14 |
 | `correlator.falcoTriggerMinPriority` | string | `"warning"` | off, warning, error, critical, alert or emergency | Falco priority at or above which one Falco alert on a pod starts an investigation | FR14 |
+| `correlator.neverScoreReleaseNamespace` | boolean | `false` | - | never score workloads in the release namespace (added to detection.correlator.never_scored_namespaces) | FR47 |
 
 ## `falcoIngest`
 
@@ -44,6 +45,7 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 
 | Value | Type | Default | Valid range | Effect | Ref |
 |-------|------|---------|-------------|--------|-----|
+| `secrets.llmApiKeyExistingSecret` | string | `""` | Secret name in the release namespace, or empty for the chart Secret | Secret the aggregator reads llm-api-key from instead of secrets.llmApiKey | NFR8 |
 | `secrets.falcoHttpToken` | string | `""` | 16+ characters of [A-Za-z0-9._~-], or empty to generate | token Falco must present to the collector's falco-ingest endpoint | NFR8 |
 
 ## `probes`
@@ -188,6 +190,19 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 | `analyst.local.endpoint` | string | `""` | - | Ollama endpoint for the local provider (air-gapped); empty keeps file-side default http://ollama:11434 | FR48 |
 | `analyst.local.model` | string | `""` | - | Ollama model for the local provider; must be a model the operator provisioned (no cross-model default) | FR48 |
 
+## `ollama`
+
+| Value | Type | Default | Valid range | Effect | Ref |
+|-------|------|---------|-------------|--------|-----|
+| `ollama.image.digest` | string | `"sha256:2ea3b768a8f2dcd4d910f838d79702bb952089414dd578146619c0a939647ac6"` | sha256:<64 hex>, or empty for tag-only | image digest the in-cluster Ollama is pinned to | NFR31 |
+| `ollama.persistence.create` | boolean | `false` | - | create the Ollama model claim in the chart when no existingClaim is named | FR48 |
+| `ollama.persistence.size` | string | `"10Gi"` | - | size of the chart-created Ollama model claim | FR48 |
+| `ollama.persistence.storageClassName` | string | `""` | - | storageClassName of the chart-created Ollama model claim; empty uses the cluster default | FR48 |
+| `ollama.pull.models` | array | `[]` | - | Ollama models the chart pulls into the model volume; empty pulls nothing (operator-provisioned, air-gapped) | FR48 |
+| `ollama.pull.backoffLimit` | integer | `4` | minimum 0 | retries of the model pull Job before it is marked failed | FR48 |
+| `ollama.pull.activeDeadlineSeconds` | integer | `1800` | minimum 1 | seconds the model pull Job may run before it is killed; the server's wait for the models gives up 300s after it | FR48 |
+| `ollama.pull.expectedIds` | object | `{}` | - | expected `ollama list` ID per pulled model; the pull Job fails on drift | NFR31 |
+
 ## `openshift`
 
 | Value | Type | Default | Valid range | Effect | Ref |
@@ -211,9 +226,10 @@ completeness. Set them by editing the mounted config, not via `--set`.
 |-----------|------|---------|-------------|--------|-----|-------|
 | NATS core-stream time retention (MaxAge) | duration | `EVENTS 24h, EVENTS_RAW 6h, EVIDENCE never-expire` | not configurable | the core-stream MaxAge values for EVENTS, EVENTS_RAW and EVIDENCE are code-fixed in internal/nats/streams.go, not a Helm value; only the size cap (nats.streamMaxBytesOverride, the OLT_NATS_STREAM_MAXBYTES_OVERRIDE env var) is Helm-exposed | - | internal/nats/streams.go (code-fixed; only nats.streamMaxBytesOverride is Helm-exposed) |
 | Redis key-family TTLs | duration | `baseline:* 48h, fsm:{workload_id} no-TTL` | not configurable | the baseline:* family carries a 48h server-side Redis TTL (EXPIRE, internal/redis/setters.go ttlBaseline) and the fsm:{workload_id} family carries NO TTL (BI-2, so durable FSM state survives an arbitrary restart gap); both are code-fixed, not Helm values | - | internal/keys/keys.go, internal/redis/setters.go (code-fixed; not a Helm or config value) |
+| detection.correlator.never_scored_namespaces | array | `[olaitan]` | list of namespace names | namespaces whose events are dropped before correlation, so no path scores a workload there (Olaitan's own; correlator.neverScoreReleaseNamespace adds the release namespace) | FR47 | config/olaitan.yaml (detection.correlator.never_scored_namespaces) |
 | logging level (per component) | string | `info` | not configurable | structured slog JSON logging runs process-wide at its default level (cmd/olaitan/main.go: slog.NewJSONHandler(stderr, nil)); there is no per-component log-level knob in the chart or config today | - | cmd/olaitan/main.go (hardcoded; not a Helm or config value) |
 | report.redact.audit_enabled | boolean | `false` | true\|false | gates the AUDIT.redactions SIEM emission; redaction itself is ALWAYS applied at every LLM/persistence boundary regardless of this flag (NFR15) | FR41/NFR15 | config/olaitan.yaml (report.redact) |
 | report.redact.retention_redactions_days | integer | `365` | minimum 1 (days) | AUDIT_REDACTIONS JetStream stream MaxAge; the redaction-pattern set itself is code-embedded, not a tunable value | NFR16 | config/olaitan.yaml (report.redact.retention_redactions_days) |
-| response.excluded_namespaces | array | `[kube-system, olaitan]` | list of namespace names | namespaces whose events are dropped before correlation (self-exclusion + control plane) | FR47 | config/olaitan.yaml (response.excluded_namespaces) |
+| response.excluded_namespaces | array | `[kube-system, olaitan]` | list of namespace names | namespaces the response ring never isolates or overrides, and where one Falco alert alone opens no investigation; their events are still correlated and scored, so kube-system stays detected | FR47 | config/olaitan.yaml (response.excluded_namespaces) |
 | worker pool sizes and graceful shutdown grace period | integer | `folded into aggregator.replicas (1); no separate grace-period knob` | not configurable | the worker pool maps to aggregator.replicas (hard-constrained to 1; the rings are cooperative goroutines in one process), and there is no separate terminationGracePeriodSeconds knob (the process drains on SIGTERM within the default 30s grace) | - | deploy/helm/olaitan/values.yaml aggregator.replicas (folded); no separate grace-period value |
 

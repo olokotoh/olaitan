@@ -494,6 +494,7 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		MetricsRegistry:       metricsReg,
 		FalcoTriggerFloor:     cfg.Detection.Correlator.FalcoTriggerMinPriorityOrDefault(),
 		ExcludedNamespaces:    cfg.Response.ExcludedNamespaces,
+		NeverScoredNamespaces: cfg.Detection.Correlator.NeverScoredNamespaces,
 	})
 	if err != nil {
 		closeNATS()
@@ -510,6 +511,7 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 			)
 			corr.SetFalcoTriggerFloor(newCfg.Detection.Correlator.FalcoTriggerMinPriorityOrDefault())
 			corr.SetExcludedNamespaces(newCfg.Response.ExcludedNamespaces)
+			corr.SetNeverScoredNamespaces(newCfg.Detection.Correlator.NeverScoredNamespaces)
 		})
 	}
 	g.Go(func() error {

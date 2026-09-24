@@ -1,0 +1,24 @@
+# Test-only stand-in for the three per-install key-material files that
+# hack/install-full-kind.sh generates (audit mTLS, Calico Goldmane mTLS,
+# applog webhook serving cert). values-full.yaml refuses to render without
+# them, which is correct for an install and useless for a render test.
+# Every value is the base64 of the word "stub": nothing here is a key, and
+# the chart only checks presence, never parses the PEM.
+auditWebhook:
+  caBundle: c3R1Yg==
+  clusterCAData: c3R1Yg==
+  servingCert: c3R1Yg==
+  servingKey: c3R1Yg==
+  apiserverClientCert: c3R1Yg==
+  apiserverClientKey: c3R1Yg==
+calicoSensor:
+  tls:
+    caBundle: c3R1Yg==
+    clientCert: c3R1Yg==
+    clientKey: c3R1Yg==
+applogSidecar:
+  tls:
+    certManagerEnabled: false
+    servingCert: c3R1Yg==
+    servingKey: c3R1Yg==
+    caBundle: c3R1Yg==

@@ -367,7 +367,9 @@ func TestFalcoGuardCatchesEveryForm(t *testing.T) {
 // TestEveryE2EJobChecksFalcoIsLive: review of #136. Every CI job and
 // Makefile target that filters the e2e tests with -run must include
 // TestFalcoSourceIsLive, or the test that proves Falco reaches the collector
-// never runs in CI.
+// never runs in CI. A line that sets OLT_E2E_NO_CLUSTER=1 is exempt: every
+// cluster test skips under it (requireKindCluster), so it runs only the
+// package's checker unit tests and touches no cluster to check Falco on.
 func TestEveryE2EJobChecksFalcoIsLive(t *testing.T) {
 	root := repoRoot(t)
 	for _, f := range []string{".github/workflows/ci.yml", "Makefile"} {
@@ -376,6 +378,9 @@ func TestEveryE2EJobChecksFalcoIsLive(t *testing.T) {
 			t.Fatal(err)
 		}
 		for i, line := range strings.Split(string(raw), "\n") {
+			if strings.Contains(line, "OLT_E2E_NO_CLUSTER=1 go test") {
+				continue
+			}
 			if strings.Contains(line, "go test -tags=e2e") && strings.Contains(line, " -run ") && !strings.Contains(line, "TestFalcoSourceIsLive") {
 				t.Errorf("%s:%d runs e2e tests without TestFalcoSourceIsLive: %s", f, i+1, strings.TrimSpace(line))
 			}

@@ -174,3 +174,121 @@ func TestAddEvent_HostEventsAreDroppedAndCounted(t *testing.T) {
 		t.Errorf("HostEventsDropped = %d, want 1", c.HostEventsDropped())
 	}
 }
+
+// newScoringTestCorrelator wires a correlator to a fresh NATS server with a
+// durable EVIDENCE consumer, for the Story 10.6 namespace tests.
+func newScoringTestCorrelator(t *testing.T, name string, cfg Config) (*Correlator, jetstream.Consumer, context.Context) {
+	t.Helper()
+	srv := startTestNATSServer(t)
+	nc, err := natsclient.NewClient(natsclient.ClientConfig{URL: srv.ClientURL(), Name: name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = nc.Close(ctx)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	t.Cleanup(cancel)
+	if err := natsclient.EnsureStreams(ctx, nc.JetStream(), testStreamConfigs()); err != nil {
+		t.Fatal(err)
+	}
+	kube := kubefake.NewSimpleClientset(
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "web-1", Namespace: "payments", UID: "web-uid"}},
+	)
+	cfg.NATS = nc
+	cfg.Kube = kube
+	cfg.Assembler = assembler.New(assembler.Config{Kube: kube, Posture: fakePosture{now: time.Now}, MaxPackageBytes: 128 * 1024})
+	cfg.WindowDuration = time.Minute
+	cfg.MultiSignalMinSources = 2
+	cfg.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	c, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := nc.JetStream().Stream(ctx, "EVIDENCE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+		Durable: name, AckPolicy: jetstream.AckExplicitPolicy, FilterSubject: subjects.EvidencePackages,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c, consumer, ctx
+}
+
+// Story 10.6: a never-scored namespace (Olaitan's own) opens no
+// investigation by ANY path, not only the single-alert Falco trigger. On
+// kind-full the release lives in `default`, and its own aggregator and
+// Ollama crossed the multi-signal threshold at startup; the rule and
+// baseline engines then raised FR19 chains on those packages, which queued
+// ahead of a real attack. Dropping the events at the correlator means no
+// package, so neither engine ever sees the workload.
+func TestIntegration_NeverScoredNamespaceOpensNoPackageByAnyPath(t *testing.T) {
+	c, consumer, ctx := newScoringTestCorrelator(t, "never-scored-ns-test", Config{NeverScoredNamespaces: []string{"payments"}})
+
+	// Two distinct sources on one workload (the multi-signal rising edge),
+	// then a Critical Falco alert (the single-alert trigger).
+	for _, ev := range []schema.Event{
+		testEvent("ex-1", "web-1", schema.SourceAudit, schema.CategoryAudit, "info", "get pod"),
+		testEvent("ex-2", "web-1", schema.SourceNetwork, schema.CategoryFlow, "info", "flow"),
+		falcoAlert("ex-3", "web-1", "Drop and execute new binary in container", "CRITICAL"),
+	} {
+		pkg, err := c.AddEvent(ctx, ev)
+		if err != nil {
+			t.Fatalf("AddEvent %s: %v", ev.ID, err)
+		}
+		if pkg != nil {
+			t.Fatalf("AddEvent %s returned a %s package for a never-scored namespace", ev.ID, pkg.Trigger.Type)
+		}
+	}
+	noPackage(t, consumer, "multi-signal and Falco in a never-scored namespace")
+	if got := c.NeverScoredEventsDropped(); got != 3 {
+		t.Errorf("NeverScoredEventsDropped = %d, want 3", got)
+	}
+
+	// Lift it (hot reload): the same two sources now correlate.
+	c.SetNeverScoredNamespaces(nil)
+	for _, ev := range []schema.Event{
+		testEvent("ok-1", "web-1", schema.SourceAudit, schema.CategoryAudit, "info", "get pod"),
+		testEvent("ok-2", "web-1", schema.SourceNetwork, schema.CategoryFlow, "info", "flow"),
+	} {
+		if _, err := c.AddEvent(ctx, ev); err != nil {
+			t.Fatalf("AddEvent %s: %v", ev.ID, err)
+		}
+	}
+	if p := nextPackage(t, consumer); p.Trigger.Type != "multi_signal" {
+		t.Errorf("after lifting it: trigger %q, want multi_signal", p.Trigger.Type)
+	}
+}
+
+// Story 10.6 review (D3): response.excluded_namespaces (kube-system by
+// default) means NEVER ENFORCED, not never scored. A compromised
+// kube-system workload must still be correlated: its multi-signal package
+// is published, as before Story 10.6; only the single-alert Falco trigger
+// stays off there (Story 10.3), and the response ring never isolates it.
+func TestIntegration_ExcludedNamespaceIsStillScored(t *testing.T) {
+	c, consumer, ctx := newScoringTestCorrelator(t, "excluded-ns-test", Config{ExcludedNamespaces: []string{"payments"}})
+
+	if _, err := c.AddEvent(ctx, falcoAlert("fx-1", "web-1", "Drop and execute new binary in container", "CRITICAL")); err != nil {
+		t.Fatal(err)
+	}
+	noPackage(t, consumer, "single Falco alert in an excluded namespace")
+
+	for _, ev := range []schema.Event{
+		testEvent("mx-1", "web-1", schema.SourceAudit, schema.CategoryAudit, "info", "get pod"),
+	} {
+		if _, err := c.AddEvent(ctx, ev); err != nil {
+			t.Fatalf("AddEvent %s: %v", ev.ID, err)
+		}
+	}
+	if p := nextPackage(t, consumer); p.Trigger.Type != "multi_signal" {
+		t.Errorf("excluded namespace: trigger %q, want multi_signal (still scored)", p.Trigger.Type)
+	}
+	if got := c.NeverScoredEventsDropped(); got != 0 {
+		t.Errorf("NeverScoredEventsDropped = %d, want 0 for an excluded (never-enforced) namespace", got)
+	}
+}

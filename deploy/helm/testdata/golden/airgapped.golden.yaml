@@ -698,6 +698,13 @@ data:
         # an investigation on its own (a rule_match, severity 50 for warning
         # up to 100). off, warning, error, critical, alert or emergency.
         falco_trigger_min_priority: "warning"
+        # Story 10.6: namespaces whose events are dropped before correlation,
+        # so no path (multi-signal, rule, baseline, Falco trigger) ever scores
+        # a workload there. Olaitan's own namespace only: Olaitan must not
+        # investigate itself. kube-system is NOT here on purpose: it is on
+        # response.excluded_namespaces (never isolated) but still detected.
+        never_scored_namespaces:
+          - olaitan
       # Story 1.7: per-source adapter configuration. The audit-webhook
       # receiver is gated on enabled; chart deploys with
       # auditWebhook.enabled=false leave this block at its zero value and
@@ -2356,6 +2363,9 @@ spec:
             # "api" provider (claude / openai_compat) reads its key from this
             # env. An empty Secret value degrades the chain to rules-only
             # (NFR27) -- so this is safe to project unconditionally.
+            # Story 10.6: secrets.llmApiKeyExistingSecret names a Secret
+            # created out of band (key llm-api-key), so a hosted model's key
+            # never passes through helm values or `helm get values`.
             - name: olaitan-llm
               valueFrom:
                 secretKeyRef:
@@ -2471,7 +2481,7 @@ spec:
       automountServiceAccountToken: false
       containers:
         - name: ollama
-          image: "ollama/ollama:0.9.0"
+          image: "ollama/ollama:0.9.0@sha256:2ea3b768a8f2dcd4d910f838d79702bb952089414dd578146619c0a939647ac6"
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false

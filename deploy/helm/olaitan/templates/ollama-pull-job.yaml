@@ -1,0 +1,132 @@
+{{/*
+Story 10.6: the chart pulls the models a profile routes to, so the full
+profile runs a real model with no API key and no manual provisioning.
+
+Why a separate Job and not an init container in the server: a
+NetworkPolicy selects pods, not containers, so a pull inside the serving
+pod would give the server internet egress for its whole life. Story 3.4
+made the serving pod's declared-empty egress the air-gap statement; this
+keeps it. The download runs here, in a short-lived pod with its own
+policy (DNS and TCP 443 egress only, no ingress), and the server's
+wait-for-models init container holds it back until the files exist.
+
+The Job runs a private server bound to loopback inside its own pod and
+asks it to pull; `ollama pull` is idempotent, so a re-run on an existing
+volume only verifies. The name carries a hash of the image, the model
+list and the expected model IDs (olaitan.ollama.pullJobName): a Job's pod
+template is immutable, so a change must be a new Job, and the same inputs
+must be the same Job so a no-change upgrade leaves the finished one alone.
+The flip side: a FAILED Job is not retried by an upgrade either. The
+server's wait gives up after activeDeadlineSeconds + 300s and names the
+Job to delete (docs/runbook.md).
+
+Rendered only when ollama.pull.models is non-empty (never in the default
+render or the air-gapped overlay).
+*/}}
+{{- $o := default (dict) .Values.ollama -}}
+{{- $pullModels := include "olaitan.ollama.pullModels" . -}}
+{{- if and $o.enabled $pullModels }}
+{{- $image := include "olaitan.ollama.image" . -}}
+{{- $claim := include "olaitan.ollama.claimName" . -}}
+{{- $expect := include "olaitan.ollama.pullExpect" . -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "olaitan.ollama.pullJobName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ollama-pull
+spec:
+  backoffLimit: {{ int $o.pull.backoffLimit }}
+  activeDeadlineSeconds: {{ int (required "ollama.pull.activeDeadlineSeconds is required" $o.pull.activeDeadlineSeconds) }}
+  template:
+    metadata:
+      labels:
+        {{- include "olaitan.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: ollama-pull
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      # Review round 1 (P4): run on the server pod's node. Both pods mount
+      # the same ReadWriteOnce claim, and RWO is per node: a node-local
+      # provisioner (kind local-path) would force one node anyway, but
+      # attachable block storage (EBS, PD, Azure Disk) would not, and the
+      # second pod would hit Multi-Attach. The server pod is bound to its
+      # node while it sits in Init waiting for this Job, so this pod
+      # follows it there.
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "olaitan.ollama.selectorLabels" . | nindent 18 }}
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: pull
+          image: {{ $image | quote }}
+          imagePullPolicy: {{ $o.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
+          env:
+            - name: OLAITAN_OLLAMA_MODELS
+              value: {{ $pullModels | quote }}
+            # model=ID pairs to verify after the pull (ollama.pull.expectedIds).
+            - name: OLAITAN_OLLAMA_EXPECT
+              value: {{ $expect | quote }}
+            - name: OLLAMA_HOST
+              value: "127.0.0.1:11434"
+            # The serving pod may start its own server on this volume while
+            # the pull is still writing; neither side may prune.
+            - name: OLLAMA_NOPRUNE
+              value: "1"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              ollama serve >/tmp/ollama-serve.log 2>&1 &
+              server=$!
+              tries=0
+              until ollama list >/dev/null 2>&1; do
+                tries=$((tries+1))
+                if [ "$tries" -gt 60 ]; then cat /tmp/ollama-serve.log; exit 1; fi
+                sleep 1
+              done
+              for m in $OLAITAN_OLLAMA_MODELS; do
+                echo "pulling $m"
+                ollama pull "$m"
+              done
+              ollama list
+              # A tag can be re-pushed; the expected IDs pin what we got.
+              for pair in $OLAITAN_OLLAMA_EXPECT; do
+                m=${pair%=*}
+                want=${pair##*=}
+                got=$(ollama list | while read -r name id _; do
+                  if [ "$name" = "$m" ] || [ "$name" = "$m:latest" ]; then echo "$id"; fi
+                done)
+                if [ "$got" != "$want" ]; then
+                  echo "model $m has ID ${got:-<missing>}, want $want: the registry tag now points at different weights; check them, then update ollama.pull.expectedIds"
+                  kill "$server"
+                  exit 1
+                fi
+                echo "model $m ID $got matches"
+              done
+              kill "$server"
+          volumeMounts:
+            - name: models
+              mountPath: /root/.ollama
+      {{- with $o.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $o.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: {{ $claim }}
+{{- end }}

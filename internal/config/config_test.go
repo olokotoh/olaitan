@@ -1369,3 +1369,26 @@ analyst:
 		})
 	}
 }
+
+// TestCorrelatorNeverScoredNamespaces: Story 10.6 review (D3). The shipped
+// config never scores Olaitan's own namespace, and keeps kube-system on the
+// never-ENFORCED list only, so a compromised kube-system workload is still
+// detected. Entries are validated like response.excluded_namespaces.
+func TestCorrelatorNeverScoredNamespaces(t *testing.T) {
+	cfg, err := config.Load(defaultConfigPath(t))
+	if err != nil {
+		t.Fatalf("shipped config: %v", err)
+	}
+	if got := strings.Join(cfg.Detection.Correlator.NeverScoredNamespaces, ","); got != "olaitan" {
+		t.Errorf("shipped never_scored_namespaces = %q, want olaitan (Olaitan's own namespace only)", got)
+	}
+	if got := strings.Join(cfg.Response.ExcludedNamespaces, ","); got != "kube-system,olaitan" {
+		t.Errorf("shipped excluded_namespaces = %q, want kube-system,olaitan", got)
+	}
+	for _, bad := range []string{`""`, `" olaitan"`} {
+		body := strings.Replace(validYAML, "  baseline_window: 24h", "  baseline_window: 24h\n  correlator:\n    window_duration: 60s\n    never_scored_namespaces:\n      - "+bad, 1)
+		if _, err := config.Load(writeConfig(t, body)); err == nil || !strings.Contains(err.Error(), "never_scored_namespaces") {
+			t.Errorf("%s: err = %v, want a never_scored_namespaces rejection", bad, err)
+		}
+	}
+}

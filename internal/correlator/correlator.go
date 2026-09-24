@@ -73,10 +73,18 @@ type Config struct {
 	// "" means trigger.DefaultFalcoTriggerFloor ("warning"); "off"
 	// disables it.
 	FalcoTriggerFloor string
-	// ExcludedNamespaces (response.excluded_namespaces) never open a
-	// Falco-triggered investigation: Olaitan must not score its own pods
-	// or kube-system on a single alert.
+	// ExcludedNamespaces (response.excluded_namespaces) are never
+	// enforced; here they only keep the single-alert Falco trigger off
+	// (Story 10.3), so kube-system is not isolated on one alert. Their
+	// events are still correlated: a multi-signal package from kube-system
+	// is published and scored like any other.
 	ExcludedNamespaces []string
+	// NeverScoredNamespaces (detection.correlator.never_scored_namespaces)
+	// open no investigation by any path: their events are dropped before
+	// the window, so there is no multi-signal package, nothing for the
+	// rule or baseline engines to match, and no Falco trigger. This is
+	// Olaitan's own namespace, so it never scores itself (Story 10.6).
+	NeverScoredNamespaces []string
 }
 
 // Correlator owns the per-workload window and evidence publish path.
@@ -108,6 +116,10 @@ type Correlator struct {
 	windowNanos       atomic.Int64
 	hostEventsDropped atomic.Int64
 	excluded          atomic.Value // map[string]struct{}
+	// Story 10.6. neverScored holds the never-scored namespaces;
+	// neverScoredEventsDropped counts the events dropped for them.
+	neverScored              atomic.Value // map[string]struct{}
+	neverScoredEventsDropped atomic.Int64
 }
 
 type identityCacheEntry struct {
@@ -157,6 +169,7 @@ func New(cfg Config) (*Correlator, error) {
 	}
 	c.falcoFloor.Store(cfg.FalcoTriggerFloor)
 	c.SetExcludedNamespaces(cfg.ExcludedNamespaces)
+	c.SetNeverScoredNamespaces(cfg.NeverScoredNamespaces)
 	if cfg.MetricsRegistry != nil {
 		if err := c.registerMetrics(cfg.MetricsRegistry); err != nil {
 			return nil, fmt.Errorf("correlator: register metrics: %w", err)
@@ -190,13 +203,23 @@ func (c *Correlator) SetFalcoTriggerFloor(floor string) {
 }
 
 // SetExcludedNamespaces replaces the namespaces whose Falco alerts never
-// start an investigation (hot-reloadable).
+// start an investigation on their own (hot-reloadable).
 func (c *Correlator) SetExcludedNamespaces(nss []string) {
+	c.excluded.Store(namespaceSet(nss))
+}
+
+// SetNeverScoredNamespaces replaces the namespaces whose events never start
+// an investigation by any path (hot-reloadable).
+func (c *Correlator) SetNeverScoredNamespaces(nss []string) {
+	c.neverScored.Store(namespaceSet(nss))
+}
+
+func namespaceSet(nss []string) map[string]struct{} {
 	m := make(map[string]struct{}, len(nss))
 	for _, ns := range nss {
 		m[ns] = struct{}{}
 	}
-	c.excluded.Store(m)
+	return m
 }
 
 func (c *Correlator) isExcluded(ns string) bool {
@@ -205,9 +228,19 @@ func (c *Correlator) isExcluded(ns string) bool {
 	return ok
 }
 
+func (c *Correlator) isNeverScored(ns string) bool {
+	m, _ := c.neverScored.Load().(map[string]struct{})
+	_, ok := m[ns]
+	return ok
+}
+
 // HostEventsDropped is the cumulative count of events dropped because
 // they carry no Kubernetes pod (host processes, non-Kubernetes containers).
 func (c *Correlator) HostEventsDropped() int64 { return c.hostEventsDropped.Load() }
+
+// NeverScoredEventsDropped is the cumulative count of events dropped
+// because their pod is in a never-scored namespace.
+func (c *Correlator) NeverScoredEventsDropped() int64 { return c.neverScoredEventsDropped.Load() }
 
 // Run consumes the raw event JetStream hierarchy until ctx is cancelled.
 func (c *Correlator) Run(ctx context.Context) error {
@@ -301,6 +334,16 @@ func (c *Correlator) AddEvent(ctx context.Context, ev schema.Event) (*schema.Evi
 	if ev.Pod.Namespace == "" || ev.Pod.Name == "" {
 		c.hostEventsDropped.Add(1)
 		c.log.Debug("correlator: dropping event with no pod", "event_id", ev.ID, "source", ev.Source, "node", ev.Pod.Node)
+		return nil, nil
+	}
+	// Story 10.6: a never-scored namespace (Olaitan's own) is dropped
+	// here, before the window and the kube lookup, which closes every path
+	// at once: no multi-signal package, so the rule and baseline engines
+	// never see the workload, and no Falco trigger. kube-system is NOT on
+	// this list by default: it is excluded from enforcement, not from
+	// detection.
+	if c.isNeverScored(ev.Pod.Namespace) {
+		c.neverScoredEventsDropped.Add(1)
 		return nil, nil
 	}
 	workloadID, identity, pod, err := c.resolveAndCacheIdentity(ctx, ev)

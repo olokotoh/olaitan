@@ -49,6 +49,17 @@ What "verified 2026-09-21" covers, precisely:
   `auditWebhook.hostPort`, because on kind the apiserver is a host-network
   static pod that cannot resolve an in-cluster Service FQDN, and its audit
   kubeconfig must exist before the cluster does.
+- Since Story 10.6 the profile also runs the LLM analyst tier with a real
+  in-cluster model (`qwen2.5:3b-instruct` on Ollama, pulled by a chart Job,
+  no API key). Memory budget: the model is about 1.9 GB on disk and the
+  Ollama pod is limited to 6 GiB, on top of the rest of the profile, so give
+  the host at least 16 GB (the Story 10.6 run used 32 GB and 8 vCPUs).
+  Speed on that host, CPU only: about 5 to 10 minutes per chain role, 15 to
+  30 minutes per incident (see the runbook's Ollama section); use a GPU node
+  or a hosted model for real-time use. `values-llm-deepseek.yaml` and
+  `values-llm-claude.yaml` switch the tier to a hosted model, with the key
+  in a Secret you create (`secrets.llmApiKeyExistingSecret`) or the chart
+  Secret.
 
 ## Support matrix
 

@@ -91,6 +91,16 @@ func (c *Correlator) registerMetrics(reg *metrics.Registry) error {
 	}
 
 	if err := reg.RegisterCounter(
+		"olaitan_correlator_never_scored_events_dropped_total",
+		"",
+		"Cumulative events dropped because their pod is in a namespace listed in detection.correlator.never_scored_namespaces (Olaitan's own): such a workload is never scored by any path (Story 10.6).",
+		nil,
+		func() int64 { return c.neverScoredEventsDropped.Load() },
+	); err != nil {
+		return err
+	}
+
+	if err := reg.RegisterCounter(
 		"olaitan_correlator_overflow_summarised_total",
 		"",
 		"Cumulative EvidencePackages whose Events slice was reduced by the assembler size-cap enforcement path (pkg.Overflow non-nil). Increment is one per publish, not per dropped event; for per-event accounting see pkg.Overflow.DroppedEventCount carried inline on the package.",

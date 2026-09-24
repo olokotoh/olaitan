@@ -27,8 +27,21 @@ runs as root (writes /root/.ollama), so runAsNonRoot is not imposed;
 mirror the image by digest in production registries (the pinned tag is
 reproducibility hygiene, not tamper-proofing).
 [Source: architecture.md:263, :963 -- FR48 air-gapped Ollama mode]
+
+Story 10.6: a profile may now let the chart provision the model
+(ollama.pull.models, see ollama-pull-job.yaml). The server then waits in
+an init container until every listed model is on the volume, so a
+`helm install --wait` returns only once the model can answer. The wait
+starts a private, loopback-only server on the shared volume to ask
+`ollama show`; it sets OLLAMA_NOPRUNE because a server start otherwise
+deletes blobs no manifest references yet, which is exactly what a pull in
+progress looks like. The serving pod keeps its declared-empty egress: the
+download happens in the pull Job's pod, not here.
 */}}
 {{- if (default (dict) .Values.ollama).enabled -}}
+{{- $image := include "olaitan.ollama.image" . -}}
+{{- $claim := include "olaitan.ollama.claimName" . -}}
+{{- $pullModels := include "olaitan.ollama.pullModels" . -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -53,9 +66,60 @@ spec:
         {{- include "olaitan.ollama.selectorLabels" . | nindent 8 }}
     spec:
       automountServiceAccountToken: false
+      {{- if $pullModels }}
+      initContainers:
+        - name: wait-for-models
+          image: {{ $image | quote }}
+          imagePullPolicy: {{ .Values.ollama.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
+          env:
+            - name: OLAITAN_OLLAMA_MODELS
+              value: {{ $pullModels | quote }}
+            - name: OLLAMA_HOST
+              value: "127.0.0.1:11434"
+            - name: OLLAMA_NOPRUNE
+              value: "1"
+            # Review round 1 (P5): give up a little after the pull Job's own
+            # deadline instead of waiting in Init forever. A failed Job is
+            # not retried by `helm upgrade` (same name, same spec).
+            - name: OLAITAN_OLLAMA_WAIT_SECONDS
+              value: {{ add (int .Values.ollama.pull.activeDeadlineSeconds) 300 | quote }}
+            - name: OLAITAN_OLLAMA_PULL_JOB
+              value: {{ include "olaitan.ollama.pullJobName" . | quote }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              ollama serve >/dev/null 2>&1 &
+              server=$!
+              until ollama list >/dev/null 2>&1; do sleep 1; done
+              waited=0
+              for m in $OLAITAN_OLLAMA_MODELS; do
+                until ollama show "$m" >/dev/null 2>&1; do
+                  if [ "$waited" -ge "$OLAITAN_OLLAMA_WAIT_SECONDS" ]; then
+                    echo "model $m is still missing after ${waited}s: the pull Job $OLAITAN_OLLAMA_PULL_JOB failed or never ran."
+                    echo "See: kubectl logs job/$OLAITAN_OLLAMA_PULL_JOB"
+                    echo "A failed Job is not retried by helm upgrade: kubectl delete job $OLAITAN_OLLAMA_PULL_JOB, then run the upgrade again."
+                    kill "$server"
+                    exit 1
+                  fi
+                  echo "waiting for model $m (pulled by the Job $OLAITAN_OLLAMA_PULL_JOB, ${waited}s)"
+                  sleep 10
+                  waited=$((waited+10))
+                done
+                echo "model $m present"
+              done
+              kill "$server"
+          volumeMounts:
+            - name: models
+              mountPath: /root/.ollama
+      {{- end }}
       containers:
         - name: ollama
-          image: "{{ .Values.ollama.image.repository }}:{{ required "ollama.image.tag is required (an empty tag renders a broken image reference)" .Values.ollama.image.tag }}"
+          image: {{ $image | quote }}
           imagePullPolicy: {{ .Values.ollama.image.pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false
@@ -85,7 +149,7 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- if .Values.ollama.persistence.enabled }}
+          {{- if $claim }}
           volumeMounts:
             - name: models
               mountPath: /root/.ollama
@@ -98,10 +162,10 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if .Values.ollama.persistence.enabled }}
+      {{- if $claim }}
       volumes:
         - name: models
           persistentVolumeClaim:
-            claimName: {{ .Values.ollama.persistence.existingClaim | required "ollama.persistence.existingClaim is required when ollama.persistence.enabled=true (the chart does not create the model volume; provision it with the pre-pulled model)" }}
+            claimName: {{ $claim }}
       {{- end }}
 {{- end }}
