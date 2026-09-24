@@ -44,6 +44,7 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 
 | Value | Type | Default | Valid range | Effect | Ref |
 |-------|------|---------|-------------|--------|-----|
+| `secrets.llmApiKeyExistingSecret` | string | `""` | Secret name in the release namespace, or empty for the chart Secret | Secret the aggregator reads llm-api-key from instead of secrets.llmApiKey | NFR8 |
 | `secrets.falcoHttpToken` | string | `""` | 16+ characters of [A-Za-z0-9._~-], or empty to generate | token Falco must present to the collector's falco-ingest endpoint | NFR8 |
 
 ## `probes`
@@ -150,6 +151,7 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 
 | Value | Type | Default | Valid range | Effect | Ref |
 |-------|------|---------|-------------|--------|-----|
+| `response.excludeReleaseNamespace` | boolean | `false` | - | never score workloads in the release namespace (added to response.excluded_namespaces) | FR47 |
 | `response.audit.retentionTransitionsDays` | integer | `90` | minimum 1 | Redis/JetStream AUDIT_TRANSITIONS stream retention in days (append-only SIEM audit) | NFR16 |
 | `response.audit.retentionOverridesDays` | integer | `365` | minimum 1 | AUDIT_OVERRIDES stream retention in days | NFR16 |
 | `response.audit.retentionPoliciesDays` | integer | `365` | minimum 1 | AUDIT_POLICIES stream retention in days | NFR16 |

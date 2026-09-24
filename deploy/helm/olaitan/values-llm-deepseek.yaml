@@ -1,16 +1,20 @@
 # values-llm-deepseek.yaml -- Story 10.6: route the analyst chain to
 # DeepSeek instead of the in-cluster model.
 #
-# Layer it AFTER a profile, and supply the key through the chart Secret,
-# never in a values file:
+# Layer it AFTER a profile, and supply the key out of band, never in a
+# values file. Preferred: a Secret you create yourself, key on stdin, so the
+# key never passes through helm values or `helm get values`:
 #
+#   kubectl -n <ns> create secret generic olaitan-llm-key \
+#     --from-file=llm-api-key=/dev/stdin < <file holding the key>
 #   helm upgrade --install olaitan deploy/helm/olaitan \
 #     -f deploy/helm/olaitan/values-full.yaml ...the full profile's files... \
 #     -f deploy/helm/olaitan/values-llm-deepseek.yaml \
-#     --set-file secrets.llmApiKey=./deepseek-key.txt
+#     --set secrets.llmApiKeyExistingSecret=olaitan-llm-key
 #
-# (or let an external-secrets operator write llm-api-key into the release's
-# <fullname>-secrets Secret). With no key the chain does not start and the
+# (`make e2e-full-real-llm-deepseek` does exactly this.) Also possible:
+# --set-file secrets.llmApiKey=<file>, or an external-secrets operator
+# writing llm-api-key into the release's <fullname>-secrets Secret. With no key the chain does not start and the
 # controller runs rules and baselines only (NFR27), loudly, in its log.
 #
 # DeepSeek speaks the OpenAI chat-completions API, so every role uses the

@@ -5,6 +5,7 @@ package helm_test
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -505,5 +506,115 @@ func TestRealLLMTargetRestoresTheProfile(t *testing.T) {
 	}
 	if full := makeTarget(t, "e2e-full"); !strings.Contains(full, "$(FULL_HELM_VALUES)") {
 		t.Error("e2e-full must install from the same $(FULL_HELM_VALUES) as e2e-full-real-llm, or the two targets can drift apart")
+	}
+}
+
+// aggregatorKeyRef returns the Secret name and key the aggregator's LLM key
+// env var is read from.
+func aggregatorKeyRef(t *testing.T, rendered string) (name, key string) {
+	t.Helper()
+	agg := docNamed(t, rendered, "Deployment", "olaitan-aggregator")
+	if agg == nil {
+		t.Fatal("no olaitan-aggregator Deployment rendered")
+	}
+	for _, c := range podContainers(agg, "containers") {
+		for _, e := range asList(c["env"]) {
+			if dig(e, "name") != "olaitan-llm" {
+				continue
+			}
+			return fmt.Sprint(dig(e, "valueFrom", "secretKeyRef", "name")), fmt.Sprint(dig(e, "valueFrom", "secretKeyRef", "key"))
+		}
+	}
+	t.Fatal("the aggregator has no olaitan-llm env var")
+	return "", ""
+}
+
+// Story 10.6: a hosted model's key can live in a Secret the operator (or a
+// test) creates out of band, so it never passes through helm values, a
+// values file, or `helm get values`. Default: the chart's own Secret.
+func TestLLMKeyFromAnExistingSecret(t *testing.T) {
+	if name, key := aggregatorKeyRef(t, renderFullProfile(t)); name != "olaitan-secrets" || key != "llm-api-key" {
+		t.Errorf("default key ref = %s/%s, want olaitan-secrets/llm-api-key", name, key)
+	}
+	dir := t.TempDir()
+	extra := filepath.Join(dir, "existing.yaml")
+	if err := os.WriteFile(extra, []byte("secrets:\n  llmApiKeyExistingSecret: my-llm-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rendered := renderFullProfile(t, filepath.Join(chartDir(t), "values-llm-deepseek.yaml"), extra)
+	if name, key := aggregatorKeyRef(t, rendered); name != "my-llm-key" || key != "llm-api-key" {
+		t.Errorf("existing-secret key ref = %s/%s, want my-llm-key/llm-api-key", name, key)
+	}
+}
+
+// Story 10.6 (issue #151 part 2, the part 10.6 needs): kind-full installs
+// into `default`, and without this its own aggregator and Ollama crossed the
+// multi-signal threshold at startup and queued FR19 chains ahead of a real
+// attack. values-full.yaml turns on response.excludeReleaseNamespace, which
+// adds the release namespace to response.excluded_namespaces; the default
+// install leaves the list as shipped.
+func TestFullProfileExcludesItsOwnNamespace(t *testing.T) {
+	load := func(rendered string) []string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "olaitan.yaml")
+		if err := os.WriteFile(path, []byte(extractEmbeddedConfigYAML(t, rendered)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := configLoad(t, path)
+		if err != nil {
+			t.Fatalf("config does not load: %v", err)
+		}
+		return c.Response.ExcludedNamespaces
+	}
+	full := load(renderFullProfile(t))
+	if strings.Join(full, ",") != "kube-system,olaitan,default" {
+		t.Errorf("values-full excluded_namespaces = %v, want [kube-system olaitan default]", full)
+	}
+	if def := load(helmTemplate(t, nil)); strings.Join(def, ",") != "kube-system,olaitan" {
+		t.Errorf("default excluded_namespaces = %v, want the shipped [kube-system olaitan]", def)
+	}
+	// Installed into olaitan, the release namespace is already listed:
+	// no duplicate.
+	dir := t.TempDir()
+	extra := filepath.Join(dir, "ns.yaml")
+	if err := os.WriteFile(extra, []byte("response:\n  excludeReleaseNamespace: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("helm", "template", "olaitan", chartDir(t), "-n", "olaitan", "-f", extra).CombinedOutput()
+	if err != nil {
+		t.Fatalf("helm template -n olaitan: %v\n%s", err, out)
+	}
+	if got := load(string(out)); strings.Join(got, ",") != "kube-system,olaitan" {
+		t.Errorf("-n olaitan excluded_namespaces = %v, want no duplicate", got)
+	}
+}
+
+// TestRealLLMDeepSeekTarget: `make e2e-full-real-llm-deepseek` restores the
+// profile the same way, layers the DeepSeek overlay, and reads the key from
+// a Secret created out of band: it never takes a key file, a key variable
+// or --set secrets.llmApiKey, so the key cannot land in the repo, a shell
+// history line or the release's values.
+func TestRealLLMDeepSeekTarget(t *testing.T) {
+	recipe := makeTarget(t, "e2e-full-real-llm-deepseek")
+	head := strings.SplitN(recipe, "\n", 2)[0]
+	for _, dep := range []string{"helm-prepare", "helm-deps", "docker-build"} {
+		if !strings.Contains(head, dep) {
+			t.Errorf("e2e-full-real-llm-deepseek does not depend on %s", dep)
+		}
+	}
+	if strings.Contains(recipe, "--reuse-values") {
+		t.Error("e2e-full-real-llm-deepseek reuses release values, so it would inherit the fake-LLM overlay")
+	}
+	for _, want := range []string{"kind load docker-image", "$(FULL_HELM_VALUES)", "values-llm-deepseek.yaml",
+		"secrets.llmApiKeyExistingSecret=$(LLM_KEY_SECRET)", "get secret $(LLM_KEY_SECRET)",
+		"OLT_E2E_FULL=1", "OLT_E2E_REAL_LLM=1", "TestRealLLM_RealIncidentOnFullProfile", "TestFalcoSourceIsLive"} {
+		if !strings.Contains(recipe, want) {
+			t.Errorf("e2e-full-real-llm-deepseek recipe lacks %q", want)
+		}
+	}
+	for _, bad := range []string{"secrets.llmApiKey=", "--set-file secrets.llmApiKey", "DEEPSEEK_API_KEY"} {
+		if strings.Contains(recipe, bad) {
+			t.Errorf("e2e-full-real-llm-deepseek recipe contains %q: the key must come from the out-of-band Secret only", bad)
+		}
 	}
 }

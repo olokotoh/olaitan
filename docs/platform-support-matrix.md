@@ -54,8 +54,12 @@ What "verified 2026-09-21" covers, precisely:
   no API key). Memory budget: the model is about 1.9 GB on disk and the
   Ollama pod is limited to 6 GiB, on top of the rest of the profile, so give
   the host at least 16 GB (the Story 10.6 run used 32 GB and 8 vCPUs).
-  `values-llm-deepseek.yaml` and `values-llm-claude.yaml` switch the tier to
-  a hosted model with the key in the chart Secret.
+  Speed on that host, CPU only: about 7 minutes per chain role, over 20
+  minutes per incident (see the runbook's Ollama section); use a GPU node
+  or a hosted model for real-time use. `values-llm-deepseek.yaml` and
+  `values-llm-claude.yaml` switch the tier to a hosted model, with the key
+  in a Secret you create (`secrets.llmApiKeyExistingSecret`) or the chart
+  Secret.
 
 ## Support matrix
 

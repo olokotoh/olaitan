@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/olokotoh/olaitan/internal/config"
 )
 
 // Story 10.6: the live test can only prove what its checker refuses, so the
@@ -146,5 +148,124 @@ func TestRealLLMCheckRejects(t *testing.T) {
 func TestRealLLMCheckRejectsGarbage(t *testing.T) {
 	if problems := checkRealLLMAssessment([]byte("not json"), realLLMWantForTest, loadModelSchemas(t)); len(problems) == 0 {
 		t.Fatal("garbage accepted")
+	}
+}
+
+// Story 10.6 (DeepSeek run): what the audit record must say is derived
+// from the live release's configuration, per family, so the same test
+// proves the in-cluster model and a hosted one.
+func TestRealLLMWantFollowsTheConfiguredFamily(t *testing.T) {
+	cfg := func(f func(c *config.Config)) *config.Config {
+		c := &config.Config{}
+		c.Analyst.ScoreCap = 35
+		f(c)
+		return c
+	}
+	good := []struct {
+		name string
+		c    *config.Config
+		want realLLMWant
+	}{
+		{"full profile: in-cluster ollama", cfg(func(c *config.Config) {
+			c.Analyst.Provider = "local"
+			c.Analyst.Local.Model = "qwen2.5:3b-instruct"
+		}), realLLMWant{Provider: "ollama", Model: "qwen2.5:3b-instruct", Cap: 25}},
+		{"deepseek overlay: openai family", cfg(func(c *config.Config) {
+			c.Analyst.Provider = "api"
+			c.Analyst.API.Endpoint = "https://api.deepseek.com/v1"
+			c.Analyst.L1Provider, c.Analyst.L2Provider, c.Analyst.SeniorProvider = "openai", "openai", "openai"
+			c.Analyst.L1Model, c.Analyst.L2Model, c.Analyst.SeniorModel = "deepseek-chat", "deepseek-chat", "deepseek-chat"
+			c.Analyst.Local.Model = "qwen2.5:3b-instruct" // the FR28 fallback stays configured
+		}), realLLMWant{Provider: "openai", Model: "deepseek-chat", Cap: 30}},
+		{"claude overlay: model from analyst.api.model", cfg(func(c *config.Config) {
+			c.Analyst.Provider = "api"
+			c.Analyst.L1Provider, c.Analyst.L2Provider, c.Analyst.SeniorProvider = "claude", "claude", "claude"
+			c.Analyst.API.Model = "claude-haiku-4-5"
+		}), realLLMWant{Provider: "claude", Model: "claude-haiku-4-5", Cap: 35}},
+	}
+	for _, tc := range good {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := wantFromConfig(tc.c)
+			if err != nil {
+				t.Fatalf("wantFromConfig: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("want = %+v, expected %+v", got, tc.want)
+			}
+		})
+	}
+
+	bad := []struct {
+		name, why string
+		c         *config.Config
+	}{
+		{"rules only", "provider", cfg(func(c *config.Config) { c.Analyst.Provider = "none" })},
+		{"roles on different families", "family", cfg(func(c *config.Config) {
+			c.Analyst.Provider = "api"
+			c.Analyst.L1Provider, c.Analyst.L2Provider, c.Analyst.SeniorProvider = "openai", "ollama", "openai"
+			c.Analyst.L1Model, c.Analyst.SeniorModel = "deepseek-chat", "deepseek-chat"
+			c.Analyst.Local.Model = "qwen2.5:3b-instruct"
+		})},
+		{"roles on different models", "model", cfg(func(c *config.Config) {
+			c.Analyst.Provider = "api"
+			c.Analyst.L1Provider, c.Analyst.L2Provider, c.Analyst.SeniorProvider = "openai", "openai", "openai"
+			c.Analyst.L1Model, c.Analyst.L2Model, c.Analyst.SeniorModel = "deepseek-chat", "deepseek-chat", "deepseek-reasoner"
+		})},
+		{"openai role with no model", "model", cfg(func(c *config.Config) {
+			c.Analyst.Provider = "api"
+			c.Analyst.L1Provider, c.Analyst.L2Provider, c.Analyst.SeniorProvider = "openai", "openai", "openai"
+		})},
+		{"global cap tighter than the family cap", "score_cap", cfg(func(c *config.Config) {
+			c.Analyst.ScoreCap = 20
+			c.Analyst.Provider = "local"
+			c.Analyst.Local.Model = "qwen2.5:3b-instruct"
+		})},
+		{"fake-llm endpoint left behind", "fake-llm", cfg(func(c *config.Config) {
+			c.Analyst.Provider = "api"
+			c.Analyst.API.Endpoint = "http://fake-llm.default.svc:8080/v1"
+			c.Analyst.L1Provider, c.Analyst.L2Provider, c.Analyst.SeniorProvider = "openai", "openai", "openai"
+			c.Analyst.L1Model, c.Analyst.L2Model, c.Analyst.SeniorModel = "m", "m", "m"
+		})},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := wantFromConfig(tc.c)
+			if err == nil {
+				t.Fatalf("accepted as %+v; want an error naming %q", got, tc.why)
+			}
+			if !strings.Contains(err.Error(), tc.why) {
+				t.Errorf("error %q does not name %q", err, tc.why)
+			}
+		})
+	}
+}
+
+// The checker holds a hosted-model record to the openai cap of 30, not the
+// ollama 25: a record capped at 25 under the openai family is wrong.
+func TestRealLLMCheckUsesTheFamilyCap(t *testing.T) {
+	schemas := loadModelSchemas(t)
+	want := realLLMWant{Provider: "openai", Model: "deepseek-chat", Cap: 30}
+	openai := func(capped int) func(m map[string]any) {
+		return func(m map[string]any) {
+			for _, k := range []string{"providers", "models"} {
+				for _, r := range []string{"l1", "l2", "senior"} {
+					v := "openai"
+					if k == "models" {
+						v = "deepseek-chat"
+					}
+					m[k].(map[string]any)[r] = v
+				}
+			}
+			m["llm_capped_confidence"] = capped
+			m["threat_assessment"].(map[string]any)["llm_capped_confidence"] = capped
+			m["threat_assessment"].(map[string]any)["confidence"] = capped
+		}
+	}
+	if p := checkRealLLMAssessment(mutate(t, openai(30)), want, schemas); len(p) != 0 {
+		t.Fatalf("openai record capped at 30 rejected:\n%s", strings.Join(p, "\n"))
+	}
+	p := checkRealLLMAssessment(mutate(t, openai(25)), want, schemas)
+	if !strings.Contains(strings.Join(p, "\n"), "cap 30") {
+		t.Fatalf("openai record capped at 25 not rejected for the openai cap:\n%s", strings.Join(p, "\n"))
 	}
 }

@@ -2356,6 +2356,9 @@ spec:
             # "api" provider (claude / openai_compat) reads its key from this
             # env. An empty Secret value degrades the chain to rules-only
             # (NFR27) -- so this is safe to project unconditionally.
+            # Story 10.6: secrets.llmApiKeyExistingSecret names a Secret
+            # created out of band (key llm-api-key), so a hosted model's key
+            # never passes through helm values or `helm get values`.
             - name: olaitan-llm
               valueFrom:
                 secretKeyRef:

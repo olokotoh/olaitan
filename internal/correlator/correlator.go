@@ -73,9 +73,13 @@ type Config struct {
 	// "" means trigger.DefaultFalcoTriggerFloor ("warning"); "off"
 	// disables it.
 	FalcoTriggerFloor string
-	// ExcludedNamespaces (response.excluded_namespaces) never open a
-	// Falco-triggered investigation: Olaitan must not score its own pods
-	// or kube-system on a single alert.
+	// ExcludedNamespaces (response.excluded_namespaces) never open an
+	// investigation by any path: their events are dropped before the
+	// window, so there is no multi-signal package, and therefore nothing
+	// for the rule or baseline engines to match, and the single-alert
+	// Falco trigger never fires either. Olaitan must not score its own
+	// pods or kube-system (Story 10.3 for the Falco path, Story 10.6 for
+	// the rest).
 	ExcludedNamespaces []string
 }
 
@@ -107,7 +111,9 @@ type Correlator struct {
 	falcoFired        sync.Map // key workloadID + "\x00" + ruleID -> time.Time
 	windowNanos       atomic.Int64
 	hostEventsDropped atomic.Int64
-	excluded          atomic.Value // map[string]struct{}
+	// excludedEventsDropped counts events from an excluded namespace.
+	excludedEventsDropped atomic.Int64
+	excluded              atomic.Value // map[string]struct{}
 }
 
 type identityCacheEntry struct {
@@ -189,8 +195,8 @@ func (c *Correlator) SetFalcoTriggerFloor(floor string) {
 	}
 }
 
-// SetExcludedNamespaces replaces the namespaces whose Falco alerts never
-// start an investigation (hot-reloadable).
+// SetExcludedNamespaces replaces the namespaces whose events never start
+// an investigation by any path (hot-reloadable).
 func (c *Correlator) SetExcludedNamespaces(nss []string) {
 	m := make(map[string]struct{}, len(nss))
 	for _, ns := range nss {
@@ -208,6 +214,10 @@ func (c *Correlator) isExcluded(ns string) bool {
 // HostEventsDropped is the cumulative count of events dropped because
 // they carry no Kubernetes pod (host processes, non-Kubernetes containers).
 func (c *Correlator) HostEventsDropped() int64 { return c.hostEventsDropped.Load() }
+
+// ExcludedEventsDropped is the cumulative count of events dropped because
+// their pod is in an excluded namespace.
+func (c *Correlator) ExcludedEventsDropped() int64 { return c.excludedEventsDropped.Load() }
 
 // Run consumes the raw event JetStream hierarchy until ctx is cancelled.
 func (c *Correlator) Run(ctx context.Context) error {
@@ -303,6 +313,14 @@ func (c *Correlator) AddEvent(ctx context.Context, ev schema.Event) (*schema.Evi
 		c.log.Debug("correlator: dropping event with no pod", "event_id", ev.ID, "source", ev.Source, "node", ev.Pod.Node)
 		return nil, nil
 	}
+	// Story 10.6: an excluded namespace (Olaitan's own, kube-system) is
+	// never scored. Dropping here, before the window and the kube lookup,
+	// closes every path at once: no multi-signal package, so the rule and
+	// baseline engines never see the workload, and no Falco trigger.
+	if c.isExcluded(ev.Pod.Namespace) {
+		c.excludedEventsDropped.Add(1)
+		return nil, nil
+	}
 	workloadID, identity, pod, err := c.resolveAndCacheIdentity(ctx, ev)
 	if err != nil {
 		// P14: validation errors are drop-and-continue. Surface them
@@ -332,7 +350,7 @@ func (c *Correlator) AddEvent(ctx context.Context, ev schema.Event) (*schema.Evi
 	// once per (workload, rule) per window.
 	floor, _ := c.falcoFloor.Load().(string)
 	match, ok := trigger.FalcoRuleMatch(ev, floor)
-	if !ok || c.isExcluded(ev.Pod.Namespace) || !c.claimFalcoTrigger(workloadID, match.RuleID) {
+	if !ok || !c.claimFalcoTrigger(workloadID, match.RuleID) {
 		return multi, nil
 	}
 	tr := trigger.RuleMatch(workloadID, match, time.Now().UTC())

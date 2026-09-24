@@ -6,23 +6,29 @@
 // supplied by it. A fresh workload reads /etc/shadow inside its own
 // container; Falco's stock "Read sensitive file untrusted" rule fires, the
 // collector ingests it, the correlator packages it, the FR19 gate starts
-// the L1 -> L2 -> Senior chain, each role calls the in-cluster Ollama, and
-// the chain publishes its assessment to AUDIT.assessments. The test only
+// the L1 -> L2 -> Senior chain, each role calls the configured model (the
+// in-cluster Ollama, or a hosted one such as DeepSeek), and the chain
+// publishes its assessment to AUDIT.assessments. The test only
 // reads that record and checks it:
 //
 //   - AC1: L1, L2 and Senior all contributed, and each output validates
 //     against its published model contract (docs/schemas).
 //   - AC2: every role's recorded provider and model is what the live
 //     release was configured with (read from the release's own ConfigMap,
-//     not from a constant in this file), and the Ollama server really holds
-//     that model.
-//   - AC3: the model's own confidence was above the ollama cap of 25 and the
-//     audit record carries it capped to exactly 25.
+//     not from a constant in this file); for Ollama, the server really
+//     holds that model. A hosted role that fell back to the in-cluster
+//     model (FR28) records "ollama" and fails this.
+//   - AC3: the model's own confidence was above its family's trust cap
+//     (ollama 25, openai 30, claude 35) and the audit record carries it
+//     capped to exactly that cap.
 //
 // Gated twice, like the Story 10.7 test: OLT_E2E_FULL says the cluster runs
 // the full profile, OLT_E2E_REAL_LLM says it runs it with its real model
 // (not the fake-LLM overlay `make e2e-full-report-archive` leaves behind).
-// `make e2e-full-real-llm` restores the profile and runs this.
+// `make e2e-full-real-llm` restores the profile and runs this against the
+// in-cluster model; `make e2e-full-real-llm-deepseek` layers
+// values-llm-deepseek.yaml and takes the key from a Secret created out of
+// band.
 package e2e_test
 
 import (
@@ -48,19 +54,24 @@ import (
 	"github.com/olokotoh/olaitan/internal/subjects"
 )
 
-const (
-	// ollamaScoreCap is the trust cap of the ollama family, enforced in code
-	// (cmd/olaitan/analyst_chain.go roleScoreCap). Deliberately a constant
-	// here and not read from the release: AC3 is about the code path, and a
-	// value lowered in the release would make the check easier, not stronger.
-	ollamaScoreCap = 25
+// familyScoreCap is the trust cap of each provider family, enforced in code
+// (cmd/olaitan/analyst_chain.go roleScoreCap: claude 35, openai 30, ollama
+// 25). Deliberately a table here and not read from the code under test or
+// the release: AC3 is about the code path, and a value lowered in the
+// release would make the check easier, not stronger. wantFromConfig refuses
+// a release whose global analyst.score_cap is tighter than the family cap
+// for the same reason.
+var familyScoreCap = map[string]int{"claude": 35, "openai": 30, "ollama": 25}
 
-	// A 3B model on CPU reads a few thousand prompt tokens per role before
-	// it writes a word, and the chain runs L1, L2 and Senior in turn, inline
-	// in the single FSM consumer, behind any package that qualified before
-	// the attack. This bounds the whole path, syscall to audit record; it
-	// asserts provenance and validity, not latency.
-	realLLMBudget = 25 * time.Minute
+// A 3B model on CPU reads a few thousand prompt tokens per role before it
+// writes a word (measured on 8 vCPUs: 6.5 to 8 minutes per role), and the
+// chain runs L1, L2 and Senior in turn, inline in the single FSM consumer.
+// A hosted model answers each role in seconds. The budget bounds the whole
+// path, syscall to audit record; it asserts provenance and validity, not
+// latency.
+const (
+	realLLMBudgetLocal  = 40 * time.Minute
+	realLLMBudgetHosted = 10 * time.Minute
 )
 
 // realLLMWant is what the audit record must attribute every role to.
@@ -255,6 +266,77 @@ func jsonInt(v any) int {
 	return -1
 }
 
+// roleFamily mirrors cmd/olaitan/analyst_chain.go resolveRoleFamily: an
+// explicit per-role provider wins, otherwise analyst.provider api means
+// claude and local means ollama.
+func roleFamily(roleProvider, global string) string {
+	if roleProvider != "" {
+		return strings.ToLower(roleProvider)
+	}
+	switch strings.ToLower(global) {
+	case "api", "claude":
+		return "claude"
+	case "local", "ollama":
+		return "ollama"
+	}
+	return "none"
+}
+
+// wantFromConfig derives what every role of the chain must be attributed to
+// in the audit record from the release's analyst configuration: one family
+// and one model for all three roles (the supported topologies), and that
+// family's trust cap. It refuses a configuration the test cannot prove
+// anything about: rules-only, mixed families or models, an openai role with
+// no model, a tightened global cap, or a leftover fake-llm endpoint.
+func wantFromConfig(cfg *config.Config) (realLLMWant, error) {
+	a := cfg.Analyst
+	for _, ep := range []string{a.API.Endpoint, a.Local.Endpoint} {
+		if strings.Contains(ep, "fake-llm") {
+			return realLLMWant{}, fmt.Errorf("analyst endpoint %q is the fake-llm fixture (the report-archive overlay is still applied?)", ep)
+		}
+	}
+	type role struct{ name, provider, model string }
+	roles := []role{{"l1", a.L1Provider, a.L1Model}, {"l2", a.L2Provider, a.L2Model}, {"senior", a.SeniorProvider, a.SeniorModel}}
+	var want realLLMWant
+	for i, r := range roles {
+		fam := roleFamily(r.provider, a.Provider)
+		var model string
+		switch fam {
+		case "ollama":
+			model = r.model
+			if model == "" {
+				model = a.Local.Model
+			}
+		case "claude":
+			model = r.model
+			if model == "" {
+				model = a.API.Model
+			}
+		case "openai":
+			model = r.model
+		default:
+			return realLLMWant{}, fmt.Errorf("analyst.%s resolves to provider family %q (analyst.provider %q): no model runs, so there is nothing to prove", r.name, fam, a.Provider)
+		}
+		if model == "" {
+			return realLLMWant{}, fmt.Errorf("analyst.%s_model is empty for the %s family: the record's model cannot be checked against the configuration", r.name, fam)
+		}
+		if i == 0 {
+			want = realLLMWant{Provider: fam, Model: model, Cap: familyScoreCap[fam]}
+			continue
+		}
+		if fam != want.Provider {
+			return realLLMWant{}, fmt.Errorf("analyst.%s is on the %s family but l1 is on %s: this test proves one family at a time", r.name, fam, want.Provider)
+		}
+		if model != want.Model {
+			return realLLMWant{}, fmt.Errorf("analyst.%s_model %q differs from l1's %q: this test proves one model at a time", r.name, model, want.Model)
+		}
+	}
+	if a.ScoreCap > 0 && a.ScoreCap < want.Cap {
+		return realLLMWant{}, fmt.Errorf("analyst.score_cap %d is tighter than the %s family cap %d: AC3 would test the operator ceiling, not the family cap", a.ScoreCap, want.Provider, want.Cap)
+	}
+	return want, nil
+}
+
 // configuredChain reads the analyst configuration of the LIVE release from
 // its own ConfigMap and returns what every role must be attributed to.
 func configuredChain(t *testing.T) realLLMWant {
@@ -269,22 +351,14 @@ func configuredChain(t *testing.T) realLLMWant {
 	if err != nil {
 		t.Fatalf("the live release's config does not load: %v", err)
 	}
-	a := cfg.Analyst
-	if a.Provider != "local" {
-		t.Fatalf("live analyst.provider = %q, want local: this is not the full profile's real-model configuration (run `make e2e-full-real-llm`, which restores it)", a.Provider)
-	}
-	for role, p := range map[string]string{"l1": a.L1Provider, "l2": a.L2Provider, "senior": a.SeniorProvider} {
-		if p != "" && p != "ollama" {
-			t.Fatalf("live analyst.%s_provider = %q: a role is routed away from the in-cluster model (the fake-LLM overlay is still applied?)", role, p)
-		}
-	}
-	if a.Local.Model == "" {
-		t.Fatal("live analyst.local.model is empty")
-	}
 	if strings.Contains(raw, "fake-llm") {
-		t.Fatal("the live release's config references fake-llm")
+		t.Fatal("the live release's config references fake-llm (run `make e2e-full-real-llm` or `make e2e-full-real-llm-deepseek`, which restore the profile)")
 	}
-	return realLLMWant{Provider: "ollama", Model: a.Local.Model, Cap: ollamaScoreCap}
+	want, err := wantFromConfig(cfg)
+	if err != nil {
+		t.Fatalf("the live release is not a real-model configuration: %v", err)
+	}
+	return want
 }
 
 func TestRealLLM_RealIncidentOnFullProfile(t *testing.T) {
@@ -298,12 +372,16 @@ func TestRealLLM_RealIncidentOnFullProfile(t *testing.T) {
 	want := configuredChain(t)
 	t.Logf("configured chain: every role -> provider %q model %q (cap %d)", want.Provider, want.Model, want.Cap)
 
-	// The server really holds that model: the provenance in the record is
-	// then a claim about something that exists, not a label.
-	list := kubectl(t, "exec", "deploy/"+defaultReleaseName+"-ollama", "-n", defaultNamespace, "--", "ollama", "list")
-	t.Logf("ollama list:\n%s", strings.TrimSpace(list))
-	if !strings.Contains(list, want.Model) {
-		t.Fatalf("the in-cluster Ollama does not hold %q", want.Model)
+	budget := realLLMBudgetHosted
+	if want.Provider == "ollama" {
+		budget = realLLMBudgetLocal
+		// The server really holds that model: the provenance in the record
+		// is then a claim about something that exists, not a label.
+		list := kubectl(t, "exec", "deploy/"+defaultReleaseName+"-ollama", "-n", defaultNamespace, "--", "ollama", "list")
+		t.Logf("ollama list:\n%s", strings.TrimSpace(list))
+		if !strings.Contains(list, want.Model) {
+			t.Fatalf("the in-cluster Ollama does not hold %q", want.Model)
+		}
 	}
 
 	runID := fmt.Sprintf("%d", time.Now().UnixNano()%1e9)
@@ -353,11 +431,11 @@ func TestRealLLM_RealIncidentOnFullProfile(t *testing.T) {
 	// The FIRST full-chain record for the victim must pass. Taking any later
 	// one that happens to pass would hide a model that is only sometimes
 	// schema-valid.
-	deadline := time.Now().Add(realLLMBudget)
+	deadline := time.Now().Add(budget)
 	for {
 		if time.Now().After(deadline) {
 			t.Fatalf("no full-chain AUDIT.assessments record for %s within %s of the attack: the incident was not raised, the chain did not trigger, or the model did not answer in time (see the aggregator log)",
-				workloadID, realLLMBudget)
+				workloadID, budget)
 		}
 		batch, err := cons.Fetch(10, jetstream.FetchMaxWait(5*time.Second))
 		if err != nil {
@@ -390,7 +468,7 @@ func TestRealLLM_RealIncidentOnFullProfile(t *testing.T) {
 			_ = json.Unmarshal(msg.Data(), &rec)
 			t.Logf("AC1 ok: L1, L2 and Senior outputs from %s validate against docs/schemas", want.Model)
 			t.Logf("AC2 ok: providers %v, models %v", rec.Providers, rec.Models)
-			t.Logf("AC3 ok: raw_confidence %d capped to llm_capped_confidence %d (ollama cap %d)", rec.RawConfidence, rec.LLMCappedConfidence, want.Cap)
+			t.Logf("AC3 ok: raw_confidence %d capped to llm_capped_confidence %d (%s cap %d)", rec.RawConfidence, rec.LLMCappedConfidence, want.Provider, want.Cap)
 			return
 		}
 		if err := batch.Error(); err != nil && !errors.Is(err, nats.ErrTimeout) && !errors.Is(err, context.DeadlineExceeded) {

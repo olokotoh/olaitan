@@ -123,22 +123,37 @@ digest, model on a chart-created volume) and routes the L1, L2 and Senior
 roles to it, so no API key is needed and nothing leaves the cluster at
 inference time. Only the short-lived pull Job may reach the internet (DNS and
 HTTPS); the serving pod keeps an empty egress policy. The trust cap for this
-model family is 25, enforced in code. To use a hosted model instead, layer
-one overlay after the profile and put the key in the chart Secret:
+model family is 25, enforced in code.
+
+**The in-cluster model is slow on CPU, and that is measured, not guessed.**
+On an 8 vCPU AWS m6i.2xlarge with no GPU, running beside the whole profile,
+`qwen2.5:3b-instruct` reads a prompt at about 17 to 27 tokens/s and writes at
+about 8.5 tokens/s. A chain role's prompt is 8k to 10k tokens, so each role
+spends 6.5 to 8 minutes just reading it: about 7 minutes per role and over 20
+minutes per incident, with incidents queued one after another. That proves
+the tier runs with no key; it does not keep up with a live cluster. For
+real-time use, give Ollama a GPU node, or use a hosted model: layer one
+overlay after the profile and supply the key out of band, in a Secret you
+create yourself, so it never passes through helm values:
 
 ```
--f deploy/helm/olaitan/values-llm-deepseek.yaml --set-file secrets.llmApiKey=./key.txt
--f deploy/helm/olaitan/values-llm-claude.yaml   --set-file secrets.llmApiKey=./key.txt
+kubectl -n default create secret generic olaitan-llm-key --from-file=llm-api-key=/dev/stdin < key.txt
+-f deploy/helm/olaitan/values-llm-deepseek.yaml --set secrets.llmApiKeyExistingSecret=olaitan-llm-key
+-f deploy/helm/olaitan/values-llm-claude.yaml   --set secrets.llmApiKeyExistingSecret=olaitan-llm-key
 ```
 
-The in-cluster model then stays on as the fallback for every role. The
-`fake-llm` fixture is for unit and CI tests only and is not part of any
-profile. `make e2e-full-real-llm` proves the tier on a live cluster: a real
-in-pod attack, then schema-valid L1, L2 and Senior output from the model,
-the configured provider and model recorded in `AUDIT.assessments`, and the
-model's own confidence capped at 25. A 3B model on CPU takes minutes per
-investigation, so the profile raises the per-role LLM timeouts tenfold; the
-3B Qwen2.5 weights are under the Qwen Research licence, so for commercial use
+(`--set-file secrets.llmApiKey=./key.txt` also works, but then the key is in
+the release's values.) The in-cluster model stays on as the fallback for
+every role. The `fake-llm` fixture is for unit and CI tests only and is not
+part of any profile. `make e2e-full-real-llm` (in-cluster model) and
+`make e2e-full-real-llm-deepseek` (DeepSeek, key from the Secret above) prove
+the tier on a live cluster: a real in-pod attack, then schema-valid L1, L2
+and Senior output from the model, the configured provider and model recorded
+in `AUDIT.assessments`, and the model's own confidence capped at its family's
+trust cap (ollama 25, openai 30, claude 35). The profile raises the per-role
+LLM timeouts twentyfold for the CPU model, and excludes its own namespace
+(`response.excludeReleaseNamespace`) so Olaitan does not investigate its own
+pods ahead of a real incident. The 3B Qwen2.5 weights are under the Qwen Research licence, so for commercial use
 switch `analyst.local.model` and `ollama.pull.models` to an Apache-2.0 size
 such as `qwen2.5:7b-instruct`.
 

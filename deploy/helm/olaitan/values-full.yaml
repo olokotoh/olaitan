@@ -103,6 +103,14 @@ collector:
 # e2e cluster NetworkPolicy objects are accepted and never enforced, so the
 # same setting there would prove nothing.
 response:
+  # Story 10.6 (the part of issue #151 it needs): this profile installs into
+  # `default`, which is not on the shipped excluded list (kube-system,
+  # olaitan). Without this, Olaitan's own aggregator and Ollama crossed the
+  # multi-signal threshold at startup and their FR19 chains queued ahead of
+  # a real attack. Test workloads run in their own namespaces, so excluding
+  # all of `default` costs nothing here. Whether the profile should move to
+  # its own namespace instead stays open on issue #151.
+  excludeReleaseNamespace: true
   networkPolicy:
     enabled: true
     # MUST match networking.podSubnet and networking.serviceSubnet in
@@ -122,8 +130,7 @@ response:
 # code, not here (cmd/olaitan/analyst_chain.go roleScoreCap).
 #
 # Model: qwen2.5:3b-instruct (Q4_K_M, about 1.9 GB). The strongest JSON and
-# instruction follower at the 3B size, fast enough on 8 CPU cores, and
-# small enough to sit in memory next to every other component of this
+# instruction follower at the 3B size, and small enough to sit in memory next to every other component of this
 # profile. The provider also sends each role's JSON Schema as Ollama's
 # native `format`, so decoding is constrained to schema-valid replies.
 # Licence note: the 3B Qwen2.5 weights are under the Qwen Research licence
@@ -131,10 +138,23 @@ response:
 # change BOTH analyst.local.model and ollama.pull.models, for example to
 # qwen2.5:7b-instruct (Apache-2.0, about twice as slow on CPU).
 #
+# SPEED, measured (Story 10.6, AWS m6i.2xlarge, 8 vCPU, no GPU, the whole
+# profile running beside it): about 17 to 27 tokens/s to read a prompt and
+# about 8.5 tokens/s to write. A chain role's prompt is 8k to 10k tokens
+# (the evidence package, the role schema and, for L2 and Senior, the
+# earlier verdicts), so each role spends 6.5 to 8 minutes just reading it:
+# about 7 minutes per role, over 20 minutes per incident, and incidents
+# queue behind each other in the single FSM consumer. That is enough to
+# prove the tier runs keyless, not enough to keep up with a live cluster.
+# For real-time use give Ollama a GPU node (set ollama.nodeSelector /
+# tolerations and a GPU resource), or use a hosted model below.
+#
 # DeepSeek or Claude instead: layer values-llm-deepseek.yaml or
-# values-llm-claude.yaml after this file and put the key in the chart
-# Secret (--set-file secrets.llmApiKey=...). This in-cluster model then
-# stays on as the FR28 fallback for every role.
+# values-llm-claude.yaml after this file and supply the key out of band:
+# create a Secret holding it under `llm-api-key` and set
+# secrets.llmApiKeyExistingSecret to its name (or --set-file
+# secrets.llmApiKey=...). This in-cluster model then stays on as the FR28
+# fallback for every role.
 analyst:
   provider: local
   local:
@@ -154,8 +174,9 @@ ollama:
     # The evidence package, the role schema and (for L2 and Senior) the
     # earlier verdicts must all fit, or Ollama silently truncates the
     # FRONT of the prompt, which is where the system prompt lives.
+    # Measured role prompts run 8k to 10k tokens, so 8192 was too small.
     - name: OLLAMA_CONTEXT_LENGTH
-      value: "8192"
+      value: "16384"
     # Keep the model resident: a cold load costs seconds on every call.
     - name: OLLAMA_KEEP_ALIVE
       value: "-1"
@@ -177,10 +198,11 @@ aggregator:
   extraEnv:
     # The per-role LLM budgets (30s L1, 30s L2, 60s Senior) are calibrated
     # for a hosted model. A 3B model on shared CPU reads a few thousand
-    # prompt tokens per role before it writes a word, so the budgets are
-    # scaled (DW3.8-1): 300s L1, 300s L2, 600s Senior.
+    # prompt tokens per role before it writes a word (6.5 to 8 minutes on
+    # 8 vCPUs, see SPEED above), so the budgets are scaled (DW3.8-1):
+    # 600s L1, 600s L2, 1200s Senior.
     - name: OLT_LLM_ROLE_TIMEOUT_MULTIPLIER
-      value: "10"
+      value: "20"
 
 # --- Falco on kind (moved here from the Story 10.7 overlay) -------------
 # The kind mount-product-files hook exception, copied verbatim from

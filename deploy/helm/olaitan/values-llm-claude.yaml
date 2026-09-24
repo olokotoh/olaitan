@@ -1,16 +1,19 @@
 # values-llm-claude.yaml -- Story 10.6: route the analyst chain to Claude
 # instead of the in-cluster model.
 #
-# Layer it AFTER a profile, and supply the key through the chart Secret,
-# never in a values file:
+# Layer it AFTER a profile, and supply the key out of band, never in a
+# values file:
 #
 #   helm upgrade --install olaitan deploy/helm/olaitan \
 #     -f deploy/helm/olaitan/values-full.yaml ...the full profile's files... \
 #     -f deploy/helm/olaitan/values-llm-claude.yaml \
-#     --set-file secrets.llmApiKey=./anthropic-key.txt
+#     --set secrets.llmApiKeyExistingSecret=olaitan-llm-key
 #
-# (or let an external-secrets operator write llm-api-key into the release's
-# <fullname>-secrets Secret). With no key the chain does not start and the
+# where olaitan-llm-key is a Secret you created with the key under
+# `llm-api-key` (kubectl create secret generic ... --from-file=
+# llm-api-key=/dev/stdin), so the key never passes through helm values.
+# Also possible: --set-file secrets.llmApiKey=<file>, or an external-secrets
+# operator writing llm-api-key into the release's <fullname>-secrets Secret. With no key the chain does not start and the
 # controller runs rules and baselines only (NFR27), loudly, in its log.
 #
 # Every role uses the claude family: trust cap 35, enforced in code. The

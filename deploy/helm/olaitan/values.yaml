@@ -200,6 +200,13 @@ secrets:
   # LLM provider API key (OpenAI/Anthropic/…). Empty by default; Epic 4
   # analyst ring refuses to start when analyst.provider=api with empty.
   llmApiKey: ""
+  # Story 10.6: name of a Secret you create yourself, holding the key under
+  # `llm-api-key`. When set, the aggregator reads the LLM key from it
+  # instead of from llmApiKey, so the key never passes through helm values,
+  # a values file or `helm get values`:
+  #   kubectl create secret generic my-llm-key --from-file=llm-api-key=/dev/stdin < key
+  # @schema type:string pattern:"Secret name in the release namespace, or empty for the chart Secret" effect:"Secret the aggregator reads llm-api-key from instead of secrets.llmApiKey" ref:NFR8
+  llmApiKeyExistingSecret: ""
   # Story 10.2: shared secret Falco puts in its http_output URL path; the
   # collector rejects any alert without it (401). Empty -> generated on
   # first install and reused on upgrade, like the bundled Redis password.
@@ -1036,6 +1043,14 @@ fsm:
 # by default; an operator running RS-with-isolation enables them explicitly.
 # A block left empty leaves the config/olaitan.yaml defaults untouched.
 response:
+  # Story 10.6: add the release namespace to response.excluded_namespaces
+  # (shipped: kube-system, olaitan), so Olaitan never scores its own pods
+  # when it is installed somewhere other than `olaitan`. Everything else in
+  # that namespace is excluded too, which is why it is off by default; the
+  # kind-full profile, which installs into `default` and attacks from its
+  # own namespaces, turns it on.
+  # @schema type:boolean effect:"never score workloads in the release namespace (added to response.excluded_namespaces)" ref:FR47
+  excludeReleaseNamespace: false
   # Story 2.4-2.6: RESTRICTED/QUARANTINED NetworkPolicy enforcement (FR33/NFR6).
   networkPolicy:
     enabled: false

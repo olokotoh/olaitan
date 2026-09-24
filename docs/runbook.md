@@ -77,6 +77,14 @@ The catalogue is organised by registering ring + story, in commit chronology so 
 - **Help:** Events dropped by the correlator because they carry no Kubernetes pod: host processes and non-Kubernetes containers. There is no workload to score or isolate. On a busy node this is most of Falco's output, which is why it is a counter rather than a log line.
 - **Sample PromQL (aggregate):** `rate(olaitan_correlator_host_events_dropped_total[5m])`.
 
+#### `olaitan_correlator_excluded_events_dropped_total` (Story 10.6)
+
+- **Type:** counter
+- **Unit:** count
+- **Labels:** none
+- **Help:** Events dropped by the correlator because their pod is in a namespace listed in `response.excluded_namespaces` (by default `kube-system` and `olaitan`, plus the release namespace when `response.excludeReleaseNamespace` is on). Such a workload is never scored by any path: no multi-signal package, no rule or baseline match, no Falco trigger. A steady non-zero rate is normal; it is Olaitan's own pods and the control plane talking.
+- **Sample PromQL (aggregate):** `rate(olaitan_correlator_excluded_events_dropped_total[5m])`.
+
 #### `olaitan_sensor_falco_http_requests_total` (Story 10.2)
 
 - **Type:** counter
@@ -1103,11 +1111,40 @@ client (no SDK, no external egress).
   what makes a 3B model reliably schema-valid; the runners still validate
   every reply and still enforce the cited-event rule a grammar cannot
   express.
+- **CPU latency, measured (Story 10.6).** On an AWS m6i.2xlarge (8 vCPU,
+  no GPU) running the whole kind-full profile, `qwen2.5:3b-instruct` reads
+  prompts at about 17 to 27 tokens/s and writes at about 8.5 tokens/s. A
+  chain role's prompt is 8k to 10k tokens, so each role spends 6.5 to 8
+  minutes on the prompt alone: about 7 minutes per role, over 20 minutes
+  per incident, and incidents queue behind each other. That is fine to
+  prove the tier works with no key; for real-time use, schedule Ollama on
+  a GPU node (`ollama.nodeSelector`, `ollama.tolerations`, a GPU resource
+  in `ollama.resources`) or switch to a hosted model (below).
 - **CPU timeouts.** The per-role budgets (30s L1, 30s L2, 60s Senior) are
   calibrated for a hosted model. On CPU, raise them with
   `aggregator.extraEnv` `OLT_LLM_ROLE_TIMEOUT_MULTIPLIER` (values-full sets
-  10). The chain runs inline in the FSM consumer, so a slow model delays
-  FSM evaluation behind it; the circuit breaker (FR51) bounds a burst.
+  20: 600s, 600s, 1200s, sized to the measured numbers above; it also sets
+  `OLLAMA_CONTEXT_LENGTH` to 16384 because the prompts outgrow 8192). The
+  chain runs inline in the FSM consumer, so a slow model delays FSM
+  evaluation behind it; the circuit breaker (FR51) bounds a burst.
+- **Hosted model, key out of band (Story 10.6).** Layer
+  `values-llm-deepseek.yaml` (openai family, cap 30) or
+  `values-llm-claude.yaml` (claude family, cap 35) after the profile.
+  Create the key Secret yourself (`kubectl create secret generic
+  olaitan-llm-key --from-file=llm-api-key=/dev/stdin`, key on stdin) and
+  set `secrets.llmApiKeyExistingSecret=olaitan-llm-key`; the aggregator
+  then reads `llm-api-key` from that Secret, and the key never appears in
+  helm values or `helm get values`. The in-cluster model stays configured
+  as every role's FR28 fallback, and `AUDIT_ASSESSMENTS` records which
+  provider answered. `make e2e-full-real-llm-deepseek` runs the real-attack
+  proof this way.
+- **Self-exclusion on kind-full (Story 10.6).** The profile installs into
+  `default` and sets `response.excludeReleaseNamespace: true`, which adds
+  the release namespace to `response.excluded_namespaces`. The correlator
+  drops every event from an excluded namespace before it is windowed, so
+  no path (multi-signal, rule, baseline, Falco trigger) opens an
+  investigation of Olaitan's own pods; the drops are counted in
+  `olaitan_correlator_excluded_events_dropped_total`.
 - **Startup warning on the local path.** The aggregator warns when
   `analyst.score_cap` (file default 35) exceeds 25 on the local provider.
   Since Story 3.8 the per-role cap is `min(family cap, score_cap)`, so an

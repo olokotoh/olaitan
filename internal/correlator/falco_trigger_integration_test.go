@@ -174,3 +174,85 @@ func TestAddEvent_HostEventsAreDroppedAndCounted(t *testing.T) {
 		t.Errorf("HostEventsDropped = %d, want 1", c.HostEventsDropped())
 	}
 }
+
+// Story 10.6: an excluded namespace opens no investigation by ANY path, not
+// only the single-alert Falco trigger. On kind-full the release lives in
+// `default`, and its own aggregator and Ollama crossed the multi-signal
+// threshold at startup; the rule and baseline engines then raised FR19
+// chains on those packages, which queued ahead of a real attack. Dropping
+// the events at the correlator means no package, so neither engine ever
+// sees the workload.
+func TestIntegration_ExcludedNamespaceOpensNoPackageByAnyPath(t *testing.T) {
+	srv := startTestNATSServer(t)
+	nc, err := natsclient.NewClient(natsclient.ClientConfig{URL: srv.ClientURL(), Name: "excluded-ns-test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = nc.Close(ctx)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := natsclient.EnsureStreams(ctx, nc.JetStream(), testStreamConfigs()); err != nil {
+		t.Fatal(err)
+	}
+	kube := kubefake.NewSimpleClientset(
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "web-1", Namespace: "payments", UID: "web-uid"}},
+	)
+	c, err := New(Config{
+		NATS:                  nc,
+		Kube:                  kube,
+		Assembler:             assembler.New(assembler.Config{Kube: kube, Posture: fakePosture{now: time.Now}, MaxPackageBytes: 128 * 1024}),
+		WindowDuration:        time.Minute,
+		MultiSignalMinSources: 2,
+		Log:                   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		ExcludedNamespaces:    []string{"payments"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := nc.JetStream().Stream(ctx, "EVIDENCE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+		Durable: "excluded-ns-test", AckPolicy: jetstream.AckExplicitPolicy, FilterSubject: subjects.EvidencePackages,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Two distinct sources on one workload: the multi-signal rising edge.
+	for _, ev := range []schema.Event{
+		testEvent("ex-1", "web-1", schema.SourceAudit, schema.CategoryAudit, "info", "get pod"),
+		testEvent("ex-2", "web-1", schema.SourceNetwork, schema.CategoryFlow, "info", "flow"),
+	} {
+		pkg, err := c.AddEvent(ctx, ev)
+		if err != nil {
+			t.Fatalf("AddEvent %s: %v", ev.ID, err)
+		}
+		if pkg != nil {
+			t.Fatalf("AddEvent %s returned a %s package for an excluded namespace", ev.ID, pkg.Trigger.Type)
+		}
+	}
+	noPackage(t, consumer, "multi-signal in an excluded namespace")
+	if got := c.ExcludedEventsDropped(); got != 2 {
+		t.Errorf("ExcludedEventsDropped = %d, want 2", got)
+	}
+
+	// Lift the exclusion (hot reload): the same two sources now correlate.
+	c.SetExcludedNamespaces(nil)
+	for _, ev := range []schema.Event{
+		testEvent("ok-1", "web-1", schema.SourceAudit, schema.CategoryAudit, "info", "get pod"),
+		testEvent("ok-2", "web-1", schema.SourceNetwork, schema.CategoryFlow, "info", "flow"),
+	} {
+		if _, err := c.AddEvent(ctx, ev); err != nil {
+			t.Fatalf("AddEvent %s: %v", ev.ID, err)
+		}
+	}
+	if p := nextPackage(t, consumer); p.Trigger.Type != "multi_signal" {
+		t.Errorf("after lifting the exclusion: trigger %q, want multi_signal", p.Trigger.Type)
+	}
+}

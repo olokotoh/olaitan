@@ -613,7 +613,39 @@ e2e-full-real-llm: helm-prepare helm-deps docker-build
 		--wait --timeout 15m
 	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig \
 		KIND_CLUSTER_NAME=$(FULL_CLUSTER_NAME) OLT_E2E_FULL=1 OLT_E2E_REAL_LLM=1 \
-		go test -tags=e2e -v -count=1 -timeout 40m -run 'TestRealLLM_RealIncidentOnFullProfile|TestFalcoSourceIsLive' ./tests/e2e/...
+		go test -tags=e2e -v -count=1 -timeout 60m -run 'TestRealLLM_RealIncidentOnFullProfile|TestFalcoSourceIsLive' ./tests/e2e/...
+
+# Story 10.6: the same real-incident test, against DeepSeek instead of the
+# in-cluster model. Restores the profile like e2e-full-real-llm (no
+# --reuse-values), layers values-llm-deepseek.yaml, and reads the key from a
+# Secret you create out of band BEFORE running this, so the key never goes
+# through make, helm values or a file in this repo:
+#
+#   kubectl -n default create secret generic olaitan-llm-key \
+#     --from-file=llm-api-key=/dev/stdin < <file holding the key>
+#
+# The test derives the expected provider (openai), model (deepseek-chat) and
+# trust cap (30) from the live release's config, so nothing here names them.
+LLM_KEY_SECRET ?= olaitan-llm-key
+.PHONY: e2e-full-real-llm-deepseek
+e2e-full-real-llm-deepseek: helm-prepare helm-deps docker-build
+	kind get clusters | grep -qx '$(FULL_CLUSTER_NAME)' || \
+		{ echo 'kind cluster $(FULL_CLUSTER_NAME) not found; run make e2e-full first' >&2; exit 1; }
+	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig kubectl -n default get secret $(LLM_KEY_SECRET) -o name >/dev/null || \
+		{ echo 'Secret $(LLM_KEY_SECRET) not found in default; create it first (see the comment above this target)' >&2; exit 1; }
+	kind load docker-image $(IMAGE):$(TAG) --name $(FULL_CLUSTER_NAME)
+	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig \
+		helm upgrade --install olaitan $(CHART_DIR) -n default \
+		--set-string image.repository=$(IMAGE) \
+		--set-string image.tag=$(TAG) \
+		--set image.pullPolicy=Never \
+		$(FULL_HELM_VALUES) \
+		-f $(CHART_DIR)/values-llm-deepseek.yaml \
+		--set-string secrets.llmApiKeyExistingSecret=$(LLM_KEY_SECRET) \
+		--wait --timeout 15m
+	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig \
+		KIND_CLUSTER_NAME=$(FULL_CLUSTER_NAME) OLT_E2E_FULL=1 OLT_E2E_REAL_LLM=1 \
+		go test -tags=e2e -v -count=1 -timeout 20m -run 'TestRealLLM_RealIncidentOnFullProfile|TestFalcoSourceIsLive' ./tests/e2e/...
 
 # Removes FULL_OUT_DIR too. It holds the audit CA and the apiserver client
 # key; leaving it behind also leaves a Calico marker file that would make the

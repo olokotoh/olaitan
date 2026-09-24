@@ -529,6 +529,18 @@ data:
     */ -}}
     {{- if .Values.response }}
     {{- $rsp := .Values.response }}
+    {{- /*
+    Story 10.6: response.excludeReleaseNamespace appends the release
+    namespace to response.excluded_namespaces unless it is already listed.
+    */ -}}
+    {{- if $rsp.excludeReleaseNamespace }}
+    {{- $p := "(\\n  excluded_namespaces:\\n(?:    - [^\\n]+\\n)+)" -}}
+    {{- $list := mustRegexFind $p $cfg }}
+    {{- if not $list }}{{- fail (printf "helm bridge: response.excluded_namespaces anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- if not (contains (printf "\n    - %s\n" .Release.Namespace) $list) }}
+    {{- $cfg = replace $list (printf "%s    - %s\n" $list .Release.Namespace) $cfg }}
+    {{- end }}
+    {{- end }}
     {{- $np := $rsp.networkPolicy | default dict }}
     {{- if hasKey $np "enabled" }}
     {{- $p := "(\\n  network_policy:\\n    enabled: )(?:true|false)" -}}
