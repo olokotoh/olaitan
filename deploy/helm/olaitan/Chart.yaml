@@ -43,10 +43,12 @@ appVersion: "edge"
 # been removed.
 kubeVersion: ">=1.29.0 < 2.0.0"
 
-# All three subcharts ship the infra Olaitan depends on: Falco (Ring 1
-# signal source), NATS JetStream (inter-ring bus), Redis (state store).
-# Operators with existing infra disable each via --set <name>.enabled=false
-# and point values.endpoints.* at their own services (see Dev Notes).
+# The subcharts ship the infra Olaitan depends on: Falco (Ring 1 signal
+# source) and NATS JetStream (inter-ring bus). Redis (state store) was the
+# Bitnami subchart until Story 12.6 and is now the chart's own
+# templates/redis.yaml (ADR-2026-09-23-01). Operators with existing infra
+# disable each via --set <name>.enabled=false and point values.endpoints.*
+# at their own services (see Dev Notes).
 # Every version is pinned exactly — no caret ranges — so a rebuild with
 # the same Chart.yaml produces the same manifests (NFR13, reproducibility).
 dependencies:
@@ -62,7 +64,3 @@ dependencies:
     version: "2.12.6"
     repository: https://nats-io.github.io/k8s/helm/charts/
     condition: nats.enabled
-  - name: redis
-    version: "25.3.11"
-    repository: oci://registry-1.docker.io/bitnamicharts
-    condition: redis.enabled

@@ -25,6 +25,17 @@ image:
   # "olaitan.image" helper. Set explicitly (e.g. a commit SHA) to pin a
   # pre-release image.
   tag: ""
+  # Story 12.6: the image digest, rendered as repository:tag@digest. Empty
+  # in the source tree, because an unreleased commit's image has no digest
+  # yet and local e2e loads a locally built image into kind with
+  # pullPolicy Never (a digest reference could never match it). The release
+  # workflow writes the digest it pushed into the PACKAGED chart, so a
+  # published chart always pins the image. If you override image.tag on a
+  # published chart, set image.digest to that tag's digest too, or to ""
+  # (the digest wins at pull time, so a stale one silently runs the old
+  # image).
+  # @schema type:string pattern:"sha256:<64 hex>, or empty for tag-only" effect:"digest the Olaitan image is pinned to; the release stamps it into the packaged chart" ref:NFR31
+  digest: ""
   # IfNotPresent avoids gratuitous registry traffic on pod restart; use
   # Always only for mutable dev tags (not recommended in production).
   pullPolicy: IfNotPresent
@@ -945,8 +956,8 @@ baselines:
   # 48h key-family TTL is enforced server-side by the Olaitan redis
   # wrapper. Restart-required. Empty (default) falls back to the
   # `olaitan.endpoints.redis` helper that resolves to
-  # `<release>-redis-master:6379` when the bundled Bitnami Redis
-  # subchart is enabled; matches the env-var path the main aggregator
+  # `<release>-redis-master:6379` when the bundled Redis
+  # (templates/redis.yaml) is enabled; matches the env-var path the main aggregator
   # Redis client uses (REDIS_ADDR via templates/daemonset.yaml). Set
   # explicitly to point at externally-managed Redis when redis.enabled=false.
   redisAddr: ""
@@ -1480,7 +1491,7 @@ ollama:
 # the subchart's own values.yaml:
 #   - https://artifacthub.io/packages/helm/falcosecurity/falco
 #   - https://artifacthub.io/packages/helm/nats/nats
-#   - https://artifacthub.io/packages/helm/bitnami/redis
+# (Redis is not a subchart since Story 12.6; see the redis: block below.)
 
 # Falco -- host-level signal source (Ring 1). Falco POSTs its alerts to the
 # collector over http_output (Story 10.2); see the falco: block below and
@@ -1518,8 +1529,18 @@ falco:
   # on kernel 7.0 with 0 restarts. TODO: move to 0.45.0 GA when it ships
   # (planned 2026-09-21). Keep in step with hack/falco-support.env; the helm
   # suite fails if they differ.
+  #
+  # Story 12.6: every image is pinned by tag AND digest (the multi-arch index
+  # digest, resolved with `docker buildx imagetools inspect <image>:<tag>`).
+  # The Falco chart has no digest field and renders registry/repository:tag,
+  # so the digest rides in `tag` as "<tag>@sha256:...", which renders the
+  # valid reference docker.io/falcosecurity/falco:<tag>@sha256:... (the tag
+  # is used nowhere else in the chart, labels included). When you move the
+  # tag, resolve and replace the digest in the same edit; the helm suite
+  # (image_pin_test.go) fails on a tag without one.
   image:
-    tag: "0.45.0-rc1"
+    # falcosecurity/falco:0.45.0-rc1
+    tag: "0.45.0-rc1@sha256:4d0707bba5bdcb8c378395fe7f01a3b37ff0008ac7a2dd3e8b25d4f8f2ab5cbf"
   driver:
     # The driver loader (used by kind=kmod, the fallback for nodes without
     # BTF) defaults to the CHART's appVersion, 0.44.1, not image.tag. Pinned
@@ -1528,7 +1549,8 @@ falco:
     loader:
       initContainer:
         image:
-          tag: "0.45.0-rc1"
+          # falcosecurity/falco-driver-loader:0.45.0-rc1
+          tag: "0.45.0-rc1@sha256:2f27eadd263d26fd85435e13771cc57dd93ff9d9281099387c697c16c7d2409e"
     # `modern_ebpf` is CO-RE: one prebuilt probe that relocates itself against
     # the running kernel's BTF. It needs NO kernel headers and compiles NOTHING
     # at pod start.
@@ -1575,6 +1597,13 @@ falco:
       enabled: true
       interval: 1m
       output_rule: true
+  # Story 12.6: falcoctl runs as Falco's init container (rules and plugin
+  # install) and its sidecar (rules follower). Same digest-in-tag pin as
+  # falco.image above; the chart's own default is the bare tag 0.13.0.
+  falcoctl:
+    image:
+      # falcosecurity/falcoctl:0.13.0
+      tag: "0.13.0@sha256:0eeb79adc580ae6a5abfdefd7f8f0fed9151fcb545f015c84e8f1d7b2d8a6b02"
   extra:
     # The Falco chart renders these through `tpl` in this release's context,
     # so the Service FQDN and the Secret name follow the release name and
@@ -1623,22 +1652,100 @@ nats:
   # the pairing is the point, and NOTES.txt says so at install time.
   # @schema type:string pattern:"byte count as a string (e.g. 1073741824), or empty for production sizing" effect:"per-stream JetStream MaxBytes override for small kind/CI PVCs; empty leaves production retention sized by nats.persistence.size" ref:NFR3
   streamMaxBytesOverride: "536870912"
+  # Story 12.6: the NATS chart's own `digest` field REPLACES the tag
+  # (repository@digest), which leaves nobody able to tell what the digest is
+  # meant to be. fullImageName is used as given, so each image is written
+  # out whole as registry/repository:tag@sha256:<multi-arch index digest>
+  # (resolved with `docker buildx imagetools inspect`). It also overrides
+  # global.image.registry: a mirror must replace the whole string. Keep the
+  # tag in step with the subchart version when bumping it (the chart's
+  # defaults are the tags below).
+  container:
+    image:
+      # nats:2.12.6-alpine (the NATS chart 2.12.6 default tag)
+      fullImageName: "docker.io/library/nats:2.12.6-alpine@sha256:1cfc36e2e5e638243d8c722f72c954cd0ec4b15ee82fadbc718ce12e2b3c1652"
+  reloader:
+    image:
+      # natsio/nats-server-config-reloader:0.21.1
+      fullImageName: "docker.io/natsio/nats-server-config-reloader:0.21.1@sha256:10ff229eaf52f42de80107c02d38f3b3ec1ef6084d444431938778f4bd00d3dd"
+  # nats-box runs as a Deployment and as the chart's `helm test` Pod
+  # (olaitan-nats-test-request-reply); both read this one value.
+  natsBox:
+    container:
+      image:
+        # natsio/nats-box:0.19.3
+        fullImageName: "docker.io/natsio/nats-box:0.19.3@sha256:fbdf67cb49333afc50e2003c6857845d1ed9cf822d2b886cc5658ebf3c754b07"
 
 # Redis -- state store (per-workload baselines, FSM state, checkpoints).
-# Standalone architecture is enough for the single-aggregator MVP;
-# Sentinel/Cluster are deferred to the Target-tier HA story. AUTH is
-# mandatory (NFR8). The subchart reads its password from the parent
-# chart's `<fullname>-secrets` Secret (key `redis-password`) so both
-# sides agree on a single source of truth -- the operator-supplied
-# `secrets.redisPassword`. NOTE: `existingSecret` is hardcoded for the
-# canonical `helm install olaitan ...` release-name pattern; for any
-# other release name, also override:
-#   --set redis.auth.existingSecret=<release>-olaitan-secrets
-# [Source: architecture.md:328, NFR8]
+# Standalone is enough for the single-aggregator MVP; Sentinel/Cluster are
+# deferred to the Target-tier HA story. AUTH is mandatory (NFR8): the server
+# and every client read the one password in the release Secret
+# (`<fullname>-secrets`, key `redis-password`, i.e. secrets.redisPassword, or
+# a generated one for the bundled Redis). [Source: architecture.md:328, NFR8]
+#
+# Story 12.6: this is the chart's OWN Redis (templates/redis.yaml) on the
+# official `redis` image, no longer the Bitnami subchart. Bitnami stopped
+# publishing any versioned free `bitnami/redis` tag (only `latest` is left),
+# so that image could not be pinned to a version at all, and the Bitnami
+# chart refuses any other image unless its image verification is switched
+# off. The resource names, labels, volume claim template and security
+# context are the ones the Bitnami chart rendered, so an existing release
+# upgrades in place and keeps its data (ADR-2026-09-23-01 in
+# docs/deferred-decisions.md). Set enabled: false and point
+# endpoints.redis at your own Redis to bring your own.
 redis:
+  # @schema type:boolean effect:"deploy the bundled Redis; false means bring your own and set endpoints.redis" ref:NFR8
   enabled: true
-  architecture: standalone
+  image:
+    # Full image name, registry included (there is no separate registry
+    # key). Point it at a mirror for an air-gapped install and keep the tag
+    # and digest.
+    # @schema type:string effect:"bundled Redis image repository, registry included; override to pull from a mirror" ref:NFR31
+    repository: docker.io/library/redis
+    # The same Redis release `bitnami/redis:latest` served on 2026-09-23, so
+    # an upgrade never hands newer on-disk data to an older server.
+    # @schema type:string effect:"Redis image tag; change redis.image.digest in the same edit" ref:NFR31
+    tag: "8.10.2-alpine"
+    # Multi-arch index digest of redis:8.10.2-alpine (docker buildx
+    # imagetools inspect). Rendered as repository:tag@digest.
+    # @schema type:string pattern:"sha256:<64 hex>" effect:"digest the bundled Redis image is pinned to" ref:NFR31
+    digest: "sha256:72cedd9603038893af961e90ac5e1a1a0d8377d5e338dbdad8fe284ea25de18f"
+    # @schema type:string enum:Always|IfNotPresent|Never effect:"pull policy of the bundled Redis image" ref:NFR31
+    pullPolicy: IfNotPresent
   auth:
-    enabled: true
-    existingSecret: olaitan-secrets
+    # Secret holding the Redis password. Empty uses the release Secret
+    # (`<fullname>-secrets`), which is where the clients read it from too;
+    # name another Secret only if every client is pointed at it as well.
+    # @schema type:string effect:"Secret the bundled Redis reads its password from; empty uses the release Secret" ref:NFR8
+    existingSecret: ""
+    # @schema type:string effect:"key in auth.existingSecret holding the Redis password" ref:NFR8
     existingSecretPasswordKey: redis-password
+  persistence:
+    # AOF on a volume, so FSM state and baselines survive a restart.
+    # @schema type:boolean effect:"keep Redis data on a PersistentVolumeClaim; false uses an emptyDir (state lost on restart)" ref:NFR3
+    enabled: true
+    # @schema type:string effect:"size of the Redis data claim (fixed at first install: a StatefulSet cannot resize its claim template)" ref:NFR3
+    size: 8Gi
+    # @schema type:string effect:"storageClassName of the Redis data claim; empty uses the cluster default" ref:NFR3
+    storageClassName: ""
+  # The Bitnami "nano" preset this Redis ran under before Story 12.6.
+  # @schema type:object effect:"requests and limits of the bundled Redis container" ref:NFR24
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+      ephemeral-storage: 50Mi
+    limits:
+      cpu: 150m
+      memory: 192Mi
+      ephemeral-storage: 2Gi
+  networkPolicy:
+    # Ingress on 6379 from pods in the release namespace only, and NO
+    # egress at all: a standalone Redis never dials out (no replicas, no
+    # sentinels, no name to resolve).
+    # @schema type:boolean effect:"render the Redis NetworkPolicy (6379 from the release namespace, no egress)" ref:NFR11
+    enabled: true
+  # @schema type:object effect:"nodeSelector of the bundled Redis pod" ref:NFR24
+  nodeSelector: {}
+  # @schema type:array effect:"tolerations of the bundled Redis pod" ref:NFR24
+  tolerations: []

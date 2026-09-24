@@ -344,6 +344,8 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
+          IMAGE: ${{ needs.preflight.outputs.image }}
+          DIGEST: ${{ needs.image.outputs.digest }}
         run: |
           set -euo pipefail
           rm -rf build/chart
@@ -357,6 +359,33 @@ jobs:
           grep -qx "version: ${VERSION}" build/chart/Chart.yaml
           grep -qx "appVersion: \"${VERSION}\"" build/chart/Chart.yaml
           git diff --quiet -- deploy/helm/olaitan/Chart.yaml
+          # Story 12.6: pin the Olaitan image by the digest the image job
+          # just pushed (the index digest it verified, scanned and signed),
+          # and name the repository it was pushed to, so the two can never
+          # disagree (a fork pushes to its own owner). The helm test suite
+          # runs the same script on every CI run
+          # (TestReleaseStampPinsTheOlaitanImage).
+          hack/stamp-chart-image.sh deploy/helm/olaitan/values.yaml \
+            build/chart/values.yaml "$IMAGE" "$DIGEST"
+          git diff --quiet -- deploy/helm/olaitan/values.yaml
+          rendered="$(helm template olaitan build/chart --set secrets.redisPassword=stamp-check)"
+          grep -qF "image: ${IMAGE}:${VERSION}@${DIGEST}" <<<"$rendered" \
+            || { echo "staged chart does not render ${IMAGE}:${VERSION}@${DIGEST}" >&2; exit 1; }
+
+      # Story 12.6: the same guard the helm CI job runs on the tree, pointed
+      # at the stamped chart, where the Olaitan image must be pinned too.
+      # A published chart therefore cannot carry any image that is untagged,
+      # :latest, or a tag without a digest.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Every image in the staged chart is pinned by tag and digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          OLT_PIN_CHART_DIR="$PWD/build/chart" \
+            go test ./deploy/helm/ -tags=helm -count=1 -v -run 'TestEveryRenderedImageIsPinned$'
 
       - name: Package chart
         shell: bash

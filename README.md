@@ -58,9 +58,10 @@ the registry holds.
 
 Install into the `olaitan` namespace as shown. The agent's default
 `excluded_namespaces` list contains `kube-system` and `olaitan`, so installing
-anywhere else leaves the agent able to act on its own workloads. The chart bundles pinned Falco, NATS and Redis
-subcharts; disable any of them with `--set <name>.enabled=false` if you already
-run that infrastructure.
+anywhere else leaves the agent able to act on its own workloads. The chart bundles Falco and NATS
+subcharts and its own Redis, with every image pinned by tag and digest; disable
+any of them with `--set <name>.enabled=false` if you already run that
+infrastructure.
 
 Enforcement is **observe-only by default**. `response.networkPolicy.enabled` is
 `false`, so out of the box Olaitan detects and records but writes no

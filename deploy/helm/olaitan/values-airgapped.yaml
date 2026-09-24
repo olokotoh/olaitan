@@ -91,33 +91,19 @@ networkPolicy:
 notifications:
   enabled: false
 
-# Close the Bitnami Redis subchart's allow-all egress. The subchart
-# defaults networkPolicy.allowExternalEgress to true, which renders the
-# Redis NetworkPolicy egress as `- {}` (every destination, every port) --
-# a namespace egress hole that contradicts the air-gapped no-external-
-# egress commitment. Setting it false drops that wildcard rule. Redis is a
-# state STORE here (the aggregator dials INTO it; architecture=standalone,
-# no replica / sentinel peers), so the only outbound it needs is cluster
-# DNS resolution, scoped explicitly below via extraEgress. With
-# architecture=standalone the subchart's built-in replica/peer egress
-# branch is inert, so extraEgress is the one rule that survives, giving a
-# closed-by-default Redis netpol with DNS only and no external destination.
-redis:
-  networkPolicy:
-    allowExternalEgress: false
-    # Cluster DNS only (kube-dns / CoreDNS on UDP+TCP 53). No external
-    # destination: that is the whole point of the air-gapped overlay.
-    extraEgress:
-      - ports:
-          - port: 53
-            protocol: UDP
-          - port: 53
-            protocol: TCP
+# Redis egress: nothing to set. Before Story 12.6 the bundled Redis was the
+# Bitnami subchart, whose NetworkPolicy allowed all egress by default, so
+# this overlay closed it down to cluster DNS. The chart's own Redis
+# (templates/redis.yaml) declares NO egress at all in every profile: a
+# standalone Redis dials nothing, not even DNS.
 
 # --- Container images ------------------------------------------------
 # "Air-gapped" in this file means LLM-provider egress (Ollama instead of
 # Claude/OpenAI), not registry reachability: the bundled Falco, NATS and
-# Redis subchart images still pull from their public registries. Mirror them
-# and override each subchart's image.repository if your nodes cannot reach
-# them. (Story 10.2 removed the busybox socket-permission container that used
-# to be the first default-on image to worry about here.)
+# Redis images still pull from their public registries. Every one is pinned
+# by tag and digest (Story 12.6), so mirror them by digest (crane copy,
+# skopeo copy --all keep it) and override the image values in values.yaml
+# (falco.image, falco.falcoctl.image, nats.*.image.fullImageName,
+# redis.image) with your mirror if your nodes cannot reach them. (Story 10.2
+# removed the busybox socket-permission container that used to be the first
+# default-on image to worry about here.)

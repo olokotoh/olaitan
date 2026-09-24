@@ -48,8 +48,9 @@ deviate from the canonical arms (e.g. a one-off experiment), leave
 
 ## Install recipes
 
-The Bitnami Redis subchart requires an explicit password
-(`secrets.redisPassword`); set it on every install.
+The examples set the bundled Redis password (`secrets.redisPassword`)
+explicitly. It is optional: without it the chart generates one on first
+install and reuses it on upgrade.
 
 ```bash
 # F arm: Falco-only baseline.
@@ -157,6 +158,13 @@ followed by the harness's idempotent re-apply of the same/another arm's
 overlay; the first-install-VIA-the-harness path (option (b)) is supported by
 helm's `--reuse-values` no-op-on-fresh-install semantics but is NOT a tested
 path here.
+
+Upgrading the chart across Story 12.6 (the release that replaced the
+Bitnami Redis subchart) is the one case `--reuse-values` does not cover:
+the reused defaults are the old chart's, which have no `redis.image`, and
+the render fails on purpose. Upgrade the release once by hand with
+`--reset-then-reuse-values` (docs/runbook.md, "Upgrading across Story
+12.6"); the harness's `--reuse-values` re-applies are safe again after that.
 
 ## Restart semantics
 
