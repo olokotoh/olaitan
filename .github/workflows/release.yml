@@ -645,6 +645,11 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          # The title every release gets (softprops' default for a new
+          # release is the tag). Set explicitly because, on an existing
+          # release, softprops keeps the old title when given none: a
+          # "Re-run all jobs" after mark-failed would keep the FAILED title.
+          name: ${{ github.ref_name }}
           generate_release_notes: true
           # Not "Latest" yet: promote sets that once the stranger check
           # passed (and only for the highest stable tag).
@@ -782,25 +787,41 @@ jobs:
           REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
         run: |
           set -euo pipefail
           begin='<!-- stranger-check: FAILED'
           end='<!-- stranger-check: end -->'
           suffix=' (FAILED stranger-path check)'
-          gh release view "$TAG" -R "$REPO" --json body -q .body > body.md
+          # One test for "marked", in grep and awk alike: the begin marker
+          # at the start of a line. Notes that quote it mid-line are not a
+          # mark.
+          re="^${begin}"
+          # Notes saved from the web UI have CRLF line ends. Strip the CR so
+          # the end marker still matches a whole line.
+          gh release view "$TAG" -R "$REPO" --json body -q .body | tr -d '\r' > body.md
           title="$(gh release view "$TAG" -R "$REPO" --json name -q .name)"
           pre="$(gh release view "$TAG" -R "$REPO" --json isPrerelease -q .isPrerelease)"
-          if grep -qF "$begin" body.md; then
+          if grep -q "$re" body.md; then
             # Marked by an earlier attempt: the flag is on because of that
-            # mark, so keep the state it recorded.
-            pre="$(sed -n 's/^<!-- stranger-check: FAILED; prerelease-before=\([a-z]*\) -->$/\1/p' body.md | head -n 1)"
+            # mark, so keep the state it recorded. A header a human edited
+            # records none: fall back to preflight's value for this tag.
+            recorded="$(sed -n 's/^<!-- stranger-check: FAILED; prerelease-before=\(true\|false\) -->$/\1/p' body.md | head -n 1)"
+            pre="${recorded:-$PRERELEASE}"
           fi
-          awk -v b="$begin" -v e="$end" '
+          # Drop an earlier banner. A begin marker with no end marker would
+          # take every line after it along, so leave the notes as they are
+          # and stop: a human has to fix them.
+          if ! awk -v r="$re" -v e="$end" '
             skip == 2 { skip = 0; if ($0 == "") next }
             skip == 1 { if ($0 == e) skip = 2; next }
-            index($0, b) == 1 { skip = 1; next }
+            $0 ~ r { skip = 1; next }
             { print }
-          ' body.md > rest.md
+            END { if (skip == 1) exit 3 }
+          ' body.md > rest.md; then
+            echo "::error::The notes of $TAG have a line starting '${begin}' with no '${end}' line after it. Rewriting them would drop everything below it, so the release was left unchanged. Fix the notes by hand, then rerun this job."
+            exit 1
+          fi
           rest="$(cat rest.md)"
           title="${title:-$TAG}"
           case "$title" in *"$suffix") ;; *) title="${title}${suffix}" ;; esac
@@ -843,19 +864,39 @@ jobs:
           begin='<!-- stranger-check: FAILED'
           end='<!-- stranger-check: end -->'
           suffix=' (FAILED stranger-path check)'
-          gh release view "$TAG" -R "$REPO" --json body -q .body > body.md
-          if ! grep -qF "$begin" body.md; then
-            echo "$TAG is not marked failed: nothing to undo"
+          # The same "marked" test as mark-failed: begin marker at the start
+          # of a line, CR stripped from web-UI (CRLF) notes.
+          re="^${begin}"
+          gh release view "$TAG" -R "$REPO" --json body -q .body | tr -d '\r' > body.md
+          title="$(gh release view "$TAG" -R "$REPO" --json name -q .name)"
+          if ! grep -q "$re" body.md; then
+            # No banner in the notes. A "Re-run all jobs" after a mark can
+            # still leave the FAILED title (softprops rewrites the notes and
+            # the flag but keeps an existing title when given none). Take it
+            # off, or promote would make a FAILED-titled release Latest.
+            case "$title" in
+              *"$suffix")
+                gh release edit "$TAG" -R "$REPO" --title "${title%"$suffix"}"
+                echo "took the FAILED title off $TAG (its notes carry no mark)"
+                ;;
+              *) echo "$TAG is not marked failed: nothing to undo" ;;
+            esac
             exit 0
           fi
-          title="$(gh release view "$TAG" -R "$REPO" --json name -q .name)"
-          pre="$(sed -n 's/^<!-- stranger-check: FAILED; prerelease-before=\([a-z]*\) -->$/\1/p' body.md | head -n 1)"
-          awk -v b="$begin" -v e="$end" '
+          # The state mark-failed recorded; a header a human edited records
+          # none, so fall back to preflight's value for this tag.
+          recorded="$(sed -n 's/^<!-- stranger-check: FAILED; prerelease-before=\(true\|false\) -->$/\1/p' body.md | head -n 1)"
+          pre="${recorded:-$PRERELEASE}"
+          if ! awk -v r="$re" -v e="$end" '
             skip == 2 { skip = 0; if ($0 == "") next }
             skip == 1 { if ($0 == e) skip = 2; next }
-            index($0, b) == 1 { skip = 1; next }
+            $0 ~ r { skip = 1; next }
             { print }
-          ' body.md > rest.md
+            END { if (skip == 1) exit 3 }
+          ' body.md > rest.md; then
+            echo "::error::The notes of $TAG have a line starting '${begin}' with no '${end}' line after it. Rewriting them would drop everything below it, so the release was left unchanged. Fix the notes by hand, then rerun this job."
+            exit 1
+          fi
           rest="$(cat rest.md)"
           printf '%s\n' "$rest" > notes.md
           args=(--title "${title%"$suffix"}" --notes-file notes.md)

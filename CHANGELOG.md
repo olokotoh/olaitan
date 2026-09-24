@@ -45,7 +45,14 @@ and false-positive numbers; see [Unreleased](#unreleased).
   fails, is cancelled or times out there, the run fails, `latest` does not
   move, and the release is marked failed (pre-release, title and a banner
   linking the run); marking twice leaves one banner, and a green rerun
-  takes the mark off without clearing a real pre-release. The GitHub
+  takes the mark off without clearing a real pre-release. Only a banner at
+  the start of a line counts as a mark, CRLF notes from the web UI are
+  handled, a banner a human edited falls back to the preflight pre-release
+  value, and notes with a begin marker but no end marker are left unchanged
+  and fail the job with an error. The release job sets the title (the tag)
+  explicitly and `unmark-failed` strips a FAILED title even when the notes
+  carry no banner, so "Re-run all jobs" after a mark cannot leave a
+  FAILED-titled release to become Latest. The GitHub
   Release is created without "Latest" and becomes Latest only in `promote`,
   after the check passed and only for the highest stable tag. Every failure
   names its phase (readme, install, infra: cluster / rollout / pull / exec /
