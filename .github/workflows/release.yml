@@ -5,7 +5,8 @@
 #
 #   1. a multi-arch image at ghcr.io/<owner>/olaitan
 #   2. the Helm chart at oci://ghcr.io/<owner>/charts/olaitan
-#   3. a GitHub Release carrying the chart tarball, SBOM and checksums
+#   3. a GitHub Release carrying the chart tarball, SBOM, checksums and
+#      install.yaml (the chart defaults rendered for `kubectl apply -f`)
 #
 # Image and chart are both cosign-signed keylessly (OIDC, no long-lived
 # key) and carry an SPDX SBOM.
@@ -448,6 +449,25 @@ jobs:
           [ "$subcharts" -eq "$expected_subcharts" ] \
             || { echo "expected ${expected_subcharts} subcharts, found ${subcharts}" >&2; exit 1; }
 
+      # Story 12.4: install.yaml is the packaged chart's defaults rendered
+      # into one file for `kubectl apply -f`, for people who do not use
+      # helm. It is rendered here, from the tarball this job pushes and
+      # signs, never by hand, so it cannot differ from the chart. The helm
+      # test suite runs the same script on every CI run
+      # (TestInstallManifestIsOneApplyableFile).
+      - name: Render the kubectl install manifest
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          IMAGE: ${{ needs.preflight.outputs.image }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          hack/render-install-manifest.sh "dist/olaitan-${VERSION}.tgz" dist/install.yaml
+          grep -qF "image: ${IMAGE}:${VERSION}@${DIGEST}" dist/install.yaml \
+            || { echo "install.yaml does not run ${IMAGE}:${VERSION}@${DIGEST}" >&2; exit 1; }
+          grep -c '^kind: ' dist/install.yaml | xargs echo "install.yaml objects:"
+
       # Generated from the packaged tarball, not the working tree, so the
       # SBOM describes what was actually shipped.
       - name: SBOM for the chart
@@ -529,7 +549,7 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          sha256sum ./*.tgz ./*.spdx.json > checksums.txt
+          sha256sum ./*.tgz ./*.spdx.json ./install.yaml > checksums.txt
           cat checksums.txt
 
       - uses: actions/upload-artifact@v4
@@ -596,6 +616,7 @@ jobs:
           files: |
             dist/*.tgz
             dist/*.spdx.json
+            dist/install.yaml
             dist/checksums.txt
           body: |
             ## Install
@@ -604,6 +625,18 @@ jobs:
             helm install olaitan ${{ needs.preflight.outputs.chart_repo }}/olaitan \
               --version ${{ needs.preflight.outputs.version }}
             ```
+
+            Or without helm: the same chart defaults, rendered by this
+            release into one file, installed into the `olaitan` namespace:
+
+            ```sh
+            kubectl apply -f https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/install.yaml
+            ```
+
+            `install.yaml` carries a bundled-Redis password and a Falco
+            token generated once for this release, the same for everyone
+            who applies it. Use the helm command for anything beyond
+            evaluation; it generates both per install.
 
             Enforcement is off by default: Olaitan observes and reports until
             `response.networkPolicy.enabled=true` is set explicitly.

@@ -238,6 +238,17 @@ func TestInstallManifestCheckBites(t *testing.T) {
 	if p := installManifestProblems(ns, installNamespace); len(p) != 0 {
 		t.Errorf("a lone Namespace was rejected: %v", p)
 	}
+
+	// The real chart, rendered plainly with a Namespace in front, is what
+	// the script exists to fix: the NATS objects have no namespace and the
+	// NATS test Pod is still there.
+	plain := ns + "---\n" + renderChartAt(t, chartDir(t), "--namespace", installNamespace)
+	p := strings.Join(installManifestProblems(plain, installNamespace), "\n")
+	for _, want := range []string{`StatefulSet/olaitan-nats has namespace ""`, `Pod/olaitan-nats-test-request-reply is a helm "test" hook`} {
+		if !strings.Contains(p, want) {
+			t.Errorf("plain helm template: want a problem %q, got:\n%s", want, p)
+		}
+	}
 }
 
 // TestReleaseAttachesTheInstallManifest (AC2): release.yml renders
