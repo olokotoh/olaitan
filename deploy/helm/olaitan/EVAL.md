@@ -48,8 +48,9 @@ deviate from the canonical arms (e.g. a one-off experiment), leave
 
 ## Install recipes
 
-The Bitnami Redis subchart requires an explicit password
-(`secrets.redisPassword`); set it on every install.
+The examples set the bundled Redis password (`secrets.redisPassword`)
+explicitly. It is optional: without it the chart generates one on first
+install and reuses it on upgrade.
 
 ```bash
 # F arm: Falco-only baseline.

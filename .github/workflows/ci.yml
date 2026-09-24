@@ -193,8 +193,8 @@ jobs:
         with:
           version: v3.16.4
 
-      # Cache the downloaded subcharts so re-runs skip the OCI pull from
-      # registry-1.docker.io (Bitnami Redis is the largest). The cache
+      # Cache the downloaded subcharts so re-runs skip the pulls from the
+      # Falco and NATS chart repositories. The cache
       # key MUST include Chart.lock (committed to the repo); otherwise a
       # re-tagged subchart at the same SemVer would resolve from cache
       # to the old digest, defeating reproducibility.

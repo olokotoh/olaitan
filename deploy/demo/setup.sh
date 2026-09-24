@@ -114,9 +114,9 @@ kubectl -n calico-system wait --for=condition=Ready pod -l k8s-app=calico-node -
 EOF
 }
 
-# Helm repo operations run as the current user (no root needed). The OCI
-# Bitnami registry for Redis needs no `helm repo add` — `helm dependency
-# update` handles OCI transparently.
+# Helm repo operations run as the current user (no root needed). Redis is
+# part of the chart itself (templates/redis.yaml), so only the Falco and
+# NATS repositories are needed.
 #
 # The `make helm-prepare` step copies config/olaitan.yaml into the chart's
 # files/ directory so Helm's `.Files.Get` can read it. Without this, the

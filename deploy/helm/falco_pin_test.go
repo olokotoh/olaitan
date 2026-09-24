@@ -70,8 +70,10 @@ func TestFalcoPinIsTheOneRecorded(t *testing.T) {
 			image, _ = cm["image"].(string)
 		}
 	}
-	if want := "docker.io/falcosecurity/falco:" + sup["FALCO_PINNED_VERSION"]; image != want {
-		t.Errorf("Falco image = %q, want %q (hack/falco-support.env)", image, want)
+	// Story 12.6: the tag carries the digest pin as well
+	// (<tag>@sha256:<hex>); image_pin_test.go checks the digest itself.
+	if want := "docker.io/falcosecurity/falco:" + sup["FALCO_PINNED_VERSION"] + "@sha256:"; !strings.HasPrefix(image, want) {
+		t.Errorf("Falco image = %q, want %q<digest> (hack/falco-support.env)", image, want)
 	}
 
 	// Review of #133: the kmod/driver-loader fallback (for nodes without
@@ -86,8 +88,8 @@ func TestFalcoPinIsTheOneRecorded(t *testing.T) {
 			loader, _ = cm["image"].(string)
 		}
 	}
-	if want := "docker.io/falcosecurity/falco-driver-loader:" + sup["FALCO_PINNED_VERSION"]; loader != want {
-		t.Errorf("driver-loader image with kind=kmod = %q, want %q", loader, want)
+	if want := "docker.io/falcosecurity/falco-driver-loader:" + sup["FALCO_PINNED_VERSION"] + "@sha256:"; !strings.HasPrefix(loader, want) {
+		t.Errorf("driver-loader image with kind=kmod = %q, want %q<digest>", loader, want)
 	}
 
 	raw, err := os.ReadFile(filepath.Join(chartDir(t), "Chart.yaml"))

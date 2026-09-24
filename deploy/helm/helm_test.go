@@ -98,7 +98,7 @@ func chartDir(t *testing.T) string {
 func helmTemplate(t *testing.T, sets []string) string {
 	t.Helper()
 	// Every render must satisfy the chart's fail-fast guard for the
-	// Bitnami Redis subchart auth. Inject a dummy password by default;
+	// bundled Redis auth. Inject a dummy password by default;
 	// individual tests can override by prepending their own --set.
 	args := []string{"template", "olaitan", chartDir(t),
 		"--set", "secrets.redisPassword=test-password",

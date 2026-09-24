@@ -1,0 +1,270 @@
+{{/*
+Story 12.6: the bundled Redis state store, on the official redis image pinned
+by tag and digest. It replaces the Bitnami Redis subchart, which could no
+longer be pinned (Bitnami publishes no versioned free bitnami/redis tag) and
+refuses a non-Bitnami image unless its image verification is switched off.
+ADR-2026-09-23-01 in docs/deferred-decisions.md.
+
+Parity with the Bitnami render it replaces, on purpose:
+  - StatefulSet <release>-redis-master, serviceName <release>-redis-headless,
+    selector {instance, name: redis, component: master} and the volume claim
+    template `redis-data` (RWO, redis.persistence.size): all immutable, so an
+    existing release upgrades in place and keeps its data.
+  - runAsUser/runAsGroup/fsGroup 1001, read-only root filesystem, no
+    capabilities, RuntimeDefault seccomp: the files Bitnami's Redis wrote
+    under /data stay readable.
+  - The same server settings: AOF on, RDB snapshots off, FLUSHDB and
+    FLUSHALL disabled, AUTH from the release Secret.
+Not carried over: Bitnami's ConfigMap-shipped start and health scripts (the
+official image needs none), its RediSearch/ReJSON module lines (Olaitan uses
+neither), and its PodDisruptionBudget (maxUnavailable 1 on one replica
+protected nothing).
+*/}}
+{{- if .Values.redis.enabled }}
+{{- $name := include "olaitan.redis.fullname" . }}
+{{- $r := .Values.redis }}
+{{- $conf := `port 6379
+dir /data
+# Append-only file for durability; RDB snapshots off (AOF already
+# persists every write).
+appendonly yes
+save ""
+# Nothing in Olaitan flushes a database; a stray FLUSHALL would wipe
+# every workload's FSM state.
+rename-command FLUSHDB ""
+rename-command FLUSHALL ""
+` }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}-master
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.redis.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-configuration
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.redis.labels" . | nindent 4 }}
+data:
+  redis.conf: |
+    {{- $conf | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.redis.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - name: tcp-redis
+      port: 6379
+      targetPort: redis
+  selector:
+    {{- include "olaitan.redis.selectorLabels" . | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-master
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.redis.labels" . | nindent 4 }}
+    app.kubernetes.io/component: master
+spec:
+  type: ClusterIP
+  ports:
+    - name: tcp-redis
+      port: 6379
+      targetPort: redis
+  selector:
+    {{- include "olaitan.redis.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: master
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}-master
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.redis.labels" . | nindent 4 }}
+    app.kubernetes.io/component: master
+spec:
+  replicas: 1
+  revisionHistoryLimit: 10
+  serviceName: {{ $name }}-headless
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "olaitan.redis.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: master
+  template:
+    metadata:
+      labels:
+        {{- include "olaitan.redis.labels" . | nindent 8 }}
+        app.kubernetes.io/component: master
+      annotations:
+        checksum/configuration: {{ $conf | sha256sum | trunc 16 }}
+    spec:
+      serviceAccountName: {{ $name }}-master
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $r.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $r.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: redis
+          image: {{ include "olaitan.redis.image" . | quote }}
+          imagePullPolicy: {{ $r.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1001
+            runAsGroup: 1001
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          # The password goes on the command line exactly as the Bitnami
+          # start script passed it (--requirepass), read from the Secret
+          # through the environment, never rendered into a manifest.
+          command:
+            - sh
+            - -c
+            - exec redis-server /etc/redis/redis.conf --requirepass "$REDIS_PASSWORD"
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "olaitan.redis.secretName" . }}
+                  key: {{ $r.auth.existingSecretPasswordKey }}
+            # redis-cli (probes, and anyone who execs in) reads this.
+            - name: REDISCLI_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "olaitan.redis.secretName" . }}
+                  key: {{ $r.auth.existingSecretPasswordKey }}
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          # Liveness tolerates LOADING (a large AOF replaying after a
+          # restart) so a slow start is not killed into a restart loop;
+          # readiness waits for PONG.
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - r="$(redis-cli -p 6379 ping)"; [ "$r" = PONG ] || [ "${r%% *}" = LOADING ]
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            timeoutSeconds: 6
+            failureThreshold: 5
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - '[ "$(redis-cli -p 6379 ping)" = PONG ]'
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 5
+          {{- with $r.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/redis
+              readOnly: true
+            - name: redis-data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $name }}-configuration
+        - name: tmp
+          emptyDir: {}
+        {{- if not $r.persistence.enabled }}
+        - name: redis-data
+          emptyDir: {}
+        {{- end }}
+  {{- if $r.persistence.enabled }}
+  volumeClaimTemplates:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: redis-data
+        labels:
+          {{- include "olaitan.redis.selectorLabels" . | nindent 10 }}
+          app.kubernetes.io/component: master
+      spec:
+        accessModes:
+          - "ReadWriteOnce"
+        {{- with $r.persistence.storageClassName }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $r.persistence.size | quote }}
+  {{- end }}
+{{- if $r.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.redis.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "olaitan.redis.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # The aggregator and collector, and anything else in the release
+    # namespace. Nothing outside the namespace needs Redis.
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 6379
+          protocol: TCP
+  # Declared empty: a standalone Redis dials nothing.
+  egress: []
+{{- end }}
+{{- end }}

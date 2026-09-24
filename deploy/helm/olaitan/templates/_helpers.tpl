@@ -198,7 +198,21 @@ regardless of whether callers use --set or --set-string.
 */}}
 {{- define "olaitan.image" -}}
 {{- $tag := default .Chart.AppVersion .Values.image.tag -}}
-{{- printf "%s:%s" .Values.image.repository (toString $tag) -}}
+{{- $ref := printf "%s:%s" .Values.image.repository (toString $tag) -}}
+{{- /*
+Story 12.6: @digest when image.digest is set. The tree leaves it empty (an
+unreleased commit has no digest, and local e2e runs a kind-loaded image with
+pullPolicy Never); the release writes the digest it just pushed into the
+packaged chart. Validated like ollama.image.digest so a typo fails the render
+instead of shipping a reference the kubelet cannot pull.
+*/ -}}
+{{- with .Values.image.digest -}}
+{{- if not (regexMatch "^sha256:[a-f0-9]{64}$" (toString .)) -}}
+{{- fail (printf "image.digest must be sha256:<64 lowercase hex> (got %q)" (toString .)) -}}
+{{- end -}}
+{{- $ref = printf "%s@%s" $ref . -}}
+{{- end -}}
+{{- $ref -}}
 {{- end -}}
 
 {{/*
@@ -825,4 +839,48 @@ Usage: include "olaitan.tlsSecretChecksum" (dict "root" $ "template" "audit-webh
 {{- fail (printf "olaitan.tlsSecretChecksum: %s rendered no Secret data; the caller must gate on the same condition as the Secret" .template) -}}
 {{- end -}}
 {{- $secret.data | toJson | sha256sum -}}
+{{- end -}}
+
+{{/*
+Story 12.6: the bundled Redis (templates/redis-*.yaml). Names and labels are
+the ones the Bitnami subchart rendered before it was replaced
+(<release>-redis, name=redis, component=master), because a StatefulSet's
+selector, serviceName and volume claim template are immutable: keeping them
+lets an existing release upgrade in place and keep its data, and keeps
+<release>-redis-master:6379 (olaitan.endpoints.redis) and the pod name
+<release>-redis-master-0 that CI and the e2e tests exec into.
+*/}}
+{{- define "olaitan.redis.fullname" -}}
+{{- printf "%s-redis" .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "olaitan.redis.selectorLabels" -}}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/name: redis
+{{- end -}}
+
+{{- define "olaitan.redis.labels" -}}
+{{ include "olaitan.redis.selectorLabels" . }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/part-of: {{ include "olaitan.name" . }}
+helm.sh/chart: {{ include "olaitan.chart" . }}
+{{- end -}}
+
+{{/*
+The bundled Redis image, repository:tag@digest. Tag and digest are both
+required: this is a chart-owned image, and Story 12.6 pins every image the
+chart deploys by both (deploy/helm/image_pin_test.go).
+*/}}
+{{- define "olaitan.redis.image" -}}
+{{- $img := .Values.redis.image -}}
+{{- $tag := required "redis.image.tag is required" $img.tag | toString -}}
+{{- $digest := required "redis.image.digest is required (Story 12.6: every image is pinned by digest)" $img.digest | toString -}}
+{{- if not (regexMatch "^sha256:[a-f0-9]{64}$" $digest) -}}
+{{- fail (printf "redis.image.digest must be sha256:<64 lowercase hex> (got %q)" $digest) -}}
+{{- end -}}
+{{- printf "%s:%s@%s" $img.repository $tag $digest -}}
+{{- end -}}
+
+{{- define "olaitan.redis.secretName" -}}
+{{- default (printf "%s-secrets" (include "olaitan.fullname" .)) .Values.redis.auth.existingSecret -}}
 {{- end -}}

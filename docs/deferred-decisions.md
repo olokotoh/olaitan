@@ -130,7 +130,8 @@ update that brings the doc into line with the running system.
 
 ## ADR-2026-04-27-03: Bitnami Redis OCI registry — accept current path
 
-**Status:** Accepted (with risk note).
+**Status:** Superseded by ADR-2026-09-23-01 (the Bitnami subchart is gone).
+Kept for the record.
 
 **Date:** 2026-04-27.
 
@@ -1309,3 +1310,78 @@ publication campaign:
 plus the PR #92 review-fix commits; evaluation log
 (supervision/EVAL-LOG.md) 2026-07-02 entries; traceability row
 `c3.6.4-risk-window`.
+
+---
+
+## ADR-2026-09-23-01: Bundled Redis moves off the Bitnami subchart to a chart-owned StatefulSet on the official image
+
+**Status:** Accepted. Supersedes ADR-2026-04-27-03.
+
+**Date:** 2026-09-23 (Story 12.6, issue #123).
+
+**Context.** Story 12.6 pins every image the chart deploys by tag AND
+digest, and adds a CI guard that fails on `:latest`, untagged and
+tag-without-digest images. The Bitnami Redis subchart (25.3.11) rendered
+`registry-1.docker.io/bitnami/redis:latest`. Checked against the registry
+on 2026-09-23:
+
+- `docker.io/bitnami/redis` carries no versioned tag at all any more, only
+  `latest` (8.10.2 that day) and signature artefacts.
+- `docker.io/bitnamisecure/redis` is the same: `latest` only.
+- `docker.io/bitnamilegacy/redis` has version tags, frozen at 8.2.1 since
+  2025-08: no patches since, and older than the data `latest` has already
+  written.
+- The Bitnami chart refuses any image that is not a Bitnami one ("Original
+  containers have been substituted for unrecognized ones") unless
+  `global.security.allowInsecureImages: true` is set, and its start and
+  config scripts assume the Bitnami image layout (`/opt/bitnami/...`,
+  RediSearch and ReJSON module paths).
+
+So the Bitnami chart can only be pinned to `latest@sha256:...`, which the
+story's guard rejects by design: a version tag is what tells a reader what
+the digest is meant to be.
+
+**Decision.** The chart ships its own Redis (`templates/redis.yaml`) on the
+official `redis` image, `8.10.2-alpine` pinned by its multi-arch index
+digest. 8.10.2 is the version `bitnami/redis:latest` served that day, so an
+upgrade never hands newer on-disk data to an older server. Everything an
+upgrade depends on is kept identical to the Bitnami render: the StatefulSet
+`<release>-redis-master` with its selector, `serviceName`
+`<release>-redis-headless` and volume claim template `redis-data`
+(immutable fields), the Services, UID/GID/fsGroup 1001, the read-only root
+filesystem, AOF on, RDB off, FLUSHDB and FLUSHALL disabled, AUTH from the
+release Secret. `<release>-redis-master:6379` and the pod name
+`<release>-redis-master-0` (which CI and the e2e tests exec into) are
+unchanged. `deploy/helm/redis_test.go` pins that contract.
+
+Changes an operator can see: the `redis.*` values are the chart's own now
+(`image`, `auth.existingSecret`, `persistence`, `resources`,
+`networkPolicy.enabled`, `nodeSelector`, `tolerations`; see
+docs/helm-values.md), Bitnami-only keys have no effect, and
+`redis.auth.existingSecret` defaults to the release Secret instead of the
+literal `olaitan-secrets`, which was wrong for any other release name. The
+Redis NetworkPolicy now admits 6379 from the release namespace only and
+declares NO egress in every profile (the Bitnami policy allowed all egress
+unless an overlay closed it; the air-gapped overlay's override is removed
+as redundant). The Bitnami PodDisruptionBudget (maxUnavailable 1 on a
+single replica) is not carried over.
+
+**Alternatives considered and rejected.**
+
+- `bitnami/redis:latest@sha256:...`: content-pinned, but the tag says
+  nothing and the story's guard forbids `:latest`.
+- `bitnamilegacy/redis:8.2.1`: unmaintained, and a downgrade from the
+  8.10.x a current install is already running.
+- The Bitnami chart with the official image substituted: needs
+  `allowInsecureImages: true` and overrides of the chart's start script and
+  module configuration, an unsupported combination that any chart bump can
+  break.
+- Mirroring a Bitnami-built image into `ghcr.io/olokotoh` under a version
+  tag: that is publishing an artefact, and it still tracks an image Bitnami
+  no longer versions in public.
+
+**Risk inherited.** The chart now owns one Redis template (about 270 lines with its comments)
+(no Sentinel, no replicas: the MVP is standalone, as before). The upgrade
+path from a Bitnami-era release relies on the immutable fields staying
+identical; `TestRedisKeepsTheBitnamiUpgradeContract` fails if they drift.
+
