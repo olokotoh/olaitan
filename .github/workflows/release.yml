@@ -673,8 +673,10 @@ jobs:
             done
             ```
 
-            The README has rotation and the details. Not for OpenShift: use
-            the helm command with `-f values-openshift.yaml` there.
+            Run it again after every `kubectl apply` of the file: an apply
+            puts the rule back to `10.96.0.1` alone. The README has rotation
+            and the details. Not for OpenShift: use the helm command with
+            `-f values-openshift.yaml` there.
 
             Enforcement is off by default: Olaitan observes and reports until
             `response.networkPolicy.enabled=true` is set explicitly.

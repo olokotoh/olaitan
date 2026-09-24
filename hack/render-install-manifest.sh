@@ -113,7 +113,8 @@ trap 'rm -f "$tmp"' EXIT
 #       "[{\"op\":\"add\",\"path\":\"/spec/egress/-\",\"value\":{\"to\":[{\"ipBlock\":{\"cidr\":\"\${ip}/32\"}}],\"ports\":[{\"protocol\":\"TCP\",\"port\":443},{\"protocol\":\"TCP\",\"port\":\${port}}]}}]"
 #   done
 #
-# Run it again after applying a newer release. The README has the details.
+# Run it again after every apply of this file: an apply, even of the same
+# file, puts the rule back to 10.96.0.1 alone. The README has the details.
 ---
 apiVersion: v1
 kind: Namespace

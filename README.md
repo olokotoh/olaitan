@@ -135,7 +135,8 @@ for ip in $(kubectl get service -n default kubernetes -o jsonpath='{.spec.cluste
 done
 ```
 
-Run it again after applying a newer release, which can reset the rule. On
+Run it again after every `kubectl apply` of the file: an apply, even of
+the same file, puts the rule back to `10.96.0.1` alone (checked on kind). On
 an IPv6 cluster use `/128` instead of `/32`. Where it matters, prefer the
 helm command, which gets this right by itself.
 
