@@ -18,8 +18,45 @@ and false-positive numbers; see [Unreleased](#unreleased).
 > campaign that fills them in is outstanding. No performance figure in this
 > repository should be cited until it is.
 
+## [v1.0.0-rc4] - 2026-09-24
+
+The first release since rc3 that installs with the README command and no
+flags. On rc3 that command failed (#96 and the Falco driver, below); rc4 was
+verified before release on a fresh single-node kind with the chart packaged
+the way the release packages it. The verification output is in PR #174.
+
 ### Added
 
+- **The Helm chart installs with no flags on a fresh cluster** (Epic 9).
+  `helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan --version
+  1.0.0-rc4 --namespace olaitan --create-namespace` needs no values: the
+  bundled Redis gets a generated password (an explicit
+  `secrets.redisPassword` still wins, and an upgrade reuses the existing
+  one), the tree chart's image defaults to `edge` instead of a tag that was
+  never published, and the default JetStream sizing fits the default NATS
+  volume (see Fixed, #96).
+- **`hack/preflight.sh`** (Story 9.1). Probes storage, privileged-workload
+  admission, NetworkPolicy enforcement, each optional source and the node
+  kernel against the pinned Falco, and prints `yes` / `no` / `BLOCKER` with
+  the flag that fixes each. It changes nothing. NOTES.txt reports the same
+  from inside the release after install.
+- **Per-platform overlays** (Story 9.4): `values-kind.yaml`,
+  `values-minikube.yaml`, `values-k3s.yaml`, `values-eks.yaml`,
+  `values-aks.yaml`, `values-gke.yaml`, `values-openshift.yaml`, each
+  carrying only that platform's deltas, and the OpenShift SCC binding
+  shipped in the chart. `docs/platform-support-matrix.md` separates
+  `verified` (installed and observed) from `template-verified` (renders
+  only).
+- **kind-full, one profile where all five sources run at once** (Story
+  10.5): `hack/kind-full.yaml`, `values-full.yaml` and
+  `hack/install-full-kind.sh`, on Calico so NetworkPolicy is enforced.
+  `make e2e-full` runs it.
+- **The full profile runs a real LLM tier with no API key** (Story 10.6):
+  an in-cluster Ollama with `qwen2.5:3b-instruct`, image pinned by digest,
+  model pulled by a Job under its own NetworkPolicy.
+  `values-llm-deepseek.yaml` and `values-llm-claude.yaml` switch to a
+  hosted model with the key in a Secret you create. On CPU the in-cluster
+  model takes 15 to 30 minutes per incident; the README says so.
 - **A NATS outage no longer loses Falco alerts** (#135). Falco's
   `http_output` does not retry a failed POST, and the collector used to
   publish inside the request and answer `503` after about 9s of NATS
@@ -148,8 +185,41 @@ and false-positive numbers; see [Unreleased](#unreleased).
   `olaitan_sensor_falco_heartbeats_total`,
   `olaitan_sensor_falco_publish_drops_total`.
 
+- **Every image is pinned by tag and digest** (#123, Story 12.6), guarded
+  in CI, and the release stamps the Olaitan image's own digest into the
+  published chart. **Redis is no longer the Bitnami subchart**: Bitnami
+  stopped publishing versioned free `bitnami/redis` tags, so the chart now
+  runs its own Redis on the official `redis` image, keeping the Bitnami
+  resource names, labels and volume claim so an existing release upgrades
+  in place and keeps its data. Upgrading across this change: do not use
+  `--reuse-values` (use `--reset-then-reuse-values`), and move any
+  `redis.master.*` or `global.storageClass` values to the keys the render
+  error names. The runbook has the full key map.
+- Dependencies bumped for CVEs: `golang.org/x/crypto` (CVE-2026-56854,
+  CRITICAL) and `google.golang.org/grpc` 1.83.2.
+
 ### Fixed
 
+- **The default install can create its JetStream streams** (#96). The
+  aggregator declared 160 GiB of stream retention against the 10 Gi NATS
+  volume the chart ships, and JetStream reserves up front, so a default
+  install crash-looped with `err_code=10047 insufficient storage resources
+  available`. `nats.streamMaxBytesOverride` now defaults to 512 MiB per
+  stream (13 streams, 6.5 GiB), and a helm test reads the rendered cap, the
+  NATS `max_file_store` and volume claim and the stream list from the code,
+  and fails if the sum no longer fits. Running real retention means raising
+  `nats.config.jetstream.fileStore.pvc.size` and clearing the override
+  together.
+- **The collector can reach Falco on clusters where the two run as
+  different users** (Story 9.6), found on a 3-node kubeadm cluster where the
+  primary source was dead while every pod looked healthy. Superseded in
+  this release by the HTTP ingest (#104), which needs no shared socket.
+- **`hack/check-netpol-enforcement.sh` reported "NOT ENFORCED" on every
+  cluster**, including ones that enforce, because it matched the wrong
+  timeout text. It now matches every refusal form and self-tests its
+  matcher first.
+- **The report archive works without forensics** (#149, Story 10.7): its S3
+  credentials followed `forensics.enabled` alone.
 - **Rotating a chart-rendered TLS cert now restarts the pods that serve
   it** (#148). The applog injector and the audit receiver read their
   serving cert once, at start-up, so a `helm upgrade` that changed only
@@ -249,7 +319,8 @@ First tagged artefact, covering the work of Epics 1 through 7.
 - **Reproducible evaluation harness** (`cmd/olaitan-eval`), a pre-registered
   analysis plan, and an analysis pipeline.
 
-[Unreleased]: https://github.com/olokotoh/olaitan/compare/v1.0.0-rc3...HEAD
+[Unreleased]: https://github.com/olokotoh/olaitan/compare/v1.0.0-rc4...HEAD
+[v1.0.0-rc4]: https://github.com/olokotoh/olaitan/compare/v1.0.0-rc3...v1.0.0-rc4
 [v1.0.0-rc3]: https://github.com/olokotoh/olaitan/compare/v1.0.0-rc2...v1.0.0-rc3
 [v1.0.0-rc2]: https://github.com/olokotoh/olaitan/compare/v1.0.0-rc1...v1.0.0-rc2
 [v1.0.0-rc1]: https://github.com/olokotoh/olaitan/tree/v1.0.0-rc1

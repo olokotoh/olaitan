@@ -9,7 +9,8 @@ a best-effort basis.
 ## Supported versions
 
 Only the most recent release line receives fixes. There are currently no
-maintained older branches: `v1.0.0-rc1` and `v1.0.0-rc2` are superseded, and
+maintained older branches: `v1.0.0-rc1` to `v1.0.0-rc3` are superseded by
+`v1.0.0-rc4`, and
 fixes land on `main` and in the next tag rather than being backported. The
 `:edge` image tracks `main` and is not a supported artefact.
 

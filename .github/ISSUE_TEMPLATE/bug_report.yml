@@ -14,7 +14,7 @@ body:
     attributes:
       label: Version
       description: Chart version or image tag, or the commit SHA if you built it yourself.
-      placeholder: v1.0.0-rc3
+      placeholder: v1.0.0-rc4
     validations:
       required: true
 
