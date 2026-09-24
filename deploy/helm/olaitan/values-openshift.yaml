@@ -1,6 +1,7 @@
 # Red Hat OpenShift overlay.
 #
 #   helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan \
+#     --version 1.0.0-rc4 \
 #     -f values-openshift.yaml --namespace olaitan --create-namespace
 #
 # Deltas only. Template-verified, NOT verified: the chart renders and validates

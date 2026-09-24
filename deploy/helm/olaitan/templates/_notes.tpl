@@ -172,14 +172,16 @@ ENFORCEMENT
 STORAGE
 {{- if $nats.streamMaxBytesOverride }}
   JetStream streams are capped at {{ $nats.streamMaxBytesOverride }} bytes each, so they fit the
-  default volume. For production retention, raise nats.persistence.size AND
-  clear nats.streamMaxBytesOverride together -- the pairing is the point.
+  default volume. For production retention, raise
+  nats.config.jetstream.fileStore.pvc.size AND clear
+  nats.streamMaxBytesOverride together -- the pairing is the point.
   Raising the volume alone leaves the cap in force; clearing the cap alone
   declares about 160 GiB against your volume and the first stream exhausts it.
 {{- else }}
   JetStream is running at full declared retention, no per-stream cap: about
-  160 GiB across the streams. nats.persistence.size must accommodate that or
-  the aggregator dies on its first stream with err_code=10047.
+  160 GiB across the streams. nats.config.jetstream.fileStore.pvc.size must
+  accommodate that or the aggregator dies on its first stream with
+  err_code=10047.
 {{- end }}
 
 VERIFY THE INSTALL
@@ -207,6 +209,8 @@ SEE A DETECTION
   Clean up:  kubectl delete namespace olaitan-demo
 
 IF SOMETHING IS OFF THAT YOU EXPECTED TO BE ON
+  From a clone of https://github.com/olokotoh/olaitan:
+
   hack/preflight.sh          (or: make preflight)
 
   It probes storage, privileged-workload admission, NetworkPolicy ENFORCEMENT

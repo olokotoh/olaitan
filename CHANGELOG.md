@@ -209,7 +209,17 @@ the way the release packages it. The verification output is in PR #174.
   NATS `max_file_store` and volume claim and the stream list from the code,
   and fails if the sum no longer fits. Running real retention means raising
   `nats.config.jetstream.fileStore.pvc.size` and clearing the override
-  together.
+  together. The install notes used to name `nats.persistence.size`, which the
+  bundled NATS chart ignores; they now name the key that moves both the store
+  and the claim, and a helm test checks that it does. Only EVENTS, EVENTS_RAW
+  and EVIDENCE have production caps of their own, so with the override
+  cleared the other ten streams are unbounded; size the volume for that.
+- **Every printed install command pins the chart version.** The closing hint
+  of `hack/preflight.sh` and the platform overlay headers ran
+  `helm install oci://...` with no `--version`, which resolves nothing while
+  the registry holds only release candidates. They now carry the version, a
+  helm test ties every one of them to Chart.yaml, and the release refuses a
+  tag that is not Chart.yaml's version.
 - **The collector can reach Falco on clusters where the two run as
   different users** (Story 9.6), found on a 3-node kubeadm cluster where the
   primary source was dead while every pod looked healthy. Superseded in

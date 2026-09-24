@@ -1630,12 +1630,16 @@ nats:
   # EVENTS/EVENTS_RAW/EVIDENCE), set this to a per-stream byte cap
   # (e.g. "1073741824" for 1 GiB) so JetStream CreateOrUpdateStream
   # does not return err 10047 ("not enough storage"). Production
-  # leaves this empty and sizes nats.persistence.size to accommodate
-  # the configured sum, rather than overriding fileStore.maxSize.
+  # leaves this empty and sizes nats.config.jetstream.fileStore.pvc.size
+  # to accommodate the configured sum, rather than overriding
+  # fileStore.maxSize. (The bundled NATS chart 2.12.x has no top-level
+  # persistence.size: a value set there is ignored and max_file_store and
+  # the claim stay at 10Gi. The pvc.size key moves both.)
   # Epic 9: this defaulted to "" (no override), which made the DEFAULT install
   # unstartable on any cluster whose storage is smaller than the declared
   # retention. streams.go declares EVENTS 10 GiB + EVENTS_RAW 50 GiB +
-  # THREATS 100 GiB = 160 GiB, while nats.persistence.size defaults to 10 Gi.
+  # EVIDENCE 100 GiB = 160 GiB, while the NATS file store
+  # (nats.config.jetstream.fileStore.pvc.size) defaults to 10 Gi.
   # JetStream reserves against the file store up front, so EVENTS_RAW alone
   # exhausted the volume and the aggregator died on its first stream:
   #
@@ -1646,11 +1650,14 @@ nats:
   # not: 160 GiB of declared retention against a 10 Gi default volume fails
   # everywhere, and reproduced here on a healthy bound 10Gi PVC.
   #
-  # 512 MiB x 11 streams = 5.5 GiB, which fits the 10 Gi default with headroom
-  # and matches the value CI already proved on kind. Operators running real
-  # retention raise nats.persistence.size AND clear this override together --
-  # the pairing is the point, and NOTES.txt says so at install time.
-  # @schema type:string pattern:"byte count as a string (e.g. 1073741824), or empty for production sizing" effect:"per-stream JetStream MaxBytes override for small kind/CI PVCs; empty leaves production retention sized by nats.persistence.size" ref:NFR3
+  # 512 MiB x 13 streams = 6.5 GiB, which fits the 10 Gi default with headroom
+  # and matches the value CI already proved on kind
+  # (deploy/helm/stream_budget_test.go checks the sum on every render).
+  # Operators running real retention raise
+  # nats.config.jetstream.fileStore.pvc.size AND clear this override
+  # together -- the pairing is the point, and NOTES.txt says so at install
+  # time.
+  # @schema type:string pattern:"byte count as a string (e.g. 1073741824), or empty for production sizing" effect:"per-stream JetStream MaxBytes override for small kind/CI PVCs; empty leaves production retention sized by nats.config.jetstream.fileStore.pvc.size" ref:NFR3
   streamMaxBytesOverride: "536870912"
   # Story 12.6: the NATS chart's own `digest` field REPLACES the tag
   # (repository@digest), which leaves nobody able to tell what the digest is

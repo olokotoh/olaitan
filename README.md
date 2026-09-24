@@ -95,9 +95,6 @@ machine:
   `fs.inotify.max_user_watches=1048576` (that page has the `sysctl`
   commands); it was not tried with the distribution defaults.
 
-On kind NetworkPolicies are accepted and ignored (kindnet does not enforce
-them), which is one reason enforcement is off by default; see below.
-
 Install into the `olaitan` namespace as shown. The agent's default
 `excluded_namespaces` list contains `kube-system` and `olaitan`, so installing
 anywhere else leaves the agent able to act on its own workloads. The chart bundles Falco and NATS
@@ -129,7 +126,7 @@ sources are on, which are off, and why.
 
 | Platform | Install | NetworkPolicy enforced | Audit webhook | Overlay |
 | --- | --- | --- | --- | --- |
-| kind | ✅ verified | ❌ no (kindnet accepts and ignores) | ✅ possible | `values-kind.yaml` |
+| kind | ✅ verified | not verified on current kind; run `hack/check-netpol-enforcement.sh` | ✅ possible | `values-kind.yaml` |
 | **kind-full** (reference) | ⚠️ verified 2026-09-21, see note | ✅ yes (Calico) | ✅ enabled | `values-full.yaml` |
 | kubeadm | ⚠️ verified 2026-08-31, see note | depends on your CNI | ✅ possible | (defaults) |
 | k3s / k3d | template-verified | ✅ (kube-router) | ✅ possible | `values-k3s.yaml` |
