@@ -1683,7 +1683,7 @@ nats:
 # (`<fullname>-secrets`, key `redis-password`, i.e. secrets.redisPassword, or
 # a generated one for the bundled Redis). [Source: architecture.md:328, NFR8]
 #
-# Story 12.6: this is the chart's OWN Redis (templates/redis-*.yaml) on the
+# Story 12.6: this is the chart's OWN Redis (templates/redis.yaml) on the
 # official `redis` image, no longer the Bitnami subchart. Bitnami stopped
 # publishing any versioned free `bitnami/redis` tag (only `latest` is left),
 # so that image could not be pinned to a version at all, and the Bitnami
@@ -1697,6 +1697,10 @@ redis:
   # @schema type:boolean effect:"deploy the bundled Redis; false means bring your own and set endpoints.redis" ref:NFR8
   enabled: true
   image:
+    # Full image name, registry included (there is no separate registry
+    # key). Point it at a mirror for an air-gapped install and keep the tag
+    # and digest.
+    # @schema type:string effect:"bundled Redis image repository, registry included; override to pull from a mirror" ref:NFR31
     repository: docker.io/library/redis
     # The same Redis release `bitnami/redis:latest` served on 2026-09-23, so
     # an upgrade never hands newer on-disk data to an older server.
@@ -1706,6 +1710,7 @@ redis:
     # imagetools inspect). Rendered as repository:tag@digest.
     # @schema type:string pattern:"sha256:<64 hex>" effect:"digest the bundled Redis image is pinned to" ref:NFR31
     digest: "sha256:72cedd9603038893af961e90ac5e1a1a0d8377d5e338dbdad8fe284ea25de18f"
+    # @schema type:string enum:Always|IfNotPresent|Never effect:"pull policy of the bundled Redis image" ref:NFR31
     pullPolicy: IfNotPresent
   auth:
     # Secret holding the Redis password. Empty uses the release Secret
@@ -1724,6 +1729,7 @@ redis:
     # @schema type:string effect:"storageClassName of the Redis data claim; empty uses the cluster default" ref:NFR3
     storageClassName: ""
   # The Bitnami "nano" preset this Redis ran under before Story 12.6.
+  # @schema type:object effect:"requests and limits of the bundled Redis container" ref:NFR24
   resources:
     requests:
       cpu: 100m
@@ -1739,5 +1745,7 @@ redis:
     # sentinels, no name to resolve).
     # @schema type:boolean effect:"render the Redis NetworkPolicy (6379 from the release namespace, no egress)" ref:NFR11
     enabled: true
+  # @schema type:object effect:"nodeSelector of the bundled Redis pod" ref:NFR24
   nodeSelector: {}
+  # @schema type:array effect:"tolerations of the bundled Redis pod" ref:NFR24
   tolerations: []

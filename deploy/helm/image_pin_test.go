@@ -4,7 +4,9 @@ package helm_test
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -133,10 +135,15 @@ func collectImages(t *testing.T, rendered string) []renderedImage {
 func parseImages(rendered string) ([]renderedImage, error) {
 	var out []renderedImage
 	dec := yaml.NewDecoder(strings.NewReader(rendered))
-	for {
+	for i := 1; ; i++ {
 		var doc map[string]any
 		if err := dec.Decode(&doc); err != nil {
-			break
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			// A document the walker cannot read would otherwise end the
+			// scan early and leave every later image unchecked.
+			return nil, fmt.Errorf("rendered document %d: %w", i, err)
 		}
 		if doc == nil {
 			continue
@@ -246,7 +253,10 @@ func TestEveryRenderedImageIsPinned(t *testing.T) {
 	ownTagOnly := regexp.MustCompile(`^` + regexp.QuoteMeta(ownImageRepo) + `:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
 	seen := map[string]bool{}
 	for _, name := range names {
-		imgs := collectImages(t, renders[name])
+		imgs, err := parseImages(renders[name])
+		if err != nil {
+			t.Fatalf("%s: image walker: %v", name, err)
+		}
 		if len(imgs) == 0 {
 			t.Errorf("%s: no images found; the walker is broken", name)
 		}

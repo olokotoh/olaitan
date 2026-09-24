@@ -227,14 +227,19 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 | Value | Type | Default | Valid range | Effect | Ref |
 |-------|------|---------|-------------|--------|-----|
 | `redis.enabled` | boolean | `true` | - | deploy the bundled Redis; false means bring your own and set endpoints.redis | NFR8 |
+| `redis.image.repository` | string | `"docker.io/library/redis"` | - | bundled Redis image repository, registry included; override to pull from a mirror | NFR31 |
 | `redis.image.tag` | string | `"8.10.2-alpine"` | - | Redis image tag; change redis.image.digest in the same edit | NFR31 |
 | `redis.image.digest` | string | `"sha256:72cedd9603038893af961e90ac5e1a1a0d8377d5e338dbdad8fe284ea25de18f"` | sha256:<64 hex> | digest the bundled Redis image is pinned to | NFR31 |
+| `redis.image.pullPolicy` | string | `"IfNotPresent"` | one of: Always, IfNotPresent, Never | pull policy of the bundled Redis image | NFR31 |
 | `redis.auth.existingSecret` | string | `""` | - | Secret the bundled Redis reads its password from; empty uses the release Secret | NFR8 |
 | `redis.auth.existingSecretPasswordKey` | string | `"redis-password"` | - | key in auth.existingSecret holding the Redis password | NFR8 |
 | `redis.persistence.enabled` | boolean | `true` | - | keep Redis data on a PersistentVolumeClaim; false uses an emptyDir (state lost on restart) | NFR3 |
 | `redis.persistence.size` | string | `"8Gi"` | - | size of the Redis data claim (fixed at first install: a StatefulSet cannot resize its claim template) | NFR3 |
 | `redis.persistence.storageClassName` | string | `""` | - | storageClassName of the Redis data claim; empty uses the cluster default | NFR3 |
+| `redis.resources` | object | `{requests: {cpu: "100m", memory: "128Mi", ephemeral-storage: "50Mi"}, limits: {cpu: "150m", memory: "192Mi", ephemeral-storage: "2Gi"}}` | - | requests and limits of the bundled Redis container | NFR24 |
 | `redis.networkPolicy.enabled` | boolean | `true` | - | render the Redis NetworkPolicy (6379 from the release namespace, no egress) | NFR11 |
+| `redis.nodeSelector` | object | `{}` | - | nodeSelector of the bundled Redis pod | NFR24 |
+| `redis.tolerations` | array | `[]` | - | tolerations of the bundled Redis pod | NFR24 |
 
 ## Config-file-only parameters (not Helm-exposed)
 

@@ -288,6 +288,9 @@ func TestRedisRejectsBitnamiOnlyKeys(t *testing.T) {
 		"redis.master.persistence.size=16Gi":         "redis.persistence.size",
 		"redis.master.persistence.storageClass=fast": "redis.persistence.storageClassName",
 		"redis.architecture=replication":             "redis.architecture",
+		// Bitnami read these too; the chart-owned Redis does not.
+		"global.storageClass=fast":       "redis.persistence.storageClassName",
+		"redis.image.registry=mirror.io": "redis.image.repository",
 	} {
 		stderr := helmTemplateExpectError(t, []string{set})
 		if !strings.Contains(stderr, want) || !strings.Contains(stderr, "--reset-then-reuse-values") {

@@ -1772,7 +1772,52 @@ command above on every change. The documented invocation was render-verified
   (a kernel/driver problem; `hack/preflight.sh` judges the node kernel), and
   `falco_heartbeats_total` (Falco is not reaching this node's collector).
 - *Redis pod CrashLoopBackOff:* you omitted `--set secrets.redisPassword`; the
-  Redis subchart requires it. Supply a value.
+  bundled Redis requires it. Supply a value.
+
+#### Upgrading across Story 12.6
+
+Story 12.6 replaced the Bitnami Redis subchart with the chart's own Redis
+(ADR-2026-09-23-01). The StatefulSet, its claim template and the Services
+keep their names, so the data volume carries over. Three things to do once,
+on the first upgrade from a chart before Story 12.6:
+
+1. **Check the running Redis version.** The new chart runs Redis 8.10.2,
+   the version `bitnami/redis:latest` served on 2026-09-23. If your node
+   pulled a newer `latest`, do not downgrade the data:
+
+   ```sh
+   kubectl exec -n <namespace> <release>-redis-master-0 -c redis -- redis-server --version
+   ```
+
+   If it prints a version above 8.10.2, set `redis.image.tag` and
+   `redis.image.digest` to that version (or newer) in the upgrade.
+
+2. **Move Bitnami-only keys.** The chart fails the render on any of these,
+   naming the replacement, instead of silently ignoring them (a changed
+   claim template makes Kubernetes reject the StatefulSet update):
+
+   | Bitnami-era key | Since Story 12.6 |
+   |---|---|
+   | `redis.master.persistence.size` | `redis.persistence.size` |
+   | `redis.master.persistence.storageClass`, `global.storageClass` | `redis.persistence.storageClassName` |
+   | `redis.master.resources` | `redis.resources` |
+   | `redis.master.nodeSelector` | `redis.nodeSelector` |
+   | `redis.master.tolerations` | `redis.tolerations` |
+   | `redis.image.registry` + `redis.image.repository` | `redis.image.repository` (full name, registry included) |
+   | `redis.architecture` | remove (standalone only; bring your own Redis for replicas) |
+
+   Keep the same size and storage class the release was installed with.
+
+3. **Do not use `--reuse-values` for this one upgrade.** Helm 3 renders the
+   new templates against the old chart's defaults, which have no
+   `redis.image`, and the render stops with a message saying so. Use
+   `--reset-then-reuse-values` (Helm 3.14 or later) instead:
+
+   ```sh
+   helm upgrade <release> deploy/helm/olaitan --reset-then-reuse-values
+   ```
+
+   Later upgrades can use `--reuse-values` again.
 
 ### 2.2 State-override workflow and TTL management
 

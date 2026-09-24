@@ -1357,7 +1357,8 @@ unchanged. `deploy/helm/redis_test.go` pins that contract.
 Changes an operator can see: the `redis.*` values are the chart's own now
 (`image`, `auth.existingSecret`, `persistence`, `resources`,
 `networkPolicy.enabled`, `nodeSelector`, `tolerations`; see
-docs/helm-values.md), Bitnami-only keys have no effect, and
+docs/helm-values.md), Bitnami-only keys fail the render with the name of
+the key that replaced them (see "Upgrade" below), and
 `redis.auth.existingSecret` defaults to the release Secret instead of the
 literal `olaitan-secrets`, which was wrong for any other release name. The
 Redis NetworkPolicy now admits 6379 from the release namespace only and
@@ -1380,8 +1381,33 @@ single replica) is not carried over.
   tag: that is publishing an artefact, and it still tracks an image Bitnami
   no longer versions in public.
 
-**Risk inherited.** The chart now owns one Redis template (about 270 lines with its comments)
-(no Sentinel, no replicas: the MVP is standalone, as before). The upgrade
+**Risk inherited.** The chart now owns one Redis template, about 270
+lines with its comments. It is standalone only (no Sentinel, no replicas),
+as the MVP was before. The upgrade
 path from a Bitnami-era release relies on the immutable fields staying
 identical; `TestRedisKeepsTheBitnamiUpgradeContract` fails if they drift.
+
+**Upgrade (review round 1).** Three traps when upgrading a release
+installed from a chart before Story 12.6, all covered in docs/runbook.md
+("Upgrading across Story 12.6"):
+
+- Do not use `helm upgrade --reuse-values`. Helm 3 renders the new
+  templates against the OLD chart's defaults, which have no `redis.image`
+  and no `redis.persistence`; the render stops with a message naming the
+  fix. Use `--reset-then-reuse-values` (Helm 3.14 or later), which takes
+  the new chart's defaults and re-applies only the values you set.
+- Move Bitnami-only keys to the chart's own ones:
+  `redis.master.persistence.size` to `redis.persistence.size`,
+  `redis.master.persistence.storageClass` and `global.storageClass` to
+  `redis.persistence.storageClassName`, `redis.master.resources`,
+  `redis.master.nodeSelector` and `redis.master.tolerations` to
+  `redis.resources`, `redis.nodeSelector` and `redis.tolerations`,
+  `redis.image.registry` into `redis.image.repository`, and drop
+  `redis.architecture`. The chart fails the render on any of the old keys
+  rather than ignoring them, because a changed claim template would make
+  Kubernetes reject the StatefulSet update.
+- Check the running server version first (`redis-server --version` in
+  `<release>-redis-master-0`). A node that pulled a `bitnami/redis:latest`
+  newer than 8.10.2 has written data an 8.10.2 server may not load; pin
+  `redis.image.tag` and `redis.image.digest` to that version or newer.
 

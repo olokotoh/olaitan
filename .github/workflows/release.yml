@@ -362,18 +362,11 @@ jobs:
           # Story 12.6: pin the Olaitan image by the digest the image job
           # just pushed (the index digest it verified, scanned and signed),
           # and name the repository it was pushed to, so the two can never
-          # disagree (a fork pushes to its own owner). Only the top-level
-          # `image:` block is touched: its first `repository:` line and its
-          # empty `digest: ""` line; exit 3 if either is not found.
-          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
-            || { echo "image job output is not a digest: '${DIGEST}'" >&2; exit 1; }
-          awk -v repo="$IMAGE" -v digest="$DIGEST" '
-            /^[^[:space:]#]/ { inimg = ($0 == "image:") }
-            inimg && !r && /^  repository: / { print "  repository: " repo; r = 1; next }
-            inimg && !d && /^  digest: ""$/ { print "  digest: \"" digest "\""; d = 1; next }
-            { print }
-            END { if (!r || !d) exit 3 }
-          ' deploy/helm/olaitan/values.yaml > build/chart/values.yaml
+          # disagree (a fork pushes to its own owner). The helm test suite
+          # runs the same script on every CI run
+          # (TestReleaseStampPinsTheOlaitanImage).
+          hack/stamp-chart-image.sh deploy/helm/olaitan/values.yaml \
+            build/chart/values.yaml "$IMAGE" "$DIGEST"
           git diff --quiet -- deploy/helm/olaitan/values.yaml
           rendered="$(helm template olaitan build/chart --set secrets.redisPassword=stamp-check)"
           grep -qF "image: ${IMAGE}:${VERSION}@${DIGEST}" <<<"$rendered" \

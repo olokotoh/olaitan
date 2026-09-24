@@ -12,7 +12,9 @@ Parity with the Bitnami render it replaces, on purpose:
     existing release upgrades in place and keeps its data.
   - runAsUser/runAsGroup/fsGroup 1001, read-only root filesystem, no
     capabilities, RuntimeDefault seccomp: the files Bitnami's Redis wrote
-    under /data stay readable.
+    under /data stay readable. On OpenShift the three numbers are left out,
+    as Bitnami's adaptSecurityContext did: restricted-v2 assigns them from
+    the namespace range and refuses a pod that asks for 1001.
   - The same server settings: AOF on, RDB snapshots off, FLUSHDB and
     FLUSHALL disabled, AUTH from the release Secret.
 Not carried over: Bitnami's ConfigMap-shipped start and health scripts (the
@@ -21,8 +23,10 @@ neither), and its PodDisruptionBudget (maxUnavailable 1 on one replica
 protected nothing).
 */}}
 {{- if .Values.redis.enabled }}
+{{- include "olaitan.redis.validate" . }}
 {{- $name := include "olaitan.redis.fullname" . }}
 {{- $r := .Values.redis }}
+{{- $openshift := eq (include "olaitan.platform" .) "openshift" }}
 {{- $conf := `port 6379
 dir /data
 # Append-only file for durability; RDB snapshots off (AOF already
@@ -120,9 +124,11 @@ spec:
       enableServiceLinks: false
       securityContext:
         runAsNonRoot: true
+        {{- if not $openshift }}
         runAsUser: 1001
         runAsGroup: 1001
         fsGroup: 1001
+        {{- end }}
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
@@ -147,8 +153,10 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             runAsNonRoot: true
+            {{- if not $openshift }}
             runAsUser: 1001
             runAsGroup: 1001
+            {{- end }}
             capabilities:
               drop: ["ALL"]
             seccompProfile:

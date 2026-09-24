@@ -842,7 +842,7 @@ Usage: include "olaitan.tlsSecretChecksum" (dict "root" $ "template" "audit-webh
 {{- end -}}
 
 {{/*
-Story 12.6: the bundled Redis (templates/redis-*.yaml). Names and labels are
+Story 12.6: the bundled Redis (templates/redis.yaml). Names and labels are
 the ones the Bitnami subchart rendered before it was replaced
 (<release>-redis, name=redis, component=master), because a StatefulSet's
 selector, serviceName and volume claim template are immutable: keeping them
@@ -879,6 +879,37 @@ chart deploys by both (deploy/helm/image_pin_test.go).
 {{- fail (printf "redis.image.digest must be sha256:<64 lowercase hex> (got %q)" $digest) -}}
 {{- end -}}
 {{- printf "%s:%s@%s" $img.repository $tag $digest -}}
+{{- end -}}
+
+{{/*
+Fail on values the chart-owned Redis cannot honour (review round 1 of Story
+12.6). Two ways to get here, one fix each:
+  - an operator values file still carrying Bitnami subchart keys (or
+    Bitnami's global.storageClass), which
+    would otherwise be ignored in silence (and a changed claim template makes
+    Kubernetes reject the StatefulSet update);
+  - `helm upgrade --reuse-values` from a Bitnami-era release: Helm 3 renders
+    the new templates against the OLD chart's defaults (redis.architecture
+    set, no redis.image), so the new keys are missing, not wrong.
+*/}}
+{{- define "olaitan.redis.validate" -}}
+{{- $r := .Values.redis -}}
+{{- $hint := "If this is `helm upgrade --reuse-values` from a chart before Story 12.6, use `--reset-then-reuse-values` instead (docs/runbook.md, \"Upgrading across Story 12.6\")." -}}
+{{- if hasKey $r "master" -}}
+{{- fail (printf "redis.master is a Bitnami subchart key; the chart owns Redis since Story 12.6. Move redis.master.persistence.size to redis.persistence.size, redis.master.persistence.storageClass to redis.persistence.storageClassName, redis.master.resources to redis.resources, redis.master.nodeSelector to redis.nodeSelector, redis.master.tolerations to redis.tolerations. %s" $hint) -}}
+{{- end -}}
+{{- if hasKey $r "architecture" -}}
+{{- fail (printf "redis.architecture is a Bitnami subchart key; the bundled Redis is standalone only since Story 12.6, so remove it (for replicas, set redis.enabled=false and endpoints.redis). %s" $hint) -}}
+{{- end -}}
+{{- if (.Values.global).storageClass -}}
+{{- fail (printf "global.storageClass is a Bitnami convention the chart-owned Redis does not read since Story 12.6; set redis.persistence.storageClassName (and nats.persistence.storageClass, reports.storageClass) instead. %s" $hint) -}}
+{{- end -}}
+{{- if and (kindIs "map" $r.image) (hasKey $r.image "registry") -}}
+{{- fail (printf "redis.image.registry is a Bitnami subchart key; since Story 12.6 put the full image name in redis.image.repository (for example mirror.example/library/redis) and keep redis.image.tag and redis.image.digest. %s" $hint) -}}
+{{- end -}}
+{{- if not (and (kindIs "map" $r.image) (kindIs "map" $r.persistence)) -}}
+{{- fail (printf "redis.image and redis.persistence are not set. %s" $hint) -}}
+{{- end -}}
 {{- end -}}
 
 {{- define "olaitan.redis.secretName" -}}
