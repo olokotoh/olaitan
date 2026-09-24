@@ -149,6 +149,10 @@ main() {
 	local image="${QUICKSTART_IMAGE:-}"
 	local plan="${QUICKSTART_PLAN:-}"
 	QS_KCTX=(--context "kind-$QS_CLUSTER")
+	if ! [[ $budget =~ ^[0-9]+$ ]]; then
+		echo "quickstart: QUICKSTART_BUDGET must be a whole number of seconds (0 or more), got '$budget'" >&2
+		exit 1
+	fi
 
 	local -a install=(helm install "$QS_RELEASE")
 	case "$chart" in
@@ -169,7 +173,7 @@ main() {
 	install+=(--kube-context "kind-$QS_CLUSTER" --namespace "$QS_NS" --create-namespace)
 	if [ -n "$image" ]; then
 		local repo="${image%:*}" tag="${image##*:}"
-		if [ "$repo" = "$image" ] || [[ "$tag" == */* ]] || [[ "$image" == *@* ]]; then
+		if [ "$repo" = "$image" ] || [ -z "$repo" ] || [ -z "$tag" ] || [[ "$tag" == */* ]] || [[ "$image" == *@* ]]; then
 			echo "quickstart: QUICKSTART_IMAGE must be repo:tag, got '$image'" >&2
 			exit 1
 		fi

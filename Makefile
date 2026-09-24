@@ -47,9 +47,11 @@ preflight:
 # than QUICKSTART_BUDGET seconds.
 #   make quickstart                                  # published chart (Chart.yaml version)
 #   make quickstart QUICKSTART_CHART=local           # the chart in this checkout
-#   make docker-build && make quickstart QUICKSTART_CHART=local QUICKSTART_IMAGE=olaitan:$$(make -s version-tag)
+#   make docker-build && make quickstart QUICKSTART_CHART=local QUICKSTART_IMAGE=olaitan:$(make -s version-tag)
 # The cluster is left running so you can look around; make quickstart-clean
 # deletes it.
+# QUICKSTART_VERSION (unset) is read from the environment or the make command
+# line: the published chart version to install, Chart.yaml's version when unset.
 QUICKSTART_CLUSTER ?= olaitan-quickstart
 QUICKSTART_CHART   ?= published
 QUICKSTART_IMAGE   ?=

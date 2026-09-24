@@ -309,6 +309,53 @@ func TestQuickstartRejectsDigestImage(t *testing.T) {
 	}
 }
 
+// quickstartRejects runs the script in plan mode with env and returns its
+// output, failing the test when the script accepts the setting or runs any
+// command (a "+ " line) before rejecting it.
+func quickstartRejects(t *testing.T, want string, env ...string) {
+	t.Helper()
+	cmd := exec.Command("bash", quickstartScript(t))
+	cmd.Dir = repoRoot(t)
+	cmd.Env = quickstartEnv(append([]string{"QUICKSTART_PLAN=1"}, env...)...)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Errorf("%v accepted:\n%s", env, out)
+		return
+	}
+	if !strings.Contains(string(out), want) {
+		t.Errorf("%v rejected without %q:\n%s", env, want, out)
+	}
+	for _, l := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(l, "+ ") {
+			t.Errorf("%v ran %q before it was rejected", env, l)
+		}
+	}
+}
+
+// TestQuickstartRejectsBadBudget (review round 2, F6): QUICKSTART_BUDGET is
+// compared with [ -le ], so a value that is not a whole number of seconds
+// used to surface only as a bash error after the whole run. It is checked
+// before anything runs.
+func TestQuickstartRejectsBadBudget(t *testing.T) {
+	for _, b := range []string{"abc", "-5", "1.5", "10m", " 600", "600s"} {
+		quickstartRejects(t, "QUICKSTART_BUDGET must be a whole number of seconds", "QUICKSTART_BUDGET="+b)
+	}
+	for _, b := range []string{"0", "900"} {
+		if plan := quickstartPlan(t, "QUICKSTART_BUDGET="+b); !strings.Contains(plan, "budget "+b+"s") {
+			t.Errorf("QUICKSTART_BUDGET=%s not used:\n%s", b, plan)
+		}
+	}
+}
+
+// TestQuickstartRejectsEmptyImageParts (review round 2, F7): an image with
+// an empty repository or tag used to reach helm as image.repository= or
+// image.tag=. It is rejected before anything is created.
+func TestQuickstartRejectsEmptyImageParts(t *testing.T) {
+	for _, img := range []string{"olaitan:", ":dev", ":", "localhost:5000/olaitan:"} {
+		quickstartRejects(t, "must be repo:tag", "QUICKSTART_CHART=local", "QUICKSTART_IMAGE="+img)
+	}
+}
+
 // fakeTools puts failing stand-ins for helm, kind, kubectl and docker first
 // on PATH, so a function under test that calls one of them for real cannot
 // reach a registry or a cluster. Each records its arguments in calls.log.
