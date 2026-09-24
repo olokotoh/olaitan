@@ -346,7 +346,9 @@ func TestQuickstartVersionCheck(t *testing.T) {
 	if calls != "helm show chart "+publishedChartRef+" --version 9.9.9-rc9\n" {
 		t.Errorf("the check ran %q, want only helm show chart for 9.9.9-rc9", calls)
 	}
-	for _, want := range []string{"9.9.9-rc9", "QUICKSTART_VERSION=", "QUICKSTART_CHART=local"} {
+	// helm also fails when the registry cannot be reached, so the message
+	// must not claim the version is unpublished (review round 2).
+	for _, want := range []string{"9.9.9-rc9", "not published yet, or the registry cannot be reached", "QUICKSTART_VERSION=", "QUICKSTART_CHART=local"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the failure does not mention %s:\n%s", want, out)
 		}

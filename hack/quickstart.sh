@@ -92,7 +92,7 @@ qs_check_published() {
 	printf '+ %s\n' "helm show chart $QS_PUBLISHED_CHART --version $version"
 	[ "${QUICKSTART_PLAN:-}" = "1" ] && return 0
 	if ! helm show chart "$QS_PUBLISHED_CHART" --version "$version" >/dev/null; then
-		echo "quickstart: chart $QS_PUBLISHED_CHART version $version is not published (yet)." >&2
+		echo "quickstart: cannot fetch chart $QS_PUBLISHED_CHART version $version: it is not published yet, or the registry cannot be reached (helm's error is above)." >&2
 		echo "quickstart: use a published one, QUICKSTART_VERSION=<version>, or this checkout's chart, QUICKSTART_CHART=local" >&2
 		exit 1
 	fi
