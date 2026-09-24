@@ -525,7 +525,7 @@ func createSecretCommand(text string) (string, map[string]string) {
 	}
 	cmd := strings.Join(lines, "\n")
 	keys := map[string]string{}
-	for _, m := range regexp.MustCompile(`--from-literal=([A-Za-z0-9._-]+)=(\S*)`).FindAllStringSubmatch(cmd, -1) {
+	for _, m := range regexp.MustCompile(`--from-literal=([A-Za-z0-9._-]+)=("[^"]*"|\S*)`).FindAllStringSubmatch(cmd, -1) {
 		keys[m[1]] = strings.TrimSuffix(m[2], `\`)
 	}
 	return cmd, keys
