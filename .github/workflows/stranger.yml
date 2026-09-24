@@ -1,0 +1,115 @@
+# Stranger-path check (Story 12.5).
+#
+# Installs the PUBLISHED release the way the README tells a stranger to, on
+# a fresh kind cluster, then requires a real attack to be detected. rc3
+# shipped broken because nothing did this. hack/stranger.sh reads README.md
+# when it runs and executes its install block as written, so a README change
+# that breaks the install breaks this job.
+#
+# Two paths, one job each:
+#   helm     README "### Try it on kind" (kind create, helm install, wait)
+#   kubectl  README "## Install" block 2 (namespace, Secret, kubectl apply
+#            of the release's install.yaml); skipped only for releases cut
+#            before install.yaml existed (v1.0.0-rc4 and earlier)
+#
+# When it runs:
+#   - every release tag: release.yml calls it (workflow_call) after the
+#     GitHub Release exists, with the tag's README and version. A failure
+#     fails the release run, keeps `latest` where it is and marks the
+#     GitHub Release failed (release.yml, job mark-failed).
+#   - nightly: main's README, the one GitHub shows a stranger. If it names a
+#     version that is not published, this fails, as it would for them.
+#   - by hand (workflow_dispatch), and on pull requests that change this job.
+name: Stranger path
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref whose README is followed (default: the branch dispatched from)'
+        required: false
+        type: string
+        default: ''
+      expect_version:
+        description: 'Fail unless the README installs this chart version (empty: whatever it names)'
+        required: false
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref whose README is followed'
+        required: true
+        type: string
+      expect_version:
+        description: 'Fail unless the README installs this chart version'
+        required: true
+        type: string
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/stranger.yml'
+      - 'hack/stranger.sh'
+
+permissions:
+  contents: read
+
+jobs:
+  stranger:
+    name: stranger (${{ matrix.leg }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [helm, kubectl]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      # The README asks for Docker, kind, helm and kubectl. kind is the
+      # version the README says the path was verified with; helm is the
+      # current release, which is what a stranger installs today. The
+      # README block creates the cluster, so kind is only installed here.
+      - name: Install kind and kubectl
+        uses: helm/kind-action@v1.12.0
+        with:
+          version: v0.30.0
+          install_only: 'true'
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: latest
+
+      # The README's two host prerequisites. inotify is raised to the values
+      # its verification host ran with; BTF is reported (Falco's modern
+      # eBPF probe needs it).
+      - name: Host prerequisites
+        run: |
+          sudo sysctl -w fs.inotify.max_user_instances=1024
+          sudo sysctl -w fs.inotify.max_user_watches=1048576
+          uname -r
+          if [ -e /sys/kernel/btf/vmlinux ]; then echo "BTF: present"; else echo "BTF: MISSING"; fi
+          docker version --format 'docker {{.Server.Version}}'
+          kind version
+          helm version --short
+          kubectl version --client
+
+      - name: Follow the README (${{ matrix.leg }} path) and attack
+        env:
+          STRANGER_EXPECT_VERSION: ${{ inputs.expect_version }}
+          LEG: ${{ matrix.leg }}
+        run: hack/stranger.sh "$LEG"
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl -n olaitan get events --sort-by=.lastTimestamp || true
+          kubectl -n olaitan describe pods || true
+          kubectl -n olaitan logs -l app.kubernetes.io/name=falco -c falco --tail=100 || true
+          kubectl -n olaitan logs -l app.kubernetes.io/component=aggregator --tail=100 || true
+          kubectl -n olaitan logs -l app.kubernetes.io/component=collector --tail=100 || true

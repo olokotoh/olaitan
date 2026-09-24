@@ -11,6 +11,11 @@
 # Image and chart are both cosign-signed keylessly (OIDC, no long-lived
 # key) and carry an SPDX SBOM.
 #
+# Then the stranger-path check (Story 12.5, stranger.yml) installs what was
+# just published the way the README says, on a fresh kind, and requires a
+# real attack to be detected. If it fails, the run fails, `latest` does not
+# move, and the GitHub Release is marked failed (job mark-failed).
+#
 # The tag is expected to sit on a commit that already passed CI on main.
 # That is ENFORCED, not assumed: the preflight job below refuses to publish
 # a tag whose commit is not an ancestor of main or whose CI run did not
@@ -565,10 +570,12 @@ jobs:
   # ---------------------------------------------------------------------
   # Promote: `latest` moves only once the chart is published too. Otherwise
   # a chart-job failure would leave `latest` advertising a version that has
-  # no chart and no GitHub Release.
+  # no chart and no GitHub Release. It also waits for the stranger-path
+  # check (Story 12.5): a release that a stranger cannot install from the
+  # README never becomes `latest`.
   # ---------------------------------------------------------------------
   promote:
-    needs: [preflight, image, chart]
+    needs: [preflight, image, chart, stranger]
     if: needs.preflight.outputs.promote_latest == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -706,3 +713,55 @@ jobs:
             `ghcr.io/${{ github.repository_owner }}/charts/olaitan`. The
             `:edge` image is signed by `ci.yml` rather than `release.yml`, so
             verifying it needs that workflow in the identity regexp.
+
+  # ---------------------------------------------------------------------
+  # Stranger path (Story 12.5): install what this run just published the way
+  # the tag's README says, on a fresh kind, with Falco on, and require a real
+  # attack to be detected. It runs after `release` because the kubectl path
+  # downloads this release's install.yaml. Its failure fails this run and
+  # holds `latest` (promote needs it); mark-failed below says so on the
+  # GitHub Release.
+  # ---------------------------------------------------------------------
+  stranger:
+    needs: [preflight, release]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/stranger.yml
+    with:
+      ref: ${{ github.ref_name }}
+      expect_version: ${{ needs.preflight.outputs.version }}
+
+  # ---------------------------------------------------------------------
+  # Mark failed: the image and chart are already public and signed, and
+  # deleting them would break anyone who pinned the digest, so the release
+  # stays, marked. It becomes a pre-release (never "Latest"), its title says
+  # it failed, and the notes open with the run that failed it.
+  # ---------------------------------------------------------------------
+  mark-failed:
+    needs: [preflight, release, stranger]
+    if: always() && needs.release.result == 'success' && needs.stranger.result == 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Mark the GitHub Release failed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" -R "$REPO" --json body -q .body > notes-old.md
+          {
+            echo "> [!CAUTION]"
+            echo "> **This release FAILED the stranger-path check.** Installing it the way"
+            echo "> its README says, on a fresh kind cluster, did not reach every pod Ready"
+            echo "> with a real attack detected. Do not install it. Run: ${RUN_URL}"
+            echo
+            cat notes-old.md
+          } > notes.md
+          gh release edit "$TAG" -R "$REPO" --prerelease --latest=false \
+            --title "$TAG (FAILED stranger-path check)" --notes-file notes.md
+          echo "marked $TAG failed"
