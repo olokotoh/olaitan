@@ -18,6 +18,21 @@ and false-positive numbers; see [Unreleased](#unreleased).
 > campaign that fills them in is outstanding. No performance figure in this
 > repository should be cited until it is.
 
+### Added
+
+- **`install.yaml` on every release** (Story 12.4, #121). The release
+  workflow renders the chart it publishes, with default values, into one
+  file for `kubectl apply -f`, checks that it runs the released image by
+  digest, adds it to `checksums.txt` and attaches it to the GitHub release.
+  The file creates the `olaitan` namespace, namespaces the NATS objects
+  (the subchart renders none) and leaves out the NATS `helm test` Pod.
+  `hack/render-install-manifest.sh` does the rendering; the helm test suite
+  runs it on every CI run. Two limits, stated in the README: the bundled
+  Redis password and the Falco token are generated once per release, so
+  they are shared by everyone who applies that file, and the API server
+  NetworkPolicy rule names `10.96.0.1` because a rendered file cannot look
+  the address up. v1.0.0-rc4 predates this and has no `install.yaml`.
+
 ## [v1.0.0-rc4] - 2026-09-24
 
 The first release since rc3 that installs with the README command and no

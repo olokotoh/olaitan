@@ -56,6 +56,36 @@ No clone and no local build. The chart version is unprefixed SemVer, not the
 git tag: `v1.0.0-rc4` is the tag that triggers the release, `1.0.0-rc4` is what
 the registry holds.
 
+Or without helm, from the release's `install.yaml`:
+
+```bash
+kubectl apply -f https://github.com/olokotoh/olaitan/releases/download/v1.0.0-rc4/install.yaml
+```
+
+`install.yaml` is the same chart with its default values, rendered by the
+release workflow from the chart it publishes (the same pinned images), into
+the `olaitan` namespace, which it creates. `kubectl delete -f` with the same
+URL removes it. Releases get it from the first one cut after v1.0.0-rc4;
+rc4 itself has none, so until the next release that URL returns 404 and the
+helm command is the way in.
+
+A file cannot do two things helm does at install time. The bundled Redis
+password and the Falco token are generated once, when the release renders
+the file, so they are the same for everyone who applies it and anyone can
+read them in the file. And the NetworkPolicy's API server rule names the
+kubeadm Service IP (`10.96.0.1`) instead of the addresses helm reads from
+the cluster; on a CNI that enforces egress after Service translation that
+can cut the agent off from the API server. Use `install.yaml` to try
+Olaitan; use helm anywhere that matters.
+
+Before merge, the file was rendered with the release's own script from the
+chart packaged the way the release packages it, and applied with `kubectl
+apply -f` to a fresh single-node kind (the host described below): all six
+pods existed 54 seconds after `kind create cluster` started and were Ready
+at 117 seconds, Falco included, and `cat /etc/shadow` in a pod moved it to
+SUSPICIOUS. Egress NetworkPolicy was not enforced on that kind, so the API
+server rule above was not exercised there.
+
 ### Try it on kind
 
 With Docker, [kind](https://kind.sigs.k8s.io/), helm and kubectl installed:
