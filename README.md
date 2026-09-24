@@ -150,7 +150,7 @@ With Docker, [kind](https://kind.sigs.k8s.io/), helm and kubectl installed:
 ```bash
 kind create cluster --name olaitan
 helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan \
-  --version 1.0.0-rc3 \
+  --version 1.0.0-rc4 \
   --namespace olaitan --create-namespace --wait --timeout 10m
 kubectl -n olaitan wait pod --all --for=condition=Ready --timeout=10m
 ```
