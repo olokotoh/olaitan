@@ -133,6 +133,45 @@ shell loop safely.
 {{- end -}}
 
 {{/*
+Story 10.6 review (P6): space-separated model=ID pairs from
+ollama.pull.expectedIds, "" when none. The pull Job checks `ollama list`
+against them after the pull and fails on drift: the image is pinned by
+digest, but a model tag can be re-pushed. Each key must be a pulled model
+and each ID the 12 hex characters of the `ollama list` ID column.
+*/}}
+{{- define "olaitan.ollama.pullExpect" -}}
+{{- $pull := default (dict) (default (dict) .Values.ollama).pull -}}
+{{- $ids := default (dict) $pull.expectedIds -}}
+{{- $models := list -}}
+{{- range (default (list) $pull.models) }}{{ $models = append $models (toString .) }}{{ end -}}
+{{- $out := list -}}
+{{- range $m := keys $ids | sortAlpha -}}
+{{- $id := toString (get $ids $m) -}}
+{{- if not (has $m $models) -}}
+{{- fail (printf "ollama.pull.expectedIds names %q, which is not in ollama.pull.models" $m) -}}
+{{- end -}}
+{{- if not (regexMatch "^[a-f0-9]{12}$" $id) -}}
+{{- fail (printf "ollama.pull.expectedIds[%q] must be the 12 lowercase hex characters of the `ollama list` ID column, quoted (got %q)" $m $id) -}}
+{{- end -}}
+{{- $out = append $out (printf "%s=%s" $m $id) -}}
+{{- end -}}
+{{- join " " $out -}}
+{{- end -}}
+
+{{/*
+Story 10.6: the model pull Job's name. It carries a hash of the image, the
+model list and the expected IDs: a Job's pod template is immutable, so a
+change must be a new Job, and the same inputs must be the same Job so a
+no-change upgrade leaves the finished one alone. Shared with the server's
+wait-for-models container, which names the Job when it gives up.
+*/}}
+{{- define "olaitan.ollama.pullJobName" -}}
+{{- $in := printf "%s|%s" (include "olaitan.ollama.image" .) (include "olaitan.ollama.pullModels" .) -}}
+{{- with include "olaitan.ollama.pullExpect" . }}{{ $in = printf "%s|%s" $in . }}{{ end -}}
+{{- printf "%s-ollama-pull-%s" (include "olaitan.fullname" . | trunc 40 | trimSuffix "-") ($in | sha256sum | trunc 10) -}}
+{{- end -}}
+
+{{/*
 ServiceAccount name helpers. Each ring has its own SA so the RBAC grant
 stays ring-scoped (Dev Notes § "RBAC: Role vs ClusterRole split"). The
 SA name is deterministic from the fullname -- it is not a user-tunable

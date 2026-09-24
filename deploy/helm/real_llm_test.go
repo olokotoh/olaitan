@@ -227,8 +227,21 @@ func TestFullProfileRunsAnInClusterModel(t *testing.T) {
 	for _, c := range aggC {
 		aggregator = c
 	}
-	if v, ok := envValue(aggregator, "OLT_LLM_ROLE_TIMEOUT_MULTIPLIER"); !ok || v == "" {
-		t.Error("the full profile runs a CPU model; OLT_LLM_ROLE_TIMEOUT_MULTIPLIER must raise the Claude-calibrated per-role timeouts")
+	v, ok := envValue(aggregator, "OLT_LLM_ROLE_TIMEOUT_MULTIPLIER")
+	if !ok || v == "" {
+		t.Fatal("the full profile runs a CPU model; OLT_LLM_ROLE_TIMEOUT_MULTIPLIER must raise the Claude-calibrated per-role timeouts")
+	}
+	// Review round 1 (P2): the budget must cover the SLOW end of the
+	// measured rates, not the middle. A role prompt is up to 10k tokens
+	// read at as little as 17 tokens/s (588s), plus about 35s of output at
+	// 8.5 tokens/s: 623s. L1 and L2 have the smallest base budget, 30s.
+	var mult int
+	if _, err := fmt.Sscanf(v, "%d", &mult); err != nil {
+		t.Fatalf("OLT_LLM_ROLE_TIMEOUT_MULTIPLIER = %q is not an integer", v)
+	}
+	const slowestRoleSeconds = 10000/17 + 35
+	if mult*30 < slowestRoleSeconds || mult > 100 {
+		t.Errorf("OLT_LLM_ROLE_TIMEOUT_MULTIPLIER = %d gives L1/L2 %ds, want at least %ds (the measured slow end) and a multiplier within the code ceiling of 100", mult, mult*30, slowestRoleSeconds)
 	}
 }
 
@@ -418,7 +431,9 @@ func TestHostedModelOverlays(t *testing.T) {
 		models                 bool
 	}{
 		{"values-llm-deepseek.yaml", "openai", "https://api.deepseek.com/v1", true},
-		{"values-llm-claude.yaml", "claude", "", false},
+		// Review round 1 (P10): the Claude overlay pins its model too, so
+		// the real-LLM e2e (wantFromConfig) can check the record against it.
+		{"values-llm-claude.yaml", "claude", "", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.file, func(t *testing.T) {
@@ -446,8 +461,11 @@ func TestHostedModelOverlays(t *testing.T) {
 			if tc.models {
 				for role, m := range map[string]string{"l1": c.Analyst.L1Model, "l2": c.Analyst.L2Model, "senior": c.Analyst.SeniorModel} {
 					if m == "" {
-						t.Errorf("analyst.%s_model empty; an openai-family role has no model default", role)
+						t.Errorf("analyst.%s_model empty; the e2e cannot check the recorded model of an unpinned role", role)
 					}
+				}
+				if c.Analyst.L1Model != c.Analyst.L2Model || c.Analyst.L2Model != c.Analyst.SeniorModel {
+					t.Errorf("per-role models %q/%q/%q differ; the real-LLM e2e proves one model at a time", c.Analyst.L1Model, c.Analyst.L2Model, c.Analyst.SeniorModel)
 				}
 			}
 			if c.Analyst.Local.Model != fullProfileModel {
@@ -550,11 +568,14 @@ func TestLLMKeyFromAnExistingSecret(t *testing.T) {
 // Story 10.6 (issue #151 part 2, the part 10.6 needs): kind-full installs
 // into `default`, and without this its own aggregator and Ollama crossed the
 // multi-signal threshold at startup and queued FR19 chains ahead of a real
-// attack. values-full.yaml turns on response.excludeReleaseNamespace, which
-// adds the release namespace to response.excluded_namespaces; the default
-// install leaves the list as shipped.
-func TestFullProfileExcludesItsOwnNamespace(t *testing.T) {
-	load := func(rendered string) []string {
+// attack. values-full.yaml turns on correlator.neverScoreReleaseNamespace,
+// which adds the release namespace to detection.correlator.
+// never_scored_namespaces. Review round 1 (D3) split this from
+// response.excluded_namespaces, which stays the never-ENFORCED list: the
+// profile must not put its release namespace, or anything else, on it, and
+// kube-system must stay detected (not never-scored) everywhere.
+func TestFullProfileNeverScoresItsOwnNamespace(t *testing.T) {
+	load := func(rendered string) (neverScored, excluded string) {
 		t.Helper()
 		path := filepath.Join(t.TempDir(), "olaitan.yaml")
 		if err := os.WriteFile(path, []byte(extractEmbeddedConfigYAML(t, rendered)), 0o600); err != nil {
@@ -564,28 +585,32 @@ func TestFullProfileExcludesItsOwnNamespace(t *testing.T) {
 		if err != nil {
 			t.Fatalf("config does not load: %v", err)
 		}
-		return c.Response.ExcludedNamespaces
+		return strings.Join(c.Detection.Correlator.NeverScoredNamespaces, ","), strings.Join(c.Response.ExcludedNamespaces, ",")
 	}
-	full := load(renderFullProfile(t))
-	if strings.Join(full, ",") != "kube-system,olaitan,default" {
-		t.Errorf("values-full excluded_namespaces = %v, want [kube-system olaitan default]", full)
+	ns, ex := load(renderFullProfile(t))
+	if ns != "olaitan,default" {
+		t.Errorf("values-full never_scored_namespaces = %q, want olaitan,default", ns)
 	}
-	if def := load(helmTemplate(t, nil)); strings.Join(def, ",") != "kube-system,olaitan" {
-		t.Errorf("default excluded_namespaces = %v, want the shipped [kube-system olaitan]", def)
+	if ex != "kube-system,olaitan" {
+		t.Errorf("values-full excluded_namespaces = %q, want the shipped kube-system,olaitan (never-enforced is not never-scored)", ex)
+	}
+	ns, ex = load(helmTemplate(t, nil))
+	if ns != "olaitan" || ex != "kube-system,olaitan" {
+		t.Errorf("default render: never_scored %q excluded %q, want olaitan and kube-system,olaitan", ns, ex)
 	}
 	// Installed into olaitan, the release namespace is already listed:
 	// no duplicate.
 	dir := t.TempDir()
 	extra := filepath.Join(dir, "ns.yaml")
-	if err := os.WriteFile(extra, []byte("response:\n  excludeReleaseNamespace: true\n"), 0o600); err != nil {
+	if err := os.WriteFile(extra, []byte("correlator:\n  neverScoreReleaseNamespace: true\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	out, err := exec.Command("helm", "template", "olaitan", chartDir(t), "-n", "olaitan", "-f", extra).CombinedOutput()
 	if err != nil {
 		t.Fatalf("helm template -n olaitan: %v\n%s", err, out)
 	}
-	if got := load(string(out)); strings.Join(got, ",") != "kube-system,olaitan" {
-		t.Errorf("-n olaitan excluded_namespaces = %v, want no duplicate", got)
+	if got, _ := load(string(out)); got != "olaitan" {
+		t.Errorf("-n olaitan never_scored_namespaces = %q, want no duplicate", got)
 	}
 }
 
@@ -615,6 +640,106 @@ func TestRealLLMDeepSeekTarget(t *testing.T) {
 	for _, bad := range []string{"secrets.llmApiKey=", "--set-file secrets.llmApiKey", "DEEPSEEK_API_KEY"} {
 		if strings.Contains(recipe, bad) {
 			t.Errorf("e2e-full-real-llm-deepseek recipe contains %q: the key must come from the out-of-band Secret only", bad)
+		}
+	}
+}
+
+// fullProfileModelID is the ID `ollama list` showed for fullProfileModel in
+// the Story 10.6 live run. The registry tag is mutable; this is not.
+const fullProfileModelID = "357c53fb659c"
+
+// TestPullJobCoLocatesWithTheServer (review round 1, P4): the pull Job pod
+// and the server pod mount the same ReadWriteOnce claim. RWO is per node,
+// so that is only safe on one node; a node-local provisioner (kind
+// local-path) forces it, but attachable block storage (EBS, PD, Azure Disk)
+// does not, and the second pod would hit Multi-Attach while the server
+// waits forever. A required podAffinity to the server pod pins the pull pod
+// to the server's node (the server is bound to a node while it sits in
+// Init, so the pull pod can follow it).
+func TestPullJobCoLocatesWithTheServer(t *testing.T) {
+	rendered := renderFullProfile(t)
+	job := pullJob(t, rendered)
+	terms := asList(dig(job, "spec", "template", "spec", "affinity", "podAffinity", "requiredDuringSchedulingIgnoredDuringExecution"))
+	if len(terms) != 1 {
+		t.Fatalf("pull Job pod has %d required podAffinity terms, want 1 (to the ollama server pod)", len(terms))
+	}
+	if got := dig(terms[0], "topologyKey"); got != "kubernetes.io/hostname" {
+		t.Errorf("podAffinity topologyKey = %v, want kubernetes.io/hostname", got)
+	}
+	want, _ := dig(docNamed(t, rendered, "Deployment", "olaitan-ollama"), "spec", "template", "metadata", "labels").(map[string]any)
+	got, _ := dig(terms[0], "labelSelector", "matchLabels").(map[string]any)
+	if len(got) == 0 || fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("podAffinity selects %v, want the ollama server pod labels %v", got, want)
+	}
+	// And it must not select the pull pod itself (it would then satisfy
+	// its own affinity nowhere, or everywhere).
+	self, _ := dig(job, "spec", "template", "metadata", "labels").(map[string]any)
+	if fmt.Sprint(self) == fmt.Sprint(got) {
+		t.Error("the podAffinity selector matches the pull pod's own labels")
+	}
+}
+
+// TestWaitForModelsIsBounded (review round 1, P5): a failed pull Job is not
+// retried by `helm upgrade` (same name, same spec), so the server must not
+// wait in Init forever. The wait gives up a little after the Job's own
+// deadline, exits non-zero, and names the Job to delete.
+func TestWaitForModelsIsBounded(t *testing.T) {
+	rendered := renderFullProfile(t)
+	jobName, _ := dig(pullJob(t, rendered), "metadata", "name").(string)
+	wait := podContainers(docNamed(t, rendered, "Deployment", "olaitan-ollama"), "initContainers")["wait-for-models"]
+	if wait == nil {
+		t.Fatal("no wait-for-models init container")
+	}
+	if v, _ := envValue(wait, "OLAITAN_OLLAMA_WAIT_SECONDS"); v != "2100" {
+		t.Errorf("OLAITAN_OLLAMA_WAIT_SECONDS = %q, want 2100 (activeDeadlineSeconds 1800 + 300)", v)
+	}
+	if v, _ := envValue(wait, "OLAITAN_OLLAMA_PULL_JOB"); v != jobName {
+		t.Errorf("OLAITAN_OLLAMA_PULL_JOB = %q, want the rendered Job name %q", v, jobName)
+	}
+	script := fmt.Sprint(asList(wait["args"]))
+	for _, want := range []string{"OLAITAN_OLLAMA_WAIT_SECONDS", "exit 1", "kubectl delete job"} {
+		if !strings.Contains(script, want) {
+			t.Errorf("wait-for-models script lacks %q:\n%s", want, script)
+		}
+	}
+}
+
+// TestPullJobVerifiesModelIDs (review round 1, P6): the image is pinned by
+// digest, but a model is pulled by a registry tag that can be re-pushed.
+// values-full records the ID the live run pulled; the pull Job compares
+// `ollama list` against it after the pull and fails on drift, and a changed
+// expectation is a new Job.
+func TestPullJobVerifiesModelIDs(t *testing.T) {
+	rendered := renderFullProfile(t)
+	job := pullJob(t, rendered)
+	c := podContainers(job, "containers")["pull"]
+	if v, _ := envValue(c, "OLAITAN_OLLAMA_EXPECT"); v != fullProfileModel+"="+fullProfileModelID {
+		t.Errorf("OLAITAN_OLLAMA_EXPECT = %q, want %s=%s", v, fullProfileModel, fullProfileModelID)
+	}
+	script := fmt.Sprint(asList(c["args"]))
+	if !strings.Contains(script, "OLAITAN_OLLAMA_EXPECT") || !strings.Contains(script, "exit 1") {
+		t.Errorf("pull script does not check the model IDs:\n%s", script)
+	}
+
+	base := []string{
+		"ollama.enabled=true", "ollama.persistence.enabled=true", "ollama.persistence.create=true",
+		"ollama.pull.models={" + fullProfileModel + "}",
+	}
+	name := func(extra ...string) string {
+		n, _ := dig(pullJob(t, helmTemplate(t, append(append([]string{}, base...), extra...))), "metadata", "name").(string)
+		return n
+	}
+	key := `ollama.pull.expectedIds.qwen2\.5:3b-instruct=`
+	if name(key+fullProfileModelID) == name(key+"0123456789ab") {
+		t.Error("a changed expected model ID kept the same Job name; the Job would not re-verify")
+	}
+	for _, bad := range []struct{ set, msg string }{
+		{key + "not-hex", "ollama.pull.expectedIds"},
+		{`ollama.pull.expectedIds.other:7b=` + fullProfileModelID, "not in ollama.pull.models"},
+	} {
+		out := helmTemplateExpectError(t, append(append([]string{}, base...), bad.set))
+		if !strings.Contains(out, bad.msg) {
+			t.Errorf("%s: render error = %q, want it to mention %q", bad.set, out, bad.msg)
 		}
 	}
 }

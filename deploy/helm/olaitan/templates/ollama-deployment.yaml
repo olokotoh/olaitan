@@ -82,6 +82,13 @@ spec:
               value: "127.0.0.1:11434"
             - name: OLLAMA_NOPRUNE
               value: "1"
+            # Review round 1 (P5): give up a little after the pull Job's own
+            # deadline instead of waiting in Init forever. A failed Job is
+            # not retried by `helm upgrade` (same name, same spec).
+            - name: OLAITAN_OLLAMA_WAIT_SECONDS
+              value: {{ add (int .Values.ollama.pull.activeDeadlineSeconds) 300 | quote }}
+            - name: OLAITAN_OLLAMA_PULL_JOB
+              value: {{ include "olaitan.ollama.pullJobName" . | quote }}
           command: ["/bin/sh", "-c"]
           args:
             - |
@@ -89,10 +96,19 @@ spec:
               ollama serve >/dev/null 2>&1 &
               server=$!
               until ollama list >/dev/null 2>&1; do sleep 1; done
+              waited=0
               for m in $OLAITAN_OLLAMA_MODELS; do
                 until ollama show "$m" >/dev/null 2>&1; do
-                  echo "waiting for model $m (pulled by the ollama-pull Job)"
+                  if [ "$waited" -ge "$OLAITAN_OLLAMA_WAIT_SECONDS" ]; then
+                    echo "model $m is still missing after ${waited}s: the pull Job $OLAITAN_OLLAMA_PULL_JOB failed or never ran."
+                    echo "See: kubectl logs job/$OLAITAN_OLLAMA_PULL_JOB"
+                    echo "A failed Job is not retried by helm upgrade: kubectl delete job $OLAITAN_OLLAMA_PULL_JOB, then run the upgrade again."
+                    kill "$server"
+                    exit 1
+                  fi
+                  echo "waiting for model $m (pulled by the Job $OLAITAN_OLLAMA_PULL_JOB, ${waited}s)"
                   sleep 10
+                  waited=$((waited+10))
                 done
                 echo "model $m present"
               done

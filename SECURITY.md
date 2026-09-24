@@ -84,7 +84,8 @@ QUARANTINED is an outage for that workload. That is why the default is off.
 | Guard | Where | What it bounds |
 | --- | --- | --- |
 | `response.networkPolicy.enabled` | chart values | Global enforcement kill switch. `false` by default, so nothing is written until you opt in. |
-| `response.excluded_namespaces` | `config/olaitan.yaml` | Namespaces the response ring skips entirely. Defaults to `kube-system` and `olaitan`. **Not settable through Helm values** (see below). |
+| `response.excluded_namespaces` | `config/olaitan.yaml` | Namespaces the response ring skips entirely. Defaults to `kube-system` and `olaitan`. **Not settable through Helm values** (see below). Workloads there are still detected and scored; one Falco alert alone opens no investigation there. |
+| `detection.correlator.never_scored_namespaces` | `config/olaitan.yaml` | Namespaces whose events are dropped before correlation, so nothing there is ever scored. Defaults to `olaitan` only. `correlator.neverScoreReleaseNamespace=true` adds the release namespace. Keep kube-system OFF this list: a compromised CoreDNS or CNI agent would then go unseen. |
 | Trust ladder score cap | code | Bounds how far the LLM tier alone can move a workload's score. |
 | Dwell guards and `deescalation_cooldown_seconds` | `config/olaitan.yaml` | Damp oscillation. A single low sample cannot de-escalate a workload; the cooldown defaults to 600s. |
 | `response.override` | `config/olaitan.yaml` | **Off by default.** When enabled, an operator annotation pins a workload's state, overriding the agent. The pin carries its own TTL (default 1h) and releases on expiry or on removing the annotation. |

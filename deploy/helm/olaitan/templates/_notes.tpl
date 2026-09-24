@@ -39,17 +39,18 @@ Olaitan {{ .Chart.AppVersion }} is installed as "{{ .Release.Name }}" in namespa
 This tool decides that a workload is compromised and can cut its network. What
 follows is what it concluded about THIS cluster, so you know what it can and
 cannot see before you trust it.
-{{- if and (ne $ns "olaitan") (not (default (dict) .Values.response).excludeReleaseNamespace) }}
+{{- if and (ne $ns "olaitan") (not (default (dict) .Values.correlator).neverScoreReleaseNamespace) }}
 
 ! NAMESPACE
 !
 !   You installed into "{{ $ns }}", not "olaitan". The agent's
-!   excluded_namespaces list is `kube-system` and `olaitan`, so it does NOT
-!   exclude this namespace: Olaitan can score, and if enforcement is on
-!   isolate, its own aggregator and collector. Either reinstall into the
-!   `olaitan` namespace, or set response.excludeReleaseNamespace=true to
-!   add "{{ $ns }}" to excluded_namespaces (which excludes everything else
-!   in it too).
+!   excluded_namespaces list is `kube-system` and `olaitan`, and it never
+!   scores only `olaitan`, so it does NOT exclude this namespace: Olaitan
+!   can score, and if enforcement is on isolate, its own aggregator and
+!   collector. Either reinstall into the `olaitan` namespace, or set
+!   correlator.neverScoreReleaseNamespace=true to add "{{ $ns }}" to
+!   detection.correlator.never_scored_namespaces (nothing else in it is
+!   scored then either).
 {{- end }}
 
 DETECTION SOURCES

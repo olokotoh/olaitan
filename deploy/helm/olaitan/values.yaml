@@ -140,6 +140,18 @@ correlator:
   # plain kubectl exec trips it.
   # @schema type:string pattern:"off, warning, error, critical, alert or emergency" effect:"Falco priority at or above which one Falco alert on a pod starts an investigation" ref:FR14
   falcoTriggerMinPriority: "warning"
+  # Story 10.6: add the release namespace to
+  # detection.correlator.never_scored_namespaces (shipped: olaitan), so
+  # Olaitan never scores its own pods when it is installed somewhere other
+  # than `olaitan`. Its events are then dropped before correlation, by every
+  # path. Everything else in that namespace is never scored either, which is
+  # why it is off by default; the kind-full profile, which installs into
+  # `default` and attacks from its own namespaces, turns it on. This is not
+  # response.excluded_namespaces (config-file only): that list is never
+  # isolated but still detected, which is why kube-system is on it and not
+  # here.
+  # @schema type:boolean effect:"never score workloads in the release namespace (added to detection.correlator.never_scored_namespaces)" ref:FR47
+  neverScoreReleaseNamespace: false
 
 # --- Service endpoints -------------------------------------------------
 # Where Olaitan dials its dependencies. Empty by default -- the templates
@@ -1043,14 +1055,6 @@ fsm:
 # by default; an operator running RS-with-isolation enables them explicitly.
 # A block left empty leaves the config/olaitan.yaml defaults untouched.
 response:
-  # Story 10.6: add the release namespace to response.excluded_namespaces
-  # (shipped: kube-system, olaitan), so Olaitan never scores its own pods
-  # when it is installed somewhere other than `olaitan`. Everything else in
-  # that namespace is excluded too, which is why it is off by default; the
-  # kind-full profile, which installs into `default` and attacks from its
-  # own namespaces, turns it on.
-  # @schema type:boolean effect:"never score workloads in the release namespace (added to response.excluded_namespaces)" ref:FR47
-  excludeReleaseNamespace: false
   # Story 2.4-2.6: RESTRICTED/QUARANTINED NetworkPolicy enforcement (FR33/NFR6).
   networkPolicy:
     enabled: false
@@ -1460,8 +1464,15 @@ ollama:
     models: []
     # @schema type:integer minimum:0 effect:"retries of the model pull Job before it is marked failed" ref:FR48
     backoffLimit: 4
-    # @schema type:integer minimum:1 effect:"seconds the model pull Job may run before it is killed" ref:FR48
+    # @schema type:integer minimum:1 effect:"seconds the model pull Job may run before it is killed; the server's wait for the models gives up 300s after it" ref:FR48
     activeDeadlineSeconds: 1800
+    # Story 10.6 review: the ID `ollama list` shows for each pulled model,
+    # keyed by model name, e.g. {"qwen2.5:3b-instruct": "357c53fb659c"}
+    # (quote the ID). The pull Job fails when the pulled weights have
+    # another ID: a model tag can be re-pushed, the image digest cannot.
+    # Empty checks nothing.
+    # @schema type:object effect:"expected `ollama list` ID per pulled model; the pull Job fails on drift" ref:NFR31
+    expectedIds: {}
 
 # --- Subchart overrides ------------------------------------------------
 # Only opinions we impose on the downstream charts live here -- upstream

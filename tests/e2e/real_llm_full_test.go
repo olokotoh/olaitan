@@ -49,6 +49,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/santhosh-tekuri/jsonschema/v6"
+	"gopkg.in/yaml.v3"
 
 	"github.com/olokotoh/olaitan/internal/config"
 	"github.com/olokotoh/olaitan/internal/subjects"
@@ -63,8 +64,8 @@ import (
 // for the same reason.
 var familyScoreCap = map[string]int{"claude": 35, "openai": 30, "ollama": 25}
 
-// A 3B model on CPU reads a few thousand prompt tokens per role before it
-// writes a word (measured on 8 vCPUs: 6.5 to 8 minutes per role), and the
+// A 3B model on CPU reads 8k to 10k prompt tokens per role before it writes
+// a word (measured on 8 vCPUs: about 5 to 10 minutes per role), and the
 // chain runs L1, L2 and Senior in turn, inline in the single FSM consumer.
 // A hosted model answers each role in seconds. The budget bounds the whole
 // path, syscall to audit record; it asserts provenance and validity, not
@@ -357,6 +358,42 @@ func wantFromConfig(cfg *config.Config) (realLLMWant, error) {
 	return want, nil
 }
 
+// ollamaListID returns the ID column of `ollama list` for model ("" when
+// the server does not hold it). An untagged model is listed as :latest.
+func ollamaListID(list, model string) string {
+	for _, line := range strings.Split(list, "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 2 && (f[0] == model || f[0] == model+":latest") {
+			return f[1]
+		}
+	}
+	return ""
+}
+
+// profileExpectedModelIDs reads ollama.pull.expectedIds from the profile
+// file in the repo: the IDs the profile pins its pulled model tags to.
+func profileExpectedModelIDs() (map[string]string, error) {
+	_, here, _, ok := runtime.Caller(0)
+	if !ok {
+		return nil, errors.New("runtime.Caller failed")
+	}
+	b, err := os.ReadFile(filepath.Join(filepath.Dir(here), "..", "..", "deploy", "helm", "olaitan", "values-full.yaml"))
+	if err != nil {
+		return nil, err
+	}
+	var v struct {
+		Ollama struct {
+			Pull struct {
+				ExpectedIDs map[string]string `yaml:"expectedIds"`
+			} `yaml:"pull"`
+		} `yaml:"ollama"`
+	}
+	if err := yaml.Unmarshal(b, &v); err != nil {
+		return nil, fmt.Errorf("values-full.yaml: %w", err)
+	}
+	return v.Ollama.Pull.ExpectedIDs, nil
+}
+
 // configuredChain reads the analyst configuration of the LIVE release from
 // its own ConfigMap and returns what every role must be attributed to.
 func configuredChain(t *testing.T) realLLMWant {
@@ -403,8 +440,18 @@ func TestRealLLM_RealIncidentOnFullProfile(t *testing.T) {
 		// is then a claim about something that exists, not a label.
 		list := kubectl(t, "exec", "deploy/"+defaultReleaseName+"-ollama", "-n", defaultNamespace, "--", "ollama", "list")
 		t.Logf("ollama list:\n%s", strings.TrimSpace(list))
-		if !strings.Contains(list, want.Model) {
+		got := ollamaListID(list, want.Model)
+		if got == "" {
 			t.Fatalf("the in-cluster Ollama does not hold %q", want.Model)
+		}
+		// And it holds the weights the profile pins, not whatever the
+		// mutable registry tag points at today (review round 1, P6).
+		ids, err := profileExpectedModelIDs()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if exp := ids[want.Model]; exp == "" || got != exp {
+			t.Fatalf("the in-cluster %q has ID %q, want %q (values-full.yaml ollama.pull.expectedIds)", want.Model, got, exp)
 		}
 	}
 

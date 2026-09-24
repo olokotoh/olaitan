@@ -657,6 +657,13 @@ data:
         # an investigation on its own (a rule_match, severity 50 for warning
         # up to 100). off, warning, error, critical, alert or emergency.
         falco_trigger_min_priority: "warning"
+        # Story 10.6: namespaces whose events are dropped before correlation,
+        # so no path (multi-signal, rule, baseline, Falco trigger) ever scores
+        # a workload there. Olaitan's own namespace only: Olaitan must not
+        # investigate itself. kube-system is NOT here on purpose: it is on
+        # response.excluded_namespaces (never isolated) but still detected.
+        never_scored_namespaces:
+          - olaitan
       # Story 1.7: per-source adapter configuration. The audit-webhook
       # receiver is gated on enabled; chart deploys with
       # auditWebhook.enabled=false leave this block at its zero value and

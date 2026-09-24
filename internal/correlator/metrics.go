@@ -91,11 +91,11 @@ func (c *Correlator) registerMetrics(reg *metrics.Registry) error {
 	}
 
 	if err := reg.RegisterCounter(
-		"olaitan_correlator_excluded_events_dropped_total",
+		"olaitan_correlator_never_scored_events_dropped_total",
 		"",
-		"Cumulative events dropped because their pod is in a namespace listed in response.excluded_namespaces (Olaitan's own, kube-system): such a workload is never scored by any path (Story 10.6).",
+		"Cumulative events dropped because their pod is in a namespace listed in detection.correlator.never_scored_namespaces (Olaitan's own): such a workload is never scored by any path (Story 10.6).",
 		nil,
-		func() int64 { return c.excludedEventsDropped.Load() },
+		func() int64 { return c.neverScoredEventsDropped.Load() },
 	); err != nil {
 		return err
 	}

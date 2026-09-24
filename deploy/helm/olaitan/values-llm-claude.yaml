@@ -17,21 +17,29 @@
 # controller runs rules and baselines only (NFR27), loudly, in its log.
 #
 # Every role uses the claude family: trust cap 35, enforced in code. The
-# model is left to the provider's own default; pin one per role with
-# analyst.l1_model / l2_model / senior_model (for example a small model for
-# L1 and L2 and a larger one for Senior). On values-full the in-cluster
-# Ollama stays up and analyst.local.model stays set, so each role falls
-# back to it when Claude is unreachable after the 3-strike retry (FR28).
+# model is pinned (claude-opus-4-8, the provider's own default), so the
+# audit record's model id can be checked against this file; change it per
+# role with analyst.l1_model / l2_model / senior_model (for example a
+# smaller model for L1 and L2). On values-full the in-cluster Ollama stays
+# up and analyst.local.model stays set, so the FR28 fallback to it is
+# CONFIGURED; on CPU it cannot finish, though: the aggregator.extraEnv
+# below replaces values-full's (Helm replaces lists), so the fallback gets
+# this file's hosted budget (60s L1, 60s L2, 120s Senior) against 5 to 10
+# minutes per role for the CPU model. It needs a GPU node, or per-provider
+# budgets (DW10.6-1).
 analyst:
   provider: api
   l1_provider: claude
   l2_provider: claude
   senior_provider: claude
+  l1_model: claude-opus-4-8
+  l2_model: claude-opus-4-8
+  senior_model: claude-opus-4-8
 
 aggregator:
   extraEnv:
     # A hosted model answers in seconds; keep a little slack over the
-    # Claude-calibrated budgets rather than the CPU-model 10x of values-full.
+    # Claude-calibrated budgets rather than the CPU-model 30x of values-full.
     - name: OLT_LLM_ROLE_TIMEOUT_MULTIPLIER
       value: "2"
 

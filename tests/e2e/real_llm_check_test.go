@@ -278,3 +278,29 @@ func TestRealLLMCheckUsesTheFamilyCap(t *testing.T) {
 		t.Fatalf("openai record capped at 25 not rejected for the openai cap:\n%s", strings.Join(p, "\n"))
 	}
 }
+
+// TestOllamaListID (review round 1, P6): the e2e reads the model's ID from
+// `ollama list` and compares it with the ID values-full.yaml pins, so a
+// re-pushed tag fails the proof instead of passing it with other weights.
+func TestOllamaListID(t *testing.T) {
+	list := "NAME                   ID              SIZE      MODIFIED\n" +
+		"qwen2.5:3b-instruct    357c53fb659c    1.9 GB    2 minutes ago\n" +
+		"llama3:latest          0123456789ab    4.7 GB    1 day ago\n"
+	for _, c := range []struct{ model, want string }{
+		{"qwen2.5:3b-instruct", "357c53fb659c"},
+		{"llama3", "0123456789ab"},
+		{"qwen2.5:7b-instruct", ""},
+		{"ID", ""},
+	} {
+		if got := ollamaListID(list, c.model); got != c.want {
+			t.Errorf("ollamaListID(%q) = %q, want %q", c.model, got, c.want)
+		}
+	}
+	ids, err := profileExpectedModelIDs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids["qwen2.5:3b-instruct"] != "357c53fb659c" {
+		t.Errorf("values-full expectedIds = %v, want qwen2.5:3b-instruct pinned to 357c53fb659c", ids)
+	}
+}

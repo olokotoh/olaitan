@@ -210,6 +210,20 @@ data:
     {{- if not (mustRegexFind $pCf $cfg) }}{{- fail (printf "helm bridge: correlator.falco_trigger_min_priority anchor not found (pattern %q)" $pCf) }}{{- end }}
     {{- $cfg = regexReplaceAll $pCf $cfg (printf "${1}falco_trigger_min_priority: %q" (lower .)) }}
     {{- end }}
+    {{- /*
+    Story 10.6: correlator.neverScoreReleaseNamespace appends the release
+    namespace to detection.correlator.never_scored_namespaces unless it is
+    already listed. Deliberately NOT response.excluded_namespaces: that is
+    the never-enforced list and still detected (review round 1, D3).
+    */ -}}
+    {{- if $co.neverScoreReleaseNamespace }}
+    {{- $p := "(\\n    never_scored_namespaces:\\n(?:      - [^\\n]+\\n)+)" -}}
+    {{- $list := mustRegexFind $p $cfg }}
+    {{- if not $list }}{{- fail (printf "helm bridge: detection.correlator.never_scored_namespaces anchor not found (pattern %q)" $p) }}{{- end }}
+    {{- if not (contains (printf "\n      - %s\n" .Release.Namespace) $list) }}
+    {{- $cfg = replace $list (printf "%s      - %s\n" $list .Release.Namespace) $cfg }}
+    {{- end }}
+    {{- end }}
     {{- if hasKey $co "highSeverityThreshold" }}
     {{- $pCh := "(?s)(correlator:.{0,256}?\\n[[:space:]]+)high_severity_threshold:[[:space:]]+[0-9]+" -}}
     {{- if not (mustRegexFind $pCh $cfg) }}{{- fail (printf "helm bridge: correlator.high_severity_threshold anchor not found (pattern %q)" $pCh) }}{{- end }}
@@ -529,18 +543,6 @@ data:
     */ -}}
     {{- if .Values.response }}
     {{- $rsp := .Values.response }}
-    {{- /*
-    Story 10.6: response.excludeReleaseNamespace appends the release
-    namespace to response.excluded_namespaces unless it is already listed.
-    */ -}}
-    {{- if $rsp.excludeReleaseNamespace }}
-    {{- $p := "(\\n  excluded_namespaces:\\n(?:    - [^\\n]+\\n)+)" -}}
-    {{- $list := mustRegexFind $p $cfg }}
-    {{- if not $list }}{{- fail (printf "helm bridge: response.excluded_namespaces anchor not found (pattern %q)" $p) }}{{- end }}
-    {{- if not (contains (printf "\n    - %s\n" .Release.Namespace) $list) }}
-    {{- $cfg = replace $list (printf "%s    - %s\n" $list .Release.Namespace) $cfg }}
-    {{- end }}
-    {{- end }}
     {{- $np := $rsp.networkPolicy | default dict }}
     {{- if hasKey $np "enabled" }}
     {{- $p := "(\\n  network_policy:\\n    enabled: )(?:true|false)" -}}

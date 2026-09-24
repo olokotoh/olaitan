@@ -129,8 +129,8 @@ model family is 25, enforced in code.
 On an 8 vCPU AWS m6i.2xlarge with no GPU, running beside the whole profile,
 `qwen2.5:3b-instruct` reads a prompt at about 17 to 27 tokens/s and writes at
 about 8.5 tokens/s. A chain role's prompt is 8k to 10k tokens, so each role
-spends 6.5 to 8 minutes just reading it: about 7 minutes per role and over 20
-minutes per incident, with incidents queued one after another. That proves
+spends about 5 to 10 minutes just reading it, plus about 35 seconds writing:
+15 to 30 minutes per incident, with incidents queued one after another. That proves
 the tier runs with no key; it does not keep up with a live cluster. For
 real-time use, give Ollama a GPU node, or use a hosted model: layer one
 overlay after the profile and supply the key out of band, in a Secret you
@@ -143,17 +143,20 @@ kubectl -n default create secret generic olaitan-llm-key --from-file=llm-api-key
 ```
 
 (`--set-file secrets.llmApiKey=./key.txt` also works, but then the key is in
-the release's values.) The in-cluster model stays on as the fallback for
-every role. The `fake-llm` fixture is for unit and CI tests only and is not
+the release's values.) The in-cluster model stays configured as the fallback
+for every role, but on CPU that fallback cannot finish: the overlay sets the
+hosted budget (60s to 120s per role) for every provider, the fallback
+included. A working fallback needs a GPU node or per-provider budgets
+(deferred). The `fake-llm` fixture is for unit and CI tests only and is not
 part of any profile. `make e2e-full-real-llm` (in-cluster model) and
 `make e2e-full-real-llm-deepseek` (DeepSeek, key from the Secret above) prove
 the tier on a live cluster: a real in-pod attack, then schema-valid L1, L2
 and Senior output from the model, the configured provider and model recorded
 in `AUDIT.assessments`, and the model's own confidence capped at its family's
 trust cap (ollama 25, openai 30, claude 35). The profile raises the per-role
-LLM timeouts twentyfold for the CPU model, and excludes its own namespace
-(`response.excludeReleaseNamespace`) so Olaitan does not investigate its own
-pods ahead of a real incident. The 3B Qwen2.5 weights are under the Qwen Research licence, so for commercial use
+LLM timeouts thirtyfold for the CPU model, and never scores its own namespace
+(`correlator.neverScoreReleaseNamespace`) so Olaitan does not investigate its
+own pods ahead of a real incident. The 3B Qwen2.5 weights are under the Qwen Research licence, so for commercial use
 switch `analyst.local.model` and `ollama.pull.models` to an Apache-2.0 size
 such as `qwen2.5:7b-instruct`.
 
