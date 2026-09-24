@@ -30,6 +30,35 @@ and false-positive numbers; see [Unreleased](#unreleased).
   cluster. `QUICKSTART_CHART=local` (and `QUICKSTART_IMAGE`) use the
   checkout instead.
 
+- **Stranger-path check on every release and nightly** (Story 12.5, #122).
+  `.github/workflows/stranger.yml` runs `hack/stranger.sh`, which reads
+  README.md when it runs and executes its install block as written, on a
+  fresh kind cluster (kind v0.30.0, current helm, inotify raised): the helm
+  path ("Try it on kind") and the kubectl path (`## Install`, the
+  `install.yaml` commands; skipped only for v1.0.0-rc4 and earlier, which
+  have no `install.yaml`). It then requires every workload rolled out,
+  every pod Ready with a Falco pod among them, and, after a real
+  `cat /etc/shadow` in a throwaway pod, both a Falco alert on that read and
+  an FSM transition for its namespace. Nothing is injected. It runs nightly
+  on main's README, by hand, on PRs that change it, and from `release.yml`
+  on every tag (the tagged commit), after the GitHub Release exists. If it
+  fails, is cancelled or times out there, the run fails, `latest` does not
+  move, and the release is marked failed (pre-release, title and a banner
+  linking the run); marking twice leaves one banner, and a green rerun
+  takes the mark off without clearing a real pre-release. Only a banner at
+  the start of a line counts as a mark, CRLF notes from the web UI are
+  handled, a banner a human edited falls back to the preflight pre-release
+  value, and notes with a begin marker but no end marker are left unchanged
+  and fail the job with an error. The release job sets the title (the tag)
+  explicitly and `unmark-failed` strips a FAILED title even when the notes
+  carry no banner, so "Re-run all jobs" after a mark cannot leave a
+  FAILED-titled release to become Latest. The GitHub
+  Release is created without "Latest" and becomes Latest only in `promote`,
+  after the check passed and only for the highest stable tag. Every failure
+  names its phase (readme, install, infra: cluster / rollout / pull / exec /
+  kubectl logs, product: no Falco alert / no FSM transition) in the log, as
+  an annotation and in the job summary, and kubectl errors are kept.
+
 - **`install.yaml` on every release** (Story 12.4, #121). The release
   workflow renders the chart it publishes, with default values, into one
   file for `kubectl apply -f`, checks that it runs the released image by
