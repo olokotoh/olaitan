@@ -22,16 +22,22 @@
 # in-cluster Ollama stays up and analyst.local.model stays set, so each
 # role falls back to it when DeepSeek is unreachable after the 3-strike
 # retry (FR28), and AUDIT_ASSESSMENTS records which provider answered.
+#
+# Model id: deepseek-flash, the id DeepSeek's /models endpoint lists
+# (DeepSeek-V4.1-Flash). The older `deepseek-chat` still answers, but as an
+# alias: the response names deepseek-flash, and the audit record stores
+# what the vendor says served the call, so a `deepseek-chat` configuration
+# would never match its own provenance (seen live in the Story 10.6 run).
 analyst:
   provider: api
   api:
     endpoint: "https://api.deepseek.com/v1"
   l1_provider: openai
-  l1_model: deepseek-chat
+  l1_model: deepseek-flash
   l2_provider: openai
-  l2_model: deepseek-chat
+  l2_model: deepseek-flash
   senior_provider: openai
-  senior_model: deepseek-chat
+  senior_model: deepseek-flash
 
 aggregator:
   extraEnv:

@@ -624,7 +624,7 @@ e2e-full-real-llm: helm-prepare helm-deps docker-build
 #   kubectl -n default create secret generic olaitan-llm-key \
 #     --from-file=llm-api-key=/dev/stdin < <file holding the key>
 #
-# The test derives the expected provider (openai), model (deepseek-chat) and
+# The test derives the expected provider (openai), model (deepseek-flash) and
 # trust cap (30) from the live release's config, so nothing here names them.
 LLM_KEY_SECRET ?= olaitan-llm-key
 .PHONY: e2e-full-real-llm-deepseek
