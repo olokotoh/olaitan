@@ -30,6 +30,21 @@ and false-positive numbers; see [Unreleased](#unreleased).
   cluster. `QUICKSTART_CHART=local` (and `QUICKSTART_IMAGE`) use the
   checkout instead.
 
+- **Stranger-path check on every release and nightly** (Story 12.5, #122).
+  `.github/workflows/stranger.yml` runs `hack/stranger.sh`, which reads
+  README.md when it runs and executes its install block as written, on a
+  fresh kind cluster (kind v0.30.0, current helm, inotify raised): the helm
+  path ("Try it on kind") and the kubectl path (`## Install`, the
+  `install.yaml` commands; skipped only for v1.0.0-rc4 and earlier, which
+  have no `install.yaml`). It then requires every workload rolled out,
+  every pod Ready with a Falco pod among them, and, after a real
+  `cat /etc/shadow` in a throwaway pod, both a Falco alert on that read and
+  an FSM transition for its namespace. Nothing is injected. It runs nightly
+  on main's README, by hand, on PRs that change it, and from `release.yml`
+  on every tag, after the GitHub Release exists. If it fails there, the
+  run fails, `latest` does not move, and the release is marked failed
+  (pre-release, title and a banner linking the run).
+
 - **`install.yaml` on every release** (Story 12.4, #121). The release
   workflow renders the chart it publishes, with default values, into one
   file for `kubectl apply -f`, checks that it runs the released image by
