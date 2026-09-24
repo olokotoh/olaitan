@@ -292,7 +292,11 @@ func TestStrangerAssertsReadyAndARealAttack(t *testing.T) {
 			text = regexp.MustCompile(`/releases/download/v[^/]+/install\.yaml`).ReplaceAllString(text, "/releases/download/v9.9.9-test/install.yaml")
 		}
 		plan := strangerPlan(t, leg, "STRANGER_README="+writeReadme(t, text))
-		after := plan[strings.Index(plan, "--- README block end"):]
+		end := strings.Index(plan, "--- README block end")
+		if end == -1 {
+			t.Fatalf("%s leg plan has no README block end marker:\n%s", leg, plan)
+		}
+		after := plan[end:]
 		if n := len(strangerRollout.FindAllString(after, -1)); n != 3 {
 			t.Errorf("%s leg: want rollout status for daemonset, deployment and statefulset after the README block, got %d:\n%s", leg, n, after)
 		}
@@ -361,24 +365,29 @@ type workflowDoc struct {
 }
 
 type workflowJob struct {
-	Needs    yaml.Node         `yaml:"needs"`
-	If       string            `yaml:"if"`
-	Uses     string            `yaml:"uses"`
-	With     map[string]string `yaml:"with"`
-	Strategy struct {
+	Needs           yaml.Node         `yaml:"needs"`
+	If              string            `yaml:"if"`
+	Uses            string            `yaml:"uses"`
+	With            map[string]string `yaml:"with"`
+	ContinueOnError *yaml.Node        `yaml:"continue-on-error"`
+	Strategy        struct {
 		FailFast *bool `yaml:"fail-fast"`
 		Matrix   struct {
 			Leg []string `yaml:"leg"`
 		} `yaml:"matrix"`
 	} `yaml:"strategy"`
-	Permissions yaml.Node `yaml:"permissions"`
-	Steps       []struct {
-		Name string            `yaml:"name"`
-		Uses string            `yaml:"uses"`
-		Run  string            `yaml:"run"`
-		With map[string]string `yaml:"with"`
-		If   string            `yaml:"if"`
-	} `yaml:"steps"`
+	Permissions map[string]string `yaml:"permissions"`
+	Steps       []workflowStep    `yaml:"steps"`
+}
+
+type workflowStep struct {
+	Name            string            `yaml:"name"`
+	Uses            string            `yaml:"uses"`
+	Run             string            `yaml:"run"`
+	With            map[string]string `yaml:"with"`
+	Env             map[string]string `yaml:"env"`
+	If              string            `yaml:"if"`
+	ContinueOnError *yaml.Node        `yaml:"continue-on-error"`
 }
 
 func readWorkflow(t *testing.T, name string) (workflowDoc, string) {
@@ -433,6 +442,13 @@ func TestStrangerWorkflow(t *testing.T) {
 		if err := pr.Decode(&spec); err != nil || len(spec.Paths) == 0 {
 			t.Errorf("stranger.yml pull_request trigger must be limited to the job's own files: %v %+v", err, spec)
 		}
+		// hack/stranger.sh sources hack/quickstart.sh (parsers, demo image),
+		// so a change there changes this job too (review F10).
+		for _, want := range []string{".github/workflows/stranger.yml", "hack/stranger.sh", "hack/quickstart.sh"} {
+			if !contains(spec.Paths, want) {
+				t.Errorf("stranger.yml pull_request paths miss %s: %v", want, spec.Paths)
+			}
+		}
 		for _, p := range spec.Paths {
 			if p == "README.md" || p == "**" {
 				t.Errorf("stranger.yml runs on PRs touching %s; a release-cut PR names an unpublished version and would go red", p)
@@ -476,46 +492,621 @@ func TestStrangerWorkflow(t *testing.T) {
 	}
 }
 
-// TestReleaseIsMarkedFailedWithoutTheStrangerJob (AC3, D4): the Release
-// workflow runs the stranger job after the GitHub Release exists, `latest`
-// waits for it, and a failure edits the release to say so.
-func TestReleaseIsMarkedFailedWithoutTheStrangerJob(t *testing.T) {
-	wf, _ := readWorkflow(t, "release.yml")
-	s, ok := wf.Jobs["stranger"]
-	if !ok {
-		t.Fatal("release.yml has no `stranger` job")
+// ---------------------------------------------------------------------------
+// GitHub Actions `if:` semantics, enough to evaluate the release job graph.
+// The review (F3) found that string matching let three mutations through
+// (always() removed from mark-failed, always() added to promote, `|| true`
+// on the stranger step). These tests decide what each job DOES for a given
+// stranger result instead of what its text contains.
+// ---------------------------------------------------------------------------
+
+// ghaStatusFn is a status check function; a job `if:` without one gets an
+// implicit success() && in front (GitHub's rule).
+var ghaStatusFn = regexp.MustCompile(`\b(always|success|failure|cancelled)\(\)`)
+
+// ghaCtx is what an `if:` can see: status functions and context values.
+type ghaCtx struct {
+	success, failure, cancelled bool
+	values                      map[string]string // e.g. needs.stranger.result
+}
+
+type ghaVal struct {
+	isBool bool
+	b      bool
+	s      string
+}
+
+func (v ghaVal) truthy() bool {
+	if v.isBool {
+		return v.b
 	}
+	return v.s != ""
+}
+
+func (v ghaVal) str() string {
+	if v.isBool {
+		return fmt.Sprint(v.b)
+	}
+	return v.s
+}
+
+var ghaToken = regexp.MustCompile(`\s*(\$\{\{|\}\}|==|!=|&&|\|\||!|\(|\)|'(?:[^']|'')*'|[A-Za-z_][A-Za-z0-9_.-]*)`)
+
+type ghaParser struct {
+	toks []string
+	pos  int
+	ctx  ghaCtx
+	err  error
+}
+
+func (p *ghaParser) peek() string {
+	if p.pos < len(p.toks) {
+		return p.toks[p.pos]
+	}
+	return ""
+}
+
+func (p *ghaParser) next() string {
+	t := p.peek()
+	p.pos++
+	return t
+}
+
+func (p *ghaParser) fail(format string, a ...any) ghaVal {
+	if p.err == nil {
+		p.err = fmt.Errorf(format, a...)
+	}
+	return ghaVal{}
+}
+
+func (p *ghaParser) or() ghaVal {
+	v := p.and()
+	for p.peek() == "||" {
+		p.next()
+		r := p.and()
+		v = ghaVal{isBool: true, b: v.truthy() || r.truthy()}
+	}
+	return v
+}
+
+func (p *ghaParser) and() ghaVal {
+	v := p.cmp()
+	for p.peek() == "&&" {
+		p.next()
+		r := p.cmp()
+		v = ghaVal{isBool: true, b: v.truthy() && r.truthy()}
+	}
+	return v
+}
+
+func (p *ghaParser) cmp() ghaVal {
+	v := p.unary()
+	if op := p.peek(); op == "==" || op == "!=" {
+		p.next()
+		r := p.unary()
+		eq := strings.EqualFold(v.str(), r.str())
+		return ghaVal{isBool: true, b: eq == (op == "==")}
+	}
+	return v
+}
+
+func (p *ghaParser) unary() ghaVal {
+	if p.peek() == "!" {
+		p.next()
+		return ghaVal{isBool: true, b: !p.unary().truthy()}
+	}
+	return p.primary()
+}
+
+func (p *ghaParser) primary() ghaVal {
+	t := p.next()
+	switch {
+	case t == "(":
+		v := p.or()
+		if p.next() != ")" {
+			return p.fail("missing )")
+		}
+		return v
+	case strings.HasPrefix(t, "'"):
+		return ghaVal{s: strings.ReplaceAll(t[1:len(t)-1], "''", "'")}
+	case t == "true" || t == "false":
+		return ghaVal{isBool: true, b: t == "true"}
+	case p.peek() == "(":
+		p.next()
+		if p.next() != ")" {
+			return p.fail("function %s takes no arguments here", t)
+		}
+		switch t {
+		case "always":
+			return ghaVal{isBool: true, b: true}
+		case "success":
+			return ghaVal{isBool: true, b: p.ctx.success}
+		case "failure":
+			return ghaVal{isBool: true, b: p.ctx.failure}
+		case "cancelled":
+			return ghaVal{isBool: true, b: p.ctx.cancelled}
+		}
+		return p.fail("unknown function %s()", t)
+	case t != "":
+		v, ok := p.ctx.values[t]
+		if !ok {
+			return p.fail("unknown context value %s", t)
+		}
+		return ghaVal{s: v}
+	}
+	return p.fail("unexpected end of expression")
+}
+
+// ghaRuns reports whether a job or step with this `if:` runs in ctx.
+func ghaRuns(expr string, ctx ghaCtx) (bool, error) {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return ctx.success, nil
+	}
+	var toks []string
+	rest := expr
+	for strings.TrimSpace(rest) != "" {
+		m := ghaToken.FindStringSubmatchIndex(rest)
+		if m == nil || m[0] != 0 {
+			return false, fmt.Errorf("cannot tokenize %q at %q", expr, rest)
+		}
+		tok := rest[m[2]:m[3]]
+		rest = rest[m[1]:]
+		if tok == "${{" || tok == "}}" {
+			continue
+		}
+		toks = append(toks, tok)
+	}
+	p := &ghaParser{toks: toks, ctx: ctx}
+	v := p.or()
+	if p.err == nil && p.pos != len(toks) {
+		p.err = fmt.Errorf("trailing tokens in %q", expr)
+	}
+	if p.err != nil {
+		return false, p.err
+	}
+	if !ghaStatusFn.MatchString(expr) {
+		return ctx.success && v.truthy(), nil
+	}
+	return v.truthy(), nil
+}
+
+// jobRunsFor evaluates job `name` of release.yml when every job before the
+// stranger check succeeded and the stranger job ended with `stranger`.
+func jobRunsFor(t *testing.T, wf workflowDoc, name, stranger, promoteLatest string) bool {
+	t.Helper()
+	j, ok := wf.Jobs[name]
+	if !ok {
+		t.Fatalf("release.yml has no job %q", name)
+	}
+	results := map[string]string{"stranger": stranger}
+	ctx := ghaCtx{success: true, cancelled: stranger == "cancelled", values: map[string]string{}}
+	for _, n := range needsList(j.Needs) {
+		r, ok := results[n]
+		if !ok {
+			r = "success"
+		}
+		ctx.values["needs."+n+".result"] = r
+		if r != "success" {
+			ctx.success = false
+		}
+		if r == "failure" {
+			ctx.failure = true
+		}
+	}
+	if contains(needsList(j.Needs), "preflight") {
+		ctx.values["needs.preflight.outputs.promote_latest"] = promoteLatest
+		ctx.values["needs.preflight.outputs.prerelease"] = map[string]string{"true": "false", "false": "true"}[promoteLatest]
+	}
+	run, err := ghaRuns(j.If, ctx)
+	if err != nil {
+		t.Fatalf("release.yml job %s if %q: %v", name, j.If, err)
+	}
+	return run
+}
+
+// TestGhaIfEvaluator pins the evaluator itself against GitHub's documented
+// rules, so the graph tests below cannot pass because it is wrong.
+func TestGhaIfEvaluator(t *testing.T) {
+	ok := ghaCtx{success: true, values: map[string]string{"needs.a.result": "success"}}
+	bad := ghaCtx{failure: true, values: map[string]string{"needs.a.result": "failure"}}
+	cases := []struct {
+		expr string
+		ctx  ghaCtx
+		want bool
+	}{
+		{"", ok, true},
+		{"", bad, false},
+		{"needs.a.result == 'failure'", bad, false}, // implicit success() &&
+		{"always() && needs.a.result == 'failure'", bad, true},
+		{"${{ always() && needs.a.result != 'success' }}", bad, true},
+		{"always() && needs.a.result != 'success'", ok, false},
+		{"failure() || cancelled()", bad, true},
+		{"failure() || cancelled()", ok, false},
+		{"!cancelled() && (needs.a.result == 'SUCCESS')", ok, true},
+	}
+	for _, c := range cases {
+		got, err := ghaRuns(c.expr, c.ctx)
+		if err != nil || got != c.want {
+			t.Errorf("ghaRuns(%q) = %v, %v; want %v", c.expr, got, err, c.want)
+		}
+	}
+	if _, err := ghaRuns("needs.b.result == 'x'", ok); err == nil {
+		t.Error("an unknown context value must be an error, not an empty string")
+	}
+}
+
+// TestReleaseGatesOnTheStrangerResult (AC3, D4; review F1, F3): for each way
+// the stranger job can end, which release jobs run. mark-failed must run on
+// failure AND on cancellation or timeout; promote (moves `latest`) and
+// unmark-failed must run only on success.
+func TestReleaseGatesOnTheStrangerResult(t *testing.T) {
+	wf, _ := readWorkflow(t, "release.yml")
+	for _, name := range []string{"promote", "mark-failed", "unmark-failed"} {
+		if !contains(needsList(wf.Jobs[name].Needs), "stranger") {
+			t.Errorf("job %s must need stranger, needs %v", name, needsList(wf.Jobs[name].Needs))
+		}
+	}
+	if !strings.Contains(wf.Jobs["mark-failed"].If, "always()") {
+		t.Errorf("mark-failed must use always() so it runs after a failed or cancelled stranger job: %q", wf.Jobs["mark-failed"].If)
+	}
+	if m := ghaStatusFn.FindString(wf.Jobs["promote"].If); m != "" && m != "success()" {
+		t.Errorf("promote must not use %s: `latest` would move after a failed stranger check: %q", m, wf.Jobs["promote"].If)
+	}
+	for _, r := range []string{"success", "failure", "cancelled"} {
+		pass := r == "success"
+		if got := jobRunsFor(t, wf, "mark-failed", r, "true"); got == pass {
+			t.Errorf("stranger %s: mark-failed runs=%v, want %v", r, got, !pass)
+		}
+		if got := jobRunsFor(t, wf, "promote", r, "true"); got != pass {
+			t.Errorf("stranger %s: promote (moves `latest`) runs=%v, want %v", r, got, pass)
+		}
+		if got := jobRunsFor(t, wf, "unmark-failed", r, "true"); got != pass {
+			t.Errorf("stranger %s: unmark-failed runs=%v, want %v", r, got, pass)
+		}
+	}
+	// A backport or an rc never takes `latest`, stranger green or not.
+	if jobRunsFor(t, wf, "promote", "success", "false") {
+		t.Error("promote runs when preflight said this tag may not take `latest` (backport or pre-release)")
+	}
+	s := wf.Jobs["stranger"]
 	if s.Uses != "./.github/workflows/stranger.yml" {
 		t.Errorf("release.yml stranger job uses %q, want ./.github/workflows/stranger.yml", s.Uses)
 	}
 	if !contains(needsList(s.Needs), "release") {
 		t.Errorf("stranger job must run after `release` (the kubectl leg downloads its install.yaml), needs %v", needsList(s.Needs))
 	}
-	if !strings.Contains(s.With["expect_version"], "needs.preflight.outputs.version") || !strings.Contains(s.With["ref"], "github.ref_name") {
-		t.Errorf("stranger job must test the tag's README at the tag's version, with: %v", s.With)
+	// Review F2: the tagged commit itself, not a name that can be re-pointed.
+	if strings.TrimSpace(s.With["ref"]) != "${{ github.sha }}" || !strings.Contains(s.With["expect_version"], "needs.preflight.outputs.version") {
+		t.Errorf("stranger job must test the tagged commit (ref: ${{ github.sha }}) at the tag's version, with: %v", s.With)
 	}
-	if p, ok := wf.Jobs["promote"]; !ok || !contains(needsList(p.Needs), "stranger") {
-		t.Error("promote (moves `latest`) must need the stranger job")
+	if s.ContinueOnError != nil {
+		t.Error("release.yml stranger job has continue-on-error; its failure must fail the release run")
 	}
-	var marker string
-	for name, j := range wf.Jobs {
-		if strings.Contains(j.If, "needs.stranger.result == 'failure'") {
-			marker = name
-			var edits bool
-			for _, st := range j.Steps {
-				if strings.Contains(st.Run, "gh release edit") && strings.Contains(st.Run, "--prerelease") && strings.Contains(st.Run, "FAILED stranger-path check") {
-					edits = true
-				}
+}
+
+// TestStrangerCannotBeSwallowed (review F3): nothing that decides the
+// stranger job's result may ignore a failure. A step that runs while the
+// job is still green is a deciding step; the diagnostics step (failure or
+// cancellation only) is not.
+func TestStrangerCannotBeSwallowed(t *testing.T) {
+	wf, _ := readWorkflow(t, "stranger.yml")
+	job := wf.Jobs["stranger"]
+	if job.ContinueOnError != nil {
+		t.Error("stranger job has continue-on-error")
+	}
+	swallow := regexp.MustCompile(`\|\|\s*(true|:|exit 0)\b|set \+e|\|\|\s*:\s*$`)
+	var diag bool
+	for i, st := range job.Steps {
+		green, err := ghaRuns(st.If, ghaCtx{success: true, values: map[string]string{}})
+		if err != nil {
+			t.Fatalf("step %d (%s) if %q: %v", i, st.Name, st.If, err)
+		}
+		failed, _ := ghaRuns(st.If, ghaCtx{failure: true, values: map[string]string{}})
+		cancelled, _ := ghaRuns(st.If, ghaCtx{cancelled: true, values: map[string]string{}})
+		if !green {
+			if strings.Contains(st.Run, "kubectl") {
+				// Review F9: diagnostics on failure AND on cancel/timeout, and
+				// for the attack namespace too.
+				diag = failed && cancelled && strings.Contains(st.Run, "olaitan-stranger")
 			}
-			if !edits {
-				t.Errorf("job %s runs on a stranger failure but does not edit the release (gh release edit --prerelease, title FAILED stranger-path check)", name)
-			}
-			if !contains(needsList(j.Needs), "stranger") {
-				t.Errorf("job %s must need stranger", name)
+			continue
+		}
+		if st.ContinueOnError != nil {
+			t.Errorf("step %d (%s) decides the job's result and has continue-on-error", i, st.Name)
+		}
+		if loc := swallow.FindString(st.Run); loc != "" {
+			t.Errorf("step %d (%s) decides the job's result and swallows a failure with %q:\n%s", i, st.Name, loc, st.Run)
+		}
+	}
+	if !diag {
+		t.Error("stranger.yml needs a diagnostics step that runs on failure() || cancelled() and covers olaitan-stranger")
+	}
+	raw, err := os.ReadFile(strangerScript(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, line := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		if loc := swallow.FindString(line); loc != "" {
+			t.Errorf("hack/stranger.sh:%d swallows a failure with %q: %s", i+1, loc, strings.TrimSpace(line))
+		}
+		// Review F5: kubectl's own error is the evidence of an infra fault.
+		if strings.Contains(line, "kubectl") && strings.Contains(line, "2>/dev/null") {
+			t.Errorf("hack/stranger.sh:%d hides kubectl's stderr: %s", i+1, strings.TrimSpace(line))
+		}
+	}
+}
+
+// strangerFn sources hack/stranger.sh (main does not run), defines shell
+// functions (a kubectl shim, say) and runs body; it returns output and err.
+func strangerFn(t *testing.T, prelude, body string, env ...string) (string, error) {
+	t.Helper()
+	cmd := exec.Command("bash", "-c", `source "$1"; `+prelude+"\n"+body, "stranger-test", strangerScript(t))
+	cmd.Env = strangerEnv(env...)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// TestStrangerRolloutFailsWhenKubectlGetFails (review F7): a failing
+// `kubectl get` must stop the check, not be an empty list of workloads.
+func TestStrangerRolloutFailsWhenKubectlGetFails(t *testing.T) {
+	out, err := strangerFn(t, `kubectl() { echo "kubectl: connection refused" >&2; return 3; }`, `st_rollout daemonset; echo REACHED`)
+	if err == nil || strings.Contains(out, "REACHED") {
+		t.Errorf("st_rollout carried on after kubectl get failed (err %v):\n%s", err, out)
+	}
+	if !strings.Contains(out, "infra: rollout") || !strings.Contains(out, "connection refused") {
+		t.Errorf("st_rollout failure must name its phase (infra: rollout) and keep kubectl's error:\n%s", out)
+	}
+}
+
+// TestStrangerKeepsKubectlLogErrors (review F5): a failing `kubectl logs`
+// is an infra fault, reported as one with kubectl's error and exit code,
+// never read as "no alert yet".
+func TestStrangerKeepsKubectlLogErrors(t *testing.T) {
+	shim := `kubectl() { echo "error: You must be logged in to the server" >&2; return 7; }`
+	for _, fn := range []string{"st_aggregator_logs", "st_falco_logs"} {
+		out, err := strangerFn(t, shim, `set +e; `+fn+`; echo "rc=$?"`)
+		if err != nil {
+			t.Fatalf("%s: %v\n%s", fn, err, out)
+		}
+		if !strings.Contains(out, "rc=7") || !strings.Contains(out, "You must be logged in") {
+			t.Errorf("%s swallowed kubectl's error or exit code:\n%s", fn, out)
+		}
+	}
+	raw, err := os.ReadFile(strangerScript(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range []string{"infra: cluster", "infra: rollout", "infra: pull", "infra: kubectl logs", "product: no Falco alert", "product: no FSM transition"} {
+		if !strings.Contains(string(raw), phase) {
+			t.Errorf("hack/stranger.sh has no failure message for phase %q", phase)
+		}
+	}
+}
+
+// TestStrangerWarnsWhenKubectlLegIsSkipped (review F4): a skip is visible
+// in the run's annotations and summary, not only in the log.
+func TestStrangerWarnsWhenKubectlLegIsSkipped(t *testing.T) {
+	text := regexp.MustCompile(`/releases/download/v[^/]+/install\.yaml`).ReplaceAllString(readmeText(t), "/releases/download/v1.0.0-rc4/install.yaml")
+	summary := filepath.Join(t.TempDir(), "summary.md")
+	out := strangerPlan(t, "kubectl", "STRANGER_README="+writeReadme(t, text), "GITHUB_STEP_SUMMARY="+summary)
+	if !strings.Contains(out, "::warning") || !strings.Contains(out, "skipped") {
+		t.Errorf("kubectl skip for rc4 emits no ::warning:: annotation:\n%s", out)
+	}
+	got, err := os.ReadFile(summary)
+	if err != nil || !strings.Contains(string(got), "skipped") {
+		t.Errorf("kubectl skip for rc4 wrote nothing to $GITHUB_STEP_SUMMARY (%v): %q", err, got)
+	}
+	// Without GITHUB_STEP_SUMMARY (a local run) it still works.
+	strangerPlan(t, "kubectl", "STRANGER_README="+writeReadme(t, text))
+}
+
+// TestStrangerReadsTheVersionFromTheHelmInstallOnly (review F6): a
+// `--version` in a comment or another command is not the version installed.
+func TestStrangerReadsTheVersionFromTheHelmInstallOnly(t *testing.T) {
+	v := chartVersion(t)
+	install := "helm install olaitan " + publishedChartRef + " \\\n"
+	unpinned := strings.Replace(readmeText(t),
+		"kind create cluster --name olaitan\n"+install+"  --version "+v+" \\\n",
+		"kind create cluster --name olaitan\n# pin it with --version "+v+" if you like\n"+install, 1)
+	block, err := readmeBashBlock(unpinned, strangerHelmHeading, 1)
+	if err != nil || !strings.Contains(block, "# pin it with --version") || strings.Contains(block, "  --version "+v) {
+		t.Fatalf("could not build the unpinned README variant (%v):\n%s", err, block)
+	}
+	if out, err := strangerRun(t, "helm", "STRANGER_README="+writeReadme(t, unpinned)); err == nil {
+		t.Errorf("an unpinned helm install passed because a comment names --version:\n%s", out)
+	}
+	// The pinned README still reads its version from the install line.
+	if out := strangerPlan(t, "helm"); !strings.Contains(out, "version "+v) {
+		t.Errorf("helm leg does not report version %s:\n%s", v, out)
+	}
+}
+
+// ghShim is a fake `gh` for the mark/unmark scripts: one release, held in
+// files under dir (body, name, pre), and a log of every edit.
+const ghShim = `#!/usr/bin/env bash
+set -euo pipefail
+d="$GH_SHIM_DIR"
+[ "$1 $2" = "release view" ] && {
+	case "$*" in
+	*"--json body"*) cat "$d/body"; echo ;;
+	*"--json name"*) cat "$d/name"; echo ;;
+	*"--json isPrerelease"*) cat "$d/pre"; echo ;;
+	*) echo "shim: unsupported view: $*" >&2; exit 2 ;;
+	esac
+	exit 0
+}
+[ "$1 $2" = "release edit" ] || { echo "shim: unsupported: $*" >&2; exit 2; }
+echo "edit $*" >> "$d/edits"
+shift 3
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-R) shift ;;
+	--prerelease|--prerelease=true) echo -n true > "$d/pre" ;;
+	--prerelease=false) echo -n false > "$d/pre" ;;
+	--latest|--latest=true|--latest=false) ;;
+	--title) shift; printf '%s' "$1" > "$d/name" ;;
+	--notes-file) shift; cp "$1" "$d/body" ;;
+	*) echo "shim: unsupported flag $1" >&2; exit 2 ;;
+	esac
+	shift
+done
+`
+
+// releaseStepScript returns the run script of the step in job that edits the
+// release, and that step's env keys.
+func releaseStepScript(t *testing.T, wf workflowDoc, job string) (string, map[string]string) {
+	t.Helper()
+	for _, st := range wf.Jobs[job].Steps {
+		if strings.Contains(st.Run, "gh release edit") {
+			return st.Run, st.Env
+		}
+	}
+	t.Fatalf("release.yml job %s has no step that runs gh release edit", job)
+	return "", nil
+}
+
+type shimRelease struct{ dir string }
+
+func newShimRelease(t *testing.T, name, body, pre string) shimRelease {
+	t.Helper()
+	d := t.TempDir()
+	for f, v := range map[string]string{"name": name, "body": body, "pre": pre} {
+		if err := os.WriteFile(filepath.Join(d, f), []byte(v), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bin := filepath.Join(d, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "gh"), []byte(ghShim), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return shimRelease{dir: d}
+}
+
+func (r shimRelease) get(t *testing.T, f string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(r.dir, f))
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func (r shimRelease) run(t *testing.T, script string, env map[string]string, prerelease string) {
+	t.Helper()
+	for _, k := range []string{"TAG", "REPO"} {
+		if _, ok := env[k]; !ok {
+			t.Fatalf("release edit step has no env %s", k)
+		}
+	}
+	work := t.TempDir()
+	cmd := exec.Command("bash", "-e", "-o", "pipefail", "-c", script)
+	cmd.Dir = work
+	cmd.Env = append(os.Environ(),
+		"PATH="+filepath.Join(r.dir, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"GH_SHIM_DIR="+r.dir, "TAG=v9.9.9", "REPO=o/r", "PRERELEASE="+prerelease,
+		"RUN_URL=https://github.com/o/r/actions/runs/1", "GH_TOKEN=unused")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("release edit script failed: %v\n%s\n--- script\n%s", err, out, script)
+	}
+}
+
+// TestReleaseMarkAndUnmarkAreIdempotent (review F11): marking twice leaves
+// one banner and one title suffix; a later green rerun restores title and
+// notes, and clears the pre-release flag only when the mark set it (a real
+// rc stays a pre-release). Both scripts run against a fake `gh`.
+func TestReleaseMarkAndUnmarkAreIdempotent(t *testing.T) {
+	wf, _ := readWorkflow(t, "release.yml")
+	mark, markEnv := releaseStepScript(t, wf, "mark-failed")
+	unmark, unmarkEnv := releaseStepScript(t, wf, "unmark-failed")
+	const notes = "## Install\n\nhelm install ...\n\n## Verify\n"
+	for _, c := range []struct{ pre, prerelease string }{{"false", "false"}, {"true", "true"}} {
+		r := newShimRelease(t, "v9.9.9", notes, c.pre)
+		r.run(t, mark, markEnv, c.prerelease)
+		r.run(t, mark, markEnv, c.prerelease) // a second failed attempt
+		body, name := r.get(t, "body"), r.get(t, "name")
+		if n := strings.Count(body, "FAILED the stranger-path check"); n != 1 {
+			t.Errorf("pre=%s: after two marks the notes carry %d banners, want 1:\n%s", c.pre, n, body)
+		}
+		if name != "v9.9.9 (FAILED stranger-path check)" {
+			t.Errorf("pre=%s: after two marks the title is %q", c.pre, name)
+		}
+		if r.get(t, "pre") != "true" || !strings.HasSuffix(strings.TrimRight(body, "\n"), strings.TrimRight(notes, "\n")) {
+			t.Errorf("pre=%s: a marked release must be a pre-release that keeps its notes: pre=%s\n%s", c.pre, r.get(t, "pre"), body)
+		}
+		if strings.Contains(r.get(t, "edits"), "--latest ") || strings.HasSuffix(strings.TrimSpace(r.get(t, "edits")), "--latest") {
+			t.Errorf("pre=%s: mark-failed must never set latest: %s", c.pre, r.get(t, "edits"))
+		}
+		r.run(t, unmark, unmarkEnv, c.prerelease)
+		if got := r.get(t, "name"); got != "v9.9.9" {
+			t.Errorf("pre=%s: unmark left title %q", c.pre, got)
+		}
+		if got := strings.TrimRight(r.get(t, "body"), "\n"); got != strings.TrimRight(notes, "\n") {
+			t.Errorf("pre=%s: unmark left notes:\n%q\nwant\n%q", c.pre, got, notes)
+		}
+		if got := r.get(t, "pre"); got != c.pre {
+			t.Errorf("pre=%s: after unmark the pre-release flag is %s; unmark must restore what was there before the mark", c.pre, got)
+		}
+		// Unmarking a release that was never marked changes nothing.
+		edits := r.get(t, "edits")
+		r.run(t, unmark, unmarkEnv, c.prerelease)
+		if r.get(t, "edits") != edits {
+			t.Errorf("pre=%s: unmark edited a release that was not marked", c.pre)
+		}
+	}
+}
+
+// TestReleaseLatestOnlyAfterTheStrangerPasses (review F12, CoS default
+// pending Aslim): the GitHub Release is created without "Latest", and only
+// promote, which needs the stranger job and runs only for the highest stable
+// tag (backports and rcs never), marks it Latest.
+func TestReleaseLatestOnlyAfterTheStrangerPasses(t *testing.T) {
+	wf, _ := readWorkflow(t, "release.yml")
+	var created bool
+	for _, st := range wf.Jobs["release"].Steps {
+		if strings.HasPrefix(st.Uses, "softprops/action-gh-release@") {
+			created = true
+			if st.With["make_latest"] != "false" {
+				t.Errorf("release creates the GitHub Release with make_latest %q, want 'false' (it would show Latest before the stranger check)", st.With["make_latest"])
 			}
 		}
 	}
-	if marker == "" {
-		t.Error("release.yml has no job that runs when needs.stranger.result == 'failure'")
+	if !created {
+		t.Fatal("release job has no softprops/action-gh-release step")
+	}
+	p := wf.Jobs["promote"]
+	if !strings.Contains(p.If, "needs.preflight.outputs.promote_latest == 'true'") {
+		t.Errorf("promote must still be gated on promote_latest (backports and rcs never take latest): %q", p.If)
+	}
+	if p.Permissions["contents"] != "write" {
+		t.Errorf("promote needs contents: write to mark the GitHub Release Latest, has %v", p.Permissions)
+	}
+	var sets bool
+	for _, st := range p.Steps {
+		if regexp.MustCompile(`gh release edit\b[^\n]*--latest(\s|$)`).MatchString(st.Run) {
+			sets = true
+		}
+	}
+	if !sets {
+		t.Error("promote does not mark the GitHub Release Latest (gh release edit ... --latest)")
+	}
+	if !contains(needsList(p.Needs), "unmark-failed") {
+		t.Error("promote must run after unmark-failed: a release still flagged pre-release cannot be marked Latest")
+	}
+	for name, j := range wf.Jobs {
+		if name == "promote" {
+			continue
+		}
+		for _, st := range j.Steps {
+			if regexp.MustCompile(`--latest(=true)?(\s|$)`).MatchString(st.Run) {
+				t.Errorf("job %s marks a release Latest; only promote may", name)
+			}
+		}
 	}
 }
