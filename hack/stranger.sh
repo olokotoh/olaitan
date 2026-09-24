@@ -43,7 +43,7 @@ ST_ATTEMPTS=8
 ST_ATTEMPT_GAP=15
 ST_POLL=5
 # Releases cut before install.yaml was a release asset (Story 12.4).
-ST_NO_MANIFEST="1.0.0-rc1 1.0.0-rc2 1.0.0-rc3"
+ST_NO_MANIFEST="1.0.0-rc1 1.0.0-rc2 1.0.0-rc3 1.0.0-rc4"
 ST_HELM_MARK="helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan"
 ST_KUBECTL_MARK="kubectl apply -f https://github.com/olokotoh/olaitan/releases/download/"
 
@@ -161,14 +161,6 @@ main() {
 		st_run kind create cluster --name "$ST_CLUSTER"
 	fi
 
-	if [ "$leg" = kubectl ]; then
-		# THROWAWAY: rc4 has no install.yaml asset; render one from the
-		# published rc4 chart with the release's own script, in place of the URL.
-		mkdir -p /tmp/st
-		helm pull oci://ghcr.io/olokotoh/charts/olaitan --version "$version" -d /tmp/st
-		"$ST_ROOT/hack/render-install-manifest.sh" "/tmp/st/olaitan-$version.tgz" /tmp/st/install.yaml
-		block="${block//"https://github.com/olokotoh/olaitan/releases/download/v$version/install.yaml"//tmp/st/install.yaml}"
-	fi
 	st_say "running the README block as written"
 	echo "--- README block begin"
 	printf '%s\n' "$block"
