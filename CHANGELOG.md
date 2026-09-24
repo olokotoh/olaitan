@@ -23,7 +23,7 @@ and false-positive numbers; see [Unreleased](#unreleased).
 The first release since rc3 that installs with the README command and no
 flags. On rc3 that command failed (#96 and the Falco driver, below); rc4 was
 verified before release on a fresh single-node kind with the chart packaged
-the way the release packages it. The verification output is in PR #174.
+the way the release packages it. The verification output is in the pull request that cut it (Story 12.1).
 
 ### Added
 

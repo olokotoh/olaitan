@@ -72,26 +72,28 @@ Both waits are needed. `kubectl wait` only sees pods that already exist, so
 straight after a plain `helm install` it fails with `no matching resources
 found`. `helm --wait` makes sure every pod exists, but it counts a DaemonSet
 as ready with one pod unavailable, so on one node it can return while the
-collector is still restarting (it restarts until NATS is up). The
-`kubectl wait` after it is the real check.
+collector is still restarting (the collector and the aggregator restart a
+few times until NATS is up). The `kubectl wait` after it is the real check.
 
 That is the whole default install, Falco included: on a single-node cluster,
 six pods (Falco and the collector, one each per node; the aggregator; NATS;
 nats-box; Redis). Before release, this sequence
-was run word for word on a fresh single-node kind (kind v0.30.0, Ubuntu 24.04
-host, kernel with BTF) with the chart packaged the way the release packages
-it, and every pod was Ready in RESULT_TIME. Two things can stop it on your
+was run word for word on a fresh single-node kind (kind v0.30.0, node image
+v1.34.0, a 4 vCPU Ubuntu 24.04 host on kernel 7.0 with BTF), with the chart
+packaged the way the release packages it and the image loaded into kind
+instead of pulled. Every pod was Ready 102 seconds after `kind create
+cluster` started, Falco reported healthy a minute later, and `cat
+/etc/shadow` in a pod moved it to SUSPICIOUS. Two things can stop it on your
 machine:
 
 - **Falco needs BTF** (`/sys/kernel/btf/vmlinux` exists on the host). Most
   current distribution kernels have it; see [Limitations](#limitations).
-- **inotify limits.** kind nodes share the host's
-  `fs.inotify.max_user_instances`, and the default of 128 runs out with a
-  few clusters up; pods then fail with `too many open files`. The
-  verification host ran with `max_user_instances=1024` and
-  `max_user_watches=1048576`, which is kind's own
-  [known-issues](https://kind.sigs.k8s.io/docs/user/known-issues/#pod-errors-due-to-too-many-open-files)
-  advice.
+- **inotify limits.** kind nodes share the host's inotify limits, and kind's
+  own [known issues](https://kind.sigs.k8s.io/docs/user/known-issues/#pod-errors-due-to-too-many-open-files)
+  page says pods can fail with `too many open files` when they run out. The
+  verification host ran with `fs.inotify.max_user_instances=1024` and
+  `fs.inotify.max_user_watches=1048576` (that page has the `sysctl`
+  commands); it was not tried with the distribution defaults.
 
 On kind NetworkPolicies are accepted and ignored (kindnet does not enforce
 them), which is one reason enforcement is off by default; see below.
