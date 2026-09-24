@@ -1,6 +1,7 @@
 # Amazon EKS (EC2 node groups) overlay.
 #
 #   helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan \
+#     --version 1.0.0-rc4 \
 #     -f values-eks.yaml --namespace olaitan --create-namespace
 #
 # Deltas only. Every line states why, from docs/platform-support-matrix.md

@@ -112,6 +112,17 @@ jobs:
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # The README installs `--version <Chart.yaml version>` (a helm test
+      # ties the two), so a tag that differs from Chart.yaml would publish
+      # a chart the README never names. Story 12.1 review, D1.
+      - name: Require the tag to be the tree's chart version
+        shell: bash
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          hack/check-release-version.sh "$REF_NAME"
+
       - name: Require the tag to sit on main
         shell: bash
         env:

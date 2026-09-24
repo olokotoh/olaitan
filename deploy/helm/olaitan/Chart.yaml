@@ -3,9 +3,12 @@ name: olaitan
 description: Olaitan — LLM-powered autonomous K8s security agent
 type: application
 
-# Chart version: bumped on every chart-schema change. Independent of the
-# application (binary) version — appVersion tracks the Olaitan binary.
-version: 0.1.0
+# Chart version: the release this tree is heading for. The release workflow
+# overwrites it (and appVersion) from the git tag when it packages the chart,
+# so it only shows in a chart packaged straight from the tree. Story 12.1 moved
+# it from 0.1.0, which no published chart ever carried, to the next release.
+version: 1.0.0-rc4
+# appVersion deliberately stays "edge" (Story 12.1, D2): see below.
 # The image tag used when values.yaml leaves image.tag empty (see the
 # "olaitan.image" helper). The release workflow overwrites BOTH fields from the
 # git tag at package time, so this value only governs installs straight from the

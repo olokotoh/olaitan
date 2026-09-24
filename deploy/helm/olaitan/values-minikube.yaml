@@ -1,6 +1,7 @@
 # minikube overlay (local evaluation).
 #
 #   helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan \
+#     --version 1.0.0-rc4 \
 #     -f values-minikube.yaml --namespace olaitan --create-namespace
 #
 # Deltas only. Template-verified, NOT verified.

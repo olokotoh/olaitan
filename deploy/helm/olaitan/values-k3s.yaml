@@ -1,6 +1,7 @@
 # k3s / k3d overlay.
 #
 #   helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan \
+#     --version 1.0.0-rc4 \
 #     -f values-k3s.yaml --namespace olaitan --create-namespace
 #
 # Deltas only. Template-verified, NOT verified.

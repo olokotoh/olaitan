@@ -250,5 +250,6 @@ else
 fi
 echo
 echo "Install:  ${B}helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan \\"
+echo "            --version 1.0.0-rc4 \\"
 echo "            --namespace olaitan --create-namespace${X}"
 exit 0

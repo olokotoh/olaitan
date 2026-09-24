@@ -220,7 +220,7 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 
 | Value | Type | Default | Valid range | Effect | Ref |
 |-------|------|---------|-------------|--------|-----|
-| `nats.streamMaxBytesOverride` | string | `"536870912"` | byte count as a string (e.g. 1073741824), or empty for production sizing | per-stream JetStream MaxBytes override for small kind/CI PVCs; empty leaves production retention sized by nats.persistence.size | NFR3 |
+| `nats.streamMaxBytesOverride` | string | `"536870912"` | byte count as a string (e.g. 1073741824), or empty for production sizing | per-stream JetStream MaxBytes override for small kind/CI PVCs; empty leaves production retention sized by nats.config.jetstream.fileStore.pvc.size | NFR3 |
 
 ## `redis`
 

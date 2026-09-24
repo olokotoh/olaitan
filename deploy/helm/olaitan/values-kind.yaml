@@ -1,6 +1,7 @@
 # kind overlay (local evaluation and CI).
 #
 #   helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan \
+#     --version 1.0.0-rc4 \
 #     -f values-kind.yaml --namespace olaitan --create-namespace
 #
 # This is the ONE platform marked `verified` in

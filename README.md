@@ -48,13 +48,52 @@ and does not guarantee.
 
 ```bash
 helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan \
-  --version 1.0.0-rc3 \
+  --version 1.0.0-rc4 \
   --namespace olaitan --create-namespace
 ```
 
 No clone and no local build. The chart version is unprefixed SemVer, not the
-git tag: `v1.0.0-rc3` is the tag that triggers the release, `1.0.0-rc3` is what
+git tag: `v1.0.0-rc4` is the tag that triggers the release, `1.0.0-rc4` is what
 the registry holds.
+
+### Try it on kind
+
+With Docker, [kind](https://kind.sigs.k8s.io/), helm and kubectl installed:
+
+```bash
+kind create cluster --name olaitan
+helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan \
+  --version 1.0.0-rc4 \
+  --namespace olaitan --create-namespace --wait --timeout 10m
+kubectl -n olaitan wait pod --all --for=condition=Ready --timeout=10m
+```
+
+Both waits are needed. `kubectl wait` only sees pods that already exist, so
+straight after a plain `helm install` it fails with `no matching resources
+found`. `helm --wait` makes sure every pod exists, but it counts a DaemonSet
+as ready with one pod unavailable, so on one node it can return while the
+collector is still restarting (the collector and the aggregator restart a
+few times until NATS is up). The `kubectl wait` after it is the real check.
+
+That is the whole default install, Falco included: on a single-node cluster,
+six pods (Falco and the collector, one each per node; the aggregator; NATS;
+nats-box; Redis). Before release, this sequence
+was run word for word on a fresh single-node kind (kind v0.30.0, node image
+v1.34.0, a 4 vCPU Ubuntu 24.04 host on kernel 7.0 with BTF), with the chart
+packaged the way the release packages it and the image loaded into kind
+instead of pulled. Every pod was Ready 102 seconds after `kind create
+cluster` started, Falco reported healthy a minute later, and `cat
+/etc/shadow` in a pod moved it to SUSPICIOUS. Two things can stop it on your
+machine:
+
+- **Falco needs BTF** (`/sys/kernel/btf/vmlinux` exists on the host). Most
+  current distribution kernels have it; see [Limitations](#limitations).
+- **inotify limits.** kind nodes share the host's inotify limits, and kind's
+  own [known issues](https://kind.sigs.k8s.io/docs/user/known-issues/#pod-errors-due-to-too-many-open-files)
+  page says pods can fail with `too many open files` when they run out. The
+  verification host ran with `fs.inotify.max_user_instances=1024` and
+  `fs.inotify.max_user_watches=1048576` (that page has the `sysctl`
+  commands); it was not tried with the distribution defaults.
 
 Install into the `olaitan` namespace as shown. The agent's default
 `excluded_namespaces` list contains `kube-system` and `olaitan`, so installing
@@ -69,9 +108,11 @@ NetworkPolicies. Turning it on is a deliberate act, and you should set
 `response.networkPolicy.clusterCidrs` to your cluster's real CIDRs first or
 egress blocking under RESTRICTED will take DNS with it.
 
-Run this first, against whatever cluster you are pointed at:
+To check a cluster before installing, clone this repository and run, against
+whatever cluster you are pointed at:
 
 ```bash
+git clone https://github.com/olokotoh/olaitan && cd olaitan
 hack/preflight.sh      # or: make preflight
 ```
 
@@ -85,7 +126,7 @@ sources are on, which are off, and why.
 
 | Platform | Install | NetworkPolicy enforced | Audit webhook | Overlay |
 | --- | --- | --- | --- | --- |
-| kind | ✅ verified | ❌ no (kindnet accepts and ignores) | ✅ possible | `values-kind.yaml` |
+| kind | ✅ verified | not verified on current kind; run `hack/check-netpol-enforcement.sh` | ✅ possible | `values-kind.yaml` |
 | **kind-full** (reference) | ⚠️ verified 2026-09-21, see note | ✅ yes (Calico) | ✅ enabled | `values-full.yaml` |
 | kubeadm | ⚠️ verified 2026-08-31, see note | depends on your CNI | ✅ possible | (defaults) |
 | k3s / k3d | template-verified | ✅ (kube-router) | ✅ possible | `values-k3s.yaml` |
@@ -102,7 +143,8 @@ sources are on, which are off, and why.
 once.** Every other row above runs some subset. `values-kind.yaml` leaves the
 audit webhook, the containerd sensor, the Calico flow adapter and the applog
 sidecar at their chart defaults of off, so the full combination had never been
-exercised together until this profile existed. Bring it up with:
+exercised together until this profile existed. It needs a clone of this
+repository; from its root, bring it up with:
 
 ```
 hack/install-full-kind.sh <scratch-dir-outside-this-repo>
@@ -244,7 +286,8 @@ Read this section before trusting it with anything.
   and the data plane ignores all of them, so the workload keeps full network
   access while the tool says it is contained. Stock kind, stock EKS (VPC CNI)
   and stock AKS all behave this way. Enforcement is **off by default** for this
-  reason. Before turning it on, run `hack/check-netpol-enforcement.sh`, which
+  reason. Before turning it on, run `hack/check-netpol-enforcement.sh` (from a
+  clone of this repository), which
   pushes real traffic through a deny-all policy and tells you which world you
   are in.
 - **Falco's modern eBPF driver needs BTF (`CONFIG_DEBUG_INFO_BTF`) and kernel
