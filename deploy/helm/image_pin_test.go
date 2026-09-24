@@ -122,6 +122,15 @@ type renderedImage struct {
 // webhook learns the sidecar image it injects into other pods.
 func collectImages(t *testing.T, rendered string) []renderedImage {
 	t.Helper()
+	out, err := parseImages(rendered)
+	if err != nil {
+		t.Fatalf("image walker: %v", err)
+	}
+	return out
+}
+
+// parseImages is collectImages without the test handle.
+func parseImages(rendered string) ([]renderedImage, error) {
 	var out []renderedImage
 	dec := yaml.NewDecoder(strings.NewReader(rendered))
 	for {
@@ -162,7 +171,7 @@ func collectImages(t *testing.T, rendered string) []renderedImage {
 		}
 		walk(doc, "")
 	}
-	return out
+	return out, nil
 }
 
 // renderChartAt renders the chart in dir the way the suite's helpers do
@@ -347,4 +356,73 @@ func writeValues(t *testing.T, body string) string {
 		t.Fatal(err)
 	}
 	return p
+}
+
+// TestImageWalkerStopsLoudly (review round 1, R1-P3): a document the walker
+// cannot decode must fail the guard, not end the scan early and leave every
+// later image unchecked.
+func TestImageWalkerStopsLoudly(t *testing.T) {
+	good := "kind: Pod\nmetadata:\n  name: a\nspec:\n  containers:\n    - image: x:1@sha256:" + strings.Repeat("a", 64) + "\n"
+	for name, stream := range map[string]string{
+		"sequence document": "- not\n- a map\n---\n" + good,
+		"duplicate key":     "kind: Pod\nkind: Pod\n---\n" + good,
+	} {
+		if _, err := parseImages(stream); err == nil {
+			t.Errorf("%s: parseImages returned no error", name)
+		}
+	}
+	imgs, err := parseImages("---\n" + good + "---\n# only a comment\n")
+	if err != nil || len(imgs) != 1 {
+		t.Errorf("clean stream: %d images, err %v; want 1, nil", len(imgs), err)
+	}
+}
+
+// TestReleaseStampPinsTheOlaitanImage (review round 1, R1-P4): the release
+// job's chart stamp (hack/stamp-chart-image.sh) runs only after the image is
+// pushed and signed, so it is exercised here on every CI run instead: stamp
+// a copy of the chart with a fake repository and digest, then run the
+// release-mode guard over every render of the copy.
+func TestReleaseStampPinsTheOlaitanImage(t *testing.T) {
+	const (
+		repo   = "ghcr.io/example/olaitan"
+		digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	)
+	root := filepath.Join(chartDir(t), "..", "..", "..") // deploy/helm/olaitan -> repo root
+	stage := filepath.Join(t.TempDir(), "chart")
+	if out, err := exec.Command("cp", "-r", chartDir(t), stage).CombinedOutput(); err != nil {
+		t.Fatalf("copy chart: %v\n%s", err, out)
+	}
+	script := filepath.Join(root, "hack", "stamp-chart-image.sh")
+	cmd := exec.Command("bash", script, filepath.Join(chartDir(t), "values.yaml"), filepath.Join(stage, "values.yaml"), repo, digest)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("stamp: %v\n%s", err, out)
+	}
+	for name, rendered := range pinRenders(t, stage) {
+		n := 0
+		for _, img := range collectImages(t, rendered) {
+			if strings.HasSuffix(strings.SplitN(img.ref, ":", 2)[0], "/olaitan") {
+				n++
+				if img.ref != repo+":edge@"+digest {
+					t.Errorf("%s: %s = %q, want %s:edge@%s", name, img.where, img.ref, repo, digest)
+				}
+				continue
+			}
+			if p := imagePinProblem(img.ref); p != "" {
+				t.Errorf("%s: %s: %q: %s", name, img.where, img.ref, p)
+			}
+		}
+		if n == 0 {
+			t.Errorf("%s: no Olaitan image rendered from the stamped chart", name)
+		}
+	}
+
+	// A values.yaml the stamp cannot place its lines in fails, not a silent
+	// unstamped chart.
+	bad := writeValues(t, "image:\n  repository: x\n  tag: \"\"\n")
+	if out, err := exec.Command("bash", script, bad, filepath.Join(t.TempDir(), "v.yaml"), repo, digest).CombinedOutput(); err == nil {
+		t.Errorf("stamp of a values.yaml with no digest line succeeded:\n%s", out)
+	}
+	if out, err := exec.Command("bash", script, filepath.Join(chartDir(t), "values.yaml"), filepath.Join(t.TempDir(), "v.yaml"), repo, "sha256:abc").CombinedOutput(); err == nil {
+		t.Errorf("stamp with a malformed digest succeeded:\n%s", out)
+	}
 }

@@ -5,6 +5,7 @@ package helm_test
 import (
 	"bytes"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -242,4 +243,86 @@ func runHelmErr(args ...string) (string, error) {
 		return stderr.String(), err
 	}
 	return stdout.String(), nil
+}
+
+// TestRedisOnOpenShiftLeavesTheUIDToTheSCC (review round 1, R1-P1): on
+// OpenShift, restricted-v2 assigns the UID, GID and fsGroup from the
+// namespace range and refuses a pod that asks for 1001. The Bitnami chart
+// dropped the three fields there (adaptSecurityContext: auto), so the
+// chart-owned Redis must too, whether the platform is detected from the
+// API surface or declared. Everywhere else they stay 1001 (upgrade contract).
+func TestRedisOnOpenShiftLeavesTheUIDToTheSCC(t *testing.T) {
+	overlay := filepath.Join(chartDir(t), "values-openshift.yaml")
+	for name, rendered := range map[string]string{
+		"detected": runHelm(t, "template", "olaitan", chartDir(t), "--set", "secrets.redisPassword=x",
+			"--api-versions", "security.openshift.io/v1"),
+		"overlay": runHelm(t, "template", "olaitan", chartDir(t), "--set", "secrets.redisPassword=x",
+			"--values", overlay, "--api-versions", "security.openshift.io/v1"),
+		"declared": helmTemplate(t, []string{"platform=openshift"}),
+	} {
+		sts := docNamed(t, rendered, "StatefulSet", "olaitan-redis-master")
+		podSC, _ := dig(sts, "spec", "template", "spec", "securityContext").(map[string]any)
+		c := asList(dig(sts, "spec", "template", "spec", "containers"))[0]
+		cSC, _ := dig(c, "securityContext").(map[string]any)
+		for _, k := range []string{"runAsUser", "runAsGroup", "fsGroup"} {
+			if v, ok := podSC[k]; ok {
+				t.Errorf("%s: pod securityContext.%s = %v, want unset on OpenShift", name, k, v)
+			}
+			if v, ok := cSC[k]; ok {
+				t.Errorf("%s: container securityContext.%s = %v, want unset on OpenShift", name, k, v)
+			}
+		}
+		// Still non-root, read-only and capability-free: only the numbers go.
+		if podSC["runAsNonRoot"] != true || cSC["runAsNonRoot"] != true || cSC["readOnlyRootFilesystem"] != true {
+			t.Errorf("%s: hardening lost on OpenShift: pod %v container %v", name, podSC, cSC)
+		}
+	}
+}
+
+// TestRedisRejectsBitnamiOnlyKeys (review round 1, R1-P2): a Bitnami-era
+// key would otherwise be ignored in silence, and a changed claim template
+// makes Kubernetes reject the StatefulSet update. The render fails instead
+// and names the key that replaced it.
+func TestRedisRejectsBitnamiOnlyKeys(t *testing.T) {
+	for set, want := range map[string]string{
+		"redis.master.persistence.size=16Gi":         "redis.persistence.size",
+		"redis.master.persistence.storageClass=fast": "redis.persistence.storageClassName",
+		"redis.architecture=replication":             "redis.architecture",
+	} {
+		stderr := helmTemplateExpectError(t, []string{set})
+		if !strings.Contains(stderr, want) || !strings.Contains(stderr, "--reset-then-reuse-values") {
+			t.Errorf("--set %s: stderr does not name %q and the upgrade flag:\n%s", set, want, stderr)
+		}
+	}
+}
+
+// TestRedisReuseValuesFromTheBitnamiChartFailsClearly (R1-P2): Helm 3's
+// `upgrade --reuse-values` renders the new templates against the OLD
+// chart's defaults. Across Story 12.6 that is the Bitnami-era redis block
+// (architecture: standalone, no image, no persistence). The render must stop
+// with the fix, not a nil pointer or a silently emptyDir-backed Redis.
+func TestRedisReuseValuesFromTheBitnamiChartFailsClearly(t *testing.T) {
+	old := writeValues(t, `redis:
+  enabled: true
+  architecture: standalone
+  auth:
+    enabled: true
+    existingSecret: olaitan-secrets
+    existingSecretPasswordKey: redis-password
+  image: null
+  persistence: null
+  resources: null
+  networkPolicy: null
+  nodeSelector: null
+  tolerations: null
+`)
+	out, err := runHelmErr("template", "olaitan", chartDir(t), "--set", "secrets.redisPassword=x", "--values", old)
+	if err == nil || !strings.Contains(out, "--reset-then-reuse-values") {
+		t.Errorf("Bitnami-era values rendered or failed unclearly (err=%v):\n%s", err, out)
+	}
+	// Same with only the image missing (a hand-trimmed values file).
+	out, err = runHelmErr("template", "olaitan", chartDir(t), "--set", "secrets.redisPassword=x", "--set", "redis.image=null")
+	if err == nil || !strings.Contains(out, "--reset-then-reuse-values") {
+		t.Errorf("missing redis.image rendered or failed unclearly (err=%v):\n%s", err, out)
+	}
 }
