@@ -9,7 +9,7 @@ CONFIG_SRC       := config/olaitan.yaml
 AUDIT_POLICY_SRC := config/audit-policy-default.yaml
 CHART_FILES      := $(CHART_DIR)/files/olaitan.yaml $(CHART_DIR)/files/audit-policy-default.yaml
 
-.PHONY: quickstart quickstart-clean
+.PHONY: quickstart quickstart-clean up down
 .PHONY: e2e-full e2e-full-down e2e-full-real-llm build test lint olaitan-lint prereg-check analysis analysis-test docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics e2e-local-overlays eval-smoke scenarios-smoke capture-it e2e-local-down schemas helm-values-doc preflight
 
 # envtest-bin downloads the kube-apiserver and etcd binaries that the
@@ -675,6 +675,26 @@ e2e-full-real-llm-deepseek: helm-prepare helm-deps docker-build
 	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig \
 		KIND_CLUSTER_NAME=$(FULL_CLUSTER_NAME) OLT_E2E_FULL=1 OLT_E2E_REAL_LLM=1 \
 		go test -tags=e2e -v -count=1 -timeout 20m -run 'TestRealLLM_RealIncidentOnFullProfile|TestFalcoSourceIsLive' ./tests/e2e/...
+
+# up / down (Story 12.3): one command to the full live system and one to
+# remove it. `make up` checks the host first and stops, with the exact remedy
+# for each blocker, before anything is created; then it brings up kind-full
+# with the full profile (every source on, Falco on) through
+# hack/install-full-kind.sh, reads /etc/shadow in a throwaway pod, and prints
+# the aggregator's first decision about it with the time since make up
+# started. It fails over UP_BUDGET seconds. Same cluster, out dir and worker
+# count as e2e-full; the kubeconfig is $(FULL_OUT_DIR)/kubeconfig, so your
+# default kubeconfig is not touched. `make down` deletes the cluster, any
+# node container and kind context left, $(FULL_OUT_DIR) and hack/.audit-full,
+# then checks that nothing is left.
+UP_BUDGET ?= 900
+
+up:
+	@UP_CLUSTER='$(FULL_CLUSTER_NAME)' UP_OUT_DIR='$(FULL_OUT_DIR)' \
+		UP_WORKERS='$(FULL_WORKERS)' UP_BUDGET='$(UP_BUDGET)' hack/up.sh
+
+down:
+	@UP_CLUSTER='$(FULL_CLUSTER_NAME)' UP_OUT_DIR='$(FULL_OUT_DIR)' hack/down.sh
 
 # Removes FULL_OUT_DIR too. It holds the audit CA and the apiserver client
 # key; leaving it behind also leaves a Calico marker file that would make the

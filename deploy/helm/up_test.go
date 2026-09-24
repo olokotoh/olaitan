@@ -454,6 +454,12 @@ func TestUpBudget(t *testing.T) {
 // one is there, and removes the out dir and the audit mount.
 func TestDownPlan(t *testing.T) {
 	h := newUpHost(t)
+	if err := os.MkdirAll(h.out, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(h.out, "kubeconfig"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	out, err := h.run("down.sh")
 	if err != nil {
 		t.Fatalf("down plan failed: %v\n%s", err, out)
@@ -477,6 +483,14 @@ func TestDownPlan(t *testing.T) {
 		t.Fatalf("down plan failed: %v\n%s", err, out)
 	}
 	cmds = strings.Join(planCommands(out), "\n")
+	// A second make down, after the out dir is gone, still deletes the
+	// cluster (kind cannot lock a kubeconfig in a missing directory).
+	if err := os.RemoveAll(h.out); err != nil {
+		t.Fatal(err)
+	}
+	if again, err := h.run("down.sh"); err != nil || !strings.Contains(again, "+ kind delete cluster --name "+upCluster+"\n") {
+		t.Errorf("down without the out dir: %v\n%s", err, again)
+	}
 	for _, want := range []string{
 		"+ kubectl config delete-context kind-" + upCluster,
 		"+ kubectl config delete-cluster kind-" + upCluster,
