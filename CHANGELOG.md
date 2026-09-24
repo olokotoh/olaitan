@@ -18,6 +18,16 @@ and false-positive numbers; see [Unreleased](#unreleased).
 > campaign that fills them in is outstanding. No performance figure in this
 > repository should be cited until it is.
 
+### Added
+
+- **`make quickstart`** (Story 12.2, #119). From a clone: a fresh kind
+  cluster, the published chart with Falco on, a real `cat /etc/shadow` in a
+  throwaway pod in a scored namespace, and the agent's first decision about
+  that pod, printed with the time since `kind create cluster` (non-zero exit
+  over ten minutes). Nothing is published to NATS; the transition is read
+  from the aggregator's log. `make quickstart-clean` deletes the cluster.
+  `QUICKSTART_CHART=local` (and `QUICKSTART_IMAGE`) use the checkout instead.
+
 ## [v1.0.0-rc4] - 2026-09-24
 
 The first release since rc3 that installs with the README command and no
