@@ -20,6 +20,16 @@ and false-positive numbers; see [Unreleased](#unreleased).
 
 ### Added
 
+- **`make quickstart`** (Story 12.2, #119). From a clone: a fresh kind
+  cluster, the published chart with Falco on, a real `cat /etc/shadow` in a
+  throwaway pod in a scored namespace, and the agent's first decision about
+  that pod, printed with the time since `kind create cluster` (non-zero exit
+  over ten minutes). Nothing is published to NATS; the transition is read
+  from the aggregator's log. `make quickstart-clean` deletes the cluster.
+  It checks that the chart version is published before it creates the
+  cluster. `QUICKSTART_CHART=local` (and `QUICKSTART_IMAGE`) use the
+  checkout instead.
+
 - **`install.yaml` on every release** (Story 12.4, #121). The release
   workflow renders the chart it publishes, with default values, into one
   file for `kubectl apply -f`, checks that it runs the released image by
