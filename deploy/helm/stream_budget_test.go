@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -65,22 +67,28 @@ func parseSize(t *testing.T, what, v string) int64 {
 	return q.Value()
 }
 
-// readStreamBudget walks the rendered manifests for the three numbers.
-func readStreamBudget(t *testing.T, rendered string) streamBudget {
+// streamRings are the two workloads that call EnsureStreams
+// (cmd/olaitan/main.go: the collector at startup, the aggregator in its
+// run loop). Each creates every stream with the cap its own env gives it, so
+// a ring that loses the override asks JetStream for production retention
+// even when the other ring is capped.
+var streamRings = []string{"Deployment/olaitan-aggregator", "DaemonSet/olaitan-collector"}
+
+const overrideEnv = "OLT_NATS_STREAM_MAXBYTES_OVERRIDE"
+
+// readStreamBudget walks the rendered manifests for the three numbers. It
+// fails the test on a render it cannot read, and returns an error when the
+// two stream rings do not carry the same cap.
+func readStreamBudget(t *testing.T, rendered string) (streamBudget, error) {
 	t.Helper()
 	var b streamBudget
-	var overrides []string
-	for _, m := range regexp.MustCompile(`- name: OLT_NATS_STREAM_MAXBYTES_OVERRIDE\s*\n\s*value:\s*"?([^"\n]*)"?`).
-		FindAllStringSubmatch(rendered, -1) {
-		overrides = append(overrides, strings.TrimSpace(m[1]))
+	type ring struct {
+		seen   bool
+		values []string
 	}
-	for _, o := range overrides {
-		if o != overrides[0] {
-			t.Fatalf("the aggregator and the collector disagree on the stream cap: %v", overrides)
-		}
-	}
-	if len(overrides) > 0 {
-		b.override = overrides[0]
+	rings := map[string]*ring{}
+	for _, r := range streamRings {
+		rings[r] = &ring{}
 	}
 
 	dec := yaml.NewDecoder(strings.NewReader(rendered))
@@ -93,6 +101,16 @@ func readStreamBudget(t *testing.T, rendered string) streamBudget {
 			} `yaml:"metadata"`
 			Data map[string]string `yaml:"data"`
 			Spec struct {
+				Template struct {
+					Spec struct {
+						Containers []struct {
+							Env []struct {
+								Name  string `yaml:"name"`
+								Value string `yaml:"value"`
+							} `yaml:"env"`
+						} `yaml:"containers"`
+					} `yaml:"spec"`
+				} `yaml:"template"`
 				VolumeClaimTemplates []struct {
 					Metadata struct {
 						Name string `yaml:"name"`
@@ -111,6 +129,16 @@ func readStreamBudget(t *testing.T, rendered string) streamBudget {
 		}
 		if err != nil {
 			t.Fatalf("decode rendered manifest: %v", err)
+		}
+		if r, ok := rings[doc.Kind+"/"+doc.Metadata.Name]; ok {
+			r.seen = true
+			for _, c := range doc.Spec.Template.Spec.Containers {
+				for _, e := range c.Env {
+					if e.Name == overrideEnv {
+						r.values = append(r.values, strings.TrimSpace(e.Value))
+					}
+				}
+			}
 		}
 		switch {
 		case doc.Kind == "ConfigMap" && doc.Data["nats.conf"] != "":
@@ -135,6 +163,42 @@ func readStreamBudget(t *testing.T, rendered string) streamBudget {
 	}
 	if !sawConf || !sawClaim {
 		t.Fatalf("render has no NATS config (%v) or no NATS volume claim (%v)", sawConf, sawClaim)
+	}
+
+	// Every ring must be rendered, carry the env at most once, and agree
+	// with the other ring: both capped at the same value, or both uncapped.
+	per := map[string]string{}
+	for _, name := range streamRings {
+		r := rings[name]
+		if !r.seen {
+			t.Fatalf("render has no %s, which creates the streams", name)
+		}
+		switch len(r.values) {
+		case 0:
+			per[name] = ""
+		case 1:
+			per[name] = r.values[0]
+		default:
+			return b, fmt.Errorf("%s sets %s %d times: %v", name, overrideEnv, len(r.values), r.values)
+		}
+	}
+	first := per[streamRings[0]]
+	for _, name := range streamRings[1:] {
+		if per[name] != first {
+			return b, fmt.Errorf("the stream rings disagree on the cap (%s %q, %s %q): the uncapped one asks JetStream for production retention and dies with err_code=10047",
+				streamRings[0], first, name, per[name])
+		}
+	}
+	b.override = first
+	return b, nil
+}
+
+// mustReadStreamBudget is readStreamBudget for renders whose rings must agree.
+func mustReadStreamBudget(t *testing.T, rendered string) streamBudget {
+	t.Helper()
+	b, err := readStreamBudget(t, rendered)
+	if err != nil {
+		t.Fatal(err)
 	}
 	return b
 }
@@ -200,7 +264,7 @@ func renderREADME(t *testing.T, extra ...string) string {
 // TestDefaultInstallStreamsFitTheNATSStore is issue #96's regression test:
 // the README install creates every stream on the NATS the chart ships.
 func TestDefaultInstallStreamsFitTheNATSStore(t *testing.T) {
-	if err := checkStreamBudget(t, readStreamBudget(t, renderREADME(t))); err != nil {
+	if err := checkStreamBudget(t, mustReadStreamBudget(t, renderREADME(t))); err != nil {
 		t.Fatalf("issue #96: the default install cannot create its streams: %v", err)
 	}
 }
@@ -209,7 +273,7 @@ func TestDefaultInstallStreamsFitTheNATSStore(t *testing.T) {
 // produced #96, so a green run above means something.
 func TestStreamBudgetCheckBites(t *testing.T) {
 	// rc3: no override, so production caps (10 + 50 + 100 GiB) against 10Gi.
-	rc3 := readStreamBudget(t, renderREADME(t, "--set-string", "nats.streamMaxBytesOverride="))
+	rc3 := mustReadStreamBudget(t, renderREADME(t, "--set-string", "nats.streamMaxBytesOverride="))
 	if rc3.override != "" {
 		t.Fatalf("empty override still rendered %q", rc3.override)
 	}
@@ -219,9 +283,73 @@ func TestStreamBudgetCheckBites(t *testing.T) {
 		t.Logf("rc3 shape rejected as expected: %v", err)
 	}
 	// A store smaller than the default reservation.
-	small := readStreamBudget(t, renderREADME(t,
+	small := mustReadStreamBudget(t, renderREADME(t,
 		"--set", "nats.config.jetstream.fileStore.pvc.size=2Gi"))
 	if err := checkStreamBudget(t, small); err == nil {
 		t.Errorf("a 2Gi store passed the budget check with %s-byte streams; it must fail", small.override)
+	}
+	// One ring loses the cap: the collector DaemonSet renders no override
+	// while the aggregator keeps it.
+	docs := strings.Split(renderREADME(t), "\n---\n")
+	dropped := 0
+	for i, d := range docs {
+		if strings.Contains(d, "kind: DaemonSet") && strings.Contains(d, "name: olaitan-collector\n") {
+			before := d
+			docs[i] = regexp.MustCompile(`\n\s*- name: `+overrideEnv+`\s*\n\s*value:[^\n]*`).ReplaceAllString(d, "")
+			if docs[i] != before {
+				dropped++
+			}
+		}
+	}
+	if dropped != 1 {
+		t.Fatalf("could not drop the override from the collector DaemonSet (dropped %d)", dropped)
+	}
+	if _, err := readStreamBudget(t, strings.Join(docs, "\n---\n")); err == nil {
+		t.Error("a render whose collector has no stream cap passed; that ring would request production retention")
+	} else {
+		t.Logf("one-ring render rejected as expected: %v", err)
+	}
+}
+
+// natsSizeKey is a values key that NOTES or values.yaml offers for sizing
+// the NATS store, e.g. nats.config.jetstream.fileStore.pvc.size.
+var natsSizeKey = regexp.MustCompile(`nats(?:\.[A-Za-z]+)+\.size\b`)
+
+// TestNotesNameTheKeyThatSizesTheNATSStore (Story 12.1 review). NOTES told
+// operators to raise nats.persistence.size, which the bundled NATS chart
+// ignores: the store and the claim stayed at 10Gi. An operator who cleared
+// the stream cap and raised that key got #96 back. Every sizing key NOTES
+// names, in both the capped and the uncapped branch, must move both the
+// NATS max_file_store and the claim.
+func TestNotesNameTheKeyThatSizesTheNATSStore(t *testing.T) {
+	const want = "50Gi"
+	wantBytes := parseSize(t, "want", want)
+	for _, branch := range []struct {
+		name string
+		sets []string
+	}{
+		{"capped (default)", nil},
+		{"uncapped", []string{"nats.streamMaxBytesOverride="}},
+	} {
+		notes := renderNotes(t, branch.sets)
+		keys := natsSizeKey.FindAllString(notes, -1)
+		if len(keys) == 0 {
+			t.Errorf("%s: NOTES name no key for sizing the NATS store:\n%s", branch.name, notes)
+			continue
+		}
+		for _, k := range keys {
+			b := mustReadStreamBudget(t, renderREADME(t, "--set", k+"="+want))
+			if b.maxFileStore != wantBytes || b.claim != wantBytes {
+				t.Errorf("%s: NOTES say raise %s, but --set %s=%s renders max_file_store %d and claim %d (want %d for both)",
+					branch.name, k, k, want, b.maxFileStore, b.claim, wantBytes)
+			}
+		}
+	}
+	values, err := os.ReadFile(filepath.Join(chartDir(t), "values.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(values), "nats.persistence.size") {
+		t.Error("values.yaml still tells operators to raise nats.persistence.size, which the NATS chart ignores")
 	}
 }

@@ -6191,7 +6191,7 @@ func TestNotesTellTheOperatorHowToVerifyAndHowToSeeADetection(t *testing.T) {
 // install time. Keep that promise honest.
 func TestNotesExplainTheJetStreamSizingPairing(t *testing.T) {
 	notes := renderNotes(t, nil)
-	if !strings.Contains(notes, "nats.persistence.size") || !strings.Contains(notes, "streamMaxBytesOverride") {
+	if !strings.Contains(notes, "nats.config.jetstream.fileStore.pvc.size") || !strings.Contains(notes, "streamMaxBytesOverride") {
 		t.Errorf("notes do not explain the JetStream sizing pairing values.yaml says they explain; notes:\n%s", notes)
 	}
 }
