@@ -998,9 +998,13 @@ func (r shimRelease) get(t *testing.T, f string) string {
 	return string(b)
 }
 
-func (r shimRelease) run(t *testing.T, script string, env map[string]string, prerelease string) {
+// runErr runs a mark/unmark script against the fake release and returns its
+// output and error. Both steps must get TAG, REPO and PRERELEASE (the
+// preflight value, which a missing or garbled banner falls back to) through
+// their env.
+func (r shimRelease) runErr(t *testing.T, script string, env map[string]string, prerelease string) (string, error) {
 	t.Helper()
-	for _, k := range []string{"TAG", "REPO"} {
+	for _, k := range []string{"TAG", "REPO", "PRERELEASE"} {
 		if _, ok := env[k]; !ok {
 			t.Fatalf("release edit step has no env %s", k)
 		}
@@ -1012,7 +1016,13 @@ func (r shimRelease) run(t *testing.T, script string, env map[string]string, pre
 		"PATH="+filepath.Join(r.dir, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"GH_SHIM_DIR="+r.dir, "TAG=v9.9.9", "REPO=o/r", "PRERELEASE="+prerelease,
 		"RUN_URL=https://github.com/o/r/actions/runs/1", "GH_TOKEN=unused")
-	if out, err := cmd.CombinedOutput(); err != nil {
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+func (r shimRelease) run(t *testing.T, script string, env map[string]string, prerelease string) {
+	t.Helper()
+	if out, err := r.runErr(t, script, env, prerelease); err != nil {
 		t.Fatalf("release edit script failed: %v\n%s\n--- script\n%s", err, out, script)
 	}
 }
@@ -1060,6 +1070,160 @@ func TestReleaseMarkAndUnmarkAreIdempotent(t *testing.T) {
 			t.Errorf("pre=%s: unmark edited a release that was not marked", c.pre)
 		}
 	}
+}
+
+// TestReleaseMarkAndUnmarkEdgeCases (review round 3, N1 to N5): the notes a
+// human edited, a banner cut short or garbled, a marker quoted inside the
+// notes, a backport, and "Re-run all jobs" after a mark. The scripts never
+// drop notes outside the banner, never guess a pre-release state they did
+// not record (they fall back to preflight's), and never leave a FAILED title
+// on a release whose stranger check passed.
+func TestReleaseMarkAndUnmarkEdgeCases(t *testing.T) {
+	wf, _ := readWorkflow(t, "release.yml")
+	mark, markEnv := releaseStepScript(t, wf, "mark-failed")
+	unmark, unmarkEnv := releaseStepScript(t, wf, "unmark-failed")
+	const (
+		notes   = "## Install\n\nhelm install ...\n\n## Verify\n"
+		failed  = "v9.9.9 (FAILED stranger-path check)"
+		caution = "> [!CAUTION]\n> **This release FAILED the stranger-path check.** Do not install it.\n"
+		endMark = "<!-- stranger-check: end -->\n"
+	)
+	trim := func(s string) string { return strings.TrimRight(s, "\n") }
+
+	// N1: the web UI saves notes with CRLF. The end marker must still be
+	// found, and nothing after the banner may be lost.
+	t.Run("crlf notes", func(t *testing.T) {
+		crlf := func(s string) string { return strings.ReplaceAll(s, "\n", "\r\n") }
+		body := crlf("<!-- stranger-check: FAILED; prerelease-before=false -->\n" + caution + endMark + "\n" + notes)
+		r := newShimRelease(t, failed, body, "true")
+		r.run(t, unmark, unmarkEnv, "false")
+		if got := strings.ReplaceAll(trim(r.get(t, "body")), "\r", ""); got != trim(notes) {
+			t.Errorf("unmark of CRLF notes left:\n%q\nwant\n%q", got, notes)
+		}
+		if r.get(t, "name") != "v9.9.9" || r.get(t, "pre") != "false" {
+			t.Errorf("unmark of CRLF notes: title %q pre %s, want v9.9.9 false", r.get(t, "name"), r.get(t, "pre"))
+		}
+		r2 := newShimRelease(t, failed, body, "true")
+		r2.run(t, mark, markEnv, "false")
+		got := strings.ReplaceAll(r2.get(t, "body"), "\r", "")
+		if strings.Count(got, "FAILED the stranger-path check") != 1 || !strings.HasSuffix(trim(got), trim(notes)) {
+			t.Errorf("re-mark of CRLF notes lost the notes or doubled the banner:\n%s", got)
+		}
+	})
+
+	// N1: a begin marker with no end marker. Rewriting would drop every line
+	// after it, so both scripts must fail and leave the release untouched.
+	t.Run("missing end marker", func(t *testing.T) {
+		body := "<!-- stranger-check: FAILED; prerelease-before=false -->\n" + caution + "\n" + notes
+		for name, script := range map[string]string{"mark": mark, "unmark": unmark} {
+			env := markEnv
+			if name == "unmark" {
+				env = unmarkEnv
+			}
+			r := newShimRelease(t, failed, body, "true")
+			out, err := r.runErr(t, script, env, "false")
+			if err == nil {
+				t.Errorf("%s succeeded on a banner with no end marker:\n%s", name, out)
+			} else if !strings.Contains(out, "::error::") {
+				t.Errorf("%s failed without a ::error:: line:\n%s", name, out)
+			}
+			if r.get(t, "body") != body || r.get(t, "name") != failed || r.get(t, "edits") != "" {
+				t.Errorf("%s changed a release whose banner has no end marker:\nbody %q\nname %q\nedits %q", name, r.get(t, "body"), r.get(t, "name"), r.get(t, "edits"))
+			}
+		}
+	})
+
+	// N2: a human edited the header, so the recorded state is gone. Fall
+	// back to preflight's value instead of an empty one.
+	t.Run("garbled header", func(t *testing.T) {
+		for _, header := range []string{
+			"<!-- stranger-check: FAILED -->",
+			"<!-- stranger-check: FAILED; prerelease-before= -->",
+			"<!-- stranger-check: FAILED; prerelease-before=maybe -->",
+		} {
+			body := header + "\n" + caution + endMark + "\n" + notes
+			r := newShimRelease(t, failed, body, "true")
+			r.run(t, unmark, unmarkEnv, "false")
+			if r.get(t, "pre") != "false" || r.get(t, "name") != "v9.9.9" || trim(r.get(t, "body")) != trim(notes) {
+				t.Errorf("header %q: unmark left pre=%s title %q body %q; want false, v9.9.9, the notes", header, r.get(t, "pre"), r.get(t, "name"), r.get(t, "body"))
+			}
+			r2 := newShimRelease(t, failed, body, "true")
+			r2.run(t, mark, markEnv, "false")
+			if !strings.Contains(r2.get(t, "body"), "prerelease-before=false -->") {
+				t.Errorf("header %q: re-mark recorded no pre-release state:\n%s", header, r2.get(t, "body"))
+			}
+		}
+	})
+
+	// N4: notes that quote the marker mid-line are not a mark.
+	t.Run("quoted marker mid-line", func(t *testing.T) {
+		quoted := notes + "\nA failed release starts with `<!-- stranger-check: FAILED` in its notes.\n"
+		r := newShimRelease(t, "v9.9.9", quoted, "false")
+		r.run(t, unmark, unmarkEnv, "false")
+		if r.get(t, "edits") != "" {
+			t.Errorf("unmark edited a release that only quotes the marker: %s", r.get(t, "edits"))
+		}
+		r.run(t, mark, markEnv, "false")
+		if !strings.Contains(r.get(t, "body"), "prerelease-before=false -->") {
+			t.Errorf("mark read the quoted marker as an earlier mark:\n%s", r.get(t, "body"))
+		}
+		r.run(t, unmark, unmarkEnv, "false")
+		if r.get(t, "pre") != "false" || r.get(t, "name") != "v9.9.9" || trim(r.get(t, "body")) != trim(quoted) {
+			t.Errorf("mark then unmark with a quoted marker: pre=%s title %q body %q", r.get(t, "pre"), r.get(t, "name"), r.get(t, "body"))
+		}
+	})
+
+	// A backport (stable, not the highest tag): marked, then unmarked, it is
+	// stable again, and neither script ever makes it Latest.
+	t.Run("backport", func(t *testing.T) {
+		r := newShimRelease(t, "v9.9.9", notes, "false")
+		r.run(t, mark, markEnv, "false")
+		if r.get(t, "pre") != "true" || !strings.Contains(r.get(t, "edits"), "--latest=false") {
+			t.Errorf("mark of a backport: pre=%s edits %q", r.get(t, "pre"), r.get(t, "edits"))
+		}
+		r.run(t, unmark, unmarkEnv, "false")
+		if r.get(t, "pre") != "false" || r.get(t, "name") != "v9.9.9" || trim(r.get(t, "body")) != trim(notes) {
+			t.Errorf("unmark of a backport: pre=%s title %q body %q", r.get(t, "pre"), r.get(t, "name"), r.get(t, "body"))
+		}
+		if regexp.MustCompile(`--latest(=true)?(\s|$)`).MatchString(r.get(t, "edits")) {
+			t.Errorf("mark or unmark made a backport Latest: %s", r.get(t, "edits"))
+		}
+	})
+
+	// N3: "Re-run all jobs" after a mark. softprops replaces the body (the
+	// banner is gone) and resets the pre-release flag, and without an
+	// explicit name it keeps the FAILED title. The release job must pass
+	// the title releases get today (the tag), and unmark must still strip
+	// the suffix when no banner is left.
+	t.Run("re-run all jobs after a mark", func(t *testing.T) {
+		var name string
+		for _, st := range wf.Jobs["release"].Steps {
+			if strings.HasPrefix(st.Uses, "softprops/action-gh-release@") {
+				name = st.With["name"]
+			}
+		}
+		if name != "${{ github.ref_name }}" {
+			t.Errorf("softprops name is %q, want ${{ github.ref_name }} (the tag, the title a first run gets today), or a rerun keeps the FAILED title", name)
+		}
+		r := newShimRelease(t, "v9.9.9", notes, "false")
+		r.run(t, mark, markEnv, "false")
+		// softprops-style reset with no name input: new body, FAILED title kept.
+		for f, v := range map[string]string{"body": notes, "pre": "false"} {
+			if err := os.WriteFile(filepath.Join(r.dir, f), []byte(v), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if r.get(t, "name") != failed {
+			t.Fatalf("setup: title after mark is %q", r.get(t, "name"))
+		}
+		r.run(t, unmark, unmarkEnv, "false")
+		if got := r.get(t, "name"); got != "v9.9.9" {
+			t.Errorf("unmark after a re-run left the title %q; promote would make a FAILED-titled release Latest", got)
+		}
+		if trim(r.get(t, "body")) != trim(notes) || r.get(t, "pre") != "false" {
+			t.Errorf("unmark after a re-run changed body or flag: pre=%s body %q", r.get(t, "pre"), r.get(t, "body"))
+		}
+	})
 }
 
 // TestReleaseLatestOnlyAfterTheStrangerPasses (review F12, CoS default
