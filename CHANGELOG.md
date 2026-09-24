@@ -41,9 +41,16 @@ and false-positive numbers; see [Unreleased](#unreleased).
   `cat /etc/shadow` in a throwaway pod, both a Falco alert on that read and
   an FSM transition for its namespace. Nothing is injected. It runs nightly
   on main's README, by hand, on PRs that change it, and from `release.yml`
-  on every tag, after the GitHub Release exists. If it fails there, the
-  run fails, `latest` does not move, and the release is marked failed
-  (pre-release, title and a banner linking the run).
+  on every tag (the tagged commit), after the GitHub Release exists. If it
+  fails, is cancelled or times out there, the run fails, `latest` does not
+  move, and the release is marked failed (pre-release, title and a banner
+  linking the run); marking twice leaves one banner, and a green rerun
+  takes the mark off without clearing a real pre-release. The GitHub
+  Release is created without "Latest" and becomes Latest only in `promote`,
+  after the check passed and only for the highest stable tag. Every failure
+  names its phase (readme, install, infra: cluster / rollout / pull / exec /
+  kubectl logs, product: no Falco alert / no FSM transition) in the log, as
+  an annotation and in the job summary, and kubectl errors are kept.
 
 - **`install.yaml` on every release** (Story 12.4, #121). The release
   workflow renders the chart it publishes, with default values, into one
