@@ -55,6 +55,49 @@ qs_parse_transition() {
 	return 1
 }
 
+# qs_parse_rule NS POD: read Falco's JSON log lines on stdin and print the
+# rule of the first alert on /etc/shadow raised for pod POD in namespace NS
+# (both are in the alert's output_fields). Exit 1 when there is none, so an
+# alert from any other container is never shown as the demo pod's reason.
+qs_parse_rule() {
+	local ns="$1" pod="$2" line
+	while IFS= read -r line; do
+		case "$line" in
+		*'"k8s.ns.name":"'"$ns"'"'*) ;;
+		*) continue ;;
+		esac
+		case "$line" in
+		*'"k8s.pod.name":"'"$pod"'"'*) ;;
+		*) continue ;;
+		esac
+		case "$line" in
+		*'/etc/shadow'*) ;;
+		*) continue ;;
+		esac
+		line="$(sed -n 's/.*"rule":"\([^"]*\)".*/\1/p' <<<"$line")"
+		[ -n "$line" ] || continue
+		printf '%s\n' "$line"
+		return 0
+	done
+	return 1
+}
+
+# qs_check_published VERSION: fail before any cluster exists when the chart
+# VERSION is not in the registry. Chart.yaml carries the release this tree
+# is heading for, which is not published until the release run.
+qs_check_published() {
+	local version="$1"
+	# Printed like qs_run, but only helm's own output (the chart metadata) is
+	# dropped.
+	printf '+ %s\n' "helm show chart $QS_PUBLISHED_CHART --version $version"
+	[ "${QUICKSTART_PLAN:-}" = "1" ] && return 0
+	if ! helm show chart "$QS_PUBLISHED_CHART" --version "$version" >/dev/null; then
+		echo "quickstart: chart $QS_PUBLISHED_CHART version $version is not published (yet)." >&2
+		echo "quickstart: use a published one, QUICKSTART_VERSION=<version>, or this checkout's chart, QUICKSTART_CHART=local" >&2
+		exit 1
+	fi
+}
+
 # qs_within_budget ELAPSED BUDGET: exit 0 when ELAPSED <= BUDGET seconds.
 qs_within_budget() {
 	[ "$1" -le "$2" ]
@@ -87,7 +130,7 @@ qs_require() {
 	if [ "$(uname -s)" = "Linux" ] && [ ! -e /sys/kernel/btf/vmlinux ]; then
 		echo "quickstart: warning: /sys/kernel/btf/vmlinux is missing; Falco's modern eBPF probe needs BTF and may not load" >&2
 	fi
-	if kind get clusters 2>/dev/null | grep -qx "$QS_CLUSTER"; then
+	if kind get clusters 2>/dev/null | grep -qxF "$QS_CLUSTER"; then
 		echo "quickstart: kind cluster $QS_CLUSTER already exists." >&2
 		echo "quickstart: the timing is measured from kind create cluster, so start clean: make quickstart-clean" >&2
 		exit 1
@@ -126,7 +169,7 @@ main() {
 	install+=(--kube-context "kind-$QS_CLUSTER" --namespace "$QS_NS" --create-namespace)
 	if [ -n "$image" ]; then
 		local repo="${image%:*}" tag="${image##*:}"
-		if [ "$repo" = "$image" ] || [[ "$tag" == */* ]]; then
+		if [ "$repo" = "$image" ] || [[ "$tag" == */* ]] || [[ "$image" == *@* ]]; then
 			echo "quickstart: QUICKSTART_IMAGE must be repo:tag, got '$image'" >&2
 			exit 1
 		fi
@@ -141,6 +184,9 @@ main() {
 	if [ "$chart" = "local" ]; then
 		qs_say "staging the chart from this checkout (before the clock starts)"
 		qs_run make -s helm-deps
+	else
+		qs_say "checking that chart $version is published (before the clock starts)"
+		qs_check_published "$version"
 	fi
 
 	qs_say "clock starts: kind create cluster (budget ${budget}s to the first transition)"
@@ -200,7 +246,7 @@ main() {
 	local wl from to score ts rule
 	IFS=$'\t' read -r wl from to score ts <<<"$found"
 	rule="$(kubectl "${QS_KCTX[@]}" -n "$QS_NS" logs -l app.kubernetes.io/name=falco -c falco --tail=-1 2>/dev/null |
-		grep -F '/etc/shadow' | sed -n 's/.*"rule":"\([^"]*\)".*/\1/p' | head -n 1 || true)"
+		qs_parse_rule "$QS_DEMO_NS" "$QS_DEMO_POD" || true)"
 	local elapsed=$((t_seen - t0))
 
 	echo

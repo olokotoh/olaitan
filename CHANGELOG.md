@@ -26,7 +26,9 @@ and false-positive numbers; see [Unreleased](#unreleased).
   that pod, printed with the time since `kind create cluster` (non-zero exit
   over ten minutes). Nothing is published to NATS; the transition is read
   from the aggregator's log. `make quickstart-clean` deletes the cluster.
-  `QUICKSTART_CHART=local` (and `QUICKSTART_IMAGE`) use the checkout instead.
+  It checks that the chart version is published before it creates the
+  cluster. `QUICKSTART_CHART=local` (and `QUICKSTART_IMAGE`) use the
+  checkout instead.
 
 ## [v1.0.0-rc4] - 2026-09-24
 

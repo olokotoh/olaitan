@@ -144,6 +144,7 @@ it took from `kind create cluster`:
     from       CLEAN
     to         SUSPICIOUS
     score      36
+    logged at  2026-09-24T08:41:19.353671951Z (aggregator clock)
     falco rule Read sensitive file untrusted
     reads      1 of /etc/shadow before the transition
 
@@ -158,7 +159,10 @@ aggregator's own log, and it only appears because Falco saw the read. It
 exits non-zero if the transition takes more than ten minutes
 (`QUICKSTART_BUDGET`, in seconds). It refuses to reuse an existing
 `olaitan-quickstart` cluster, since the time is measured from
-`kind create cluster`. `QUICKSTART_CHART=local` installs the chart in your
+`kind create cluster`. Before the clock starts it checks that the chart
+version it is about to install is in the registry; on a checkout that is
+ahead of the last release, set `QUICKSTART_VERSION` to a published version.
+`QUICKSTART_CHART=local` installs the chart in your
 checkout instead; add `QUICKSTART_IMAGE=olaitan:<tag>` to load an image
 you built with `make docker-build` into kind as well.
 
