@@ -5,7 +5,8 @@
 #
 #   1. a multi-arch image at ghcr.io/<owner>/olaitan
 #   2. the Helm chart at oci://ghcr.io/<owner>/charts/olaitan
-#   3. a GitHub Release carrying the chart tarball, SBOM and checksums
+#   3. a GitHub Release carrying the chart tarball, SBOM, checksums and
+#      install.yaml (the chart defaults rendered for `kubectl apply -f`)
 #
 # Image and chart are both cosign-signed keylessly (OIDC, no long-lived
 # key) and carry an SPDX SBOM.
@@ -448,6 +449,30 @@ jobs:
           [ "$subcharts" -eq "$expected_subcharts" ] \
             || { echo "expected ${expected_subcharts} subcharts, found ${subcharts}" >&2; exit 1; }
 
+      # Story 12.4: install.yaml is the packaged chart's defaults rendered
+      # into one file for `kubectl apply -f`, for people who do not use
+      # helm. It is rendered here, from the tarball this job pushes and
+      # signs, never by hand, so it cannot differ from the chart. It holds
+      # no credentials: the script leaves out Secret olaitan-secrets, which
+      # the install docs create per install (D5). The helm test suite runs
+      # the same script on every CI run (TestInstallManifestIsOneApplyableFile,
+      # TestInstallManifestHoldsNoCredentials).
+      - name: Render the kubectl install manifest
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          IMAGE: ${{ needs.preflight.outputs.image }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          hack/render-install-manifest.sh "dist/olaitan-${VERSION}.tgz" dist/install.yaml
+          grep -qF "image: ${IMAGE}:${VERSION}@${DIGEST}" dist/install.yaml \
+            || { echo "install.yaml does not run ${IMAGE}:${VERSION}@${DIGEST}" >&2; exit 1; }
+          if grep -qE '^  (redis-password|falco-http-token):' dist/install.yaml; then
+            echo "install.yaml carries a generated credential; it must hold none (D5)" >&2; exit 1
+          fi
+          grep -c '^kind: ' dist/install.yaml | xargs echo "install.yaml objects:"
+
       # Generated from the packaged tarball, not the working tree, so the
       # SBOM describes what was actually shipped.
       - name: SBOM for the chart
@@ -529,7 +554,7 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          sha256sum ./*.tgz ./*.spdx.json > checksums.txt
+          sha256sum ./*.tgz ./*.spdx.json ./install.yaml > checksums.txt
           cat checksums.txt
 
       - uses: actions/upload-artifact@v4
@@ -596,14 +621,62 @@ jobs:
           files: |
             dist/*.tgz
             dist/*.spdx.json
+            dist/install.yaml
             dist/checksums.txt
           body: |
             ## Install
 
             ```sh
             helm install olaitan ${{ needs.preflight.outputs.chart_repo }}/olaitan \
-              --version ${{ needs.preflight.outputs.version }}
+              --version ${{ needs.preflight.outputs.version }} \
+              --namespace olaitan --create-namespace
             ```
+
+            Or without helm: the same chart defaults, rendered by this
+            release into one file for the `olaitan` namespace. The file
+            holds no credentials, so first create the namespace and the
+            Secret it reads, with fresh random values, then apply it:
+
+            ```sh
+            kubectl create namespace olaitan --save-config
+            kubectl create secret generic olaitan-secrets -n olaitan \
+              --from-literal=redis-password="$(openssl rand -hex 32)" \
+              --from-literal=falco-http-token="$(openssl rand -hex 32)" \
+              --from-literal=llm-api-key=
+            kubectl apply -f https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/install.yaml
+            ```
+
+            Upgrading from an earlier `install.yaml`: apply this release's
+            file, then restart every workload so all of them start on it.
+            The apply never touches `olaitan-secrets` (the file does not
+            contain it), so your values stay:
+
+            ```sh
+            kubectl -n olaitan rollout restart daemonset,deployment,statefulset
+            ```
+
+            API server access: the file's NetworkPolicy `olaitan` allows
+            only `10.96.0.1` (the kubeadm Service IP) on 443 and 6443,
+            because a rendered file cannot look the real address up. That
+            is not enough on k3s (Service IP `10.43.0.1`), on minikube (API
+            server on 8443), or with Calico or Cilium, which check egress
+            after the Service IP is translated. There, after the apply, add
+            the addresses `kubectl get endpointslice -n default kubernetes`
+            shows:
+
+            ```sh
+            port=$(kubectl get endpointslice -n default kubernetes -o jsonpath='{.ports[0].port}')
+            for ip in $(kubectl get service -n default kubernetes -o jsonpath='{.spec.clusterIP}') \
+                      $(kubectl get endpointslice -n default kubernetes -o jsonpath='{.endpoints[*].addresses[*]}'); do
+              kubectl -n olaitan patch networkpolicy olaitan --type=json -p \
+                "[{\"op\":\"add\",\"path\":\"/spec/egress/-\",\"value\":{\"to\":[{\"ipBlock\":{\"cidr\":\"${ip}/32\"}}],\"ports\":[{\"protocol\":\"TCP\",\"port\":443},{\"protocol\":\"TCP\",\"port\":${port}}]}}]"
+            done
+            ```
+
+            Run it again after every `kubectl apply` of the file: an apply
+            puts the rule back to `10.96.0.1` alone. The README has rotation
+            and the details. Not for OpenShift: use the helm command with
+            `-f values-openshift.yaml` there.
 
             Enforcement is off by default: Olaitan observes and reports until
             `response.networkPolicy.enabled=true` is set explicitly.

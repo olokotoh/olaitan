@@ -30,6 +30,24 @@ and false-positive numbers; see [Unreleased](#unreleased).
   cluster. `QUICKSTART_CHART=local` (and `QUICKSTART_IMAGE`) use the
   checkout instead.
 
+- **`install.yaml` on every release** (Story 12.4, #121). The release
+  workflow renders the chart it publishes, with default values, into one
+  file for `kubectl apply -f`, checks that it runs the released image by
+  digest and holds no generated credential, adds it to `checksums.txt` and
+  attaches it to the GitHub release. The file creates the `olaitan`
+  namespace, namespaces the NATS objects (the subchart renders none) and
+  leaves out the NATS `helm test` Pod and the chart's Secret
+  `olaitan-secrets`: a published file would give every install the same
+  Redis password and Falco token (D5). The install is two steps: create the
+  namespace and `olaitan-secrets` with fresh random values, then apply the
+  file. The README covers upgrading (apply, then `kubectl rollout restart`;
+  the apply never touches the Secret), rotating the two values, and the API
+  server NetworkPolicy rule, which names `10.96.0.1` because a rendered file
+  cannot look the address up (k3s, minikube, Calico and Cilium need the
+  `kubectl patch` it gives). `hack/render-install-manifest.sh` does the
+  rendering; the helm test suite runs it on every CI run. v1.0.0-rc4
+  predates this and has no `install.yaml`. Deferred review items: #180.
+
 ## [v1.0.0-rc4] - 2026-09-24
 
 The first release since rc3 that installs with the README command and no

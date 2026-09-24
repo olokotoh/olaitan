@@ -56,6 +56,93 @@ No clone and no local build. The chart version is unprefixed SemVer, not the
 git tag: `v1.0.0-rc4` is the tag that triggers the release, `1.0.0-rc4` is what
 the registry holds.
 
+Or without helm, from the release's `install.yaml`. The file holds no
+credentials, so first create the namespace and the Secret it reads, with
+fresh random values, then apply it:
+
+```bash
+kubectl create namespace olaitan --save-config
+kubectl create secret generic olaitan-secrets -n olaitan \
+  --from-literal=redis-password="$(openssl rand -hex 32)" \
+  --from-literal=falco-http-token="$(openssl rand -hex 32)" \
+  --from-literal=llm-api-key=
+kubectl apply -f https://github.com/olokotoh/olaitan/releases/download/v1.0.0-rc4/install.yaml
+```
+
+`install.yaml` is the same chart with its default values, rendered by the
+release workflow from the chart it publishes (the same pinned images), into
+the `olaitan` namespace. Releases get it from the first one cut after
+v1.0.0-rc4; rc4 itself has none, so until the next release that URL returns
+404 and the helm command is the way in. It is not for OpenShift: there, use
+the helm command with `-f values-openshift.yaml`.
+
+### Installing with install.yaml
+
+**The Secret is yours.** The chart generates the bundled Redis password and
+the Falco token when you install with helm, once per install. A published
+file would carry one pair of values for everyone, readable by anyone, and
+with them any pod the CNI does not stop could wipe Olaitan's suspicion state
+in Redis or send it forged Falco alerts. So the file leaves the Secret
+`olaitan-secrets` out, and the second command above creates it with values
+only your cluster knows. `llm-api-key` stays empty unless you point the
+analyst at a hosted model. The first two commands run once: the second
+fails if the Secret already exists rather than overwrite it.
+
+**Upgrading.** Apply the newer release's `install.yaml` the same way, then
+restart every workload:
+
+```bash
+kubectl -n olaitan rollout restart daemonset,deployment,statefulset
+```
+
+The apply never touches `olaitan-secrets`, because the file does not
+contain it, so your values stay. Redis, Falco and the Olaitan pods read the
+Secret and their config only when they start, and a changed ConfigMap does
+not restart a pod by itself; the restart makes every pod start on the new
+file.
+
+**Rotating the Redis password and the Falco token.** Replace the Secret
+with new values, then restart everything so Redis, Falco, the collector and
+the aggregator all start on the new pair (set `llm-api-key` again if you use
+one):
+
+```bash
+kubectl create secret generic olaitan-secrets -n olaitan \
+  --from-literal=redis-password="$(openssl rand -hex 32)" \
+  --from-literal=falco-http-token="$(openssl rand -hex 32)" \
+  --from-literal=llm-api-key= \
+  --dry-run=client -o yaml | kubectl replace -f -
+kubectl -n olaitan rollout restart daemonset,deployment,statefulset
+```
+
+**API server access on k3s, minikube, Calico and Cilium.** The file's
+NetworkPolicy `olaitan` lets the Olaitan pods reach the API server only at
+`10.96.0.1` (the kubeadm Service IP) on ports 443 and 6443. helm reads the
+real addresses from the cluster when it installs; a file rendered in a
+release cannot. That is not enough on k3s (its Service IP is `10.43.0.1`),
+on minikube (its API server listens on 8443), or with Calico or Cilium,
+which check egress after the Service IP has been translated to the API
+server's own address. There, after the apply, add the real addresses.
+`kubectl get endpointslice -n default kubernetes` shows them; this adds the
+Service IP and every address in it:
+
+```bash
+port=$(kubectl get endpointslice -n default kubernetes -o jsonpath='{.ports[0].port}')
+for ip in $(kubectl get service -n default kubernetes -o jsonpath='{.spec.clusterIP}') \
+          $(kubectl get endpointslice -n default kubernetes -o jsonpath='{.endpoints[*].addresses[*]}'); do
+  kubectl -n olaitan patch networkpolicy olaitan --type=json -p \
+    "[{\"op\":\"add\",\"path\":\"/spec/egress/-\",\"value\":{\"to\":[{\"ipBlock\":{\"cidr\":\"${ip}/32\"}}],\"ports\":[{\"protocol\":\"TCP\",\"port\":443},{\"protocol\":\"TCP\",\"port\":${port}}]}}]"
+done
+```
+
+Run it again after every `kubectl apply` of the file: an apply, even of
+the same file, puts the rule back to `10.96.0.1` alone (checked on kind). On
+an IPv6 cluster use `/128` instead of `/32`. Where it matters, prefer the
+helm command, which gets this right by itself.
+
+**Removing it.** `kubectl delete -f` with the same URL removes everything,
+the namespace included, and with it the Secret.
+
 ### Try it on kind
 
 With Docker, [kind](https://kind.sigs.k8s.io/), helm and kubectl installed:
