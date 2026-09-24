@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -17,6 +18,19 @@ import (
 // Falco on. PR #99 (Story 8.3) got to ten minutes by switching Falco off and
 // publishing the S1 scenario's events on NATS itself; these tests keep that
 // shape out of the quickstart path and pin what the script actually does.
+
+// quickstartEnv is os.Environ() without any QUICKSTART_* setting, so a
+// developer who has one exported (say QUICKSTART_CHART=local) does not
+// change what these tests see, then the test's own settings on top.
+func quickstartEnv(extra ...string) []string {
+	var env []string
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "QUICKSTART_") {
+			env = append(env, kv)
+		}
+	}
+	return append(env, extra...)
+}
 
 func quickstartScript(t *testing.T) string {
 	t.Helper()
@@ -29,7 +43,7 @@ func quickstartPlan(t *testing.T, env ...string) string {
 	t.Helper()
 	cmd := exec.Command("bash", quickstartScript(t))
 	cmd.Dir = repoRoot(t)
-	cmd.Env = append(os.Environ(), append([]string{"QUICKSTART_PLAN=1"}, env...)...)
+	cmd.Env = quickstartEnv(append([]string{"QUICKSTART_PLAN=1"}, env...)...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("quickstart plan (%v) failed: %v\n%s", env, err, out)
@@ -47,7 +61,7 @@ func quickstartFunc(t *testing.T, stdin string, fn string, args ...string) (stri
 	script := `source "$1"; shift; "$@"`
 	cmd := exec.Command("bash", append([]string{"-c", script, "quickstart-test", quickstartScript(t), fn}, args...)...)
 	cmd.Dir = repoRoot(t)
-	cmd.Env = append(os.Environ(), "QUICKSTART_PLAN=1")
+	cmd.Env = quickstartEnv("QUICKSTART_PLAN=1")
 	cmd.Stdin = strings.NewReader(stdin)
 	out, err := cmd.Output()
 	return string(out), err
@@ -181,15 +195,24 @@ func TestQuickstartPlanPublished(t *testing.T) {
 	plan := quickstartPlan(t)
 	lines := strings.Split(strings.TrimSpace(plan), "\n")
 
-	first := ""
+	// The only command before kind create cluster is the check that the
+	// chart version is really published (review E1): a version that is not
+	// in the registry yet must fail before a cluster exists.
+	var cmds []string
 	for _, l := range lines {
 		if strings.HasPrefix(l, "+ ") {
-			first = l
-			break
+			cmds = append(cmds, l)
 		}
 	}
-	if !strings.HasPrefix(first, "+ kind create cluster --name olaitan-quickstart") {
-		t.Errorf("the first command must be kind create cluster (the clock starts there), got %q", first)
+	wantShow := "+ helm show chart " + publishedChartRef + " --version " + chartVersion(t)
+	if len(cmds) < 2 || cmds[0] != wantShow {
+		t.Errorf("the first command must be %q (before any cluster exists), got %q", wantShow, cmds)
+	}
+	if len(cmds) < 2 || !strings.HasPrefix(cmds[1], "+ kind create cluster --name olaitan-quickstart") {
+		t.Errorf("kind create cluster must come straight after the version check (the clock starts there), got %q", cmds)
+	}
+	if strings.Index(plan, "clock starts: kind create cluster") < strings.Index(plan, wantShow) {
+		t.Error("the version check must run before the clock starts")
 	}
 	if !strings.Contains(plan, "clock starts") {
 		t.Error("plan does not say where the clock starts")
@@ -241,6 +264,10 @@ func TestQuickstartPlanLocal(t *testing.T) {
 		t.Errorf("a local chart install takes no --version: %s", m[0])
 	}
 
+	if strings.Contains(plan, "helm show chart") {
+		t.Errorf("a local chart install needs no registry check:\n%s", plan)
+	}
+
 	plan = quickstartPlan(t, "QUICKSTART_CHART=local", "QUICKSTART_IMAGE=olaitan:dev")
 	if !strings.Contains(plan, "+ kind load docker-image olaitan:dev --name olaitan-quickstart") {
 		t.Errorf("QUICKSTART_IMAGE is not loaded into kind:\n%s", plan)
@@ -253,10 +280,87 @@ func TestQuickstartPlanLocal(t *testing.T) {
 	}
 }
 
+// TestQuickstartRejectsDigestImage (review E4): QUICKSTART_IMAGE is a
+// repo:tag for kind load; a digest reference used to be split into
+// image.repository=olaitan@sha256 and image.tag=<hex>.
+func TestQuickstartRejectsDigestImage(t *testing.T) {
+	for _, img := range []string{
+		"olaitan@sha256:abcd",
+		"olaitan:dev@sha256:abcd",
+		"localhost:5000/olaitan",
+		"olaitan",
+	} {
+		cmd := exec.Command("bash", quickstartScript(t))
+		cmd.Dir = repoRoot(t)
+		cmd.Env = quickstartEnv("QUICKSTART_PLAN=1", "QUICKSTART_CHART=local", "QUICKSTART_IMAGE="+img)
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Errorf("QUICKSTART_IMAGE=%s accepted:\n%s", img, out)
+			continue
+		}
+		if !strings.Contains(string(out), "must be repo:tag") {
+			t.Errorf("QUICKSTART_IMAGE=%s rejected without the repo:tag message:\n%s", img, out)
+		}
+	}
+	// A registry with a port is still a valid repo:tag.
+	plan := quickstartPlan(t, "QUICKSTART_CHART=local", "QUICKSTART_IMAGE=localhost:5000/olaitan:dev")
+	if !strings.Contains(plan, "image.repository=localhost:5000/olaitan") || !strings.Contains(plan, "image.tag=dev") {
+		t.Errorf("localhost:5000/olaitan:dev was not split into repo and tag:\n%s", plan)
+	}
+}
+
+// fakeTools puts failing stand-ins for helm, kind, kubectl and docker first
+// on PATH, so a function under test that calls one of them for real cannot
+// reach a registry or a cluster. Each records its arguments in calls.log.
+func fakeTools(t *testing.T, helmExit int) (path, calls string) {
+	t.Helper()
+	dir := t.TempDir()
+	calls = filepath.Join(dir, "calls.log")
+	for tool, code := range map[string]int{"helm": helmExit, "kind": 1, "kubectl": 1, "docker": 1} {
+		body := "#!/bin/sh\necho \"" + tool + " $*\" >>\"" + calls + "\"\nexit " + strconv.Itoa(code) + "\n"
+		if err := os.WriteFile(filepath.Join(dir, tool), []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir + string(os.PathListSeparator) + os.Getenv("PATH"), calls
+}
+
+// TestQuickstartVersionCheck (review E1): the published chart version is
+// checked in the registry before the clock starts, and a version that is
+// not there stops the run with a pointer to the two ways out.
+func TestQuickstartVersionCheck(t *testing.T) {
+	run := func(helmExit int) (string, error, string) {
+		path, calls := fakeTools(t, helmExit)
+		cmd := exec.Command("bash", "-c", `source "$1"; shift; "$@"`, "quickstart-test", quickstartScript(t), "qs_check_published", "9.9.9-rc9")
+		cmd.Dir = repoRoot(t)
+		cmd.Env = quickstartEnv("PATH=" + path)
+		out, err := cmd.CombinedOutput()
+		log, _ := os.ReadFile(calls)
+		return string(out), err, string(log)
+	}
+
+	out, err, calls := run(1)
+	if err == nil {
+		t.Fatalf("an unpublished version passed the check:\n%s", out)
+	}
+	if calls != "helm show chart "+publishedChartRef+" --version 9.9.9-rc9\n" {
+		t.Errorf("the check ran %q, want only helm show chart for 9.9.9-rc9", calls)
+	}
+	for _, want := range []string{"9.9.9-rc9", "QUICKSTART_VERSION=", "QUICKSTART_CHART=local"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the failure does not mention %s:\n%s", want, out)
+		}
+	}
+
+	if out, err, _ := run(0); err != nil {
+		t.Errorf("a published version failed the check: %v\n%s", err, out)
+	}
+}
+
 func TestQuickstartRejectsUnknownChartSource(t *testing.T) {
 	cmd := exec.Command("bash", quickstartScript(t))
 	cmd.Dir = repoRoot(t)
-	cmd.Env = append(os.Environ(), "QUICKSTART_PLAN=1", "QUICKSTART_CHART=elsewhere")
+	cmd.Env = quickstartEnv("QUICKSTART_PLAN=1", "QUICKSTART_CHART=elsewhere")
 	if out, err := cmd.CombinedOutput(); err == nil {
 		t.Errorf("QUICKSTART_CHART=elsewhere accepted:\n%s", out)
 	}
@@ -296,5 +400,31 @@ func TestQuickstartBudget(t *testing.T) {
 	}
 	if _, err := quickstartFunc(t, "", "qs_within_budget", "601", "600"); err == nil {
 		t.Error("601 s reported within a 600 s budget")
+	}
+}
+
+// falcoLog is shaped like Falco's JSON stdout (json_output on): another pod
+// reading /etc/shadow under a different rule comes first, then the demo
+// pod's alert, then a line from a pod whose name has the demo's as a prefix.
+const falcoLog = `{"hostname":"n","output":"x","output_fields":{"container.name":"other","fd.name":"/etc/shadow","k8s.ns.name":"default","k8s.pod.name":"other"},"priority":"Warning","rule":"Some other rule","source":"syscall","time":"2026-09-24T08:41:17Z"}
+{"hostname":"n","output":"x","output_fields":{"container.name":"quickstart-demo","fd.name":"/etc/passwd","k8s.ns.name":"olaitan-quickstart","k8s.pod.name":"quickstart-demo"},"priority":"Notice","rule":"Unrelated passwd rule","source":"syscall","time":"2026-09-24T08:41:18Z"}
+{"hostname":"n","output":"x","output_fields":{"container.name":"quickstart-demo","fd.name":"/etc/shadow","k8s.ns.name":"olaitan-quickstart","k8s.pod.name":"quickstart-demo"},"priority":"Warning","rule":"Read sensitive file untrusted","source":"syscall","time":"2026-09-24T08:41:19Z"}
+`
+
+// TestQuickstartRuleIsTheDemoPods (review E2): the printed Falco rule is the
+// one that fired for the demo pod in the demo namespace, not the first
+// /etc/shadow line in the log.
+func TestQuickstartRuleIsTheDemoPods(t *testing.T) {
+	out, err := quickstartFunc(t, falcoLog, "qs_parse_rule", "olaitan-quickstart", "quickstart-demo")
+	if err != nil {
+		t.Fatalf("qs_parse_rule: %v", err)
+	}
+	if out != "Read sensitive file untrusted\n" {
+		t.Errorf("qs_parse_rule = %q, want the demo pod's rule", out)
+	}
+	for _, c := range [][2]string{{"olaitan-quickstart", "quickstart"}, {"default", "quickstart-demo"}} {
+		if out, err := quickstartFunc(t, falcoLog, "qs_parse_rule", c[0], c[1]); err == nil || out != "" {
+			t.Errorf("qs_parse_rule %s %s matched %q, want nothing", c[0], c[1], out)
+		}
 	}
 }
