@@ -19,7 +19,8 @@
 #     GitHub Release failed (release.yml, job mark-failed).
 #   - nightly: main's README, the one GitHub shows a stranger. If it names a
 #     version that is not published, this fails, as it would for them.
-#   - by hand (workflow_dispatch), and on pull requests that change this job.
+#   - by hand (workflow_dispatch), and on pull requests that change this job
+#     (its workflow, hack/stranger.sh, or hack/quickstart.sh, which it sources).
 name: Stranger path
 
 on:
@@ -52,6 +53,7 @@ on:
     paths:
       - '.github/workflows/stranger.yml'
       - 'hack/stranger.sh'
+      - 'hack/quickstart.sh'
 
 permissions:
   contents: read
@@ -104,12 +106,18 @@ jobs:
           LEG: ${{ matrix.leg }}
         run: hack/stranger.sh "$LEG"
 
-      - name: Diagnostics on failure
-        if: failure()
+      # Also on cancel and timeout, and for the attack namespace. It only
+      # prints: it runs when the job has already failed, so its `|| true`
+      # cannot turn a failure green.
+      - name: Diagnostics on failure or cancel
+        if: failure() || cancelled()
         run: |
           kubectl get pods -A -o wide || true
-          kubectl -n olaitan get events --sort-by=.lastTimestamp || true
-          kubectl -n olaitan describe pods || true
+          for ns in olaitan olaitan-stranger; do
+            echo "=== $ns"
+            kubectl -n "$ns" get events --sort-by=.lastTimestamp || true
+            kubectl -n "$ns" describe pods || true
+          done
           kubectl -n olaitan logs -l app.kubernetes.io/name=falco -c falco --tail=100 || true
           kubectl -n olaitan logs -l app.kubernetes.io/component=aggregator --tail=100 || true
           kubectl -n olaitan logs -l app.kubernetes.io/component=collector --tail=100 || true

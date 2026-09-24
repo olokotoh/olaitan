@@ -15,6 +15,13 @@
 #
 # Nothing here talks to NATS and nothing turns Falco off.
 #
+# Every failure names its phase, so a flaky runner is told apart from a
+# broken release: readme (the block moved or names another version),
+# install (the README block itself failed), infra: cluster / rollout /
+# pull / exec / kubectl logs, and product: no Falco alert / no FSM
+# transition. A rollout that never goes Ready can still have a product
+# cause (a crash loop); the diagnostics step shows which.
+#
 # Usage: hack/stranger.sh helm|kubectl
 #   helm     README "### Try it on kind", bash block 1 (it creates the kind
 #            cluster itself, installs the published chart, waits)
@@ -74,10 +81,37 @@ stranger_readme_block() {
 
 st_say() { printf '==> %s\n' "$*"; }
 
+# st_summary LINE: add a line to the job summary when there is one.
+st_summary() {
+	if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+		printf '%s\n' "$*" >>"$GITHUB_STEP_SUMMARY"
+	fi
+}
+
+# st_fail PHASE MESSAGE: stop the check, naming the phase that failed, in the
+# log, as an annotation and in the job summary.
+st_fail() {
+	local phase="$1"
+	shift
+	printf 'stranger: FAILED [%s] %s\n' "$phase" "$*" >&2
+	printf '::error title=stranger-path check failed [%s]::%s\n' "$phase" "$*"
+	st_summary "- **FAILED [$phase]** $*"
+	exit 1
+}
+
 st_run() {
 	printf '+ %s\n' "$*"
 	[ "${STRANGER_PLAN:-}" = "1" ] && return 0
 	"$@"
+}
+
+# st_step PHASE CMD...: st_run, and on failure st_fail PHASE with the exit code.
+# The command's own stderr stays in the log.
+st_step() {
+	local phase="$1" rc=0
+	shift
+	st_run "$@" || rc=$?
+	[ "$rc" -eq 0 ] || st_fail "$phase" "'$*' exited $rc"
 }
 
 st_no_manifest() {
@@ -88,24 +122,30 @@ st_no_manifest() {
 	return 1
 }
 
+# The log readers keep kubectl's stderr and exit code: a failed read is an
+# infra fault, never "no alert yet".
 st_aggregator_logs() {
-	kubectl -n "$ST_NS" logs -l app.kubernetes.io/component=aggregator --tail=-1 2>/dev/null || true
+	kubectl -n "$ST_NS" logs -l app.kubernetes.io/component=aggregator --tail=-1
 }
 
 st_falco_logs() {
-	kubectl -n "$ST_NS" logs -l app.kubernetes.io/name=falco -c falco --tail=-1 2>/dev/null || true
+	kubectl -n "$ST_NS" logs -l app.kubernetes.io/name=falco -c falco --tail=-1
 }
 
 # st_rollout TYPE: wait for every object of TYPE in the namespace to roll
 # out. The kubectl path has no wait of its own in the README.
 st_rollout() {
-	local type="$1" name
+	local type="$1" names name rc=0
 	if [ "${STRANGER_PLAN:-}" = "1" ]; then
 		printf '+ kubectl -n %s rollout status %s/<each> --timeout=10m\n' "$ST_NS" "$type"
 		return 0
 	fi
-	for name in $(kubectl -n "$ST_NS" get "$type" -o name); do
-		st_run kubectl -n "$ST_NS" rollout status "$name" --timeout=10m
+	# Listed first, on its own: a failed `get` inside the `for` list would
+	# look like "no workloads of this type" and pass.
+	names="$(kubectl -n "$ST_NS" get "$type" -o name)" || rc=$?
+	[ "$rc" -eq 0 ] || st_fail "infra: rollout" "kubectl get $type in $ST_NS exited $rc"
+	for name in $names; do
+		st_step "infra: rollout" kubectl -n "$ST_NS" rollout status "$name" --timeout=10m
 	done
 }
 
@@ -126,31 +166,33 @@ main() {
 	esac
 
 	if ! block="$(stranger_readme_block "$readme" "$heading" "$n")"; then
-		echo "stranger: $readme has no bash block $n under '$heading'; the check follows the README, so fix the README or this script" >&2
-		exit 1
+		st_fail readme "$readme has no bash block $n under '$heading'; the check follows the README, so fix the README or this script"
 	fi
 	if [[ "$block" != *"$mark"* ]]; then
-		echo "stranger: bash block $n under '$heading' in $readme does not contain '$mark'; it is not the $leg path any more:" >&2
 		printf '%s\n' "$block" >&2
-		exit 1
+		st_fail readme "bash block $n under '$heading' in $readme does not contain '$mark'; it is not the $leg path any more (block above)"
 	fi
 	if [ "$leg" = helm ]; then
-		version="$(sed -n 's/.*--version[ =]\{1,\}\([0-9A-Za-z.+-]\{1,\}\).*/\1/p' <<<"$block" | head -n 1)"
+		# Only the `helm install` command itself, continuation lines joined:
+		# a --version in a comment or another command is not what installs.
+		version="$(sed -e ':a' -e '/\\$/{N;s/\\\n//;ba' -e '}' <<<"$block" |
+			sed -n 's/^[[:space:]]*helm install[[:space:]].*--version[ =]\{1,\}\([0-9A-Za-z.+-]\{1,\}\).*/\1/p' | head -n 1)"
 	else
 		version="$(sed -n 's#.*/releases/download/v\([^/[:space:]]\{1,\}\)/install\.yaml.*#\1#p' <<<"$block" | head -n 1)"
 	fi
 	if [ -z "$version" ]; then
-		echo "stranger: cannot read the version the $leg block installs" >&2
-		exit 1
+		st_fail readme "cannot read the version the $leg block installs (helm: --version on the helm install command)"
 	fi
 	if [ -n "$expect" ] && [ "$version" != "$expect" ]; then
-		echo "stranger: the README's $leg block installs $version, this run tests $expect" >&2
-		exit 1
+		st_fail readme "the README's $leg block installs $version, this run tests $expect"
 	fi
 	st_say "$leg path: $(basename "$readme"), '$heading', bash block $n, version $version"
 
 	if [ "$leg" = kubectl ] && st_no_manifest "$version"; then
-		st_say "kubectl path skipped: v$version was released before install.yaml was a release asset (Story 12.4); it runs from the next release on"
+		local why="kubectl path skipped: v$version was released before install.yaml was a release asset (Story 12.4); it runs from the next release on"
+		st_say "$why"
+		printf '::warning title=stranger-path check::%s\n' "$why"
+		st_summary "- **WARNING** $why"
 		return 0
 	fi
 
@@ -158,7 +200,7 @@ main() {
 	t0="$(date +%s)"
 	if [ "$leg" = kubectl ]; then
 		st_say "a fresh kind cluster for the kubectl path (the README assumes one)"
-		st_run kind create cluster --name "$ST_CLUSTER"
+		st_step "infra: cluster" kind create cluster --name "$ST_CLUSTER"
 	fi
 
 	st_say "running the README block as written"
@@ -166,23 +208,25 @@ main() {
 	printf '%s\n' "$block"
 	echo "--- README block end"
 	if [ "$plan" != "1" ]; then
-		bash -e -o pipefail -c "$block"
+		local rc=0
+		bash -e -o pipefail -c "$block" || rc=$?
+		[ "$rc" -eq 0 ] || st_fail install "the README $leg block exited $rc (its output is above)"
 	fi
 
 	st_say "every workload rolled out, every pod Ready, Falco among them"
 	st_rollout daemonset
 	st_rollout deployment
 	st_rollout statefulset
-	st_run kubectl -n "$ST_NS" wait pod --all --for=condition=Ready --timeout=10m
-	st_run kubectl -n "$ST_NS" wait pod -l app.kubernetes.io/name=falco --for=condition=Ready --timeout=5m
-	st_run kubectl -n "$ST_NS" get pods -o wide
+	st_step "infra: rollout" kubectl -n "$ST_NS" wait pod --all --for=condition=Ready --timeout=10m
+	st_step "infra: rollout" kubectl -n "$ST_NS" wait pod -l app.kubernetes.io/name=falco --for=condition=Ready --timeout=5m
+	st_step "infra: rollout" kubectl -n "$ST_NS" get pods -o wide
 	local t_ready
 	t_ready="$(date +%s)"
 
 	st_say "a throwaway pod in $ST_DEMO_NS (a namespace the agent scores)"
-	st_run kubectl create namespace "$ST_DEMO_NS"
-	st_run kubectl -n "$ST_DEMO_NS" run "$ST_DEMO_POD" --image="$QS_DEMO_IMAGE" --restart=Never -- sleep 3600
-	st_run kubectl -n "$ST_DEMO_NS" wait "pod/$ST_DEMO_POD" --for=condition=Ready --timeout=3m
+	st_step "infra: pull" kubectl create namespace "$ST_DEMO_NS"
+	st_step "infra: pull" kubectl -n "$ST_DEMO_NS" run "$ST_DEMO_POD" --image="$QS_DEMO_IMAGE" --restart=Never -- sleep 3600
+	st_step "infra: pull" kubectl -n "$ST_DEMO_NS" wait "pod/$ST_DEMO_POD" --for=condition=Ready --timeout=3m
 
 	st_say "the real action: cat /etc/shadow in the pod, until there is a Falco alert on /etc/shadow from it and an FSM transition for its namespace"
 	if [ "$plan" = "1" ]; then
@@ -190,18 +234,32 @@ main() {
 		return 0
 	fi
 
-	local attempt found="" rule="" t_seen="" t_attack
+	local attempt found="" rule="" t_seen="" t_attack logs rc
 	for attempt in $(seq 1 "$ST_ATTEMPTS"); do
 		# A read before Falco's driver is loaded is not seen, so the real
 		# read is repeated until both signals are there. Each one is counted.
 		printf '+ kubectl -n %s exec %s -- cat /etc/shadow   (read %s of %s)\n' \
 			"$ST_DEMO_NS" "$ST_DEMO_POD" "$attempt" "$ST_ATTEMPTS"
-		kubectl -n "$ST_DEMO_NS" exec "$ST_DEMO_POD" -- cat /etc/shadow >/dev/null
+		rc=0
+		kubectl -n "$ST_DEMO_NS" exec "$ST_DEMO_POD" -- cat /etc/shadow >/dev/null || rc=$?
+		[ "$rc" -eq 0 ] || st_fail "infra: exec" "kubectl exec cat /etc/shadow in $ST_DEMO_NS/$ST_DEMO_POD exited $rc"
 		t_attack="$(date +%s)"
 		while [ $(($(date +%s) - t_attack)) -lt "$ST_ATTEMPT_GAP" ]; do
 			sleep "$ST_POLL"
-			[ -n "$found" ] || found="$(st_aggregator_logs | qs_parse_transition "$ST_DEMO_NS")" || found=""
-			[ -n "$rule" ] || rule="$(st_falco_logs | qs_parse_rule "$ST_DEMO_NS" "$ST_DEMO_POD")" || rule=""
+			# Read the log first, on its own, so a kubectl failure stops the
+			# check as an infra fault; a parser miss only means "not yet".
+			if [ -z "$found" ]; then
+				rc=0
+				logs="$(st_aggregator_logs)" || rc=$?
+				[ "$rc" -eq 0 ] || st_fail "infra: kubectl logs" "reading the aggregator log exited $rc (kubectl's error is above)"
+				found="$(qs_parse_transition "$ST_DEMO_NS" <<<"$logs")" || found=""
+			fi
+			if [ -z "$rule" ]; then
+				rc=0
+				logs="$(st_falco_logs)" || rc=$?
+				[ "$rc" -eq 0 ] || st_fail "infra: kubectl logs" "reading the Falco log exited $rc (kubectl's error is above)"
+				rule="$(qs_parse_rule "$ST_DEMO_NS" "$ST_DEMO_POD" <<<"$logs")" || rule=""
+			fi
 			if [ -n "$found" ] && [ -n "$rule" ]; then
 				t_seen="$(date +%s)"
 				break 2
@@ -213,7 +271,12 @@ main() {
 		echo "stranger: after $ST_ATTEMPTS reads of /etc/shadow:" >&2
 		echo "stranger:   Falco alert on /etc/shadow from $ST_DEMO_NS/$ST_DEMO_POD: ${rule:-none}" >&2
 		echo "stranger:   FSM transition in $ST_DEMO_NS: ${found:-none}" >&2
-		exit 1
+		local missing=()
+		[ -n "$rule" ] || missing+=("product: no Falco alert")
+		[ -n "$found" ] || missing+=("product: no FSM transition")
+		local phase
+		phase="$(printf '%s, ' "${missing[@]}")"
+		st_fail "${phase%, }" "after $ST_ATTEMPTS real reads of /etc/shadow every pod was Ready but detection did not complete"
 	fi
 
 	local wl from to score ts

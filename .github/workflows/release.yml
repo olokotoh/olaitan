@@ -13,8 +13,11 @@
 #
 # Then the stranger-path check (Story 12.5, stranger.yml) installs what was
 # just published the way the README says, on a fresh kind, and requires a
-# real attack to be detected. If it fails, the run fails, `latest` does not
-# move, and the GitHub Release is marked failed (job mark-failed).
+# real attack to be detected. If it fails (or is cancelled or times out),
+# the run fails, `latest` does not move, and the GitHub Release is marked
+# failed (job mark-failed). A later green rerun takes the mark off again
+# (job unmark-failed). The GitHub Release is created without "Latest" and
+# only promote marks it Latest, after the check passed.
 #
 # The tag is expected to sit on a commit that already passed CI on main.
 # That is ENFORCED, not assumed: the preflight job below refuses to publish
@@ -572,14 +575,17 @@ jobs:
   # a chart-job failure would leave `latest` advertising a version that has
   # no chart and no GitHub Release. It also waits for the stranger-path
   # check (Story 12.5): a release that a stranger cannot install from the
-  # README never becomes `latest`.
+  # README never becomes `latest`, neither the image tag nor the GitHub
+  # Release's "Latest" badge. It runs after unmark-failed, because a release
+  # still flagged pre-release by an earlier failed attempt cannot be Latest.
   # ---------------------------------------------------------------------
   promote:
-    needs: [preflight, image, chart, stranger]
+    needs: [preflight, image, chart, stranger, unmark-failed]
     if: needs.preflight.outputs.promote_latest == 'true'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # contents: write only to mark the GitHub Release Latest.
+      contents: write
       packages: write
     steps:
       - uses: docker/setup-buildx-action@v3
@@ -607,6 +613,22 @@ jobs:
           [ "$got" = "$DIGEST" ] \
             || { echo "latest resolves to ${got}, not the signed digest ${DIGEST}" >&2; exit 1; }
 
+      # The release job created the GitHub Release with make_latest: false,
+      # so GitHub did not show it as Latest while the stranger check ran. It
+      # becomes Latest here and nowhere else: only after the check passed,
+      # and only for the highest stable tag (the promote_latest gate above),
+      # so a backport or an rc never does.
+      - name: Mark the GitHub Release Latest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" -R "$REPO" --latest
+          echo "$TAG is the Latest GitHub Release"
+
   # ---------------------------------------------------------------------
   # Release: notes plus the assets an operator may want to verify offline.
   # ---------------------------------------------------------------------
@@ -624,6 +646,9 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          # Not "Latest" yet: promote sets that once the stranger check
+          # passed (and only for the highest stable tag).
+          make_latest: 'false'
           prerelease: ${{ needs.preflight.outputs.prerelease == 'true' }}
           files: |
             dist/*.tgz
@@ -728,18 +753,24 @@ jobs:
       contents: read
     uses: ./.github/workflows/stranger.yml
     with:
-      ref: ${{ github.ref_name }}
+      # The tagged commit itself, not the tag's name, which could be
+      # re-pointed while the run is in flight.
+      ref: ${{ github.sha }}
       expect_version: ${{ needs.preflight.outputs.version }}
 
   # ---------------------------------------------------------------------
   # Mark failed: the image and chart are already public and signed, and
   # deleting them would break anyone who pinned the digest, so the release
   # stays, marked. It becomes a pre-release (never "Latest"), its title says
-  # it failed, and the notes open with the run that failed it.
+  # it failed, and the notes open with the run that failed it. It runs when
+  # the stranger job did not succeed for any reason: failure, cancel, or
+  # timeout. It is idempotent: a second failed attempt replaces the banner
+  # and keeps the pre-release state recorded by the first one, so
+  # unmark-failed can restore it.
   # ---------------------------------------------------------------------
   mark-failed:
     needs: [preflight, release, stranger]
-    if: always() && needs.release.result == 'success' && needs.stranger.result == 'failure'
+    if: always() && needs.release.result == 'success' && needs.stranger.result != 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -753,15 +784,83 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          gh release view "$TAG" -R "$REPO" --json body -q .body > notes-old.md
+          begin='<!-- stranger-check: FAILED'
+          end='<!-- stranger-check: end -->'
+          suffix=' (FAILED stranger-path check)'
+          gh release view "$TAG" -R "$REPO" --json body -q .body > body.md
+          title="$(gh release view "$TAG" -R "$REPO" --json name -q .name)"
+          pre="$(gh release view "$TAG" -R "$REPO" --json isPrerelease -q .isPrerelease)"
+          if grep -qF "$begin" body.md; then
+            # Marked by an earlier attempt: the flag is on because of that
+            # mark, so keep the state it recorded.
+            pre="$(sed -n 's/^<!-- stranger-check: FAILED; prerelease-before=\([a-z]*\) -->$/\1/p' body.md | head -n 1)"
+          fi
+          awk -v b="$begin" -v e="$end" '
+            skip == 2 { skip = 0; if ($0 == "") next }
+            skip == 1 { if ($0 == e) skip = 2; next }
+            index($0, b) == 1 { skip = 1; next }
+            { print }
+          ' body.md > rest.md
+          rest="$(cat rest.md)"
+          title="${title:-$TAG}"
+          case "$title" in *"$suffix") ;; *) title="${title}${suffix}" ;; esac
           {
+            echo "${begin}; prerelease-before=${pre} -->"
             echo "> [!CAUTION]"
             echo "> **This release FAILED the stranger-path check.** Installing it the way"
             echo "> its README says, on a fresh kind cluster, did not reach every pod Ready"
             echo "> with a real attack detected. Do not install it. Run: ${RUN_URL}"
+            echo "$end"
             echo
-            cat notes-old.md
+            printf '%s\n' "$rest"
           } > notes.md
           gh release edit "$TAG" -R "$REPO" --prerelease --latest=false \
-            --title "$TAG (FAILED stranger-path check)" --notes-file notes.md
+            --title "$title" --notes-file notes.md
           echo "marked $TAG failed"
+
+  # ---------------------------------------------------------------------
+  # Unmark: a rerun of the stranger job that passes takes an earlier mark
+  # off: the title and notes go back, and the pre-release flag is cleared
+  # only when mark-failed set it (recorded in its banner). A real
+  # pre-release (an rc) stays one. Nothing to do when there is no mark.
+  # ---------------------------------------------------------------------
+  unmark-failed:
+    needs: [preflight, release, stranger]
+    if: needs.release.result == 'success' && needs.stranger.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Take an earlier failed mark off the GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          begin='<!-- stranger-check: FAILED'
+          end='<!-- stranger-check: end -->'
+          suffix=' (FAILED stranger-path check)'
+          gh release view "$TAG" -R "$REPO" --json body -q .body > body.md
+          if ! grep -qF "$begin" body.md; then
+            echo "$TAG is not marked failed: nothing to undo"
+            exit 0
+          fi
+          title="$(gh release view "$TAG" -R "$REPO" --json name -q .name)"
+          pre="$(sed -n 's/^<!-- stranger-check: FAILED; prerelease-before=\([a-z]*\) -->$/\1/p' body.md | head -n 1)"
+          awk -v b="$begin" -v e="$end" '
+            skip == 2 { skip = 0; if ($0 == "") next }
+            skip == 1 { if ($0 == e) skip = 2; next }
+            index($0, b) == 1 { skip = 1; next }
+            { print }
+          ' body.md > rest.md
+          rest="$(cat rest.md)"
+          printf '%s\n' "$rest" > notes.md
+          args=(--title "${title%"$suffix"}" --notes-file notes.md)
+          if [ "$pre" = false ] && [ "$PRERELEASE" != true ]; then
+            args+=(--prerelease=false)
+          fi
+          gh release edit "$TAG" -R "$REPO" "${args[@]}"
+          echo "took the failed mark off $TAG"
