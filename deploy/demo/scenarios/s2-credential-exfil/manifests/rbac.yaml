@@ -1,0 +1,56 @@
+# S2 credential-exfil least-privilege RBAC (Story 11.2a, design point DP1 from
+# PR #190 / #112 comment).
+#
+# The Story 11.1 target ran as the tenant-acme default ServiceAccount with no
+# RBAC, so a real kube-API call from the stolen token returned 403. Detection
+# (OLT-CRED-001 token read + OLT-CRED-002 metadata IP) does not need API
+# success, but to show a SUCCESSFUL, scoped API read this story binds a
+# dedicated ServiceAccount to a narrow Role: list/get Secrets in its OWN
+# namespace only. It grants nothing cluster-wide and nothing outside
+# tenant-acme, so the stolen token can read only what a compromised tenant
+# workload could already reach. The namespace is declared here too so applying
+# this manifest before the workload creates the SA the pod binds to.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-acme
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: s2-attacker
+  namespace: tenant-acme
+  labels:
+    olaitan.scenario: s2-credential-exfil
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: s2-secrets-reader
+  namespace: tenant-acme
+  labels:
+    olaitan.scenario: s2-credential-exfil
+rules:
+  # Narrowest scope that lets the stolen token show a successful API read:
+  # list/get Secrets in this namespace only. No create/update/delete, no
+  # other resources, no other namespace, nothing cluster-scoped.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: s2-attacker-secrets-reader
+  namespace: tenant-acme
+  labels:
+    olaitan.scenario: s2-credential-exfil
+subjects:
+  - kind: ServiceAccount
+    name: s2-attacker
+    namespace: tenant-acme
+roleRef:
+  kind: Role
+  name: s2-secrets-reader
+  apiGroup: rbac.authorization.k8s.io

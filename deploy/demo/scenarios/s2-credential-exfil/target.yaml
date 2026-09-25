@@ -11,3 +11,22 @@ floor: true
 triggering_rules:
   - OLT-CRED-001
   - OLT-CRED-002
+
+# Story 11.2a (AC3): the real in-cluster primitives the runner executes,
+# mapped to their MITRE ATT&CK for Containers ID(s). Cited from the repo rule
+# corpus (OLT-CRED-001 tags T1552, OLT-CRED-002 tags T1552.005) and the ATT&CK
+# for Containers matrix (T1528, T1552.007). The token value is never printed.
+attack_steps:
+  - id: sa-token-read
+    mitre:
+      - T1552     # Unsecured Credentials
+      - T1528     # Steal Application Access Token
+    primitive: read the projected SA token, emitting only its length and sha256
+  - id: kube-api-use
+    mitre:
+      - T1552.007 # Container API
+    primitive: call the kube-API with the token (least-privilege s2-attacker SA), status only
+  - id: cloud-metadata-request
+    mitre:
+      - T1552.005 # Cloud Instance Metadata API
+    primitive: request 169.254.169.254 (cloud instance-metadata IP)

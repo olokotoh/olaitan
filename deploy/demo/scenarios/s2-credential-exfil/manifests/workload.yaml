@@ -37,6 +37,10 @@ spec:
       labels:
         app: web
     spec:
+      # Story 11.2a (DP1): bind the least-privilege s2-attacker SA (created by
+      # manifests/rbac.yaml, applied first) so the stolen token shows a real,
+      # scoped API read (list Secrets in tenant-acme only) instead of a 403.
+      serviceAccountName: s2-attacker
       automountServiceAccountToken: true
       containers:
         - name: web
