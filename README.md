@@ -253,6 +253,71 @@ ahead of the last release, set `QUICKSTART_VERSION` to a published version.
 checkout instead; add `QUICKSTART_IMAGE=olaitan:<tag>` to load an image
 you built with `make docker-build` into kind as well.
 
+### The whole system: make up / make down
+
+`make quickstart` is the default install. `make up` is the full reference
+system from a clone: the kind-full cluster (Calico, audit webhook, one
+worker), the full profile with all five sources and the in-cluster model,
+Falco on, and the same real `cat /etc/shadow` in a throwaway pod.
+
+```bash
+make up     # host preflight, kind-full, the full profile, a real attack, the result
+make down   # removes the cluster, its node containers and kubeconfig context, and the key material
+```
+
+`make up` checks the host before it creates anything and stops on every
+blocker it finds, each with the exact fix. On a stock Ubuntu 24.04 host
+this is what it said first:
+
+```
+==> preflight (host): nothing is created until every check passes
+  ok       docker, kind, helm, kubectl and openssl are on PATH
+  ok       Docker is reachable
+  ok       kernel BTF present (/sys/kernel/btf/vmlinux)
+  ok       kernel 7.0.0-1013-aws is supported by Falco 0.45.0-rc1 (modern_ebpf, tested through 7.0)
+  BLOCKER  inotify limits too low for Falco on kind-full: instances=128 (need >= 512), watches=255080 (need >= 524288)
+           Falco would crash with 'could not initialize inotify handler' and never see the attack.
+           fix: sudo sysctl -w fs.inotify.max_user_instances=512 fs.inotify.max_user_watches=524288
+           to keep it after a reboot, put the same settings in /etc/sysctl.d/99-olaitan.conf
+  ok       python3 with PyYAML (trims hack/kind-full.yaml to 1 worker(s))
+  ok       no kind cluster named olaitan-full yet
+up: preflight found 1 blocker(s); nothing was created. Fix them and run make up again.
+```
+
+After that one `sysctl`, `make up` ran to the end:
+
+```
+  Olaitan (full profile, Falco on) saw a real action and moved the workload:
+
+    workload   olaitan-up/Pod/up-demo
+    from       CLEAN
+    to         SUSPICIOUS
+    score      27.5
+    logged at  2026-09-25T06:42:25.854609892Z (aggregator clock)
+    falco rule Read sensitive file untrusted
+    reads      26 of /etc/shadow before the transition
+
+  make up -> Falco, collector, aggregator ready:  319s
+  make up -> first detection:                     727s (budget 900s)
+```
+
+That was an 8 vCPU, 32 GiB Ubuntu 24.04 host on kernel 7.0 (kind v0.30.0,
+helm v3.16.4) with only Docker, kind, helm, kubectl and make installed
+(openssl and python3 with PyYAML come with the image). The time covers the
+whole command, from preflight to the aggregator's decision, and `make up`
+fails over 900 s (`UP_BUDGET`). Falco saw the first read. On this profile
+the rule score alone (20) stays below the threshold, so the transition
+waited for the in-cluster model's first verdict on CPU (7.5), about seven
+minutes after that read; the reads repeat until the aggregator decides.
+With 4 vCPUs expect that step to be slower, and possibly over budget.
+
+It uses the chart in your checkout with the `edge` image, the same cluster
+name, out dir and worker count as `make e2e-full` (`FULL_CLUSTER_NAME`,
+`FULL_OUT_DIR`, `FULL_WORKERS`), and writes its kubeconfig to
+`$(FULL_OUT_DIR)/kubeconfig`, never to your default kubeconfig. `make down`
+ends by checking that no cluster, node container or kubeconfig context is
+left, and fails if one is.
+
 ### Where it runs
 
 | Platform | Install | NetworkPolicy enforced | Audit webhook | Overlay |

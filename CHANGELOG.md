@@ -20,6 +20,16 @@ and false-positive numbers; see [Unreleased](#unreleased).
 
 ### Added
 
+- **`make up` / `make down`** (Story 12.3, #120). `make up` checks the host
+  first (tools, Docker, BTF, the Falco pin against the kernel, inotify
+  limits, PyYAML when the node list is trimmed, an existing cluster) and
+  stops with the exact fix for every blocker before anything is created.
+  Then it brings up kind-full with the full profile and Falco on, reads
+  `/etc/shadow` in a throwaway pod, and prints the aggregator's first
+  decision about it with the time since `make up` started (non-zero exit
+  over 900 s, `UP_BUDGET`). `make down` removes the cluster, node
+  containers, kind kubeconfig entries, `$(FULL_OUT_DIR)` and
+  `hack/.audit-full`, then checks nothing is left.
 - **`make quickstart`** (Story 12.2, #119). From a clone: a fresh kind
   cluster, the published chart with Falco on, a real `cat /etc/shadow` in a
   throwaway pod in a scored namespace, and the agent's first decision about
