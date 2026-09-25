@@ -1616,6 +1616,82 @@ falco:
           secretKeyRef:
             name: '{{ include "olaitan.falcoIngest.releaseFullname" . }}-secrets'
             key: falco-http-token
+  # Story 11.2d (#195): custom Falco rules that fire on the REAL S1-S3 attack
+  # primitives and, crucially, EMIT the exact Falco fields the OLT rules key
+  # on plus the k8s pod identity the correlator needs to resolve workload
+  # posture. Before this, real attacks produced no OLT match (only the removed
+  # synthetic NATS events carried those fields); see the PR #194 live finding
+  # and _bmad-output/implementation-artifacts/11-2d-detection-gap.md.
+  #
+  # The OLT rules are NOT loosened. Story 10.3's canonical field mapping
+  # (internal/collector/falco/translate.go) projects the emitted Falco fields
+  # onto the OLT canonical names: thread.cap_effective -> process.cap_effective,
+  # fd.name -> file.path, proc.exepath -> process.exe, fd.sip/fd.rip ->
+  # network.dst_ip. k8s.ns.name / k8s.pod.name flow to the correlator's
+  # posture lookup (translate.go:88-93). Each rule is narrowly scoped to the
+  # attack behaviour so benign workloads do not match (benign check in 11.2d).
+  # customRules is a map; values-<platform>.yaml keys (e.g. the kind mount-hook
+  # exception) deep-merge with this one.
+  customRules:
+    olaitan-detection.yaml: |-
+      - rule: Olaitan Privileged Escape Primitive
+        desc: >-
+          A container process holding CAP_SYS_ADMIN runs a namespace or mount
+          escape tool. Emits thread.cap_effective (OLT-PRIV-001 keys on
+          process.cap_effective) and the k8s pod identity for the correlator.
+        condition: >-
+          spawned_process and container
+          and thread.cap_effective contains CAP_SYS_ADMIN
+          and proc.name in (nsenter, mount, umount, chroot, setns, unshare)
+        output: >-
+          Olaitan privileged escape primitive (proc_exepath=%proc.exepath
+          proc_cmdline=%proc.cmdline cap_effective=%thread.cap_effective
+          container_id=%container.id k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+        priority: WARNING
+        tags: [olaitan, container, mitre_privilege_escalation, T1611]
+        source: syscall
+      - rule: Olaitan ServiceAccount Token Read
+        desc: >-
+          A container process opens the projected ServiceAccount token file.
+          Emits fd.name (OLT-CRED-001 keys on file.path) and proc.exepath
+          (process.exe) plus the k8s pod identity.
+        condition: >-
+          open_read and container
+          and (fd.name startswith /run/secrets/kubernetes.io/serviceaccount/
+          or fd.name startswith /var/run/secrets/kubernetes.io/serviceaccount/)
+        output: >-
+          Olaitan serviceaccount token read (file=%fd.name
+          proc_exepath=%proc.exepath k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+        priority: WARNING
+        tags: [olaitan, container, mitre_credential_access, T1552]
+        source: syscall
+      - rule: Olaitan Cloud Metadata Contact
+        desc: >-
+          A container process connects to the cloud instance metadata IP
+          169.254.169.254. Emits fd.sip/fd.rip (OLT-CRED-002 keys on
+          network.dst_ip) plus the k8s pod identity.
+        condition: >-
+          evt.type=connect and evt.dir=< and container
+          and (fd.sip=169.254.169.254 or fd.rip=169.254.169.254)
+        output: >-
+          Olaitan cloud metadata contact (dst_sip=%fd.sip dst_rip=%fd.rip
+          proc_exepath=%proc.exepath k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+        priority: WARNING
+        tags: [olaitan, container, mitre_credential_access, T1552.005]
+        source: syscall
+      - rule: Olaitan In-Pod kubectl Exec
+        desc: >-
+          A process whose executable path ends /kubectl execs inside a
+          container. Emits proc.exepath (OLT-LATERAL-001 keys on process.exe)
+          plus the k8s pod identity.
+        condition: >-
+          spawned_process and container and proc.exepath endswith /kubectl
+        output: >-
+          Olaitan in-pod kubectl exec (proc_exepath=%proc.exepath
+          proc_cmdline=%proc.cmdline k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+        priority: WARNING
+        tags: [olaitan, container, mitre_lateral_movement, T1613]
+        source: syscall
 
 # NATS with JetStream persistence -- inter-ring event bus. JetStream
 # provides the replay/checkpoint primitive that Story 2.7 + Story 3.1

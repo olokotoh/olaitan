@@ -67,6 +67,7 @@ func TestAttackExecutor_S1_AppliesTargetThenExecsEscapeThenCleansUp(t *testing.T
 	if err != nil {
 		t.Fatalf("newAttackExecutor: %v", err)
 	}
+	e.settleWait = 0 // Story 11.2d: skip the 45s settle in unit tests
 	if err := e.Execute(context.Background()); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -113,6 +114,7 @@ func TestAttackExecutor_CleanupRunsEvenWhenPrimitiveFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newAttackExecutor: %v", err)
 	}
+	e.settleWait = 0 // Story 11.2d: skip the 45s settle in unit tests
 	execErr := e.Execute(context.Background())
 	if execErr == nil {
 		t.Fatalf("expected Execute to surface the injected exec failure")
@@ -160,6 +162,7 @@ func TestAttackExecutor_S2_ReadsTokenWithoutPrintingItsValue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newAttackExecutor: %v", err)
 	}
+	e.settleWait = 0 // Story 11.2d: skip the 45s settle in unit tests
 	if err := e.Execute(context.Background()); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -201,22 +204,46 @@ func TestAttackExecutor_S2_ReadsTokenWithoutPrintingItsValue(t *testing.T) {
 
 func TestAttackExecutor_S3_LaunchesKubectlNamedProcessInPod(t *testing.T) {
 	var calls []recordedCall
-	run := recordingRunner(&calls, nil, "")
+	// targetPod resolves the concrete pod name via `kubectl get pod ... -o
+	// jsonpath`; return one for that call so kubectl cp has a destination.
+	stdoutFor := func(args []string) string {
+		if strings.Contains(strings.Join(args, " "), "get pod") {
+			return "web-6d4f9c7b8-abcde"
+		}
+		return ""
+	}
+	run := recordingRunner(&calls, stdoutFor, "")
 	e, err := newAttackExecutor("s3", harnessDir("s3-lateral-movement"), run, testLogger())
 	if err != nil {
 		t.Fatalf("newAttackExecutor: %v", err)
 	}
+	e.settleWait = 0                  // Story 11.2d: skip the 45s settle in unit tests
+	e.kubectlBinary = "/fake/kubectl" // deterministic cp source in the unit test
 	if err := e.Execute(context.Background()); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
 	_ = e.Cleanup(context.Background())
 
-	// OLT-LATERAL-001 keys on a process whose exe ends /kubectl inside the
-	// tenant pod, so the S3 plan must launch a /kubectl-named process in-pod
-	// (kubectl is the driver binary of every call, so the meaningful check is
-	// that an exec primitive references a /kubectl path in-pod).
-	if firstCallContaining(calls, "/tmp/kubectl") < 0 {
-		t.Errorf("S3 did not launch a /kubectl-named process in-pod; calls=%v", calls)
+	// Story 11.2d: OLT-LATERAL-001 keys on a process whose exe ends /kubectl.
+	// The prior primitive renamed the in-pod busybox to /tmp/kubectl, which
+	// exited 127 (multicall dispatch) so no /kubectl process execd. The fix
+	// uploads a REAL standalone kubectl with kubectl cp, then execs it. Assert
+	// a real binary is uploaded (cp) to a /tmp/kubectl destination, and that
+	// the primitive does NOT rename busybox.
+	cpIdx := firstCallContaining(calls, "cp")
+	if cpIdx < 0 || !strings.Contains(joinCall(calls[cpIdx]), "/tmp/kubectl") {
+		t.Errorf("S3 did not upload a real kubectl to /tmp/kubectl via kubectl cp; calls=%v", calls)
+	}
+	if !strings.Contains(joinCall(calls[cpIdx]), "/fake/kubectl") {
+		t.Errorf("S3 cp source is not the runner-host kubectl binary; calls=%v", calls)
+	}
+	if firstCallContaining(calls, "/tmp/kubectl version") < 0 {
+		t.Errorf("S3 did not exec the uploaded /tmp/kubectl; calls=%v", calls)
+	}
+	for _, c := range calls {
+		if strings.Contains(joinCall(c), "cp /bin/busybox") || strings.Contains(joinCall(c), "busybox /tmp/kubectl") {
+			t.Errorf("S3 must not rename busybox (multicall exits 127): %s", joinCall(c))
+		}
 	}
 }
 
@@ -246,6 +273,7 @@ func TestAttackExecutor_ApplyRetriesTerminatingNamespace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newAttackExecutor: %v", err)
 	}
+	e.settleWait = 0               // Story 11.2d: skip the 45s settle in unit tests
 	e.retryWait = time.Millisecond // do not sleep 5s in the unit test
 	if err := e.Execute(context.Background()); err != nil {
 		t.Fatalf("Execute should have retried past the terminating-namespace race: %v", err)
@@ -265,6 +293,7 @@ func TestAttackExecutor_ApplyRetriesTerminatingNamespace(t *testing.T) {
 	}
 	e2, _ := newAttackExecutor("s1", harnessDir("s1-container-escape"), hardRun, testLogger())
 	e2.retryWait = time.Millisecond
+	e2.settleWait = 0
 	if err := e2.Execute(context.Background()); err == nil {
 		t.Fatalf("Execute should surface a non-transient apply error")
 	}
@@ -282,6 +311,7 @@ func TestAttackExecutor_CleanupIsSurgical(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newAttackExecutor: %v", err)
 	}
+	e.settleWait = 0 // Story 11.2d: skip the 45s settle in unit tests
 	if err := e.Cleanup(context.Background()); err != nil {
 		t.Fatalf("Cleanup: %v", err)
 	}
@@ -299,6 +329,43 @@ func TestAttackExecutor_CleanupIsSurgical(t *testing.T) {
 		if strings.Contains(j, "delete") && !strings.Contains(j, "--ignore-not-found") {
 			t.Errorf("cleanup delete is not idempotent: %s", j)
 		}
+	}
+}
+
+// TestAttackExecutor_SettlesBeforeCleanup proves Story 11.2d's
+// settle-before-cleanup: Execute waits settleWait AFTER the primitive and
+// BEFORE returning (so the caller's deferred Cleanup does not delete the pod
+// before the correlator resolves workload posture off the live pod), and a
+// cancelled context short-circuits the wait. The default settleWait is
+// non-zero so a real run never deletes the target immediately.
+func TestAttackExecutor_SettlesBeforeCleanup(t *testing.T) {
+	var calls []recordedCall
+	run := recordingRunner(&calls, nil, "")
+	e, err := newAttackExecutor("s1", harnessDir("s1-container-escape"), run, testLogger())
+	if err != nil {
+		t.Fatalf("newAttackExecutor: %v", err)
+	}
+	if e.settleWait <= 0 {
+		t.Fatalf("default settleWait must be positive so a real run does not delete the pod before posture resolves; got %s", e.settleWait)
+	}
+	e.settleWait = 60 * time.Millisecond
+	start := time.Now()
+	if err := e.Execute(context.Background()); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < e.settleWait {
+		t.Errorf("Execute returned after %s; expected to settle at least %s before returning", elapsed, e.settleWait)
+	}
+
+	// A cancelled context must short-circuit the settle so a shutdown is not
+	// blocked for the full window.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	e.settleWait = 10 * time.Second
+	start = time.Now()
+	_ = e.Execute(ctx)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("cancelled-context settle took %s; expected a prompt return", elapsed)
 	}
 }
 

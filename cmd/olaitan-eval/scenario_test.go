@@ -79,7 +79,13 @@ func TestNewScenario_DispatchAllFive(t *testing.T) {
 			// Story 11.2a: Run now executes a REAL in-cluster attack, so
 			// inject a fake attack runner to exercise dispatch without a
 			// cluster (the overlay-fake precedent).
+			// Story 11.2d: S3 resolves the concrete pod name (kubectl get
+			// pod) before uploading a real kubectl, so the fake runner must
+			// answer that lookup; all other calls return empty.
 			fakeAttack := func(ctx context.Context, name string, args ...string) (string, error) {
+				if strings.Contains(strings.Join(args, " "), "get pod") {
+					return "web-6d4f9c7b8-abcde", nil
+				}
 				return "", nil
 			}
 			sc, err := newScenario(tc.id, root, fakeAttack, testLogger())
@@ -90,6 +96,7 @@ func TestNewScenario_DispatchAllFive(t *testing.T) {
 			if !ok {
 				t.Fatalf("scenario %q is %T; want *scenarioHarness", tc.id, sc)
 			}
+			h.settleWait = 0 // Story 11.2d: do not wait the 45s settle in a unit test
 			if h.id != tc.id {
 				t.Errorf("harness id = %q; want %q", h.id, tc.id)
 			}
