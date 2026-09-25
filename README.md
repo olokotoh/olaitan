@@ -78,6 +78,10 @@ the helm command with `-f values-openshift.yaml`.
 
 ### Installing with install.yaml
 
+On kind, use the helm path with the kind overlay ("Try it on kind" below):
+`install.yaml` has no kind hook exception, so there every pod start trips
+Falco's Critical rule "Drop and execute new binary in container".
+
 **The Secret is yours.** The chart generates the bundled Redis password and
 the Falco token when you install with helm, once per install. A published
 file would carry one pair of values for everyone, readable by anyone, and
@@ -157,15 +161,18 @@ kubectl -n olaitan wait pod --all --for=condition=Ready --timeout=10m
 ```
 
 The `-f` line is the kind overlay of the same release, which helm reads
-straight from GitHub. It matters on kind only. A kind node is itself a
+straight from GitHub. The overlay comes from the release's git tag and is
+not yet covered by the release's `checksums.txt` or its cosign signature,
+as the chart is. It matters on kind only. A kind node is itself a
 container, and kind's containerd runs a hook of its own
 (`mount-product-files`) inside every new container, including each
 `kubectl exec`. Falco's Critical rule "Drop and execute new binary in
 container" fires on that hook and blames your pod, and a Critical alert
 scores 36, enough to mark the pod SUSPICIOUS before it has done anything.
 The overlay adds one narrow exception: that hook running `mount` or
-`umount`, nothing else. The chart's defaults carry no exception, since
-real nodes do not run the hook.
+`umount`, nothing else. It also sets `platform: kind`, which only changes
+the text of the install notes. The chart's defaults carry no exception,
+since real nodes do not run the hook.
 
 Both waits are needed. `kubectl wait` only sees pods that already exist, so
 straight after a plain `helm install` it fails with `no matching resources
@@ -174,7 +181,8 @@ as ready with one pod unavailable, so on one node it can return while the
 collector is still restarting (the collector and the aggregator restart a
 few times until NATS is up). The `kubectl wait` after it is the real check.
 
-That is the default install plus that one kind exception, Falco included:
+That is the default install plus that one kind exception (and
+`platform: kind`, notes text only), Falco included:
 on a single-node cluster, six pods (Falco and the collector, one each per node; the aggregator; NATS;
 nats-box; Redis). Before release, this sequence
 was run word for word on a fresh single-node kind (kind v0.30.0, node image
@@ -183,7 +191,8 @@ packaged the way the release packages it and the image loaded into kind
 instead of pulled. Every pod was Ready 102 seconds after `kind create
 cluster` started and Falco reported healthy a minute later. That run had no
 `-f` line, so the SUSPICIOUS it saw after `cat /etc/shadow` in a pod was
-the hook's Critical alert, not the read. With the overlay, the read alone
+most likely the hook's Critical alert, not the read (that run did not
+record the score). With the overlay, the read alone
 does it: it trips Falco's Warning rule "Read sensitive file untrusted",
 which scores 20, the SUSPICIOUS threshold. The stranger-path CI job runs
 this block word for word and prints every Falco rule that fired for its
@@ -243,7 +252,10 @@ file untrusted" (Warning, score 20, SUSPICIOUS on its own). The script then
 waits for the aggregator's decision about the pod and prints it, with every
 Falco rule that fired for the pod up to that decision and how long it took
 from `kind create cluster`. If none of those rules was an alert on
-`/etc/shadow`, it says the transition was not caused by the read.
+`/etc/shadow`, it says the transition was not caused by the read and exits
+non-zero. If a rule of higher priority than the read's also fired before
+the transition, it names that rule as a contributor, since the score is
+the highest rule's.
 
 ```
     workload   olaitan-stranger/Pod/stranger-demo

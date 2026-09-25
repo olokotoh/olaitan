@@ -9,7 +9,8 @@
 # rule, Warning, score 20: SUSPICIOUS on its own), and waits for the
 # aggregator to log its decision about that pod. It then prints the
 # transition, every Falco rule that fired for the pod up to it, and the time
-# from `kind create cluster` to it.
+# from `kind create cluster` to it. It exits non-zero when the read was not
+# shown to cause the transition, or when the Falco log cannot be read.
 #
 # Nothing here talks to NATS. The detection has to come from Falco seeing a
 # real action; the transition is read from the aggregator's own log line,
@@ -108,13 +109,22 @@ qs_ts_key() {
 # every rule that fired for pod POD in namespace NS at or before time UNTIL
 # (the transition's time), one line per rule in the order each first fired:
 # first-time<TAB>priority<TAB>rule<TAB>alerts<TAB>yes|no (an alert of that
-# rule was on /etc/shadow). An alert whose time cannot be compared is kept,
-# so a cause is never hidden. Exit 1 when there is none. The transition can
-# have more than one cause; on kind without the kind overlay, the node's own
-# mount-product-files hook trips a Critical rule for the pod (#177).
+# rule was the read: its Falco field fd.name is exactly /etc/shadow). The
+# log lines need not be in time order. Exit 1 when there is none. The
+# transition can have more than one cause; on kind without the kind overlay,
+# the node's own mount-product-files hook trips a Critical rule for the pod
+# (#177).
+#
+# Fails closed: when UNTIL, or the time of an alert for the pod, is not an
+# RFC 3339 UTC time (an offset such as +01:00, say), nothing can be said
+# about what came first, so it prints "cannot compare times: ..." on stdout
+# and exits 1 instead of listing anything.
 qs_parse_rules() {
-	local ns="$1" pod="$2" until="$3" ukey line ts key prio rule shadow
-	ukey="$(qs_ts_key "$until")" || ukey=""
+	local ns="$1" pod="$2" until="$3" ukey line ts key prio rule shadow rows=""
+	if ! ukey="$(qs_ts_key "$until")"; then
+		printf 'cannot compare times: the transition time %s is not an RFC 3339 UTC time\n' "'$until'"
+		return 1
+	fi
 	while IFS= read -r line; do
 		case "$line" in
 		*'"k8s.ns.name":"'"$ns"'"'*) ;;
@@ -128,19 +138,21 @@ qs_parse_rules() {
 		[ -n "$rule" ] || continue
 		prio="$(sed -n 's/.*"priority":"\([^"]*\)".*/\1/p' <<<"$line")"
 		ts="$(sed -n 's/.*"time":"\([^"]*\)".*/\1/p' <<<"$line")"
-		if key="$(qs_ts_key "$ts")"; then
-			if [ -n "$ukey" ] && [[ $key > $ukey ]]; then
-				continue
-			fi
-		else
-			key="~"
+		if ! key="$(qs_ts_key "$ts")"; then
+			printf 'cannot compare times: the time %s of a "%s" alert for %s is not an RFC 3339 UTC time\n' "'$ts'" "$rule" "$pod"
+			return 1
+		fi
+		if [[ $key > $ukey ]]; then
+			continue
 		fi
 		case "$line" in
-		*'/etc/shadow'*) shadow=yes ;;
+		*'"fd.name":"/etc/shadow"'*) shadow=yes ;;
 		*) shadow=no ;;
 		esac
-		printf '%s\t%s\t%s\t%s\t%s\n' "$key" "$ts" "${prio:-?}" "$rule" "$shadow"
-	done | LC_ALL=C sort -s -t "$(printf '\t')" -k1,1 | awk -F '\t' '
+		rows+="$(printf '%s\t%s\t%s\t%s\t%s' "$key" "$ts" "${prio:-?}" "$rule" "$shadow")"$'\n'
+	done
+	[ -n "$rows" ] || return 1
+	printf '%s' "$rows" | LC_ALL=C sort -s -t "$(printf '\t')" -k1,1 | awk -F '\t' '
 		!($4 in n) { order[++k] = $4; first[$4] = $2; prio[$4] = $3; sh[$4] = "no" }
 		{ n[$4]++; if ($5 == "yes") sh[$4] = "yes" }
 		END {
@@ -148,25 +160,55 @@ qs_parse_rules() {
 				r = order[i]
 				printf "%s\t%s\t%s\t%d\t%s\n", first[r], prio[r], r, n[r], sh[r]
 			}
-			exit (k == 0)
 		}'
+}
+
+# qs_prio_rank PRIORITY: print Falco's priority as a number, higher is more
+# severe. An unknown priority ranks above every known one, so a rule of
+# unknown weight is never ruled out as a contributor.
+qs_prio_rank() {
+	case "$1" in
+	Debug) echo 1 ;;
+	Informational | Info) echo 2 ;;
+	Notice) echo 3 ;;
+	Warning) echo 4 ;;
+	Error) echo 5 ;;
+	Critical) echo 6 ;;
+	Alert) echo 7 ;;
+	Emergency) echo 8 ;;
+	*) echo 9 ;;
+	esac
 }
 
 # qs_report_rules NS POD UNTIL: print, from Falco's log on stdin, every rule
 # that fired for the demo pod up to the transition at UNTIL, with priority
-# and alert count. Exit 0 when one of them was an alert on /etc/shadow (the
-# read), 1 when none was, and say so: then the transition was not the read's.
+# and alert count, and what that means for the read:
+#   0  an alert on /etc/shadow (the read) came before the transition, and no
+#      other rule of higher priority did;
+#   3  the read came before it, and so did rules of higher priority than
+#      the read's; the score is the highest rule's (max-based,
+#      internal/correlator/trigger/falco.go), so they contributed. A line
+#      "Other rules contributed: A, B (...)" names them;
+#   1  no read came before it, or the times cannot be compared: the
+#      transition was not shown to be the read's.
 qs_report_rules() {
-	local ns="$1" pod="$2" until="$3" rules first prio rule n shadow read=1
+	local ns="$1" pod="$2" until="$3" rules first prio rule n shadow read=1 top=0 r others=""
 	echo "  Falco rules that fired for $pod up to the transition:"
 	if ! rules="$(qs_parse_rules "$ns" "$pod" "$until")"; then
-		echo "    (none found in the Falco log)"
-		echo "  The transition was not caused by the read: no alert on /etc/shadow from $pod came before it."
+		if [[ $rules == "cannot compare times"* ]]; then
+			echo "    ($rules)"
+			echo "  The transition was not shown to be the read's: its cause cannot be told from the Falco log."
+		else
+			echo "    (none found in the Falco log)"
+			echo "  The transition was not caused by the read: no alert on /etc/shadow from $pod came before it."
+		fi
 		return 1
 	fi
 	while IFS=$'\t' read -r first prio rule n shadow; do
 		if [ "$shadow" = yes ]; then
 			read=0
+			r="$(qs_prio_rank "$prio")"
+			if [ "$r" -gt "$top" ]; then top="$r"; fi
 			shadow="  (on /etc/shadow)"
 		else
 			shadow=""
@@ -175,8 +217,32 @@ qs_report_rules() {
 	done <<<"$rules"
 	if [ "$read" != 0 ]; then
 		echo "  The transition was not caused by the read: no alert on /etc/shadow from $pod came before it."
+		return 1
 	fi
-	return "$read"
+	while IFS=$'\t' read -r first prio rule n shadow; do
+		if [ "$shadow" = no ] && [ "$(qs_prio_rank "$prio")" -gt "$top" ]; then
+			others+="${others:+, }$rule"
+		fi
+	done <<<"$rules"
+	if [ -n "$others" ]; then
+		echo "  Other rules contributed: $others (higher priority than the read's, before the transition; the score is the highest rule's)."
+		return 3
+	fi
+	return 0
+}
+
+# qs_headline RC REPORT: the headline for qs_report_rules' exit status RC
+# and its output REPORT.
+qs_headline() {
+	local others
+	case "$1" in
+	0) echo "Olaitan saw the read of /etc/shadow and moved the workload:" ;;
+	3)
+		others="$(sed -n 's/^  Other rules contributed: \(.*\) (higher priority.*/\1/p' <<<"$2")"
+		echo "Olaitan moved the workload; the read of /etc/shadow and other rules contributed ($others):"
+		;;
+	*) echo "Olaitan moved the workload, but not because of the read (rules below):" ;;
+	esac
 }
 
 # qs_check_published VERSION: fail before any cluster exists when the chart
@@ -344,21 +410,23 @@ main() {
 		exit 1
 	fi
 
-	local wl from to score ts report rc=0
+	local wl from to score ts report falco rc=0
 	IFS=$'\t' read -r wl from to score ts <<<"$found"
 	# Every rule that fired for the demo pod up to the transition, not only
 	# the read's: the score is theirs together, and a transition some other
 	# rule caused is said to be one (#177 showed the hook's 36 as the read's).
-	report="$(kubectl "${QS_KCTX[@]}" -n "$QS_NS" logs -l app.kubernetes.io/name=falco -c falco --tail=-1 2>/dev/null |
-		qs_report_rules "$QS_DEMO_NS" "$QS_DEMO_POD" "$ts")" || rc=$?
+	# The log is read on its own first: a kubectl failure is an infra fault,
+	# never an empty log that the verdict is drawn from.
+	falco="$(kubectl "${QS_KCTX[@]}" -n "$QS_NS" logs -l app.kubernetes.io/name=falco -c falco --tail=-1)" || rc=$?
+	if [ "$rc" != 0 ]; then
+		echo "quickstart: infra: cannot read the Falco log (kubectl exited $rc, its error is above); the transition of $wl was seen but its cause cannot be checked." >&2
+		exit 1
+	fi
+	report="$(qs_report_rules "$QS_DEMO_NS" "$QS_DEMO_POD" "$ts" <<<"$falco")" || rc=$?
 	local elapsed=$((t_seen - t0))
 
 	echo
-	if [ "$rc" = 0 ]; then
-		echo "  Olaitan saw the read of /etc/shadow and moved the workload:"
-	else
-		echo "  Olaitan moved the workload, but not because of the read (rules below):"
-	fi
+	echo "  $(qs_headline "$rc" "$report")"
 	echo
 	printf '    %-10s %s\n' "workload" "$wl"
 	printf '    %-10s %s\n' "from" "$from"
@@ -374,10 +442,16 @@ main() {
 	echo
 	echo "  Watch it:  kubectl --context kind-$QS_CLUSTER -n $QS_NS logs -l app.kubernetes.io/component=aggregator -f"
 	echo "  Clean up:  make quickstart-clean"
+	local fail=0
+	if [ "$rc" != 0 ] && [ "$rc" != 3 ]; then
+		echo "quickstart: the read of /etc/shadow did not cause the transition (or its cause cannot be told); see the rules above." >&2
+		fail=1
+	fi
 	if ! qs_within_budget "$elapsed" "$budget"; then
 		echo "quickstart: over budget: ${elapsed}s > ${budget}s" >&2
-		exit 1
+		fail=1
 	fi
+	[ "$fail" = 0 ] || exit 1
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then

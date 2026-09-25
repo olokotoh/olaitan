@@ -1300,3 +1300,71 @@ func TestReadmeKindBlockInstallsTheKindHookException(t *testing.T) {
 		t.Error("README still shows score 36 as the read's result; that was the kind hook's Critical rule")
 	}
 }
+
+// strangerMain runs hack/stranger.sh LEG for real (not plan mode) against
+// the kubectl shim of quickstart_test.go, with FALCO (written for the
+// quickstart's demo pod) moved to the stranger's pod and namespace and a
+// transition at 08:41:19.5Z. It returns the output and the job summary.
+func strangerMain(t *testing.T, leg, falco string, env ...string) (string, string, error) {
+	t.Helper()
+	move := strings.NewReplacer("olaitan-quickstart", "olaitan-stranger", "quickstart-demo", "stranger-demo")
+	summary := filepath.Join(t.TempDir(), "summary.md")
+	cmd := exec.Command("bash", strangerScript(t), leg)
+	cmd.Dir = repoRoot(t)
+	cmd.Env = strangerEnv(append([]string{
+		"PATH=" + resultShim(t),
+		"GITHUB_STEP_SUMMARY=" + summary,
+		"SHIM_AGG=" + writeTemp(t, "agg.log", transitionAt("olaitan-stranger", "stranger-demo", "2026-09-24T08:41:19.5Z")),
+		"SHIM_FALCO=" + writeTemp(t, "falco.log", move.Replace(falco)),
+	}, env...)...)
+	out, err := cmd.CombinedOutput()
+	sum, _ := os.ReadFile(summary)
+	return string(out), string(sum), err
+}
+
+// TestStrangerMainResult (review F1, F6): the result block of main, run end
+// to end with a kubectl shim. On the helm path (the kind overlay) a
+// transition the read did not cause fails the job as a product fault; on
+// the kubectl path (install.yaml, no kind hook exception) it is a
+// ::warning:: and a WARNING line in the job summary.
+func TestStrangerMainResult(t *testing.T) {
+	kubectlReadme := "STRANGER_README=" + writeReadme(t, regexp.MustCompile(`/releases/download/v[^/]+/install\.yaml`).ReplaceAllString(readmeText(t), "/releases/download/v9.9.9-test/install.yaml"))
+	for _, leg := range []string{"helm", "kubectl"} {
+		var env []string
+		if leg == "kubectl" {
+			env = append(env, kubectlReadme)
+		}
+		out, sum, err := strangerMain(t, leg, falcoLogReadOnly, env...)
+		if err != nil || !strings.Contains(out, "Olaitan saw the read of /etc/shadow and moved the workload:") || strings.Contains(out, "::warning") {
+			t.Errorf("%s leg, the read alone: exit %v, want 0, the \"saw the read\" headline and no warning:\n%s", leg, err, out)
+		}
+		if !strings.Contains(sum, "Read sensitive file untrusted") {
+			t.Errorf("%s leg summary lacks the rule list:\n%s", leg, sum)
+		}
+
+		out, sum, err = strangerMain(t, leg, falcoLogHookOnly, env...)
+		if leg == "helm" {
+			if err == nil {
+				t.Errorf("helm leg passed although the read did not cause the transition:\n%s", out)
+			}
+			if !strings.Contains(out, "::error title=stranger-path check failed [product: the read did not cause the transition]") || !strings.Contains(sum, "**FAILED [product: the read did not cause the transition]**") {
+				t.Errorf("helm leg failure does not name the product phase in the log and summary:\n%s\nsummary:\n%s", out, sum)
+			}
+		} else {
+			if err != nil {
+				t.Errorf("kubectl leg failed on the hook's rule; install.yaml has no kind hook exception, so it warns (%v):\n%s", err, out)
+			}
+			if !strings.Contains(out, "::warning title=stranger-path check::") || !strings.Contains(sum, "**WARNING**") || !strings.Contains(sum, "not caused by the read") {
+				t.Errorf("kubectl leg does not warn in the log and the summary:\n%s\nsummary:\n%s", out, sum)
+			}
+		}
+		if !strings.Contains(out, "Drop and execute new binary in container") {
+			t.Errorf("%s leg does not print the rule that did cause it:\n%s", leg, out)
+		}
+
+		out, _, err = strangerMain(t, leg, falcoLogHook, env...)
+		if err != nil || !strings.Contains(out, "the read of /etc/shadow and other rules contributed (Drop and execute new binary in container)") {
+			t.Errorf("%s leg, hook and read: exit %v, want 0 and a headline naming the other rule:\n%s", leg, err, out)
+		}
+	}
+}

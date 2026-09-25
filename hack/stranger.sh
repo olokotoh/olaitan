@@ -14,7 +14,10 @@
 # that pod up to the transition, with its priority, and says so when none of
 # them was the read: several real alerts can feed one transition, and on
 # kind without the kind overlay the node's own hook trips a Critical rule
-# for the pod (#177), which once passed for the read's result.
+# for the pod (#177), which once passed for the read's result. On the helm
+# path (kind overlay) a transition the read did not cause fails the check;
+# on the kubectl path (install.yaml, no kind hook exception) it is a
+# warning in the log and the job summary.
 #
 # Nothing here talks to NATS and nothing turns Falco off.
 #
@@ -22,7 +25,7 @@
 # broken release: readme (the block moved or names another version),
 # install (the README block itself failed), infra: cluster / rollout /
 # pull / exec / kubectl logs, and product: no Falco alert / no FSM
-# transition. A rollout that never goes Ready can still have a product
+# transition / the read did not cause the transition (helm path). A rollout that never goes Ready can still have a product
 # cause (a crash loop); the diagnostics step shows which.
 #
 # Usage: hack/stranger.sh helm|kubectl
@@ -290,11 +293,7 @@ main() {
 	rc=0
 	report="$(qs_report_rules "$ST_DEMO_NS" "$ST_DEMO_POD" "$ts" <<<"$logs")" || rc=$?
 	echo
-	if [ "$rc" -eq 0 ]; then
-		echo "  The $leg path of the README installed v$version and Olaitan saw the read of /etc/shadow:"
-	else
-		echo "  The $leg path of the README installed v$version; Olaitan moved the workload, but not because of the read (rules below):"
-	fi
+	echo "  The $leg path of the README installed v$version. $(qs_headline "$rc" "$report")"
 	echo
 	printf '    %-10s %s\n' "workload" "$wl"
 	printf '    %-10s %s\n' "from" "$from"
@@ -311,6 +310,21 @@ main() {
 	done <<<"$report"
 	printf '  start -> every pod Ready:                          %ss\n' "$((t_ready - t0))"
 	printf '  start -> Falco alert and FSM transition both seen:  %ss\n' "$((t_seen - t0))"
+	# 0: the read alone (by priority); 3: the read and higher-priority rules,
+	# named in the headline. Anything else means the read was not shown to
+	# cause the transition. The helm path installs the kind overlay, so that
+	# is a product fault. The kubectl path installs install.yaml, which has
+	# no kind hook exception (#180), so there kind's own node hook can move
+	# the pod first: a warning, never a silent pass.
+	if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+		local why="the $leg path: the read of /etc/shadow was not shown to cause the transition of $wl (score $score); the rules that fired are above"
+		if [ "$leg" = helm ]; then
+			st_fail "product: the read did not cause the transition" "$why"
+		fi
+		why="$why. install.yaml has no kind hook exception, so on kind the node's mount-product-files hook can trip a Critical rule for the pod first (#180)"
+		printf '::warning title=stranger-path check::%s\n' "$why"
+		st_summary "- **WARNING** $why"
+	fi
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then

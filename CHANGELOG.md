@@ -93,9 +93,15 @@ and false-positive numbers; see [Unreleased](#unreleased).
   is unchanged. `hack/quickstart.sh` and `hack/stranger.sh` now print every
   Falco rule that fired for the demo pod up to the transition, with its
   priority and alert count, and say so when none was an alert on
-  `/etc/shadow`. The stranger job follows the README block, so it installs
-  with the overlay too; its kubectl path (`install.yaml`, default values)
-  does not, and will list the hook's rule when it runs from the next tag.
+  `/etc/shadow` (matched on Falco's `fd.name` field exactly); they name any
+  rule of higher priority than the read's that also fired, and a time they
+  cannot compare fails the check instead of widening it. `make quickstart`
+  exits non-zero, and the stranger job's helm path fails, when the read did
+  not cause the transition or the Falco log cannot be read. The stranger job
+  follows the README block, so it installs with the overlay too; its kubectl
+  path (`install.yaml`, default values) does not. If the hook fired there,
+  the rule list would name it, and that path would raise a warning in the
+  log and the job summary rather than pass silently.
 
 ## [v1.0.0-rc4] - 2026-09-24
 
