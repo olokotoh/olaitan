@@ -246,20 +246,30 @@ from `kind create cluster`. If none of those rules was an alert on
 `/etc/shadow`, it says the transition was not caused by the read.
 
 ```
-    workload   olaitan-quickstart/Pod/quickstart-demo
+    workload   olaitan-stranger/Pod/stranger-demo
     from       CLEAN
     to         SUSPICIOUS
-    score      36
-    logged at  2026-09-24T08:41:19.353671951Z (aggregator clock)
-    falco rule Read sensitive file untrusted
-    reads      1 of /etc/shadow before the transition
+    score      20
+    logged at  2026-09-25T09:16:59.896234784Z (aggregator clock)
+    reads      1 of /etc/shadow
 
-  kind create cluster -> every pod Ready:       115s
-  kind create cluster -> first FSM transition:  122s (budget 600s)
+  Falco rules that fired for stranger-demo up to the transition:
+    Warning   Read sensitive file untrusted, 1 alert(s), first at 2026-09-25T09:16:59.320521661Z  (on /etc/shadow)
 ```
 
-That output is from a fresh single-node kind (kind v0.30.0) on a 4 vCPU
-Ubuntu 24.04 host on kernel 7.0, pulling everything from the registries.
+That output is from the stranger-path CI job
+([run 36117369938](https://github.com/olokotoh/olaitan/actions/runs/36117369938)),
+which runs the "Try it on kind" block above word for word on a fresh kind
+(kind v0.30.0, a GitHub-hosted runner) and prints its result with the same
+code as the quickstart; the quickstart's own lines name its namespace and
+pod and add the time from `kind create cluster` to the transition. Every
+pod was Ready 112 s after the start and the transition was seen at 119 s.
+One read, one Warning alert, score 20: nothing else fired for the pod
+before the transition.
+Before the kind overlay was added, the same pod reached score 36 through
+the hook's Critical alert, and the transition was logged before the read's
+alert.
+
 Nothing in the quickstart talks to NATS: the transition is read from the
 aggregator's own log, and it only appears because Falco saw real actions
 in the pod; the rule list says which ones. It
