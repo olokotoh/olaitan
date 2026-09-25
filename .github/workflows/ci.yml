@@ -780,21 +780,22 @@ jobs:
 
       # MinIO is started as an explicit `docker run` step rather than a
       # `services:` container because GitHub Actions `services:` cannot
-      # override an image's command, and the official MinIO image
-      # (quay.io/minio/minio) needs an explicit `server /data ...` command (it has no default
-      # server entrypoint). The previously-used `bitnami/minio:latest` tag
-      # was pruned by Bitnami (manifest unknown), so we pin the official
-      # image to a specific, verified-pullable RELEASE tag for
-      # reproducibility (never `latest`). The image is pulled from quay.io:
-      # MinIO removed `minio/minio` from Docker Hub ("pull access denied"),
-      # while quay.io/minio/minio still serves the same RELEASE tags.
+      # override an image's command, and the MinIO image needs an explicit
+      # `server /data ...` command (it has no default server entrypoint).
+      # MinIO archived its community edition: Docker Hub `minio/minio` is
+      # gone, quay.io/minio/minio no longer allows anonymous pulls
+      # ("unauthorized") and dl.min.io answers 410. `bitnami/minio:latest`
+      # was pruned earlier. The image is now pgsty/minio, a maintained AGPL
+      # fork of minio/minio built with the same Dockerfile (same entrypoint,
+      # args, env, and bundled mc), pinned by tag AND digest (Story 12.6
+      # rule; deploy/helm/minio_pin_test.go guards it).
       - name: Start MinIO
         run: |
           docker run -d --name minio \
             -p 9000:9000 -p 9001:9001 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z \
+            docker.io/pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372 \
             server /data --console-address :9001
 
       # Bounded wait-for-ready loop (~30s) polling the MinIO liveness
@@ -843,10 +844,10 @@ jobs:
           go-version: '1.26'
 
       # MinIO is started as an explicit `docker run` step (see the
-      # forensics-integration job rationale): the official quay.io/minio/minio image
-      # needs an explicit `server /data ...` command, pinned to a verified
-      # RELEASE tag (never `latest`), pulled from quay.io because Docker Hub no
-      # longer serves it. MinIO supports object lock + SSE-KMS, so a
+      # forensics-integration job rationale): the pgsty/minio image needs an
+      # explicit `server /data ...` command and is pinned by tag AND digest,
+      # because MinIO no longer publishes community images. MinIO supports
+      # object lock + SSE-KMS, so a
       # single MinIO instance backs the object-lock-enabled report bucket the
       # suite creates in its TestMain setup.
       - name: Start MinIO
@@ -855,7 +856,7 @@ jobs:
             -p 9000:9000 -p 9001:9001 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z \
+            docker.io/pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372 \
             server /data --console-address :9001
 
       # Bounded wait-for-ready loop (~30s) polling the MinIO liveness endpoint
