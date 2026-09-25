@@ -26,6 +26,10 @@ set -euo pipefail
 DOWN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=hack/lib/out-dir.sh
 . "$DOWN_ROOT/hack/lib/out-dir.sh"
+# make up prints `export KUBECONFIG=<out>/kubeconfig`. The kind-<name>
+# entries make down removes, and the no-context check it ends with, are about
+# the default kubeconfig, so an inherited KUBECONFIG is ignored.
+unset KUBECONFIG
 DOWN_CLUSTER="${UP_CLUSTER:-olaitan-full}"
 DOWN_OUT="${UP_OUT_DIR-$HOME/.olaitan-full}"
 
@@ -137,10 +141,17 @@ main() {
 	done
 	if [ "$owned" = 1 ]; then
 		down_say "removing $DOWN_OUT (make up's marker names $DOWN_CLUSTER)"
-		down_run rm -rf "$DOWN_OUT"
+		# A failed rm (an empty mount point gives EBUSY) is reported and the
+		# rest of the cleanup still runs; make down exits non-zero at the end.
+		if ! down_run rm -rf "$DOWN_OUT"; then
+			echo "down: could not remove $DOWN_OUT (rm's error is above)" >&2
+			kept=1
+		fi
 	elif [ -e "$DOWN_OUT" ] || [ -L "$DOWN_OUT" ]; then
-		if name="$(olaitan_out_marked "$DOWN_OUT")"; then
-			why="its $OLAITAN_OUT_MARKER names $name, not $DOWN_CLUSTER"
+		if [ -L "$DOWN_OUT/$OLAITAN_OUT_MARKER" ]; then
+			why="its $OLAITAN_OUT_MARKER is a symlink, not the file make up writes"
+		elif name="$(olaitan_out_marked "$DOWN_OUT")"; then
+			why="its $OLAITAN_OUT_MARKER names $(printf '%q' "$name"), not $DOWN_CLUSTER"
 		else
 			why="it has no $OLAITAN_OUT_MARKER, so make up did not make it"
 		fi
@@ -150,7 +161,10 @@ main() {
 		down_say "no $DOWN_OUT to remove"
 	fi
 	down_say "removing $DOWN_ROOT/hack/.audit-full"
-	down_run rm -rf "$DOWN_ROOT/hack/.audit-full"
+	if ! down_run rm -rf "$DOWN_ROOT/hack/.audit-full"; then
+		echo "down: could not remove $DOWN_ROOT/hack/.audit-full (rm's error is above)" >&2
+		kept=1
+	fi
 	if [ "${UP_PLAN:-}" != "1" ]; then
 		down_leftovers || kept=1
 	fi

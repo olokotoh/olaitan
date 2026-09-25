@@ -5,8 +5,9 @@
 # before anything is created. Then it stages the chart, brings up the kind-full
 # reference cluster with the full profile (every source on, Falco on) through
 # hack/install-full-kind.sh, reads /etc/shadow inside a throwaway pod in a
-# namespace the agent scores, and prints the aggregator's first decision about
-# that pod with the time since `make up` started.
+# namespace the agent scores, and prints Falco's alert on that read, then the
+# aggregator's FSM transition for the pod if it comes within the budget, each
+# with the time since `make up` started.
 #
 # Nothing here talks to NATS. The detection has to come from Falco seeing a
 # real action; it is read from the aggregator's own log line (the parsers are
@@ -232,7 +233,7 @@ up_check_out_dir() {
 			up_block "out dir $d is left from an earlier run of make up, with no kind cluster $cluster behind it" \
 				"make up starts from nothing; fix: make down"
 		else
-			up_block "out dir $d was made by make up for kind cluster $name (its $OLAITAN_OUT_MARKER)" \
+			up_block "out dir $d was made by make up for kind cluster $(printf '%q' "$name") (its $OLAITAN_OUT_MARKER)" \
 				"fix: make down FULL_CLUSTER_NAME=$name FULL_OUT_DIR=$d, or make up FULL_OUT_DIR=<a new directory>"
 		fi
 		return 0
@@ -245,13 +246,16 @@ up_check_out_dir() {
 			"fix: make e2e-full-down (removes the cluster, $d and hack/.audit-full)"
 		return 0
 	fi
-	if [ -d "$d" ] && [ -n "$(ls -A "$d")" ]; then
-		up_block "out dir $d is not empty and was not made by make up (no $OLAITAN_OUT_MARKER)" \
+	# Any directory that is already there, even an empty or unreadable one,
+	# is refused: make up marks only a directory it creates itself, so make
+	# down never removes one it did not make (nor an empty mount point).
+	if [ -e "$d" ] || [ -L "$d" ]; then
+		up_block "out dir $d already exists and was not made by make up (no $OLAITAN_OUT_MARKER); make up only uses a directory it creates" \
 			"make up writes private keys into it and make down would then remove it" \
-			"fix: make up FULL_OUT_DIR=<a new or empty directory>, for example \$HOME/.olaitan-full"
+			"fix: rmdir $d (if it is empty and yours), or make up FULL_OUT_DIR=<a path that does not exist yet>"
 		return 0
 	fi
-	up_ok "out dir $d is new or empty"
+	up_ok "out dir $d does not exist yet; make up will create it"
 }
 
 # up_preflight CLUSTER WORKERS OUT: every check runs, so one run lists every
@@ -276,14 +280,16 @@ up_preflight() {
 }
 
 # up_mark OUT CLUSTER: create OUT (0700) and write make up's marker into it,
-# the first write after preflight. make down removes OUT only when the marker
-# is there and names CLUSTER.
+# the first write after preflight. OUT must not exist yet: mkdir without -p
+# fails on an existing directory, so make up never marks one it did not
+# create. make down removes OUT only when the marker is there and names
+# CLUSTER.
 up_mark() {
 	printf '+ mark %s/%s %s\n' "$1" "$OLAITAN_OUT_MARKER" "$2"
 	[ "${UP_PLAN:-}" = "1" ] && return 0
-	(umask 077 && mkdir -p "$1")
-	chmod 700 "$1"
-	printf '%s\n' "$2" >"$1/$OLAITAN_OUT_MARKER"
+	mkdir -p -- "$(dirname -- "$1")"
+	(umask 077 && mkdir -- "$1")
+	(umask 077 && printf '%s\n' "$2" >"$1/$OLAITAN_OUT_MARKER")
 }
 
 # up_logs SELECTOR [ARGS]: the log reader keeps kubectl's stderr and exit
@@ -388,7 +394,8 @@ up_report() {
 		echo "  The aggregator logged no FSM transition within the budget. The detection happened (the"
 		echo "  Falco alert above); on the full profile the FSM transition is waiting on the analyst chain,"
 		echo "  which runs on the in-cluster CPU model before scoring. See #185 and Story 7.4 (score before"
-		echo "  the analyst chain). The aggregator log below shows the transition when it comes."
+		echo "  the analyst chain). The \"Watch it\" command below follows the aggregator log, where the"
+		echo "  transition shows up when it comes."
 	fi
 	echo
 	printf '  make up -> Falco, collector, aggregator ready:  %ss\n' "$((t_ready - t0))"

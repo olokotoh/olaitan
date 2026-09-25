@@ -23,8 +23,9 @@ and false-positive numbers; see [Unreleased](#unreleased).
 - **`make up` / `make down`** (Story 12.3, #120). `make up` checks the host
   first (tools, Docker, BTF, the Falco pin against the kernel, inotify
   limits, PyYAML when the node list is trimmed, an existing cluster, a
-  stale or foreign out dir; a caveat, not a blocker, below 8 vCPU or
-  32 GiB). It stops with the exact fix for every blocker before anything
+  out dir that already exists; a caveat, not a blocker, below 8 vCPU or
+  32 GiB, where memory is MemTotal under 28 GiB because a 32 GiB machine
+  reads about 30 to 31 GiB). It stops with the exact fix for every blocker before anything
   is created. Then it brings up kind-full with the full profile and Falco
   on, and reads `/etc/shadow` in a throwaway pod until Falco alerts on it.
   That alert, within 900 s (`UP_BUDGET`), is what `make up` needs (AC1 as
@@ -37,10 +38,14 @@ and false-positive numbers; see [Unreleased](#unreleased).
   about 40 GB of disk: Falco alert at 316 s, transition at 744 s. `make
   down` removes any kind cluster with that name, its node containers and
   the `kind-<name>` kubeconfig entries, printing each removal, then
-  `hack/.audit-full`. It removes `$(FULL_OUT_DIR)` only when `make up`'s
-  `.olaitan-up` marker in it names the cluster. Both commands refuse an
-  out dir that is empty, relative, a symlink, `/`, the home directory or
-  a parent of it, or the repository, a parent of it or a path inside it.
+  `hack/.audit-full`. `make up` creates `$(FULL_OUT_DIR)` itself (the path
+  must not exist yet) and writes its `.olaitan-up` marker there first;
+  `make down` removes `$(FULL_OUT_DIR)` only when that marker names the
+  cluster, and reports a failed removal without skipping the rest. Both
+  commands refuse an out dir that is empty, relative, a path through a
+  symlink, `/`, the home directory or a parent of it, or the repository, a
+  parent of it or a path inside it. `make down` ignores an inherited
+  `KUBECONFIG`.
   `make down` ends by checking that nothing is left, and fails if
   something is or if it could not check.
 - **`make quickstart`** (Story 12.2, #119). From a clone: a fresh kind

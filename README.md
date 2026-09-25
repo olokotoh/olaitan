@@ -294,6 +294,10 @@ this is what it said first:
 up: preflight found 1 blocker(s); nothing was created. Fix them and run make up again.
 ```
 
+(Since a later review, that last check reads `out dir ... does not exist
+yet; make up will create it`: an out dir that already exists, even an empty
+one, is now a blocker.)
+
 After that one `sysctl`, `make up` ran to the end:
 
 ```
@@ -331,19 +335,22 @@ the analyst chain) is the fix, and #185 tracks the timing.
 It uses the chart in your checkout with the `edge` image, the same cluster
 name, out dir and worker count as `make e2e-full` (`FULL_CLUSTER_NAME`,
 `FULL_OUT_DIR`, `FULL_WORKERS`), and writes its kubeconfig to
-`$(FULL_OUT_DIR)/kubeconfig`, never to your default kubeconfig. The first
-thing it writes is a marker, `$(FULL_OUT_DIR)/.olaitan-up`, with the
+`$(FULL_OUT_DIR)/kubeconfig`, never to your default kubeconfig. It creates
+`$(FULL_OUT_DIR)` itself, so the path must not exist yet, and the first
+thing it writes there is a marker, `$(FULL_OUT_DIR)/.olaitan-up`, with the
 cluster name in it.
 
 `make down` goes by name. It removes any kind cluster called
 `$(FULL_CLUSTER_NAME)`, whoever made it, plus that cluster's node
 containers and any `kind-<name>` context, cluster and user entries in your
-default kubeconfig, and prints each removal. It removes `$(FULL_OUT_DIR)`
+default kubeconfig (an inherited `KUBECONFIG`, such as the one `make up`
+suggests exporting, is ignored), and prints each removal. It removes
+`$(FULL_OUT_DIR)`
 only when `make up`'s marker is in it and names that cluster. If the marker
 is missing, it leaves the directory in place, says so, and exits non-zero.
-Both commands refuse an out dir that is empty, relative, a symlink, `/`,
-your home directory or a parent of it, or the repository, a parent of it
-or a path inside it. `make down` ends by checking that no cluster, node
+Both commands refuse an out dir that is empty, relative, a path through a
+symlink, `/`, your home directory or a parent of it, or the repository, a
+parent of it or a path inside it. `make down` ends by checking that no cluster, node
 container or kubeconfig context is left. It fails if something is left, or
 if it could not check.
 

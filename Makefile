@@ -681,12 +681,15 @@ e2e-full-real-llm-deepseek: helm-prepare helm-deps docker-build
 # for each blocker, before anything is created; then it brings up kind-full
 # with the full profile (every source on, Falco on) through
 # hack/install-full-kind.sh, reads /etc/shadow in a throwaway pod, and prints
-# the aggregator's first decision about it with the time since make up
-# started. It fails over UP_BUDGET seconds. Same cluster, out dir and worker
-# count as e2e-full; the kubeconfig is $(FULL_OUT_DIR)/kubeconfig, so your
-# default kubeconfig is not touched. `make down` deletes the cluster, any
-# node container and kind context left, $(FULL_OUT_DIR) and hack/.audit-full,
-# then checks that nothing is left.
+# Falco's alert on it, then the aggregator's FSM transition if it comes within
+# the budget, with the time since make up started. It fails when Falco has not
+# alerted within UP_BUDGET seconds. Same cluster, out dir and worker count as
+# e2e-full; the kubeconfig is $(FULL_OUT_DIR)/kubeconfig, so your default
+# kubeconfig is not touched. make up creates $(FULL_OUT_DIR) itself (it must
+# not exist yet) and writes the marker $(FULL_OUT_DIR)/.olaitan-up first.
+# `make down` deletes the cluster, any node container and kind context left
+# and hack/.audit-full, removes $(FULL_OUT_DIR) only when that marker names
+# the cluster, then checks that nothing is left.
 UP_BUDGET ?= 900
 
 up:

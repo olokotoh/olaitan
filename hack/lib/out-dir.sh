@@ -12,7 +12,9 @@ OLAITAN_OUT_MARKER=".olaitan-up"
 
 # olaitan_out_dir RAW REPO: print the canonical out dir and return 0, or print
 # why RAW is refused and return 1. Refused: empty, relative, a symbolic link
-# (checked before resolving, trailing slashes ignored), /, the home directory
+# (the last component checked before resolving, trailing slashes ignored;
+# any other component by comparing realpath -m with realpath -m -s), /, the
+# home directory
 # or any of its parents, the repository REPO or any of its parents, and any
 # path inside the repository. The home directory and the repository are
 # canonical too (realpath -m, pwd -P), so // and .. spellings do not slip by.
@@ -37,6 +39,13 @@ olaitan_out_dir() {
 	fi
 	if ! d="$(realpath -m -- "$raw" 2>/dev/null)" || [ -z "$d" ]; then
 		echo "it cannot be resolved (realpath -m failed)"
+		return 1
+	fi
+	# A symlink anywhere in the path (link/., link/sub) resolves somewhere
+	# else; only a path with no symlink in it is accepted.
+	local plain
+	if ! plain="$(realpath -m -s -- "$raw" 2>/dev/null)" || [ "$plain" != "$d" ]; then
+		echo "it goes through a symbolic link (it resolves to $d); name the real path"
 		return 1
 	fi
 	if [ "$d" = "/" ]; then
