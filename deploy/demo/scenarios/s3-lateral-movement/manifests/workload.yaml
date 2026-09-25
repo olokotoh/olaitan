@@ -5,9 +5,12 @@
 # correlator resolves owner_kind=Deployment + the tenant-* namespace from the
 # apiserver, matching the rule's workload_kind + tenant_namespace clauses.
 #
-# On kind the determinism path injects the synthetic kubectl-exec falco event
-# directly (see ../attack/inject.md); a real-attacker run would exec a
-# kubectl binary smuggled into the pod.
+# Target image (Story 11.1): busybox gives the pod a real shell so Story
+# 11.2's runner can `kubectl exec` into it, and a writable userland so the
+# runner can smuggle in a kubectl binary and run it in-pod (the /kubectl
+# process launch OLT-LATERAL-001 detects). The target ships no kubectl of its
+# own: bringing the binary is the attacker's move, owned by 11.2. pause has no
+# shell to exec into. Pinned by tag AND digest per Story 12.6.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -32,4 +35,5 @@ spec:
     spec:
       containers:
         - name: web
-          image: registry.k8s.io/pause:3.10
+          image: busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+          command: ["/bin/sh", "-c", "while true; do sleep 3600; done"]
