@@ -148,6 +148,8 @@ func newUpHost(t *testing.T) *upHost {
 		"UP_BTF_FILE=" + h.btf,
 		"UP_KERNEL=6.8.0-45-generic",
 		"UP_OS=Linux",
+		"UP_NPROC=8",
+		"UP_MEM_KB=32102440",
 	}
 	return h
 }
@@ -896,10 +898,13 @@ func upDetectLogs(t *testing.T, transition, alert bool) (agg, falco string) {
 	return agg, falco
 }
 
-// TestUpDetect (F6, F10): make up succeeds only when Falco alerted on the
-// demo pod's /etc/shadow read AND the aggregator moved a workload in its
-// namespace, as hack/stranger.sh requires. A log that cannot be read stops
-// the run; a failed exec is counted apart from the reads that ran.
+// TestUpDetect (AC1 as amended 2026-09-25, F10): the detection make up needs
+// is Falco's alert on the demo pod's /etc/shadow read within the budget.
+// After it, make up keeps polling for the FSM transition until the budget
+// ends; a missing transition is reported, not a failure (on the full profile
+// it waits for the analyst chain, #185 / Story 7.4). A missing Falco alert
+// fails. A log that cannot be read stops the run; a failed exec is counted
+// apart from the reads that ran.
 func TestUpDetect(t *testing.T) {
 	fast := "UP_POLL=0; UP_ATTEMPT_GAP=1; "
 	for _, c := range []struct {
@@ -909,9 +914,9 @@ func TestUpDetect(t *testing.T) {
 		ok                bool
 		want              []string
 	}{
-		{"both", true, true, nil, true, []string{"reads=1 failed=0", "rule=Read sensitive file untrusted", "found=olaitan-up/Pod/up-demo"}},
-		{"transition without a Falco alert", true, false, nil, false, []string{"product: no Falco alert", "none"}},
-		{"Falco alert without a transition", false, true, nil, false, []string{"product: no FSM transition"}},
+		{"both", true, true, nil, true, []string{"reads=1 failed=0", "rule=Read sensitive file untrusted", "found=olaitan-up/Pod/up-demo", "alert=yes seen=yes"}},
+		{"transition without a Falco alert", true, false, nil, false, []string{"no Falco alert", "none"}},
+		{"Falco alert without a transition", false, true, nil, true, []string{"rule=Read sensitive file untrusted", "found=\n", "alert=yes seen=no"}},
 		{"exec fails", true, true, []string{"FAKE_EXEC_EXIT=1"}, true, []string{"reads=0 failed=1", "exec 1 failed"}},
 		{"log read fails", true, true, []string{"FAKE_LOGS_EXIT=7"}, false, []string{"reading the aggregator log exited 7"}},
 	} {
@@ -919,7 +924,7 @@ func TestUpDetect(t *testing.T) {
 			h := newUpHost(t)
 			agg, falco := upDetectLogs(t, c.transition, c.alert)
 			env := append([]string{"UP_PLAN=", "FAKE_AGG_LOG=" + agg, "FAKE_FALCO_LOG=" + falco}, c.env...)
-			out, err := h.fnEnv(env, "up.sh", "eval", fast+`up_detect "$(date +%s)" 3 && printf 'reads=%s failed=%s\nrule=%s\nfound=%s\n' "$UP_READS" "$UP_FAILED" "$UP_RULE" "$UP_FOUND"`)
+			out, err := h.fnEnv(env, "up.sh", "eval", fast+`up_detect "$(date +%s)" 3 && printf 'reads=%s failed=%s\nrule=%s\nfound=%s\nalert=%s seen=%s\n' "$UP_READS" "$UP_FAILED" "$UP_RULE" "$UP_FOUND" "${UP_T_ALERT:+yes}" "${UP_T_SEEN:+yes}${UP_T_SEEN:-no}"`)
 			if (err == nil) != c.ok {
 				t.Errorf("err=%v, want ok=%v:\n%s", err, c.ok, out)
 			}
@@ -936,5 +941,80 @@ func TestUpDetect(t *testing.T) {
 	}
 	if regexp.MustCompile(`qs_parse_rule[^\n]*\|\|\s*true`).Match(raw) {
 		t.Error("hack/up.sh swallows a failed Falco rule lookup with || true")
+	}
+}
+
+// TestUpReport (AC1 as amended): the result names the Falco alert and its
+// time first. With a transition it prints it with its score and time;
+// without one it says plainly that detection happened and the transition is
+// waiting on the analyst chain on CPU, points to #185 and Story 7.4, and
+// still passes. Over budget to the Falco alert fails.
+func TestUpReport(t *testing.T) {
+	const set = `UP_RULE="Read sensitive file untrusted"; UP_READS=3; UP_FAILED=0; `
+	const found = `UP_FOUND=$'olaitan-up/Pod/up-demo\tCLEAN\tSUSPICIOUS\t27.5\t2026-09-25T06:42:25Z'; `
+	for _, c := range []struct {
+		name   string
+		script string
+		ok     bool
+		want   []string
+		not    []string
+	}{
+		{"alert and transition", set + found + `UP_T_ALERT=160; UP_T_SEEN=827; up_report 100 348 900 olaitan-full /o`, true,
+			[]string{"Falco detected a real action", "Read sensitive file untrusted", "make up -> Falco alert:", "60s (budget 900s)",
+				"olaitan-up/Pod/up-demo", "SUSPICIOUS", "27.5", "2026-09-25T06:42:25Z", "make up -> FSM transition:", "727s"},
+			[]string{"waiting on the analyst chain"}},
+		{"alert, no transition", set + `UP_FOUND=""; UP_T_ALERT=160; UP_T_SEEN=""; up_report 100 348 900 olaitan-full /o`, true,
+			[]string{"Falco detected a real action", "60s (budget 900s)", "no FSM transition within the budget",
+				"waiting on the analyst chain", "CPU", "#185", "Story 7.4"},
+			[]string{"make up -> FSM transition:"}},
+		{"alert over budget", set + `UP_FOUND=""; UP_T_ALERT=1100; UP_T_SEEN=""; up_report 100 348 900 olaitan-full /o`, false,
+			[]string{"over budget"}, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := newUpHost(t)
+			out, err := h.fn("up.sh", "eval", c.script)
+			if (err == nil) != c.ok {
+				t.Errorf("err=%v, want ok=%v:\n%s", err, c.ok, out)
+			}
+			for _, w := range c.want {
+				if !strings.Contains(out, w) {
+					t.Errorf("output lacks %q:\n%s", w, out)
+				}
+			}
+			for _, n := range c.not {
+				if strings.Contains(out, n) {
+					t.Errorf("output has %q:\n%s", n, out)
+				}
+			}
+		})
+	}
+}
+
+// TestUpHostSizeCaveat: below the tested host size (8 vCPU, 32 GiB) make up
+// warns and goes on; it never blocks on size. MemTotal on a 32 GiB machine
+// reads about 30 to 31 GiB, so the memory caveat starts below 28 GiB.
+func TestUpHostSizeCaveat(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		env   []string
+		warns bool
+	}{
+		{"tested size", nil, false},
+		{"4 vCPU", []string{"UP_NPROC=4"}, true},
+		{"16 GiB", []string{"UP_MEM_KB=16303412"}, true},
+		{"just under 28 GiB", []string{"UP_MEM_KB=29360127"}, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := newUpHost(t)
+			out, err := h.run("up.sh", c.env...)
+			if err != nil {
+				t.Fatalf("host size blocked the run: %v\n%s", err, out)
+			}
+			warned := strings.Contains(out, "caveat   host has") && strings.Contains(out, "tested on 8 vCPU / 32 GiB") &&
+				strings.Contains(out, "the analyst chain on the in-cluster CPU model will be slower")
+			if warned != c.warns {
+				t.Errorf("caveat shown=%v, want %v:\n%s", warned, c.warns, out)
+			}
+		})
 	}
 }
