@@ -87,7 +87,7 @@ func TestAttackExecutor_S1_AppliesTargetThenExecsEscapeThenCleansUp(t *testing.T
 	}
 	// Ordering: apply the target BEFORE the exec, and delete only in Cleanup
 	// (after the exec).
-	if !(applyIdx < execIdx && execIdx < delIdx) {
+	if applyIdx >= execIdx || execIdx >= delIdx {
 		t.Errorf("expected apply(%d) < exec(%d) < delete(%d)", applyIdx, execIdx, delIdx)
 	}
 	// The apply targets the committed 11.1 workload manifest.
@@ -211,11 +211,9 @@ func TestAttackExecutor_S3_LaunchesKubectlNamedProcessInPod(t *testing.T) {
 	_ = e.Cleanup(context.Background())
 
 	// OLT-LATERAL-001 keys on a process whose exe ends /kubectl inside the
-	// tenant pod, so the S3 plan must launch a /kubectl-named process in-pod.
-	if firstCallContaining(calls, "kubectl") < firstCallContaining(calls, "exec") {
-		// (kubectl is the driver binary of every call; the meaningful check
-		// is that an exec primitive references a /kubectl path in-pod)
-	}
+	// tenant pod, so the S3 plan must launch a /kubectl-named process in-pod
+	// (kubectl is the driver binary of every call, so the meaningful check is
+	// that an exec primitive references a /kubectl path in-pod).
 	if firstCallContaining(calls, "/tmp/kubectl") < 0 {
 		t.Errorf("S3 did not launch a /kubectl-named process in-pod; calls=%v", calls)
 	}
