@@ -1,0 +1,39 @@
+# Story 11.2a AC5: synthetic-attack NATS-injection allow-list.
+#
+# The hard rule (CLAUDE.local.md, #112 AC1) is: no scenario or test publishes
+# fabricated events to NATS as a stand-in for a real attack. The grep guard
+# cmd/olaitan-eval/nats_injection_guard_test.go scans tests/e2e for synthetic
+# attack-event publication (a raw.falco / raw.network publish, or use of the
+# evalscenario.Events / evalscenario.StagedEvents attack-recipe generators) and
+# FAILS on any file that contains one and is NOT listed here with a reason.
+#
+# An entry here is a documented, tracked exemption, not a free pass: a file
+# listed but no longer matching is also a failure (stale exemption), so
+# removing a file's synthetic injection forces removing its entry, locking the
+# file clean. Every entry MUST carry a non-empty reason.
+#
+# Story 11.2a rewrites the S1-S3 attack path to real in-cluster execution
+# (cmd/olaitan-eval/attack.go). The e2e injector rewrites that consume it are
+# validated only on a live cluster (AC6) and are tracked below; the remaining
+# entries belong to other stories or to Story 11.2b (S4/S5).
+allow:
+  - path: eval_matrix_test.go
+    reason: >-
+      Story 5.x eval-matrix e2e (TestEvalMatrix): the full synthetic S1-S5 +
+      staged + benign matrix over every evaluation arm. Its de-injection to the
+      real attack runner is a separate, larger effort outside Story 11.2a's
+      named scope; tracked for a follow-up story.
+  - path: rs_smoke_test.go
+    reason: >-
+      publishCorrelatorTrigger publishes one raw.network + one raw.falco
+      synthetic trigger and is SHARED by rslt_smoke_test.go (Story 3.16) and
+      forensics_smoke_test.go (Story 6.x). Rewriting those two other-story e2e
+      tests to real attacks is beyond Story 11.2a's named scope, so the shared
+      helper and rs_smoke's own S1 trigger de-injection are tracked as a
+      follow-up rather than silently changing other stories' coverage.
+  - path: scenarios_smoke_test.go
+    reason: >-
+      injectScenario drives S1-S5. Story 11.2a rewrites S1-S3 to the real
+      attack path (validated live, AC6); S4 and S5 still inject synthetically
+      and belong to Story 11.2b (#192). Listed until the S1-S3 rewrite lands
+      and S4/S5 move to 11.2b, at which point the entry is removed.
