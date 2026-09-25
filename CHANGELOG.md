@@ -77,6 +77,26 @@ and false-positive numbers; see [Unreleased](#unreleased).
   rendering; the helm test suite runs it on every CI run. v1.0.0-rc4
   predates this and has no `install.yaml`. Deferred review items: #180.
 
+### Fixed
+
+- **The quickstart's score was not the read's** (follows up #177 and #181).
+  The README and `make quickstart` showed "CLEAN to SUSPICIOUS at score 36"
+  as the result of `cat /etc/shadow`. The read trips Falco's Warning rule
+  "Read sensitive file untrusted", which scores 20 (already the SUSPICIOUS
+  threshold). The 36 came from Falco's Critical rule "Drop and execute new
+  binary in container", tripped by kind's own node hook
+  (`mount-product-files`) and blamed on the demo pod; PR #177 logged the
+  transition 465 ms before the read's alert. The README kind block and
+  `make quickstart` now install with the release's kind overlay
+  (`values-kind.yaml`, fetched by URL on the published path), which carries
+  the narrow `kind_mount_product_files_hook` exception; the default chart
+  is unchanged. `hack/quickstart.sh` and `hack/stranger.sh` now print every
+  Falco rule that fired for the demo pod up to the transition, with its
+  priority and alert count, and say so when none was an alert on
+  `/etc/shadow`. The stranger job follows the README block, so it installs
+  with the overlay too; its kubectl path (`install.yaml`, default values)
+  does not, and will list the hook's rule when it runs from the next tag.
+
 ## [v1.0.0-rc4] - 2026-09-24
 
 The first release since rc3 that installs with the README command and no

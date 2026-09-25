@@ -151,9 +151,21 @@ With Docker, [kind](https://kind.sigs.k8s.io/), helm and kubectl installed:
 kind create cluster --name olaitan
 helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan \
   --version 1.0.0-rc4 \
+  -f https://raw.githubusercontent.com/olokotoh/olaitan/v1.0.0-rc4/deploy/helm/olaitan/values-kind.yaml \
   --namespace olaitan --create-namespace --wait --timeout 10m
 kubectl -n olaitan wait pod --all --for=condition=Ready --timeout=10m
 ```
+
+The `-f` line is the kind overlay of the same release, which helm reads
+straight from GitHub. It matters on kind only. A kind node is itself a
+container, and kind's containerd runs a hook of its own
+(`mount-product-files`) inside every new container, including each
+`kubectl exec`. Falco's Critical rule "Drop and execute new binary in
+container" fires on that hook and blames your pod, and a Critical alert
+scores 36, enough to mark the pod SUSPICIOUS before it has done anything.
+The overlay adds one narrow exception: that hook running `mount` or
+`umount`, nothing else. The chart's defaults carry no exception, since
+real nodes do not run the hook.
 
 Both waits are needed. `kubectl wait` only sees pods that already exist, so
 straight after a plain `helm install` it fails with `no matching resources
@@ -162,16 +174,20 @@ as ready with one pod unavailable, so on one node it can return while the
 collector is still restarting (the collector and the aggregator restart a
 few times until NATS is up). The `kubectl wait` after it is the real check.
 
-That is the whole default install, Falco included: on a single-node cluster,
-six pods (Falco and the collector, one each per node; the aggregator; NATS;
+That is the default install plus that one kind exception, Falco included:
+on a single-node cluster, six pods (Falco and the collector, one each per node; the aggregator; NATS;
 nats-box; Redis). Before release, this sequence
 was run word for word on a fresh single-node kind (kind v0.30.0, node image
 v1.34.0, a 4 vCPU Ubuntu 24.04 host on kernel 7.0 with BTF), with the chart
 packaged the way the release packages it and the image loaded into kind
 instead of pulled. Every pod was Ready 102 seconds after `kind create
-cluster` started, Falco reported healthy a minute later, and `cat
-/etc/shadow` in a pod moved it to SUSPICIOUS. Two things can stop it on your
-machine:
+cluster` started and Falco reported healthy a minute later. That run had no
+`-f` line, so the SUSPICIOUS it saw after `cat /etc/shadow` in a pod was
+the hook's Critical alert, not the read. With the overlay, the read alone
+does it: it trips Falco's Warning rule "Read sensitive file untrusted",
+which scores 20, the SUSPICIOUS threshold. The stranger-path CI job runs
+this block word for word and prints every Falco rule that fired for its
+pod before the transition. Two things can stop it on your machine:
 
 - **Falco needs BTF** (`/sys/kernel/btf/vmlinux` exists on the host). Most
   current distribution kernels have it; see [Limitations](#limitations).
@@ -219,12 +235,15 @@ make quickstart-clean  # deletes the cluster
 ```
 
 `make quickstart` creates a kind cluster called `olaitan-quickstart`,
-installs the published chart exactly as above (Falco on), starts a
-throwaway busybox pod in the `olaitan-quickstart` namespace and runs
-`cat /etc/shadow` inside it. That read is a real syscall, and it trips
-Falco's stock rule "Read sensitive file untrusted". The script then waits
-for the aggregator's decision about the pod, prints it, and says how long
-it took from `kind create cluster`:
+installs the published chart exactly as above (Falco on, the kind overlay
+of the same release), starts a throwaway busybox pod in the
+`olaitan-quickstart` namespace and runs `cat /etc/shadow` inside it. That
+read is a real syscall, and it trips Falco's stock rule "Read sensitive
+file untrusted" (Warning, score 20, SUSPICIOUS on its own). The script then
+waits for the aggregator's decision about the pod and prints it, with every
+Falco rule that fired for the pod up to that decision and how long it took
+from `kind create cluster`. If none of those rules was an alert on
+`/etc/shadow`, it says the transition was not caused by the read.
 
 ```
     workload   olaitan-quickstart/Pod/quickstart-demo
@@ -242,7 +261,8 @@ it took from `kind create cluster`:
 That output is from a fresh single-node kind (kind v0.30.0) on a 4 vCPU
 Ubuntu 24.04 host on kernel 7.0, pulling everything from the registries.
 Nothing in the quickstart talks to NATS: the transition is read from the
-aggregator's own log, and it only appears because Falco saw the read. It
+aggregator's own log, and it only appears because Falco saw real actions
+in the pod; the rule list says which ones. It
 exits non-zero if the transition takes more than ten minutes
 (`QUICKSTART_BUDGET`, in seconds). It refuses to reuse an existing
 `olaitan-quickstart` cluster, since the time is measured from

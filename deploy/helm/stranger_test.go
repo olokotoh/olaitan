@@ -187,7 +187,7 @@ func TestStrangerRunsTheReadmeKubectlBlockVerbatim(t *testing.T) {
 // A broken command in the README is the command the job runs.
 func TestStrangerReadsTheReadmeAtRunTime(t *testing.T) {
 	v := chartVersion(t)
-	broken := strings.Replace(readmeText(t), "  --version "+v+" \\\n  --namespace olaitan --create-namespace --wait", "  --version 0.0.0-broken \\\n  --namespace olaitan --create-namespace --wait", 1)
+	broken := strings.Replace(readmeText(t), "  --version "+v+" \\\n  -f "+kindOverlayURL(v)+" \\\n", "  --version 0.0.0-broken \\\n  -f "+kindOverlayURL(v)+" \\\n", 1)
 	if broken == readmeText(t) {
 		t.Fatal("could not find the Try it on kind --version line to break")
 	}
@@ -238,8 +238,8 @@ func TestStrangerFailsWithoutTheBlock(t *testing.T) {
 		t.Errorf("helm leg passed with no %q heading:\n%s", strangerHelmHeading, out)
 	}
 	// The heading is there but its block is not the published helm install.
-	swapped := strings.Replace(readmeText(t), "helm install olaitan "+publishedChartRef+" \\\n  --version "+chartVersion(t)+" \\\n  --namespace olaitan --create-namespace --wait",
-		"helm install olaitan ./deploy/helm/olaitan \\\n  --version "+chartVersion(t)+" \\\n  --namespace olaitan --create-namespace --wait", 1)
+	swapped := strings.Replace(readmeText(t), "helm install olaitan "+publishedChartRef+" \\\n  --version "+chartVersion(t)+" \\\n  -f ",
+		"helm install olaitan ./deploy/helm/olaitan \\\n  --version "+chartVersion(t)+" \\\n  -f ", 1)
 	if swapped == readmeText(t) {
 		t.Fatal("could not rewrite the Try it on kind helm command")
 	}
@@ -1272,5 +1272,31 @@ func TestReleaseLatestOnlyAfterTheStrangerPasses(t *testing.T) {
 				t.Errorf("job %s marks a release Latest; only promote may", name)
 			}
 		}
+	}
+}
+
+// TestReadmeKindBlockInstallsTheKindHookException (fix/quickstart-honest-
+// score): the README kind block, which the stranger job runs verbatim,
+// passes the release's kind overlay, pinned to the same release as its
+// --version, and the README no longer shows the hook's score as the read's.
+func TestReadmeKindBlockInstallsTheKindHookException(t *testing.T) {
+	block, err := readmeBashBlock(readmeText(t), strangerHelmHeading, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmds := publishedInstallCommands("README kind block", block)
+	if len(cmds) != 1 {
+		t.Fatalf("want one helm install of the published chart in the kind block, got %d:\n%s", len(cmds), block)
+	}
+	if !strings.Contains(cmds[0].command, "-f "+kindOverlayURL(chartVersion(t))) {
+		t.Errorf("the README kind install does not pass -f %s:\n%s", kindOverlayURL(chartVersion(t)), cmds[0].command)
+	}
+	for _, m := range regexp.MustCompile(`raw\.githubusercontent\.com/olokotoh/olaitan/([^/\s]+)/`).FindAllStringSubmatch(readmeText(t), -1) {
+		if m[1] != "v"+chartVersion(t) {
+			t.Errorf("README fetches a file at %s, Chart.yaml is %s", m[1], chartVersion(t))
+		}
+	}
+	if regexp.MustCompile(`(?m)^\s*score\s+36\s*$`).MatchString(readmeText(t)) {
+		t.Error("README still shows score 36 as the read's result; that was the kind hook's Critical rule")
 	}
 }
