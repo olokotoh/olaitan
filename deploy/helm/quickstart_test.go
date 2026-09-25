@@ -477,3 +477,315 @@ func TestQuickstartRuleIsTheDemoPods(t *testing.T) {
 		}
 	}
 }
+
+// kindOverlayURL is the kind overlay of release v<version>, the way a
+// stranger without a clone passes it to helm (helm reads -f from https).
+func kindOverlayURL(version string) string {
+	return "https://raw.githubusercontent.com/olokotoh/olaitan/v" + version + "/deploy/helm/olaitan/values-kind.yaml"
+}
+
+// TestQuickstartInstallsTheKindHookException (fix/quickstart-honest-score).
+// On kind, the node's own OCI hook (mount-product-files) trips Falco's
+// Critical "Drop and execute new binary in container" for the demo pod,
+// which scores 36 and moved the pod before the read of /etc/shadow was
+// seen. The kind overlay carries a narrow exception for that hook; the
+// quickstart installs with it, so the transition it prints comes from the
+// read. The default values carry no exception (real nodes have no hook).
+func TestQuickstartInstallsTheKindHookException(t *testing.T) {
+	m := planInstall.FindStringSubmatch(quickstartPlan(t))
+	if m == nil || !strings.Contains(m[2], " -f "+kindOverlayURL(chartVersion(t))+" ") {
+		t.Errorf("the published install does not pass the release's kind overlay (-f %s): %v", kindOverlayURL(chartVersion(t)), m)
+	}
+	m = planInstall.FindStringSubmatch(quickstartPlan(t, "QUICKSTART_VERSION=1.2.3-rc9"))
+	if m == nil || !strings.Contains(m[2], " -f "+kindOverlayURL("1.2.3-rc9")+" ") {
+		t.Errorf("QUICKSTART_VERSION=1.2.3-rc9 does not take the kind overlay of that release: %v", m)
+	}
+	m = planInstall.FindStringSubmatch(quickstartPlan(t, "QUICKSTART_CHART=local"))
+	if m == nil || !strings.Contains(m[2], " -f deploy/helm/olaitan/values-kind.yaml ") {
+		t.Errorf("the local install does not pass the checkout's kind overlay: %v", m)
+	}
+
+	kind, err := os.ReadFile(filepath.Join(chartDir(t), "values-kind.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(kind), "kind_mount_product_files_hook") {
+		t.Error("values-kind.yaml no longer carries the kind_mount_product_files_hook exception")
+	}
+	def, err := os.ReadFile(filepath.Join(chartDir(t), "values.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(def), "mount-product-f") {
+		t.Error("the default values carry the kind hook exception; it belongs in the kind overlay only")
+	}
+}
+
+// falcoLogHook is the #177 shape: kind's hook trips the Critical rule for
+// the demo pod before the read, the read trips the Warning rule twice, and
+// another alert from the demo pod comes after the transition. The times
+// have different fraction lengths on purpose.
+const falcoLogHook = `{"hostname":"n","output":"x","output_fields":{"container.name":"other","k8s.ns.name":"default","k8s.pod.name":"other"},"priority":"Critical","rule":"Other pod rule","source":"syscall","time":"2026-09-24T08:41:18Z"}
+{"hostname":"n","output":"x","output_fields":{"container.name":"quickstart-demo","k8s.ns.name":"olaitan-quickstart","k8s.pod.name":"quickstart-demo","proc.pname":"mount-product-f"},"priority":"Critical","rule":"Drop and execute new binary in container","source":"syscall","time":"2026-09-24T08:41:18.9Z"}
+{"hostname":"n","output":"x","output_fields":{"container.name":"quickstart-demo","fd.name":"/etc/shadow","k8s.ns.name":"olaitan-quickstart","k8s.pod.name":"quickstart-demo"},"priority":"Warning","rule":"Read sensitive file untrusted","source":"syscall","time":"2026-09-24T08:41:19.25Z"}
+{"hostname":"n","output":"x","output_fields":{"container.name":"quickstart-demo","fd.name":"/etc/shadow","k8s.ns.name":"olaitan-quickstart","k8s.pod.name":"quickstart-demo"},"priority":"Warning","rule":"Read sensitive file untrusted","source":"syscall","time":"2026-09-24T08:41:19.499999999Z"}
+{"hostname":"n","output":"x","output_fields":{"container.name":"quickstart-demo","k8s.ns.name":"olaitan-quickstart","k8s.pod.name":"quickstart-demo"},"priority":"Error","rule":"After the transition","source":"syscall","time":"2026-09-24T08:41:19.500000001Z"}
+{"hostname":"n","output":"x","output_fields":{"container.name":"quickstart-demo","k8s.ns.name":"olaitan-quickstart","k8s.pod.name":"quickstart-demo-2"},"priority":"Critical","rule":"Prefix pod rule","source":"syscall","time":"2026-09-24T08:41:19.1Z"}
+`
+
+// TestQuickstartListsEveryRuleBeforeTheTransition: the parser returns every
+// Falco rule that fired for the demo pod up to the transition, not only the
+// read's, so a transition the hook caused cannot pass as the read's.
+// Fields: first time, priority, rule, alerts, whether one was on /etc/shadow.
+func TestQuickstartListsEveryRuleBeforeTheTransition(t *testing.T) {
+	out, err := quickstartFunc(t, falcoLogHook, "qs_parse_rules", "olaitan-quickstart", "quickstart-demo", "2026-09-24T08:41:19.5Z")
+	if err != nil {
+		t.Fatalf("qs_parse_rules: %v", err)
+	}
+	want := "2026-09-24T08:41:18.9Z\tCritical\tDrop and execute new binary in container\t1\tno\n" +
+		"2026-09-24T08:41:19.25Z\tWarning\tRead sensitive file untrusted\t2\tyes\n"
+	if out != want {
+		t.Errorf("qs_parse_rules =\n%s\nwant\n%s", out, want)
+	}
+	// Before the hook's alert there is nothing.
+	if out, err := quickstartFunc(t, falcoLogHook, "qs_parse_rules", "olaitan-quickstart", "quickstart-demo", "2026-09-24T08:41:18.5Z"); err == nil || out != "" {
+		t.Errorf("qs_parse_rules before any alert = %q, %v; want nothing and exit 1", out, err)
+	}
+}
+
+// exitCode is the exit status of a finished command, 0 for no error, -1
+// when the command did not run to an exit.
+func exitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	if ee, ok := err.(*exec.ExitError); ok {
+		return ee.ExitCode()
+	}
+	return -1
+}
+
+// TestQuickstartReportNamesTheCause: the printed block lists every rule
+// with its priority and says so when no alert on /etc/shadow came before
+// the transition (exit 1), which is what #177 printed as the read's result.
+// Review F4: the score is the highest rule's (max-based,
+// internal/correlator/trigger/falco.go), so when a rule of higher priority
+// than the read's also fired before the transition, the read did not set
+// the score alone: exit 3, and a line names the other rules.
+func TestQuickstartReportNamesTheCause(t *testing.T) {
+	out, err := quickstartFunc(t, falcoLogHook, "qs_report_rules", "olaitan-quickstart", "quickstart-demo", "2026-09-24T08:41:19.5Z")
+	if exitCode(err) != 3 {
+		t.Errorf("qs_report_rules with the hook's Critical and the read's Warning before the transition exited %v, want 3 (the read and other rules contributed):\n%s", err, out)
+	}
+	if !strings.Contains(out, "Other rules contributed: Drop and execute new binary in container (") {
+		t.Errorf("report does not name the higher-priority rule as a contributor:\n%s", out)
+	}
+	for _, want := range []string{"Critical", "Drop and execute new binary in container", "Warning", "Read sensitive file untrusted", "on /etc/shadow"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("report lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "After the transition") || strings.Contains(out, "Other pod rule") || strings.Contains(out, "Prefix pod rule") {
+		t.Errorf("report lists a rule from after the transition or another pod:\n%s", out)
+	}
+
+	out, err = quickstartFunc(t, falcoLogHook, "qs_report_rules", "olaitan-quickstart", "quickstart-demo", "2026-09-24T08:41:19.0Z")
+	if err == nil {
+		t.Errorf("qs_report_rules passed although only the hook's rule came before the transition:\n%s", out)
+	}
+	if !strings.Contains(out, "Drop and execute new binary in container") || !strings.Contains(out, "not caused by the read") {
+		t.Errorf("report does not name the hook's rule and say the read did not cause it:\n%s", out)
+	}
+}
+
+// TestQuickstartAndStrangerPrintTheRules: both scripts print the rule list
+// from qs_report_rules, and neither prints a score next to the read's rule
+// alone any more.
+func TestQuickstartAndStrangerPrintTheRules(t *testing.T) {
+	for _, f := range []string{"quickstart.sh", "stranger.sh"} {
+		raw, err := os.ReadFile(filepath.Join(repoRoot(t), "hack", f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !regexp.MustCompile(`(?m)^[^#]*qs_report_rules `).Match(raw) {
+			t.Errorf("hack/%s does not print the Falco rules that fired before the transition (qs_report_rules)", f)
+		}
+		if regexp.MustCompile(`(?m)^[^#]*"falco rule"`).Match(raw) {
+			t.Errorf("hack/%s still prints a single \"falco rule\" line next to the score", f)
+		}
+	}
+}
+
+// falcoLine is one Falco JSON alert for pod POD in namespace NS.
+func falcoLine(ns, pod, prio, rule, fd, ts string) string {
+	fields := `"container.name":"` + pod + `",`
+	if fd != "" {
+		fields += `"fd.name":"` + fd + `",`
+	}
+	fields += `"k8s.ns.name":"` + ns + `","k8s.pod.name":"` + pod + `"`
+	return `{"hostname":"n","output":"x","output_fields":{` + fields + `},"priority":"` + prio + `","rule":"` + rule + `","source":"syscall","time":"` + ts + `"}` + "\n"
+}
+
+// falcoLogUnordered (review F6): two Falco pods' logs concatenated, so the
+// lines are not in time order, plus a namespace that has the demo's as a
+// prefix (olaitan-quickstart2) with a Critical alert for a pod of the same
+// name before the transition, which must not count.
+var falcoLogUnordered = falcoLine("olaitan-quickstart", "quickstart-demo", "Warning", "Read sensitive file untrusted", "/etc/shadow", "2026-09-24T08:41:19.3Z") +
+	falcoLine("olaitan-quickstart", "quickstart-demo", "Notice", "Late rule", "", "2026-09-24T08:41:20Z") +
+	falcoLine("olaitan-quickstart2", "quickstart-demo", "Critical", "Prefix namespace rule", "/etc/shadow", "2026-09-24T08:41:18Z") +
+	falcoLine("olaitan-quickstart", "quickstart-demo", "Notice", "Early notice rule", "", "2026-09-24T08:41:18.123Z") +
+	falcoLine("olaitan-quickstart", "quickstart-demo", "Warning", "Read sensitive file untrusted", "/etc/shadow", "2026-09-24T08:41:19.1Z")
+
+func TestQuickstartRulesIgnoreNamespacePrefixAndLogOrder(t *testing.T) {
+	out, err := quickstartFunc(t, falcoLogUnordered, "qs_parse_rules", "olaitan-quickstart", "quickstart-demo", "2026-09-24T08:41:19.5Z")
+	if err != nil {
+		t.Fatalf("qs_parse_rules: %v", err)
+	}
+	want := "2026-09-24T08:41:18.123Z\tNotice\tEarly notice rule\t1\tno\n" +
+		"2026-09-24T08:41:19.1Z\tWarning\tRead sensitive file untrusted\t2\tyes\n"
+	if out != want {
+		t.Errorf("qs_parse_rules =\n%s\nwant\n%s", out, want)
+	}
+	out, err = quickstartFunc(t, falcoLogUnordered, "qs_report_rules", "olaitan-quickstart", "quickstart-demo", "2026-09-24T08:41:19.5Z")
+	if err != nil || strings.Contains(out, "Prefix namespace rule") || strings.Contains(out, "contributed") {
+		t.Errorf("report counted another namespace's rule or a lower-priority one as a contributor (%v):\n%s", err, out)
+	}
+}
+
+// TestQuickstartRulesFailClosedOnTimes (review F3): a transition or alert
+// time that cannot be compared (here, an offset instead of Z) must stop the
+// verdict, never switch the time window off and count every alert.
+func TestQuickstartRulesFailClosedOnTimes(t *testing.T) {
+	for _, fn := range []string{"qs_parse_rules", "qs_report_rules"} {
+		out, err := quickstartFunc(t, falcoLogHook, fn, "olaitan-quickstart", "quickstart-demo", "2026-09-24T09:41:19.5+01:00")
+		if exitCode(err) != 1 || !strings.Contains(out, "cannot compare times") {
+			t.Errorf("%s with a +01:00 transition time exited %v, want 1 and \"cannot compare times\":\n%s", fn, err, out)
+		}
+		if strings.Contains(out, "Read sensitive file untrusted") {
+			t.Errorf("%s listed rules although the times cannot be compared:\n%s", fn, out)
+		}
+		log := falcoLine("olaitan-quickstart", "quickstart-demo", "Warning", "Read sensitive file untrusted", "/etc/shadow", "2026-09-24T09:41:19+01:00")
+		out, err = quickstartFunc(t, log, fn, "olaitan-quickstart", "quickstart-demo", "2026-09-24T08:41:19.5Z")
+		if exitCode(err) != 1 || !strings.Contains(out, "cannot compare times") {
+			t.Errorf("%s with a +01:00 alert time exited %v, want 1 and \"cannot compare times\":\n%s", fn, err, out)
+		}
+	}
+}
+
+// TestQuickstartReadIsTheFdNameField (review F5): the read is an alert
+// whose Falco field fd.name is exactly /etc/shadow, not any line that has
+// /etc/shadow somewhere in it (/etc/shadow- is the backup file).
+func TestQuickstartReadIsTheFdNameField(t *testing.T) {
+	log := falcoLine("olaitan-quickstart", "quickstart-demo", "Warning", "Read sensitive file untrusted", "/etc/shadow-", "2026-09-24T08:41:19Z")
+	out, err := quickstartFunc(t, log, "qs_report_rules", "olaitan-quickstart", "quickstart-demo", "2026-09-24T08:41:19.5Z")
+	if exitCode(err) != 1 || strings.Contains(out, "(on /etc/shadow)") {
+		t.Errorf("a read of /etc/shadow- counted as the read of /etc/shadow (%v):\n%s", err, out)
+	}
+}
+
+// resultShim is a PATH with fake docker, kind, helm, kubectl and sleep for
+// running a script's main end to end with no cluster (review F6). kubectl
+// prints $SHIM_AGG for the aggregator's logs and $SHIM_FALCO for Falco's,
+// or fails Falco's with $SHIM_FALCO_RC; everything else succeeds silently.
+func resultShim(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	tools := map[string]string{
+		"docker": "exit 0\n",
+		"helm":   "exit 0\n",
+		"sleep":  "exit 0\n",
+		"kind":   "exit 0\n",
+		"kubectl": `case " $* " in
+*" logs "*component=aggregator*) cat "$SHIM_AGG" ;;
+*" logs "*name=falco*)
+	if [ -n "${SHIM_FALCO_RC:-}" ]; then
+		echo "error: the server is currently unable to handle the request" >&2
+		exit "$SHIM_FALCO_RC"
+	fi
+	cat "$SHIM_FALCO" ;;
+esac
+exit 0
+`,
+	}
+	for name, body := range tools {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/usr/bin/env bash\n"+body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir + string(os.PathListSeparator) + os.Getenv("PATH")
+}
+
+func writeTemp(t *testing.T, name, text string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(p, []byte(text), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// transitionAt is an aggregator log with one transition of the demo pod in
+// namespace NS at time TS.
+func transitionAt(ns, pod, ts string) string {
+	return `{"time":"2026-09-24T08:41:10Z","level":"WARN","msg":"aggregator: nats connect failed"}` + "\n" +
+		`{"time":"` + ts + `","level":"INFO","msg":"aggregator: fsm transition","workload_id":"` + ns + `/Pod/` + pod + `","from_state":"CLEAN","to_state":"SUSPICIOUS","reason":"escalation_threshold_crossed","score":36}` + "\n"
+}
+
+var (
+	falcoLogReadOnly = falcoLogUnordered
+	falcoLogHookOnly = falcoLine("olaitan-quickstart", "quickstart-demo", "Critical", "Drop and execute new binary in container", "", "2026-09-24T08:41:18.9Z") +
+		falcoLine("olaitan-quickstart", "quickstart-demo", "Warning", "Read sensitive file untrusted", "/etc/shadow", "2026-09-24T08:41:19.6Z")
+)
+
+// quickstartMain runs hack/quickstart.sh for real (not plan mode) against
+// the shim, with FALCO as Falco's log and a transition at 08:41:19.5Z.
+func quickstartMain(t *testing.T, falco string, env ...string) (string, error) {
+	t.Helper()
+	cmd := exec.Command("bash", quickstartScript(t))
+	cmd.Dir = repoRoot(t)
+	cmd.Env = quickstartEnv(append([]string{
+		"PATH=" + resultShim(t),
+		"SHIM_AGG=" + writeTemp(t, "agg.log", transitionAt("olaitan-quickstart", "quickstart-demo", "2026-09-24T08:41:19.5Z")),
+		"SHIM_FALCO=" + writeTemp(t, "falco.log", falco),
+	}, env...)...)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// TestQuickstartMainResult (review F1, F2, F4, F6): the result block of
+// main, run end to end with a kubectl shim. The read alone passes; a
+// transition the read did not cause is printed and exits non-zero; a
+// higher-priority rule before the read is named in the headline; a Falco
+// log that cannot be read is an infra failure, never a verdict.
+func TestQuickstartMainResult(t *testing.T) {
+	out, err := quickstartMain(t, falcoLogReadOnly)
+	if err != nil || !strings.Contains(out, "Olaitan saw the read of /etc/shadow and moved the workload:") {
+		t.Errorf("the read alone before the transition: exit %v, want 0 and the \"saw the read\" headline:\n%s", err, out)
+	}
+
+	out, err = quickstartMain(t, falcoLogHookOnly)
+	if err == nil {
+		t.Errorf("quickstart passed although the read did not cause the transition:\n%s", out)
+	}
+	for _, want := range []string{"not because of the read", "Drop and execute new binary in container", "quickstart: the read of /etc/shadow did not cause the transition"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("hook-only run lacks %q:\n%s", want, out)
+		}
+	}
+
+	out, err = quickstartMain(t, falcoLogHook)
+	if err != nil || !strings.Contains(out, "the read of /etc/shadow and other rules contributed (Drop and execute new binary in container)") || strings.Contains(out, "Olaitan saw the read of /etc/shadow and moved") {
+		t.Errorf("hook and read before the transition: exit %v, want 0 and a headline naming the other rule:\n%s", err, out)
+	}
+
+	out, err = quickstartMain(t, falcoLogReadOnly, "SHIM_FALCO_RC=5")
+	if err == nil {
+		t.Errorf("quickstart passed although the Falco log could not be read:\n%s", out)
+	}
+	if !strings.Contains(out, "cannot read the Falco log") || !strings.Contains(out, "unable to handle the request") {
+		t.Errorf("a failed Falco log read is not reported as one, with kubectl's error:\n%s", out)
+	}
+	if strings.Contains(out, "moved the workload") {
+		t.Errorf("a verdict was printed from a Falco log that could not be read:\n%s", out)
+	}
+}

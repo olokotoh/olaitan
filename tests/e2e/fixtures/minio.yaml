@@ -34,12 +34,14 @@ spec:
     spec:
       containers:
         - name: minio
-          # Pinned to a specific verified-pullable RELEASE tag (never latest),
-          # mirroring the forensics-integration CI job's image-pinning
-          # discipline. The official minio image has no default server
-          # entrypoint, so the server command is explicit. Pulled from quay.io:
-          # MinIO removed minio/minio from Docker Hub.
-          image: quay.io/minio/minio:RELEASE.2024-10-13T13-34-11Z
+          # The same image as the forensics-integration CI job, pinned by tag
+          # AND digest (deploy/helm/minio_pin_test.go). MinIO archived its
+          # community edition and no longer serves minio/minio from Docker
+          # Hub or quay.io, so this is pgsty/minio, a maintained fork built
+          # with the same Dockerfile: no default server entrypoint (the
+          # server command is explicit), and mc is bundled for the bucket
+          # provisioning step.
+          image: docker.io/pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372
           imagePullPolicy: IfNotPresent
           args: ["server", "/data", "--console-address", ":9001"]
           env:
