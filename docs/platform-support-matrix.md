@@ -68,7 +68,7 @@ What "verified 2026-09-21" covers, precisely:
 | **kind** | ✅ verified | modern_ebpf (Falco 0.45.0-rc1) | ❌ **no** (kindnet) | ✅ `standard` | ✅ possible | `values-kind.yaml` |
 | **kind + Calico** | ✅ verified 2026-09-17 | modern_ebpf (Falco 0.45.0-rc1) | ✅ **proven** (Calico) | ✅ `standard` | untested here | `values-kind.yaml` |
 | **kind-full** (reference) | ⚠️ verified 2026-09-21, see note | modern_ebpf (Falco 0.45.0-rc1) | ✅ **proven** (Calico) | ✅ `standard` | ✅ **enabled** | `values-full.yaml` |
-| **kubeadm** | ✅ verified | modern_ebpf | depends on CNI | depends | ✅ possible | (defaults) |
+| **kubeadm** | ✅ verified 2026-09-25 (one node) | modern_ebpf (Falco 0.45.0-rc1) | ✅ **proven** (Calico v3.31.5); otherwise depends on CNI | ❌ **none** on stock kubeadm (add one) | ✅ possible | (defaults) |
 | **k3s / k3d** | template-verified | modern_ebpf | ✅ (kube-router) | ✅ `local-path` | ✅ possible | `values-k3s.yaml` |
 | **minikube** | template-verified | modern_ebpf | ❌ unless `--cni=calico` | ✅ addon | ✅ possible | `values-minikube.yaml` |
 | **EKS (EC2)** | template-verified | modern_ebpf **required** | ❌ off until enabled | ❌ **none ≥1.30** | ❌ CloudWatch instead | `values-eks.yaml` |
@@ -95,12 +95,54 @@ The `verified` rows are separate, and none rests on CI:
   `--audit-webhook-config-file`, so nothing on that cluster exercised the
   audit path, and kind being capable of it is not the same as it having
   been done.
-- **kubeadm** was installed by hand on a real 3-node cluster on 2026-08-31.
-  Note what that run actually established: the chart installs and every
-  workload schedules, but the collector could not attach to Falco's socket
-  (Blocker 8) until Story 9.6, and **the fix has not yet been re-run on
-  kubeadm**. Story 9.6 was verified in containers and on kind; the kubeadm
-  re-run is outstanding.
+- **kubeadm** was re-run live on 2026-09-25, after Story 10.1 (Falco pin)
+  and Story 10.2 (Falco posts to the collector over `http_output`). Cluster:
+  one node, kubeadm/kubelet v1.34.12 with the control-plane taint removed,
+  containerd 2.2.1 (`SystemdCgroup = true`), Calico v3.31.5 through the
+  Tigera operator (pod CIDR 192.168.0.0/16, service CIDR 10.96.0.0/12),
+  Ubuntu 24.04.5 on kernel 7.0.0-1013-aws with BTF, AWS m6i.xlarge (4 vCPU,
+  16 GiB, 40 GB gp3), inotify 512 / 524288, helm v3.16.4. Install: the
+  README command word for word (published chart 1.0.0-rc4, defaults, no
+  overlay). Results:
+  - **Install: yes, after one cluster-side fix.** Stock kubeadm has no
+    default StorageClass, so three claims (NATS JetStream, Redis, reports)
+    stayed Pending and NATS, Redis and the aggregator with them. Adding
+    local-path-provisioner v0.0.32 as the default bound them with no
+    reinstall; every pod Ready 205 s after `helm install`. `hack/preflight.sh`
+    check 1 catches this before the install.
+  - **Falco: yes.** modern eBPF probe, Falco 0.45.0-rc1; collector counters
+    `olaitan_sensor_falco_http_requests_total{code="204"} 29`, every other
+    code 0, `olaitan_source_healthy{source="falco"} 1`. Blocker 8 of the
+    2026-08-31 run is closed on kubeadm.
+  - **Detection: yes.** Real `cat /etc/shadow` in a pinned busybox pod:
+    Falco Warning "Read sensitive file untrusted" at 10:50:54.413Z, the
+    aggregator transition CLEAN to SUSPICIOUS, score 20
+    (`score_rules` 20, `score_baseline` 0, `score_llm` 0) at 10:50:54.435Z.
+    No other rule fired for the pod.
+  - **NetworkPolicy enforcement: yes.** `hack/check-netpol-enforcement.sh`
+    exit 0, "NetworkPolicy IS ENFORCED".
+  - **Containment: proven, on non-default values.** On the defaults
+    (20 / 40 / 70) a Falco-only attack stops at SUSPICIOUS: the Falco
+    severity map caps one alert at 38. With `response.networkPolicy.enabled`,
+    `clusterCidrs` set, and `fsm.thresholds` 10 / 15 / 19 (a values
+    upgrade plus a manual aggregator restart, #188), repeated real reads
+    took a pod CLEAN to SUSPICIOUS (10:53:48Z), RESTRICTED (10:54:48Z) and
+    QUARANTINED (10:56:50Z, reason `dwell_guard_elapsed`). The aggregator
+    wrote `olaitan-quarantined-<hash>` (policyTypes Ingress and Egress, no
+    rules) and deleted the RESTRICTED one. From the pod, HTTP to another
+    pod, DNS and TCP 1.1.1.1:443 all timed out; all three worked before the
+    attack, and a fresh pod in another namespace still reached the same
+    target afterwards. A second pod held at RESTRICTED kept pod HTTP and DNS
+    and lost 1.1.1.1:443.
+  - **Not shown:** multi-node, `install.yaml`, the optional sources,
+    ingress blocking to a quarantined pod (no baseline taken), and
+    containment on the default thresholds.
+
+  The earlier run, 2026-08-31, was a real 3-node cluster: the chart
+  installed and every workload scheduled, but the collector could not
+  attach to Falco's socket (Blocker 8), so the primary source was dead.
+  Story 9.6 and then Story 10.2 fixed that; the 2026-09-25 run above is the
+  kubeadm confirmation.
 
 The `portability` matrix job (kind, minikube, k3s) is written but **has not run
 yet** -- this branch has never been pushed, so no CI has executed against it.

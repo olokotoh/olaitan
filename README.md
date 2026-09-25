@@ -402,7 +402,7 @@ if it could not check.
 | --- | --- | --- | --- | --- |
 | kind | ✅ verified | not verified on current kind; run `hack/check-netpol-enforcement.sh` | ✅ possible | `values-kind.yaml` |
 | **kind-full** (reference) | ⚠️ verified 2026-09-21, see note | ✅ yes (Calico) | ✅ enabled | `values-full.yaml` |
-| kubeadm | ⚠️ verified 2026-08-31, see note | depends on your CNI | ✅ possible | (defaults) |
+| kubeadm | ✅ verified 2026-09-25 (one node), see note | ✅ yes (Calico, proven); otherwise depends on your CNI | ✅ possible | (defaults) |
 | k3s / k3d | template-verified | ✅ (kube-router) | ✅ possible | `values-k3s.yaml` |
 | minikube | template-verified | ❌ unless `--cni=calico` | ✅ possible | `values-minikube.yaml` |
 | EKS (EC2) | template-verified | ❌ until VPC CNI policy enabled | ❌ impossible | `values-eks.yaml` |
@@ -500,13 +500,52 @@ was run there. Rendering is not running, and the two are never blurred; the
 cited, per-platform detail is in
 [docs/platform-support-matrix.md](docs/platform-support-matrix.md).
 
-**The kubeadm caveat, stated here rather than only in the matrix.** The
-2026-08-31 kubeadm run established that the chart installs and every workload
-schedules. It also found that the collector could not attach to Falco's
-socket at all, so the primary detection source was dead on that cluster. That
-defect is fixed, and the fix has **not been re-run on kubeadm** -- it was
-verified in containers and on kind. Treat the kubeadm row as "installs, and
-the known blocker is fixed but unconfirmed there".
+**The kubeadm caveat, stated here rather than only in the matrix.** On
+2026-09-25 the published 1.0.0-rc4 chart was installed with the command under
+[Install](#install), defaults and no overlay, on a fresh single-node kubeadm
+cluster: Kubernetes v1.34.12 with the control-plane taint removed, containerd
+2.2.1 with `SystemdCgroup`, Calico v3.31.5 through the Tigera operator,
+Ubuntu 24.04 on kernel 7.0.0-1013-aws with BTF (an AWS m6i.xlarge, 4 vCPU,
+16 GiB), inotify raised to 512 / 524288. What that run showed:
+
+- **Stock kubeadm has no default StorageClass,** so the install as written
+  left NATS, Redis and the aggregator waiting on three Pending volume claims.
+  After a default StorageClass was added (local-path-provisioner v0.0.32) the
+  claims bound with no reinstall, and every pod was Ready 205 s after
+  `helm install`. `hack/preflight.sh` reports this as its storage check; run
+  it first.
+- **Falco works on kubeadm.** It loaded its modern eBPF probe (Falco
+  0.45.0-rc1) and posted to the collector over `http_output`: 29 requests,
+  all 204, no 4xx or 5xx, and `source_healthy{source="falco"}` at 1. The
+  2026-08-31 blocker (the collector could not attach to Falco's socket, so
+  the primary source was dead) is gone.
+- **Detection.** A real `cat /etc/shadow` in a pinned busybox pod tripped
+  Falco's Warning rule "Read sensitive file untrusted", and the aggregator
+  moved the pod from CLEAN to SUSPICIOUS at score 20, 22 ms after the alert.
+  No other rule fired for the pod: the kind hook's Critical rule does not
+  appear on a real node.
+- **`hack/check-netpol-enforcement.sh`** said NetworkPolicy IS ENFORCED
+  (Calico).
+- **Containment was proven, but not on the default values.** With the
+  defaults a Falco-only attack cannot reach RESTRICTED: the highest Falco
+  rule scores 38 and RESTRICTED needs 40 (QUARANTINED 70). To exercise the
+  response path, the run upgraded with `response.networkPolicy.enabled=true`,
+  `response.networkPolicy.clusterCidrs` set to the pod and service CIDRs,
+  and `fsm.thresholds` lowered to 10 / 15 / 19 (values only, no code). The
+  aggregator then had to be restarted by hand, because the upgrade does not
+  restart it and it reads that flag only at start
+  ([#188](https://github.com/olokotoh/olaitan/issues/188)). Repeated reads
+  then took a pod to RESTRICTED and, after the 120 s RESTRICTED dwell, to
+  QUARANTINED, and Olaitan wrote its deny-all policy. From inside that pod,
+  HTTP to another pod, DNS and TCP to 1.1.1.1:443 all timed out; before the
+  attack the same pod reached all three, and a fresh pod in another
+  namespace still did afterwards. A second pod held at RESTRICTED kept HTTP
+  to the other pod and DNS, and lost 1.1.1.1:443.
+
+Not shown on kubeadm: more than one node, the `install.yaml` path, the
+optional sources (audit webhook, containerd sensor, Calico flows, applog),
+blocking of ingress to a quarantined pod (it failed, but no baseline was
+taken first), and containment on the default thresholds.
 
 "Impossible" above means the K8s audit webhook specifically, and it is the
 only capability with a hard platform limit: it needs
