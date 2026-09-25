@@ -14,9 +14,18 @@
 #
 # `make down` (hack/down.sh) removes everything this creates.
 #
+# The first thing it writes, once preflight has passed, is <out>/.olaitan-up
+# with the cluster name: `make down` removes the out dir only when that marker
+# is there, so it never removes a directory make up did not make.
+#
+# It succeeds only when Falco has alerted on the demo pod's /etc/shadow read
+# AND the aggregator has moved a workload in that namespace, as
+# hack/stranger.sh (Story 12.5) requires.
+#
 # Settings (environment; the make targets pass the kind-full ones):
 #   UP_CLUSTER   kind cluster name                          (olaitan-full)
-#   UP_OUT_DIR   key material and kubeconfig, outside repo  ($HOME/.olaitan-full)
+#   UP_OUT_DIR   key material and kubeconfig, outside repo  ($HOME/.olaitan-full;
+#                set but empty is refused, as in hack/down.sh)
 #   UP_WORKERS   worker nodes; empty = hack/kind-full.yaml  (1)
 #   UP_BUDGET    seconds allowed, make up to detection      (900)
 #   UP_PLAN=1    run preflight, print the commands, create nothing
@@ -30,6 +39,8 @@ UP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$UP_ROOT/hack/quickstart.sh"
 # shellcheck source=hack/lib/falco-kernel.sh
 . "$UP_ROOT/hack/lib/falco-kernel.sh"
+# shellcheck source=hack/lib/out-dir.sh
+. "$UP_ROOT/hack/lib/out-dir.sh"
 
 UP_NS="default" # hack/install-full-kind.sh installs the release here
 UP_DEMO_NS="olaitan-up"
@@ -39,6 +50,10 @@ UP_POLL=5
 # The same floor hack/preflight.sh reports and kind documents.
 UP_MIN_INSTANCES=512
 UP_MIN_WATCHES=524288
+
+UP_K=()
+UP_OUT=""
+UP_CLUSTER_EXISTS=0
 
 UP_BLOCKERS=0
 up_ok() { printf '  ok       %s\n' "$*"; }
@@ -96,8 +111,15 @@ up_check_python() {
 # only what is low, so it never lowers the other limit.
 up_check_inotify() {
 	local inst="$1" watch="$2" set=""
-	if [ "$inst" -lt "$UP_MIN_INSTANCES" ]; then set+=" fs.inotify.max_user_instances=$UP_MIN_INSTANCES"; fi
-	if [ "$watch" -lt "$UP_MIN_WATCHES" ]; then set+=" fs.inotify.max_user_watches=$UP_MIN_WATCHES"; fi
+	local -a conf=()
+	if [ "$inst" -lt "$UP_MIN_INSTANCES" ]; then
+		set+=" fs.inotify.max_user_instances=$UP_MIN_INSTANCES"
+		conf+=("fs.inotify.max_user_instances = $UP_MIN_INSTANCES")
+	fi
+	if [ "$watch" -lt "$UP_MIN_WATCHES" ]; then
+		set+=" fs.inotify.max_user_watches=$UP_MIN_WATCHES"
+		conf+=("fs.inotify.max_user_watches = $UP_MIN_WATCHES")
+	fi
 	if [ -z "$set" ]; then
 		up_ok "inotify limits: instances=$inst, watches=$watch"
 		return 0
@@ -105,7 +127,8 @@ up_check_inotify() {
 	up_block "inotify limits too low for Falco on kind-full: instances=$inst (need >= $UP_MIN_INSTANCES), watches=$watch (need >= $UP_MIN_WATCHES)" \
 		"Falco would crash with 'could not initialize inotify handler' and never see the attack." \
 		"fix: sudo sysctl -w${set}" \
-		"to keep it after a reboot, put the same settings in /etc/sysctl.d/99-olaitan.conf"
+		"to keep it after a reboot, put these lines in /etc/sysctl.d/99-olaitan.conf:" \
+		"${conf[@]}"
 }
 
 up_check_host_kernel() {
@@ -143,6 +166,7 @@ up_check_host_kernel() {
 up_check_cluster() {
 	command -v kind >/dev/null 2>&1 || return 0
 	if kind get clusters 2>/dev/null | grep -qxF "$1"; then
+		UP_CLUSTER_EXISTS=1
 		up_block "kind cluster $1 already exists" \
 			"make up starts from nothing (the time is measured from the start); fix: make down"
 	else
@@ -150,7 +174,55 @@ up_check_cluster() {
 	fi
 }
 
-# up_preflight CLUSTER WORKERS: every check runs, so one run lists every
+# up_check_out_dir RAW CLUSTER: the out dir passes make down's guard (the
+# same rules, hack/lib/out-dir.sh), and holds nothing left from an earlier
+# run or from anyone else: make up writes private keys into it and marks it
+# as its own, and make down then removes it. Sets UP_OUT to the canonical
+# path.
+up_check_out_dir() {
+	local raw="$1" cluster="$2" d name f stale=""
+	if ! d="$(olaitan_out_dir "$raw" "$UP_ROOT")"; then
+		up_block "refusing out dir '$raw' (FULL_OUT_DIR, UP_OUT_DIR): $d" \
+			"make down removes the out dir with rm -rf, so it must be a directory of its own" \
+			"fix: make up FULL_OUT_DIR=\$HOME/.olaitan-full (or any new directory outside the repository)"
+		return 0
+	fi
+	UP_OUT="$d"
+	# An existing cluster is its own blocker, with make down as the fix.
+	[ "$UP_CLUSTER_EXISTS" = 0 ] || return 0
+	if [ -e "$d" ] && [ ! -d "$d" ]; then
+		up_block "out dir $d exists and is not a directory" \
+			"fix: make up FULL_OUT_DIR=<a new directory>"
+		return 0
+	fi
+	if name="$(olaitan_out_marked "$d")"; then
+		if [ "$name" = "$cluster" ]; then
+			up_block "out dir $d is left from an earlier run of make up, with no kind cluster $cluster behind it" \
+				"make up starts from nothing; fix: make down"
+		else
+			up_block "out dir $d was made by make up for kind cluster $name (its $OLAITAN_OUT_MARKER)" \
+				"fix: make down FULL_CLUSTER_NAME=$name FULL_OUT_DIR=$d, or make up FULL_OUT_DIR=<a new directory>"
+		fi
+		return 0
+	fi
+	for f in calico audit-certs applog-certs kubeconfig; do
+		[ ! -e "$d/$f" ] || stale+=" $f"
+	done
+	if [ -n "$stale" ]; then
+		up_block "out dir $d holds${stale} from an earlier run of make e2e-full (no $OLAITAN_OUT_MARKER, so make up did not make it)" \
+			"fix: make e2e-full-down (removes the cluster, $d and hack/.audit-full)"
+		return 0
+	fi
+	if [ -d "$d" ] && [ -n "$(ls -A "$d")" ]; then
+		up_block "out dir $d is not empty and was not made by make up (no $OLAITAN_OUT_MARKER)" \
+			"make up writes private keys into it and make down would then remove it" \
+			"fix: make up FULL_OUT_DIR=<a new or empty directory>, for example \$HOME/.olaitan-full"
+		return 0
+	fi
+	up_ok "out dir $d is new or empty"
+}
+
+# up_preflight CLUSTER WORKERS OUT: every check runs, so one run lists every
 # blocker. Returns 1 when any blocker was found.
 up_preflight() {
 	UP_BLOCKERS=0
@@ -161,6 +233,7 @@ up_preflight() {
 		"${UP_BTF_FILE:-/sys/kernel/btf/vmlinux}" "${UP_INOTIFY_DIR:-/proc/sys/fs/inotify}"
 	up_check_python "$2"
 	up_check_cluster "$1"
+	up_check_out_dir "$3" "$1"
 	if [ "$UP_BLOCKERS" -gt 0 ]; then
 		echo "up: preflight found $UP_BLOCKERS blocker(s); nothing was created. Fix them and run make up again." >&2
 		return 1
@@ -168,12 +241,80 @@ up_preflight() {
 	qs_say "preflight passed"
 }
 
-up_logs() {
-	kubectl "${UP_K[@]}" -n "$UP_NS" logs "$@" 2>/dev/null || true
+# up_mark OUT CLUSTER: create OUT (0700) and write make up's marker into it,
+# the first write after preflight. make down removes OUT only when the marker
+# is there and names CLUSTER.
+up_mark() {
+	printf '+ mark %s/%s %s\n' "$1" "$OLAITAN_OUT_MARKER" "$2"
+	[ "${UP_PLAN:-}" = "1" ] && return 0
+	(umask 077 && mkdir -p "$1")
+	chmod 700 "$1"
+	printf '%s\n' "$2" >"$1/$OLAITAN_OUT_MARKER"
 }
 
-# up_print_access: how to reach what make up built. Stories 13.2 (#126) and
-# 13.3 (#127) add the Grafana and console URLs here.
+# up_logs SELECTOR [ARGS]: the log reader keeps kubectl's stderr and exit
+# code, so a failed read is never taken for "nothing yet".
+up_logs() {
+	kubectl "${UP_K[@]}" -n "$UP_NS" logs -l "$@" --tail=-1
+}
+
+# up_detect T0 BUDGET: read /etc/shadow in the demo pod until Falco has
+# alerted on that read from that pod AND the aggregator has logged a
+# transition for a workload in its namespace (hack/stranger.sh's rule), or
+# until BUDGET seconds after T0. A failed exec is reported and counted apart
+# from the reads that ran; a log that cannot be read stops make up. Sets
+# UP_FOUND, UP_RULE, UP_T_SEEN, UP_READS, UP_FAILED. Returns 1 on no
+# detection, naming what is missing.
+up_detect() {
+	local t0="$1" budget="$2" n t_attack logs rc
+	local -a attack=(kubectl "${UP_K[@]}" -n "$UP_DEMO_NS" exec "$UP_DEMO_POD" -c "$UP_DEMO_POD" -- cat /etc/shadow)
+	UP_FOUND="" UP_RULE="" UP_T_SEEN="" UP_READS=0 UP_FAILED=0
+	while [ $(($(date +%s) - t0)) -lt "$budget" ]; do
+		n=$((UP_READS + UP_FAILED + 1))
+		printf '+ %s   (read %s)\n' "${attack[*]}" "$n"
+		if "${attack[@]}" >/dev/null; then
+			UP_READS=$((UP_READS + 1))
+		else
+			UP_FAILED=$((UP_FAILED + 1))
+			echo "up: exec $n failed (kubectl's error is above); trying again" >&2
+		fi
+		t_attack="$(date +%s)"
+		while [ $(($(date +%s) - t_attack)) -lt "$UP_ATTEMPT_GAP" ]; do
+			sleep "$UP_POLL"
+			if [ -z "$UP_FOUND" ]; then
+				rc=0
+				logs="$(up_logs app.kubernetes.io/component=aggregator)" || rc=$?
+				if [ "$rc" -ne 0 ]; then
+					echo "up: reading the aggregator log exited $rc (kubectl's error is above)" >&2
+					exit 1
+				fi
+				UP_FOUND="$(qs_parse_transition "$UP_DEMO_NS" <<<"$logs")" || UP_FOUND=""
+			fi
+			if [ -z "$UP_RULE" ]; then
+				rc=0
+				logs="$(up_logs app.kubernetes.io/name=falco -c falco)" || rc=$?
+				if [ "$rc" -ne 0 ]; then
+					echo "up: reading the Falco log exited $rc (kubectl's error is above)" >&2
+					exit 1
+				fi
+				UP_RULE="$(qs_parse_rule "$UP_DEMO_NS" "$UP_DEMO_POD" <<<"$logs")" || UP_RULE=""
+			fi
+			if [ -n "$UP_FOUND" ] && [ -n "$UP_RULE" ]; then
+				UP_T_SEEN="$(date +%s)"
+				return 0
+			fi
+		done
+	done
+	echo "up: no detection for $UP_DEMO_NS within ${budget}s ($UP_READS reads of /etc/shadow, $UP_FAILED failed execs):" >&2
+	echo "up:   Falco alert on /etc/shadow from $UP_DEMO_NS/$UP_DEMO_POD: ${UP_RULE:-none (product: no Falco alert)}" >&2
+	echo "up:   FSM transition in $UP_DEMO_NS: ${UP_FOUND:-none (product: no FSM transition)}" >&2
+	echo "up: check Falco: kubectl ${UP_K[*]} -n $UP_NS logs -l app.kubernetes.io/name=falco -c falco" >&2
+	echo "up: and the aggregator: kubectl ${UP_K[*]} -n $UP_NS logs -l app.kubernetes.io/component=aggregator --tail=200" >&2
+	return 1
+}
+
+# up_print_access: how to reach what make up built. Story 13.3 (#127) adds
+# the console URL here.
 up_print_access() {
 	local cluster="$1" out="$2"
 	echo "  Use it:     export KUBECONFIG=$out/kubeconfig   (context kind-$cluster)"
@@ -193,7 +334,7 @@ main() {
 	local t0
 	t0="$(date +%s)"
 	local cluster="${UP_CLUSTER:-olaitan-full}"
-	local out="${UP_OUT_DIR:-$HOME/.olaitan-full}"
+	local out="${UP_OUT_DIR-$HOME/.olaitan-full}"
 	local workers="${UP_WORKERS-1}"
 	local budget="${UP_BUDGET:-900}"
 	local plan="${UP_PLAN:-}"
@@ -204,13 +345,16 @@ main() {
 	# qs_run reads the quickstart's plan switch.
 	# shellcheck disable=SC2034 # read by qs_run in hack/quickstart.sh
 	QUICKSTART_PLAN="$plan"
-	UP_K=(--kubeconfig "$out/kubeconfig" --context "kind-$cluster")
 	cd "$UP_ROOT"
 
 	qs_say "clock starts: make up (budget ${budget}s to a live detection)"
-	up_preflight "$cluster" "$workers" || exit 1
+	up_preflight "$cluster" "$workers" "$out" || exit 1
+	out="$UP_OUT"
+	UP_K=(--kubeconfig "$out/kubeconfig" --context "kind-$cluster")
 
 	trap up_on_exit EXIT
+	qs_say "marking $out as make up's (make down removes it only with this marker)"
+	up_mark "$out" "$cluster"
 	qs_say "staging the chart from this checkout"
 	qs_run make -s helm-deps
 
@@ -234,46 +378,22 @@ main() {
 	qs_run kubectl "${UP_K[@]}" -n "$UP_DEMO_NS" run "$UP_DEMO_POD" --image="$QS_DEMO_IMAGE" --restart=Never -- sleep 3600
 	qs_run kubectl "${UP_K[@]}" -n "$UP_DEMO_NS" wait "pod/$UP_DEMO_POD" --for=condition=Ready --timeout=3m
 
-	qs_say "the smoke attack: read /etc/shadow inside the pod (Falco rule: Read sensitive file untrusted)"
-	# -c: the full profile injects the applog sidecar into the pod.
-	local -a attack=(kubectl "${UP_K[@]}" -n "$UP_DEMO_NS" exec "$UP_DEMO_POD" -c "$UP_DEMO_POD" -- cat /etc/shadow)
+	qs_say "the smoke attack: read /etc/shadow inside the pod until Falco alerts on it and the aggregator moves the pod"
 	if [ "$plan" = "1" ]; then
-		qs_run "${attack[@]}"
+		# -c: the full profile injects the applog sidecar into the pod.
+		qs_run kubectl "${UP_K[@]}" -n "$UP_DEMO_NS" exec "$UP_DEMO_POD" -c "$UP_DEMO_POD" -- cat /etc/shadow
 		qs_run kubectl "${UP_K[@]}" -n "$UP_NS" logs -l app.kubernetes.io/component=aggregator --tail=-1
+		qs_run kubectl "${UP_K[@]}" -n "$UP_NS" logs -l app.kubernetes.io/name=falco -c falco --tail=-1
 		return 0
 	fi
 
-	# Repeat the real read until the aggregator reacts or the budget is spent:
-	# a read before Falco's driver is loaded is not seen. A failed exec is
-	# reported, not fatal, and the next read is tried.
-	local reads=0 found="" t_seen="" t_attack
-	while [ $(($(date +%s) - t0)) -lt "$budget" ]; do
-		reads=$((reads + 1))
-		t_attack="$(date +%s)"
-		printf '+ %s   (read %s)\n' "${attack[*]}" "$reads"
-		if ! "${attack[@]}" >/dev/null; then
-			echo "up: read $reads failed (kubectl's error is above); trying again" >&2
-		fi
-		while [ $(($(date +%s) - t_attack)) -lt "$UP_ATTEMPT_GAP" ]; do
-			sleep "$UP_POLL"
-			if found="$(up_logs -l app.kubernetes.io/component=aggregator --tail=-1 | qs_parse_transition "$UP_DEMO_NS")"; then
-				t_seen="$(date +%s)"
-				break 2
-			fi
-		done
-	done
+	# A read before Falco's driver is loaded is not seen, so the real read is
+	# repeated until both signals are there or the budget is spent.
+	up_detect "$t0" "$budget" || exit 1
 
-	if [ -z "$t_seen" ]; then
-		echo "up: no detection for $UP_DEMO_NS within ${budget}s ($reads reads of /etc/shadow)." >&2
-		echo "up: check Falco: kubectl ${UP_K[*]} -n $UP_NS logs -l app.kubernetes.io/name=falco -c falco" >&2
-		echo "up: and the aggregator: kubectl ${UP_K[*]} -n $UP_NS logs -l app.kubernetes.io/component=aggregator --tail=200" >&2
-		exit 1
-	fi
-
-	local wl from to score ts rule
-	IFS=$'\t' read -r wl from to score ts <<<"$found"
-	rule="$(up_logs -l app.kubernetes.io/name=falco -c falco --tail=-1 | qs_parse_rule "$UP_DEMO_NS" "$UP_DEMO_POD" || true)"
-	local elapsed=$((t_seen - t0))
+	local wl from to score ts
+	IFS=$'\t' read -r wl from to score ts <<<"$UP_FOUND"
+	local elapsed=$((UP_T_SEEN - t0))
 
 	echo
 	echo "  Olaitan (full profile, Falco on) saw a real action and moved the workload:"
@@ -283,11 +403,11 @@ main() {
 	printf '    %-10s %s\n' "to" "$to"
 	printf '    %-10s %s\n' "score" "$score"
 	printf '    %-10s %s\n' "logged at" "$ts (aggregator clock)"
-	printf '    %-10s %s\n' "falco rule" "${rule:-(not found in the Falco log)}"
-	printf '    %-10s %s\n' "reads" "$reads of /etc/shadow before the transition"
+	printf '    %-10s %s\n' "falco rule" "$UP_RULE (on /etc/shadow, from $UP_DEMO_POD)"
+	printf '    %-10s %s\n' "reads" "$UP_READS of /etc/shadow ($UP_FAILED failed execs) until both were seen"
 	echo
 	printf '  make up -> Falco, collector, aggregator ready:  %ss\n' "$((t_ready - t0))"
-	printf '  make up -> first detection:                     %ss (budget %ss)\n' "$elapsed" "$budget"
+	printf '  make up -> Falco alert and FSM transition:      %ss (budget %ss)\n' "$elapsed" "$budget"
 	echo
 	up_print_access "$cluster" "$out"
 	if ! qs_within_budget "$elapsed" "$budget"; then

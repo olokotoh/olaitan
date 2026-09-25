@@ -103,7 +103,7 @@ exit 0`,
 
 // upBasics are linked into the fake PATH from the real one.
 var upBasics = []string{"bash", "sh", "sed", "grep", "cat", "date", "uname", "sort", "head", "tail",
-	"tr", "seq", "mkdir", "env", "dirname", "basename", "rm", "cut", "wc", "sleep", "id", "printf", "test", "cp", "mktemp", "realpath", "ls"}
+	"tr", "seq", "mkdir", "env", "dirname", "basename", "rm", "cut", "wc", "sleep", "id", "printf", "test", "cp", "mktemp", "realpath", "ls", "chmod"}
 
 func newUpHost(t *testing.T) *upHost {
 	t.Helper()
