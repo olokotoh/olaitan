@@ -413,6 +413,13 @@ func TestRun_LayoutTrialsAndMetadata(t *testing.T) {
 		overlayCalls++
 		return nil
 	}
+	// Story 11.2a: the Scenario phase now runs a real in-cluster attack via
+	// kubectl. Inject a fake attack runner so the full dispatch exercises the
+	// executor's apply/exec/cleanup plan WITHOUT a cluster (the overlay-fake
+	// precedent above); it records nothing and succeeds.
+	fakeAttack := func(ctx context.Context, name string, args ...string) (string, error) {
+		return "", nil
+	}
 	err := run([]string{
 		"--manifest", manifestPath,
 		"--scenario", "s1",
@@ -427,7 +434,7 @@ func TestRun_LayoutTrialsAndMetadata(t *testing.T) {
 		// resolves; the fake runner means no real helm/kubectl runs.
 		"--overlays-dir", filepath.Join("..", "..", "deploy", "helm", "olaitan"),
 		"--chart-root", filepath.Join("..", "..", "deploy", "helm", "olaitan"),
-	}, &stdout, &stderr, fakeRun)
+	}, &stdout, &stderr, fakeRun, fakeAttack)
 	if err != nil {
 		t.Fatalf("run: unexpected error: %v\nstderr:\n%s", err, stderr.String())
 	}
@@ -510,7 +517,7 @@ func TestRun_DigestGateRefusesWithoutAllowlist(t *testing.T) {
 		"--scenario", "s1",
 		"--config", "rs",
 		"--out", filepath.Join(dir, "runs"),
-	}, &stdout, &stderr, execRunCmd)
+	}, &stdout, &stderr, execRunCmd, execAttackCmd)
 	if err == nil {
 		t.Fatalf("expected a fail-closed REFUSE, got nil")
 	}

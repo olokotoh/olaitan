@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -25,7 +26,7 @@ func scenariosTreeRoot() string {
 // measurement consumes (BI-9, the cross-story seam; 5.2 declares, 5.4
 // measures), and that a non-harness Scenario yields the zero Target.
 func TestCaptureTarget_ProjectsResolvedTarget(t *testing.T) {
-	sc, err := newScenario("s2", scenariosTreeRoot(), testLogger())
+	sc, err := newScenario("s2", scenariosTreeRoot(), nil, testLogger())
 	if err != nil {
 		t.Fatalf("newScenario: %v", err)
 	}
@@ -75,7 +76,13 @@ func TestNewScenario_DispatchAllFive(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.id, func(t *testing.T) {
-			sc, err := newScenario(tc.id, root, testLogger())
+			// Story 11.2a: Run now executes a REAL in-cluster attack, so
+			// inject a fake attack runner to exercise dispatch without a
+			// cluster (the overlay-fake precedent).
+			fakeAttack := func(ctx context.Context, name string, args ...string) (string, error) {
+				return "", nil
+			}
+			sc, err := newScenario(tc.id, root, fakeAttack, testLogger())
 			if err != nil {
 				t.Fatalf("newScenario(%q): %v", tc.id, err)
 			}
@@ -109,10 +116,21 @@ func TestNewScenario_DispatchAllFive(t *testing.T) {
 					t.Errorf("triggering_rules[%d] = %q; want %q", i, h.target.TriggeringRules[i], r)
 				}
 			}
-			// Run must dispatch without error (the honest in-process
-			// log-and-resolve path; the injection lives in the e2e test).
-			if err := sc.Run(context.Background()); err != nil {
-				t.Errorf("Run(%q): %v", tc.id, err)
+			// Story 11.2a: Run dispatches the REAL in-cluster attack. S1-S3
+			// are implemented here and dispatch cleanly through the injected
+			// fake runner; S4-S5 need attacker-side sink / pool infra and
+			// land in Story 11.2b (#192), so Run returns a loud error rather
+			// than a silent no-op.
+			runErr := sc.Run(context.Background())
+			switch tc.id {
+			case "s1", "s2", "s3":
+				if runErr != nil {
+					t.Errorf("Run(%q): %v", tc.id, runErr)
+				}
+			default:
+				if runErr == nil {
+					t.Errorf("Run(%q): want a not-implemented error (S4/S5 are Story 11.2b), got nil", tc.id)
+				}
 			}
 		})
 	}
@@ -121,7 +139,7 @@ func TestNewScenario_DispatchAllFive(t *testing.T) {
 // TestNewScenario_RejectsUnknownID asserts an id with no harness mapping is a
 // hard error (no silent no-op).
 func TestNewScenario_RejectsUnknownID(t *testing.T) {
-	if _, err := newScenario("s99", scenariosTreeRoot(), testLogger()); err == nil {
+	if _, err := newScenario("s99", scenariosTreeRoot(), nil, testLogger()); err == nil {
 		t.Fatalf("expected an error for an unmapped scenario id, got nil")
 	}
 }
@@ -130,7 +148,7 @@ func TestNewScenario_RejectsUnknownID(t *testing.T) {
 // directory (bad scenariosRoot) is a hard error so a mis-wired tree cannot
 // silently no-op.
 func TestNewScenario_MissingHarnessFailsLoudly(t *testing.T) {
-	if _, err := newScenario("s1", t.TempDir(), testLogger()); err == nil {
+	if _, err := newScenario("s1", t.TempDir(), nil, testLogger()); err == nil {
 		t.Fatalf("expected an error for a missing harness dir, got nil")
 	}
 }
@@ -362,4 +380,55 @@ func rawMap(t *testing.T, evs []scenarioEvent, subject string) map[string]any {
 		found = raw
 	}
 	return found
+}
+
+// mitreIDShape matches a MITRE ATT&CK (for Containers) technique or
+// sub-technique id, so the AC3 mapping test rejects a malformed or invented
+// id shape rather than blindly accepting any string.
+var mitreIDShape = regexp.MustCompile(`^T\d{4}(\.\d{3})?$`)
+
+// TestScenarioManifestsMapAttackStepsToMitre is the Story 11.2a AC3
+// self-proving check: each S1-S3 harness manifest maps every executed
+// primitive to at least one well-formed MITRE ATT&CK for Containers id, and
+// the union covers the techniques the runner actually runs. A green suite is
+// therefore not a blind check: a missing or malformed mapping fails here.
+func TestScenarioManifestsMapAttackStepsToMitre(t *testing.T) {
+	root := scenariosTreeRoot()
+	want := map[string][]string{
+		"s1": {"T1611"},
+		"s2": {"T1552", "T1552.005", "T1552.007"},
+		"s3": {"T1613", "T1609"},
+	}
+	for id, wantIDs := range want {
+		t.Run(id, func(t *testing.T) {
+			sc, err := newScenario(id, root, nil, testLogger())
+			if err != nil {
+				t.Fatalf("newScenario(%q): %v", id, err)
+			}
+			h := sc.(*scenarioHarness)
+			if len(h.target.AttackSteps) == 0 {
+				t.Fatalf("scenario %q manifest has no attack_steps (AC3)", id)
+			}
+			seen := map[string]bool{}
+			for _, step := range h.target.AttackSteps {
+				if step.ID == "" {
+					t.Errorf("scenario %q has an attack step with no id", id)
+				}
+				if len(step.Mitre) == 0 {
+					t.Errorf("scenario %q step %q maps to no MITRE id (AC3)", id, step.ID)
+				}
+				for _, m := range step.Mitre {
+					if !mitreIDShape.MatchString(m) {
+						t.Errorf("scenario %q step %q MITRE id %q is not a valid ATT&CK id shape", id, step.ID, m)
+					}
+					seen[m] = true
+				}
+			}
+			for _, m := range wantIDs {
+				if !seen[m] {
+					t.Errorf("scenario %q attack_steps do not cover expected MITRE id %q; got %v", id, m, seen)
+				}
+			}
+		})
+	}
 }

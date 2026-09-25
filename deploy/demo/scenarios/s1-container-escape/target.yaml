@@ -11,3 +11,14 @@ target_time_to_detect_seconds: 30
 floor: false
 triggering_rules:
   - OLT-PRIV-001
+
+# Story 11.2a (AC3): the real in-cluster primitive the runner executes, mapped
+# to its MITRE ATT&CK for Containers ID(s). Cited from the repo rule corpus
+# (OLT-PRIV-001/OLT-EXEC-001 both tag T1611) and the ATT&CK for Containers
+# matrix (T1610). The scalar mitre_technique above stays the primary contract.
+attack_steps:
+  - id: privileged-host-escape
+    mitre:
+      - T1611   # Escape to Host
+      - T1610   # Deploy Container (privileged pod)
+    primitive: privileged pod; nsenter into pid 1 namespaces / read host view via /proc

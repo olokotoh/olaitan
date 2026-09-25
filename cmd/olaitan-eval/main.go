@@ -98,7 +98,7 @@ type metadata struct {
 }
 
 func main() {
-	if err := run(os.Args[1:], os.Stdout, os.Stderr, execRunCmd); err != nil {
+	if err := run(os.Args[1:], os.Stdout, os.Stderr, execRunCmd, execAttackCmd); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "olaitan-eval: %v\n", err)
 		os.Exit(1)
 	}
@@ -113,7 +113,7 @@ func main() {
 // the Story-5.3 helmOverlay shells out through (main passes the real
 // execRunCmd; a unit test passes a fake so the full dispatch runs without a
 // cluster).
-func run(args []string, stdout, stderr io.Writer, runCmd overlayRunFunc) error {
+func run(args []string, stdout, stderr io.Writer, runCmd overlayRunFunc, attackRun attackRunFunc) error {
 	cfg, err := parseFlags(args, stderr)
 	if err != nil {
 		return err
@@ -160,7 +160,7 @@ func run(args []string, stdout, stderr io.Writer, runCmd overlayRunFunc) error {
 	// the Runner behind the frozen Scenario seam. A mis-wired scenario
 	// (no harness mapping, missing/invalid target.yaml) fails the run
 	// loudly here rather than silently no-opping (BI-3).
-	scenario, err := newScenario(cfg.scenario, cfg.scenariosRoot, logger)
+	scenario, err := newScenario(cfg.scenario, cfg.scenariosRoot, attackRun, logger)
 	if err != nil {
 		return err
 	}

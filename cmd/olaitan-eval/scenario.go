@@ -62,6 +62,23 @@ type scenarioTarget struct {
 	TargetTimeToDetectSeconds int      `yaml:"target_time_to_detect_seconds"`
 	Floor                     bool     `yaml:"floor"`
 	TriggeringRules           []string `yaml:"triggering_rules"`
+	// AttackSteps (Story 11.2a, AC3) maps each in-cluster primitive the
+	// real attack runner executes to its MITRE ATT&CK for Containers ID(s).
+	// It is additive and optional: the scalar MitreTechnique above stays the
+	// Story 5.2 primary-technique contract the factory + goldens key on, and
+	// AttackSteps records the full, cited mapping of what actually runs. Only
+	// the S1-S3 harnesses carry it in Story 11.2a; S4/S5 add theirs in 11.2b.
+	AttackSteps []attackStep `yaml:"attack_steps,omitempty"`
+}
+
+// attackStep is one MITRE-mapped primitive the attack runner executes
+// (Story 11.2a, AC3). Every id in Mitre is a real ATT&CK for Containers
+// technique/sub-technique, cited from the repo rule corpus or the ATT&CK for
+// Containers matrix; none is invented.
+type attackStep struct {
+	ID        string   `yaml:"id"`
+	Mitre     []string `yaml:"mitre"`
+	Primitive string   `yaml:"primitive"`
 }
 
 // scenarioHarness is the rich Scenario impl Story 5.2 wires behind the frozen
@@ -73,6 +90,11 @@ type scenarioHarness struct {
 	dir    string
 	target scenarioTarget
 	logger *slog.Logger
+	// attackRun is the injectable kubectl shell-out the Story 11.2a attack
+	// executor drives (threaded from run(); main wires the real
+	// execAttackCmd, a unit test injects a recorder). A nil value defaults to
+	// execAttackCmd inside newAttackExecutor.
+	attackRun attackRunFunc
 }
 
 // newScenario is the scenario FACTORY (Story 5.2, Task 3.2). It maps the
@@ -83,7 +105,7 @@ type scenarioHarness struct {
 // mis-wired scenario fails loudly rather than silently no-opping (the BI-3
 // "no silent no-op" discipline). scenariosRoot is a parameter so tests can
 // point it at the committed tree from any working directory.
-func newScenario(scenarioID, scenariosRoot string, logger *slog.Logger) (Scenario, error) {
+func newScenario(scenarioID, scenariosRoot string, attackRun attackRunFunc, logger *slog.Logger) (Scenario, error) {
 	slug, ok := scenarioSlugs[scenarioID]
 	if !ok {
 		return nil, fmt.Errorf("scenario %q has no harness mapping (want one of %s)", scenarioID, knownScenarioIDs())
@@ -102,7 +124,7 @@ func newScenario(scenarioID, scenariosRoot string, logger *slog.Logger) (Scenari
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &scenarioHarness{id: scenarioID, dir: dir, target: target, logger: logger}, nil
+	return &scenarioHarness{id: scenarioID, dir: dir, target: target, logger: logger, attackRun: attackRun}, nil
 }
 
 // captureTarget projects the resolved scenarioTarget onto the
@@ -171,26 +193,47 @@ func loadScenarioTarget(path string) (scenarioTarget, error) {
 	return t, nil
 }
 
-// Run drives the scenario harness against the warmed cluster (Story 5.2,
-// Task 3.3). HONEST in-process-vs-test-driven split (BI-3, the rs_smoke
-// precedent): the synthetic-event INJECTION lives in the e2e test
-// (tests/e2e/scenarios_smoke_test.go) for the same reason rs_smoke kept it
-// there (it needs the kind port-forward + a JetStream connection the
-// in-process binary does not hold on a host with no cluster). Run therefore
-// resolves + validates the harness contract and logs the resolved harness +
-// triggering rules so `olaitan-eval --scenario s3` honestly dispatches the
-// S3 harness (NOT the 5.1 rsScenario no-op marker), and the e2e test invokes
-// the matching injectScenario(scenarioID) helper against the same harness
-// contract. This is a deliberate, documented split, not a silent no-op.
-func (s *scenarioHarness) Run(ctx context.Context) error {
-	s.logger.Info("scenario harness dispatched",
+// Run drives the scenario harness's REAL in-cluster attack against the
+// warmed cluster (Story 11.2a, replacing the Story 5.2 log-only Run and all
+// synthetic NATS-event injection). It builds the per-scenario attack
+// executor (attack.go), applies the Story 11.1 target, runs the technique
+// primitive(s) via kubectl exec, and reverses the technique via a deferred
+// Cleanup so teardown runs even when a primitive errors (AC2, the Runner-loop
+// BI-2 discipline). The attack produces genuine syscalls Falco observes, so
+// the signal flows through the real bus (Falco -> gRPC -> NATS -> correlator)
+// and the Story 5.4 Capturer drains it; nothing is fabricated. S4/S5 need
+// attacker-side sink / pool infrastructure and land in Story 11.2b (#192), so
+// newAttackExecutor rejects them here with a loud error rather than a silent
+// no-op.
+func (s *scenarioHarness) Run(ctx context.Context) (err error) {
+	executor, err := newAttackExecutor(s.id, s.dir, s.attackRun, s.logger)
+	if err != nil {
+		return err
+	}
+	s.logger.Info("scenario harness dispatched (real in-cluster attack)",
 		"scenario", s.id,
 		"harness_dir", s.dir,
 		"mitre_technique", s.target.MitreTechnique,
 		"target_fsm_state", s.target.TargetFSMState,
-		"target_time_to_detect_seconds", s.target.TargetTimeToDetectSeconds,
 		"triggering_rules", s.target.TriggeringRules,
-		"stimulus", "synthetic-event injection driven by tests/e2e/scenarios_smoke_test.go on kind (BI-3)")
+		"stimulus", "real attack executed in-cluster via kubectl exec (Story 11.2a)")
+
+	// Cleanup is deferred so the technique is reversed even when a primitive
+	// errors. A cleanup error is surfaced only when the attack otherwise
+	// succeeded, so it never masks the real failure.
+	defer func() {
+		if cerr := executor.Cleanup(ctx); cerr != nil {
+			if err == nil {
+				err = fmt.Errorf("scenario %s cleanup: %w", s.id, cerr)
+			} else {
+				s.logger.Error("cleanup failed after an attack error", "cleanup_err", cerr, "attack_err", err)
+			}
+		}
+	}()
+
+	if err = executor.Execute(ctx); err != nil {
+		return fmt.Errorf("scenario %s attack: %w", s.id, err)
+	}
 	return nil
 }
 
