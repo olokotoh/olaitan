@@ -59,6 +59,13 @@ type runConfig struct {
 	// BI-10).
 	natsURL         string
 	maxRunSizeBytes int64
+	// Story 11.2d: how long the attack executor settles after the technique
+	// primitive and before the deferred Cleanup deletes the target, so the
+	// correlator resolves workload posture (owner_kind, namespace) off the
+	// live pod at EvidencePackage assembly time. A flag so the live
+	// verification can tune it to the measured trigger-to-match time without
+	// rebuilding, and CI / unit dispatch can set 0.
+	attackSettle time.Duration
 }
 
 // metadata is the MINIMAL per-run metadata.yaml schema (BI-5, BI-8). It
@@ -161,6 +168,12 @@ func run(args []string, stdout, stderr io.Writer, runCmd overlayRunFunc, attackR
 	// (no harness mapping, missing/invalid target.yaml) fails the run
 	// loudly here rather than silently no-opping (BI-3).
 	scenario, err := newScenario(cfg.scenario, cfg.scenariosRoot, attackRun, logger)
+	// Story 11.2d: apply the configured settle-before-cleanup to the harness
+	// without changing the frozen Scenario interface. newScenario always
+	// returns *scenarioHarness; the assertion is defensive.
+	if h, ok := scenario.(*scenarioHarness); ok {
+		h.settleWait = cfg.attackSettle
+	}
 	if err != nil {
 		return err
 	}
@@ -274,6 +287,7 @@ func parseFlags(args []string, stderr io.Writer) (runConfig, error) {
 	// six still exist, AC5). --max-run-size-bytes defaults to 500 MiB (BI-10).
 	fs.StringVar(&cfg.natsURL, "nats-url", "", "JetStream endpoint the per-run Capturer drains the run's subjects from (empty = no NATS wired; artefacts captured empty)")
 	fs.Int64Var(&cfg.maxRunSizeBytes, "max-run-size-bytes", capture.DefaultMaxRunSizeBytes, "per-run artefact size cap; over it a fail-LOUD alert is emitted and size_cap_exceeded is recorded (the artefacts are NOT deleted)")
+	fs.DurationVar(&cfg.attackSettle, "attack-settle", attackSettleWait, "Story 11.2d: settle after the attack primitive before cleanup so the correlator resolves posture off the live pod; 0 to delete immediately (unit/CI dispatch)")
 
 	if err := fs.Parse(args); err != nil {
 		return runConfig{}, err

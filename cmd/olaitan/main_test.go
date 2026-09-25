@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -780,4 +781,60 @@ func TestEnvNonNegativeInt(t *testing.T) {
 			t.Errorf("%q: got %d, %v; want %d, err=%v", tc.val, got, err, tc.want, tc.wantErr)
 		}
 	}
+}
+
+// Story 11.2d (#195): the collector builds the Falco pod identity cache from
+// the chart's env vars. Off unless FALCO_POD_IDENTITY_ENABLED=true; a bad
+// knob is a startup error; no Kubernetes client degrades to no enrichment
+// (logged) instead of taking Falco ingest down with it.
+func TestNewFalcoPodIdentity(t *testing.T) {
+	prevFactory := kubeClientFactory
+	t.Cleanup(func() { kubeClientFactory = prevFactory })
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	t.Run("unset is off", func(t *testing.T) {
+		t.Setenv("FALCO_POD_IDENTITY_ENABLED", "")
+		kubeClientFactory = func(*slog.Logger) (kubernetes.Interface, error) {
+			t.Error("kube client built while enrichment is off")
+			return nil, errors.New("unused")
+		}
+		c, err := newFalcoPodIdentity(log, "node-a")
+		if err != nil || c != nil {
+			t.Errorf("got %v, %v; want nil, nil", c, err)
+		}
+	})
+	t.Run("enabled", func(t *testing.T) {
+		t.Setenv("FALCO_POD_IDENTITY_ENABLED", "true")
+		t.Setenv("FALCO_POD_IDENTITY_MAX_ENTRIES", "64")
+		t.Setenv("FALCO_POD_IDENTITY_MISS_WAIT", "250ms")
+		kubeClientFactory = func(*slog.Logger) (kubernetes.Interface, error) { return kubefake.NewClientset(), nil }
+		c, err := newFalcoPodIdentity(log, "node-a")
+		if err != nil || c == nil {
+			t.Fatalf("got %v, %v; want a cache", c, err)
+		}
+	})
+	t.Run("bad miss wait", func(t *testing.T) {
+		t.Setenv("FALCO_POD_IDENTITY_ENABLED", "true")
+		t.Setenv("FALCO_POD_IDENTITY_MISS_WAIT", "soon")
+		kubeClientFactory = func(*slog.Logger) (kubernetes.Interface, error) { return kubefake.NewClientset(), nil }
+		if _, err := newFalcoPodIdentity(log, "node-a"); err == nil {
+			t.Error("accepted FALCO_POD_IDENTITY_MISS_WAIT=soon")
+		}
+	})
+	t.Run("bad max entries", func(t *testing.T) {
+		t.Setenv("FALCO_POD_IDENTITY_ENABLED", "true")
+		t.Setenv("FALCO_POD_IDENTITY_MAX_ENTRIES", "-1")
+		kubeClientFactory = func(*slog.Logger) (kubernetes.Interface, error) { return kubefake.NewClientset(), nil }
+		if _, err := newFalcoPodIdentity(log, "node-a"); err == nil {
+			t.Error("accepted FALCO_POD_IDENTITY_MAX_ENTRIES=-1")
+		}
+	})
+	t.Run("no kube client degrades", func(t *testing.T) {
+		t.Setenv("FALCO_POD_IDENTITY_ENABLED", "true")
+		kubeClientFactory = func(*slog.Logger) (kubernetes.Interface, error) { return nil, errors.New("no in-cluster config") }
+		c, err := newFalcoPodIdentity(log, "node-a")
+		if err != nil || c != nil {
+			t.Errorf("got %v, %v; want nil, nil (enrichment off, collector still starts)", c, err)
+		}
+	})
 }

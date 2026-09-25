@@ -436,6 +436,78 @@ data:
       url: https://falcosecurity.github.io/falcoctl/index.yaml
 ---
 apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: olaitan-falco-rules
+  namespace: default
+  labels:
+    helm.sh/chart: falco-9.1.0
+    app.kubernetes.io/name: falco
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+data:
+  olaitan-detection.yaml: |-
+    - rule: Olaitan Privileged Escape Primitive
+      desc: >-
+        A container process holding CAP_SYS_ADMIN runs a namespace or mount
+        escape tool. Emits thread.cap_effective (OLT-PRIV-001 keys on
+        process.cap_effective) and the k8s pod identity for the correlator.
+      condition: >-
+        spawned_process and container
+        and thread.cap_effective contains CAP_SYS_ADMIN
+        and proc.name in (nsenter, mount, umount, chroot, setns, unshare)
+      output: >-
+        Olaitan privileged escape primitive (proc_exepath=%proc.exepath
+        proc_cmdline=%proc.cmdline cap_effective=%thread.cap_effective
+        container_id=%container.id k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+      priority: WARNING
+      tags: [olaitan, container, mitre_privilege_escalation, T1611]
+      source: syscall
+    - rule: Olaitan ServiceAccount Token Read
+      desc: >-
+        A container process opens the projected ServiceAccount token file.
+        Emits fd.name (OLT-CRED-001 keys on file.path) and proc.exepath
+        (process.exe) plus the k8s pod identity.
+      condition: >-
+        open_read and container
+        and (fd.name startswith /run/secrets/kubernetes.io/serviceaccount/
+        or fd.name startswith /var/run/secrets/kubernetes.io/serviceaccount/)
+      output: >-
+        Olaitan serviceaccount token read (file=%fd.name
+        proc_exepath=%proc.exepath k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+      priority: WARNING
+      tags: [olaitan, container, mitre_credential_access, T1552]
+      source: syscall
+    - rule: Olaitan Cloud Metadata Contact
+      desc: >-
+        A container process connects to the cloud instance metadata IP
+        169.254.169.254. Emits fd.sip/fd.rip (OLT-CRED-002 keys on
+        network.dst_ip) plus the k8s pod identity.
+      condition: >-
+        evt.type=connect and evt.dir=< and container
+        and (fd.sip=169.254.169.254 or fd.rip=169.254.169.254)
+      output: >-
+        Olaitan cloud metadata contact (dst_sip=%fd.sip dst_rip=%fd.rip
+        proc_exepath=%proc.exepath k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+      priority: WARNING
+      tags: [olaitan, container, mitre_credential_access, T1552.005]
+      source: syscall
+    - rule: Olaitan In-Pod kubectl Exec
+      desc: >-
+        A process whose executable path ends /kubectl execs inside a
+        container. Emits proc.exepath (OLT-LATERAL-001 keys on process.exe)
+        plus the k8s pod identity.
+      condition: >-
+        spawned_process and container and proc.exepath endswith /kubectl
+      output: >-
+        Olaitan in-pod kubectl exec (proc_exepath=%proc.exepath
+        proc_cmdline=%proc.cmdline k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+      priority: WARNING
+      tags: [olaitan, container, mitre_lateral_movement, T1613]
+      source: syscall
+---
+apiVersion: v1
 data:
   nats.conf: |
     {
@@ -1382,6 +1454,24 @@ spec:
     requests:
       storage: "1Gi"
 ---
+# Story 11.2d: collector pod identity watch. Read-only pods, nothing else.
+# Each collector narrows its LIST/WATCH to its own node (spec.nodeName).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: olaitan-collector-pod-identity
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: collector
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
 # Aggregator: cluster-wide. NetworkPolicy writes and pod annotation
 # patches must reach every workload namespace; a Role would constrain
 # us to a single namespace, which does not match the operator model.
@@ -1438,6 +1528,26 @@ rules:
   - apiGroups: [""]
     resources: ["serviceaccounts"]
     verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: olaitan-collector-pod-identity
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: collector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: olaitan-collector-pod-identity
+subjects:
+  - kind: ServiceAccount
+    name: olaitan-collector
+    namespace: default
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -1668,7 +1778,7 @@ spec:
         app.kubernetes.io/instance: olaitan
       annotations:
         checksum/config: a72d6f229358572950c603eb17b8c4083d54a8e54645753b65053a36208e3f6c
-        checksum/rules: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        checksum/rules: 7ad64b46c4123fa600c61280f1b54a7c60e6ef2de9c8778c68c566dc9ccac6a4
         checksum/certs: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
     spec:
       serviceAccountName: olaitan-falco
@@ -1769,6 +1879,8 @@ spec:
             - mountPath: /etc/falco/falco.yaml
               name: falco-yaml
               subPath: falco.yaml
+            - mountPath: /etc/falco/rules.d
+              name: rules-volume
         - name: falcoctl-artifact-follow
           image: docker.io/falcosecurity/falcoctl:0.13.0@sha256:0eeb79adc580ae6a5abfdefd7f8f0fed9151fcb545f015c84e8f1d7b2d8a6b02
           imagePullPolicy: IfNotPresent
@@ -1861,6 +1973,9 @@ spec:
             items:
             - key: falco.yaml
               path: falco.yaml
+        - name: rules-volume
+          configMap:
+            name: olaitan-falco-rules
   updateStrategy:
     type: RollingUpdate
 ---
@@ -1956,6 +2071,13 @@ spec:
               value: "4096"
             - name: FALCO_BUFFER_MAX_BYTES
               value: "16777216"
+            # Story 11.2d: container ID -> pod enrichment for Falco alerts.
+            - name: FALCO_POD_IDENTITY_ENABLED
+              value: "true"
+            - name: FALCO_POD_IDENTITY_MAX_ENTRIES
+              value: "2048"
+            - name: FALCO_POD_IDENTITY_MISS_WAIT
+              value: "1s"
             # Story 1.6: the Falco adapter records the node name on
             # every emitted Event.Pod.Node so host events without K8s
             # pod context still record where they were observed. Sourced

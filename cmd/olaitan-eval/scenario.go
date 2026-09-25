@@ -95,6 +95,10 @@ type scenarioHarness struct {
 	// execAttackCmd, a unit test injects a recorder). A nil value defaults to
 	// execAttackCmd inside newAttackExecutor.
 	attackRun attackRunFunc
+	// settleWait is the executor's settle-before-cleanup duration (Story
+	// 11.2d), threaded onto the executor in Run. Defaults to attackSettleWait;
+	// a unit test zeroes it so dispatch does not wait the real window.
+	settleWait time.Duration
 }
 
 // newScenario is the scenario FACTORY (Story 5.2, Task 3.2). It maps the
@@ -124,7 +128,7 @@ func newScenario(scenarioID, scenariosRoot string, attackRun attackRunFunc, logg
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &scenarioHarness{id: scenarioID, dir: dir, target: target, logger: logger, attackRun: attackRun}, nil
+	return &scenarioHarness{id: scenarioID, dir: dir, target: target, logger: logger, attackRun: attackRun, settleWait: attackSettleWait}, nil
 }
 
 // captureTarget projects the resolved scenarioTarget onto the
@@ -210,6 +214,7 @@ func (s *scenarioHarness) Run(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	executor.settleWait = s.settleWait
 	s.logger.Info("scenario harness dispatched (real in-cluster attack)",
 		"scenario", s.id,
 		"harness_dir", s.dir,

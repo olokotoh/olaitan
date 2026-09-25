@@ -13,9 +13,11 @@ import (
 
 	natsjs "github.com/nats-io/nats.go/jetstream"
 	"golang.org/x/sync/errgroup"
+	kubefake "k8s.io/client-go/kubernetes/fake"
 
 	"github.com/olokotoh/olaitan/internal/collector/applog"
 	"github.com/olokotoh/olaitan/internal/collector/falco"
+	"github.com/olokotoh/olaitan/internal/collector/podidentity"
 	"github.com/olokotoh/olaitan/internal/config"
 	"github.com/olokotoh/olaitan/internal/metrics"
 	responseaudit "github.com/olokotoh/olaitan/internal/response/audit"
@@ -403,4 +405,67 @@ type nopPublisher struct{}
 
 func (nopPublisher) PublishJS(context.Context, string, any, ...natsjs.PublishOpt) (*natsjs.PubAck, error) {
 	return &natsjs.PubAck{}, nil
+}
+
+// Story 11.2d (#195): with pod identity enrichment on, the Falco adapter's
+// metrics include the cache size, hits, misses, wait-recovered hits and cap
+// rejections. With it off, none of them is registered.
+func TestRegisterAdapterCounters_FalcoPodIdentity(t *testing.T) {
+	t.Parallel()
+	names := []string{
+		"olaitan_sensor_falco_pod_identity_cache_entries",
+		"olaitan_sensor_falco_pod_identity_enriched_total",
+		"olaitan_sensor_falco_pod_identity_misses_total",
+		"olaitan_sensor_falco_pod_identity_wait_recovered_total",
+		"olaitan_sensor_falco_pod_identity_cap_rejected_total",
+	}
+	gather := func(t *testing.T, pi falco.PodIdentityResolver) map[string]bool {
+		t.Helper()
+		a, err := falco.New(falco.Config{
+			ListenAddr:  "127.0.0.1:0",
+			Token:       "0123456789abcdef0123456789abcdef",
+			Hostname:    "node-a",
+			PodIdentity: pi,
+		}, nopPublisher{}, quietTestLogger())
+		if err != nil {
+			t.Fatalf("falco.New: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		g, gctx := errgroup.WithContext(ctx)
+		cfg := &config.Config{Metrics: config.MetricsConfig{Address: "127.0.0.1:0"}}
+		reg, err := startMetricsServer(gctx, g, quietTestLogger(), cfg, "node-a",
+			map[string]adapterMetrics{"falco": a}, nil)
+		if err != nil {
+			t.Fatalf("startMetricsServer: %v", err)
+		}
+		mfs, err := reg.Gatherer().Gather()
+		if err != nil {
+			t.Fatalf("gather: %v", err)
+		}
+		seen := map[string]bool{}
+		for _, mf := range mfs {
+			seen[mf.GetName()] = true
+		}
+		cancel()
+		_ = g.Wait()
+		return seen
+	}
+
+	c, err := podidentity.New(kubefake.NewClientset(), podidentity.Config{NodeName: "node-a"}, quietTestLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	on := gather(t, falcoPodIdentity{c})
+	for _, n := range names {
+		if !on[n] {
+			t.Errorf("metric family %s not registered with enrichment on", n)
+		}
+	}
+	off := gather(t, nil)
+	for _, n := range names {
+		if off[n] {
+			t.Errorf("metric family %s registered with enrichment off", n)
+		}
+	}
 }

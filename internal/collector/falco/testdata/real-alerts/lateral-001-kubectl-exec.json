@@ -1,0 +1,43 @@
+{
+  "hostname": "olaitan-full-control-plane",
+  "output": "18:35:24.684804693: Critical Executing binary not part of base image | proc_exe=/tmp/kubectl proc_sname=sh gparent=containerd-shim proc_exe_ino_ctime=1790361177439492389 proc_exe_ino_mtime=1790361177439492389 proc_exe_ino_ctime_duration_proc_start=147244901845 proc_cwd=/ container_start_ts=1790361081083266061 evt_type=execve user=root user_uid=0 user_loginuid=-1 process=kubectl proc_exepath=/tmp/kubectl parent=sh command=kubectl config view terminal=0 exe_flags=EXE_WRITABLE|EXE_UPPER_LAYER container_id=ba197754b7bc container_name=<NA> container_image_repository=<NA> container_image_tag=<NA> k8s_pod_name=<NA> k8s_ns_name=<NA>",
+  "output_fields": {
+    "container.id": "ba197754b7bc",
+    "container.image.repository": null,
+    "container.image.tag": null,
+    "container.name": null,
+    "container.start_ts": 1790361081083266061,
+    "evt.arg.flags": "EXE_WRITABLE|EXE_UPPER_LAYER",
+    "evt.time": 1790361324684804693,
+    "evt.type": "execve",
+    "k8s.ns.name": null,
+    "k8s.pod.name": null,
+    "proc.aname[2]": "containerd-shim",
+    "proc.cmdline": "kubectl config view",
+    "proc.cwd": "/",
+    "proc.exe": "/tmp/kubectl",
+    "proc.exe_ino.ctime": 1790361177439492389,
+    "proc.exe_ino.ctime_duration_proc_start": 147244901845,
+    "proc.exe_ino.mtime": 1790361177439492389,
+    "proc.exepath": "/tmp/kubectl",
+    "proc.name": "kubectl",
+    "proc.pname": "sh",
+    "proc.sname": "sh",
+    "proc.tty": 0,
+    "user.loginuid": -1,
+    "user.name": "root",
+    "user.uid": 0
+  },
+  "priority": "Critical",
+  "rule": "Drop and execute new binary in container",
+  "source": "syscall",
+  "tags": [
+    "PCI_DSS_11.5.1",
+    "TA0003",
+    "container",
+    "maturity_stable",
+    "mitre_persistence",
+    "process"
+  ],
+  "time": "2026-09-25T18:35:24.684804693Z"
+}

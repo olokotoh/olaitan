@@ -202,6 +202,13 @@ spec:
               value: {{ int64 .Values.falcoIngest.buffer.maxAlerts | toString | quote }}
             - name: FALCO_BUFFER_MAX_BYTES
               value: {{ int64 .Values.falcoIngest.buffer.maxBytes | toString | quote }}
+            # Story 11.2d: container ID -> pod enrichment for Falco alerts.
+            - name: FALCO_POD_IDENTITY_ENABLED
+              value: {{ .Values.falcoIngest.podIdentity.enabled | toString | quote }}
+            - name: FALCO_POD_IDENTITY_MAX_ENTRIES
+              value: {{ int64 .Values.falcoIngest.podIdentity.maxEntries | toString | quote }}
+            - name: FALCO_POD_IDENTITY_MISS_WAIT
+              value: {{ .Values.falcoIngest.podIdentity.missWait | toString | quote }}
             # Story 1.6: the Falco adapter records the node name on
             # every emitted Event.Pod.Node so host events without K8s
             # pod context still record where they were observed. Sourced

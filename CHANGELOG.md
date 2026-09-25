@@ -107,6 +107,18 @@ and false-positive numbers; see [Unreleased](#unreleased).
 
 ### Fixed
 
+- **Falco alerts from pods created after Falco started are now attributed
+  to their pod** (Story 11.2d, #195). The pinned Falco leaves
+  `k8s.ns.name` / `k8s.pod.name` empty for those pods, so their alerts
+  arrived with only a `container.id` and the correlator dropped them as host
+  events. Each collector now watches the pods on its own node (field
+  selector `spec.nodeName`) and fills the pod from the container ID before
+  translating the alert; Falco's own values are never overwritten. New
+  values `falcoIngest.podIdentity.{enabled,maxEntries,missWait}` (on, 2048,
+  1s); new metrics `olaitan_sensor_falco_pod_identity_*`. RBAC: while
+  enabled, the collector ServiceAccount gets one ClusterRole with
+  get/list/watch on pods and nothing else.
+
 - **The quickstart's score was not the read's** (follows up #177 and #181).
   The README and `make quickstart` showed "CLEAN to SUSPICIOUS at score 36"
   as the result of `cat /etc/shadow`. The read trips Falco's Warning rule

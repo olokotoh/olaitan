@@ -1,0 +1,25 @@
+{
+  "hostname": "olaitan-full-control-plane",
+  "output": "18:33:49.394142351: Warning Olaitan serviceaccount token read (file=/var/run/secrets/kubernetes.io/serviceaccount/token proc_exepath=/tmp/kubectl k8s_ns=<NA> k8s_pod=<NA>) container_id=ba197754b7bc container_name=<NA> container_image_repository=<NA> container_image_tag=<NA> k8s_pod_name=<NA> k8s_ns_name=<NA>",
+  "output_fields": {
+    "container.id": "ba197754b7bc",
+    "container.image.repository": null,
+    "container.image.tag": null,
+    "container.name": null,
+    "evt.time": 1790361229394142351,
+    "fd.name": "/var/run/secrets/kubernetes.io/serviceaccount/token",
+    "k8s.ns.name": null,
+    "k8s.pod.name": null,
+    "proc.exepath": "/tmp/kubectl"
+  },
+  "priority": "Warning",
+  "rule": "Olaitan ServiceAccount Token Read",
+  "source": "syscall",
+  "tags": [
+    "T1552",
+    "container",
+    "mitre_credential_access",
+    "olaitan"
+  ],
+  "time": "2026-09-25T18:33:49.394142351Z"
+}

@@ -1,0 +1,26 @@
+{
+  "hostname": "olaitan-full-control-plane",
+  "output": "18:30:52.738392399: Warning Olaitan cloud metadata contact (dst_sip=169.254.169.254 dst_rip=10.244.237.100 proc_exepath=/usr/bin/curl k8s_ns=<NA> k8s_pod=<NA>) container_id=ea556864dfb0 container_name=<NA> container_image_repository=<NA> container_image_tag=<NA> k8s_pod_name=<NA> k8s_ns_name=<NA>",
+  "output_fields": {
+    "container.id": "ea556864dfb0",
+    "container.image.repository": null,
+    "container.image.tag": null,
+    "container.name": null,
+    "evt.time": 1790361052738392399,
+    "fd.rip": "10.244.237.100",
+    "fd.sip": "169.254.169.254",
+    "k8s.ns.name": null,
+    "k8s.pod.name": null,
+    "proc.exepath": "/usr/bin/curl"
+  },
+  "priority": "Warning",
+  "rule": "Olaitan Cloud Metadata Contact",
+  "source": "syscall",
+  "tags": [
+    "T1552.005",
+    "container",
+    "mitre_credential_access",
+    "olaitan"
+  ],
+  "time": "2026-09-25T18:30:52.738392399Z"
+}
