@@ -4,9 +4,11 @@
 # It checks the host first and stops, with the exact remedy for each problem,
 # before anything is created. Then it stages the chart, brings up the kind-full
 # reference cluster with the full profile (every source on, Falco on) through
-# hack/install-full-kind.sh, reads /etc/shadow inside a throwaway pod in a
-# namespace the agent scores, and prints the aggregator's first decision about
-# that pod with the time since `make up` started.
+# hack/install-full-kind.sh, runs a real three-step attack inside a throwaway
+# pod in a namespace the agent scores (the Epic 10 audit's, #117: read
+# /etc/shadow, read the service-account token, request the cloud metadata
+# IP), and prints the aggregator's first decision about that pod, the Falco
+# rules that fired, and the time since `make up` started.
 #
 # Nothing here talks to NATS. The detection has to come from Falco seeing a
 # real action; it is read from the aggregator's own log line (the parsers are
@@ -20,7 +22,9 @@
 #
 # It succeeds only when Falco has alerted on the demo pod's /etc/shadow read
 # AND the aggregator has moved a workload in that namespace, as
-# hack/stranger.sh (Story 12.5) requires.
+# hack/stranger.sh (Story 12.5) requires. The metadata request usually gets
+# no answer on kind; the connect is the real syscall Falco sees, so its exit
+# code is not counted.
 #
 # Settings (environment; the make targets pass the kind-full ones):
 #   UP_CLUSTER   kind cluster name                          (olaitan-full)
@@ -46,12 +50,20 @@ UP_NS="default" # hack/install-full-kind.sh installs the release here
 UP_DEMO_NS="olaitan-up"
 UP_DEMO_POD="up-demo"
 UP_ATTEMPT_GAP=15
+# The attack, one kubectl exec per step, in this order. Every step is a real
+# syscall in the demo pod; the output is thrown away (the token is a secret).
+UP_ATTACK=(
+	"cat /etc/shadow"
+	"cat /var/run/secrets/kubernetes.io/serviceaccount/token"
+	"wget -q -T 3 -O /dev/null http://169.254.169.254/latest/meta-data/"
+)
 UP_POLL=5
 # The same floor hack/preflight.sh reports and kind documents.
 UP_MIN_INSTANCES=512
 UP_MIN_WATCHES=524288
 
 UP_K=()
+UP_CMD=()
 UP_OUT=""
 UP_CLUSTER_EXISTS=0
 
@@ -258,21 +270,68 @@ up_logs() {
 	kubectl "${UP_K[@]}" -n "$UP_NS" logs -l "$@" --tail=-1
 }
 
-# up_detect T0 BUDGET: read /etc/shadow in the demo pod until Falco has
+# up_parse_rules NS POD: read Falco's JSON log lines on stdin and print every
+# distinct rule raised for pod POD in namespace NS, in order of first
+# appearance, joined with ", ". Exit 1 when there is none.
+up_parse_rules() {
+	local ns="$1" pod="$2" line rule out="" seen=$'\n'
+	while IFS= read -r line; do
+		case "$line" in
+		*'"k8s.ns.name":"'"$ns"'"'*) ;;
+		*) continue ;;
+		esac
+		case "$line" in
+		*'"k8s.pod.name":"'"$pod"'"'*) ;;
+		*) continue ;;
+		esac
+		rule="$(sed -n 's/.*"rule":"\([^"]*\)".*/\1/p' <<<"$line")"
+		[ -n "$rule" ] || continue
+		case "$seen" in
+		*$'\n'"$rule"$'\n'*) continue ;;
+		esac
+		seen+="$rule"$'\n'
+		out+="${out:+, }$rule"
+	done
+	[ -n "$out" ] || return 1
+	printf '%s\n' "$out"
+}
+
+# up_attack_cmd N: set UP_CMD to attack step N (0-based) as a kubectl exec
+# into the demo pod's own container (-c: the full profile injects the applog
+# sidecar). The only exec in make up.
+up_attack_cmd() {
+	local -a step
+	read -ra step <<<"${UP_ATTACK[$1]}"
+	UP_CMD=(kubectl "${UP_K[@]}" -n "$UP_DEMO_NS" exec "$UP_DEMO_POD" -c "$UP_DEMO_POD" -- "${step[@]}")
+}
+
+# up_attack_step N: run attack step N in the demo pod, output thrown away.
+up_attack_step() {
+	up_attack_cmd "$1"
+	printf '+ %s\n' "${UP_CMD[*]}"
+	"${UP_CMD[@]}" >/dev/null
+}
+
+# up_detect T0 BUDGET: run the attack in the demo pod until Falco has
 # alerted on that read from that pod AND the aggregator has logged a
 # transition for a workload in its namespace (hack/stranger.sh's rule), or
 # until BUDGET seconds after T0. A failed exec is reported and counted apart
-# from the reads that ran; a log that cannot be read stops make up. Sets
-# UP_FOUND, UP_RULE, UP_T_SEEN, UP_READS, UP_FAILED. Returns 1 on no
-# detection, naming what is missing.
+# from the rounds that ran (a round counts as a read when both file reads
+# ran; the metadata request's exit code is not counted); a log that cannot be
+# read stops make up. Sets UP_FOUND, UP_RULE (the /etc/shadow alert),
+# UP_RULES (every rule raised for the demo pod), UP_T_SEEN, UP_READS,
+# UP_FAILED. Returns 1 on no detection, naming what is missing.
 up_detect() {
-	local t0="$1" budget="$2" n t_attack logs rc
-	local -a attack=(kubectl "${UP_K[@]}" -n "$UP_DEMO_NS" exec "$UP_DEMO_POD" -c "$UP_DEMO_POD" -- cat /etc/shadow)
-	UP_FOUND="" UP_RULE="" UP_T_SEEN="" UP_READS=0 UP_FAILED=0
+	local t0="$1" budget="$2" n t_attack logs rc ok
+	UP_FOUND="" UP_RULE="" UP_RULES="" UP_T_SEEN="" UP_READS=0 UP_FAILED=0
 	while [ $(($(date +%s) - t0)) -lt "$budget" ]; do
 		n=$((UP_READS + UP_FAILED + 1))
-		printf '+ %s   (read %s)\n' "${attack[*]}" "$n"
-		if "${attack[@]}" >/dev/null; then
+		echo "==> attack round $n"
+		ok=1
+		up_attack_step 0 || ok=0
+		up_attack_step 1 || ok=0
+		up_attack_step 2 || echo "up: round $n: no answer from 169.254.169.254 (expected on kind; the connect is what Falco sees)"
+		if [ "$ok" = 1 ]; then
 			UP_READS=$((UP_READS + 1))
 		else
 			UP_FAILED=$((UP_FAILED + 1))
@@ -290,23 +349,23 @@ up_detect() {
 				fi
 				UP_FOUND="$(qs_parse_transition "$UP_DEMO_NS" <<<"$logs")" || UP_FOUND=""
 			fi
-			if [ -z "$UP_RULE" ]; then
-				rc=0
-				logs="$(up_logs app.kubernetes.io/name=falco -c falco)" || rc=$?
-				if [ "$rc" -ne 0 ]; then
-					echo "up: reading the Falco log exited $rc (kubectl's error is above)" >&2
-					exit 1
-				fi
-				UP_RULE="$(qs_parse_rule "$UP_DEMO_NS" "$UP_DEMO_POD" <<<"$logs")" || UP_RULE=""
+			rc=0
+			logs="$(up_logs app.kubernetes.io/name=falco -c falco)" || rc=$?
+			if [ "$rc" -ne 0 ]; then
+				echo "up: reading the Falco log exited $rc (kubectl's error is above)" >&2
+				exit 1
 			fi
+			[ -n "$UP_RULE" ] || UP_RULE="$(qs_parse_rule "$UP_DEMO_NS" "$UP_DEMO_POD" <<<"$logs")" || UP_RULE=""
+			UP_RULES="$(up_parse_rules "$UP_DEMO_NS" "$UP_DEMO_POD" <<<"$logs")" || UP_RULES=""
 			if [ -n "$UP_FOUND" ] && [ -n "$UP_RULE" ]; then
 				UP_T_SEEN="$(date +%s)"
 				return 0
 			fi
 		done
 	done
-	echo "up: no detection for $UP_DEMO_NS within ${budget}s ($UP_READS reads of /etc/shadow, $UP_FAILED failed execs):" >&2
+	echo "up: no detection for $UP_DEMO_NS within ${budget}s ($UP_READS attack rounds, $UP_FAILED failed execs):" >&2
 	echo "up:   Falco alert on /etc/shadow from $UP_DEMO_NS/$UP_DEMO_POD: ${UP_RULE:-none (product: no Falco alert)}" >&2
+	echo "up:   every Falco rule raised for $UP_DEMO_NS/$UP_DEMO_POD: ${UP_RULES:-none}" >&2
 	echo "up:   FSM transition in $UP_DEMO_NS: ${UP_FOUND:-none (product: no FSM transition)}" >&2
 	echo "up: check Falco: kubectl ${UP_K[*]} -n $UP_NS logs -l app.kubernetes.io/name=falco -c falco" >&2
 	echo "up: and the aggregator: kubectl ${UP_K[*]} -n $UP_NS logs -l app.kubernetes.io/component=aggregator --tail=200" >&2
@@ -378,10 +437,13 @@ main() {
 	qs_run kubectl "${UP_K[@]}" -n "$UP_DEMO_NS" run "$UP_DEMO_POD" --image="$QS_DEMO_IMAGE" --restart=Never -- sleep 3600
 	qs_run kubectl "${UP_K[@]}" -n "$UP_DEMO_NS" wait "pod/$UP_DEMO_POD" --for=condition=Ready --timeout=3m
 
-	qs_say "the smoke attack: read /etc/shadow inside the pod until Falco alerts on it and the aggregator moves the pod"
+	qs_say "the smoke attack, real syscalls in the pod: read /etc/shadow, read the service-account token, request 169.254.169.254; repeated until Falco alerts and the aggregator moves the pod"
 	if [ "$plan" = "1" ]; then
-		# -c: the full profile injects the applog sidecar into the pod.
-		qs_run kubectl "${UP_K[@]}" -n "$UP_DEMO_NS" exec "$UP_DEMO_POD" -c "$UP_DEMO_POD" -- cat /etc/shadow
+		local i
+		for i in "${!UP_ATTACK[@]}"; do
+			up_attack_cmd "$i"
+			qs_run "${UP_CMD[@]}"
+		done
 		qs_run kubectl "${UP_K[@]}" -n "$UP_NS" logs -l app.kubernetes.io/component=aggregator --tail=-1
 		qs_run kubectl "${UP_K[@]}" -n "$UP_NS" logs -l app.kubernetes.io/name=falco -c falco --tail=-1
 		return 0
@@ -404,7 +466,8 @@ main() {
 	printf '    %-10s %s\n' "score" "$score"
 	printf '    %-10s %s\n' "logged at" "$ts (aggregator clock)"
 	printf '    %-10s %s\n' "falco rule" "$UP_RULE (on /etc/shadow, from $UP_DEMO_POD)"
-	printf '    %-10s %s\n' "reads" "$UP_READS of /etc/shadow ($UP_FAILED failed execs) until both were seen"
+	printf '    %-10s %s\n' "all rules" "$UP_RULES (every Falco rule raised for $UP_DEMO_POD)"
+	printf '    %-10s %s\n' "rounds" "$UP_READS attack rounds ($UP_FAILED failed execs) until both were seen"
 	echo
 	printf '  make up -> Falco, collector, aggregator ready:  %ss\n' "$((t_ready - t0))"
 	printf '  make up -> Falco alert and FSM transition:      %ss (budget %ss)\n' "$elapsed" "$budget"
