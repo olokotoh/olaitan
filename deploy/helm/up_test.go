@@ -305,6 +305,15 @@ func TestUpHasNoInjection(t *testing.T) {
 		regexp.MustCompile(`endpoints\.falco`),
 		regexp.MustCompile(`\bgo (run|build)\b`),
 	}
+	// The attack is real syscalls in the demo pod: no synthetic Falco
+	// events, no copying files in, no exec into any other pod.
+	forbidden = append(forbidden,
+		regexp.MustCompile(`(?i)event-generator`),
+		regexp.MustCompile(`(?i)falcosidekick`),
+		regexp.MustCompile(`(?i)http_output`),
+		regexp.MustCompile(`kubectl\s.*\bcp\b`),
+	)
+	execLine := regexp.MustCompile(`kubectl\s.*\sexec\s`)
 	for where, text := range path {
 		for i, line := range strings.Split(text, "\n") {
 			if strings.HasPrefix(strings.TrimSpace(line), "#") {
@@ -315,7 +324,69 @@ func TestUpHasNoInjection(t *testing.T) {
 					t.Errorf("%s:%d matches %s: %s", where, i+1, re, strings.TrimSpace(line))
 				}
 			}
+			if execLine.MatchString(line) && !strings.Contains(line, `-n "$UP_DEMO_NS" exec "$UP_DEMO_POD" -c "$UP_DEMO_POD"`) {
+				t.Errorf("%s:%d execs somewhere other than the demo pod: %s", where, i+1, strings.TrimSpace(line))
+			}
 		}
+	}
+}
+
+// upAttack is the Epic 10 audit's attack (#117 evidence item 3), run for
+// real inside the demo pod.
+var upAttack = []string{
+	"cat /etc/shadow",
+	"cat /var/run/secrets/kubernetes.io/serviceaccount/token",
+	"wget -q -T 3 -O /dev/null http://169.254.169.254/latest/meta-data/",
+}
+
+// TestUpPlanAttack: the smoke attack is the three real steps, in order, each
+// a kubectl exec into the demo pod's own container in a scored namespace,
+// and nothing is published or faked.
+func TestUpPlanAttack(t *testing.T) {
+	h := newUpHost(t)
+	out, err := h.run("up.sh")
+	if err != nil {
+		t.Fatalf("up plan failed: %v\n%s", err, out)
+	}
+	var execs []string
+	for _, c := range planCommands(out) {
+		if strings.Contains(c, " exec ") {
+			execs = append(execs, c)
+		}
+	}
+	if len(execs) != len(upAttack) {
+		t.Fatalf("want %d attack execs, got %q", len(upAttack), execs)
+	}
+	prefix := "+ kubectl --kubeconfig " + h.out + "/kubeconfig --context kind-" + upCluster + " -n olaitan-up exec up-demo -c up-demo -- "
+	for i, step := range upAttack {
+		if execs[i] != prefix+step {
+			t.Errorf("attack step %d = %q, want %q", i+1, execs[i], prefix+step)
+		}
+	}
+}
+
+// TestUpParseRules: every distinct Falco rule raised for the demo pod is
+// listed, in order of first appearance; other pods' alerts are not.
+func TestUpParseRules(t *testing.T) {
+	h := newUpHost(t)
+	log := strings.Join([]string{
+		`{"rule":"Read sensitive file untrusted","output_fields":{"k8s.ns.name":"olaitan-up","k8s.pod.name":"up-demo","fd.name":"/etc/shadow"}}`,
+		`{"rule":"Terminal shell in container","output_fields":{"k8s.ns.name":"kube-system","k8s.pod.name":"up-demo"}}`,
+		`{"rule":"Read sensitive file untrusted","output_fields":{"k8s.ns.name":"olaitan-up","k8s.pod.name":"up-demo","fd.name":"/etc/shadow"}}`,
+		`{"rule":"Contact cloud metadata","output_fields":{"k8s.ns.name":"olaitan-up","k8s.pod.name":"up-demo","fd.sip":"169.254.169.254"}}`,
+		`{"rule":"Other pod","output_fields":{"k8s.ns.name":"olaitan-up","k8s.pod.name":"up-demo-2"}}`,
+		`not json`,
+	}, "\n")
+	f := filepath.Join(t.TempDir(), "falco.log")
+	if err := os.WriteFile(f, []byte(log+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := h.fn("up.sh", "eval", `up_parse_rules olaitan-up up-demo <"`+f+`"`)
+	if err != nil || out != "Read sensitive file untrusted, Contact cloud metadata\n" {
+		t.Errorf("up_parse_rules = %q, %v", out, err)
+	}
+	if out, err := h.fn("up.sh", "eval", `up_parse_rules olaitan-up nobody <"`+f+`"`); err == nil {
+		t.Errorf("no alert for the pod, but up_parse_rules passed: %q", out)
 	}
 }
 
@@ -909,7 +980,7 @@ func TestUpDetect(t *testing.T) {
 		ok                bool
 		want              []string
 	}{
-		{"both", true, true, nil, true, []string{"reads=1 failed=0", "rule=Read sensitive file untrusted", "found=olaitan-up/Pod/up-demo"}},
+		{"both", true, true, nil, true, []string{"reads=1 failed=0", "rule=Read sensitive file untrusted", "rules=Read sensitive file untrusted\n", "found=olaitan-up/Pod/up-demo"}},
 		{"transition without a Falco alert", true, false, nil, false, []string{"product: no Falco alert", "none"}},
 		{"Falco alert without a transition", false, true, nil, false, []string{"product: no FSM transition"}},
 		{"exec fails", true, true, []string{"FAKE_EXEC_EXIT=1"}, true, []string{"reads=0 failed=1", "exec 1 failed"}},
@@ -919,7 +990,7 @@ func TestUpDetect(t *testing.T) {
 			h := newUpHost(t)
 			agg, falco := upDetectLogs(t, c.transition, c.alert)
 			env := append([]string{"UP_PLAN=", "FAKE_AGG_LOG=" + agg, "FAKE_FALCO_LOG=" + falco}, c.env...)
-			out, err := h.fnEnv(env, "up.sh", "eval", fast+`up_detect "$(date +%s)" 3 && printf 'reads=%s failed=%s\nrule=%s\nfound=%s\n' "$UP_READS" "$UP_FAILED" "$UP_RULE" "$UP_FOUND"`)
+			out, err := h.fnEnv(env, "up.sh", "eval", fast+`up_detect "$(date +%s)" 3 && printf 'reads=%s failed=%s\nrule=%s\nrules=%s\nfound=%s\n' "$UP_READS" "$UP_FAILED" "$UP_RULE" "$UP_RULES" "$UP_FOUND"`)
 			if (err == nil) != c.ok {
 				t.Errorf("err=%v, want ok=%v:\n%s", err, c.ok, out)
 			}
