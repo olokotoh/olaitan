@@ -8,10 +8,13 @@
 # The workload is a Deployment in a tenant-* namespace so the correlator
 # resolves the namespace the rules' not-system-namespace clause checks.
 #
-# On kind the determinism path injects the synthetic file-read and/or
-# outbound-metadata events directly (see ../attack/inject.md); the projected
-# token mount below is the real-attacker target shape for a future
-# kubeadm-cluster run.
+# Target image (Story 11.1): curlimages/curl is a real, minimal image built
+# for exactly this attack surface (sh + curl + CA bundle), so Story 11.2's
+# runner can steal the SA token, use it against the kube API over TLS, and
+# request the metadata IP (169.254.169.254). pause could do none of this.
+# defaultMode 0644 on the projected token makes it readable by curl's
+# non-root user, so the token-theft read actually succeeds in the pod.
+# Pinned by tag AND digest per Story 12.6.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -37,7 +40,10 @@ spec:
       automountServiceAccountToken: true
       containers:
         - name: web
-          image: registry.k8s.io/pause:3.10
+          image: curlimages/curl:8.11.1@sha256:c1fe1679c34d9784c1b0d1e5f62ac0a79fca01fb6377cdd33e90473c6f9f9a69
+          # curl is the image ENTRYPOINT; override it to keep the pod Running
+          # so the attack runner can exec in.
+          command: ["/bin/sh", "-c", "while true; do sleep 3600; done"]
           volumeMounts:
             - name: kube-api-access
               mountPath: /run/secrets/kubernetes.io/serviceaccount
@@ -45,6 +51,7 @@ spec:
       volumes:
         - name: kube-api-access
           projected:
+            defaultMode: 0644
             sources:
               - serviceAccountToken:
                   path: token

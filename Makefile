@@ -10,7 +10,7 @@ AUDIT_POLICY_SRC := config/audit-policy-default.yaml
 CHART_FILES      := $(CHART_DIR)/files/olaitan.yaml $(CHART_DIR)/files/audit-policy-default.yaml
 
 .PHONY: quickstart quickstart-clean up down
-.PHONY: e2e-full e2e-full-down e2e-full-real-llm build test lint olaitan-lint prereg-check analysis analysis-test docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics e2e-local-overlays eval-smoke scenarios-smoke capture-it e2e-local-down schemas helm-values-doc preflight
+.PHONY: scenarios-validate e2e-full e2e-full-down e2e-full-real-llm build test lint olaitan-lint prereg-check analysis analysis-test docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics e2e-local-overlays eval-smoke scenarios-smoke capture-it e2e-local-down schemas helm-values-doc preflight
 
 # envtest-bin downloads the kube-apiserver and etcd binaries that the
 # Story 1.11 posture-client integration tests (and any future
@@ -275,6 +275,19 @@ helm-lint: helm-prepare
 # schema validation (see deploy/helm/README.md).
 helm-template: helm-prepare
 	helm template olaitan $(CHART_DIR)
+
+# Story 11.1: the S1-S5 scenario target manifests are held to the SAME
+# kubeconform strict check as the chart (AC2). They are plain core-type
+# manifests (Namespace + Deployment), so no CRD schemas are needed. The helm
+# Go test suite also enforces this (TestScenarioManifestsPassKubeconform) and
+# the pin/no-pause rule (TestScenarioTargetsArePinnedAndReal); this target is
+# the local one-liner.
+scenarios-validate:
+	kubeconform -strict -summary \
+		-kubernetes-version 1.29.0 \
+		-schema-location default \
+		-skip CustomResourceDefinition \
+		deploy/demo/scenarios/*/manifests/workload.yaml
 
 # --- Story 1.19: kind-based RS smoke test ----------------------------
 # `make e2e-local` spins up a single-node kind cluster, builds the
@@ -597,7 +610,7 @@ FULL_HELM_VALUES = -f $(CHART_DIR)/values-full.yaml \
 # not resolve, and without docker-build + kind load the cluster pulls the last
 # PUBLISHED image instead of the working tree, so a green run would say
 # nothing about the code under test.
-.PHONY: e2e-full e2e-full-down
+.PHONY: scenarios-validate e2e-full e2e-full-down
 e2e-full: helm-prepare helm-deps docker-build
 	CLUSTER_NAME=$(FULL_CLUSTER_NAME) WORKERS=$(FULL_WORKERS) \
 		KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig \
