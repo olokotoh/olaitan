@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Story 11.2a fills the FROZEN Scenario seam (runner.go) with a REAL
@@ -65,12 +66,20 @@ func execAttackCmd(ctx context.Context, name string, args ...string) (string, er
 type attackExecutor struct {
 	scenarioID string
 	dir        string
-	// manifests are the files Execute applies, in apply order; Cleanup
-	// deletes them in reverse. The workload is always present; S2 adds its
-	// least-privilege RBAC manifest (design point DP1).
+	// manifests are the files Execute applies, in apply order. The workload
+	// is always present; S2 adds its least-privilege RBAC manifest (DP1).
 	manifests []string
-	runCmd    attackRunFunc
-	logger    *slog.Logger
+	// cleanupRefs are the specific resources Cleanup deletes by name (NOT the
+	// shared tenant-acme Namespace, which is tenant infrastructure and is left
+	// in place): deleting only what the attack added keeps the reversal
+	// surgical and avoids leaving the namespace mid-termination for the next
+	// trial or test.
+	cleanupRefs []string
+	runCmd      attackRunFunc
+	logger      *slog.Logger
+	// retryWait is the backoff between apply retries; a field so a unit test
+	// can shrink it. Defaults to applyRetryWait.
+	retryWait time.Duration
 }
 
 // newAttackExecutor builds the executor for an S1-S3 scenario. An unknown or
@@ -96,12 +105,26 @@ func newAttackExecutor(scenarioID, dir string, runCmd attackRunFunc, logger *slo
 		manifests = append(manifests, filepath.Join(dir, "manifests", "rbac.yaml"))
 	}
 	manifests = append(manifests, filepath.Join(dir, "manifests", "workload.yaml"))
+
+	// Cleanup deletes exactly what the attack added, by name, leaving the
+	// shared tenant-acme Namespace in place. The target Deployment is common
+	// to S1-S3; S2 also adds the least-privilege SA + Role + RoleBinding.
+	cleanupRefs := []string{"deployment/web"}
+	if scenarioID == "s2" {
+		cleanupRefs = append(cleanupRefs,
+			"rolebinding/s2-attacker-secrets-reader",
+			"role/s2-secrets-reader",
+			"serviceaccount/s2-attacker",
+		)
+	}
 	return &attackExecutor{
-		scenarioID: scenarioID,
-		dir:        dir,
-		manifests:  manifests,
-		runCmd:     runCmd,
-		logger:     logger,
+		scenarioID:  scenarioID,
+		dir:         dir,
+		manifests:   manifests,
+		cleanupRefs: cleanupRefs,
+		runCmd:      runCmd,
+		logger:      logger,
+		retryWait:   applyRetryWait,
 	}, nil
 }
 
@@ -111,7 +134,7 @@ func newAttackExecutor(scenarioID, dir string, runCmd attackRunFunc, logger *slo
 // error (the Runner-loop BI-2 discipline).
 func (e *attackExecutor) Execute(ctx context.Context) error {
 	for _, m := range e.manifests {
-		if _, err := e.runCmd(ctx, "kubectl", "apply", "-f", m); err != nil {
+		if err := e.applyWithRetry(ctx, m); err != nil {
 			return fmt.Errorf("apply %s: %w", m, err)
 		}
 	}
@@ -127,6 +150,59 @@ func (e *attackExecutor) Execute(ctx context.Context) error {
 		return e.runS3(ctx)
 	}
 	return fmt.Errorf("attack executor: no primitive for scenario %q", e.scenarioID) // unreachable (newAttackExecutor gate)
+}
+
+// applyRetries / applyRetryWait bound the apply retry loop. A prior test or
+// trial that deleted the shared tenant-acme Namespace can leave it briefly
+// Terminating, and a create into a terminating namespace is rejected with a
+// Forbidden "namespace is being terminated" error. The retry rides that out
+// without masking a genuine manifest error (only the terminating / being-
+// deleted transient is retried).
+const (
+	applyRetries   = 6
+	applyRetryWait = 5 * time.Second
+)
+
+// applyWithRetry runs kubectl apply, retrying only the transient
+// namespace-terminating / object-being-deleted races (a prior cleanup still in
+// flight). Any other error, or exhausting the retries, is returned.
+func (e *attackExecutor) applyWithRetry(ctx context.Context, manifest string) error {
+	var lastErr error
+	for attempt := 1; attempt <= applyRetries; attempt++ {
+		_, err := e.runCmd(ctx, "kubectl", "apply", "-f", manifest)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isTransientApplyError(err) {
+			return err
+		}
+		e.logger.Warn("apply hit a terminating-namespace race; retrying",
+			"manifest", manifest, "attempt", attempt, "of", applyRetries)
+		wait := e.retryWait
+		if wait <= 0 {
+			wait = applyRetryWait
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+	return lastErr
+}
+
+// isTransientApplyError reports whether err is the retryable
+// namespace-terminating / object-being-deleted race rather than a real
+// manifest problem.
+func isTransientApplyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "being terminated") ||
+		strings.Contains(msg, "being deleted") ||
+		strings.Contains(msg, "object is being deleted")
 }
 
 // exec runs a shell script inside the target pod via kubectl exec.
@@ -216,19 +292,22 @@ func (e *attackExecutor) runS3(ctx context.Context) error {
 	return nil
 }
 
-// Cleanup deletes exactly what Execute applied, in reverse order, idempotent
-// (--ignore-not-found). It is safe to call after a partial or failed Execute
-// and safe to call more than once (AC2 reversibility). A delete error is
-// returned but does not stop the other deletes.
+// Cleanup deletes exactly what Execute added, by name, idempotent
+// (--ignore-not-found). It deletes the attacker resources (the target
+// Deployment, and for S2 the least-privilege SA + Role + RoleBinding) but NOT
+// the shared tenant-acme Namespace, which is tenant infrastructure: deleting
+// only what the attack added keeps the reversal surgical and never leaves the
+// namespace mid-termination for the next trial or test. It is safe to call
+// after a partial or failed Execute and safe to call more than once (AC2
+// reversibility). A delete error is returned but does not stop the others.
 func (e *attackExecutor) Cleanup(ctx context.Context) error {
 	var firstErr error
-	for i := len(e.manifests) - 1; i >= 0; i-- {
-		m := e.manifests[i]
-		if _, err := e.runCmd(ctx, "kubectl", "delete", "-f", m, "--ignore-not-found", "--wait=false"); err != nil {
+	for _, ref := range e.cleanupRefs {
+		if _, err := e.runCmd(ctx, "kubectl", "delete", ref, "-n", attackNamespace, "--ignore-not-found", "--wait=false"); err != nil {
 			if firstErr == nil {
-				firstErr = fmt.Errorf("delete %s: %w", m, err)
+				firstErr = fmt.Errorf("delete %s: %w", ref, err)
 			}
-			e.logger.Error("cleanup delete failed", "manifest", m, "err", err)
+			e.logger.Error("cleanup delete failed", "resource", ref, "err", err)
 		}
 	}
 	return firstErr

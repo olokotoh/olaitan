@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Story 11.2a red-first tests for the real in-cluster attack executor
@@ -224,3 +225,84 @@ func TestNewAttackExecutor_RejectsUnknownScenario(t *testing.T) {
 		t.Errorf("expected newAttackExecutor to reject an unknown scenario id")
 	}
 }
+
+// TestAttackExecutor_ApplyRetriesTerminatingNamespace proves Execute rides out
+// a transient "namespace is being terminated" apply race (left by a prior
+// trial or test cleanup) rather than failing the run, and that a non-transient
+// apply error is NOT retried.
+func TestAttackExecutor_ApplyRetriesTerminatingNamespace(t *testing.T) {
+	var applyAttempts int
+	run := func(ctx context.Context, name string, args ...string) (string, error) {
+		joined := strings.Join(args, " ")
+		if strings.Contains(joined, "apply") {
+			applyAttempts++
+			if applyAttempts == 1 {
+				return "", errDummy("Error from server (Forbidden): ... namespace tenant-acme because it is being terminated")
+			}
+		}
+		return "", nil
+	}
+	e, err := newAttackExecutor("s1", harnessDir("s1-container-escape"), run, testLogger())
+	if err != nil {
+		t.Fatalf("newAttackExecutor: %v", err)
+	}
+	e.retryWait = time.Millisecond // do not sleep 5s in the unit test
+	if err := e.Execute(context.Background()); err != nil {
+		t.Fatalf("Execute should have retried past the terminating-namespace race: %v", err)
+	}
+	if applyAttempts < 2 {
+		t.Errorf("apply attempts = %d; want >= 2 (a retry after the terminating-namespace error)", applyAttempts)
+	}
+
+	// A non-transient apply error must NOT be retried.
+	var hardAttempts int
+	hardRun := func(ctx context.Context, name string, args ...string) (string, error) {
+		if strings.Contains(strings.Join(args, " "), "apply") {
+			hardAttempts++
+			return "", errDummy("error validating data: unknown field \"bogus\"")
+		}
+		return "", nil
+	}
+	e2, _ := newAttackExecutor("s1", harnessDir("s1-container-escape"), hardRun, testLogger())
+	e2.retryWait = time.Millisecond
+	if err := e2.Execute(context.Background()); err == nil {
+		t.Fatalf("Execute should surface a non-transient apply error")
+	}
+	if hardAttempts != 1 {
+		t.Errorf("hard apply attempts = %d; want 1 (no retry on a real manifest error)", hardAttempts)
+	}
+}
+
+// TestAttackExecutor_CleanupIsSurgical proves Cleanup deletes the attacker
+// resources by name and never deletes the shared tenant-acme Namespace.
+func TestAttackExecutor_CleanupIsSurgical(t *testing.T) {
+	var calls []recordedCall
+	run := recordingRunner(&calls, nil, "")
+	e, err := newAttackExecutor("s2", harnessDir("s2-credential-exfil"), run, testLogger())
+	if err != nil {
+		t.Fatalf("newAttackExecutor: %v", err)
+	}
+	if err := e.Cleanup(context.Background()); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	if firstCallContaining(calls, "deployment/web") < 0 {
+		t.Errorf("cleanup did not delete deployment/web; calls=%v", calls)
+	}
+	if firstCallContaining(calls, "serviceaccount/s2-attacker") < 0 {
+		t.Errorf("S2 cleanup did not delete the least-privilege SA; calls=%v", calls)
+	}
+	for _, c := range calls {
+		j := joinCall(c)
+		if strings.Contains(j, "delete") && (strings.Contains(j, "namespace/") || strings.Contains(j, "delete namespace") || strings.Contains(j, " ns ")) {
+			t.Errorf("cleanup must NOT delete the shared namespace: %s", j)
+		}
+		if strings.Contains(j, "delete") && !strings.Contains(j, "--ignore-not-found") {
+			t.Errorf("cleanup delete is not idempotent: %s", j)
+		}
+	}
+}
+
+// errDummy is a tiny error type for tests that need a specific message.
+type errDummy string
+
+func (e errDummy) Error() string { return string(e) }
