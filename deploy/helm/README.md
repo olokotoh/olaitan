@@ -72,7 +72,12 @@ rationale. The most common overrides:
 The chart never requires `cluster-admin`. It grants:
 
 - **Collector** (Role/RoleBinding, release namespace): `get,list,watch`
-  on `pods,events`.
+  on `pods,events`. While `falcoIngest.podIdentity.enabled` (default on,
+  Story 11.2d) also a ClusterRole/ClusterRoleBinding with `get,list,watch`
+  on `pods` only, for the watch that attributes Falco alerts to their pod.
+  Each collector narrows every LIST and WATCH to its own node
+  (`spec.nodeName`); RBAC cannot express that scope, so the grant itself
+  is cluster-wide.
 - **Aggregator** (ClusterRole/ClusterRoleBinding, cluster-wide):
   `create,update,delete` on `networkpolicies.networking.k8s.io`;
   `patch` on `pods`; `get,list` on `pods,events`.

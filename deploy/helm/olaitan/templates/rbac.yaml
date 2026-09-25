@@ -3,10 +3,16 @@ RBAC model (ring-scoped, no wildcards, no cluster-admin — NFR13).
 Source of truth: architecture.md#K8s-API-Boundaries-(RBAC) lines 949-957.
 
   Collector (Ring 1): pod/event GET/LIST/WATCH inside its install
-  namespace only. Narrower than the aggregator because the collector
-  only enriches events for pods it already sees via the kubelet — an
-  auditor reviewing the chart should see that the collector CANNOT
-  enumerate pods cluster-wide.
+  namespace. Story 11.2d adds ONE cluster-wide grant, gated on
+  falcoIngest.podIdentity.enabled: get/list/watch on pods, for the
+  node-scoped container ID -> pod watch that attributes Falco alerts
+  Falco left without a pod. architecture.md (K8s API boundaries) gives
+  the agent ServiceAccount get/list/watch on Pods; this template used to
+  grant less. RBAC cannot restrict a grant to a field selector, so the
+  node scoping (spec.nodeName=<this node>) is enforced by the collector
+  on every request, not by RBAC. Nothing else is cluster-wide: no
+  events, no secrets, no writes. With podIdentity off the ClusterRole is
+  not rendered and the collector CANNOT enumerate pods cluster-wide.
 
   Aggregator (Rings 2-4): namespaced resources, cluster-wide reach.
     - networkpolicies (networking.k8s.io): CREATE/UPDATE/DELETE — must
@@ -70,6 +76,38 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "olaitan.collector.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
+{{- if .Values.falcoIngest.podIdentity.enabled }}
+---
+# Story 11.2d: collector pod identity watch. Read-only pods, nothing else.
+# Each collector narrows its LIST/WATCH to its own node (spec.nodeName).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "olaitan.collector.serviceAccountName" . }}-pod-identity
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: collector
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "olaitan.collector.serviceAccountName" . }}-pod-identity
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: collector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "olaitan.collector.serviceAccountName" . }}-pod-identity
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "olaitan.collector.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
 ---
 # Aggregator: cluster-wide. NetworkPolicy writes and pod annotation
 # patches must reach every workload namespace; a Role would constrain

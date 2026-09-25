@@ -1417,6 +1417,24 @@ spec:
     requests:
       storage: "1Gi"
 ---
+# Story 11.2d: collector pod identity watch. Read-only pods, nothing else.
+# Each collector narrows its LIST/WATCH to its own node (spec.nodeName).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: olaitan-collector-pod-identity
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: collector
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
 # Aggregator: cluster-wide. NetworkPolicy writes and pod annotation
 # patches must reach every workload namespace; a Role would constrain
 # us to a single namespace, which does not match the operator model.
@@ -1473,6 +1491,26 @@ rules:
   - apiGroups: [""]
     resources: ["serviceaccounts"]
     verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: olaitan-collector-pod-identity
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: collector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: olaitan-collector-pod-identity
+subjects:
+  - kind: ServiceAccount
+    name: olaitan-collector
+    namespace: default
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -1972,6 +2010,13 @@ spec:
               value: "4096"
             - name: FALCO_BUFFER_MAX_BYTES
               value: "16777216"
+            # Story 11.2d: container ID -> pod enrichment for Falco alerts.
+            - name: FALCO_POD_IDENTITY_ENABLED
+              value: "true"
+            - name: FALCO_POD_IDENTITY_MAX_ENTRIES
+              value: "2048"
+            - name: FALCO_POD_IDENTITY_MISS_WAIT
+              value: "1s"
             # Story 1.6: the Falco adapter records the node name on
             # every emitted Event.Pod.Node so host events without K8s
             # pod context still record where they were observed. Sourced

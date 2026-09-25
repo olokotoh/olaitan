@@ -112,6 +112,15 @@ The catalogue is organised by registering ring + story, in commit chronology so 
 - **Sample PromQL (aggregate):** `max(olaitan_sensor_falco_buffer_depth) by (pod)`.
 - **Sample PromQL (alert):** `increase(olaitan_sensor_falco_buffer_dropped_total[5m]) > 0` (alerts were lost: NATS was unavailable longer than the buffer covers; raise the bound or fix NATS), and `olaitan_sensor_falco_buffer_depth > 0 and on(pod) olaitan_source_healthy{source="falco"} == 0` for 5 minutes (alerts are queued and NATS is not taking publishes; the depth alone can read above 0 at every scrape on a busy, healthy node).
 
+#### `olaitan_sensor_falco_pod_identity_*` (Story 11.2d)
+
+- **Type:** gauge (`cache_entries`), counter (`enriched_total`, `misses_total`, `wait_recovered_total`, `cap_rejected_total`)
+- **Unit:** count (container IDs, alerts)
+- **Labels:** `source` (constant `falco`)
+- **Help:** The pinned Falco leaves `k8s.ns.name` and `k8s.pod.name` empty for pods created after Falco started, so their alerts reach the collector with only a `container.id`. With `falcoIngest.podIdentity.enabled` (default on) each collector watches the pods on its own node (LIST and WATCH with field selector `spec.nodeName`, each with a client-side timeout) and keeps a map from container ID (regular, init and ephemeral containers, plus the previous instance of a restarted one) to namespace, pod name and pod UID. An alert with a `container.id` but no pod gets the pod from that map before translation; the published event's raw `output_fields` then carry `olaitan.k8s.enriched_by=collector-pod-cache`. Falco's own values are never overwritten, and the per-alert path never calls the API. `cache_entries` is the map size; entries go when their pod is deleted, and the map stops growing at `falcoIngest.podIdentity.maxEntries` (2048), counting each container it could not add in `cap_rejected_total`. `enriched_total` counts alerts attributed from the map; `misses_total` counts alerts the map could not attribute, which stay host events and are dropped by the correlator (`olaitan_correlator_host_events_dropped_total`). An alert can arrive before the watch has delivered its pod: it then waits up to `falcoIngest.podIdentity.missWait` (1s) for the map to change, and `wait_recovered_total` counts the ones attributed during that wait. After a miss the container is remembered as unknown for 30s, so its next alerts do not wait again.
+- **Sample PromQL (aggregate):** `sum(rate(olaitan_sensor_falco_pod_identity_misses_total[5m])) / sum(rate(olaitan_sensor_falco_pod_identity_enriched_total[5m]) + rate(olaitan_sensor_falco_pod_identity_misses_total[5m]))` (share of unattributed container alerts).
+- **Sample PromQL (alert):** `increase(olaitan_sensor_falco_pod_identity_cap_rejected_total[15m]) > 0` (raise `maxEntries`); a sustained high miss share means the watch is failing (check the collector log and its RBAC) or the containers are not Kubernetes pods.
+
 #### `olaitan_sensor_applog_sidecars` (Story 10.10)
 
 - **Type:** gauge

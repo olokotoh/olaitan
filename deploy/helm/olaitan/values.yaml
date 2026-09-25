@@ -206,6 +206,25 @@ falcoIngest:
     maxAlerts: 4096
     # @schema type:integer minimum:1 effect:"most bytes (marshalled events) a collector pod queues for NATS before dropping the oldest Falco alerts" ref:FR1
     maxBytes: 16777216
+  # Story 11.2d: the pinned Falco does not fill k8s.ns.name / k8s.pod.name for
+  # pods created after Falco started, so their alerts arrive with a
+  # container.id and no pod and the correlator drops them as host events. With
+  # this on, each collector watches the pods on its own node (field selector
+  # spec.nodeName) and fills the pod from the container ID before translating
+  # the alert. The per-alert path reads memory only; the watch's LIST and
+  # WATCH carry client-side timeouts. Needs cluster-wide get/list/watch on
+  # pods for the collector ServiceAccount (RBAC cannot scope a grant to a
+  # field selector); turning this off removes that ClusterRole and restores
+  # the namespace-only collector reads. Metrics:
+  # olaitan_sensor_falco_pod_identity_* (cache_entries, enriched_total,
+  # misses_total, wait_recovered_total, cap_rejected_total).
+  podIdentity:
+    # @schema type:boolean effect:"fill the pod on Falco alerts Falco left unattributed from a node-scoped pod watch; adds a collector ClusterRole with get/list/watch on pods" ref:FR1
+    enabled: true
+    # @schema type:integer minimum:1 effect:"hard cap on container IDs one collector caches; containers over it stay unattributed and count in olaitan_sensor_falco_pod_identity_cap_rejected_total" ref:FR1
+    maxEntries: 2048
+    # @schema type:string effect:"longest a Falco alert waits for the pod watch to deliver a just-started container before it is published unattributed; 0s disables the wait" ref:FR1
+    missWait: 1s
 
 # --- Operator-provided secrets ----------------------------------------
 # All three default to "" so the Secret always renders (downstream pods

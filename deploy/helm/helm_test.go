@@ -246,11 +246,13 @@ func TestSubchartsDisabled(t *testing.T) {
 	// added here so a future PR that introduces an unintended kind
 	// (e.g. an extra Secret) trips this test.
 	want := map[string]int{
-		"ServiceAccount":     2,
-		"Role":               1,
-		"RoleBinding":        1,
-		"ClusterRole":        1,
-		"ClusterRoleBinding": 1,
+		"ServiceAccount": 2,
+		"Role":           1,
+		"RoleBinding":    1,
+		// aggregator + the Story 11.2d collector pod identity watch
+		// (falcoIngest.podIdentity.enabled, on by default).
+		"ClusterRole":        2,
+		"ClusterRoleBinding": 2,
 		"Secret":             1,
 		// config + rules + prompts (Story 3.13 added the prompts ConfigMap).
 		"ConfigMap":             3,

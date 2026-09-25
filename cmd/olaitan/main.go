@@ -46,6 +46,7 @@ import (
 	"github.com/olokotoh/olaitan/internal/collector/cni"
 	"github.com/olokotoh/olaitan/internal/collector/cri"
 	"github.com/olokotoh/olaitan/internal/collector/falco"
+	"github.com/olokotoh/olaitan/internal/collector/podidentity"
 	"github.com/olokotoh/olaitan/internal/collector/posture"
 	"github.com/olokotoh/olaitan/internal/config"
 	"github.com/olokotoh/olaitan/internal/correlator"
@@ -2011,7 +2012,14 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 		return fmt.Errorf("collector: ensure streams: %w", err)
 	}
 
-	adapter, err := falco.New(falco.Config{
+	// Story 11.2d (#195): node-scoped container ID -> pod cache that
+	// fills the pod on Falco alerts Falco left unattributed.
+	podCache, err := newFalcoPodIdentity(log, nodeName)
+	if err != nil {
+		closeNATS()
+		return fmt.Errorf("collector: %w", err)
+	}
+	falcoCfg := falco.Config{
 		ListenAddr: falcoListen,
 		Token:      falcoToken,
 		Hostname:   nodeName,
@@ -2019,12 +2027,25 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 		// Issue #135: bounded queue between Falco's http_output and NATS.
 		BufferMaxAlerts: falcoBufAlerts,
 		BufferMaxBytes:  falcoBufBytes,
-	}, nc, log)
+	}
+	if podCache != nil {
+		falcoCfg.PodIdentity = falcoPodIdentity{podCache}
+	}
+	adapter, err := falco.New(falcoCfg, nc, log)
 	if err != nil {
 		closeNATS()
 		return fmt.Errorf("collector: falco adapter: %w", err)
 	}
 	metricsSources[string(schema.SourceFalco)] = adapter
+	if podCache != nil {
+		g.Go(func() error {
+			if err := podCache.Run(ctx); err != nil {
+				// Enrichment is best effort: log and keep Falco ingest up.
+				log.Error("collector: falco pod identity cache stopped; alerts from pods Falco did not attribute stay unattributed", "err", err)
+			}
+			return nil
+		})
+	}
 
 	// Falco adapter goroutine. NATS drain happens after g.Wait()
 	// returns (see runRingCtx) so the adapter has fully exited before
@@ -2396,6 +2417,52 @@ func readFalcoToken(path string) (string, error) {
 
 // envNonNegativeInt reads an optional integer env var. Unset or blank is
 // 0 (the caller's default); anything else must parse as an integer >= 0.
+// falcoPodIdentity adapts the podidentity cache to the Falco adapter's
+// resolver interface. Embedding keeps the cache's counters reachable for
+// the metrics layer.
+type falcoPodIdentity struct{ *podidentity.Cache }
+
+func (f falcoPodIdentity) ResolvePodIdentity(ctx context.Context, containerID string) (falco.PodIdentity, bool) {
+	id, ok := f.Resolve(ctx, containerID)
+	return falco.PodIdentity(id), ok
+}
+
+// newFalcoPodIdentity builds the Story 11.2d pod identity cache from the
+// chart's env vars: FALCO_POD_IDENTITY_ENABLED ("true" turns it on; unset
+// is off), FALCO_POD_IDENTITY_MAX_ENTRIES (hard cap, 0 = default) and
+// FALCO_POD_IDENTITY_MISS_WAIT (Go duration, bounded wait for a container
+// the watch has not delivered yet). A malformed knob is an error. A missing
+// Kubernetes client is logged and returns nil: the collector keeps
+// ingesting Falco alerts without enrichment rather than failing to start.
+func newFalcoPodIdentity(log *slog.Logger, nodeName string) (*podidentity.Cache, error) {
+	if strings.TrimSpace(os.Getenv("FALCO_POD_IDENTITY_ENABLED")) != "true" {
+		return nil, nil
+	}
+	maxEntries, err := envNonNegativeInt("FALCO_POD_IDENTITY_MAX_ENTRIES")
+	if err != nil {
+		return nil, err
+	}
+	missWait := podidentity.DefaultMissWait
+	if v := strings.TrimSpace(os.Getenv("FALCO_POD_IDENTITY_MISS_WAIT")); v != "" {
+		d, perr := time.ParseDuration(v)
+		if perr != nil || d < 0 {
+			return nil, fmt.Errorf("FALCO_POD_IDENTITY_MISS_WAIT=%q is not a non-negative duration", v)
+		}
+		missWait = d
+	}
+	cs, err := kubeClientFactory(log)
+	if err != nil {
+		log.Error("collector: no Kubernetes client for the falco pod identity cache; alerts Falco did not attribute to a pod stay unattributed",
+			"err", err)
+		return nil, nil
+	}
+	return podidentity.New(cs, podidentity.Config{
+		NodeName:   nodeName,
+		MaxEntries: maxEntries,
+		MissWait:   missWait,
+	}, log)
+}
+
 func envNonNegativeInt(name string) (int, error) {
 	v := strings.TrimSpace(os.Getenv(name))
 	if v == "" {

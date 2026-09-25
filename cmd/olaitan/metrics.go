@@ -37,6 +37,17 @@ type adapterMetrics interface {
 	EngagedTotal() int64
 }
 
+// podIdentityMetrics is what the metrics layer reads from the Falco pod
+// identity cache (Story 11.2d). falcoPodIdentity satisfies it by embedding
+// *podidentity.Cache.
+type podIdentityMetrics interface {
+	Size() int64
+	Hits() int64
+	Misses() int64
+	WaitRecovered() int64
+	CapRejected() int64
+}
+
 // startMetricsServer is the wiring helper called by both
 // startCollectorRing and startAggregatorRing. It constructs a fresh
 // metrics.Registry, binds every adapter under sources, optionally binds
@@ -274,6 +285,34 @@ func registerAdapterCounters(reg *metrics.Registry, source, nodeName string, ad 
 			"Marshalled size in bytes of the Falco alerts queued in the collector (issue #135).",
 			nil, a.BufferBytes); err != nil {
 			return err
+		}
+		// Story 11.2d (#195): the container ID -> pod cache that fills
+		// the pod on alerts Falco left unattributed. Registered only when
+		// enrichment is on, so an absent series means the feature is off.
+		if pi, ok := a.PodIdentity().(podIdentityMetrics); ok {
+			if err := reg.RegisterGauge(
+				"olaitan_sensor_falco_pod_identity_cache_entries", source,
+				"Container IDs in this collector's node-scoped pod identity cache (Story 11.2d).",
+				nil, pi.Size); err != nil {
+				return err
+			}
+			for _, c := range []struct {
+				name, help string
+				read       func() int64
+			}{
+				{"olaitan_sensor_falco_pod_identity_enriched_total",
+					"Falco alerts with a container.id but no pod that the collector attributed to a pod from its cache (Story 11.2d).", pi.Hits},
+				{"olaitan_sensor_falco_pod_identity_misses_total",
+					"Falco alerts with a container.id but no pod that the cache could not attribute, after the bounded wait; these stay host events (Story 11.2d).", pi.Misses},
+				{"olaitan_sensor_falco_pod_identity_wait_recovered_total",
+					"Enriched alerts that arrived before the pod watch delivered their pod and were attributed during the bounded wait; a subset of enriched_total (Story 11.2d).", pi.WaitRecovered},
+				{"olaitan_sensor_falco_pod_identity_cap_rejected_total",
+					"Containers not cached because the pod identity cache was at its hard cap (falcoIngest.podIdentity.maxEntries); nonzero means raise the cap (Story 11.2d).", pi.CapRejected},
+			} {
+				if err := reg.RegisterCounter(c.name, source, c.help, nil, c.read); err != nil {
+					return err
+				}
+			}
 		}
 	case *applog.SidecarTracker:
 		// Story 10.10: the applog sidecars on this node, by state.

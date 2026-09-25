@@ -46,6 +46,9 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 | `falcoIngest.extraFrom` | array | `[]` | - | additional NetworkPolicy peers allowed to post to the Falco ingest port | NFR11 |
 | `falcoIngest.buffer.maxAlerts` | integer | `4096` | minimum 1 | most Falco alerts a collector pod queues while NATS is unavailable before dropping the oldest | FR1 |
 | `falcoIngest.buffer.maxBytes` | integer | `16777216` | minimum 1 | most bytes (marshalled events) a collector pod queues for NATS before dropping the oldest Falco alerts | FR1 |
+| `falcoIngest.podIdentity.enabled` | boolean | `true` | - | fill the pod on Falco alerts Falco left unattributed from a node-scoped pod watch; adds a collector ClusterRole with get/list/watch on pods | FR1 |
+| `falcoIngest.podIdentity.maxEntries` | integer | `2048` | minimum 1 | hard cap on container IDs one collector caches; containers over it stay unattributed and count in olaitan_sensor_falco_pod_identity_cap_rejected_total | FR1 |
+| `falcoIngest.podIdentity.missWait` | string | `"1s"` | - | longest a Falco alert waits for the pod watch to deliver a just-started container before it is published unattributed; 0s disables the wait | FR1 |
 
 ## `secrets`
 
