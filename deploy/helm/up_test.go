@@ -507,6 +507,31 @@ func TestUpPreflightBlockers(t *testing.T) {
 			want:  []string{"was not made by make up", "FULL_OUT_DIR"},
 		},
 		{
+			// N2: make up only marks a directory it creates itself, so
+			// make down never removes one it did not make (or an empty
+			// mount point).
+			name: "out dir exists and is empty",
+			setup: func(h *upHost) {
+				if err := os.Mkdir(h.out, 0o700); err != nil {
+					h.t.Fatal(err)
+				}
+			},
+			want: []string{"already exists", "make up only uses a directory it creates", "fix: rmdir ", "FULL_OUT_DIR"},
+		},
+		{
+			// N1: an unreadable directory is never taken for an empty one.
+			name: "out dir unreadable",
+			setup: func(h *upHost) {
+				h.write(h.out, "notes.txt", "mine")
+				if err := os.Chmod(h.out, 0); err != nil {
+					h.t.Fatal(err)
+				}
+				h.t.Cleanup(func() { _ = os.Chmod(h.out, 0o700) })
+			},
+			want: []string{"already exists", "FULL_OUT_DIR"},
+			not:  []string{"is new or empty"},
+		},
+		{
 			name:  "marker names another cluster",
 			setup: func(h *upHost) { h.markOut("other") },
 			want:  []string{"cluster other", "make down FULL_CLUSTER_NAME=other"},
@@ -691,7 +716,7 @@ func TestDownOwnership(t *testing.T) {
 			if err := os.Symlink(filepath.Join(filepath.Dir(h.out), "elsewhere"), filepath.Join(h.out, upMarker)); err != nil {
 				t.Fatal(err)
 			}
-		}, "no " + upMarker},
+		}, "is a symlink"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			h := newUpHost(t)
@@ -740,6 +765,91 @@ func TestUpMark(t *testing.T) {
 	if _, err := h.fn("down.sh", "down_owns", h.out, "other"); err == nil {
 		t.Error("down accepts a marker for another cluster")
 	}
+	// N2: make up never adopts a directory that is already there, even an
+	// empty one it could mark.
+	other := filepath.Join(t.TempDir(), "existing")
+	if err := os.Mkdir(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := h.fnEnv([]string{"UP_PLAN="}, "up.sh", "up_mark", other, upCluster); err == nil {
+		t.Errorf("up_mark marked an existing directory:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(other, upMarker)); err == nil {
+		t.Error("up_mark wrote a marker into an existing directory")
+	}
+}
+
+// TestDownRmFailureKeepsCleaning (N2): a failed rm (an empty mount point
+// gives EBUSY) is reported, the rest of the cleanup still runs, and make
+// down exits non-zero at the end.
+func TestDownRmFailureKeepsCleaning(t *testing.T) {
+	h := newUpHost(t)
+	h.markOut(upCluster)
+	h.stub("rm", "exit 1")
+	out, err := h.run("down.sh", "UP_PLAN=")
+	if err == nil {
+		t.Errorf("down passed although rm failed:\n%s", out)
+	}
+	if !strings.Contains(out, "down: could not remove "+h.out) {
+		t.Errorf("the failed rm is not reported:\n%s", out)
+	}
+	raw, _ := os.ReadFile(h.calls)
+	if !strings.Contains(string(raw), "rm -rf "+filepath.Join(repoRoot(t), "hack", ".audit-full")) {
+		t.Errorf("a failed rm of the out dir skipped hack/.audit-full:\n%s", raw)
+	}
+	if !strings.Contains(out, "no cluster, no container, no kubeconfig context left") {
+		t.Errorf("a failed rm skipped the leftover check:\n%s", out)
+	}
+}
+
+// TestDownIgnoresInheritedKubeconfig (N3): make up prints
+// `export KUBECONFIG=<out>/kubeconfig`. make down's kind-<name> cleanup and
+// its no-context check are about the default kubeconfig, so an inherited
+// KUBECONFIG is ignored.
+func TestDownIgnoresInheritedKubeconfig(t *testing.T) {
+	h := newUpHost(t)
+	// The stand-in answers with the kind context only when KUBECONFIG is set,
+	// as the out-dir kubeconfig would.
+	h.stub("kubectl", `if [ "$1" = config ] && [ -n "${KUBECONFIG:-}" ]; then
+  case "$2" in
+  get-contexts) printf '%s\n' "kind-`+upCluster+`" ;;
+  *) printf 'NAME\nkind-`+upCluster+`\n' ;;
+  esac
+fi
+exit 0`)
+	h.markOut(upCluster)
+	inherited := "KUBECONFIG=" + filepath.Join(h.out, "kubeconfig")
+	out, err := h.fnEnv([]string{inherited}, "down.sh", "down_leftovers")
+	if err != nil || strings.Contains(out, "left: context") {
+		t.Errorf("the leftover check read the inherited KUBECONFIG (err=%v):\n%s", err, out)
+	}
+	out, err = h.run("down.sh", inherited)
+	if err != nil || strings.Contains(out, "kubectl config delete-") {
+		t.Errorf("make down edited the inherited KUBECONFIG (err=%v):\n%s", err, out)
+	}
+}
+
+// TestDownMarkerMessages (N10): a symlinked marker and a marker with a CR
+// are refused with a message that says what is wrong.
+func TestDownMarkerMessages(t *testing.T) {
+	h := newUpHost(t)
+	h.write(h.out, upMarker, upCluster+"\r\n")
+	out, err := h.run("down.sh")
+	if err == nil || !strings.Contains(out, `names $'`+upCluster+`\r'`) {
+		t.Errorf("CRLF marker: want the name quoted with its CR (err=%v):\n%s", err, out)
+	}
+	h2 := newUpHost(t)
+	h2.write(filepath.Dir(h2.out), "elsewhere", upCluster+"\n")
+	if err := os.MkdirAll(h2.out, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(filepath.Dir(h2.out), "elsewhere"), filepath.Join(h2.out, upMarker)); err != nil {
+		t.Fatal(err)
+	}
+	out, err = h2.run("down.sh")
+	if err == nil || !strings.Contains(out, "its "+upMarker+" is a symlink, not the file make up writes") {
+		t.Errorf("symlinked marker: want it named as a symlink (err=%v):\n%s", err, out)
+	}
 }
 
 // TestDownRefusesDangerousOutDir: the out dir is rm -rf'd, so an empty
@@ -764,6 +874,8 @@ func TestDownRefusesDangerousOutDir(t *testing.T) {
 		home + "/../" + filepath.Base(home), filepath.Dir(home), filepath.Dir(filepath.Dir(home)),
 		repo, repo + "/", filepath.Dir(repo), filepath.Join(repo, "hack"), filepath.Join(repo, "hack") + "/../..",
 		link, link + "/", link + "//",
+		// N4: a symlink anywhere in the path, not only the last component.
+		link + "/.", link + "/sub", link + "/sub/..", link + "/sub/x/",
 		"relative/dir", "./x",
 	} {
 		out, err := h.run("down.sh", "UP_OUT_DIR="+d)
