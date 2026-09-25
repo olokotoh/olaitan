@@ -18,20 +18,25 @@
 # with the cluster name: `make down` removes the out dir only when that marker
 # is there, so it never removes a directory make up did not make.
 #
-# It succeeds only when Falco has alerted on the demo pod's /etc/shadow read
-# AND the aggregator has moved a workload in that namespace, as
-# hack/stranger.sh (Story 12.5) requires.
+# AC1 (amended 2026-09-25, #120): it succeeds when Falco has alerted on the
+# demo pod's /etc/shadow read within UP_BUDGET. It then keeps polling for the
+# aggregator's FSM transition until the budget ends and prints it if it
+# comes. On the full profile with the in-cluster CPU model the transition
+# follows only when the analyst chain completes (it runs before scoring;
+# #185, Story 7.4), so a missing transition is reported, not a failure. A
+# missing Falco alert fails.
 #
 # Settings (environment; the make targets pass the kind-full ones):
 #   UP_CLUSTER   kind cluster name                          (olaitan-full)
 #   UP_OUT_DIR   key material and kubeconfig, outside repo  ($HOME/.olaitan-full;
 #                set but empty is refused, as in hack/down.sh)
 #   UP_WORKERS   worker nodes; empty = hack/kind-full.yaml  (1)
-#   UP_BUDGET    seconds allowed, make up to detection      (900)
+#   UP_BUDGET    seconds allowed, make up to the Falco alert (900)
 #   UP_PLAN=1    run preflight, print the commands, create nothing
 # Host facts, overridable so the tests can use fixtures:
 #   UP_INOTIFY_DIR (/proc/sys/fs/inotify), UP_BTF_FILE (/sys/kernel/btf/vmlinux),
-#   UP_KERNEL (uname -r), UP_OS (uname -s)
+#   UP_KERNEL (uname -r), UP_OS (uname -s), UP_NPROC (getconf
+#   _NPROCESSORS_ONLN), UP_MEM_KB (MemTotal from /proc/meminfo)
 set -euo pipefail
 
 UP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -50,6 +55,11 @@ UP_POLL=5
 # The same floor hack/preflight.sh reports and kind documents.
 UP_MIN_INSTANCES=512
 UP_MIN_WATCHES=524288
+# The host the full profile was tested on: 8 vCPU, 32 GiB. MemTotal on a
+# 32 GiB machine reads about 30 to 31 GiB (the kernel and firmware keep
+# some), so the memory caveat starts below 28 GiB.
+UP_TESTED_NPROC=8
+UP_TESTED_MEM_KB=$((28 * 1048576))
 
 UP_K=()
 UP_OUT=""
@@ -57,7 +67,12 @@ UP_CLUSTER_EXISTS=0
 
 UP_BLOCKERS=0
 up_ok() { printf '  ok       %s\n' "$*"; }
-up_note() { printf '  caveat   %s\n' "$*"; }
+up_note() {
+	printf '  caveat   %s\n' "$1"
+	shift
+	local l
+	for l in "$@"; do printf '           %s\n' "$l"; done
+}
 up_block() {
 	printf '  BLOCKER  %s\n' "$1"
 	shift
@@ -163,6 +178,23 @@ up_check_host_kernel() {
 	fi
 }
 
+# up_check_host_size NPROC MEM_KB: a caveat, never a blocker, below the host
+# the full profile was tested on.
+up_check_host_size() {
+	local n="$1" kb="$2"
+	if ! [[ $n =~ ^[0-9]+$ ]] || ! [[ $kb =~ ^[0-9]+$ ]]; then
+		up_note "cannot read the CPU count or memory; the full profile was tested on 8 vCPU / 32 GiB"
+		return 0
+	fi
+	local gib=$((kb / 1048576))
+	if [ "$n" -lt "$UP_TESTED_NPROC" ] || [ "$kb" -lt "$UP_TESTED_MEM_KB" ]; then
+		up_note "host has $n vCPU and ${gib} GiB of memory; the full profile was tested on 8 vCPU / 32 GiB." \
+			"Below that the analyst chain on the in-cluster CPU model will be slower, so the FSM transition may not come within the budget (make up needs the Falco alert)."
+		return 0
+	fi
+	up_ok "host has $n vCPU and ${gib} GiB of memory (the full profile was tested on 8 vCPU / 32 GiB)"
+}
+
 up_check_cluster() {
 	command -v kind >/dev/null 2>&1 || return 0
 	if kind get clusters 2>/dev/null | grep -qxF "$1"; then
@@ -231,6 +263,8 @@ up_preflight() {
 	up_check_docker
 	up_check_host_kernel "${UP_OS:-$(uname -s)}" "${UP_KERNEL:-$(uname -r)}" \
 		"${UP_BTF_FILE:-/sys/kernel/btf/vmlinux}" "${UP_INOTIFY_DIR:-/proc/sys/fs/inotify}"
+	up_check_host_size "${UP_NPROC:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)}" \
+		"${UP_MEM_KB:-$(sed -n 's/^MemTotal:[[:space:]]*\([0-9]*\) kB$/\1/p' /proc/meminfo 2>/dev/null || true)}"
 	up_check_python "$2"
 	up_check_cluster "$1"
 	up_check_out_dir "$3" "$1"
@@ -258,18 +292,45 @@ up_logs() {
 	kubectl "${UP_K[@]}" -n "$UP_NS" logs -l "$@" --tail=-1
 }
 
+# up_poll: read the logs once; set UP_FOUND and UP_T_SEEN on the first FSM
+# transition in the demo namespace, UP_RULE and UP_T_ALERT on the first Falco
+# alert on /etc/shadow from the demo pod. A log that cannot be read stops
+# make up: it is never taken for "nothing yet".
+up_poll() {
+	local logs rc
+	if [ -z "$UP_FOUND" ]; then
+		rc=0
+		logs="$(up_logs app.kubernetes.io/component=aggregator)" || rc=$?
+		if [ "$rc" -ne 0 ]; then
+			echo "up: reading the aggregator log exited $rc (kubectl's error is above)" >&2
+			exit 1
+		fi
+		UP_FOUND="$(qs_parse_transition "$UP_DEMO_NS" <<<"$logs")" || UP_FOUND=""
+		[ -z "$UP_FOUND" ] || UP_T_SEEN="$(date +%s)"
+	fi
+	if [ -z "$UP_RULE" ]; then
+		rc=0
+		logs="$(up_logs app.kubernetes.io/name=falco -c falco)" || rc=$?
+		if [ "$rc" -ne 0 ]; then
+			echo "up: reading the Falco log exited $rc (kubectl's error is above)" >&2
+			exit 1
+		fi
+		UP_RULE="$(qs_parse_rule "$UP_DEMO_NS" "$UP_DEMO_POD" <<<"$logs")" || UP_RULE=""
+		[ -z "$UP_RULE" ] || UP_T_ALERT="$(date +%s)"
+	fi
+}
+
 # up_detect T0 BUDGET: read /etc/shadow in the demo pod until Falco has
-# alerted on that read from that pod AND the aggregator has logged a
-# transition for a workload in its namespace (hack/stranger.sh's rule), or
-# until BUDGET seconds after T0. A failed exec is reported and counted apart
-# from the reads that ran; a log that cannot be read stops make up. Sets
-# UP_FOUND, UP_RULE, UP_T_SEEN, UP_READS, UP_FAILED. Returns 1 on no
-# detection, naming what is missing.
+# alerted on that read from that pod, then keep polling (no more reads) for
+# the aggregator's FSM transition until BUDGET seconds after T0. A failed
+# exec is reported and counted apart from the reads that ran. Sets UP_RULE,
+# UP_T_ALERT, UP_FOUND, UP_T_SEEN (empty when no transition came),
+# UP_READS, UP_FAILED. Returns 1 when Falco never alerted.
 up_detect() {
-	local t0="$1" budget="$2" n t_attack logs rc
+	local t0="$1" budget="$2" n t_attack
 	local -a attack=(kubectl "${UP_K[@]}" -n "$UP_DEMO_NS" exec "$UP_DEMO_POD" -c "$UP_DEMO_POD" -- cat /etc/shadow)
-	UP_FOUND="" UP_RULE="" UP_T_SEEN="" UP_READS=0 UP_FAILED=0
-	while [ $(($(date +%s) - t0)) -lt "$budget" ]; do
+	UP_FOUND="" UP_RULE="" UP_T_ALERT="" UP_T_SEEN="" UP_READS=0 UP_FAILED=0
+	while [ -z "$UP_T_ALERT" ] && [ $(($(date +%s) - t0)) -lt "$budget" ]; do
 		n=$((UP_READS + UP_FAILED + 1))
 		printf '+ %s   (read %s)\n' "${attack[*]}" "$n"
 		if "${attack[@]}" >/dev/null; then
@@ -279,38 +340,68 @@ up_detect() {
 			echo "up: exec $n failed (kubectl's error is above); trying again" >&2
 		fi
 		t_attack="$(date +%s)"
-		while [ $(($(date +%s) - t_attack)) -lt "$UP_ATTEMPT_GAP" ]; do
+		while [ -z "$UP_T_ALERT" ] && [ $(($(date +%s) - t_attack)) -lt "$UP_ATTEMPT_GAP" ]; do
 			sleep "$UP_POLL"
-			if [ -z "$UP_FOUND" ]; then
-				rc=0
-				logs="$(up_logs app.kubernetes.io/component=aggregator)" || rc=$?
-				if [ "$rc" -ne 0 ]; then
-					echo "up: reading the aggregator log exited $rc (kubectl's error is above)" >&2
-					exit 1
-				fi
-				UP_FOUND="$(qs_parse_transition "$UP_DEMO_NS" <<<"$logs")" || UP_FOUND=""
-			fi
-			if [ -z "$UP_RULE" ]; then
-				rc=0
-				logs="$(up_logs app.kubernetes.io/name=falco -c falco)" || rc=$?
-				if [ "$rc" -ne 0 ]; then
-					echo "up: reading the Falco log exited $rc (kubectl's error is above)" >&2
-					exit 1
-				fi
-				UP_RULE="$(qs_parse_rule "$UP_DEMO_NS" "$UP_DEMO_POD" <<<"$logs")" || UP_RULE=""
-			fi
-			if [ -n "$UP_FOUND" ] && [ -n "$UP_RULE" ]; then
-				UP_T_SEEN="$(date +%s)"
-				return 0
-			fi
+			up_poll
 		done
 	done
-	echo "up: no detection for $UP_DEMO_NS within ${budget}s ($UP_READS reads of /etc/shadow, $UP_FAILED failed execs):" >&2
-	echo "up:   Falco alert on /etc/shadow from $UP_DEMO_NS/$UP_DEMO_POD: ${UP_RULE:-none (product: no Falco alert)}" >&2
-	echo "up:   FSM transition in $UP_DEMO_NS: ${UP_FOUND:-none (product: no FSM transition)}" >&2
-	echo "up: check Falco: kubectl ${UP_K[*]} -n $UP_NS logs -l app.kubernetes.io/name=falco -c falco" >&2
-	echo "up: and the aggregator: kubectl ${UP_K[*]} -n $UP_NS logs -l app.kubernetes.io/component=aggregator --tail=200" >&2
-	return 1
+	if [ -z "$UP_T_ALERT" ]; then
+		echo "up: no Falco alert on /etc/shadow from $UP_DEMO_NS/$UP_DEMO_POD within ${budget}s ($UP_READS reads, $UP_FAILED failed execs):" >&2
+		echo "up:   Falco alert: none (no Falco alert)" >&2
+		echo "up:   FSM transition in $UP_DEMO_NS: ${UP_FOUND:-none}" >&2
+		echo "up: check Falco: kubectl ${UP_K[*]} -n $UP_NS logs -l app.kubernetes.io/name=falco -c falco" >&2
+		echo "up: and the aggregator: kubectl ${UP_K[*]} -n $UP_NS logs -l app.kubernetes.io/component=aggregator --tail=200" >&2
+		return 1
+	fi
+	if [ -z "$UP_T_SEEN" ]; then
+		echo "==> Falco alerted after $((UP_T_ALERT - t0))s; waiting for the FSM transition until the budget ends"
+	fi
+	while [ -z "$UP_T_SEEN" ] && [ $(($(date +%s) - t0)) -lt "$budget" ]; do
+		sleep "$UP_POLL"
+		up_poll
+	done
+	return 0
+}
+
+# up_report T0 T_READY BUDGET CLUSTER OUT: print what up_detect found.
+# Returns 1 when the Falco alert came after the budget.
+up_report() {
+	local t0="$1" t_ready="$2" budget="$3" cluster="$4" out="$5"
+	local e_alert=$((UP_T_ALERT - t0))
+	echo
+	echo "  Falco detected a real action in the demo pod (full profile, Falco on):"
+	echo
+	printf '    %-10s %s\n' "falco rule" "$UP_RULE (on /etc/shadow, from $UP_DEMO_NS/$UP_DEMO_POD)"
+	printf '    %-10s %s\n' "reads" "$UP_READS of /etc/shadow ($UP_FAILED failed execs) before the alert"
+	echo
+	if [ -n "$UP_FOUND" ]; then
+		local wl from to score ts
+		IFS=$'\t' read -r wl from to score ts <<<"$UP_FOUND"
+		echo "  and the aggregator moved the workload:"
+		echo
+		printf '    %-10s %s\n' "workload" "$wl"
+		printf '    %-10s %s\n' "from" "$from"
+		printf '    %-10s %s\n' "to" "$to"
+		printf '    %-10s %s\n' "score" "$score"
+		printf '    %-10s %s\n' "logged at" "$ts (aggregator clock)"
+	else
+		echo "  The aggregator logged no FSM transition within the budget. The detection happened (the"
+		echo "  Falco alert above); on the full profile the FSM transition is waiting on the analyst chain,"
+		echo "  which runs on the in-cluster CPU model before scoring. See #185 and Story 7.4 (score before"
+		echo "  the analyst chain). The aggregator log below shows the transition when it comes."
+	fi
+	echo
+	printf '  make up -> Falco, collector, aggregator ready:  %ss\n' "$((t_ready - t0))"
+	printf '  make up -> Falco alert:                         %ss (budget %ss)\n' "$e_alert" "$budget"
+	if [ -n "$UP_FOUND" ]; then
+		printf '  make up -> FSM transition:                      %ss\n' "$((UP_T_SEEN - t0))"
+	fi
+	echo
+	up_print_access "$cluster" "$out"
+	if ! qs_within_budget "$e_alert" "$budget"; then
+		echo "up: over budget: the Falco alert came after ${e_alert}s > ${budget}s" >&2
+		return 1
+	fi
 }
 
 # up_print_access: how to reach what make up built. Story 13.3 (#127) adds
@@ -347,7 +438,7 @@ main() {
 	QUICKSTART_PLAN="$plan"
 	cd "$UP_ROOT"
 
-	qs_say "clock starts: make up (budget ${budget}s to a live detection)"
+	qs_say "clock starts: make up (budget ${budget}s to Falco's alert on a real attack)"
 	up_preflight "$cluster" "$workers" "$out" || exit 1
 	out="$UP_OUT"
 	UP_K=(--kubeconfig "$out/kubeconfig" --context "kind-$cluster")
@@ -378,7 +469,7 @@ main() {
 	qs_run kubectl "${UP_K[@]}" -n "$UP_DEMO_NS" run "$UP_DEMO_POD" --image="$QS_DEMO_IMAGE" --restart=Never -- sleep 3600
 	qs_run kubectl "${UP_K[@]}" -n "$UP_DEMO_NS" wait "pod/$UP_DEMO_POD" --for=condition=Ready --timeout=3m
 
-	qs_say "the smoke attack: read /etc/shadow inside the pod until Falco alerts on it and the aggregator moves the pod"
+	qs_say "the smoke attack: read /etc/shadow inside the pod until Falco alerts on it, then wait for the aggregator's FSM transition until the budget ends"
 	if [ "$plan" = "1" ]; then
 		# -c: the full profile injects the applog sidecar into the pod.
 		qs_run kubectl "${UP_K[@]}" -n "$UP_DEMO_NS" exec "$UP_DEMO_POD" -c "$UP_DEMO_POD" -- cat /etc/shadow
@@ -388,32 +479,9 @@ main() {
 	fi
 
 	# A read before Falco's driver is loaded is not seen, so the real read is
-	# repeated until both signals are there or the budget is spent.
+	# repeated until Falco alerts on it or the budget is spent.
 	up_detect "$t0" "$budget" || exit 1
-
-	local wl from to score ts
-	IFS=$'\t' read -r wl from to score ts <<<"$UP_FOUND"
-	local elapsed=$((UP_T_SEEN - t0))
-
-	echo
-	echo "  Olaitan (full profile, Falco on) saw a real action and moved the workload:"
-	echo
-	printf '    %-10s %s\n' "workload" "$wl"
-	printf '    %-10s %s\n' "from" "$from"
-	printf '    %-10s %s\n' "to" "$to"
-	printf '    %-10s %s\n' "score" "$score"
-	printf '    %-10s %s\n' "logged at" "$ts (aggregator clock)"
-	printf '    %-10s %s\n' "falco rule" "$UP_RULE (on /etc/shadow, from $UP_DEMO_POD)"
-	printf '    %-10s %s\n' "reads" "$UP_READS of /etc/shadow ($UP_FAILED failed execs) until both were seen"
-	echo
-	printf '  make up -> Falco, collector, aggregator ready:  %ss\n' "$((t_ready - t0))"
-	printf '  make up -> Falco alert and FSM transition:      %ss (budget %ss)\n' "$elapsed" "$budget"
-	echo
-	up_print_access "$cluster" "$out"
-	if ! qs_within_budget "$elapsed" "$budget"; then
-		echo "up: over budget: ${elapsed}s > ${budget}s" >&2
-		exit 1
-	fi
+	up_report "$t0" "$t_ready" "$budget" "$cluster" "$out" || exit 1
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
