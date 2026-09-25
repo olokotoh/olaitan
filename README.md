@@ -262,8 +262,14 @@ Falco on, and the same real `cat /etc/shadow` in a throwaway pod.
 
 ```bash
 make up     # host preflight, kind-full, the full profile, a real attack, the result
-make down   # removes the cluster, its node containers and kubeconfig context, and the key material
+make down   # removes the cluster, its node containers, its kubeconfig entries and the key material
 ```
+
+Tested on: 8 vCPU, 32 GiB, about 40 GB of disk, with Docker, kind, helm,
+kubectl and make installed, plus openssl and python3 with PyYAML (Ubuntu
+24.04 ships both). On a smaller host `make up` warns and carries on, but
+the in-cluster model runs slower there, so the FSM transition takes
+longer (see below).
 
 `make up` checks the host before it creates anything and stops on every
 blocker it finds, each with the exact fix. On a stock Ubuntu 24.04 host
@@ -278,45 +284,68 @@ this is what it said first:
   BLOCKER  inotify limits too low for Falco on kind-full: instances=128 (need >= 512), watches=255080 (need >= 524288)
            Falco would crash with 'could not initialize inotify handler' and never see the attack.
            fix: sudo sysctl -w fs.inotify.max_user_instances=512 fs.inotify.max_user_watches=524288
-           to keep it after a reboot, put the same settings in /etc/sysctl.d/99-olaitan.conf
+           to keep it after a reboot, put these lines in /etc/sysctl.d/99-olaitan.conf:
+           fs.inotify.max_user_instances = 512
+           fs.inotify.max_user_watches = 524288
+  ok       host has 8 vCPU and 30 GiB of memory (the full profile was tested on 8 vCPU / 32 GiB)
   ok       python3 with PyYAML (trims hack/kind-full.yaml to 1 worker(s))
   ok       no kind cluster named olaitan-full yet
+  ok       out dir /home/ubuntu/.olaitan-full is new or empty
 up: preflight found 1 blocker(s); nothing was created. Fix them and run make up again.
 ```
 
 After that one `sysctl`, `make up` ran to the end:
 
 ```
-  Olaitan (full profile, Falco on) saw a real action and moved the workload:
+  Falco detected a real action in the demo pod (full profile, Falco on):
+
+    falco rule Read sensitive file untrusted (on /etc/shadow, from olaitan-up/up-demo)
+    reads      1 of /etc/shadow (0 failed execs) before the alert
+
+  and the aggregator moved the workload:
 
     workload   olaitan-up/Pod/up-demo
     from       CLEAN
     to         SUSPICIOUS
     score      27.5
-    logged at  2026-09-25T06:42:25.854609892Z (aggregator clock)
-    falco rule Read sensitive file untrusted
-    reads      26 of /etc/shadow before the transition
+    logged at  2026-09-25T09:28:00.791515565Z (aggregator clock)
 
-  make up -> Falco, collector, aggregator ready:  319s
-  make up -> first detection:                     727s (budget 900s)
+  make up -> Falco, collector, aggregator ready:  309s
+  make up -> Falco alert:                         316s (budget 900s)
+  make up -> FSM transition:                      744s
 ```
 
-That was an 8 vCPU, 32 GiB Ubuntu 24.04 host on kernel 7.0 (kind v0.30.0,
-helm v3.16.4) with only Docker, kind, helm, kubectl and make installed
-(openssl and python3 with PyYAML come with the image). The time covers the
-whole command, from preflight to the aggregator's decision, and `make up`
-fails over 900 s (`UP_BUDGET`). Falco saw the first read. On this profile
-the rule score alone (20) stays below the threshold, so the transition
-waited for the in-cluster model's first verdict on CPU (7.5), about seven
-minutes after that read; the reads repeat until the aggregator decides.
-With 4 vCPUs expect that step to be slower, and possibly over budget.
+That was a fresh 8 vCPU, 32 GiB Ubuntu 24.04 host on kernel 7.0 (kind
+v0.30.0, helm v3.16.4). The times cover the whole command, from preflight
+on. **What `make up` needs is Falco's alert on the read, within 900 s
+(`UP_BUDGET`); without it, `make up` fails.** The FSM transition is a
+separate step: on the full profile the aggregator runs the analyst chain
+on the in-cluster model, on CPU, before it scores, so the transition only
+comes once that chain is done. Here it came 428 s after the alert. The time
+depends on the host, and on an earlier run on the same host size it had
+not come within 900 s. `make up` keeps polling for the transition until the
+budget ends. If the transition does not come in time, `make up` says so,
+says the detection happened, and still exits 0. Story 7.4 (scoring before
+the analyst chain) is the fix, and #185 tracks the timing.
 
 It uses the chart in your checkout with the `edge` image, the same cluster
 name, out dir and worker count as `make e2e-full` (`FULL_CLUSTER_NAME`,
 `FULL_OUT_DIR`, `FULL_WORKERS`), and writes its kubeconfig to
-`$(FULL_OUT_DIR)/kubeconfig`, never to your default kubeconfig. `make down`
-ends by checking that no cluster, node container or kubeconfig context is
-left, and fails if one is.
+`$(FULL_OUT_DIR)/kubeconfig`, never to your default kubeconfig. The first
+thing it writes is a marker, `$(FULL_OUT_DIR)/.olaitan-up`, with the
+cluster name in it.
+
+`make down` goes by name. It removes any kind cluster called
+`$(FULL_CLUSTER_NAME)`, whoever made it, plus that cluster's node
+containers and any `kind-<name>` context, cluster and user entries in your
+default kubeconfig, and prints each removal. It removes `$(FULL_OUT_DIR)`
+only when `make up`'s marker is in it and names that cluster. If the marker
+is missing, it leaves the directory in place, says so, and exits non-zero.
+Both commands refuse an out dir that is empty, relative, a symlink, `/`,
+your home directory or a parent of it, or the repository, a parent of it
+or a path inside it. `make down` ends by checking that no cluster, node
+container or kubeconfig context is left. It fails if something is left, or
+if it could not check.
 
 ### Where it runs
 

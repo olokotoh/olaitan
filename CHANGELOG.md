@@ -22,14 +22,27 @@ and false-positive numbers; see [Unreleased](#unreleased).
 
 - **`make up` / `make down`** (Story 12.3, #120). `make up` checks the host
   first (tools, Docker, BTF, the Falco pin against the kernel, inotify
-  limits, PyYAML when the node list is trimmed, an existing cluster) and
-  stops with the exact fix for every blocker before anything is created.
-  Then it brings up kind-full with the full profile and Falco on, reads
-  `/etc/shadow` in a throwaway pod, and prints the aggregator's first
-  decision about it with the time since `make up` started (non-zero exit
-  over 900 s, `UP_BUDGET`). `make down` removes the cluster, node
-  containers, kind kubeconfig entries, `$(FULL_OUT_DIR)` and
-  `hack/.audit-full`, then checks nothing is left.
+  limits, PyYAML when the node list is trimmed, an existing cluster, a
+  stale or foreign out dir; a caveat, not a blocker, below 8 vCPU or
+  32 GiB). It stops with the exact fix for every blocker before anything
+  is created. Then it brings up kind-full with the full profile and Falco
+  on, and reads `/etc/shadow` in a throwaway pod until Falco alerts on it.
+  That alert, within 900 s (`UP_BUDGET`), is what `make up` needs (AC1 as
+  amended on 2026-09-25). After it, `make up` waits for the aggregator's
+  FSM transition until the budget ends and prints it if it comes. On the
+  full profile the transition comes only once the analyst chain has run on
+  the in-cluster CPU model, which it does before scoring. So the timing
+  depends on the host, and a transition that has not come yet is reported
+  without failing the run (#185, Story 7.4). Tested on 8 vCPU, 32 GiB and
+  about 40 GB of disk: Falco alert at 316 s, transition at 744 s. `make
+  down` removes any kind cluster with that name, its node containers and
+  the `kind-<name>` kubeconfig entries, printing each removal, then
+  `hack/.audit-full`. It removes `$(FULL_OUT_DIR)` only when `make up`'s
+  `.olaitan-up` marker in it names the cluster. Both commands refuse an
+  out dir that is empty, relative, a symlink, `/`, the home directory or
+  a parent of it, or the repository, a parent of it or a path inside it.
+  `make down` ends by checking that nothing is left, and fails if
+  something is or if it could not check.
 - **`make quickstart`** (Story 12.2, #119). From a clone: a fresh kind
   cluster, the published chart with Falco on, a real `cat /etc/shadow` in a
   throwaway pod in a scored namespace, and the agent's first decision about
