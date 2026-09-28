@@ -6246,6 +6246,36 @@ func TestKindOverlayExemptsOnlyKindsMountHook(t *testing.T) {
 	}
 }
 
+// TestSATokenReadRuleIsShellDrivenOnly: Story 11.2d kubeadm benign check.
+// Every client-go process re-reads its projected ServiceAccount token, so a
+// Falco rule on any read of the file fired on Calico, kube-proxy, the
+// tigera-operator and Olaitan itself, and OLT-CRED-001 matched 113 times with
+// no attack. Decision (Aslim, 2026-09-28): the chart's rule fires only when
+// the reader is a shell or the child of a shell, which is how an attacker in
+// the pod reads it. The OLT rule itself is not touched.
+func TestSATokenReadRuleIsShellDrivenOnly(t *testing.T) {
+	rules := docByKindName(t, helmTemplate(t, nil), "ConfigMap", "falco-rules")
+	data, _ := rules["data"].(map[string]any)
+	var parsed []map[string]any
+	if err := yaml.Unmarshal([]byte(fmt.Sprint(data["olaitan-detection.yaml"])), &parsed); err != nil {
+		t.Fatalf("parse olaitan-detection.yaml: %v", err)
+	}
+	var cond string
+	for _, r := range parsed {
+		if r["rule"] == "Olaitan ServiceAccount Token Read" {
+			cond = fmt.Sprint(r["condition"])
+		}
+	}
+	if cond == "" {
+		t.Fatal("Olaitan ServiceAccount Token Read is missing from olaitan-detection.yaml")
+	}
+	for _, want := range []string{"proc.name in (shell_binaries)", "proc.pname in (shell_binaries)", "serviceaccount/"} {
+		if !strings.Contains(cond, want) {
+			t.Errorf("SA token rule condition is missing %q: %s", want, cond)
+		}
+	}
+}
+
 // TestKindOverlaysExemptKindsMountHookFromTheEscapeRule: Story 11.2d benign
 // check. The same kind hook (mount-product-files.sh, proc.pname
 // mount-product-f) runs /usr/bin/mount with CAP_SYS_ADMIN inside every new

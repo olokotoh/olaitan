@@ -1652,13 +1652,18 @@ falco:
         source: syscall
       - rule: Olaitan ServiceAccount Token Read
         desc: >-
-          A container process opens the projected ServiceAccount token file.
-          Emits fd.name (OLT-CRED-001 keys on file.path) and proc.exepath
-          (process.exe) plus the k8s pod identity.
+          A shell, or a program a shell started, opens the projected
+          ServiceAccount token file inside a container: how an attacker in the
+          pod reads it. Client libraries (client-go and others) re-read the
+          token themselves for rotation, so a rule on every read fired on
+          Calico, kube-proxy and Olaitan itself (Story 11.2d kubeadm benign
+          check). Emits fd.name (OLT-CRED-001 keys on file.path) and
+          proc.exepath (process.exe) plus the k8s pod identity.
         condition: >-
           open_read and container
           and (fd.name startswith /run/secrets/kubernetes.io/serviceaccount/
           or fd.name startswith /var/run/secrets/kubernetes.io/serviceaccount/)
+          and (proc.name in (shell_binaries) or proc.pname in (shell_binaries))
         output: >-
           Olaitan serviceaccount token read (file=%fd.name
           proc_exepath=%proc.exepath k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
