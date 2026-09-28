@@ -200,16 +200,22 @@ func (e *attackExecutor) settle(ctx context.Context) {
 // attack namespace. S3 needs the concrete pod name because kubectl cp cannot
 // address a Deployment.
 func (e *attackExecutor) targetPod(ctx context.Context) (string, error) {
+	// Story 11.2d: skip pods that are terminating or not Running. The previous
+	// trial's pod can still be Terminating when this one starts; picking it
+	// made S3 upload kubectl into the old pod and exec in the new one.
 	out, err := e.runCmd(ctx, "kubectl", "get", "pod", "-n", attackNamespace,
-		"-l", "app=web", "-o", "jsonpath={.items[0].metadata.name}")
+		"-l", "app=web", "-o",
+		`jsonpath={range .items[*]}{.metadata.name}{"|"}{.metadata.deletionTimestamp}{"|"}{.status.phase}{"\n"}{end}`)
 	if err != nil {
 		return "", err
 	}
-	name := strings.TrimSpace(out)
-	if name == "" {
-		return "", fmt.Errorf("no running pod for app=web in %s", attackNamespace)
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Split(strings.TrimSpace(line), "|")
+		if len(f) == 3 && f[0] != "" && f[1] == "" && f[2] == "Running" {
+			return f[0], nil
+		}
 	}
-	return name, nil
+	return "", fmt.Errorf("no running, non-terminating pod for app=web in %s", attackNamespace)
 }
 
 // attackSettleWait is how long Execute waits AFTER the technique primitive
@@ -371,7 +377,10 @@ func (e *attackExecutor) runS3(ctx context.Context) error {
 	}
 	// Exec the uploaded real kubectl. --client keeps it offline (no API call,
 	// no egress); the point is the /kubectl-named execve Falco observes.
-	out, err := e.exec(ctx, "chmod +x /tmp/kubectl 2>/dev/null; /tmp/kubectl version --client 2>&1 | head -n 2; true")
+	// Exec in the SAME pod the binary was uploaded to (not deploy/web, which
+	// kubectl may resolve to a different pod of the Deployment).
+	out, err := e.runCmd(ctx, "kubectl", "exec", "-n", attackNamespace, pod, "-c", "web", "--",
+		"sh", "-c", "chmod +x /tmp/kubectl 2>/dev/null; /tmp/kubectl version --client 2>&1 | head -n 2; true")
 	if err != nil {
 		return fmt.Errorf("s3 in-pod kubectl primitive: %w", err)
 	}

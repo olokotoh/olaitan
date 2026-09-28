@@ -208,7 +208,7 @@ func TestAttackExecutor_S3_LaunchesKubectlNamedProcessInPod(t *testing.T) {
 	// jsonpath`; return one for that call so kubectl cp has a destination.
 	stdoutFor := func(args []string) string {
 		if strings.Contains(strings.Join(args, " "), "get pod") {
-			return "web-6d4f9c7b8-abcde"
+			return "web-6d4f9c7b8-abcde||Running\n"
 		}
 		return ""
 	}
@@ -244,6 +244,67 @@ func TestAttackExecutor_S3_LaunchesKubectlNamedProcessInPod(t *testing.T) {
 		if strings.Contains(joinCall(c), "cp /bin/busybox") || strings.Contains(joinCall(c), "busybox /tmp/kubectl") {
 			t.Errorf("S3 must not rename busybox (multicall exits 127): %s", joinCall(c))
 		}
+	}
+}
+
+// TestAttackExecutor_S3_UploadsAndExecsInTheSameLivePod: Story 11.2d kubeadm
+// live run. S3 missed OLT-LATERAL-001 in 4 of 5 runs: the previous trial's
+// web pod was still Terminating, the cp target was items[0] (that old pod),
+// and the exec went through deploy/web to the NEW pod, which answered
+// "sh: /tmp/kubectl: not found". The executor must skip terminating and
+// non-Running pods, and upload to and exec in the one pod it resolved.
+func TestAttackExecutor_S3_UploadsAndExecsInTheSameLivePod(t *testing.T) {
+	var calls []recordedCall
+	stdoutFor := func(args []string) string {
+		if strings.Contains(strings.Join(args, " "), "get pod") {
+			return "web-old-aaaaa|2026-09-28T11:02:20Z|Running\n" +
+				"web-new-pending||Pending\n" +
+				"web-new-bbbbb||Running\n"
+		}
+		return ""
+	}
+	e, err := newAttackExecutor("s3", harnessDir("s3-lateral-movement"), recordingRunner(&calls, stdoutFor, ""), testLogger())
+	if err != nil {
+		t.Fatalf("newAttackExecutor: %v", err)
+	}
+	e.settleWait = 0
+	e.kubectlBinary = "/fake/kubectl"
+	if err := e.Execute(context.Background()); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	cpIdx := firstCallContaining(calls, " cp ")
+	if cpIdx < 0 || !strings.Contains(joinCall(calls[cpIdx]), "tenant-acme/web-new-bbbbb:/tmp/kubectl") {
+		t.Fatalf("S3 did not upload to the live, non-terminating pod; calls=%v", calls)
+	}
+	execIdx := firstCallContaining(calls, "/tmp/kubectl version")
+	if execIdx < 0 {
+		t.Fatalf("S3 did not exec the uploaded kubectl; calls=%v", calls)
+	}
+	ex := joinCall(calls[execIdx])
+	if !strings.Contains(ex, " web-new-bbbbb ") || strings.Contains(ex, "deploy/web") {
+		t.Errorf("S3 exec must target the same pod it uploaded to, not deploy/web: %s", ex)
+	}
+}
+
+func TestAttackExecutor_S3_FailsWhenNoLivePod(t *testing.T) {
+	var calls []recordedCall
+	stdoutFor := func(args []string) string {
+		if strings.Contains(strings.Join(args, " "), "get pod") {
+			return "web-old-aaaaa|2026-09-28T11:02:20Z|Running\n"
+		}
+		return ""
+	}
+	e, err := newAttackExecutor("s3", harnessDir("s3-lateral-movement"), recordingRunner(&calls, stdoutFor, ""), testLogger())
+	if err != nil {
+		t.Fatalf("newAttackExecutor: %v", err)
+	}
+	e.settleWait = 0
+	e.kubectlBinary = "/fake/kubectl"
+	if err := e.Execute(context.Background()); err == nil {
+		t.Fatal("Execute succeeded with only a terminating pod; want an error")
+	}
+	if firstCallContaining(calls, " cp ") >= 0 {
+		t.Errorf("S3 uploaded into a terminating pod; calls=%v", calls)
 	}
 }
 

@@ -84,7 +84,7 @@ func TestNewScenario_DispatchAllFive(t *testing.T) {
 			// answer that lookup; all other calls return empty.
 			fakeAttack := func(ctx context.Context, name string, args ...string) (string, error) {
 				if strings.Contains(strings.Join(args, " "), "get pod") {
-					return "web-6d4f9c7b8-abcde", nil
+					return "web-6d4f9c7b8-abcde||Running\n", nil // name|deletionTimestamp|phase (Story 11.2d)
 				}
 				return "", nil
 			}
