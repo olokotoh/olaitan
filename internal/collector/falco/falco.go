@@ -156,13 +156,6 @@ type Config struct {
 	// fallback limiter is constructed in New(); main.go owns the
 	// production instance so the hot-reload callback can retune it.
 	RateLimit *ratelimit.Limiter
-
-	// PodIdentity, when set, fills the pod on alerts that have a
-	// container.id but no k8s.ns.name / k8s.pod.name (Story 11.2d, #195).
-	// It runs before Translate and before the ordering lock, so its
-	// bounded wait holds only the request it is enriching. Nil disables
-	// enrichment.
-	PodIdentity PodIdentityResolver
 }
 
 // DefaultPublishRetry returns the worker's retry strategy: 100ms doubling
@@ -391,10 +384,6 @@ func (a *Adapter) RequestsByCode(code string) uint64 {
 // can retune it without a restart (FR49).
 func (a *Adapter) Limiter() *ratelimit.Limiter { return a.limiter }
 
-// PodIdentity returns the pod identity resolver the adapter enriches with,
-// or nil when enrichment is off. The metrics layer reads its counters.
-func (a *Adapter) PodIdentity() PodIdentityResolver { return a.cfg.PodIdentity }
-
 // Addr is the bound listen address once Run has started, or "".
 func (a *Adapter) Addr() string {
 	a.addrMu.Lock()
@@ -560,19 +549,12 @@ func (a *Adapter) handleAlert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	heartbeat := resp.GetSource() == internalSource && resp.GetRule() == metricsSnapshotRule
-	if !heartbeat {
-		// Story 11.2d: fill the pod Falco left empty. Outside a.seq so a
-		// wait for a just-started container never holds up other alerts.
-		EnrichPodIdentity(r.Context(), resp, a.cfg.PodIdentity)
-	}
-
 	a.seq.Lock()
 	defer a.seq.Unlock()
 
 	// Anything well-formed from Falco proves it is alive.
 	a.sawFalco()
-	if heartbeat {
+	if resp.GetSource() == internalSource && resp.GetRule() == metricsSnapshotRule {
 		a.heartbeats.Add(1)
 		a.respond(w, http.StatusNoContent, "")
 		return
