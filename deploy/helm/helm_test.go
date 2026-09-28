@@ -6248,6 +6248,49 @@ func TestKindOverlayExemptsOnlyKindsMountHook(t *testing.T) {
 	}
 }
 
+// TestKindOverlaysExemptKindsMountHookFromTheEscapeRule: Story 11.2d benign
+// check. The same kind hook (mount-product-files.sh, proc.pname
+// mount-product-f) runs /usr/bin/mount with CAP_SYS_ADMIN inside every new
+// container, so the chart's "Olaitan Privileged Escape Primitive" rule fired
+// on every pod start on kind-full and OLT-PRIV-001 matched with no attack.
+// Both kind overlays must append the same narrow exception to that rule; the
+// default values must not, because real nodes do not run the hook.
+func TestKindOverlaysExemptKindsMountHookFromTheEscapeRule(t *testing.T) {
+	for _, overlay := range []string{"values-kind.yaml", "values-full.yaml"} {
+		t.Run(overlay, func(t *testing.T) {
+			args := []string{"template", "olaitan", chartDir(t),
+				"--set", "secrets.redisPassword=test-password",
+				"-f", filepath.Join(chartDir(t), overlay)}
+			if overlay == "values-full.yaml" {
+				args = append(args, "-f", filepath.Join(filepath.Dir(chartDir(t)), "testdata", "full-profile", "stub-key-material.yaml"))
+			}
+			out, err := exec.Command("helm", args...).CombinedOutput()
+			if err != nil {
+				t.Fatalf("render with %s: %v\n%s", overlay, err, out)
+			}
+			rules := docByKindName(t, string(out), "ConfigMap", "falco-rules")
+			data, _ := rules["data"].(map[string]any)
+			body := fmt.Sprint(data["olaitan-kind-exceptions.yaml"])
+			i := strings.Index(body, "- rule: Olaitan Privileged Escape Primitive")
+			if i < 0 {
+				t.Fatalf("%s does not append an exception to Olaitan Privileged Escape Primitive", overlay)
+			}
+			block := body[i:]
+			if j := strings.Index(block[1:], "- rule:"); j >= 0 {
+				block = block[:j+1]
+			}
+			for _, want := range []string{"kind_mount_product_files_hook", "[proc.pname, proc.exepath]", "mount-product-f", "/usr/bin/mount", "exceptions: append"} {
+				if !strings.Contains(block, want) {
+					t.Errorf("%s escape-rule exception is missing %q", overlay, want)
+				}
+			}
+		})
+	}
+	if strings.Contains(helmTemplate(t, nil), "mount-product-f") {
+		t.Error("the default install carries the kind-only mount hook exception")
+	}
+}
+
 // TestNetworkPolicyAllowsTheRealAPIServer: Story 10.3. The release policy
 // allowed only networkPolicy.apiServerCIDR (kubeadm's 10.96.0.1), so on k3s
 // (10.43.0.1) and minikube (endpoint port 8443), both of which enforce
