@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"debug/elf"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -100,23 +102,45 @@ type attackExecutor struct {
 	prepareKubectl func(path string) (resolved, sha256hex string, err error)
 }
 
-// resolveUploadKubectl follows symlinks to the real kubectl file, refuses
-// anything that is not an ELF binary (a Homebrew/asdf/snap shim or a script
-// cannot run inside the Linux target pod), and returns its sha256.
+// resolveUploadKubectl follows symlinks to the real kubectl file and refuses
+// anything the busybox target pod cannot run as kubectl: a script shim, a
+// multicall binary that snap, mise or aqua link as kubectl (the resolved file
+// must itself be named kubectl), and a dynamically linked ELF (the pod has no
+// loader). It returns the resolved path and the sha256 of that file, streamed
+// rather than read into memory.
 func resolveUploadKubectl(path string) (string, string, error) {
+	if path == "" {
+		return "", "", fmt.Errorf("kubectl not found on PATH; S3 uploads the runner's own kubectl, so put a real Linux kubectl on PATH")
+	}
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return "", "", fmt.Errorf("resolve kubectl %q: %w", path, err)
 	}
-	data, err := os.ReadFile(resolved)
+	if filepath.Base(resolved) != "kubectl" {
+		return "", "", fmt.Errorf("kubectl %q resolves to %q, which is not a kubectl binary (a snap, mise or aqua shim); put a real Linux kubectl first on PATH", path, resolved)
+	}
+	f, err := os.Open(resolved)
 	if err != nil {
 		return "", "", fmt.Errorf("read kubectl %q: %w", resolved, err)
 	}
-	if !bytes.HasPrefix(data, []byte("\x7fELF")) {
-		return "", "", fmt.Errorf("kubectl %q is not an ELF binary (a shim or script cannot run in the target pod); put a real Linux kubectl first on PATH", resolved)
+	defer func() { _ = f.Close() }()
+	bin, err := elf.NewFile(f)
+	if err != nil {
+		return "", "", fmt.Errorf("kubectl %q is not an ELF binary (a shim or script cannot run in the target pod); put a real Linux kubectl first on PATH: %w", resolved, err)
 	}
-	sum := sha256.Sum256(data)
-	return resolved, hex.EncodeToString(sum[:]), nil
+	for _, p := range bin.Progs {
+		if p.Type == elf.PT_INTERP {
+			return "", "", fmt.Errorf("kubectl %q is dynamically linked and the target pod has no loader for it; use a static kubectl (the upstream release binaries are)", resolved)
+		}
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return "", "", fmt.Errorf("rewind kubectl %q: %w", resolved, err)
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", "", fmt.Errorf("hash kubectl %q: %w", resolved, err)
+	}
+	return resolved, hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // newAttackExecutor builds the executor for an S1-S3 scenario. An unknown or
@@ -156,13 +180,9 @@ func newAttackExecutor(scenarioID, dir string, runCmd attackRunFunc, logger *slo
 	}
 	// Resolve a real, standalone kubectl on the runner host for S3 to upload
 	// into the target (a renamed busybox exits 127 on the multicall dispatch).
-	// LookPath failure falls back to the conventional path; the live S3 path
-	// surfaces a clear cp error if neither exists.
-	kubectlBinary, err := exec.LookPath("kubectl")
-	if err != nil || kubectlBinary == "" {
-		kubectlBinary = "/usr/local/bin/kubectl"
-		logger.Warn("kubectl not found on PATH; S3 falls back to the conventional path", "path", kubectlBinary, "err", err)
-	}
+	// Not on PATH leaves it empty and S3 fails loudly in resolveUploadKubectl;
+	// every other step shells out to kubectl too, so no fallback path exists.
+	kubectlBinary, _ := exec.LookPath("kubectl")
 	return &attackExecutor{
 		prepareKubectl: resolveUploadKubectl,
 		scenarioID:     scenarioID,
@@ -400,7 +420,11 @@ func (e *attackExecutor) runS3(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("s3 resolve target pod: %w", err)
 	}
-	src, sum, err := e.prepareKubectl(e.kubectlBinary)
+	prepare := e.prepareKubectl
+	if prepare == nil {
+		prepare = resolveUploadKubectl
+	}
+	src, sum, err := prepare(e.kubectlBinary)
 	if err != nil {
 		return fmt.Errorf("s3 kubectl to upload: %w", err)
 	}
@@ -418,9 +442,11 @@ func (e *attackExecutor) runS3(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("s3 in-pod kubectl primitive: %w", err)
 	}
+	version, _, _ := strings.Cut(strings.TrimSpace(out), "\n")
 	e.logger.Info("s3 technique executed",
 		"mitre", "T1613", "also", "T1609", "rule", "OLT-LATERAL-001",
-		"detail", "kubectl exec + uploaded real /tmp/kubectl process", "out_len", len(out))
+		"detail", "kubectl exec + uploaded real /tmp/kubectl process",
+		"kubectl_version", version, "out_len", len(out))
 	return nil
 }
 

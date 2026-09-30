@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"debug/elf"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"os"
@@ -342,49 +345,175 @@ func TestAttackExecutor_S3_DoesNotMaskAFailedKubectl(t *testing.T) {
 	if idx < 0 {
 		t.Fatalf("S3 did not exec kubectl; calls=%v", calls)
 	}
+	// The recording runner cannot run sh, so only the script text proves no
+	// pipe or trailing command swallows kubectl's exit status.
 	script := calls[idx].args[len(calls[idx].args)-1]
-	if strings.Contains(script, "true") || strings.Contains(script, "| head") {
-		t.Errorf("S3 in-pod script still masks the exit code: %q", script)
+	if want := "chmod +x /tmp/kubectl && /tmp/kubectl version --client 2>&1"; script != want {
+		t.Errorf("S3 in-pod script = %q, want exactly %q (nothing after kubectl may mask its exit code)", script, want)
 	}
 }
 
-// TestResolveUploadKubectl: review round 1 (P2) and decision D2. The runner
-// uploads its own kubectl, so the path must resolve through symlinks and
-// shims to a real ELF binary, and its sha256 is recorded for the run.
-func TestResolveUploadKubectl(t *testing.T) {
-	dir := t.TempDir()
-	elf := filepath.Join(dir, "kubectl-real")
-	if err := os.WriteFile(elf, []byte("\x7fELF\x02\x01\x01payload"), 0o755); err != nil {
+// writeELF writes a minimal ELF64 executable named name under dir. With
+// interp it carries a PT_INTERP program header, i.e. it is dynamically
+// linked and needs a loader the busybox target pod does not have.
+func writeELF(t *testing.T, dir, name string, interp bool) string {
+	t.Helper()
+	var buf bytes.Buffer
+	hdr := elf.Header64{
+		Type: uint16(elf.ET_EXEC), Machine: uint16(elf.EM_X86_64), Version: uint32(elf.EV_CURRENT),
+		Ehsize: 64, Phentsize: 56, Shentsize: 64,
+	}
+	copy(hdr.Ident[:], []byte{0x7f, 'E', 'L', 'F', byte(elf.ELFCLASS64), byte(elf.ELFDATA2LSB), byte(elf.EV_CURRENT)})
+	loader := []byte("/lib64/ld-linux-x86-64.so.2\x00")
+	if interp {
+		hdr.Phoff, hdr.Phnum = 64, 1
+	}
+	if err := binary.Write(&buf, binary.LittleEndian, hdr); err != nil {
 		t.Fatal(err)
 	}
+	if interp {
+		prog := elf.Prog64{Type: uint32(elf.PT_INTERP), Off: 64 + 56, Filesz: uint64(len(loader)), Memsz: uint64(len(loader))}
+		if err := binary.Write(&buf, binary.LittleEndian, prog); err != nil {
+			t.Fatal(err)
+		}
+		buf.Write(loader)
+	}
+	buf.WriteString("payload")
+	path := filepath.Join(dir, name)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestResolveUploadKubectl: review rounds 1 (P2) and 2, decision D2. The
+// runner uploads its own kubectl, so the path must resolve through symlinks
+// to a real, statically linked kubectl, and the recorded sha256 must be the
+// digest of the file that is uploaded.
+func TestResolveUploadKubectl(t *testing.T) {
+	dir := t.TempDir()
+	real := writeELF(t, dir, "versions/1.34/bin/kubectl", false)
 	link := filepath.Join(dir, "kubectl")
-	if err := os.Symlink(elf, link); err != nil {
+	if err := os.Symlink(real, link); err != nil {
 		t.Fatal(err)
 	}
 	got, sum, err := resolveUploadKubectl(link)
 	if err != nil {
 		t.Fatalf("resolveUploadKubectl(symlink): %v", err)
 	}
-	if got != elf {
-		t.Errorf("resolved %q, want the symlink target %q", got, elf)
+	if got != real {
+		t.Errorf("resolved %q, want the symlink target %q", got, real)
 	}
-	if len(sum) != 64 {
-		t.Errorf("sha256 = %q, want 64 hex chars", sum)
+	data, _ := os.ReadFile(real)
+	if want := fmt.Sprintf("%x", sha256.Sum256(data)); sum != want {
+		t.Errorf("sha256 = %q, want the digest of the uploaded file %q", sum, want)
 	}
 
-	shim := filepath.Join(dir, "kubectl-shim")
-	if err := os.WriteFile(shim, []byte("#!/bin/sh\nexec real-kubectl \"$@\"\n"), 0o755); err != nil {
+	for name, path := range map[string]string{
+		// A script shim cannot run in the pod.
+		"script shim": func() string {
+			p := filepath.Join(dir, "shim", "kubectl")
+			_ = os.MkdirAll(filepath.Dir(p), 0o755)
+			_ = os.WriteFile(p, []byte("#!/bin/sh\nexec real-kubectl \"$@\"\n"), 0o755)
+			return p
+		}(),
+		// snap, mise and aqua put a symlink named kubectl on PATH that
+		// resolves to their own multicall ELF.
+		"snap-style multicall target": func() string {
+			target := writeELF(t, dir, "usr/bin/snap", false)
+			p := filepath.Join(dir, "snap", "bin", "kubectl")
+			_ = os.MkdirAll(filepath.Dir(p), 0o755)
+			_ = os.Symlink(target, p)
+			return p
+		}(),
+		// A dynamically linked kubectl has no loader in the busybox target.
+		"dynamically linked": writeELF(t, dir, "nix/bin/kubectl", true),
+		"dangling symlink": func() string {
+			p := filepath.Join(dir, "dangling")
+			_ = os.Symlink(filepath.Join(dir, "missing"), p)
+			return p
+		}(),
+		"not on PATH": "",
+	} {
+		if _, _, err := resolveUploadKubectl(path); err == nil {
+			t.Errorf("%s (%q) was accepted; want an error", name, path)
+		}
+	}
+}
+
+// TestAttackExecutor_S3_WithoutAStubUsesTheRealResolver: review round 2. An
+// executor whose prepareKubectl is unset must not panic; it resolves the
+// kubectl itself.
+func TestAttackExecutor_S3_WithoutAStubUsesTheRealResolver(t *testing.T) {
+	var calls []recordedCall
+	stdoutFor := func(args []string) string {
+		if strings.Contains(strings.Join(args, " "), "get pod") {
+			return "web-new-bbbbb||Running\n"
+		}
+		return ""
+	}
+	e, err := newAttackExecutor("s3", harnessDir("s3-lateral-movement"), recordingRunner(&calls, stdoutFor, ""), testLogger())
+	if err != nil {
+		t.Fatalf("newAttackExecutor: %v", err)
+	}
+	e.settleWait = 0
+	e.kubectlBinary = writeELF(t, t.TempDir(), "kubectl", false)
+	e.prepareKubectl = nil
+	if err := e.Execute(context.Background()); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if firstCallContaining(calls, "cp "+e.kubectlBinary) < 0 {
+		t.Errorf("S3 did not upload the resolved kubectl %q; calls=%v", e.kubectlBinary, calls)
+	}
+}
+
+// TestAttackExecutor_S3_LogsTheKubectlVersion: review round 2, decision D2
+// ("log kubectl version + sha256 in the run"). The in-pod `version --client`
+// output names the exact client that ran; its first line is logged.
+func TestAttackExecutor_S3_LogsTheKubectlVersion(t *testing.T) {
+	var calls []recordedCall
+	stdoutFor := func(args []string) string {
+		joined := strings.Join(args, " ")
+		switch {
+		case strings.Contains(joined, "get pod"):
+			return "web-new-bbbbb||Running\n"
+		case strings.Contains(joined, "/tmp/kubectl version"):
+			return "Client Version: v1.34.12\nKustomize Version: v5.7.1\n"
+		}
+		return ""
+	}
+	var logs bytes.Buffer
+	e, err := newAttackExecutor("s3", harnessDir("s3-lateral-movement"), recordingRunner(&calls, stdoutFor, ""), slog.New(slog.NewTextHandler(&logs, nil)))
+	if err != nil {
+		t.Fatalf("newAttackExecutor: %v", err)
+	}
+	e.settleWait = 0
+	e.kubectlBinary = "/fake/kubectl"
+	e.prepareKubectl = fakePrepareKubectl
+	if err := e.Execute(context.Background()); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(logs.String(), `kubectl_version="Client Version: v1.34.12"`) {
+		t.Errorf("the run log does not record the in-pod kubectl version:\n%s", logs.String())
+	}
+}
+
+// TestAttackNamespaceIsInTheKubectlRuleScope: review round 2. The chart's
+// kubectl rule and D3's exception only cover tenant- namespaces, so S3 is
+// detected only while the attack namespace carries that prefix.
+func TestAttackNamespaceIsInTheKubectlRuleScope(t *testing.T) {
+	if !strings.HasPrefix(attackNamespace, "tenant-") {
+		t.Fatalf("attackNamespace %q is outside the chart kubectl rule's tenant- scope", attackNamespace)
+	}
+	values, err := os.ReadFile(filepath.Join("..", "..", "deploy", "helm", "olaitan", "values.yaml"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := resolveUploadKubectl(shim); err == nil {
-		t.Error("a shell-script shim was accepted; want an error (it cannot run in the pod)")
-	}
-	dangling := filepath.Join(dir, "dangling")
-	if err := os.Symlink(filepath.Join(dir, "missing"), dangling); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := resolveUploadKubectl(dangling); err == nil {
-		t.Error("a dangling symlink was accepted; want an error")
+	if !strings.Contains(string(values), "k8s.ns.name startswith tenant-") {
+		t.Error("the chart kubectl rule no longer scopes on tenant-; update attackNamespace and this test together")
 	}
 }
 
