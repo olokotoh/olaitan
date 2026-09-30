@@ -6276,6 +6276,97 @@ func TestSATokenReadRuleIsShellDrivenOnly(t *testing.T) {
 	}
 }
 
+// olaitanDetectionRules parses the chart's olaitan-detection.yaml from the
+// default render and returns each entry keyed by its rule name.
+func olaitanDetectionRules(t *testing.T) map[string]map[string]any {
+	t.Helper()
+	rules := docByKindName(t, helmTemplate(t, nil), "ConfigMap", "falco-rules")
+	data, _ := rules["data"].(map[string]any)
+	var parsed []map[string]any
+	if err := yaml.Unmarshal([]byte(fmt.Sprint(data["olaitan-detection.yaml"])), &parsed); err != nil {
+		t.Fatalf("parse olaitan-detection.yaml: %v", err)
+	}
+	out := map[string]map[string]any{}
+	for _, r := range parsed {
+		if name, ok := r["rule"].(string); ok {
+			out[name] = r
+		}
+	}
+	return out
+}
+
+// TestFalcoRulesCarryTheOLTExclusions: Story 11.2d review round 1, decision
+// D1 (Aslim, 2026-09-28). The four chart rules are WARNING, and a WARNING
+// alert starts an investigation on its own, so it can mark a workload
+// SUSPICIOUS without passing the OLT rules' own filters. Each Falco condition
+// therefore carries the exclusions its OLT rule already has. The OLT rules
+// are not touched. P7: setns is a syscall, never a process name.
+func TestFalcoRulesCarryTheOLTExclusions(t *testing.T) {
+	r := olaitanDetectionRules(t)
+	sysNS := "not k8s.ns.name in (kube-system, kube-public, kube-node-lease, olaitan)"
+	for rule, wants := range map[string][]string{
+		"Olaitan Privileged Escape Primitive": {sysNS},
+		"Olaitan Cloud Metadata Contact":      {sysNS},
+		"Olaitan ServiceAccount Token Read":   {"not proc.exepath in (olaitan_system_process_paths)"},
+		"Olaitan In-Pod kubectl Exec":         {"k8s.ns.name startswith tenant-"},
+	} {
+		cond := fmt.Sprint(r[rule]["condition"])
+		for _, want := range wants {
+			if !strings.Contains(cond, want) {
+				t.Errorf("%s condition is missing %q: %s", rule, want, cond)
+			}
+		}
+	}
+	// The OLT-CRED-001 system_process regex, spelled out as the list's paths.
+	rules := docByKindName(t, helmTemplate(t, nil), "ConfigMap", "falco-rules")
+	data, _ := rules["data"].(map[string]any)
+	var parsed []map[string]any
+	if err := yaml.Unmarshal([]byte(fmt.Sprint(data["olaitan-detection.yaml"])), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, e := range parsed {
+		if e["list"] == "olaitan_system_process_paths" {
+			for _, it := range e["items"].([]any) {
+				paths = append(paths, fmt.Sprint(it))
+			}
+		}
+	}
+	re := regexp.MustCompile(`^/(usr/)?(local/)?s?bin/(kubelet|kube-proxy|coredns)$`)
+	if len(paths) != 24 {
+		t.Errorf("olaitan_system_process_paths has %d paths, want the 24 the OLT-CRED-001 regex matches: %v", len(paths), paths)
+	}
+	for _, p := range paths {
+		if !re.MatchString(p) {
+			t.Errorf("olaitan_system_process_paths entry %q is not matched by the OLT-CRED-001 regex", p)
+		}
+	}
+	if strings.Contains(fmt.Sprint(r["Olaitan Privileged Escape Primitive"]["condition"]), "setns") {
+		t.Error("the escape rule lists setns as a process name; it is a syscall")
+	}
+}
+
+// TestOlaitanKubectlRuleWinsOverTheDefaultRule: decision D3. Falco stops at
+// the first matching rule, and the default "Drop and execute new binary in
+// container" (from the unpinned upstream rules package) used to win for S3's
+// /tmp/kubectl, so S3 detection hung on it. The chart appends an exception to
+// that rule for exactly the scope the Olaitan kubectl rule covers (a /kubectl
+// exe in a tenant- namespace), so the Olaitan rule is the one that fires
+// there and the default rule still covers every other namespace.
+func TestOlaitanKubectlRuleWinsOverTheDefaultRule(t *testing.T) {
+	r := olaitanDetectionRules(t)
+	d, ok := r["Drop and execute new binary in container"]
+	if !ok {
+		t.Fatal("olaitan-detection.yaml does not append an exception to Drop and execute new binary in container")
+	}
+	body, _ := yaml.Marshal(d)
+	for _, want := range []string{"olaitan_kubectl_rule_owns_it", "proc.exepath", "k8s.ns.name", "endswith", "startswith", "/kubectl", "tenant-", "exceptions: append"} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("default-rule exception is missing %q:\n%s", want, body)
+		}
+	}
+}
+
 // TestKindOverlaysExemptKindsMountHookFromTheEscapeRule: Story 11.2d benign
 // check. The same kind hook (mount-product-files.sh, proc.pname
 // mount-product-f) runs /usr/bin/mount with CAP_SYS_ADMIN inside every new

@@ -1621,7 +1621,7 @@ falco:
   # on plus the k8s pod identity the correlator needs to resolve workload
   # posture. Before this, real attacks produced no OLT match (only the removed
   # synthetic NATS events carried those fields); see the PR #194 live finding
-  # and _bmad-output/implementation-artifacts/11-2d-detection-gap.md.
+  # and PR #196 (Story 11.2d) for the live evidence.
   #
   # The OLT rules are NOT loosened. Story 10.3's canonical field mapping
   # (internal/collector/falco/translate.go) projects the emitted Falco fields
@@ -1634,6 +1634,38 @@ falco:
   # exception) deep-merge with this one.
   customRules:
     olaitan-detection.yaml: |-
+      # Review round 1, decision D1 (Aslim, 2026-09-28): a WARNING alert
+      # starts an investigation on its own, so each rule below carries the
+      # exclusions of the OLT rule it feeds. These two lists copy them
+      # verbatim (OLT-PRIV-001 / OLT-CRED-002 system_namespace inline below;
+      # the OLT-CRED-001 system_process regex ^/(usr/)?(local/)?s?bin/(kubelet|
+      # kube-proxy|coredns)$ spelled out as paths here). OLT rules unchanged.
+      - list: olaitan_system_process_paths
+        items:
+          - /bin/kubelet
+          - /sbin/kubelet
+          - /usr/bin/kubelet
+          - /usr/sbin/kubelet
+          - /local/bin/kubelet
+          - /local/sbin/kubelet
+          - /usr/local/bin/kubelet
+          - /usr/local/sbin/kubelet
+          - /bin/kube-proxy
+          - /sbin/kube-proxy
+          - /usr/bin/kube-proxy
+          - /usr/sbin/kube-proxy
+          - /local/bin/kube-proxy
+          - /local/sbin/kube-proxy
+          - /usr/local/bin/kube-proxy
+          - /usr/local/sbin/kube-proxy
+          - /bin/coredns
+          - /sbin/coredns
+          - /usr/bin/coredns
+          - /usr/sbin/coredns
+          - /local/bin/coredns
+          - /local/sbin/coredns
+          - /usr/local/bin/coredns
+          - /usr/local/sbin/coredns
       - rule: Olaitan Privileged Escape Primitive
         desc: >-
           A container process holding CAP_SYS_ADMIN runs a namespace or mount
@@ -1642,7 +1674,8 @@ falco:
         condition: >-
           spawned_process and container
           and thread.cap_effective contains CAP_SYS_ADMIN
-          and proc.name in (nsenter, mount, umount, chroot, setns, unshare)
+          and proc.name in (nsenter, mount, umount, chroot, unshare)
+          and not k8s.ns.name in (kube-system, kube-public, kube-node-lease, olaitan)
         output: >-
           Olaitan privileged escape primitive (proc_exepath=%proc.exepath
           proc_cmdline=%proc.cmdline cap_effective=%thread.cap_effective
@@ -1664,6 +1697,7 @@ falco:
           and (fd.name startswith /run/secrets/kubernetes.io/serviceaccount/
           or fd.name startswith /var/run/secrets/kubernetes.io/serviceaccount/)
           and (proc.name in (shell_binaries) or proc.pname in (shell_binaries))
+          and not proc.exepath in (olaitan_system_process_paths)
         output: >-
           Olaitan serviceaccount token read (file=%fd.name
           proc_exepath=%proc.exepath k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
@@ -1678,6 +1712,7 @@ falco:
         condition: >-
           evt.type=connect and evt.dir=< and container
           and (fd.sip=169.254.169.254 or fd.rip=169.254.169.254)
+          and not k8s.ns.name in (kube-system, kube-public, kube-node-lease, olaitan)
         output: >-
           Olaitan cloud metadata contact (dst_sip=%fd.sip dst_rip=%fd.rip
           proc_exepath=%proc.exepath k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
@@ -1691,12 +1726,28 @@ falco:
           plus the k8s pod identity.
         condition: >-
           spawned_process and container and proc.exepath endswith /kubectl
+          and k8s.ns.name startswith tenant-
         output: >-
           Olaitan in-pod kubectl exec (proc_exepath=%proc.exepath
           proc_cmdline=%proc.cmdline k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
         priority: WARNING
         tags: [olaitan, container, mitre_lateral_movement, T1613]
         source: syscall
+      # Decision D3: Falco stops at the first matching rule, and the default
+      # "Drop and execute new binary in container" (from the upstream rules
+      # package, not pinned by this chart) is loaded first, so it used to win
+      # for S3's /tmp/kubectl. Exempt it for exactly the scope the rule above
+      # covers (a /kubectl exe in a tenant- namespace) so the Olaitan rule
+      # fires there; the default rule still covers every other namespace.
+      - rule: Drop and execute new binary in container
+        exceptions:
+          - name: olaitan_kubectl_rule_owns_it
+            fields: [proc.exepath, k8s.ns.name]
+            comps: [endswith, startswith]
+            values:
+              - [/kubectl, tenant-]
+        override:
+          exceptions: append
 
 # NATS with JetStream persistence -- inter-ring event bus. JetStream
 # provides the replay/checkpoint primitive that Story 2.7 + Story 3.1
