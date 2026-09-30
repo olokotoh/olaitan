@@ -92,6 +92,14 @@ lint:
 olaitan-lint:
 	go run ./cmd/olaitan-lint ./...
 
+# Story 11.2d (review round 2): load the shipped Falco rules into the pinned
+# Falco image, with the pinned falco-rules package, for the default, kind and
+# full profiles. A rules file Falco rejects stops Falco at startup, so this
+# fails the build instead. Needs docker. See hack/validate-falco-rules.sh.
+.PHONY: falco-rules-validate
+falco-rules-validate: helm-prepare helm-deps
+	hack/validate-falco-rules.sh
+
 # dashboard-lint (Story 6.7, FR50/NFR32/NFR34) is the "no live Grafana"
 # testable proxy for the pre-built Grafana dashboards: it asserts every
 # deploy/grafana/dashboards/*.json parses, carries the pinned schemaVersion
