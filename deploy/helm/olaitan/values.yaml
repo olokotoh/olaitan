@@ -1604,6 +1604,24 @@ falco:
     image:
       # falcosecurity/falcoctl:0.13.0
       tag: "0.13.0@sha256:0eeb79adc580ae6a5abfdefd7f8f0fed9151fcb545f015c84e8f1d7b2d8a6b02"
+    # Story 11.2d decision D4: pin the Falco rules package. The subchart
+    # default falco-rules:5 floats to the newest 5.x and the follower
+    # re-pulls it weekly, so the ruleset (and every upstream rule name the
+    # overrides below and in the kind overlays depend on) could change under
+    # a running install. 5.2.0 is the version the 2026-09-30 live
+    # verification loaded (tag 5 then resolved to digest sha256:213c9bb2...).
+    # The container plugin keeps the subchart's own pin (container:0.7.1),
+    # which the subchart appends to the install refs. Change the rules only
+    # by changing this pin.
+    artifact:
+      follow:
+        enabled: false
+    config:
+      artifact:
+        install:
+          refs: [falco-rules:5.2.0]
+        follow:
+          refs: [falco-rules:5.2.0]
   extra:
     # The Falco chart renders these through `tpl` in this release's context,
     # so the Service FQDN and the Secret name follow the release name and
@@ -1675,7 +1693,7 @@ falco:
           spawned_process and container
           and thread.cap_effective contains CAP_SYS_ADMIN
           and proc.name in (nsenter, mount, umount, chroot, unshare)
-          and not k8s.ns.name in (kube-system, kube-public, kube-node-lease, olaitan)
+          and k8s.ns.name exists and not k8s.ns.name in (kube-system, kube-public, kube-node-lease, olaitan)
         output: >-
           Olaitan privileged escape primitive (proc_exepath=%proc.exepath
           proc_cmdline=%proc.cmdline cap_effective=%thread.cap_effective
@@ -1710,9 +1728,9 @@ falco:
           169.254.169.254. Emits fd.sip/fd.rip (OLT-CRED-002 keys on
           network.dst_ip) plus the k8s pod identity.
         condition: >-
-          evt.type=connect and evt.dir=< and container
+          evt.type=connect and container
           and (fd.sip=169.254.169.254 or fd.rip=169.254.169.254)
-          and not k8s.ns.name in (kube-system, kube-public, kube-node-lease, olaitan)
+          and k8s.ns.name exists and not k8s.ns.name in (kube-system, kube-public, kube-node-lease, olaitan)
         output: >-
           Olaitan cloud metadata contact (dst_sip=%fd.sip dst_rip=%fd.rip
           proc_exepath=%proc.exepath k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
@@ -1733,12 +1751,17 @@ falco:
         priority: WARNING
         tags: [olaitan, container, mitre_lateral_movement, T1613]
         source: syscall
-      # Decision D3: Falco stops at the first matching rule, and the default
-      # "Drop and execute new binary in container" (from the upstream rules
-      # package, not pinned by this chart) is loaded first, so it used to win
-      # for S3's /tmp/kubectl. Exempt it for exactly the scope the rule above
-      # covers (a /kubectl exe in a tenant- namespace) so the Olaitan rule
-      # fires there; the default rule still covers every other namespace.
+      # Decision D3: Falco stops at the first matching rule (rule_matching:
+      # first), and the upstream "Drop and execute new binary in container"
+      # is loaded first, so it used to win for S3's /tmp/kubectl. Exempt it
+      # for exactly the scope the rule above covers (a /kubectl exe in a
+      # tenant- namespace) so the Olaitan rule fires there; the default rule
+      # still covers every other namespace. Falco refuses to start if this
+      # override names a rule no loaded file defines, which is why the rules
+      # package is pinned below (falcoctl, decision D4). Side effect: in that
+      # scope the alert is the Olaitan rule's WARNING, not upstream's
+      # CRITICAL, and raising falco.falco.priority above warning drops the
+      # Olaitan rule while this exception stays.
       - rule: Drop and execute new binary in container
         exceptions:
           - name: olaitan_kubectl_rule_owns_it

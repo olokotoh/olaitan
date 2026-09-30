@@ -6344,6 +6344,21 @@ func TestFalcoRulesCarryTheOLTExclusions(t *testing.T) {
 	if strings.Contains(fmt.Sprint(r["Olaitan Privileged Escape Primitive"]["condition"]), "setns") {
 		t.Error("the escape rule lists setns as a process name; it is a syscall")
 	}
+	// Decision D5 (Aslim, 2026-09-30): a null k8s.ns.name makes
+	// `not k8s.ns.name in (...)` true, so the exclusion above only holds when
+	// the namespace is known. Live on kind the peer node's view of S1/S2 had
+	// no namespace; the owning node always had it.
+	for _, rule := range []string{"Olaitan Privileged Escape Primitive", "Olaitan Cloud Metadata Contact"} {
+		cond := fmt.Sprint(r[rule]["condition"])
+		if !strings.Contains(cond, "k8s.ns.name exists and "+sysNS) {
+			t.Errorf("%s does not require a known namespace before its exclusion: %s", rule, cond)
+		}
+	}
+	// Falco 0.45 dropped enter events: evt.dir is deprecated and `evt.dir=<`
+	// is always true (the live rules-load warning of 2026-09-30).
+	if strings.Contains(fmt.Sprint(r["Olaitan Cloud Metadata Contact"]["condition"]), "evt.dir") {
+		t.Error("the metadata rule still uses the deprecated evt.dir")
+	}
 }
 
 // TestOlaitanKubectlRuleWinsOverTheDefaultRule: decision D3. Falco stops at
@@ -6364,6 +6379,46 @@ func TestOlaitanKubectlRuleWinsOverTheDefaultRule(t *testing.T) {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("default-rule exception is missing %q:\n%s", want, body)
 		}
+	}
+}
+
+// TestFalcoRulesPackageIsPinned: Story 11.2d review round 2, decision D4
+// (Aslim, 2026-09-30). D3 appends an exception to the upstream rule "Drop and
+// execute new binary in container", and Falco refuses to start when an
+// override names a rule no loaded file defines. With the rules package
+// floating (falco-rules:5, re-followed weekly) an upstream rename would stop
+// Falco on every profile. The package is pinned to the version the
+// 2026-09-30 live run loaded (5.2.0), in both install and follow refs, and
+// the follower sidecar is off, so the ruleset only changes with a chart
+// change. The container plugin stays at the subchart's pin (0.7.1). D3 also
+// rests on Falco's first-match rule semantics, so that is pinned here too.
+func TestFalcoRulesPackageIsPinned(t *testing.T) {
+	rendered := helmTemplate(t, nil)
+	cm := docByKindName(t, rendered, "ConfigMap", "falco-falcoctl")
+	data, _ := cm["data"].(map[string]any)
+	var cfg struct {
+		Artifact struct {
+			Install struct{ Refs []string } `yaml:"install"`
+			Follow  struct{ Refs []string } `yaml:"follow"`
+		} `yaml:"artifact"`
+	}
+	if err := yaml.Unmarshal([]byte(fmt.Sprint(data["falcoctl.yaml"])), &cfg); err != nil {
+		t.Fatalf("parse falcoctl.yaml: %v", err)
+	}
+	wantInstall := []string{"falco-rules:5.2.0", "ghcr.io/falcosecurity/plugins/plugin/container:0.7.1"}
+	if !reflect.DeepEqual(cfg.Artifact.Install.Refs, wantInstall) {
+		t.Errorf("falcoctl install refs = %v, want %v", cfg.Artifact.Install.Refs, wantInstall)
+	}
+	if !reflect.DeepEqual(cfg.Artifact.Follow.Refs, []string{"falco-rules:5.2.0"}) {
+		t.Errorf("falcoctl follow refs = %v, want [falco-rules:5.2.0]", cfg.Artifact.Follow.Refs)
+	}
+	if strings.Contains(rendered, "name: falcoctl-artifact-follow") {
+		t.Error("the falcoctl follower sidecar is still rendered; it would re-pull rules the chart does not pin")
+	}
+	falcoCM := docByKindName(t, rendered, "ConfigMap", "olaitan-falco")
+	fdata, _ := falcoCM["data"].(map[string]any)
+	if !strings.Contains(fmt.Sprint(fdata["falco.yaml"]), "rule_matching: first") {
+		t.Error("falco.yaml does not set rule_matching: first; D3's exception assumes first-match")
 	}
 }
 

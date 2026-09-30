@@ -420,13 +420,13 @@ data:
         falcoversions: http://localhost:8765/versions
         pluginsDir: /plugins
         refs:
-        - falco-rules:5
+        - falco-rules:5.2.0
         rulesfilesDir: /rulesfiles
         stateDir: /artifactstate
       install:
         pluginsDir: /plugins
         refs:
-        - falco-rules:5
+        - falco-rules:5.2.0
         - ghcr.io/falcosecurity/plugins/plugin/container:0.7.1
         resolveDeps: true
         rulesfilesDir: /rulesfiles
@@ -489,7 +489,7 @@ data:
         spawned_process and container
         and thread.cap_effective contains CAP_SYS_ADMIN
         and proc.name in (nsenter, mount, umount, chroot, unshare)
-        and not k8s.ns.name in (kube-system, kube-public, kube-node-lease, olaitan)
+        and k8s.ns.name exists and not k8s.ns.name in (kube-system, kube-public, kube-node-lease, olaitan)
       output: >-
         Olaitan privileged escape primitive (proc_exepath=%proc.exepath
         proc_cmdline=%proc.cmdline cap_effective=%thread.cap_effective
@@ -524,9 +524,9 @@ data:
         169.254.169.254. Emits fd.sip/fd.rip (OLT-CRED-002 keys on
         network.dst_ip) plus the k8s pod identity.
       condition: >-
-        evt.type=connect and evt.dir=< and container
+        evt.type=connect and container
         and (fd.sip=169.254.169.254 or fd.rip=169.254.169.254)
-        and not k8s.ns.name in (kube-system, kube-public, kube-node-lease, olaitan)
+        and k8s.ns.name exists and not k8s.ns.name in (kube-system, kube-public, kube-node-lease, olaitan)
       output: >-
         Olaitan cloud metadata contact (dst_sip=%fd.sip dst_rip=%fd.rip
         proc_exepath=%proc.exepath k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
@@ -547,12 +547,17 @@ data:
       priority: WARNING
       tags: [olaitan, container, mitre_lateral_movement, T1613]
       source: syscall
-    # Decision D3: Falco stops at the first matching rule, and the default
-    # "Drop and execute new binary in container" (from the upstream rules
-    # package, not pinned by this chart) is loaded first, so it used to win
-    # for S3's /tmp/kubectl. Exempt it for exactly the scope the rule above
-    # covers (a /kubectl exe in a tenant- namespace) so the Olaitan rule
-    # fires there; the default rule still covers every other namespace.
+    # Decision D3: Falco stops at the first matching rule (rule_matching:
+    # first), and the upstream "Drop and execute new binary in container"
+    # is loaded first, so it used to win for S3's /tmp/kubectl. Exempt it
+    # for exactly the scope the rule above covers (a /kubectl exe in a
+    # tenant- namespace) so the Olaitan rule fires there; the default rule
+    # still covers every other namespace. Falco refuses to start if this
+    # override names a rule no loaded file defines, which is why the rules
+    # package is pinned below (falcoctl, decision D4). Side effect: in that
+    # scope the alert is the Olaitan rule's WARNING, not upstream's
+    # CRITICAL, and raising falco.falco.priority above warning drops the
+    # Olaitan rule while this exception stays.
     - rule: Drop and execute new binary in container
       exceptions:
         - name: olaitan_kubectl_rule_owns_it
@@ -1796,7 +1801,7 @@ spec:
         app.kubernetes.io/instance: olaitan
       annotations:
         checksum/config: a72d6f229358572950c603eb17b8c4083d54a8e54645753b65053a36208e3f6c
-        checksum/rules: a0d582d3eb0fc7a80c8b77fa3311bf0443fa257b7ebb213bfde0b3090c7b8778
+        checksum/rules: 47fa61ea2a6d6307f5d7063d9b3c97934ef47cd6dad83c5077521ea6db46ee20
         checksum/certs: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
     spec:
       serviceAccountName: olaitan-falco
@@ -1899,23 +1904,6 @@ spec:
               subPath: falco.yaml
             - mountPath: /etc/falco/rules.d
               name: rules-volume
-        - name: falcoctl-artifact-follow
-          image: docker.io/falcosecurity/falcoctl:0.13.0@sha256:0eeb79adc580ae6a5abfdefd7f8f0fed9151fcb545f015c84e8f1d7b2d8a6b02
-          imagePullPolicy: IfNotPresent
-          args:
-            - artifact
-            - follow
-            - --log-format=json
-          securityContext:
-          volumeMounts:
-            - mountPath: /plugins
-              name: plugins-install-dir
-            - mountPath: /rulesfiles
-              name: rulesfiles-install-dir
-            - mountPath: /etc/falcoctl
-              name: falcoctl-config-volume
-            - mountPath: /artifactstate
-              name: artifact-state-dir
       initContainers:
         - name: falcoctl-artifact-install
           image: docker.io/falcosecurity/falcoctl:0.13.0@sha256:0eeb79adc580ae6a5abfdefd7f8f0fed9151fcb545f015c84e8f1d7b2d8a6b02
