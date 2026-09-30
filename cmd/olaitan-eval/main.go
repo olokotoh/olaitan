@@ -168,14 +168,14 @@ func run(args []string, stdout, stderr io.Writer, runCmd overlayRunFunc, attackR
 	// (no harness mapping, missing/invalid target.yaml) fails the run
 	// loudly here rather than silently no-opping (BI-3).
 	scenario, err := newScenario(cfg.scenario, cfg.scenariosRoot, attackRun, logger)
+	if err != nil {
+		return err
+	}
 	// Story 11.2d: apply the configured settle-before-cleanup to the harness
 	// without changing the frozen Scenario interface. newScenario always
 	// returns *scenarioHarness; the assertion is defensive.
 	if h, ok := scenario.(*scenarioHarness); ok {
 		h.settleWait = cfg.attackSettle
-	}
-	if err != nil {
-		return err
 	}
 	// Story 5.3: build the real helmOverlay from the threaded overlay flags
 	// (the Story 5.2 --scenarios-root precedent) and wire it behind the
