@@ -3,8 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -90,6 +93,30 @@ type attackExecutor struct {
 	// tool). Resolved from PATH by newAttackExecutor; a unit test overrides
 	// it to assert the exact kubectl cp argv without a real binary.
 	kubectlBinary string
+	// prepareKubectl resolves kubectlBinary to the real file S3 uploads and
+	// returns its sha256 (decision D2: the runner's own kubectl is the tool,
+	// so each run records exactly which binary it used). resolveUploadKubectl
+	// by default; a unit test stubs it for a non-existent path.
+	prepareKubectl func(path string) (resolved, sha256hex string, err error)
+}
+
+// resolveUploadKubectl follows symlinks to the real kubectl file, refuses
+// anything that is not an ELF binary (a Homebrew/asdf/snap shim or a script
+// cannot run inside the Linux target pod), and returns its sha256.
+func resolveUploadKubectl(path string) (string, string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve kubectl %q: %w", path, err)
+	}
+	data, err := os.ReadFile(resolved)
+	if err != nil {
+		return "", "", fmt.Errorf("read kubectl %q: %w", resolved, err)
+	}
+	if !bytes.HasPrefix(data, []byte("\x7fELF")) {
+		return "", "", fmt.Errorf("kubectl %q is not an ELF binary (a shim or script cannot run in the target pod); put a real Linux kubectl first on PATH", resolved)
+	}
+	sum := sha256.Sum256(data)
+	return resolved, hex.EncodeToString(sum[:]), nil
 }
 
 // newAttackExecutor builds the executor for an S1-S3 scenario. An unknown or
@@ -134,17 +161,19 @@ func newAttackExecutor(scenarioID, dir string, runCmd attackRunFunc, logger *slo
 	kubectlBinary, err := exec.LookPath("kubectl")
 	if err != nil || kubectlBinary == "" {
 		kubectlBinary = "/usr/local/bin/kubectl"
+		logger.Warn("kubectl not found on PATH; S3 falls back to the conventional path", "path", kubectlBinary, "err", err)
 	}
 	return &attackExecutor{
-		scenarioID:    scenarioID,
-		dir:           dir,
-		manifests:     manifests,
-		cleanupRefs:   cleanupRefs,
-		runCmd:        runCmd,
-		logger:        logger,
-		retryWait:     applyRetryWait,
-		settleWait:    attackSettleWait,
-		kubectlBinary: kubectlBinary,
+		prepareKubectl: resolveUploadKubectl,
+		scenarioID:     scenarioID,
+		dir:            dir,
+		manifests:      manifests,
+		cleanupRefs:    cleanupRefs,
+		runCmd:         runCmd,
+		logger:         logger,
+		retryWait:      applyRetryWait,
+		settleWait:     attackSettleWait,
+		kubectlBinary:  kubectlBinary,
 	}, nil
 }
 
@@ -371,7 +400,12 @@ func (e *attackExecutor) runS3(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("s3 resolve target pod: %w", err)
 	}
-	if _, err := e.runCmd(ctx, "kubectl", "cp", e.kubectlBinary,
+	src, sum, err := e.prepareKubectl(e.kubectlBinary)
+	if err != nil {
+		return fmt.Errorf("s3 kubectl to upload: %w", err)
+	}
+	e.logger.Info("s3 uploading runner kubectl", "path", src, "sha256", sum)
+	if _, err := e.runCmd(ctx, "kubectl", "cp", src,
 		attackNamespace+"/"+pod+":/tmp/kubectl", "-c", "web"); err != nil {
 		return fmt.Errorf("s3 stage real kubectl into pod: %w", err)
 	}
@@ -380,7 +414,7 @@ func (e *attackExecutor) runS3(ctx context.Context) error {
 	// Exec in the SAME pod the binary was uploaded to (not deploy/web, which
 	// kubectl may resolve to a different pod of the Deployment).
 	out, err := e.runCmd(ctx, "kubectl", "exec", "-n", attackNamespace, pod, "-c", "web", "--",
-		"sh", "-c", "chmod +x /tmp/kubectl 2>/dev/null; /tmp/kubectl version --client 2>&1 | head -n 2; true")
+		"sh", "-c", "chmod +x /tmp/kubectl && /tmp/kubectl version --client 2>&1")
 	if err != nil {
 		return fmt.Errorf("s3 in-pod kubectl primitive: %w", err)
 	}

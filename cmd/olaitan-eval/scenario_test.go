@@ -96,7 +96,8 @@ func TestNewScenario_DispatchAllFive(t *testing.T) {
 			if !ok {
 				t.Fatalf("scenario %q is %T; want *scenarioHarness", tc.id, sc)
 			}
-			h.settleWait = 0 // Story 11.2d: do not wait the 45s settle in a unit test
+			h.settleWait = 0                      // Story 11.2d: do not wait the 45s settle in a unit test
+			h.prepareKubectl = fakePrepareKubectl // no real kubectl needed on the test host
 			if h.id != tc.id {
 				t.Errorf("harness id = %q; want %q", h.id, tc.id)
 			}

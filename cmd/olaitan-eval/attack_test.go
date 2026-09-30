@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -219,6 +220,7 @@ func TestAttackExecutor_S3_LaunchesKubectlNamedProcessInPod(t *testing.T) {
 	}
 	e.settleWait = 0                  // Story 11.2d: skip the 45s settle in unit tests
 	e.kubectlBinary = "/fake/kubectl" // deterministic cp source in the unit test
+	e.prepareKubectl = fakePrepareKubectl
 	if err := e.Execute(context.Background()); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -269,6 +271,7 @@ func TestAttackExecutor_S3_UploadsAndExecsInTheSameLivePod(t *testing.T) {
 	}
 	e.settleWait = 0
 	e.kubectlBinary = "/fake/kubectl"
+	e.prepareKubectl = fakePrepareKubectl
 	if err := e.Execute(context.Background()); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -300,11 +303,88 @@ func TestAttackExecutor_S3_FailsWhenNoLivePod(t *testing.T) {
 	}
 	e.settleWait = 0
 	e.kubectlBinary = "/fake/kubectl"
+	e.prepareKubectl = fakePrepareKubectl
 	if err := e.Execute(context.Background()); err == nil {
 		t.Fatal("Execute succeeded with only a terminating pod; want an error")
 	}
 	if firstCallContaining(calls, " cp ") >= 0 {
 		t.Errorf("S3 uploaded into a terminating pod; calls=%v", calls)
+	}
+}
+
+// fakePrepareKubectl stands in for resolveUploadKubectl in unit tests that
+// use a non-existent /fake/kubectl: it passes the path through unchanged.
+func fakePrepareKubectl(path string) (string, string, error) { return path, "sha256-fake", nil }
+
+// TestAttackExecutor_S3_DoesNotMaskAFailedKubectl: review round 1 (P1). The
+// S3 in-pod command ended "| head -n 2; true", so a kubectl that never ran
+// (not found, wrong arch, truncated upload) still reported success and the
+// trial looked like a detection miss. The exit code must reach Execute.
+func TestAttackExecutor_S3_DoesNotMaskAFailedKubectl(t *testing.T) {
+	var calls []recordedCall
+	stdoutFor := func(args []string) string {
+		if strings.Contains(strings.Join(args, " "), "get pod") {
+			return "web-new-bbbbb||Running\n"
+		}
+		return ""
+	}
+	e, err := newAttackExecutor("s3", harnessDir("s3-lateral-movement"), recordingRunner(&calls, stdoutFor, "/tmp/kubectl version"), testLogger())
+	if err != nil {
+		t.Fatalf("newAttackExecutor: %v", err)
+	}
+	e.settleWait = 0
+	e.kubectlBinary = "/fake/kubectl"
+	e.prepareKubectl = fakePrepareKubectl
+	if err := e.Execute(context.Background()); err == nil {
+		t.Fatal("Execute succeeded although the in-pod kubectl exec failed")
+	}
+	idx := firstCallContaining(calls, "/tmp/kubectl version")
+	if idx < 0 {
+		t.Fatalf("S3 did not exec kubectl; calls=%v", calls)
+	}
+	script := calls[idx].args[len(calls[idx].args)-1]
+	if strings.Contains(script, "true") || strings.Contains(script, "| head") {
+		t.Errorf("S3 in-pod script still masks the exit code: %q", script)
+	}
+}
+
+// TestResolveUploadKubectl: review round 1 (P2) and decision D2. The runner
+// uploads its own kubectl, so the path must resolve through symlinks and
+// shims to a real ELF binary, and its sha256 is recorded for the run.
+func TestResolveUploadKubectl(t *testing.T) {
+	dir := t.TempDir()
+	elf := filepath.Join(dir, "kubectl-real")
+	if err := os.WriteFile(elf, []byte("\x7fELF\x02\x01\x01payload"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "kubectl")
+	if err := os.Symlink(elf, link); err != nil {
+		t.Fatal(err)
+	}
+	got, sum, err := resolveUploadKubectl(link)
+	if err != nil {
+		t.Fatalf("resolveUploadKubectl(symlink): %v", err)
+	}
+	if got != elf {
+		t.Errorf("resolved %q, want the symlink target %q", got, elf)
+	}
+	if len(sum) != 64 {
+		t.Errorf("sha256 = %q, want 64 hex chars", sum)
+	}
+
+	shim := filepath.Join(dir, "kubectl-shim")
+	if err := os.WriteFile(shim, []byte("#!/bin/sh\nexec real-kubectl \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := resolveUploadKubectl(shim); err == nil {
+		t.Error("a shell-script shim was accepted; want an error (it cannot run in the pod)")
+	}
+	dangling := filepath.Join(dir, "dangling")
+	if err := os.Symlink(filepath.Join(dir, "missing"), dangling); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := resolveUploadKubectl(dangling); err == nil {
+		t.Error("a dangling symlink was accepted; want an error")
 	}
 }
 
