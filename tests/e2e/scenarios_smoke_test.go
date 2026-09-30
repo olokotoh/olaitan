@@ -2,42 +2,41 @@
 
 // Story 5.2 AC8 + AC7: the kind integration test for the five attack
 // scenario harnesses (S1-S5). It reuses the Story-1.19 rs_smoke kind
-// bring-up VERBATIM (the chart installs healthy under evaluation.config=RS,
-// Falco-off, single-node kind, synthetic raw events injected directly to
-// NATS) and, for EACH scenario, fires the scenario's deterministic stimulus
-// and asserts -- within the scenario's target.yaml target_time_to_detect_
-// seconds poll budget -- that AT LEAST ONE rule match OR baseline deviation
-// reaches EVIDENCE.packages (subject olaitan.evidence.packages):
+// bring-up (the chart installs under evaluation.config=RS on single-node kind
+// with Falco ON, Story 10.4) and, for EACH scenario, fires the scenario's
+// stimulus and asserts, within the scenario's target.yaml
+// target_time_to_detect_seconds poll budget (capped), a per-scenario DELTA:
 //
 //	olaitan_decision_rules_matches_by_attribute_total{rule_id=<one of the
-//	  scenario's triggering_rules>} >= 1  OR
-//	olaitan_decision_baseline_deviations_total >= 1
-//	AND olaitan_correlator_evidence_packages_total >= 1
+//	  scenario's triggering_rules>} +1  OR
+//	olaitan_decision_baseline_deviations_total +1
+//	AND olaitan_correlator_evidence_packages_total +1
+//
+// Story 11.2a (AC5, decision L2 2026-09-30): S1-S3 are REAL in-cluster
+// attacks. The test drives the same executor olaitan-eval runs
+// (internal/eval/attack): it applies the Story 11.1 target, runs the
+// technique inside the pod with kubectl exec, and Falco's real alerts carry
+// the signal through the chart's rules to the OLT rules. Nothing is published
+// to NATS for S1-S3. S4 and S5 still inject synthetic events until Story
+// 11.2b (#192) gives them real attacker-side infrastructure; the file stays
+// on tests/e2e/nats-injection-allowlist.yaml for them only.
 //
 // HONEST SCOPE (BI-8): AC8 asserts the EVIDENCE-package SIGNAL (the rule-
-// match / baseline-deviation half), NOT the full FSM-state attainment of
-// AC2-AC6 (the QUARANTINED / RESTRICTED / SUSPICIOUS targets + the measured
-// time-to-detect are Story 5.4 + the carry-forward A1 RSLT-full-kind gate).
-// The synthetic-event field shapes come from the SINGLE SOURCE OF TRUTH in the
-// non-main package internal/eval/scenario, which BOTH cmd/olaitan-eval AND this
-// e2e test import directly -- so there is no hand-copy to drift against (the
-// main package itself still cannot be imported here, but the recipe data is no
-// longer in main).
+// match / baseline-deviation half), NOT the FSM-state attainment of AC2-AC6
+// or a measured time-to-detect (Story 5.4, Story 7.4 #186).
 //
 // CI placement (OQ4): mirrors eval-smoke. `make scenarios-smoke` reuses the
 // SAME RS bring-up; it SKIPS gracefully when the kind cluster is absent so
-// `go test -tags=e2e ./...` on a bare host does not hard-fail. It is wired
-// into the existing CI e2e job alongside the RS + eval smokes (it reuses the
-// RS bring-up, so the marginal CI cost is the per-scenario injection +
-// poll). The live full-scenario FSM-attainment run folds into the carry-
-// forward A1 gate, disclosed honestly.
+// `go test -tags=e2e ./...` on a bare host does not hard-fail.
 package e2e_test
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,6 +44,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	"gopkg.in/yaml.v3"
 
+	"github.com/olokotoh/olaitan/internal/eval/attack"
 	evalscenario "github.com/olokotoh/olaitan/internal/eval/scenario"
 )
 
@@ -104,6 +104,71 @@ func loadScenarioSmokeTarget(t *testing.T, scenarioID string) scenarioSmokeTarge
 	return tgt
 }
 
+// realAttackScenarios are driven by the real in-cluster attack (Story 11.2a).
+// S4 and S5 are not yet: they need attacker-side sink / pool infrastructure
+// (Story 11.2b, #192) and still inject synthetic events.
+var realAttackScenarios = map[string]bool{"s1": true, "s2": true, "s3": true}
+
+// correlatorWindow is the chart default correlator.windowDuration (60s),
+// which the RS install does not override. A real Falco alert opens an
+// investigation once per (workload, Falco rule) per window
+// (internal/correlator/correlator.go, claimFalcoTrigger), and every S1-S3
+// target is the Deployment tenant-acme/web, so a repeat of the same scenario
+// inside the window is folded into the first investigation: no new
+// EvidencePackage, so no OLT rule is evaluated. Waiting the window out
+// between repeats makes each run a fresh detection.
+const correlatorWindow = 60*time.Second + 10*time.Second
+
+// lastRealAttack records when each real scenario last ran, so a repeat waits
+// out the correlator window (see correlatorWindow).
+var lastRealAttack = map[string]time.Time{}
+
+// logWriter sends the executor's structured log lines to t.Log.
+type logWriter struct{ t *testing.T }
+
+func (w logWriter) Write(p []byte) (int, error) {
+	w.t.Helper()
+	w.t.Log(strings.TrimRight(string(p), "\n"))
+	return len(p), nil
+}
+
+// runRealAttack applies scenarioID's Story 11.1 target and runs its real
+// technique through the shared executor (internal/eval/attack), the exact
+// code olaitan-eval runs. It returns the counter snapshot taken just before
+// the attack and the executor's Cleanup, which the caller runs AFTER the
+// signal assertion so the pod is alive while the correlator resolves its
+// posture (the executor's own settle is zeroed: the poll replaces it).
+func runRealAttack(t *testing.T, tgt scenarioSmokeTarget) (scenarioCounterSnapshot, func()) {
+	t.Helper()
+	scenarioID := tgt.ScenarioID
+	if last, ok := lastRealAttack[scenarioID]; ok {
+		if wait := correlatorWindow - time.Since(last); wait > 0 {
+			t.Logf("scenario %s ran %s ago; waiting %s for the correlator window to close", scenarioID, time.Since(last).Round(time.Second), wait.Round(time.Second))
+			time.Sleep(wait)
+		}
+	}
+	dir := filepath.Join(repoRoot(), "deploy", "demo", "scenarios", scenarioSmokeSlugs[scenarioID])
+	executor, err := attack.New(scenarioID, dir, attack.ExecCmd, slog.New(slog.NewTextHandler(logWriter{t}, nil)))
+	if err != nil {
+		t.Fatalf("attack executor for %s: %v", scenarioID, err)
+	}
+	executor.SettleWait = 0
+	cleanup := func() {
+		if err := executor.Cleanup(context.Background()); err != nil {
+			t.Errorf("scenario %s cleanup: %v", scenarioID, err)
+		}
+	}
+	before := snapshotScenarioCounters(t, tgt)
+	lastRealAttack[scenarioID] = time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if err := executor.Execute(ctx); err != nil {
+		cleanup()
+		t.Fatalf("scenario %s real attack: %v", scenarioID, err)
+	}
+	return before, cleanup
+}
+
 // injectScenario fires scenario scenarioID's deterministic synthetic-event
 // stimulus against the warmed cluster (BI-3) and returns the counter snapshot
 // captured immediately BEFORE the rule-match events were published, so the
@@ -131,7 +196,7 @@ func injectScenario(t *testing.T, js jetstream.JetStream, scenarioID, podName, d
 	// (BI-4) is fired by the pre-seed spike itself, so the snapshot must precede
 	// the pre-seed or that deviation would be folded into `before` and the delta
 	// would be inert.
-	before := snapshotScenarioCounters(t)
+	before := snapshotScenarioCounters(t, loadScenarioSmokeTarget(t, scenarioID))
 	// S4 rests partly on a baseline deviation: pre-seed the per-workload
 	// baseline so outbound_unique_dst_ips crosses 3 sigma and let the baseline
 	// consumer drain BEFORE the rule-match flow events arrive (BI-4).
@@ -172,23 +237,29 @@ const smokePollCeiling = 90 * time.Second
 // subtests, so an absolute >= 1 check could pass on an EARLIER scenario's
 // residue rather than this scenario's own rule/deviation/package).
 type scenarioCounterSnapshot struct {
-	deviations float64
-	evidence   float64
+	ruleMatches float64
+	deviations  float64
+	evidence    float64
 }
 
 // snapshotScenarioCounters captures the cumulative counters the delta-based
-// AC8 assertion is taken against. injectScenario calls it at the very start,
-// before any of the scenario's stimuli (including the S4 pre-seed).
-// The rule-match half is already scenario-scoped by rule_id (each scenario's
-// triggering rules are distinct), so it does not need a delta; the deviation
-// and evidence-package halves DO, because they are read unlabelled and are
-// shared across the sequential subtests.
-func snapshotScenarioCounters(t *testing.T) scenarioCounterSnapshot {
+// AC8 assertion is taken against, before any of the scenario's stimuli
+// (including the S4 pre-seed). All three halves are deltas: the counters are
+// cumulative and shared across tests, and with real attacks an earlier test
+// (or the rs_smoke synthetic trigger) can already have matched the same rule
+// on the same tenant-acme/web workload, so an absolute rule-match count could
+// pass on residue (Story 11.2a).
+func snapshotScenarioCounters(t *testing.T, tgt scenarioSmokeTarget) scenarioCounterSnapshot {
 	t.Helper()
 	metrics := scrapeMetrics(t)
+	var ruleMatches float64
+	for _, ruleID := range tgt.TriggeringRules {
+		ruleMatches += metrics["olaitan_decision_rules_matches_by_attribute_total"].sumWhere(map[string]string{"rule_id": ruleID})
+	}
 	return scenarioCounterSnapshot{
-		deviations: metrics["olaitan_decision_baseline_deviations_total"].sumWhere(nil),
-		evidence:   metrics["olaitan_correlator_evidence_packages_total"].sumWhere(nil),
+		ruleMatches: ruleMatches,
+		deviations:  metrics["olaitan_decision_baseline_deviations_total"].sumWhere(nil),
+		evidence:    metrics["olaitan_correlator_evidence_packages_total"].sumWhere(nil),
 	}
 }
 
@@ -230,12 +301,13 @@ func assertScenarioSignal(t *testing.T, tgt scenarioSmokeTarget, before scenario
 		for _, ruleID := range tgt.TriggeringRules {
 			ruleMatches += metrics["olaitan_decision_rules_matches_by_attribute_total"].sumWhere(map[string]string{"rule_id": ruleID})
 		}
+		ruleMatches -= before.ruleMatches
 		// Per-scenario DELTAs over the inject-time baseline (the counters are
 		// cumulative + shared across the sequential subtests).
 		deviations := metrics["olaitan_decision_baseline_deviations_total"].sumWhere(nil) - before.deviations
 		evidence := metrics["olaitan_correlator_evidence_packages_total"].sumWhere(nil) - before.evidence
 		if tick%4 == 0 {
-			t.Logf("scenario %s poll tick=%d: rule_matches(%v)=%v baseline_deviations(delta)=%v correlator_packages(delta)=%v",
+			t.Logf("scenario %s poll tick=%d: rule_matches(%v)(delta)=%v baseline_deviations(delta)=%v correlator_packages(delta)=%v",
 				tgt.ScenarioID, tick, tgt.TriggeringRules, ruleMatches, deviations, evidence)
 		}
 		tick++
@@ -251,7 +323,7 @@ func assertScenarioSignal(t *testing.T, tgt scenarioSmokeTarget, before scenario
 		}
 		switch {
 		case !redetected:
-			lastErr = fmt.Errorf("no rule match for %v and no baseline-deviation delta yet", tgt.TriggeringRules)
+			lastErr = fmt.Errorf("no rule-match delta for %v and no baseline-deviation delta yet", tgt.TriggeringRules)
 		case !freshPackage:
 			lastErr = fmt.Errorf("correlator evidence-package delta = %v; want >= 1", evidence)
 		}
@@ -289,30 +361,29 @@ func connectScenarioJS(t *testing.T) jetstream.JetStream {
 }
 
 // TestKindSmoke_Scenarios_S1toS5_ReachEvidence is the Story 5.2 AC8 pin: each
-// scenario S1-S5 fires its deterministic stimulus and at least one rule match
-// or baseline deviation reaches EVIDENCE.packages within the scenario's
-// target_time_to_detect_seconds window. The cluster bring-up is the rs_smoke
-// RS arm (Falco-off, NO LLM); the per-scenario stimulus mirrors
-// cmd/olaitan-eval/scenario.go.
+// scenario S1-S5 fires its stimulus and at least one rule match or baseline
+// deviation reaches EVIDENCE.packages within the scenario's
+// target_time_to_detect_seconds window (capped). S1-S3 are the real
+// in-cluster attacks (Story 11.2a); S4-S5 inject synthetic events until
+// Story 11.2b.
 func TestKindSmoke_Scenarios_S1toS5_ReachEvidence(t *testing.T) {
 	requireKindCluster(t)
 	waitForPodsReady(t)
 
-	// Each scenario gets its OWN Deployment in tenant-acme so the correlator's
-	// rising-edge `fired` flag (keyed on workloadID = tenant-acme/Deployment/
-	// <name>) is independent of rs_smoke and of the sibling scenarios -- so each
-	// scenario's first multi-signal convergence emits a FRESH EvidencePackage
-	// rather than being coalesced by a `fired` flag an earlier converger set on a
-	// shared workload (Review Round 2, CI-caught). The posture resolver still
-	// returns OwnerKind=Deployment + namespace=tenant-acme, which is all every
-	// scenario's rules key on. All five Deployments are created HERE on the parent
-	// test rather than inside the subtests so a finishing subtest's namespace-
-	// teardown cleanup does not delete a later subtest's workload (the cleanups
-	// fire on the parent `t` after the whole loop completes).
+	// S4 and S5 each get their OWN synthetic Deployment in tenant-acme so the
+	// correlator's rising-edge `fired` flag (keyed on workloadID =
+	// tenant-acme/Deployment/<name>) is independent per scenario (Review
+	// Round 2, CI-caught). They are created on the parent test so a finishing
+	// subtest's namespace-teardown cleanup cannot delete a later subtest's
+	// workload. S1-S3 apply their own real Story 11.1 target (tenant-acme/web)
+	// through the executor and delete it again; each fires a different chart
+	// Falco rule, so each opens its own investigation on that workload.
 	scenarioIDs := []string{"s1", "s2", "s3", "s4", "s5"}
-	pods := make(map[string]string, len(scenarioIDs))
+	pods := map[string]string{}
 	for _, scenarioID := range scenarioIDs {
-		pods[scenarioID] = applyScenarioWorkload(t, scenarioWorkloadName(scenarioID))
+		if !realAttackScenarios[scenarioID] {
+			pods[scenarioID] = applyScenarioWorkload(t, scenarioWorkloadName(scenarioID))
+		}
 	}
 
 	js := connectScenarioJS(t)
@@ -321,12 +392,17 @@ func TestKindSmoke_Scenarios_S1toS5_ReachEvidence(t *testing.T) {
 		scenarioID := scenarioID
 		t.Run(scenarioID, func(t *testing.T) {
 			tgt := loadScenarioSmokeTarget(t, scenarioID)
-			deployName := scenarioWorkloadName(scenarioID)
-			podName := pods[scenarioID]
-			before := injectScenario(t, js, scenarioID, podName, deployName)
-			// PRIMARY AC8 pin: a first detection on a freshly-warmed
-			// workload MUST emit a fresh EVIDENCE package (requireFreshPackage
-			// = true). This is the full-signal assertion and must not weaken.
+			var before scenarioCounterSnapshot
+			if realAttackScenarios[scenarioID] {
+				var cleanup func()
+				before, cleanup = runRealAttack(t, tgt)
+				defer cleanup()
+			} else {
+				before = injectScenario(t, js, scenarioID, pods[scenarioID], scenarioWorkloadName(scenarioID))
+			}
+			// PRIMARY AC8 pin: a first detection MUST emit a fresh EVIDENCE
+			// package (requireFreshPackage = true). This is the full-signal
+			// assertion and must not weaken.
 			if err := assertScenarioSignal(t, tgt, before, true); err != nil {
 				dumpEvidenceStream(t, js)
 				dumpRuleMatchSamples(t)
@@ -336,66 +412,34 @@ func TestKindSmoke_Scenarios_S1toS5_ReachEvidence(t *testing.T) {
 	}
 }
 
-// TestKindSmoke_Scenarios_Idempotency is the Story 5.2 AC7 pin: re-running a
-// scenario's stimulus against the warmed cluster reaches EVIDENCE.packages
-// identically on the second run (the stimulus is deterministic + idempotent;
-// the per-run namespace teardown returns the cluster to the warmed-baseline,
-// BI-7). It runs S1 (the proven rs_smoke path) twice consecutively and
-// asserts both runs reach the EVIDENCE-package signal.
+// TestKindSmoke_Scenarios_Idempotency is the Story 5.2 AC7 pin, on the real
+// S1 attack since Story 11.2a: running the attack twice against the warmed
+// cluster reaches EVIDENCE.packages both times. The executor applies the
+// target, runs the technique and deletes exactly what it applied, so the
+// second run starts from the same state (BI-7) with no manual cleanup.
 //
-// IDEMPOTENCY-TEARDOWN HOME (BI-7, OQ3): 5.2 does NOT over-reach the
-// 5.1-owned ClusterController.Reset seam. The scenario harness's
-// applySyntheticWorkload registers a t.Cleanup that deletes the tenant-acme
-// namespace (cascading the Deployment/ReplicaSet/Pod), so no scenario
-// workload state leaks across test runs; the second in-test run reuses the
-// SAME warmed pod, proving the stimulus itself is re-runnable without manual
-// cleanup.
-//
-// REPEAT-RUN SCOPE (Review Round 2, CI-caught): run 1 asserts the FULL signal
-// (re-detection delta AND a fresh EVIDENCE-package delta) -- it is a first
-// detection on a freshly-warmed workload. Run 2 (the repeat) asserts ONLY that
-// detection RE-FIRES: a per-scenario rule-match (or baseline-deviation) delta
-// >= 1, WITHOUT requiring a fresh evidence-package delta. This is the honest
-// idempotency claim (AC7): the deterministic stimulus is re-runnable and
-// re-produces the DETECTION signal. A FRESH evidence package on a same-workload
-// repeat is NOT produced by the correlator absent a between-run cluster reset:
-// the per-workload sliding window's rising-edge `fired` flag
-// (internal/correlator/window/window.go:171-185) only transitions false->true
-// once per workload until the distinct-source set drops below minSources or the
-// buffer empties, so the repeat's AddEvent returns transitioned=false
-// (internal/correlator/correlator.go:255-257) and publishTrigger never runs.
-// That fresh-package-on-repeat path is the Story-5.1-owned ClusterController.
-// Reset seam (BI-7/OQ3), which 5.2 does not over-reach; the repeat-run
-// assertion is therefore scoped to re-detection.
+// Both runs assert the FULL signal, including a fresh EVIDENCE package. The
+// synthetic version could only claim re-detection on run 2, because the
+// correlator folds a same-workload repeat inside its window into the first
+// investigation (claimFalcoTrigger, and the rising-edge `fired` flag in
+// internal/correlator/window/window.go). runRealAttack waits that window out
+// before a repeat, so run 2 is a fresh detection, which is the stronger
+// re-runnability claim.
 func TestKindSmoke_Scenarios_Idempotency(t *testing.T) {
 	requireKindCluster(t)
 	waitForPodsReady(t)
-	// Its OWN Deployment, distinct from rs_smoke (`web`) and from the S1toS5
-	// test's `scenario-s1` workload, so run 1's fresh-package assertion is not
-	// suppressed by a `fired` flag a prior test set on a shared workload, and so
-	// the deliberate run-2 coalescing (re-detection only) is observed on a
-	// workload THIS test exclusively owns (Review Round 2, CI-caught).
-	deployName := "scenario-idem-s1"
-	podName := applyScenarioWorkload(t, deployName)
 	js := connectScenarioJS(t)
 	tgt := loadScenarioSmokeTarget(t, "s1")
 
 	for run := 1; run <= 2; run++ {
-		// Run 1 is a first detection on the freshly-warmed workload, so it
-		// requires the fresh EVIDENCE package. Run 2 is a same-workload repeat
-		// whose fresh package the correlator legitimately coalesces (see the
-		// REPEAT-RUN SCOPE note above), so it asserts re-detection only.
-		requireFreshPackage := run == 1
-		before := injectScenario(t, js, "s1", podName, deployName)
-		if err := assertScenarioSignal(t, tgt, before, requireFreshPackage); err != nil {
+		before, cleanup := runRealAttack(t, tgt)
+		err := assertScenarioSignal(t, tgt, before, true)
+		cleanup()
+		if err != nil {
 			dumpEvidenceStream(t, js)
 			dumpRuleMatchSamples(t)
 			t.Fatalf("idempotency run %d: %v", run, err)
 		}
-		if requireFreshPackage {
-			t.Logf("idempotency run %d reached EVIDENCE.packages (full signal)", run)
-		} else {
-			t.Logf("idempotency run %d re-fired detection (re-detection signal; fresh-package-on-repeat deferred to 5.1 ClusterController.Reset)", run)
-		}
+		t.Logf("idempotency run %d reached EVIDENCE.packages (full signal)", run)
 	}
 }

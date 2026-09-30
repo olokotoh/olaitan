@@ -33,7 +33,7 @@ allow:
       follow-up rather than silently changing other stories' coverage.
   - path: scenarios_smoke_test.go
     reason: >-
-      injectScenario drives S1-S5. Story 11.2a rewrites S1-S3 to the real
-      attack path (validated live, AC6); S4 and S5 still inject synthetically
-      and belong to Story 11.2b (#192). Listed until the S1-S3 rewrite lands
-      and S4/S5 move to 11.2b, at which point the entry is removed.
+      S1-S3 are real in-cluster attacks through internal/eval/attack since
+      Story 11.2a (no NATS publish). injectScenario still drives S4 and S5,
+      which need attacker-side sink / pool infrastructure and belong to Story
+      11.2b (#192); the entry is removed when they move to real attacks.
