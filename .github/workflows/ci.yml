@@ -284,6 +284,16 @@ jobs:
       - name: Helm Go test suite
         run: go test ./deploy/helm/... -tags=helm -count=1 -v
 
+      # Story 11.2d (review round 2): the chart's Falco rules override
+      # upstream rules by name (D3 and the kind overlays), and Falco refuses
+      # to start on an override of a rule no loaded file defines. Load the
+      # rendered rules into the pinned Falco image with the pinned falco-rules
+      # package for each profile; a refusal or a load warning fails the job.
+      - name: Falco loads the shipped rules
+        run: |
+          python3 -c 'import yaml' 2>/dev/null || pip install pyyaml
+          hack/validate-falco-rules.sh
+
   # Story 9.5 AC1/AC3: portability claims backed by a job that fails when they
   # break, so the support matrix cannot rot into fiction.
   #

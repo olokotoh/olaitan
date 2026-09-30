@@ -45,10 +45,24 @@ response:
 # hook (process name truncated to 15 characters by the kernel) AND the binary
 # is mount or umount. Everything else the rule catches is still caught. Real
 # nodes do not run this hook, so the default values carry no exception.
+#
+# Story 11.2d: the same hook runs mount with CAP_SYS_ADMIN, so the chart's
+# "Olaitan Privileged Escape Primitive" rule fired on every pod start and
+# OLT-PRIV-001 matched with no attack (live benign check, kind-full). The
+# same narrow exception is appended to that rule.
 falco:
   customRules:
     olaitan-kind-exceptions.yaml: |-
       - rule: Drop and execute new binary in container
+        exceptions:
+          - name: kind_mount_product_files_hook
+            fields: [proc.pname, proc.exepath]
+            comps: [=, in]
+            values:
+              - [mount-product-f, [/usr/bin/mount, /usr/bin/umount]]
+        override:
+          exceptions: append
+      - rule: Olaitan Privileged Escape Primitive
         exceptions:
           - name: kind_mount_product_files_hook
             fields: [proc.pname, proc.exepath]

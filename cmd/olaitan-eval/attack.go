@@ -3,8 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"debug/elf"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"log/slog"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -80,6 +85,62 @@ type attackExecutor struct {
 	// retryWait is the backoff between apply retries; a field so a unit test
 	// can shrink it. Defaults to applyRetryWait.
 	retryWait time.Duration
+	// settleWait is how long Execute waits after the primitive before
+	// returning (so the deferred Cleanup does not delete the pod before the
+	// correlator resolves posture). A field so a unit test can zero it.
+	// Defaults to attackSettleWait.
+	settleWait time.Duration
+	// kubectlBinary is the path to a real, standalone kubectl on the runner
+	// host that S3 uploads into the target pod (the attacker brings a real
+	// tool). Resolved from PATH by newAttackExecutor; a unit test overrides
+	// it to assert the exact kubectl cp argv without a real binary.
+	kubectlBinary string
+	// prepareKubectl resolves kubectlBinary to the real file S3 uploads and
+	// returns its sha256 (decision D2: the runner's own kubectl is the tool,
+	// so each run records exactly which binary it used). resolveUploadKubectl
+	// by default; a unit test stubs it for a non-existent path.
+	prepareKubectl func(path string) (resolved, sha256hex string, err error)
+}
+
+// resolveUploadKubectl follows symlinks to the real kubectl file and refuses
+// anything the busybox target pod cannot run as kubectl: a script shim, a
+// multicall binary that snap, mise or aqua link as kubectl (the resolved file
+// must itself be named kubectl), and a dynamically linked ELF (the pod has no
+// loader). It returns the resolved path and the sha256 of that file, streamed
+// rather than read into memory.
+func resolveUploadKubectl(path string) (string, string, error) {
+	if path == "" {
+		return "", "", fmt.Errorf("kubectl not found on PATH; S3 uploads the runner's own kubectl, so put a real Linux kubectl on PATH")
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve kubectl %q: %w", path, err)
+	}
+	if filepath.Base(resolved) != "kubectl" {
+		return "", "", fmt.Errorf("kubectl %q resolves to %q, which is not a kubectl binary (a snap, mise or aqua shim); put a real Linux kubectl first on PATH", path, resolved)
+	}
+	f, err := os.Open(resolved)
+	if err != nil {
+		return "", "", fmt.Errorf("read kubectl %q: %w", resolved, err)
+	}
+	defer func() { _ = f.Close() }()
+	bin, err := elf.NewFile(f)
+	if err != nil {
+		return "", "", fmt.Errorf("kubectl %q is not an ELF binary (a shim or script cannot run in the target pod); put a real Linux kubectl first on PATH: %w", resolved, err)
+	}
+	for _, p := range bin.Progs {
+		if p.Type == elf.PT_INTERP {
+			return "", "", fmt.Errorf("kubectl %q is dynamically linked and the target pod has no loader for it; use a static kubectl (the upstream release binaries are)", resolved)
+		}
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return "", "", fmt.Errorf("rewind kubectl %q: %w", resolved, err)
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", "", fmt.Errorf("hash kubectl %q: %w", resolved, err)
+	}
+	return resolved, hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // newAttackExecutor builds the executor for an S1-S3 scenario. An unknown or
@@ -117,14 +178,22 @@ func newAttackExecutor(scenarioID, dir string, runCmd attackRunFunc, logger *slo
 			"serviceaccount/s2-attacker",
 		)
 	}
+	// Resolve a real, standalone kubectl on the runner host for S3 to upload
+	// into the target (a renamed busybox exits 127 on the multicall dispatch).
+	// Not on PATH leaves it empty and S3 fails loudly in resolveUploadKubectl;
+	// every other step shells out to kubectl too, so no fallback path exists.
+	kubectlBinary, _ := exec.LookPath("kubectl")
 	return &attackExecutor{
-		scenarioID:  scenarioID,
-		dir:         dir,
-		manifests:   manifests,
-		cleanupRefs: cleanupRefs,
-		runCmd:      runCmd,
-		logger:      logger,
-		retryWait:   applyRetryWait,
+		prepareKubectl: resolveUploadKubectl,
+		scenarioID:     scenarioID,
+		dir:            dir,
+		manifests:      manifests,
+		cleanupRefs:    cleanupRefs,
+		runCmd:         runCmd,
+		logger:         logger,
+		retryWait:      applyRetryWait,
+		settleWait:     attackSettleWait,
+		kubectlBinary:  kubectlBinary,
 	}, nil
 }
 
@@ -141,16 +210,76 @@ func (e *attackExecutor) Execute(ctx context.Context) error {
 	if _, err := e.runCmd(ctx, "kubectl", "rollout", "status", attackWorkload, "-n", attackNamespace, "--timeout", attackWaitTimeout); err != nil {
 		return fmt.Errorf("wait target ready: %w", err)
 	}
+	var primErr error
 	switch e.scenarioID {
 	case "s1":
-		return e.runS1(ctx)
+		primErr = e.runS1(ctx)
 	case "s2":
-		return e.runS2(ctx)
+		primErr = e.runS2(ctx)
 	case "s3":
-		return e.runS3(ctx)
+		primErr = e.runS3(ctx)
+	default:
+		return fmt.Errorf("attack executor: no primitive for scenario %q", e.scenarioID) // unreachable (newAttackExecutor gate)
 	}
-	return fmt.Errorf("attack executor: no primitive for scenario %q", e.scenarioID) // unreachable (newAttackExecutor gate)
+	// Settle before returning so the caller's deferred Cleanup does not delete
+	// the target before the correlator resolves its workload posture off the
+	// live pod (Story 11.2d). Settle even on a primitive error so any alert
+	// already emitted still flows; a cancelled context skips the wait.
+	e.settle(ctx)
+	return primErr
 }
+
+// settle waits settleWait (unless it is non-positive or the context is
+// already done) so a fired Falco alert flows Falco -> collector -> correlator
+// and the correlator resolves workload posture from the still-live pod before
+// the deferred Cleanup deletes it.
+func (e *attackExecutor) settle(ctx context.Context) {
+	if e.settleWait <= 0 {
+		return
+	}
+	e.logger.Info("settling before cleanup so detection posture resolves off the live pod",
+		"scenario", e.scenarioID, "settle", e.settleWait.String())
+	select {
+	case <-ctx.Done():
+	case <-time.After(e.settleWait):
+	}
+}
+
+// targetPod returns the name of the running target pod (app=web) in the
+// attack namespace. S3 needs the concrete pod name because kubectl cp cannot
+// address a Deployment.
+func (e *attackExecutor) targetPod(ctx context.Context) (string, error) {
+	// Story 11.2d: skip pods that are terminating or not Running. The previous
+	// trial's pod can still be Terminating when this one starts; picking it
+	// made S3 upload kubectl into the old pod and exec in the new one.
+	out, err := e.runCmd(ctx, "kubectl", "get", "pod", "-n", attackNamespace,
+		"-l", "app=web", "-o",
+		`jsonpath={range .items[*]}{.metadata.name}{"|"}{.metadata.deletionTimestamp}{"|"}{.status.phase}{"\n"}{end}`)
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Split(strings.TrimSpace(line), "|")
+		if len(f) == 3 && f[0] != "" && f[1] == "" && f[2] == "Running" {
+			return f[0], nil
+		}
+	}
+	return "", fmt.Errorf("no running, non-terminating pod for app=web in %s", attackNamespace)
+}
+
+// attackSettleWait is how long Execute waits AFTER the technique primitive
+// and BEFORE returning (the caller defers Cleanup, so this delays teardown).
+// Story 11.2d: OLT-PRIV-001 and OLT-LATERAL-001 need the workload posture
+// (owner_kind=Deployment, namespace) which the correlator resolves
+// read-on-demand from the live pod at EvidencePackage assembly time
+// (internal/correlator/correlator.go:488). The correlator's sliding window is
+// 60s (docs/helm-values.md correlator.windowDuration), but a WARNING+ Falco
+// alert (the Olaitan custom rules) crosses falcoTriggerMinPriority and starts
+// an investigation on its own before the window closes. The default is sized
+// to that trigger path plus margin, measured live in Story 11.2d; deleting
+// the pod sooner made owner-resolution miss and the rule never matched. A
+// unit test shrinks it via the settleWait field.
+const attackSettleWait = 45 * time.Second
 
 // applyRetries / applyRetryWait bound the apply retry loop. A prior test or
 // trial that deleted the shared tenant-acme Namespace can leave it briefly
@@ -275,20 +404,49 @@ func (e *attackExecutor) runS2(ctx context.Context) error {
 // Resource Discovery; also T1609 Container Administration Command). The
 // kubectl exec into the tenant pod is itself T1609; then it launches a
 // /kubectl-named process IN-POD so OLT-LATERAL-001 fires (process.exe ends
-// /kubectl in a tenant Deployment pod). The target ships no kubectl, so the
-// attacker brings the binary; to avoid any egress (nothing leaves the
-// cluster, hard rule) it copies the in-pod busybox to /tmp/kubectl and runs
-// it, whose exe path ends /kubectl.
+// /kubectl in a tenant Deployment pod).
+//
+// Story 11.2d fix: the target ships no kubectl, so the attacker brings a REAL
+// one. The prior primitive copied the in-pod busybox to /tmp/kubectl and ran
+// it, which exited 127 because busybox is a multicall binary that dispatches
+// on argv[0] and has no "kubectl" applet, so no /kubectl process ever execd
+// and OLT-LATERAL-001 could not fire on the real path. Now the runner uploads
+// a real, standalone kubectl from the runner host into the pod with kubectl
+// cp (busybox provides tar, which cp needs; the transfer streams over the API
+// server exec channel, so nothing leaves the cluster, hard rule) and execs
+// it. proc.exepath is then /tmp/kubectl, which ends /kubectl.
 func (e *attackExecutor) runS3(ctx context.Context) error {
-	script := "cp /bin/busybox /tmp/kubectl 2>/dev/null || cp \"$(command -v sh)\" /tmp/kubectl; " +
-		"/tmp/kubectl echo '[s3] in-pod kubectl-named process (lateral movement / discovery)'"
-	out, err := e.exec(ctx, script)
+	pod, err := e.targetPod(ctx)
+	if err != nil {
+		return fmt.Errorf("s3 resolve target pod: %w", err)
+	}
+	prepare := e.prepareKubectl
+	if prepare == nil {
+		prepare = resolveUploadKubectl
+	}
+	src, sum, err := prepare(e.kubectlBinary)
+	if err != nil {
+		return fmt.Errorf("s3 kubectl to upload: %w", err)
+	}
+	e.logger.Info("s3 uploading runner kubectl", "path", src, "sha256", sum)
+	if _, err := e.runCmd(ctx, "kubectl", "cp", src,
+		attackNamespace+"/"+pod+":/tmp/kubectl", "-c", "web"); err != nil {
+		return fmt.Errorf("s3 stage real kubectl into pod: %w", err)
+	}
+	// Exec the uploaded real kubectl. --client keeps it offline (no API call,
+	// no egress); the point is the /kubectl-named execve Falco observes.
+	// Exec in the SAME pod the binary was uploaded to (not deploy/web, which
+	// kubectl may resolve to a different pod of the Deployment).
+	out, err := e.runCmd(ctx, "kubectl", "exec", "-n", attackNamespace, pod, "-c", "web", "--",
+		"sh", "-c", "chmod +x /tmp/kubectl && /tmp/kubectl version --client 2>&1")
 	if err != nil {
 		return fmt.Errorf("s3 in-pod kubectl primitive: %w", err)
 	}
+	version, _, _ := strings.Cut(strings.TrimSpace(out), "\n")
 	e.logger.Info("s3 technique executed",
 		"mitre", "T1613", "also", "T1609", "rule", "OLT-LATERAL-001",
-		"detail", "kubectl exec + in-pod /kubectl process", "out_len", len(out))
+		"detail", "kubectl exec + uploaded real /tmp/kubectl process",
+		"kubectl_version", version, "out_len", len(out))
 	return nil
 }
 

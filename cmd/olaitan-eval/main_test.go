@@ -429,6 +429,7 @@ func TestRun_LayoutTrialsAndMetadata(t *testing.T) {
 		"--config", "rs",
 		"--runs", "3",
 		"--out", outDir,
+		"--attack-settle", "0", // Story 11.2d: no settle wait in the unit dispatch
 		"--allow-unverified", "aggregator",
 		// Point the overlay at the in-repo chart so the RS overlay file
 		// resolves; the fake runner means no real helm/kubectl runs.

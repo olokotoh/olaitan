@@ -95,6 +95,14 @@ type scenarioHarness struct {
 	// execAttackCmd, a unit test injects a recorder). A nil value defaults to
 	// execAttackCmd inside newAttackExecutor.
 	attackRun attackRunFunc
+	// settleWait is the executor's settle-before-cleanup duration (Story
+	// 11.2d), threaded onto the executor in Run. Defaults to attackSettleWait;
+	// a unit test zeroes it so dispatch does not wait the real window.
+	settleWait time.Duration
+	// prepareKubectl, when set, replaces the executor's resolveUploadKubectl
+	// (review round 1, D2) so a unit test can dispatch S3 without a real
+	// kubectl on the test host's PATH. Nil in production.
+	prepareKubectl func(path string) (string, string, error)
 }
 
 // newScenario is the scenario FACTORY (Story 5.2, Task 3.2). It maps the
@@ -124,7 +132,7 @@ func newScenario(scenarioID, scenariosRoot string, attackRun attackRunFunc, logg
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &scenarioHarness{id: scenarioID, dir: dir, target: target, logger: logger, attackRun: attackRun}, nil
+	return &scenarioHarness{id: scenarioID, dir: dir, target: target, logger: logger, attackRun: attackRun, settleWait: attackSettleWait}, nil
 }
 
 // captureTarget projects the resolved scenarioTarget onto the
@@ -209,6 +217,10 @@ func (s *scenarioHarness) Run(ctx context.Context) (err error) {
 	executor, err := newAttackExecutor(s.id, s.dir, s.attackRun, s.logger)
 	if err != nil {
 		return err
+	}
+	executor.settleWait = s.settleWait
+	if s.prepareKubectl != nil {
+		executor.prepareKubectl = s.prepareKubectl
 	}
 	s.logger.Info("scenario harness dispatched (real in-cluster attack)",
 		"scenario", s.id,
