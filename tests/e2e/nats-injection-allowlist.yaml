@@ -13,7 +13,7 @@
 # file clean. Every entry MUST carry a non-empty reason.
 #
 # Story 11.2a rewrites the S1-S3 attack path to real in-cluster execution
-# (cmd/olaitan-eval/attack.go). The e2e injector rewrites that consume it are
+# (internal/eval/attack/attack.go). The e2e injector rewrites that consume it are
 # validated only on a live cluster (AC6) and are tracked below; the remaining
 # entries belong to other stories or to Story 11.2b (S4/S5).
 allow:

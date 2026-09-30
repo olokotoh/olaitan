@@ -440,3 +440,7 @@ func TestScenarioManifestsMapAttackStepsToMitre(t *testing.T) {
 		})
 	}
 }
+
+// fakePrepareKubectl stands in for the executor's kubectl resolver so the
+// dispatch test needs no real kubectl on the test host.
+func fakePrepareKubectl(path string) (string, string, error) { return path, "sha256-fake", nil }

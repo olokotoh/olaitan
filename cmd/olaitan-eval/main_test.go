@@ -15,6 +15,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/olokotoh/olaitan/internal/eval/attack"
 	"github.com/olokotoh/olaitan/internal/eval/capture"
 	"github.com/olokotoh/olaitan/internal/schema"
 )
@@ -518,7 +519,7 @@ func TestRun_DigestGateRefusesWithoutAllowlist(t *testing.T) {
 		"--scenario", "s1",
 		"--config", "rs",
 		"--out", filepath.Join(dir, "runs"),
-	}, &stdout, &stderr, execRunCmd, execAttackCmd)
+	}, &stdout, &stderr, execRunCmd, attack.ExecCmd)
 	if err == nil {
 		t.Fatalf("expected a fail-closed REFUSE, got nil")
 	}

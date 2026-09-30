@@ -15,7 +15,7 @@ import (
 //
 // The hard rule is that no scenario or test may publish fabricated events to
 // NATS as a stand-in for a real attack (attacks run for real inside pods, via
-// cmd/olaitan-eval/attack.go). This guard scans tests/e2e for the two shapes
+// internal/eval/attack/attack.go). This guard scans tests/e2e for the two shapes
 // of synthetic attack injection and fails on any file that is not documented
 // in the allow-list with a reason. It runs in the ordinary `go test ./...` CI
 // job (no build tag), so a reintroduced synthetic attack publish fails CI.
@@ -127,7 +127,7 @@ func TestNoSyntheticNATSInjection(t *testing.T) {
 	for _, h := range hits {
 		matchedFiles[h.file] = true
 		if _, ok := allow[h.file]; !ok {
-			t.Errorf("synthetic attack-event injection not on the allow-list: %s:%d\n  %s\n  (drive the real attack via cmd/olaitan-eval/attack.go, or add %s to tests/e2e/nats-injection-allowlist.yaml with a reason)", h.file, h.line, h.text, h.file)
+			t.Errorf("synthetic attack-event injection not on the allow-list: %s:%d\n  %s\n  (drive the real attack via internal/eval/attack/attack.go, or add %s to tests/e2e/nats-injection-allowlist.yaml with a reason)", h.file, h.line, h.text, h.file)
 		}
 	}
 

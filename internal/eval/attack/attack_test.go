@@ -1,4 +1,4 @@
-package main
+package attack
 
 import (
 	"bytes"
@@ -7,6 +7,7 @@ import (
 	"debug/elf"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -16,7 +17,7 @@ import (
 )
 
 // Story 11.2a red-first tests for the real in-cluster attack executor
-// (attack.go). They inject a recording attackRunFunc so the exact kubectl
+// (attack.go). They inject a recording RunFunc so the exact kubectl
 // argv is asserted WITHOUT a cluster (the overlay.go injectable-runner
 // precedent), proving: the per-scenario plan applies the 11.1 target then
 // runs the technique primitive(s) via kubectl exec; Cleanup deletes what
@@ -29,10 +30,10 @@ type recordedCall struct {
 	args []string
 }
 
-// recordingRunner returns an attackRunFunc that records every call and
+// recordingRunner returns an RunFunc that records every call and
 // returns canned stdout chosen by a matcher, plus an optional error for a
 // call whose joined argv contains failOn (empty = never fail).
-func recordingRunner(calls *[]recordedCall, stdoutFor func(args []string) string, failOn string) attackRunFunc {
+func recordingRunner(calls *[]recordedCall, stdoutFor func(args []string) string, failOn string) RunFunc {
 	return func(ctx context.Context, name string, args ...string) (string, error) {
 		*calls = append(*calls, recordedCall{name: name, args: append([]string(nil), args...)})
 		if failOn != "" && strings.Contains(strings.Join(args, " "), failOn) {
@@ -46,7 +47,7 @@ func recordingRunner(calls *[]recordedCall, stdoutFor func(args []string) string
 }
 
 func harnessDir(slug string) string {
-	return filepath.Join(scenariosTreeRoot(), slug)
+	return filepath.Join("..", "..", "..", "deploy", "demo", "scenarios", slug)
 }
 
 func joinCall(c recordedCall) string {
@@ -67,11 +68,11 @@ func firstCallContaining(calls []recordedCall, sub string) int {
 func TestAttackExecutor_S1_AppliesTargetThenExecsEscapeThenCleansUp(t *testing.T) {
 	var calls []recordedCall
 	run := recordingRunner(&calls, nil, "")
-	e, err := newAttackExecutor("s1", harnessDir("s1-container-escape"), run, testLogger())
+	e, err := New("s1", harnessDir("s1-container-escape"), run, testLogger())
 	if err != nil {
-		t.Fatalf("newAttackExecutor: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	e.settleWait = 0 // Story 11.2d: skip the 45s settle in unit tests
+	e.SettleWait = 0 // Story 11.2d: skip the 45s settle in unit tests
 	if err := e.Execute(context.Background()); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -114,11 +115,11 @@ func TestAttackExecutor_CleanupRunsEvenWhenPrimitiveFails(t *testing.T) {
 	var calls []recordedCall
 	// Fail the exec primitive; Cleanup must still delete what was applied.
 	run := recordingRunner(&calls, nil, "exec")
-	e, err := newAttackExecutor("s1", harnessDir("s1-container-escape"), run, testLogger())
+	e, err := New("s1", harnessDir("s1-container-escape"), run, testLogger())
 	if err != nil {
-		t.Fatalf("newAttackExecutor: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	e.settleWait = 0 // Story 11.2d: skip the 45s settle in unit tests
+	e.SettleWait = 0 // Story 11.2d: skip the 45s settle in unit tests
 	execErr := e.Execute(context.Background())
 	if execErr == nil {
 		t.Fatalf("expected Execute to surface the injected exec failure")
@@ -162,11 +163,11 @@ func TestAttackExecutor_S2_ReadsTokenWithoutPrintingItsValue(t *testing.T) {
 		return "200"
 	}
 	run := recordingRunner(&calls, stdoutFor, "")
-	e, err := newAttackExecutor("s2", harnessDir("s2-credential-exfil"), run, logger)
+	e, err := New("s2", harnessDir("s2-credential-exfil"), run, logger)
 	if err != nil {
-		t.Fatalf("newAttackExecutor: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	e.settleWait = 0 // Story 11.2d: skip the 45s settle in unit tests
+	e.SettleWait = 0 // Story 11.2d: skip the 45s settle in unit tests
 	if err := e.Execute(context.Background()); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -217,13 +218,13 @@ func TestAttackExecutor_S3_LaunchesKubectlNamedProcessInPod(t *testing.T) {
 		return ""
 	}
 	run := recordingRunner(&calls, stdoutFor, "")
-	e, err := newAttackExecutor("s3", harnessDir("s3-lateral-movement"), run, testLogger())
+	e, err := New("s3", harnessDir("s3-lateral-movement"), run, testLogger())
 	if err != nil {
-		t.Fatalf("newAttackExecutor: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	e.settleWait = 0                  // Story 11.2d: skip the 45s settle in unit tests
+	e.SettleWait = 0                  // Story 11.2d: skip the 45s settle in unit tests
 	e.kubectlBinary = "/fake/kubectl" // deterministic cp source in the unit test
-	e.prepareKubectl = fakePrepareKubectl
+	e.PrepareKubectl = fakePrepareKubectl
 	if err := e.Execute(context.Background()); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -268,13 +269,13 @@ func TestAttackExecutor_S3_UploadsAndExecsInTheSameLivePod(t *testing.T) {
 		}
 		return ""
 	}
-	e, err := newAttackExecutor("s3", harnessDir("s3-lateral-movement"), recordingRunner(&calls, stdoutFor, ""), testLogger())
+	e, err := New("s3", harnessDir("s3-lateral-movement"), recordingRunner(&calls, stdoutFor, ""), testLogger())
 	if err != nil {
-		t.Fatalf("newAttackExecutor: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	e.settleWait = 0
+	e.SettleWait = 0
 	e.kubectlBinary = "/fake/kubectl"
-	e.prepareKubectl = fakePrepareKubectl
+	e.PrepareKubectl = fakePrepareKubectl
 	if err := e.Execute(context.Background()); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -300,13 +301,13 @@ func TestAttackExecutor_S3_FailsWhenNoLivePod(t *testing.T) {
 		}
 		return ""
 	}
-	e, err := newAttackExecutor("s3", harnessDir("s3-lateral-movement"), recordingRunner(&calls, stdoutFor, ""), testLogger())
+	e, err := New("s3", harnessDir("s3-lateral-movement"), recordingRunner(&calls, stdoutFor, ""), testLogger())
 	if err != nil {
-		t.Fatalf("newAttackExecutor: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	e.settleWait = 0
+	e.SettleWait = 0
 	e.kubectlBinary = "/fake/kubectl"
-	e.prepareKubectl = fakePrepareKubectl
+	e.PrepareKubectl = fakePrepareKubectl
 	if err := e.Execute(context.Background()); err == nil {
 		t.Fatal("Execute succeeded with only a terminating pod; want an error")
 	}
@@ -331,13 +332,13 @@ func TestAttackExecutor_S3_DoesNotMaskAFailedKubectl(t *testing.T) {
 		}
 		return ""
 	}
-	e, err := newAttackExecutor("s3", harnessDir("s3-lateral-movement"), recordingRunner(&calls, stdoutFor, "/tmp/kubectl version"), testLogger())
+	e, err := New("s3", harnessDir("s3-lateral-movement"), recordingRunner(&calls, stdoutFor, "/tmp/kubectl version"), testLogger())
 	if err != nil {
-		t.Fatalf("newAttackExecutor: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	e.settleWait = 0
+	e.SettleWait = 0
 	e.kubectlBinary = "/fake/kubectl"
-	e.prepareKubectl = fakePrepareKubectl
+	e.PrepareKubectl = fakePrepareKubectl
 	if err := e.Execute(context.Background()); err == nil {
 		t.Fatal("Execute succeeded although the in-pod kubectl exec failed")
 	}
@@ -445,7 +446,7 @@ func TestResolveUploadKubectl(t *testing.T) {
 }
 
 // TestAttackExecutor_S3_WithoutAStubUsesTheRealResolver: review round 2. An
-// executor whose prepareKubectl is unset must not panic; it resolves the
+// executor whose PrepareKubectl is unset must not panic; it resolves the
 // kubectl itself.
 func TestAttackExecutor_S3_WithoutAStubUsesTheRealResolver(t *testing.T) {
 	var calls []recordedCall
@@ -455,13 +456,13 @@ func TestAttackExecutor_S3_WithoutAStubUsesTheRealResolver(t *testing.T) {
 		}
 		return ""
 	}
-	e, err := newAttackExecutor("s3", harnessDir("s3-lateral-movement"), recordingRunner(&calls, stdoutFor, ""), testLogger())
+	e, err := New("s3", harnessDir("s3-lateral-movement"), recordingRunner(&calls, stdoutFor, ""), testLogger())
 	if err != nil {
-		t.Fatalf("newAttackExecutor: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	e.settleWait = 0
+	e.SettleWait = 0
 	e.kubectlBinary = writeELF(t, t.TempDir(), "kubectl", false)
-	e.prepareKubectl = nil
+	e.PrepareKubectl = nil
 	if err := e.Execute(context.Background()); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -486,13 +487,13 @@ func TestAttackExecutor_S3_LogsTheKubectlVersion(t *testing.T) {
 		return ""
 	}
 	var logs bytes.Buffer
-	e, err := newAttackExecutor("s3", harnessDir("s3-lateral-movement"), recordingRunner(&calls, stdoutFor, ""), slog.New(slog.NewTextHandler(&logs, nil)))
+	e, err := New("s3", harnessDir("s3-lateral-movement"), recordingRunner(&calls, stdoutFor, ""), slog.New(slog.NewTextHandler(&logs, nil)))
 	if err != nil {
-		t.Fatalf("newAttackExecutor: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	e.settleWait = 0
+	e.SettleWait = 0
 	e.kubectlBinary = "/fake/kubectl"
-	e.prepareKubectl = fakePrepareKubectl
+	e.PrepareKubectl = fakePrepareKubectl
 	if err := e.Execute(context.Background()); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -505,21 +506,21 @@ func TestAttackExecutor_S3_LogsTheKubectlVersion(t *testing.T) {
 // kubectl rule and D3's exception only cover tenant- namespaces, so S3 is
 // detected only while the attack namespace carries that prefix.
 func TestAttackNamespaceIsInTheKubectlRuleScope(t *testing.T) {
-	if !strings.HasPrefix(attackNamespace, "tenant-") {
-		t.Fatalf("attackNamespace %q is outside the chart kubectl rule's tenant- scope", attackNamespace)
+	if !strings.HasPrefix(Namespace, "tenant-") {
+		t.Fatalf("Namespace %q is outside the chart kubectl rule's tenant- scope", Namespace)
 	}
-	values, err := os.ReadFile(filepath.Join("..", "..", "deploy", "helm", "olaitan", "values.yaml"))
+	values, err := os.ReadFile(filepath.Join("..", "..", "..", "deploy", "helm", "olaitan", "values.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(values), "k8s.ns.name startswith tenant-") {
-		t.Error("the chart kubectl rule no longer scopes on tenant-; update attackNamespace and this test together")
+		t.Error("the chart kubectl rule no longer scopes on tenant-; update Namespace and this test together")
 	}
 }
 
 func TestNewAttackExecutor_RejectsUnknownScenario(t *testing.T) {
-	if _, err := newAttackExecutor("s9", harnessDir("nope"), recordingRunner(&[]recordedCall{}, nil, ""), testLogger()); err == nil {
-		t.Errorf("expected newAttackExecutor to reject an unknown scenario id")
+	if _, err := New("s9", harnessDir("nope"), recordingRunner(&[]recordedCall{}, nil, ""), testLogger()); err == nil {
+		t.Errorf("expected New to reject an unknown scenario id")
 	}
 }
 
@@ -539,11 +540,11 @@ func TestAttackExecutor_ApplyRetriesTerminatingNamespace(t *testing.T) {
 		}
 		return "", nil
 	}
-	e, err := newAttackExecutor("s1", harnessDir("s1-container-escape"), run, testLogger())
+	e, err := New("s1", harnessDir("s1-container-escape"), run, testLogger())
 	if err != nil {
-		t.Fatalf("newAttackExecutor: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	e.settleWait = 0               // Story 11.2d: skip the 45s settle in unit tests
+	e.SettleWait = 0               // Story 11.2d: skip the 45s settle in unit tests
 	e.retryWait = time.Millisecond // do not sleep 5s in the unit test
 	if err := e.Execute(context.Background()); err != nil {
 		t.Fatalf("Execute should have retried past the terminating-namespace race: %v", err)
@@ -561,9 +562,9 @@ func TestAttackExecutor_ApplyRetriesTerminatingNamespace(t *testing.T) {
 		}
 		return "", nil
 	}
-	e2, _ := newAttackExecutor("s1", harnessDir("s1-container-escape"), hardRun, testLogger())
+	e2, _ := New("s1", harnessDir("s1-container-escape"), hardRun, testLogger())
 	e2.retryWait = time.Millisecond
-	e2.settleWait = 0
+	e2.SettleWait = 0
 	if err := e2.Execute(context.Background()); err == nil {
 		t.Fatalf("Execute should surface a non-transient apply error")
 	}
@@ -577,11 +578,11 @@ func TestAttackExecutor_ApplyRetriesTerminatingNamespace(t *testing.T) {
 func TestAttackExecutor_CleanupIsSurgical(t *testing.T) {
 	var calls []recordedCall
 	run := recordingRunner(&calls, nil, "")
-	e, err := newAttackExecutor("s2", harnessDir("s2-credential-exfil"), run, testLogger())
+	e, err := New("s2", harnessDir("s2-credential-exfil"), run, testLogger())
 	if err != nil {
-		t.Fatalf("newAttackExecutor: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	e.settleWait = 0 // Story 11.2d: skip the 45s settle in unit tests
+	e.SettleWait = 0 // Story 11.2d: skip the 45s settle in unit tests
 	if err := e.Cleanup(context.Background()); err != nil {
 		t.Fatalf("Cleanup: %v", err)
 	}
@@ -603,35 +604,35 @@ func TestAttackExecutor_CleanupIsSurgical(t *testing.T) {
 }
 
 // TestAttackExecutor_SettlesBeforeCleanup proves Story 11.2d's
-// settle-before-cleanup: Execute waits settleWait AFTER the primitive and
+// settle-before-cleanup: Execute waits SettleWait AFTER the primitive and
 // BEFORE returning (so the caller's deferred Cleanup does not delete the pod
 // before the correlator resolves workload posture off the live pod), and a
-// cancelled context short-circuits the wait. The default settleWait is
+// cancelled context short-circuits the wait. The default SettleWait is
 // non-zero so a real run never deletes the target immediately.
 func TestAttackExecutor_SettlesBeforeCleanup(t *testing.T) {
 	var calls []recordedCall
 	run := recordingRunner(&calls, nil, "")
-	e, err := newAttackExecutor("s1", harnessDir("s1-container-escape"), run, testLogger())
+	e, err := New("s1", harnessDir("s1-container-escape"), run, testLogger())
 	if err != nil {
-		t.Fatalf("newAttackExecutor: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	if e.settleWait <= 0 {
-		t.Fatalf("default settleWait must be positive so a real run does not delete the pod before posture resolves; got %s", e.settleWait)
+	if e.SettleWait <= 0 {
+		t.Fatalf("default SettleWait must be positive so a real run does not delete the pod before posture resolves; got %s", e.SettleWait)
 	}
-	e.settleWait = 60 * time.Millisecond
+	e.SettleWait = 60 * time.Millisecond
 	start := time.Now()
 	if err := e.Execute(context.Background()); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	if elapsed := time.Since(start); elapsed < e.settleWait {
-		t.Errorf("Execute returned after %s; expected to settle at least %s before returning", elapsed, e.settleWait)
+	if elapsed := time.Since(start); elapsed < e.SettleWait {
+		t.Errorf("Execute returned after %s; expected to settle at least %s before returning", elapsed, e.SettleWait)
 	}
 
 	// A cancelled context must short-circuit the settle so a shutdown is not
 	// blocked for the full window.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	e.settleWait = 10 * time.Second
+	e.SettleWait = 10 * time.Second
 	start = time.Now()
 	_ = e.Execute(ctx)
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
@@ -643,3 +644,9 @@ func TestAttackExecutor_SettlesBeforeCleanup(t *testing.T) {
 type errDummy string
 
 func (e errDummy) Error() string { return string(e) }
+
+// testLogger discards log output; tests that assert on a log line build
+// their own buffer-backed logger.
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}

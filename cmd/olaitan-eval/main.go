@@ -13,6 +13,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/olokotoh/olaitan/internal/eval/attack"
 	"github.com/olokotoh/olaitan/internal/eval/capture"
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
 )
@@ -105,7 +106,7 @@ type metadata struct {
 }
 
 func main() {
-	if err := run(os.Args[1:], os.Stdout, os.Stderr, execRunCmd, execAttackCmd); err != nil {
+	if err := run(os.Args[1:], os.Stdout, os.Stderr, execRunCmd, attack.ExecCmd); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "olaitan-eval: %v\n", err)
 		os.Exit(1)
 	}
@@ -120,7 +121,7 @@ func main() {
 // the Story-5.3 helmOverlay shells out through (main passes the real
 // execRunCmd; a unit test passes a fake so the full dispatch runs without a
 // cluster).
-func run(args []string, stdout, stderr io.Writer, runCmd overlayRunFunc, attackRun attackRunFunc) error {
+func run(args []string, stdout, stderr io.Writer, runCmd overlayRunFunc, attackRun attack.RunFunc) error {
 	cfg, err := parseFlags(args, stderr)
 	if err != nil {
 		return err
@@ -287,7 +288,7 @@ func parseFlags(args []string, stderr io.Writer) (runConfig, error) {
 	// six still exist, AC5). --max-run-size-bytes defaults to 500 MiB (BI-10).
 	fs.StringVar(&cfg.natsURL, "nats-url", "", "JetStream endpoint the per-run Capturer drains the run's subjects from (empty = no NATS wired; artefacts captured empty)")
 	fs.Int64Var(&cfg.maxRunSizeBytes, "max-run-size-bytes", capture.DefaultMaxRunSizeBytes, "per-run artefact size cap; over it a fail-LOUD alert is emitted and size_cap_exceeded is recorded (the artefacts are NOT deleted)")
-	fs.DurationVar(&cfg.attackSettle, "attack-settle", attackSettleWait, "Story 11.2d: settle after the attack primitive before cleanup so the correlator resolves posture off the live pod; 0 to delete immediately (unit/CI dispatch)")
+	fs.DurationVar(&cfg.attackSettle, "attack-settle", attack.DefaultSettleWait, "Story 11.2d: settle after the attack primitive before cleanup so the correlator resolves posture off the live pod; 0 to delete immediately (unit/CI dispatch)")
 
 	if err := fs.Parse(args); err != nil {
 		return runConfig{}, err

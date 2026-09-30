@@ -11,6 +11,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/olokotoh/olaitan/internal/eval/attack"
 	"github.com/olokotoh/olaitan/internal/eval/capture"
 	evalscenario "github.com/olokotoh/olaitan/internal/eval/scenario"
 )
@@ -92,11 +93,11 @@ type scenarioHarness struct {
 	logger *slog.Logger
 	// attackRun is the injectable kubectl shell-out the Story 11.2a attack
 	// executor drives (threaded from run(); main wires the real
-	// execAttackCmd, a unit test injects a recorder). A nil value defaults to
-	// execAttackCmd inside newAttackExecutor.
-	attackRun attackRunFunc
+	// attack.ExecCmd, a unit test injects a recorder). A nil value defaults to
+	// attack.ExecCmd inside newAttackExecutor.
+	attackRun attack.RunFunc
 	// settleWait is the executor's settle-before-cleanup duration (Story
-	// 11.2d), threaded onto the executor in Run. Defaults to attackSettleWait;
+	// 11.2d), threaded onto the executor in Run. Defaults to attack.DefaultSettleWait;
 	// a unit test zeroes it so dispatch does not wait the real window.
 	settleWait time.Duration
 	// prepareKubectl, when set, replaces the executor's resolveUploadKubectl
@@ -113,7 +114,7 @@ type scenarioHarness struct {
 // mis-wired scenario fails loudly rather than silently no-opping (the BI-3
 // "no silent no-op" discipline). scenariosRoot is a parameter so tests can
 // point it at the committed tree from any working directory.
-func newScenario(scenarioID, scenariosRoot string, attackRun attackRunFunc, logger *slog.Logger) (Scenario, error) {
+func newScenario(scenarioID, scenariosRoot string, attackRun attack.RunFunc, logger *slog.Logger) (Scenario, error) {
 	slug, ok := scenarioSlugs[scenarioID]
 	if !ok {
 		return nil, fmt.Errorf("scenario %q has no harness mapping (want one of %s)", scenarioID, knownScenarioIDs())
@@ -132,7 +133,7 @@ func newScenario(scenarioID, scenariosRoot string, attackRun attackRunFunc, logg
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &scenarioHarness{id: scenarioID, dir: dir, target: target, logger: logger, attackRun: attackRun, settleWait: attackSettleWait}, nil
+	return &scenarioHarness{id: scenarioID, dir: dir, target: target, logger: logger, attackRun: attackRun, settleWait: attack.DefaultSettleWait}, nil
 }
 
 // captureTarget projects the resolved scenarioTarget onto the
@@ -204,7 +205,7 @@ func loadScenarioTarget(path string) (scenarioTarget, error) {
 // Run drives the scenario harness's REAL in-cluster attack against the
 // warmed cluster (Story 11.2a, replacing the Story 5.2 log-only Run and all
 // synthetic NATS-event injection). It builds the per-scenario attack
-// executor (attack.go), applies the Story 11.1 target, runs the technique
+// executor (internal/eval/attack), applies the Story 11.1 target, runs the technique
 // primitive(s) via kubectl exec, and reverses the technique via a deferred
 // Cleanup so teardown runs even when a primitive errors (AC2, the Runner-loop
 // BI-2 discipline). The attack produces genuine syscalls Falco observes, so
@@ -214,13 +215,13 @@ func loadScenarioTarget(path string) (scenarioTarget, error) {
 // newAttackExecutor rejects them here with a loud error rather than a silent
 // no-op.
 func (s *scenarioHarness) Run(ctx context.Context) (err error) {
-	executor, err := newAttackExecutor(s.id, s.dir, s.attackRun, s.logger)
+	executor, err := attack.New(s.id, s.dir, s.attackRun, s.logger)
 	if err != nil {
 		return err
 	}
-	executor.settleWait = s.settleWait
+	executor.SettleWait = s.settleWait
 	if s.prepareKubectl != nil {
-		executor.prepareKubectl = s.prepareKubectl
+		executor.PrepareKubectl = s.prepareKubectl
 	}
 	s.logger.Info("scenario harness dispatched (real in-cluster attack)",
 		"scenario", s.id,
