@@ -1,14 +1,14 @@
 {
-  "hostname": "olaitan-full-control-plane",
-  "output": "18:29:12.158111596: Warning Olaitan privileged escape primitive (proc_exepath=/bin/nsenter proc_cmdline=nsenter --target 1 --mount --uts --ipc --net --pid -- cat /etc/hostname cap_effective=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_FSETID CAP_KILL CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_LINUX_IMMUTABLE CAP_NET_BIND_SERVICE CAP_NET_BROADCAST CAP_NET_ADMIN CAP_NET_RAW CAP_IPC_LOCK CAP_IPC_OWNER CAP_SYS_MODULE CAP_SYS_RAWIO CAP_SYS_CHROOT CAP_SYS_PTRACE CAP_SYS_PACCT CAP_SYS_ADMIN CAP_SYS_BOOT CAP_SYS_NICE CAP_SYS_RESOURCE CAP_SYS_TIME CAP_SYS_TTY_CONFIG CAP_MKNOD CAP_LEASE CAP_AUDIT_WRITE CAP_AUDIT_CONTROL CAP_SETFCAP CAP_MAC_OVERRIDE CAP_MAC_ADMIN CAP_SYSLOG CAP_WAKE_ALARM CAP_BLOCK_SUSPEND CAP_AUDIT_READ CAP_PERFMON CAP_BPF CAP_CHECKPOINT_RESTORE container_id=77113aa3b410 k8s_ns=<NA> k8s_pod=<NA>) container_id=77113aa3b410 container_name=<NA> container_image_repository=<NA> container_image_tag=<NA> k8s_pod_name=<NA> k8s_ns_name=<NA>",
+  "hostname": "olaitan-full-worker",
+  "output": "09:08:40.706081180: Warning Olaitan privileged escape primitive (proc_exepath=/bin/nsenter proc_cmdline=nsenter --target 1 --mount --uts --ipc --net --pid -- cat /etc/hostname cap_effective=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_FSETID CAP_KILL CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_LINUX_IMMUTABLE CAP_NET_BIND_SERVICE CAP_NET_BROADCAST CAP_NET_ADMIN CAP_NET_RAW CAP_IPC_LOCK CAP_IPC_OWNER CAP_SYS_MODULE CAP_SYS_RAWIO CAP_SYS_CHROOT CAP_SYS_PTRACE CAP_SYS_PACCT CAP_SYS_ADMIN CAP_SYS_BOOT CAP_SYS_NICE CAP_SYS_RESOURCE CAP_SYS_TIME CAP_SYS_TTY_CONFIG CAP_MKNOD CAP_LEASE CAP_AUDIT_WRITE CAP_AUDIT_CONTROL CAP_SETFCAP CAP_MAC_OVERRIDE CAP_MAC_ADMIN CAP_SYSLOG CAP_WAKE_ALARM CAP_BLOCK_SUSPEND CAP_AUDIT_READ CAP_PERFMON CAP_BPF CAP_CHECKPOINT_RESTORE container_id=43536ab2c3ca k8s_ns=tenant-acme k8s_pod=web-8447d48b7-cmf7h) container_id=43536ab2c3ca container_name=web container_image_repository=docker.io/library/busybox container_image_tag=30ecbe1509090b38ef3260f3609d64d8261230464eaa4d235901db496e9647fb k8s_pod_name=web-8447d48b7-cmf7h k8s_ns_name=tenant-acme",
   "output_fields": {
-    "container.id": "77113aa3b410",
-    "container.image.repository": null,
-    "container.image.tag": null,
-    "container.name": null,
-    "evt.time": 1790360952158111596,
-    "k8s.ns.name": null,
-    "k8s.pod.name": null,
+    "container.id": "43536ab2c3ca",
+    "container.image.repository": "docker.io/library/busybox",
+    "container.image.tag": "30ecbe1509090b38ef3260f3609d64d8261230464eaa4d235901db496e9647fb",
+    "container.name": "web",
+    "evt.time": 1790759320706081180,
+    "k8s.ns.name": "tenant-acme",
+    "k8s.pod.name": "web-8447d48b7-cmf7h",
     "proc.cmdline": "nsenter --target 1 --mount --uts --ipc --net --pid -- cat /etc/hostname",
     "proc.exepath": "/bin/nsenter",
     "thread.cap_effective": "CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_FSETID CAP_KILL CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_LINUX_IMMUTABLE CAP_NET_BIND_SERVICE CAP_NET_BROADCAST CAP_NET_ADMIN CAP_NET_RAW CAP_IPC_LOCK CAP_IPC_OWNER CAP_SYS_MODULE CAP_SYS_RAWIO CAP_SYS_CHROOT CAP_SYS_PTRACE CAP_SYS_PACCT CAP_SYS_ADMIN CAP_SYS_BOOT CAP_SYS_NICE CAP_SYS_RESOURCE CAP_SYS_TIME CAP_SYS_TTY_CONFIG CAP_MKNOD CAP_LEASE CAP_AUDIT_WRITE CAP_AUDIT_CONTROL CAP_SETFCAP CAP_MAC_OVERRIDE CAP_MAC_ADMIN CAP_SYSLOG CAP_WAKE_ALARM CAP_BLOCK_SUSPEND CAP_AUDIT_READ CAP_PERFMON CAP_BPF CAP_CHECKPOINT_RESTORE"
@@ -22,5 +22,5 @@
     "mitre_privilege_escalation",
     "olaitan"
   ],
-  "time": "2026-09-25T18:29:12.158111596Z"
+  "time": "2026-09-30T09:08:40.706081180Z"
 }

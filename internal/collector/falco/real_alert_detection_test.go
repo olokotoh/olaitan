@@ -2,10 +2,10 @@ package falco_test
 
 // Story 11.2d (#195), AC5: pin each S1-S3 OLT rule against a RECORDED REAL
 // Falco alert, not a hand-written synthetic event. Each fixture under
-// testdata/real-alerts/ is the exact JSON body Falco's http_output POSTed to
-// the collector on a live cluster when the real attack ran (SA token values
-// are never stored; the S2 fixture carries only the token path, length and
-// hash). The test drives the SAME collector path the live pipeline uses
+// testdata/real-alerts/ is the exact alert JSON Falco emitted (the body its
+// http_output POSTs to the collector) on the node running the attack pod, on
+// a live kind-full cluster on 2026-09-30 (SA token values are never stored:
+// Falco's alert names only the token file). The test drives the SAME collector path the live pipeline uses
 // (DecodeHTTPOutput -> Translate) and then the SAME decision-engine match path
 // (matcher.NewResolver + rule.Detection.Matches), so a green result means the
 // real alert, run through the real code, triggers its intended OLT rule.
@@ -50,11 +50,17 @@ func TestRealFalcoAlerts_TriggerTheirOLTRule(t *testing.T) {
 		name     string
 		fixture  string // real Falco http_output body
 		ruleFile string // the OLT rule it must trigger
+		// falcoRule is the chart Falco rule that must have produced it.
+		// Review round 2: the first fixtures were the peer kind node's view
+		// (k8s.ns.name null) and the S3 one came from upstream's "Drop and
+		// execute new binary in container"; they are now the owning node's
+		// alert from the chart rule, re-recorded 2026-09-30.
+		falcoRule string
 	}{
-		{"S1 privileged escape -> OLT-PRIV-001", "priv-001-cap-sys-admin.json", "rules/priv/OLT-PRIV-001.yaml"},
-		{"S2 SA-token read -> OLT-CRED-001", "cred-001-sa-token-read.json", "rules/cred/OLT-CRED-001.yaml"},
-		{"S2 metadata contact -> OLT-CRED-002", "cred-002-metadata-contact.json", "rules/cred/OLT-CRED-002.yaml"},
-		{"S3 in-pod kubectl -> OLT-LATERAL-001", "lateral-001-kubectl-exec.json", "rules/lateral/OLT-LATERAL-001.yaml"},
+		{"S1 privileged escape -> OLT-PRIV-001", "priv-001-cap-sys-admin.json", "rules/priv/OLT-PRIV-001.yaml", "Olaitan Privileged Escape Primitive"},
+		{"S2 SA-token read -> OLT-CRED-001", "cred-001-sa-token-read.json", "rules/cred/OLT-CRED-001.yaml", "Olaitan ServiceAccount Token Read"},
+		{"S2 metadata contact -> OLT-CRED-002", "cred-002-metadata-contact.json", "rules/cred/OLT-CRED-002.yaml", "Olaitan Cloud Metadata Contact"},
+		{"S3 in-pod kubectl -> OLT-LATERAL-001", "lateral-001-kubectl-exec.json", "rules/lateral/OLT-LATERAL-001.yaml", "Olaitan In-Pod kubectl Exec"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -65,6 +71,12 @@ func TestRealFalcoAlerts_TriggerTheirOLTRule(t *testing.T) {
 			resp, err := falco.DecodeHTTPOutput(body)
 			if err != nil {
 				t.Fatalf("DecodeHTTPOutput(%s): %v", tc.fixture, err)
+			}
+			if resp.Rule != tc.falcoRule {
+				t.Errorf("fixture %s was produced by Falco rule %q, want the chart rule %q", tc.fixture, resp.Rule, tc.falcoRule)
+			}
+			if ns := resp.OutputFields["k8s.ns.name"]; ns != "tenant-acme" {
+				t.Errorf("fixture %s has k8s.ns.name %q, want tenant-acme (the owning node's view names the attack pod)", tc.fixture, ns)
 			}
 			ev, err := falco.Translate(resp, "eval-node")
 			if err != nil {
