@@ -573,6 +573,64 @@ func TestAttackExecutor_ApplyRetriesTerminatingNamespace(t *testing.T) {
 	}
 }
 
+// TestAttackExecutor_RetriesWhenTargetDeletedMidRollout proves the e2e drain
+// race fix: when `kubectl rollout status` fails with "object has been deleted"
+// (a prior test/trial deleted the shared tenant-acme namespace with
+// --wait=false and it finished draining right after this apply), Execute
+// re-applies the target and waits again rather than failing the trial. A real
+// rollout timeout, by contrast, is NOT retried.
+func TestAttackExecutor_RetriesWhenTargetDeletedMidRollout(t *testing.T) {
+	var applyCount, rolloutCount int
+	run := func(ctx context.Context, name string, args ...string) (string, error) {
+		joined := strings.Join(args, " ")
+		switch {
+		case strings.Contains(joined, "apply"):
+			applyCount++
+		case strings.Contains(joined, "rollout status"):
+			rolloutCount++
+			if rolloutCount == 1 {
+				// First wait loses the object to the draining namespace.
+				return "", errDummy("error: object has been deleted")
+			}
+		}
+		return "", nil
+	}
+	e, err := New("s1", harnessDir("s1-container-escape"), run, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	e.SettleWait = 0
+	e.retryWait = time.Millisecond // do not sleep the real 5s in the unit test
+	if err := e.Execute(context.Background()); err != nil {
+		t.Fatalf("Execute should have re-applied past the deletion race: %v", err)
+	}
+	if applyCount < 2 {
+		t.Errorf("apply count = %d; want >= 2 (a re-apply after the mid-rollout deletion)", applyCount)
+	}
+	if rolloutCount < 2 {
+		t.Errorf("rollout status count = %d; want >= 2 (a retry after the deletion race)", rolloutCount)
+	}
+
+	// A genuine rollout timeout is NOT a deletion race and must NOT be retried.
+	var hardRollouts int
+	hardRun := func(ctx context.Context, name string, args ...string) (string, error) {
+		if strings.Contains(strings.Join(args, " "), "rollout status") {
+			hardRollouts++
+			return "", errDummy("error: timed out waiting for the condition")
+		}
+		return "", nil
+	}
+	e2, _ := New("s1", harnessDir("s1-container-escape"), hardRun, testLogger())
+	e2.SettleWait = 0
+	e2.retryWait = time.Millisecond
+	if err := e2.Execute(context.Background()); err == nil {
+		t.Fatal("Execute should surface a genuine rollout timeout")
+	}
+	if hardRollouts != 1 {
+		t.Errorf("rollout attempts on a real timeout = %d; want 1 (no retry)", hardRollouts)
+	}
+}
+
 // TestAttackExecutor_CleanupIsSurgical proves Cleanup deletes the attacker
 // resources by name and never deletes the shared tenant-acme Namespace.
 func TestAttackExecutor_CleanupIsSurgical(t *testing.T) {

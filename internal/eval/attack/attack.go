@@ -207,13 +207,8 @@ func New(scenarioID, dir string, runCmd RunFunc, logger *slog.Logger) (*Executor
 // (scenarioHarness.Run) defers Cleanup so teardown runs even on a primitive
 // error (the Runner-loop BI-2 discipline).
 func (e *Executor) Execute(ctx context.Context) error {
-	for _, m := range e.manifests {
-		if err := e.applyWithRetry(ctx, m); err != nil {
-			return fmt.Errorf("apply %s: %w", m, err)
-		}
-	}
-	if _, err := e.runCmd(ctx, "kubectl", "rollout", "status", attackWorkload, "-n", Namespace, "--timeout", attackWaitTimeout); err != nil {
-		return fmt.Errorf("wait target ready: %w", err)
+	if err := e.ensureTargetReady(ctx); err != nil {
+		return err
 	}
 	var primErr error
 	switch e.scenarioID {
@@ -232,6 +227,48 @@ func (e *Executor) Execute(ctx context.Context) error {
 	// already emitted still flows; a cancelled context skips the wait.
 	e.settle(ctx)
 	return primErr
+}
+
+// ensureTargetReady applies the target (and the S2 RBAC) and waits for the
+// Deployment to roll out, as one retriable unit. applyWithRetry already rides
+// out a terminating namespace on the apply itself, but a prior test or trial
+// that deleted the shared tenant-acme Namespace with --wait=false can finish
+// draining AFTER a successful apply, sweeping the just-created Deployment so
+// `kubectl rollout status` fails with "object has been deleted". That is the
+// same drain race, surfacing one step later, so it is retried the same way:
+// re-apply and wait again. A non-race rollout error (a genuine timeout) is
+// returned at once. The always-on e2e job runs the RS smoke (which deletes the
+// whole tenant-acme namespace on cleanup) in the process right before the eval
+// smoke, so this race is real and recurring, not hypothetical.
+func (e *Executor) ensureTargetReady(ctx context.Context) error {
+	var lastErr error
+	for attempt := 1; attempt <= applyRetries; attempt++ {
+		for _, m := range e.manifests {
+			if err := e.applyWithRetry(ctx, m); err != nil {
+				return fmt.Errorf("apply %s: %w", m, err)
+			}
+		}
+		_, err := e.runCmd(ctx, "kubectl", "rollout", "status", attackWorkload, "-n", Namespace, "--timeout", attackWaitTimeout)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isDeletionRaceError(err) {
+			return fmt.Errorf("wait target ready: %w", err)
+		}
+		e.logger.Warn("target was deleted mid-rollout by a prior cleanup still draining; re-applying",
+			"attempt", attempt, "of", applyRetries, "err", err)
+		wait := e.retryWait
+		if wait <= 0 {
+			wait = applyRetryWait
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+	return fmt.Errorf("wait target ready after %d attempts: %w", applyRetries, lastErr)
 }
 
 // settle waits SettleWait (unless it is non-positive or the context is
@@ -337,6 +374,24 @@ func isTransientApplyError(err error) bool {
 	return strings.Contains(msg, "being terminated") ||
 		strings.Contains(msg, "being deleted") ||
 		strings.Contains(msg, "object is being deleted")
+}
+
+// isDeletionRaceError reports whether a `kubectl rollout status` failure was
+// caused by the target (or its namespace) being deleted out from under the
+// wait by a prior cleanup still draining, rather than a genuine rollout
+// timeout. "object has been deleted" is kubectl's message when the watched
+// Deployment is removed mid-watch; the terminating/not-found variants cover the
+// namespace being swept just before or during the wait. Only these are retried
+// (re-apply + wait again); a real timeout is surfaced at once.
+func isDeletionRaceError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "has been deleted") ||
+		strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "no longer exists") ||
+		isTransientApplyError(err)
 }
 
 // exec runs a shell script inside the target pod via kubectl exec.
