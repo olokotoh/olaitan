@@ -6246,6 +6246,225 @@ func TestKindOverlayExemptsOnlyKindsMountHook(t *testing.T) {
 	}
 }
 
+// TestSATokenReadRuleIsShellDrivenOnly: Story 11.2d kubeadm benign check.
+// Every client-go process re-reads its projected ServiceAccount token, so a
+// Falco rule on any read of the file fired on Calico, kube-proxy, the
+// tigera-operator and Olaitan itself, and OLT-CRED-001 matched 113 times with
+// no attack. Decision (Aslim, 2026-09-28): the chart's rule fires only when
+// the reader is a shell or the child of a shell, which is how an attacker in
+// the pod reads it. The OLT rule itself is not touched.
+func TestSATokenReadRuleIsShellDrivenOnly(t *testing.T) {
+	rules := docByKindName(t, helmTemplate(t, nil), "ConfigMap", "falco-rules")
+	data, _ := rules["data"].(map[string]any)
+	var parsed []map[string]any
+	if err := yaml.Unmarshal([]byte(fmt.Sprint(data["olaitan-detection.yaml"])), &parsed); err != nil {
+		t.Fatalf("parse olaitan-detection.yaml: %v", err)
+	}
+	var cond string
+	for _, r := range parsed {
+		if r["rule"] == "Olaitan ServiceAccount Token Read" {
+			cond = fmt.Sprint(r["condition"])
+		}
+	}
+	if cond == "" {
+		t.Fatal("Olaitan ServiceAccount Token Read is missing from olaitan-detection.yaml")
+	}
+	for _, want := range []string{"proc.name in (shell_binaries)", "proc.pname in (shell_binaries)", "serviceaccount/"} {
+		if !strings.Contains(cond, want) {
+			t.Errorf("SA token rule condition is missing %q: %s", want, cond)
+		}
+	}
+}
+
+// olaitanDetectionRules parses the chart's olaitan-detection.yaml from the
+// default render and returns each entry keyed by its rule name.
+func olaitanDetectionRules(t *testing.T) map[string]map[string]any {
+	t.Helper()
+	rules := docByKindName(t, helmTemplate(t, nil), "ConfigMap", "falco-rules")
+	data, _ := rules["data"].(map[string]any)
+	var parsed []map[string]any
+	if err := yaml.Unmarshal([]byte(fmt.Sprint(data["olaitan-detection.yaml"])), &parsed); err != nil {
+		t.Fatalf("parse olaitan-detection.yaml: %v", err)
+	}
+	out := map[string]map[string]any{}
+	for _, r := range parsed {
+		if name, ok := r["rule"].(string); ok {
+			out[name] = r
+		}
+	}
+	return out
+}
+
+// TestFalcoRulesCarryTheOLTExclusions: Story 11.2d review round 1, decision
+// D1 (Aslim, 2026-09-28). The four chart rules are WARNING, and a WARNING
+// alert starts an investigation on its own, so it can mark a workload
+// SUSPICIOUS without passing the OLT rules' own filters. Each Falco condition
+// therefore carries the exclusions its OLT rule already has. The OLT rules
+// are not touched. P7: setns is a syscall, never a process name.
+func TestFalcoRulesCarryTheOLTExclusions(t *testing.T) {
+	r := olaitanDetectionRules(t)
+	sysNS := "not k8s.ns.name in (kube-system, kube-public, kube-node-lease, olaitan)"
+	for rule, wants := range map[string][]string{
+		"Olaitan Privileged Escape Primitive": {sysNS},
+		"Olaitan Cloud Metadata Contact":      {sysNS},
+		"Olaitan ServiceAccount Token Read":   {"not proc.exepath in (olaitan_system_process_paths)"},
+		"Olaitan In-Pod kubectl Exec":         {"k8s.ns.name startswith tenant-"},
+	} {
+		cond := fmt.Sprint(r[rule]["condition"])
+		for _, want := range wants {
+			if !strings.Contains(cond, want) {
+				t.Errorf("%s condition is missing %q: %s", rule, want, cond)
+			}
+		}
+	}
+	// The OLT-CRED-001 system_process regex, spelled out as the list's paths.
+	rules := docByKindName(t, helmTemplate(t, nil), "ConfigMap", "falco-rules")
+	data, _ := rules["data"].(map[string]any)
+	var parsed []map[string]any
+	if err := yaml.Unmarshal([]byte(fmt.Sprint(data["olaitan-detection.yaml"])), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, e := range parsed {
+		if e["list"] == "olaitan_system_process_paths" {
+			for _, it := range e["items"].([]any) {
+				paths = append(paths, fmt.Sprint(it))
+			}
+		}
+	}
+	re := regexp.MustCompile(`^/(usr/)?(local/)?s?bin/(kubelet|kube-proxy|coredns)$`)
+	if len(paths) != 24 {
+		t.Errorf("olaitan_system_process_paths has %d paths, want the 24 the OLT-CRED-001 regex matches: %v", len(paths), paths)
+	}
+	for _, p := range paths {
+		if !re.MatchString(p) {
+			t.Errorf("olaitan_system_process_paths entry %q is not matched by the OLT-CRED-001 regex", p)
+		}
+	}
+	if strings.Contains(fmt.Sprint(r["Olaitan Privileged Escape Primitive"]["condition"]), "setns") {
+		t.Error("the escape rule lists setns as a process name; it is a syscall")
+	}
+	// Decision D5 (Aslim, 2026-09-30): a null k8s.ns.name makes
+	// `not k8s.ns.name in (...)` true, so the exclusion above only holds when
+	// the namespace is known. Live on kind the peer node's view of S1/S2 had
+	// no namespace; the owning node always had it.
+	for _, rule := range []string{"Olaitan Privileged Escape Primitive", "Olaitan Cloud Metadata Contact"} {
+		cond := fmt.Sprint(r[rule]["condition"])
+		if !strings.Contains(cond, "k8s.ns.name exists and "+sysNS) {
+			t.Errorf("%s does not require a known namespace before its exclusion: %s", rule, cond)
+		}
+	}
+	// Falco 0.45 dropped enter events: evt.dir is deprecated and `evt.dir=<`
+	// is always true (the live rules-load warning of 2026-09-30).
+	if strings.Contains(fmt.Sprint(r["Olaitan Cloud Metadata Contact"]["condition"]), "evt.dir") {
+		t.Error("the metadata rule still uses the deprecated evt.dir")
+	}
+}
+
+// TestOlaitanKubectlRuleWinsOverTheDefaultRule: decision D3. Falco stops at
+// the first matching rule, and the default "Drop and execute new binary in
+// container" (from the unpinned upstream rules package) used to win for S3's
+// /tmp/kubectl, so S3 detection hung on it. The chart appends an exception to
+// that rule for exactly the scope the Olaitan kubectl rule covers (a /kubectl
+// exe in a tenant- namespace), so the Olaitan rule is the one that fires
+// there and the default rule still covers every other namespace.
+func TestOlaitanKubectlRuleWinsOverTheDefaultRule(t *testing.T) {
+	r := olaitanDetectionRules(t)
+	d, ok := r["Drop and execute new binary in container"]
+	if !ok {
+		t.Fatal("olaitan-detection.yaml does not append an exception to Drop and execute new binary in container")
+	}
+	body, _ := yaml.Marshal(d)
+	for _, want := range []string{"olaitan_kubectl_rule_owns_it", "proc.exepath", "k8s.ns.name", "endswith", "startswith", "/kubectl", "tenant-", "exceptions: append"} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("default-rule exception is missing %q:\n%s", want, body)
+		}
+	}
+}
+
+// TestFalcoRulesPackageIsPinned: Story 11.2d review round 2, decision D4
+// (Aslim, 2026-09-30). D3 appends an exception to the upstream rule "Drop and
+// execute new binary in container", and Falco refuses to start when an
+// override names a rule no loaded file defines. With the rules package
+// floating (falco-rules:5, re-followed weekly) an upstream rename would stop
+// Falco on every profile. The package is pinned to the version the
+// 2026-09-30 live run loaded (5.2.0), in both install and follow refs, and
+// the follower sidecar is off, so the ruleset only changes with a chart
+// change. The container plugin stays at the subchart's pin (0.7.1). D3 also
+// rests on Falco's first-match rule semantics, so that is pinned here too.
+func TestFalcoRulesPackageIsPinned(t *testing.T) {
+	rendered := helmTemplate(t, nil)
+	cm := docByKindName(t, rendered, "ConfigMap", "falco-falcoctl")
+	data, _ := cm["data"].(map[string]any)
+	var cfg struct {
+		Artifact struct {
+			Install struct{ Refs []string } `yaml:"install"`
+			Follow  struct{ Refs []string } `yaml:"follow"`
+		} `yaml:"artifact"`
+	}
+	if err := yaml.Unmarshal([]byte(fmt.Sprint(data["falcoctl.yaml"])), &cfg); err != nil {
+		t.Fatalf("parse falcoctl.yaml: %v", err)
+	}
+	wantInstall := []string{"falco-rules:5.2.0", "ghcr.io/falcosecurity/plugins/plugin/container:0.7.1"}
+	if !reflect.DeepEqual(cfg.Artifact.Install.Refs, wantInstall) {
+		t.Errorf("falcoctl install refs = %v, want %v", cfg.Artifact.Install.Refs, wantInstall)
+	}
+	if !reflect.DeepEqual(cfg.Artifact.Follow.Refs, []string{"falco-rules:5.2.0"}) {
+		t.Errorf("falcoctl follow refs = %v, want [falco-rules:5.2.0]", cfg.Artifact.Follow.Refs)
+	}
+	if strings.Contains(rendered, "name: falcoctl-artifact-follow") {
+		t.Error("the falcoctl follower sidecar is still rendered; it would re-pull rules the chart does not pin")
+	}
+	falcoCM := docByKindName(t, rendered, "ConfigMap", "olaitan-falco")
+	fdata, _ := falcoCM["data"].(map[string]any)
+	if !strings.Contains(fmt.Sprint(fdata["falco.yaml"]), "rule_matching: first") {
+		t.Error("falco.yaml does not set rule_matching: first; D3's exception assumes first-match")
+	}
+}
+
+// TestKindOverlaysExemptKindsMountHookFromTheEscapeRule: Story 11.2d benign
+// check. The same kind hook (mount-product-files.sh, proc.pname
+// mount-product-f) runs /usr/bin/mount with CAP_SYS_ADMIN inside every new
+// container, so the chart's "Olaitan Privileged Escape Primitive" rule fired
+// on every pod start on kind-full and OLT-PRIV-001 matched with no attack.
+// Both kind overlays must append the same narrow exception to that rule; the
+// default values must not, because real nodes do not run the hook.
+func TestKindOverlaysExemptKindsMountHookFromTheEscapeRule(t *testing.T) {
+	for _, overlay := range []string{"values-kind.yaml", "values-full.yaml"} {
+		t.Run(overlay, func(t *testing.T) {
+			args := []string{"template", "olaitan", chartDir(t),
+				"--set", "secrets.redisPassword=test-password",
+				"-f", filepath.Join(chartDir(t), overlay)}
+			if overlay == "values-full.yaml" {
+				args = append(args, "-f", filepath.Join(filepath.Dir(chartDir(t)), "testdata", "full-profile", "stub-key-material.yaml"))
+			}
+			out, err := exec.Command("helm", args...).CombinedOutput()
+			if err != nil {
+				t.Fatalf("render with %s: %v\n%s", overlay, err, out)
+			}
+			rules := docByKindName(t, string(out), "ConfigMap", "falco-rules")
+			data, _ := rules["data"].(map[string]any)
+			body := fmt.Sprint(data["olaitan-kind-exceptions.yaml"])
+			i := strings.Index(body, "- rule: Olaitan Privileged Escape Primitive")
+			if i < 0 {
+				t.Fatalf("%s does not append an exception to Olaitan Privileged Escape Primitive", overlay)
+			}
+			block := body[i:]
+			if j := strings.Index(block[1:], "- rule:"); j >= 0 {
+				block = block[:j+1]
+			}
+			for _, want := range []string{"kind_mount_product_files_hook", "[proc.pname, proc.exepath]", "mount-product-f", "/usr/bin/mount", "exceptions: append"} {
+				if !strings.Contains(block, want) {
+					t.Errorf("%s escape-rule exception is missing %q", overlay, want)
+				}
+			}
+		})
+	}
+	if strings.Contains(helmTemplate(t, nil), "mount-product-f") {
+		t.Error("the default install carries the kind-only mount hook exception")
+	}
+}
+
 // TestNetworkPolicyAllowsTheRealAPIServer: Story 10.3. The release policy
 // allowed only networkPolicy.apiServerCIDR (kubeadm's 10.96.0.1), so on k3s
 // (10.43.0.1) and minikube (endpoint port 8443), both of which enforce
