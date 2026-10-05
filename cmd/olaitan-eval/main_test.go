@@ -419,6 +419,11 @@ func TestRun_LayoutTrialsAndMetadata(t *testing.T) {
 	// executor's apply/exec/cleanup plan WITHOUT a cluster (the overlay-fake
 	// precedent above); it records nothing and succeeds.
 	fakeAttack := func(ctx context.Context, name string, args ...string) (string, error) {
+		// Story 11.2a C3: Execute resolves the live pod before the primitive, so
+		// the fake must answer `kubectl get pod`.
+		if strings.Contains(strings.Join(args, " "), "get pod") {
+			return "web-6d4f9c7b8-abcde||Running\n", nil
+		}
 		return "", nil
 	}
 	err := run([]string{
@@ -431,6 +436,7 @@ func TestRun_LayoutTrialsAndMetadata(t *testing.T) {
 		"--runs", "3",
 		"--out", outDir,
 		"--attack-settle", "0", // Story 11.2d: no settle wait in the unit dispatch
+		"--inter-trial-wait", "0", // Story 11.2a C7: no inter-trial wait in the unit dispatch
 		"--allow-unverified", "aggregator",
 		// Point the overlay at the in-repo chart so the RS overlay file
 		// resolves; the fake runner means no real helm/kubectl runs.

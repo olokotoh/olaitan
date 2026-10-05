@@ -2,39 +2,29 @@
 
 ## What a real attacker would do
 
-Inside the privileged tenant pod, exec a shell and abuse CAP_SYS_ADMIN to
-mount the host filesystem (or use CAP_SYS_PTRACE to attach to a host
-process), breaking out of the container boundary onto the node.
+Inside the privileged tenant pod, exec a shell and abuse CAP_SYS_ADMIN /
+CAP_SYS_PTRACE to reach the node's namespaces and filesystem, breaking out of
+the container boundary onto the host.
 
-## Deterministic kind stimulus (BI-3, the harness path)
+## Real in-cluster attack (Story 11.2a)
 
-On kind, Falco's eBPF probe cannot load, so the harness injects the
-synthetic falco event the production Falco adapter would emit, directly to
-NATS subject `olaitan.events.raw.falco`. This is deterministic by
-construction (fixed content, no randomness, no real exploit, no external
-network) and is the proven rs_smoke S1 path.
+S1 is a REAL attack, not a synthetic NATS event. The shared executor
+(`internal/eval/attack/attack.go`, `runS1`) applies the Story 11.1 privileged
+target, then `kubectl exec`s into the live pod and runs the escape primitive:
+it enters the host namespaces with `nsenter --target 1` and reads host-view
+paths (`/proc/1/root`, `/proc/1/cgroup`). Nothing on the host is modified
+(read-only recon), so deleting the pod reverses it. A missing `nsenter` in the
+image is a hard failure (so a toolless image is not mistaken for a detection
+miss); the escape attempt's exit code is recorded.
 
-The injected event (the EXACT shape OLT-PRIV-001's `cap_acquired` clause
-matches):
-
-```json
-{
-  "id": "scenario-s1-falco-1",
-  "source": "falco",
-  "category": "syscall",
-  "severity": "CRITICAL",
-  "pod": { "name": "<resolved tenant-acme/web pod>", "namespace": "tenant-acme" },
-  "raw": {
-    "process.exe": "/host/bin/sh",
-    "process.cap_effective": "CAP_NET_BIND_SERVICE CAP_SYS_ADMIN CAP_SETUID"
-  }
-}
-```
-
-A network priming event precedes it so the correlator's multi-source
-rising-edge fires and assembles the EvidencePackage onto
+The privileged process alone trips OLT-PRIV-001 (its `cap_effective` carries
+CAP_SYS_ADMIN / CAP_SYS_PTRACE for a Deployment pod outside the system
+namespaces); the host-reach attempt is the T1611 flavour. Falco observes the
+real syscalls and its alert flows through the real bus (Falco -> gRPC -> NATS
+-> correlator), which assembles the EvidencePackage on
 `olaitan.evidence.packages`.
 
-The canonical injector is the Go helper `injectScenario(t, js, "s1", podName)`
-in `tests/e2e/scenarios_smoke_test.go`; the JSON above is the field-shape
-contract it emits.
+The attack is driven by `runRealAttack(t, tgt)` in
+`tests/e2e/scenarios_smoke_test.go` and by `olaitan-eval` through the same
+executor, so CI exercises exactly the primitive the evaluation runs. The
+synthetic injector `injectScenario` refuses S1-S3.

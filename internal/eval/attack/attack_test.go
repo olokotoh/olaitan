@@ -50,6 +50,22 @@ func harnessDir(slug string) string {
 	return filepath.Join("..", "..", "..", "deploy", "demo", "scenarios", slug)
 }
 
+// runningPodStdout wraps a stdout matcher so `kubectl get pod` always resolves
+// one live, Running, non-terminating pod (Execute now resolves the target pod
+// for every scenario before the primitive, review round 1 C3). extra answers
+// the scenario-specific calls (token reads, version output); nil means "".
+func runningPodStdout(extra func(args []string) string) func(args []string) string {
+	return func(args []string) string {
+		if strings.Contains(strings.Join(args, " "), "get pod") {
+			return "web-6d4f9c7b8-abcde||Running\n"
+		}
+		if extra != nil {
+			return extra(args)
+		}
+		return ""
+	}
+}
+
 func joinCall(c recordedCall) string {
 	return c.name + " " + strings.Join(c.args, " ")
 }
@@ -67,7 +83,7 @@ func firstCallContaining(calls []recordedCall, sub string) int {
 
 func TestAttackExecutor_S1_AppliesTargetThenExecsEscapeThenCleansUp(t *testing.T) {
 	var calls []recordedCall
-	run := recordingRunner(&calls, nil, "")
+	run := recordingRunner(&calls, runningPodStdout(nil), "")
 	e, err := New("s1", harnessDir("s1-container-escape"), run, testLogger())
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -113,8 +129,10 @@ func TestAttackExecutor_S1_AppliesTargetThenExecsEscapeThenCleansUp(t *testing.T
 
 func TestAttackExecutor_CleanupRunsEvenWhenPrimitiveFails(t *testing.T) {
 	var calls []recordedCall
-	// Fail the exec primitive; Cleanup must still delete what was applied.
-	run := recordingRunner(&calls, nil, "exec")
+	// Fail the exec primitive; Cleanup must still delete what was applied. The
+	// pod still resolves (get pod is not an exec) so the failure is the
+	// primitive, not target bring-up.
+	run := recordingRunner(&calls, runningPodStdout(nil), "exec")
 	e, err := New("s1", harnessDir("s1-container-escape"), run, testLogger())
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -162,7 +180,7 @@ func TestAttackExecutor_S2_ReadsTokenWithoutPrintingItsValue(t *testing.T) {
 		}
 		return "200"
 	}
-	run := recordingRunner(&calls, stdoutFor, "")
+	run := recordingRunner(&calls, runningPodStdout(stdoutFor), "")
 	e, err := New("s2", harnessDir("s2-credential-exfil"), run, logger)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -172,6 +190,28 @@ func TestAttackExecutor_S2_ReadsTokenWithoutPrintingItsValue(t *testing.T) {
 		t.Fatalf("Execute: %v", err)
 	}
 	_ = e.Cleanup(context.Background())
+
+	// Review round 1 (C1, AC4): the token must reach curl on stdin as the whole
+	// Authorization header (-H @-), never in curl's argv. The prior
+	// `-H "Authorization: Bearer $TOKEN"` put the value in %proc.cmdline.
+	apiIdx := -1
+	for i, c := range calls {
+		j := joinCall(c)
+		if strings.Contains(j, "curl") && strings.Contains(j, "http_code") && strings.Contains(j, "/secrets") {
+			apiIdx = i
+			break
+		}
+	}
+	if apiIdx < 0 {
+		t.Fatalf("no S2 kube-API curl recorded; calls=%v", calls)
+	}
+	apiCall := joinCall(calls[apiIdx])
+	if !strings.Contains(apiCall, "-H @-") {
+		t.Errorf("S2 kube-API curl must read the Authorization header from stdin (-H @-): %s", apiCall)
+	}
+	if strings.Contains(apiCall, `-H "Authorization`) || strings.Contains(apiCall, "Bearer $TOKEN") {
+		t.Errorf("S2 kube-API curl still puts the token in argv: %s", apiCall)
+	}
 
 	// The raw token value must NEVER appear in any recorded argv nor in any
 	// log line.
@@ -532,6 +572,9 @@ func TestAttackExecutor_ApplyRetriesTerminatingNamespace(t *testing.T) {
 	var applyAttempts int
 	run := func(ctx context.Context, name string, args ...string) (string, error) {
 		joined := strings.Join(args, " ")
+		if strings.Contains(joined, "get pod") {
+			return "web-6d4f9c7b8-abcde||Running\n", nil
+		}
 		if strings.Contains(joined, "apply") {
 			applyAttempts++
 			if applyAttempts == 1 {
@@ -562,7 +605,10 @@ func TestAttackExecutor_ApplyRetriesTerminatingNamespace(t *testing.T) {
 		}
 		return "", nil
 	}
-	e2, _ := New("s1", harnessDir("s1-container-escape"), hardRun, testLogger())
+	e2, err := New("s1", harnessDir("s1-container-escape"), hardRun, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
 	e2.retryWait = time.Millisecond
 	e2.SettleWait = 0
 	if err := e2.Execute(context.Background()); err == nil {
@@ -573,61 +619,405 @@ func TestAttackExecutor_ApplyRetriesTerminatingNamespace(t *testing.T) {
 	}
 }
 
-// TestAttackExecutor_RetriesWhenTargetDeletedMidRollout proves the e2e drain
-// race fix: when `kubectl rollout status` fails with "object has been deleted"
-// (a prior test/trial deleted the shared tenant-acme namespace with
-// --wait=false and it finished draining right after this apply), Execute
-// re-applies the target and waits again rather than failing the trial. A real
-// rollout timeout, by contrast, is NOT retried.
-func TestAttackExecutor_RetriesWhenTargetDeletedMidRollout(t *testing.T) {
-	var applyCount, rolloutCount int
-	run := func(ctx context.Context, name string, args ...string) (string, error) {
-		joined := strings.Join(args, " ")
-		switch {
-		case strings.Contains(joined, "apply"):
-			applyCount++
-		case strings.Contains(joined, "rollout status"):
-			rolloutCount++
-			if rolloutCount == 1 {
-				// First wait loses the object to the draining namespace.
-				return "", errDummy("error: object has been deleted")
-			}
-		}
-		return "", nil
-	}
+// newS1ForRetry builds an s1 executor with a tiny backoff and no settle for
+// the target-bring-up retry tests.
+func newS1ForRetry(t *testing.T, run RunFunc) *Executor {
+	t.Helper()
 	e, err := New("s1", harnessDir("s1-container-escape"), run, testLogger())
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	e.SettleWait = 0
 	e.retryWait = time.Millisecond // do not sleep the real 5s in the unit test
-	if err := e.Execute(context.Background()); err != nil {
-		t.Fatalf("Execute should have re-applied past the deletion race: %v", err)
-	}
-	if applyCount < 2 {
-		t.Errorf("apply count = %d; want >= 2 (a re-apply after the mid-rollout deletion)", applyCount)
-	}
-	if rolloutCount < 2 {
-		t.Errorf("rollout status count = %d; want >= 2 (a retry after the deletion race)", rolloutCount)
-	}
+	return e
+}
 
-	// A genuine rollout timeout is NOT a deletion race and must NOT be retried.
-	var hardRollouts int
-	hardRun := func(ctx context.Context, name string, args ...string) (string, error) {
-		if strings.Contains(strings.Join(args, " "), "rollout status") {
-			hardRollouts++
-			return "", errDummy("error: timed out waiting for the condition")
+// TestEnsureTargetReady covers the drain-race retry (review round 3). The e2e
+// RS smoke deletes the shared tenant-acme namespace with --wait=false right
+// before the eval smoke, so the drain can sweep the Deployment mid-rollout
+// ("object has been deleted"). Target bring-up re-applies and waits again, with
+// exact counts and ordering, but a genuine timeout is NOT retried, the named
+// mismatch is surfaced, and the loop is bounded.
+func TestEnsureTargetReady(t *testing.T) {
+	t.Run("re-applies past one mid-rollout sweep, exact counts and order", func(t *testing.T) {
+		var calls []string
+		var applyCount, rolloutCount int
+		run := func(ctx context.Context, name string, args ...string) (string, error) {
+			joined := strings.Join(args, " ")
+			calls = append(calls, joined)
+			switch {
+			case strings.Contains(joined, "get pod"):
+				return "web-6d4f9c7b8-abcde||Running\n", nil
+			case strings.Contains(joined, "apply"):
+				applyCount++
+			case strings.Contains(joined, "rollout status"):
+				rolloutCount++
+				if rolloutCount == 1 {
+					return "", errDummy("error: deployments.apps \"web\" has been deleted")
+				}
+			}
+			return "", nil
+		}
+		e := newS1ForRetry(t, run)
+		if err := e.Execute(context.Background()); err != nil {
+			t.Fatalf("Execute should ride out one deletion race: %v", err)
+		}
+		if applyCount != 2 {
+			t.Errorf("apply count = %d; want exactly 2 (initial + one re-apply)", applyCount)
+		}
+		if rolloutCount != 2 {
+			t.Errorf("rollout count = %d; want exactly 2 (one race + one success)", rolloutCount)
+		}
+		// Order: the re-apply must come AFTER the first failed rollout.
+		firstRollout, reApply := -1, -1
+		seenApply := 0
+		for i, c := range calls {
+			if strings.Contains(c, "rollout status") && firstRollout < 0 {
+				firstRollout = i
+			}
+			if strings.Contains(c, "apply") {
+				seenApply++
+				if seenApply == 2 {
+					reApply = i
+				}
+			}
+		}
+		if firstRollout < 0 || reApply < 0 || reApply < firstRollout {
+			t.Errorf("re-apply(%d) must follow the first rollout(%d)", reApply, firstRollout)
+		}
+	})
+
+	t.Run("a genuine rollout timeout is not retried", func(t *testing.T) {
+		var rollouts int
+		run := func(ctx context.Context, name string, args ...string) (string, error) {
+			joined := strings.Join(args, " ")
+			if strings.Contains(joined, "get pod") {
+				return "web-6d4f9c7b8-abcde||Running\n", nil
+			}
+			if strings.Contains(joined, "rollout status") {
+				rollouts++
+				return "", errDummy("error: timed out waiting for the condition")
+			}
+			return "", nil
+		}
+		e := newS1ForRetry(t, run)
+		if err := e.Execute(context.Background()); err == nil {
+			t.Fatal("Execute should surface a genuine rollout timeout")
+		}
+		if rollouts != 1 {
+			t.Errorf("rollout attempts on a real timeout = %d; want 1 (no retry)", rollouts)
+		}
+	})
+
+	t.Run("a drifted Deployment name is not a drain race", func(t *testing.T) {
+		var rollouts int
+		run := func(ctx context.Context, name string, args ...string) (string, error) {
+			joined := strings.Join(args, " ")
+			if strings.Contains(joined, "rollout status") {
+				rollouts++
+				return "", errDummy(`error: deployments.apps "api" not found`)
+			}
+			return "", nil
+		}
+		e := newS1ForRetry(t, run)
+		if err := e.Execute(context.Background()); err == nil {
+			t.Fatal("a missing, differently-named Deployment must not be retried as a drain race")
+		}
+		if rollouts != 1 {
+			t.Errorf("rollout attempts on a name mismatch = %d; want 1 (no retry)", rollouts)
+		}
+	})
+
+	t.Run("exhausts the bounded retries and returns the last error", func(t *testing.T) {
+		var rollouts int
+		run := func(ctx context.Context, name string, args ...string) (string, error) {
+			joined := strings.Join(args, " ")
+			if strings.Contains(joined, "get pod") {
+				return "web-6d4f9c7b8-abcde||Running\n", nil
+			}
+			if strings.Contains(joined, "rollout status") {
+				rollouts++
+				return "", errDummy("error: object has been deleted")
+			}
+			return "", nil
+		}
+		e := newS1ForRetry(t, run)
+		if err := e.Execute(context.Background()); err == nil {
+			t.Fatal("a never-ending drain race must eventually fail, not loop forever")
+		}
+		if rollouts != applyRetries {
+			t.Errorf("rollout attempts = %d; want applyRetries=%d (bounded)", rollouts, applyRetries)
+		}
+	})
+
+	t.Run("cancel during backoff returns the context error with the last cause", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		run := func(c context.Context, name string, args ...string) (string, error) {
+			joined := strings.Join(args, " ")
+			if strings.Contains(joined, "rollout status") {
+				cancel() // cancel just before the first backoff
+				return "", errDummy("error: object has been deleted")
+			}
+			return "", nil
+		}
+		e := newS1ForRetry(t, run)
+		e.retryWait = time.Hour // make the backoff block until the cancel fires
+		err := e.Execute(ctx)
+		if err == nil {
+			t.Fatal("a cancel during backoff must fail")
+		}
+		if !strings.Contains(err.Error(), "wait target ready") || !strings.Contains(err.Error(), "last attempt") {
+			t.Errorf("cancel error must wrap the rollout cause: %v", err)
+		}
+	})
+
+	t.Run("waits out a still-terminating namespace before applying", func(t *testing.T) {
+		var nsChecks, applies int
+		run := func(ctx context.Context, name string, args ...string) (string, error) {
+			joined := strings.Join(args, " ")
+			switch {
+			case strings.Contains(joined, "get ns"):
+				nsChecks++
+				if nsChecks == 1 {
+					return "Terminating", nil
+				}
+				return "Active", nil
+			case strings.Contains(joined, "get pod"):
+				return "web-6d4f9c7b8-abcde||Running\n", nil
+			case strings.Contains(joined, "apply"):
+				applies++
+			}
+			return "", nil
+		}
+		e := newS1ForRetry(t, run)
+		if err := e.Execute(context.Background()); err != nil {
+			t.Fatalf("Execute should wait out the terminating namespace: %v", err)
+		}
+		if nsChecks < 2 {
+			t.Errorf("namespace phase checks = %d; want >= 2 (waited out Terminating)", nsChecks)
+		}
+		if applies != 1 {
+			t.Errorf("apply count = %d; want 1 (applied once the namespace settled)", applies)
+		}
+	})
+}
+
+// TestIsDeletionRaceError pins the round-3 R3-1 tightening: only the named
+// Deployment and the named Namespace drain races are retried; a bare "not
+// found", an unverified "no longer exists", and a real timeout are not.
+func TestIsDeletionRaceError(t *testing.T) {
+	races := []string{
+		"error: object has been deleted",
+		`deployments.apps "web" not found`,
+		`Error from server (NotFound): namespaces "tenant-acme" not found`,
+		"namespace tenant-acme is being terminated",
+	}
+	notRaces := []string{
+		`deployments.apps "api" not found`,
+		"error: the server could not find the requested resource",
+		"configmaps \"x\" not found",
+		"no longer exists",
+		"timed out waiting for the condition",
+		"",
+	}
+	for _, m := range races {
+		if !isDeletionRaceError(errDummy(m)) {
+			t.Errorf("want drain race for %q", m)
+		}
+	}
+	for _, m := range notRaces {
+		if m == "" {
+			if isDeletionRaceError(nil) {
+				t.Error("nil must not be a drain race")
+			}
+			continue
+		}
+		if isDeletionRaceError(errDummy(m)) {
+			t.Errorf("must NOT be a drain race: %q", m)
+		}
+	}
+}
+
+const fakeSHA256Hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+// s2TokenStdout answers the S2 token-read with a valid "<len>\n<hash>" and the
+// kube-API / metadata steps with an HTTP status, plus the live pod.
+func s2TokenStdout(extra func(args []string) string) func(args []string) string {
+	return runningPodStdout(func(args []string) string {
+		j := strings.Join(args, " ")
+		if strings.Contains(j, "serviceaccount/token") && (strings.Contains(j, "sha256sum") || strings.Contains(j, "wc")) {
+			return "245\n" + fakeSHA256Hex
+		}
+		if extra != nil {
+			return extra(args)
+		}
+		return "200"
+	})
+}
+
+// TestAttackExecutor_S2_ExecFailureFailsTheTrial pins round-3 R3-10: a kubectl
+// exec that itself fails (pod swept, curl missing in the image) fails the
+// trial, so a run is never recorded as executed with steps that did not run.
+// An HTTP-level refusal (403) is a real attempt and stays a success.
+func TestAttackExecutor_S2_ExecFailureFailsTheTrial(t *testing.T) {
+	t.Run("kube-API exec failure fails the trial", func(t *testing.T) {
+		run := func(ctx context.Context, name string, args ...string) (string, error) {
+			j := strings.Join(args, " ")
+			if strings.Contains(j, "get pod") {
+				return "web-6d4f9c7b8-abcde||Running\n", nil
+			}
+			if strings.Contains(j, "serviceaccount/token") && (strings.Contains(j, "sha256sum") || strings.Contains(j, "wc")) {
+				return "245\n" + fakeSHA256Hex, nil
+			}
+			if strings.Contains(j, "/secrets") { // the kube-API curl exec fails (pod gone / curl missing)
+				return "", errDummy("command terminated with exit code 97")
+			}
+			return "", nil
+		}
+		e, err := New("s2", harnessDir("s2-credential-exfil"), run, testLogger())
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		e.SettleWait = 0
+		if err := e.Execute(context.Background()); err == nil {
+			t.Fatal("a failed kube-API exec must fail the trial")
+		} else if !strings.Contains(err.Error(), "s2 kube-API use") {
+			t.Errorf("error should name the kube-API step: %v", err)
+		}
+	})
+
+	t.Run("an HTTP refusal is still a real attempt", func(t *testing.T) {
+		run := recordingRunner(&[]recordedCall{}, s2TokenStdout(func(args []string) string {
+			if strings.Contains(strings.Join(args, " "), "/secrets") {
+				return "403"
+			}
+			return "200"
+		}), "")
+		e, err := New("s2", harnessDir("s2-credential-exfil"), run, testLogger())
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		e.SettleWait = 0
+		if err := e.Execute(context.Background()); err != nil {
+			t.Fatalf("a 403 is a real attempt, not a trial failure: %v", err)
+		}
+	})
+}
+
+// TestAttackExecutor_S2_RejectsAnUnprojectedToken pins round-1 C6: a token read
+// that returns no real token (len 0 or a non-hash) fails the trial instead of
+// logging a successful credential read.
+func TestAttackExecutor_S2_RejectsAnUnprojectedToken(t *testing.T) {
+	run := recordingRunner(&[]recordedCall{}, runningPodStdout(func(args []string) string {
+		if strings.Contains(strings.Join(args, " "), "serviceaccount/token") {
+			return "0\n" // no token projected
+		}
+		return "200"
+	}), "")
+	e, err := New("s2", harnessDir("s2-credential-exfil"), run, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	e.SettleWait = 0
+	if err := e.Execute(context.Background()); err == nil {
+		t.Fatal("an unprojected token must fail the trial")
+	} else if !strings.Contains(err.Error(), "unexpected shape") {
+		t.Errorf("error should name the bad token shape: %v", err)
+	}
+}
+
+func TestValidTokenShape(t *testing.T) {
+	if !validTokenShape("245", fakeSHA256Hex) {
+		t.Error("a positive length and 64-hex hash is a valid shape")
+	}
+	for _, c := range []struct{ len, hash string }{
+		{"0", fakeSHA256Hex},             // empty token
+		{"-5", fakeSHA256Hex},            // negative
+		{"abc", fakeSHA256Hex},           // non-numeric length
+		{"245", "deadbeef"},              // short hash
+		{"245", strings.Repeat("g", 64)}, // non-hex hash
+		{"", ""},
+	} {
+		if validTokenShape(c.len, c.hash) {
+			t.Errorf("want invalid shape for len=%q hash=%q", c.len, c.hash)
+		}
+	}
+}
+
+// TestAttackExecutor_S1_GuardsAMissingNsenterAndRecordsRC pins round-1 C5: the
+// S1 primitive hard-fails on a missing nsenter (exit 97) rather than masking it
+// with a trailing `true`, and records nsenter's exit code.
+func TestAttackExecutor_S1_GuardsAMissingNsenterAndRecordsRC(t *testing.T) {
+	var calls []recordedCall
+	run := recordingRunner(&calls, runningPodStdout(func(args []string) string {
+		if strings.Contains(strings.Join(args, " "), "nsenter") {
+			return "myhost\n[s1] nsenter rc=0\n"
+		}
+		return ""
+	}), "")
+	var logs bytes.Buffer
+	e, err := New("s1", harnessDir("s1-container-escape"), run, slog.New(slog.NewTextHandler(&logs, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	e.SettleWait = 0
+	if err := e.Execute(context.Background()); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	idx := firstCallContaining(calls, "nsenter")
+	if idx < 0 {
+		t.Fatalf("no S1 nsenter primitive recorded; calls=%v", calls)
+	}
+	script := calls[idx].args[len(calls[idx].args)-1]
+	if !strings.Contains(script, "command -v nsenter") || !strings.Contains(script, "exit 97") {
+		t.Errorf("S1 primitive must hard-fail on a missing nsenter: %q", script)
+	}
+	if !strings.Contains(script, "nsenter rc=") {
+		t.Errorf("S1 primitive must record nsenter's exit code: %q", script)
+	}
+	if !strings.Contains(logs.String(), "nsenter_rc=0") {
+		t.Errorf("the run log must record the nsenter rc; got:\n%s", logs.String())
+	}
+}
+
+// TestAttackExecutor_CleanupWaitsAndSurvivesCancel pins round-1 C2 + C4: Cleanup
+// runs on a context detached from a cancelled parent (a Ctrl-C mid-run still
+// reverses the attack) and WAITS for the delete (--wait=true) so the next trial
+// is not raced by a draining pod.
+func TestAttackExecutor_CleanupWaitsAndSurvivesCancel(t *testing.T) {
+	var calls []recordedCall
+	// A real kubectl would abort on a cancelled context; this fake does too, so
+	// a delete that still runs proves Cleanup detached the parent cancel.
+	run := func(ctx context.Context, name string, args ...string) (string, error) {
+		calls = append(calls, recordedCall{name, append([]string(nil), args...)})
+		if ctx.Err() != nil {
+			return "", ctx.Err()
 		}
 		return "", nil
 	}
-	e2, _ := New("s1", harnessDir("s1-container-escape"), hardRun, testLogger())
-	e2.SettleWait = 0
-	e2.retryWait = time.Millisecond
-	if err := e2.Execute(context.Background()); err == nil {
-		t.Fatal("Execute should surface a genuine rollout timeout")
+	e, err := New("s2", harnessDir("s2-credential-exfil"), run, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
 	}
-	if hardRollouts != 1 {
-		t.Errorf("rollout attempts on a real timeout = %d; want 1 (no retry)", hardRollouts)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // parent already cancelled, as on a Ctrl-C
+	if err := e.Cleanup(ctx); err != nil {
+		t.Fatalf("Cleanup must survive a cancelled parent: %v", err)
+	}
+	delIdx := firstCallContaining(calls, "delete")
+	if delIdx < 0 {
+		t.Fatalf("Cleanup issued no delete despite the cancelled parent; calls=%v", calls)
+	}
+	for _, c := range calls {
+		j := joinCall(c)
+		if strings.Contains(j, "delete") {
+			if !strings.Contains(j, "--wait=true") {
+				t.Errorf("cleanup delete must wait for the delete to finish: %s", j)
+			}
+			if strings.Contains(j, "--wait=false") {
+				t.Errorf("cleanup delete must not be fire-and-forget: %s", j)
+			}
+		}
 	}
 }
 
@@ -669,7 +1059,7 @@ func TestAttackExecutor_CleanupIsSurgical(t *testing.T) {
 // non-zero so a real run never deletes the target immediately.
 func TestAttackExecutor_SettlesBeforeCleanup(t *testing.T) {
 	var calls []recordedCall
-	run := recordingRunner(&calls, nil, "")
+	run := recordingRunner(&calls, runningPodStdout(nil), "")
 	e, err := New("s1", harnessDir("s1-container-escape"), run, testLogger())
 	if err != nil {
 		t.Fatalf("New: %v", err)

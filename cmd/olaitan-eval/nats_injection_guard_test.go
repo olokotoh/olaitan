@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -31,52 +32,88 @@ import (
 // syntheticInjectionPatterns match a synthetic attack-event publication. A
 // raw.falco / raw.network publish is a fabricated sensor event; the
 // evalscenario attack-recipe generators exist only to build such events.
+//
+// Review round 3 (C9): the publish pattern is dot-all and tolerates a bounded
+// argument span, so a call split across lines (the method on one line, the
+// subject on another) is still caught; and it covers every NATS publish /
+// request shape (Publish, PublishMsg, PublishAsync, PublishMsgAsync, Request,
+// and the helper publishJS/PublishJS), longest method first so a prefix does
+// not shadow a longer one.
 var syntheticInjectionPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`evalscenario\.(Events|StagedEvents)\(`),
-	regexp.MustCompile(`(publishJS|PublishJS|\.Publish)\([^\n]*(RawFalcoSubject|RawNetworkSubject)`),
-	regexp.MustCompile(`(publishJS|PublishJS|\.Publish)\([^\n]*"olaitan\.events\.raw\.(falco|network)"`),
+	regexp.MustCompile(`evalscenario\.(?:Events|StagedEvents)\(`),
+	regexp.MustCompile(`(?s)(?:publishJS|PublishJS|\.PublishMsgAsync|\.PublishAsync|\.PublishMsg|\.Publish|\.Request)\((?:[^()]|\([^()]*\)){0,400}?(?:RawFalcoSubject|RawNetworkSubject|"olaitan\.events\.raw\.(?:falco|network)")`),
 }
 
 type injectionHit struct {
-	file string // basename
+	file string // path relative to the scanned root
 	line int
 	text string
 }
 
-// scanSyntheticInjection walks dir for *.go files and returns every line that
-// matches a synthetic-injection pattern, skipping // comment lines and the
-// guard's own source so the guard does not flag its own pattern literals.
-func scanSyntheticInjection(dir string) ([]injectionHit, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
+// scanSyntheticInjection walks root RECURSIVELY for *.go files and returns every
+// synthetic-injection match, skipping // comment lines and the guard's own
+// source so the guard does not flag its own pattern literals. Matches may span
+// lines (a publish whose subject is on a later line); the reported line is the
+// match start and the text is its first line.
+func scanSyntheticInjection(root string) ([]injectionHit, error) {
 	var hits []injectionHit
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") {
-			continue
-		}
-		if e.Name() == "nats_injection_guard_test.go" {
-			continue
-		}
-		raw, err := os.ReadFile(filepath.Join(dir, e.Name()))
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil, err
+			return err
 		}
-		for i, line := range strings.Split(string(raw), "\n") {
-			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "*") {
+		if d.IsDir() || !strings.HasSuffix(d.Name(), ".go") {
+			return nil
+		}
+		if d.Name() == "nats_injection_guard_test.go" {
+			return nil
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			rel = d.Name()
+		}
+		hits = append(hits, scanGoSource(filepath.ToSlash(rel), raw)...)
+		return nil
+	})
+	return hits, err
+}
+
+// scanGoSource blanks full-line comments (keeping line numbers), then matches
+// the synthetic-injection patterns across the file so a multi-line publish is
+// caught. Hits are deduplicated by start line so overlapping patterns do not
+// double-report one call.
+func scanGoSource(name string, raw []byte) []injectionHit {
+	lines := strings.Split(string(raw), "\n")
+	san := make([]string, len(lines))
+	for i, line := range lines {
+		t := strings.TrimSpace(line)
+		if strings.HasPrefix(t, "//") || strings.HasPrefix(t, "*") {
+			san[i] = "" // drop commented-out publishes, keep the line slot
+		} else {
+			san[i] = line
+		}
+	}
+	content := strings.Join(san, "\n")
+	seen := map[int]bool{}
+	var hits []injectionHit
+	for _, re := range syntheticInjectionPatterns {
+		for _, m := range re.FindAllStringIndex(content, -1) {
+			line := strings.Count(content[:m[0]], "\n") + 1
+			if seen[line] {
 				continue
 			}
-			for _, re := range syntheticInjectionPatterns {
-				if re.MatchString(line) {
-					hits = append(hits, injectionHit{file: e.Name(), line: i + 1, text: trimmed})
-					break
-				}
+			seen[line] = true
+			first := content[m[0]:m[1]]
+			if nl := strings.IndexByte(first, '\n'); nl >= 0 {
+				first = first[:nl]
 			}
+			hits = append(hits, injectionHit{file: name, line: line, text: strings.TrimSpace(first)})
 		}
 	}
-	return hits, nil
+	return hits
 }
 
 type injectionAllowlist struct {
@@ -160,6 +197,20 @@ func TestSyntheticInjectionGuardBites(t *testing.T) {
 	write("recipe_test.go", "package x\nfunc g(){ events := evalscenario.Events(id, pod, ts); _ = events }\n")
 	write("clean_test.go", "package x\nfunc h(){ println(\"no injection here\") }\n")
 	write("commented_test.go", "package x\n// publishJS(t, js, \"olaitan.events.raw.network\", p) is described, not run\nfunc i(){}\n")
+	// Review round 3 (C9): a call split across lines, each alternative publish /
+	// request shape, and a file in a subdirectory (recursive walk).
+	write("multiline_test.go", "package x\nfunc m(){ js.Publish(\n\tRawFalcoSubject,\n\tpayload,\n) }\n")
+	write("publishmsg_test.go", "package x\nfunc pm(){ js.PublishMsg(&nats.Msg{Subject: RawNetworkSubject}) }\n")
+	write("publishasync_test.go", "package x\nfunc pa(){ js.PublishAsync(\"olaitan.events.raw.falco\", p) }\n")
+	write("publishmsgasync_test.go", "package x\nfunc pma(){ js.PublishMsgAsync(&nats.Msg{Subject: RawFalcoSubject}) }\n")
+	write("request_test.go", "package x\nfunc rq(){ nc.Request(RawNetworkSubject, p, d) }\n")
+	sub := filepath.Join(dir, "nested")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir nested: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "deep_test.go"), []byte("package y\nfunc d(){ publishJS(t, js, \"olaitan.events.raw.network\", p) }\n"), 0o644); err != nil {
+		t.Fatalf("write nested fixture: %v", err)
+	}
 
 	hits, err := scanSyntheticInjection(dir)
 	if err != nil {
@@ -169,11 +220,19 @@ func TestSyntheticInjectionGuardBites(t *testing.T) {
 	for _, h := range hits {
 		flagged[h.file] = true
 	}
-	if !flagged["raw_publish_test.go"] {
-		t.Errorf("guard did not flag a raw.falco publish")
-	}
-	if !flagged["recipe_test.go"] {
-		t.Errorf("guard did not flag an evalscenario.Events attack-recipe call")
+	for _, want := range []string{
+		"raw_publish_test.go",
+		"recipe_test.go",
+		"multiline_test.go",
+		"publishmsg_test.go",
+		"publishasync_test.go",
+		"publishmsgasync_test.go",
+		"request_test.go",
+		"nested/deep_test.go", // recursive walk
+	} {
+		if !flagged[want] {
+			t.Errorf("guard did not flag %s", want)
+		}
 	}
 	if flagged["clean_test.go"] {
 		t.Errorf("guard falsely flagged a clean file")

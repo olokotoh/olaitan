@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -31,13 +32,16 @@ import (
 // drains it; nothing is fabricated. S4/S5 (which need attacker-side sink /
 // pool infrastructure) land in Story 11.2b (#192).
 
-// Namespace / attackWorkload / attackWaitTimeout / saTokenPath are the
-// shared shape of the Story 11.1 targets: each S1-S3 target is a Deployment
-// named `web` with selector app=web in the tenant-acme namespace, and the S2
-// target projects its ServiceAccount token at the standard mount path.
+// Namespace / workloadName / containerName / attackWaitTimeout / saTokenPath
+// are the shared shape of the Story 11.1 targets: each S1-S3 target is a
+// Deployment named `web` with selector app=web and a container named web in
+// the tenant-acme namespace, and the S2 target projects its ServiceAccount
+// token at the standard mount path.
 const (
 	Namespace         = "tenant-acme"
-	attackWorkload    = "deploy/web"
+	workloadName      = "web"
+	containerName     = "web"
+	attackWorkload    = "deploy/" + workloadName
 	attackWaitTimeout = "120s"
 	saTokenPath       = "/run/secrets/kubernetes.io/serviceaccount/token"
 	kubeAPIHost       = "https://kubernetes.default.svc"
@@ -87,6 +91,11 @@ type Executor struct {
 	cleanupRefs []string
 	runCmd      RunFunc
 	logger      *slog.Logger
+	// pod is the live, Running, non-terminating target pod Execute resolves
+	// once after the target is ready; S1-S3 all exec into THIS pod (not
+	// deploy/web, which kubectl can resolve to a previous trial's dying pod).
+	// Review round 1, C3.
+	pod string
 	// retryWait is the backoff between apply retries; a field so a unit test
 	// can shrink it. Defaults to applyRetryWait.
 	retryWait time.Duration
@@ -175,7 +184,7 @@ func New(scenarioID, dir string, runCmd RunFunc, logger *slog.Logger) (*Executor
 	// Cleanup deletes exactly what the attack added, by name, leaving the
 	// shared tenant-acme Namespace in place. The target Deployment is common
 	// to S1-S3; S2 also adds the least-privilege SA + Role + RoleBinding.
-	cleanupRefs := []string{"deployment/web"}
+	cleanupRefs := []string{"deployment/" + workloadName}
 	if scenarioID == "s2" {
 		cleanupRefs = append(cleanupRefs,
 			"rolebinding/s2-attacker-secrets-reader",
@@ -202,14 +211,22 @@ func New(scenarioID, dir string, runCmd RunFunc, logger *slog.Logger) (*Executor
 	}, nil
 }
 
-// Execute applies the target (and the S2 RBAC), waits for it Ready, then runs
-// the scenario's technique primitive(s). It does NOT clean up; the caller
-// (scenarioHarness.Run) defers Cleanup so teardown runs even on a primitive
-// error (the Runner-loop BI-2 discipline).
+// Execute applies the target (and the S2 RBAC), waits for it Ready, resolves
+// the live target pod, then runs the scenario's technique primitive(s). It
+// does NOT clean up; the caller (scenarioHarness.Run) defers Cleanup so
+// teardown runs even on a primitive error (the Runner-loop BI-2 discipline).
 func (e *Executor) Execute(ctx context.Context) error {
 	if err := e.ensureTargetReady(ctx); err != nil {
 		return err
 	}
+	// Resolve the one live pod all primitives act on, once. S1-S3 exec into
+	// THIS pod, not deploy/web, so a previous trial's dying pod is never the
+	// target (review round 1, C3; the Story 11.2d S3 fix generalised).
+	pod, err := e.targetPod(ctx)
+	if err != nil {
+		return fmt.Errorf("resolve target pod: %w", err)
+	}
+	e.pod = pod
 	var primErr error
 	switch e.scenarioID {
 	case "s1":
@@ -229,46 +246,114 @@ func (e *Executor) Execute(ctx context.Context) error {
 	return primErr
 }
 
-// ensureTargetReady applies the target (and the S2 RBAC) and waits for the
-// Deployment to roll out, as one retriable unit. applyWithRetry already rides
-// out a terminating namespace on the apply itself, but a prior test or trial
-// that deleted the shared tenant-acme Namespace with --wait=false can finish
-// draining AFTER a successful apply, sweeping the just-created Deployment so
-// `kubectl rollout status` fails with "object has been deleted". That is the
-// same drain race, surfacing one step later, so it is retried the same way:
-// re-apply and wait again. A non-race rollout error (a genuine timeout) is
-// returned at once. The always-on e2e job runs the RS smoke (which deletes the
-// whole tenant-acme namespace on cleanup) in the process right before the eval
-// smoke, so this race is real and recurring, not hypothetical.
+// ensureTargetReady brings the target up as one bounded, retriable unit:
+// wait for the shared namespace to finish any prior drain, apply the target
+// (and the S2 RBAC), and wait for the Deployment to roll out. Two races make
+// this more than a single apply + wait (review round 3):
+//
+//  1. The always-on e2e job runs the RS smoke, which deletes the whole
+//     tenant-acme namespace with --wait=false, right before the eval smoke.
+//     A create into a still-Terminating namespace is Forbidden, so we wait
+//     the namespace out first; and the drain can finish AFTER a successful
+//     apply, sweeping the just-created Deployment so `kubectl rollout status`
+//     fails with "object has been deleted". Both are retried: wait, re-apply,
+//     wait for rollout again.
+//  2. A genuine rollout timeout (a real target bug) is NOT a drain race and
+//     is surfaced at once.
+//
+// The whole thing is bounded by targetReadyBudget so a pathological drain
+// cannot run the trial past the caller's (or go test's) deadline; the backoff
+// sleeps only BETWEEN attempts, never after the last.
 func (e *Executor) ensureTargetReady(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, targetReadyBudget)
+	defer cancel()
 	var lastErr error
 	for attempt := 1; attempt <= applyRetries; attempt++ {
-		for _, m := range e.manifests {
-			if err := e.applyWithRetry(ctx, m); err != nil {
-				return fmt.Errorf("apply %s: %w", m, err)
+		if attempt > 1 {
+			if err := e.backoff(ctx); err != nil {
+				return fmt.Errorf("wait target ready: %w (last attempt: %v)", err, lastErr)
 			}
 		}
-		_, err := e.runCmd(ctx, "kubectl", "rollout", "status", attackWorkload, "-n", Namespace, "--timeout", attackWaitTimeout)
-		if err == nil {
-			return nil
+		if err := e.waitNamespaceNotTerminating(ctx); err != nil {
+			lastErr = err
+			if !isDeletionRaceError(err) {
+				return fmt.Errorf("wait namespace ready: %w", err)
+			}
+			continue
 		}
-		lastErr = err
-		if !isDeletionRaceError(err) {
-			return fmt.Errorf("wait target ready: %w", err)
+		if err := e.applyManifests(ctx); err != nil {
+			lastErr = err
+			if !isTransientApplyError(err) {
+				return fmt.Errorf("apply target: %w", err)
+			}
+			// A drain that outlasts applyWithRetry's own budget is retried at
+			// this outer level after the namespace-settle above.
+			continue
 		}
-		e.logger.Warn("target was deleted mid-rollout by a prior cleanup still draining; re-applying",
-			"attempt", attempt, "of", applyRetries, "err", err)
-		wait := e.retryWait
-		if wait <= 0 {
-			wait = applyRetryWait
+		if _, err := e.runCmd(ctx, "kubectl", "rollout", "status", attackWorkload, "-n", Namespace, "--timeout", attackWaitTimeout); err != nil {
+			lastErr = err
+			if !isDeletionRaceError(err) {
+				return fmt.Errorf("wait target ready: %w", err)
+			}
+			e.logger.Warn("target swept mid-rollout by a prior cleanup still draining; re-applying",
+				"attempt", attempt, "max", applyRetries, "err", err)
+			continue
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(wait):
-		}
+		return nil
 	}
 	return fmt.Errorf("wait target ready after %d attempts: %w", applyRetries, lastErr)
+}
+
+// applyManifests applies the executor's manifests in order, each riding out a
+// short terminating-namespace race via applyWithRetry. A still-transient error
+// after that is returned so the ensureTargetReady outer loop can wait the
+// namespace out and try the whole unit again.
+func (e *Executor) applyManifests(ctx context.Context) error {
+	for _, m := range e.manifests {
+		if err := e.applyWithRetry(ctx, m); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// waitNamespaceNotTerminating blocks (bounded by the caller's context) until
+// the shared namespace is not Terminating, so the apply that follows is not
+// rejected with a Forbidden "namespace is being terminated". A namespace that
+// does not exist is fine: the target manifests include the Namespace object,
+// so the apply recreates it.
+func (e *Executor) waitNamespaceNotTerminating(ctx context.Context) error {
+	for {
+		out, err := e.runCmd(ctx, "kubectl", "get", "ns", Namespace, "-o", "jsonpath={.status.phase}")
+		if err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "not found") {
+				return nil // gone; the apply will recreate it
+			}
+			return err
+		}
+		if strings.TrimSpace(out) != "Terminating" {
+			return nil
+		}
+		e.logger.Warn("shared namespace still terminating from a prior cleanup; waiting", "namespace", Namespace)
+		if err := e.backoff(ctx); err != nil {
+			return err
+		}
+	}
+}
+
+// backoff sleeps retryWait (or applyRetryWait when unset), returning the
+// context error if the context is cancelled first.
+func (e *Executor) backoff(ctx context.Context) error {
+	wait := e.retryWait
+	if wait <= 0 {
+		wait = applyRetryWait
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(wait):
+		return nil
+	}
 }
 
 // settle waits SettleWait (unless it is non-positive or the context is
@@ -289,13 +374,14 @@ func (e *Executor) settle(ctx context.Context) {
 
 // targetPod returns the name of the running target pod (app=web) in the
 // attack namespace. S3 needs the concrete pod name because kubectl cp cannot
-// address a Deployment.
+// address a Deployment; S1 and S2 use it so every primitive execs into the
+// same live pod.
 func (e *Executor) targetPod(ctx context.Context) (string, error) {
 	// Story 11.2d: skip pods that are terminating or not Running. The previous
 	// trial's pod can still be Terminating when this one starts; picking it
 	// made S3 upload kubectl into the old pod and exec in the new one.
 	out, err := e.runCmd(ctx, "kubectl", "get", "pod", "-n", Namespace,
-		"-l", "app=web", "-o",
+		"-l", "app="+workloadName, "-o",
 		`jsonpath={range .items[*]}{.metadata.name}{"|"}{.metadata.deletionTimestamp}{"|"}{.status.phase}{"\n"}{end}`)
 	if err != nil {
 		return "", err
@@ -306,7 +392,7 @@ func (e *Executor) targetPod(ctx context.Context) (string, error) {
 			return f[0], nil
 		}
 	}
-	return "", fmt.Errorf("no running, non-terminating pod for app=web in %s", Namespace)
+	return "", fmt.Errorf("no running, non-terminating pod for app=%s in %s", workloadName, Namespace)
 }
 
 // DefaultSettleWait is how long Execute waits AFTER the technique primitive
@@ -323,23 +409,39 @@ func (e *Executor) targetPod(ctx context.Context) (string, error) {
 // unit test shrinks it via the SettleWait field.
 const DefaultSettleWait = 45 * time.Second
 
+// DefaultInterTrialWait is how long olaitan-eval waits BETWEEN trials of the
+// same scenario (--runs>1) so the correlator's sliding window (60s,
+// docs/helm-values.md correlator.windowDuration) closes and two trials are
+// scored as two investigations rather than folded into one (review round 1,
+// C7). It is sized to the window; a unit test / CI dispatch sets it to 0.
+const DefaultInterTrialWait = 60 * time.Second
+
 // applyRetries / applyRetryWait bound the apply retry loop. A prior test or
 // trial that deleted the shared tenant-acme Namespace can leave it briefly
 // Terminating, and a create into a terminating namespace is rejected with a
 // Forbidden "namespace is being terminated" error. The retry rides that out
 // without masking a genuine manifest error (only the terminating / being-
-// deleted transient is retried).
+// deleted transient is retried). targetReadyBudget / cleanupTimeout bound the
+// whole bring-up and the teardown so neither can run past a caller deadline.
 const (
-	applyRetries   = 6
-	applyRetryWait = 5 * time.Second
+	applyRetries      = 6
+	applyRetryWait    = 5 * time.Second
+	targetReadyBudget = 5 * time.Minute
+	cleanupTimeout    = 90 * time.Second
 )
 
 // applyWithRetry runs kubectl apply, retrying only the transient
 // namespace-terminating / object-being-deleted races (a prior cleanup still in
-// flight). Any other error, or exhausting the retries, is returned.
+// flight). Any other error, or exhausting the retries, is returned. The
+// backoff sleeps only BETWEEN attempts, never after the last.
 func (e *Executor) applyWithRetry(ctx context.Context, manifest string) error {
 	var lastErr error
 	for attempt := 1; attempt <= applyRetries; attempt++ {
+		if attempt > 1 {
+			if err := e.backoff(ctx); err != nil {
+				return err
+			}
+		}
 		_, err := e.runCmd(ctx, "kubectl", "apply", "-f", manifest)
 		if err == nil {
 			return nil
@@ -349,16 +451,7 @@ func (e *Executor) applyWithRetry(ctx context.Context, manifest string) error {
 			return err
 		}
 		e.logger.Warn("apply hit a terminating-namespace race; retrying",
-			"manifest", manifest, "attempt", attempt, "of", applyRetries)
-		wait := e.retryWait
-		if wait <= 0 {
-			wait = applyRetryWait
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(wait):
-		}
+			"manifest", manifest, "attempt", attempt, "max", applyRetries)
 	}
 	return lastErr
 }
@@ -376,27 +469,42 @@ func isTransientApplyError(err error) bool {
 		strings.Contains(msg, "object is being deleted")
 }
 
-// isDeletionRaceError reports whether a `kubectl rollout status` failure was
-// caused by the target (or its namespace) being deleted out from under the
-// wait by a prior cleanup still draining, rather than a genuine rollout
-// timeout. "object has been deleted" is kubectl's message when the watched
-// Deployment is removed mid-watch; the terminating/not-found variants cover the
-// namespace being swept just before or during the wait. Only these are retried
-// (re-apply + wait again); a real timeout is surfaced at once.
+// isDeletionRaceError reports whether a `kubectl rollout status` (or namespace
+// get) failure was caused by the target or its namespace being deleted out
+// from under us by a prior cleanup still draining, rather than a genuine
+// rollout timeout or a permanent misconfiguration. It matches only the named
+// Deployment and the named Namespace (review round 3, R3-1): a bare "not
+// found" would also swallow a manifest whose Deployment name drifted from the
+// constant and retry it six times under a false "drain race" banner. Only
+// these drain races are retried; a real timeout or a name mismatch is
+// surfaced at once.
 func isDeletionRaceError(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "has been deleted") ||
-		strings.Contains(msg, "not found") ||
-		strings.Contains(msg, "no longer exists") ||
-		isTransientApplyError(err)
+	// kubectl's message when the watched Deployment is removed mid-watch.
+	if strings.Contains(msg, "has been deleted") {
+		return true
+	}
+	// the named target Deployment swept by the drain (rollout status / get).
+	if strings.Contains(msg, `deployments.apps "`+workloadName+`" not found`) ||
+		strings.Contains(msg, `deployment.apps "`+workloadName+`" not found`) {
+		return true
+	}
+	// the shared namespace swept just before or during the wait.
+	if strings.Contains(msg, `namespaces "`+Namespace+`" not found`) ||
+		strings.Contains(msg, `namespace "`+Namespace+`" not found`) {
+		return true
+	}
+	return isTransientApplyError(err)
 }
 
-// exec runs a shell script inside the target pod via kubectl exec.
+// exec runs a shell script inside the resolved live target pod via kubectl
+// exec. It targets e.pod (not deploy/web, which kubectl may resolve to a
+// different, dying pod of the Deployment) and the named container.
 func (e *Executor) exec(ctx context.Context, script string) (string, error) {
-	return e.runCmd(ctx, "kubectl", "exec", "-n", Namespace, attackWorkload, "--", "sh", "-c", script)
+	return e.runCmd(ctx, "kubectl", "exec", "-n", Namespace, e.pod, "-c", containerName, "--", "sh", "-c", script)
 }
 
 // runS1 executes the S1 container-escape technique (MITRE T1611 Escape to
@@ -405,19 +513,25 @@ func (e *Executor) exec(ctx context.Context, script string) (string, error) {
 // privileged process alone trips OLT-PRIV-001; the host-reach attempt is the
 // T1611 flavour and a read of the host /proc view can also trip OLT-EXEC-001.
 // The attempt is read-only recon (nothing on the host is modified), so it is
-// reversible by deleting the pod.
+// reversible by deleting the pod. nsenter's exit code is recorded; a MISSING
+// nsenter is a hard failure (exit 97) so a toolless image is not mistaken for
+// a detection miss (review round 1, C5). A non-zero nsenter rc on a present
+// tool is expected recon output, not a trial failure.
 func (e *Executor) runS1(ctx context.Context) error {
 	script := "echo '[s1] container-escape attempt from privileged pod'; " +
+		"command -v nsenter >/dev/null 2>&1 || { echo '[s1] nsenter missing'; exit 97; }; " +
 		"nsenter --target 1 --mount --uts --ipc --net --pid -- cat /etc/hostname 2>/dev/null; " +
-		"ls -la /proc/1/root/ 2>/dev/null | head -n 5; " +
-		"cat /proc/1/cgroup 2>/dev/null | head -n 3; true"
+		"echo \"[s1] nsenter rc=$?\"; " +
+		"ls -la /proc/1/root/ 2>/dev/null | head -n 5 || true; " +
+		"cat /proc/1/cgroup 2>/dev/null | head -n 3 || true"
 	out, err := e.exec(ctx, script)
 	if err != nil {
 		return fmt.Errorf("s1 escape primitive: %w", err)
 	}
+	rc := extractNsenterRC(out)
 	e.logger.Info("s1 technique executed",
 		"mitre", "T1611", "also", "T1610", "rule", "OLT-PRIV-001",
-		"detail", "privileged host-escape attempt", "out_len", len(out))
+		"detail", "privileged host-escape attempt", "nsenter_rc", rc, "out_len", len(out))
 	return nil
 }
 
@@ -428,6 +542,19 @@ func (e *Executor) runS1(ctx context.Context) error {
 // body, so no cluster secret is dumped); and requests the cloud
 // instance-metadata IP. MITRE: T1552 (OLT-CRED-001 token read), T1552.007
 // (kube-API use), T1552.005 (OLT-CRED-002 metadata IP); also T1528.
+//
+// Review round 1 (C1, AC4): the token is sent to curl on STDIN as the whole
+// Authorization header via `-H @-`, built with the printf shell builtin, so
+// the token value is in no process argv and never reaches Falco's
+// %proc.cmdline. The prior `curl -H "Authorization: Bearer $TOKEN"` put the
+// token in curl's argv and the upstream "Contact K8S API Server" rule printed
+// it. The next live run must show 0 Bearer tokens in any Falco alert.
+//
+// Review round 3 (R3-10): a `kubectl exec` that itself fails (pod swept, curl
+// missing in the image) FAILS the trial rather than being logged and ignored,
+// so a trial is never recorded as executed with steps that did not run. An
+// HTTP-level refusal (403/401) is a real attempt and stays a success: curl
+// still exits 0 and prints the status, which we record.
 func (e *Executor) runS2(ctx context.Context) error {
 	readScript := "wc -c < " + saTokenPath + "; sha256sum " + saTokenPath + " | cut -d' ' -f1"
 	out, err := e.exec(ctx, readScript)
@@ -435,28 +562,33 @@ func (e *Executor) runS2(ctx context.Context) error {
 		return fmt.Errorf("s2 token read: %w", err)
 	}
 	tlen, thash := parseTokenLenHash(out)
+	if !validTokenShape(tlen, thash) {
+		return fmt.Errorf("s2 token read returned an unexpected shape (len=%q hash-len=%d); the SA token was not projected into the pod", tlen, len(thash))
+	}
 	e.logger.Info("s2 token read (value never logged)",
 		"mitre", "T1552", "also", "T1528", "rule", "OLT-CRED-001",
 		"token_len", tlen, "token_sha256", thash)
 
-	apiScript := "TOKEN=$(cat " + saTokenPath + "); " +
-		"curl -s -o /dev/null -w '%{http_code}' -k --max-time 5 " +
-		"-H \"Authorization: Bearer $TOKEN\" " +
+	// The token is piped to curl as the whole Authorization header on stdin
+	// (-H @-). printf is a shell builtin, so the token is in no argv.
+	curlGuard := "command -v curl >/dev/null 2>&1 || { echo curl-missing; exit 97; }; "
+	apiScript := curlGuard +
+		"printf 'Authorization: Bearer %s' \"$(cat " + saTokenPath + ")\" | " +
+		"curl -s -o /dev/null -w '%{http_code}' -k --max-time 5 -H @- " +
 		kubeAPIHost + "/api/v1/namespaces/" + Namespace + "/secrets"
 	status, err := e.exec(ctx, apiScript)
 	if err != nil {
-		e.logger.Warn("s2 kube-API use returned an error (still a real attempt)", "err", err)
-	} else {
-		e.logger.Info("s2 kube-API use", "mitre", "T1552.007", "http_status", status)
+		return fmt.Errorf("s2 kube-API use: %w", err)
 	}
+	e.logger.Info("s2 kube-API use", "mitre", "T1552.007", "http_status", status)
 
-	metaScript := "curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://" + metadataIP + "/latest/meta-data/ || true"
+	metaScript := curlGuard +
+		"curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://" + metadataIP + "/latest/meta-data/ || true"
 	mstatus, err := e.exec(ctx, metaScript)
 	if err != nil {
-		e.logger.Warn("s2 metadata request returned an error (still a real attempt)", "err", err)
-	} else {
-		e.logger.Info("s2 metadata IP request", "mitre", "T1552.005", "rule", "OLT-CRED-002", "http_status", mstatus)
+		return fmt.Errorf("s2 metadata request: %w", err)
 	}
+	e.logger.Info("s2 metadata IP request", "mitre", "T1552.005", "rule", "OLT-CRED-002", "http_status", mstatus)
 	return nil
 }
 
@@ -476,10 +608,7 @@ func (e *Executor) runS2(ctx context.Context) error {
 // server exec channel, so nothing leaves the cluster, hard rule) and execs
 // it. proc.exepath is then /tmp/kubectl, which ends /kubectl.
 func (e *Executor) runS3(ctx context.Context) error {
-	pod, err := e.targetPod(ctx)
-	if err != nil {
-		return fmt.Errorf("s3 resolve target pod: %w", err)
-	}
+	pod := e.pod // the live pod Execute resolved; cp and exec hit the SAME pod.
 	prepare := e.PrepareKubectl
 	if prepare == nil {
 		prepare = resolveUploadKubectl
@@ -490,14 +619,14 @@ func (e *Executor) runS3(ctx context.Context) error {
 	}
 	e.logger.Info("s3 uploading runner kubectl", "path", src, "sha256", sum)
 	if _, err := e.runCmd(ctx, "kubectl", "cp", src,
-		Namespace+"/"+pod+":/tmp/kubectl", "-c", "web"); err != nil {
+		Namespace+"/"+pod+":/tmp/kubectl", "-c", containerName); err != nil {
 		return fmt.Errorf("s3 stage real kubectl into pod: %w", err)
 	}
 	// Exec the uploaded real kubectl. --client keeps it offline (no API call,
 	// no egress); the point is the /kubectl-named execve Falco observes.
 	// Exec in the SAME pod the binary was uploaded to (not deploy/web, which
 	// kubectl may resolve to a different pod of the Deployment).
-	out, err := e.runCmd(ctx, "kubectl", "exec", "-n", Namespace, pod, "-c", "web", "--",
+	out, err := e.runCmd(ctx, "kubectl", "exec", "-n", Namespace, pod, "-c", containerName, "--",
 		"sh", "-c", "chmod +x /tmp/kubectl && /tmp/kubectl version --client 2>&1")
 	if err != nil {
 		return fmt.Errorf("s3 in-pod kubectl primitive: %w", err)
@@ -515,13 +644,19 @@ func (e *Executor) runS3(ctx context.Context) error {
 // Deployment, and for S2 the least-privilege SA + Role + RoleBinding) but NOT
 // the shared tenant-acme Namespace, which is tenant infrastructure: deleting
 // only what the attack added keeps the reversal surgical and never leaves the
-// namespace mid-termination for the next trial or test. It is safe to call
-// after a partial or failed Execute and safe to call more than once (AC2
-// reversibility). A delete error is returned but does not stop the others.
+// namespace mid-termination for the next trial or test. It WAITS (bounded) for
+// each delete so the attack is fully reversed before the next trial starts
+// (review round 1, C4), and it runs on its OWN context derived with
+// WithoutCancel so a cancelled parent (a Ctrl-C mid-run) still reverses the
+// attack (review round 1, C2). It is safe after a partial or failed Execute
+// and safe to call more than once (AC2 reversibility). A delete error is
+// returned but does not stop the others.
 func (e *Executor) Cleanup(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
 	var firstErr error
 	for _, ref := range e.cleanupRefs {
-		if _, err := e.runCmd(ctx, "kubectl", "delete", ref, "-n", Namespace, "--ignore-not-found", "--wait=false"); err != nil {
+		if _, err := e.runCmd(ctx, "kubectl", "delete", ref, "-n", Namespace, "--ignore-not-found", "--wait=true", "--timeout", "60s"); err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("delete %s: %w", ref, err)
 			}
@@ -534,7 +669,7 @@ func (e *Executor) Cleanup(ctx context.Context) error {
 // parseTokenLenHash parses the "<len>\n<sha256>" output of the S2 token-read
 // primitive. It never receives the token value (the in-pod command emits
 // only the length and the hash). A malformed line yields zero/empty, which
-// the caller logs as-is (still no token value).
+// the caller rejects via validTokenShape (still no token value).
 func parseTokenLenHash(out string) (length, hash string) {
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) > 0 {
@@ -544,4 +679,41 @@ func parseTokenLenHash(out string) (length, hash string) {
 		hash = strings.TrimSpace(lines[len(lines)-1])
 	}
 	return length, hash
+}
+
+// validTokenShape reports whether the S2 token read returned a plausible
+// projected SA token: a positive byte length and a 64-char hex sha256 (review
+// round 1, C6). A zero length or a non-hash second line means the token was
+// not projected (no SA, wrong mount), which must fail the trial rather than
+// be logged as a successful credential read.
+func validTokenShape(length, hash string) bool {
+	n, err := strconv.Atoi(length)
+	if err != nil || n <= 0 {
+		return false
+	}
+	if len(hash) != 64 {
+		return false
+	}
+	for _, c := range hash {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// extractNsenterRC pulls the "[s1] nsenter rc=N" line out of the S1 primitive
+// output so the run records the escape attempt's exit code without parsing the
+// whole log. Returns "unknown" when the line is absent.
+func extractNsenterRC(out string) string {
+	const marker = "nsenter rc="
+	i := strings.Index(out, marker)
+	if i < 0 {
+		return "unknown"
+	}
+	rest := out[i+len(marker):]
+	if nl := strings.IndexByte(rest, '\n'); nl >= 0 {
+		rest = rest[:nl]
+	}
+	return strings.TrimSpace(rest)
 }

@@ -22,15 +22,15 @@ allow:
       Story 5.x eval-matrix e2e (TestEvalMatrix): the full synthetic S1-S5 +
       staged + benign matrix over every evaluation arm. Its de-injection to the
       real attack runner is a separate, larger effort outside Story 11.2a's
-      named scope; tracked for a follow-up story.
+      named scope; tracked in issue #197.
   - path: rs_smoke_test.go
     reason: >-
       publishCorrelatorTrigger publishes one raw.network + one raw.falco
       synthetic trigger and is SHARED by rslt_smoke_test.go (Story 3.16) and
       forensics_smoke_test.go (Story 6.x). Rewriting those two other-story e2e
       tests to real attacks is beyond Story 11.2a's named scope, so the shared
-      helper and rs_smoke's own S1 trigger de-injection are tracked as a
-      follow-up rather than silently changing other stories' coverage.
+      helper and rs_smoke's own S1 trigger de-injection are tracked in issue
+      #198 rather than silently changing other stories' coverage.
   - path: scenarios_smoke_test.go
     reason: >-
       S1-S3 are real in-cluster attacks through internal/eval/attack since

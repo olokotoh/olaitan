@@ -7,8 +7,10 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -67,6 +69,11 @@ type runConfig struct {
 	// verification can tune it to the measured trigger-to-match time without
 	// rebuilding, and CI / unit dispatch can set 0.
 	attackSettle time.Duration
+	// Review round 1 (C7): how long to wait BETWEEN trials of the same scenario
+	// (--runs>1) so the correlator's sliding window closes and two trials are
+	// scored as two investigations, not folded into one. Applied only between
+	// trials, never after the last. 0 disables the wait (CI / unit dispatch).
+	interTrialWait time.Duration
 }
 
 // metadata is the MINIMAL per-run metadata.yaml schema (BI-5, BI-8). It
@@ -224,13 +231,36 @@ func run(args []string, stdout, stderr io.Writer, runCmd overlayRunFunc, attackR
 			"runs", cfg.runs, "run_dir", runDir)
 	}
 
+	// Cancel the trial loop on SIGINT/SIGTERM so a Ctrl-C stops promptly; the
+	// attack executor's Cleanup detaches this cancel (context.WithoutCancel) and
+	// still reverses the in-flight attack (review round 1, C2).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	var firstErr error
 	for trial := 1; trial <= cfg.runs; trial++ {
+		if ctx.Err() != nil {
+			logger.Warn("interrupted; stopping the trial loop", "completed_trials", trial-1, "of", cfg.runs)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("trial loop interrupted: %w", ctx.Err())
+			}
+			break
+		}
 		logger.Info("trial start", "trial", trial, "of", cfg.runs, "dir", runDir)
-		if err := r.Run(context.Background(), runDir); err != nil {
+		if err := r.Run(ctx, runDir); err != nil {
 			logger.Error("trial failed", "trial", trial, "err", err)
 			if firstErr == nil {
 				firstErr = fmt.Errorf("trial %d: %w", trial, err)
+			}
+		}
+		// Wait the correlator window out between trials of the same scenario so
+		// repeated trials are not folded into one investigation (C7). Never after
+		// the last trial; a cancel cuts the wait short.
+		if trial < cfg.runs && cfg.interTrialWait > 0 {
+			logger.Info("inter-trial wait so the correlator window closes", "wait", cfg.interTrialWait.String())
+			select {
+			case <-ctx.Done():
+			case <-time.After(cfg.interTrialWait):
 			}
 		}
 	}
@@ -289,6 +319,7 @@ func parseFlags(args []string, stderr io.Writer) (runConfig, error) {
 	fs.StringVar(&cfg.natsURL, "nats-url", "", "JetStream endpoint the per-run Capturer drains the run's subjects from (empty = no NATS wired; artefacts captured empty)")
 	fs.Int64Var(&cfg.maxRunSizeBytes, "max-run-size-bytes", capture.DefaultMaxRunSizeBytes, "per-run artefact size cap; over it a fail-LOUD alert is emitted and size_cap_exceeded is recorded (the artefacts are NOT deleted)")
 	fs.DurationVar(&cfg.attackSettle, "attack-settle", attack.DefaultSettleWait, "Story 11.2d: settle after the attack primitive before cleanup so the correlator resolves posture off the live pod; 0 to delete immediately (unit/CI dispatch)")
+	fs.DurationVar(&cfg.interTrialWait, "inter-trial-wait", attack.DefaultInterTrialWait, "Story 11.2a: wait between trials of the same scenario (--runs>1) so the correlator window closes and trials are not folded into one investigation; 0 to disable (unit/CI dispatch)")
 
 	if err := fs.Parse(args); err != nil {
 		return runConfig{}, err

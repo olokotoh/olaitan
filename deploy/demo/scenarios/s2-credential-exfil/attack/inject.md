@@ -2,46 +2,32 @@
 
 ## What a real attacker would do
 
-From the tenant pod, read the projected ServiceAccount token directly with
-a non-system tool (e.g. `cat /run/secrets/kubernetes.io/serviceaccount/token`
-via curl), and/or reach the cloud instance-metadata service at
-`169.254.169.254` to harvest node credentials for lateral movement beyond
-the cluster.
+From the tenant pod, read the projected ServiceAccount token, use it against
+the kube-API, and reach the cloud instance-metadata service at
+`169.254.169.254` to harvest node credentials for lateral movement beyond the
+cluster.
 
-## Deterministic kind stimulus (BI-3, the harness path)
+## Real in-cluster attack (Story 11.2a)
 
-The harness injects two synthetic events directly to NATS (fixed content, no
-randomness, no real credential, no external network).
+S2 is a REAL attack, not a synthetic NATS event. The shared executor
+(`internal/eval/attack/attack.go`, `runS2`) applies the least-privilege
+`s2-attacker` RBAC and the target, then `kubectl exec`s into the live pod and:
 
-(a) A falco file-read event matching OLT-CRED-001 (`olaitan.events.raw.falco`):
+1. Reads the SA token, emitting ONLY its byte length and sha256 (the token
+   value never enters argv, stdout, or a log line; the read is validated to be
+   a real projected token). MITRE T1552 (OLT-CRED-001).
+2. Uses the token against the kube-API (`/api/v1/.../secrets`), printing only
+   the HTTP status. The Authorization header is piped to curl on STDIN
+   (`printf ... | curl -H @-`, printf is a shell builtin), so the token is in
+   NO process argv and never reaches Falco's `%proc.cmdline`. MITRE T1552.007.
+3. Requests the instance-metadata IP. MITRE T1552.005 (OLT-CRED-002).
 
-```json
-{
-  "id": "scenario-s2-falco-1",
-  "source": "falco",
-  "category": "file",
-  "severity": "WARNING",
-  "pod": { "name": "<resolved tenant-acme/web pod>", "namespace": "tenant-acme" },
-  "raw": {
-    "file.path": "/run/secrets/kubernetes.io/serviceaccount/token",
-    "process.exe": "/usr/bin/curl"
-  }
-}
-```
+A `kubectl exec` that itself fails (pod swept, curl missing in the image) fails
+the trial, so a run is never recorded as executed with steps that did not run.
+An HTTP-level refusal (401/403) is a real attempt and is recorded as such.
 
-(b) A network event to the metadata IP matching OLT-CRED-002
-(`olaitan.events.raw.network`):
-
-```json
-{
-  "id": "scenario-s2-net-1",
-  "source": "network",
-  "category": "flow",
-  "pod": { "name": "<resolved tenant-acme/web pod>", "namespace": "tenant-acme" },
-  "raw": { "dst_ip": "169.254.169.254", "network.dst_ip": "169.254.169.254" }
-}
-```
-
-The canonical injector is `injectScenario(t, js, "s2", podName)` in
-`tests/e2e/scenarios_smoke_test.go`; the JSON above is the field-shape
-contract it emits.
+Falco observes the real syscalls / connection and its alerts flow through the
+real bus to the correlator, which assembles the EvidencePackage. The attack is
+driven by `runRealAttack(t, tgt)` in `tests/e2e/scenarios_smoke_test.go` and by
+`olaitan-eval` through the same executor. The synthetic injector
+`injectScenario` refuses S1-S3.

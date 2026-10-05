@@ -83,8 +83,14 @@ func TestNewScenario_DispatchAllFive(t *testing.T) {
 			// pod) before uploading a real kubectl, so the fake runner must
 			// answer that lookup; all other calls return empty.
 			fakeAttack := func(ctx context.Context, name string, args ...string) (string, error) {
-				if strings.Contains(strings.Join(args, " "), "get pod") {
+				j := strings.Join(args, " ")
+				if strings.Contains(j, "get pod") {
 					return "web-6d4f9c7b8-abcde||Running\n", nil // name|deletionTimestamp|phase (Story 11.2d)
+				}
+				// Story 11.2a C6: S2 validates the token read shape, so the fake
+				// returns a plausible length + 64-hex sha256 for the token step.
+				if strings.Contains(j, "serviceaccount/token") && (strings.Contains(j, "sha256sum") || strings.Contains(j, "wc")) {
+					return "245\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", nil
 				}
 				return "", nil
 			}

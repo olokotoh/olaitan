@@ -37,6 +37,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -120,8 +121,27 @@ var realAttackScenarios = map[string]bool{"s1": true, "s2": true, "s3": true}
 const correlatorWindow = 60*time.Second + 10*time.Second
 
 // lastRealAttack records when each real scenario last ran, so a repeat waits
-// out the correlator window (see correlatorWindow).
-var lastRealAttack = map[string]time.Time{}
+// out the correlator window (see correlatorWindow). lastRealAttackMu guards it
+// (review round 3, C8): the subtests are sequential today, but the map is
+// package state and a future t.Parallel must not race it.
+var (
+	lastRealAttack   = map[string]time.Time{}
+	lastRealAttackMu sync.Mutex
+)
+
+// requireKindContext refuses to drive a REAL in-cluster attack anywhere but the
+// ephemeral kind e2e cluster (review round 3, C8). A real attack applies a
+// privileged workload and execs into it; running it against the wrong context
+// (a dev's default kubeconfig, a shared cluster) would be an attack on a real
+// system. kind's context is always `kind-<clusterName>`.
+func requireKindContext(t *testing.T) {
+	t.Helper()
+	want := "kind-" + kindClusterName()
+	got := strings.TrimSpace(kubectl(t, "config", "current-context"))
+	if got != want {
+		t.Fatalf("refusing to run a real in-cluster attack: current kube-context is %q, not the e2e kind context %q; a real attack must only ever target the ephemeral kind e2e cluster", got, want)
+	}
+}
 
 // logWriter sends the executor's structured log lines to t.Log.
 type logWriter struct{ t *testing.T }
@@ -141,7 +161,12 @@ func (w logWriter) Write(p []byte) (int, error) {
 func runRealAttack(t *testing.T, tgt scenarioSmokeTarget) (scenarioCounterSnapshot, func()) {
 	t.Helper()
 	scenarioID := tgt.ScenarioID
-	if last, ok := lastRealAttack[scenarioID]; ok {
+	// Refuse to attack anything but the kind e2e cluster (C8).
+	requireKindContext(t)
+	lastRealAttackMu.Lock()
+	last, ok := lastRealAttack[scenarioID]
+	lastRealAttackMu.Unlock()
+	if ok {
 		if wait := correlatorWindow - time.Since(last); wait > 0 {
 			t.Logf("scenario %s ran %s ago; waiting %s for the correlator window to close", scenarioID, time.Since(last).Round(time.Second), wait.Round(time.Second))
 			time.Sleep(wait)
@@ -159,13 +184,18 @@ func runRealAttack(t *testing.T, tgt scenarioSmokeTarget) (scenarioCounterSnapsh
 		}
 	}
 	before := snapshotScenarioCounters(t, tgt)
-	lastRealAttack[scenarioID] = time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	if err := executor.Execute(ctx); err != nil {
 		cleanup()
 		t.Fatalf("scenario %s real attack: %v", scenarioID, err)
 	}
+	// Stamp the attack time AFTER the primitive ran (C8), so the correlator-
+	// window wait before the next repeat is measured from the real attack, not
+	// from before target bring-up (which could be minutes earlier on a slow pull).
+	lastRealAttackMu.Lock()
+	lastRealAttack[scenarioID] = time.Now()
+	lastRealAttackMu.Unlock()
 	return before, cleanup
 }
 
@@ -189,6 +219,12 @@ func injectScenario(t *testing.T, js jetstream.JetStream, scenarioID, podName, d
 	t.Helper()
 	if _, ok := scenarioSmokeSlugs[scenarioID]; !ok {
 		t.Fatalf("injectScenario: unknown scenario %q", scenarioID)
+	}
+	// Review round 3 (C8): S1-S3 are REAL in-cluster attacks (Story 11.2a) and
+	// must never regress to synthetic NATS injection; refuse them here so a
+	// future caller cannot quietly re-fabricate their events.
+	if realAttackScenarios[scenarioID] {
+		t.Fatalf("injectScenario must not be used for real-attack scenario %q (Story 11.2a); drive it through runRealAttack", scenarioID)
 	}
 	// Snapshot the cumulative counters BEFORE any of this scenario's stimuli
 	// (including the S4 baseline pre-seed) so the per-scenario delta captures
@@ -293,6 +329,12 @@ func assertScenarioSignal(t *testing.T, tgt scenarioSmokeTarget, before scenario
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
+	// Review round 3 (C8): only a scenario that genuinely rests on a baseline
+	// deviation (S4 C2-beaconing, the one BaselinePreseed scenario) may pass on
+	// the GLOBAL baseline-deviation delta. Every other scenario -- all the real
+	// in-cluster attacks (S1-S3) and S5 -- MUST show its OWN rule-match delta, so
+	// an unrelated deviation elsewhere on the cluster cannot pass it.
+	allowDeviation := evalscenario.BaselinePreseed(tgt.ScenarioID)
 	var lastErr error
 	tick := 0
 	for {
@@ -316,14 +358,16 @@ func assertScenarioSignal(t *testing.T, tgt scenarioSmokeTarget, before scenario
 		// delta reached the bus. The idempotency repeat passes
 		// requireFreshPackage=false because the correlator legitimately
 		// coalesces a same-workload repeat (see the helper doc comment).
-		redetected := ruleMatches >= 1 || deviations >= 1
+		redetected := ruleMatches >= 1 || (allowDeviation && deviations >= 1)
 		freshPackage := !requireFreshPackage || evidence >= 1
 		if redetected && freshPackage {
 			return nil
 		}
 		switch {
-		case !redetected:
+		case !redetected && allowDeviation:
 			lastErr = fmt.Errorf("no rule-match delta for %v and no baseline-deviation delta yet", tgt.TriggeringRules)
+		case !redetected:
+			lastErr = fmt.Errorf("no own rule-match delta for %v yet (a global baseline deviation does not pass a real-attack scenario)", tgt.TriggeringRules)
 		case !freshPackage:
 			lastErr = fmt.Errorf("correlator evidence-package delta = %v; want >= 1", evidence)
 		}
