@@ -230,10 +230,22 @@ aggregator:
 # values-kind.yaml; the rule still catches everything else. The Story 10.7
 # review deferred it here, and Story 10.6 needs it too: the incident the
 # real model is asked about must be the attack, not container start-up.
+# Story 11.2d appends the same exception to the chart's "Olaitan Privileged
+# Escape Primitive" rule: the hook runs mount with CAP_SYS_ADMIN, so without
+# it OLT-PRIV-001 matched on every pod start in the live benign check.
 falco:
   customRules:
     olaitan-kind-exceptions.yaml: |-
       - rule: Drop and execute new binary in container
+        exceptions:
+          - name: kind_mount_product_files_hook
+            fields: [proc.pname, proc.exepath]
+            comps: [=, in]
+            values:
+              - [mount-product-f, [/usr/bin/mount, /usr/bin/umount]]
+        override:
+          exceptions: append
+      - rule: Olaitan Privileged Escape Primitive
         exceptions:
           - name: kind_mount_product_files_hook
             fields: [proc.pname, proc.exepath]

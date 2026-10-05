@@ -1,0 +1,25 @@
+{
+  "hostname": "olaitan-full-worker",
+  "output": "09:10:36.922299490: Warning Olaitan serviceaccount token read (file=/run/secrets/kubernetes.io/serviceaccount/token proc_exepath=/bin/busybox k8s_ns=tenant-acme k8s_pod=web-84f577bc9-rqrvt) container_id=d8220601e94f container_name=web container_image_repository=docker.io/curlimages/curl container_image_tag=7551dbeefe0d9a88a7134dd903f97727315e9fd150b4aefa6da5dcf3a4757f2a k8s_pod_name=web-84f577bc9-rqrvt k8s_ns_name=tenant-acme",
+  "output_fields": {
+    "container.id": "d8220601e94f",
+    "container.image.repository": "docker.io/curlimages/curl",
+    "container.image.tag": "7551dbeefe0d9a88a7134dd903f97727315e9fd150b4aefa6da5dcf3a4757f2a",
+    "container.name": "web",
+    "evt.time": 1790759436922299490,
+    "fd.name": "/run/secrets/kubernetes.io/serviceaccount/token",
+    "k8s.ns.name": "tenant-acme",
+    "k8s.pod.name": "web-84f577bc9-rqrvt",
+    "proc.exepath": "/bin/busybox"
+  },
+  "priority": "Warning",
+  "rule": "Olaitan ServiceAccount Token Read",
+  "source": "syscall",
+  "tags": [
+    "T1552",
+    "container",
+    "mitre_credential_access",
+    "olaitan"
+  ],
+  "time": "2026-09-30T09:10:36.922299490Z"
+}

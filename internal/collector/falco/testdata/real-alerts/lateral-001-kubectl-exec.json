@@ -1,0 +1,25 @@
+{
+  "hostname": "olaitan-full-worker",
+  "output": "09:12:34.050326969: Warning Olaitan in-pod kubectl exec (proc_exepath=/tmp/kubectl proc_cmdline=kubectl version --client k8s_ns=tenant-acme k8s_pod=web-bd846c7f-n2t8x) container_id=cc423f38b55d container_name=web container_image_repository=docker.io/library/busybox container_image_tag=30ecbe1509090b38ef3260f3609d64d8261230464eaa4d235901db496e9647fb k8s_pod_name=web-bd846c7f-n2t8x k8s_ns_name=tenant-acme",
+  "output_fields": {
+    "container.id": "cc423f38b55d",
+    "container.image.repository": "docker.io/library/busybox",
+    "container.image.tag": "30ecbe1509090b38ef3260f3609d64d8261230464eaa4d235901db496e9647fb",
+    "container.name": "web",
+    "evt.time": 1790759554050326969,
+    "k8s.ns.name": "tenant-acme",
+    "k8s.pod.name": "web-bd846c7f-n2t8x",
+    "proc.cmdline": "kubectl version --client",
+    "proc.exepath": "/tmp/kubectl"
+  },
+  "priority": "Warning",
+  "rule": "Olaitan In-Pod kubectl Exec",
+  "source": "syscall",
+  "tags": [
+    "T1613",
+    "container",
+    "mitre_lateral_movement",
+    "olaitan"
+  ],
+  "time": "2026-09-30T09:12:34.050326969Z"
+}

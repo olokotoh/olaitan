@@ -383,13 +383,13 @@ data:
         falcoversions: http://localhost:8765/versions
         pluginsDir: /plugins
         refs:
-        - falco-rules:5
+        - falco-rules:5.2.0
         rulesfilesDir: /rulesfiles
         stateDir: /artifactstate
       install:
         pluginsDir: /plugins
         refs:
-        - falco-rules:5
+        - falco-rules:5.2.0
         - ghcr.io/falcosecurity/plugins/plugin/container:0.7.1
         resolveDeps: true
         rulesfilesDir: /rulesfiles
@@ -397,6 +397,139 @@ data:
     indexes:
     - name: falcosecurity
       url: https://falcosecurity.github.io/falcoctl/index.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: olaitan-falco-rules
+  namespace: default
+  labels:
+    helm.sh/chart: falco-9.1.0
+    app.kubernetes.io/name: falco
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+data:
+  olaitan-detection.yaml: |-
+    # Review round 1, decision D1 (Aslim, 2026-09-28): a WARNING alert
+    # starts an investigation on its own, so each rule below carries the
+    # exclusions of the OLT rule it feeds. These two lists copy them
+    # verbatim (OLT-PRIV-001 / OLT-CRED-002 system_namespace inline below;
+    # the OLT-CRED-001 system_process regex ^/(usr/)?(local/)?s?bin/(kubelet|
+    # kube-proxy|coredns)$ spelled out as paths here). OLT rules unchanged.
+    - list: olaitan_system_process_paths
+      items:
+        - /bin/kubelet
+        - /sbin/kubelet
+        - /usr/bin/kubelet
+        - /usr/sbin/kubelet
+        - /local/bin/kubelet
+        - /local/sbin/kubelet
+        - /usr/local/bin/kubelet
+        - /usr/local/sbin/kubelet
+        - /bin/kube-proxy
+        - /sbin/kube-proxy
+        - /usr/bin/kube-proxy
+        - /usr/sbin/kube-proxy
+        - /local/bin/kube-proxy
+        - /local/sbin/kube-proxy
+        - /usr/local/bin/kube-proxy
+        - /usr/local/sbin/kube-proxy
+        - /bin/coredns
+        - /sbin/coredns
+        - /usr/bin/coredns
+        - /usr/sbin/coredns
+        - /local/bin/coredns
+        - /local/sbin/coredns
+        - /usr/local/bin/coredns
+        - /usr/local/sbin/coredns
+    - rule: Olaitan Privileged Escape Primitive
+      desc: >-
+        A container process holding CAP_SYS_ADMIN runs a namespace or mount
+        escape tool. Emits thread.cap_effective (OLT-PRIV-001 keys on
+        process.cap_effective) and the k8s pod identity for the correlator.
+      condition: >-
+        spawned_process and container
+        and thread.cap_effective contains CAP_SYS_ADMIN
+        and proc.name in (nsenter, mount, umount, chroot, unshare)
+        and k8s.ns.name exists and not k8s.ns.name in (kube-system, kube-public, kube-node-lease, olaitan)
+      output: >-
+        Olaitan privileged escape primitive (proc_exepath=%proc.exepath
+        proc_cmdline=%proc.cmdline cap_effective=%thread.cap_effective
+        container_id=%container.id k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+      priority: WARNING
+      tags: [olaitan, container, mitre_privilege_escalation, T1611]
+      source: syscall
+    - rule: Olaitan ServiceAccount Token Read
+      desc: >-
+        A shell, or a program a shell started, opens the projected
+        ServiceAccount token file inside a container: how an attacker in the
+        pod reads it. Client libraries (client-go and others) re-read the
+        token themselves for rotation, so a rule on every read fired on
+        Calico, kube-proxy and Olaitan itself (Story 11.2d kubeadm benign
+        check). Emits fd.name (OLT-CRED-001 keys on file.path) and
+        proc.exepath (process.exe) plus the k8s pod identity.
+      condition: >-
+        open_read and container
+        and (fd.name startswith /run/secrets/kubernetes.io/serviceaccount/
+        or fd.name startswith /var/run/secrets/kubernetes.io/serviceaccount/)
+        and (proc.name in (shell_binaries) or proc.pname in (shell_binaries))
+        and not proc.exepath in (olaitan_system_process_paths)
+      output: >-
+        Olaitan serviceaccount token read (file=%fd.name
+        proc_exepath=%proc.exepath k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+      priority: WARNING
+      tags: [olaitan, container, mitre_credential_access, T1552]
+      source: syscall
+    - rule: Olaitan Cloud Metadata Contact
+      desc: >-
+        A container process connects to the cloud instance metadata IP
+        169.254.169.254. Emits fd.sip/fd.rip (OLT-CRED-002 keys on
+        network.dst_ip) plus the k8s pod identity.
+      condition: >-
+        evt.type=connect and container
+        and (fd.sip=169.254.169.254 or fd.rip=169.254.169.254)
+        and k8s.ns.name exists and not k8s.ns.name in (kube-system, kube-public, kube-node-lease, olaitan)
+      output: >-
+        Olaitan cloud metadata contact (dst_sip=%fd.sip dst_rip=%fd.rip
+        proc_exepath=%proc.exepath k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+      priority: WARNING
+      tags: [olaitan, container, mitre_credential_access, T1552.005]
+      source: syscall
+    - rule: Olaitan In-Pod kubectl Exec
+      desc: >-
+        A process whose executable path ends /kubectl execs inside a
+        container. Emits proc.exepath (OLT-LATERAL-001 keys on process.exe)
+        plus the k8s pod identity.
+      condition: >-
+        spawned_process and container and proc.exepath endswith /kubectl
+        and k8s.ns.name startswith tenant-
+      output: >-
+        Olaitan in-pod kubectl exec (proc_exepath=%proc.exepath
+        proc_cmdline=%proc.cmdline k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+      priority: WARNING
+      tags: [olaitan, container, mitre_lateral_movement, T1613]
+      source: syscall
+    # Decision D3: Falco stops at the first matching rule (rule_matching:
+    # first), and the upstream "Drop and execute new binary in container"
+    # is loaded first, so it used to win for S3's /tmp/kubectl. Exempt it
+    # for exactly the scope the rule above covers (a /kubectl exe in a
+    # tenant- namespace) so the Olaitan rule fires there; the default rule
+    # still covers every other namespace. Falco refuses to start if this
+    # override names a rule no loaded file defines, which is why the rules
+    # package is pinned below (falcoctl, decision D4). Side effect: in that
+    # scope the alert is the Olaitan rule's WARNING, not upstream's
+    # CRITICAL, and raising falco.falco.priority above warning drops the
+    # Olaitan rule while this exception stays.
+    - rule: Drop and execute new binary in container
+      exceptions:
+        - name: olaitan_kubectl_rule_owns_it
+          fields: [proc.exepath, k8s.ns.name]
+          comps: [endswith, startswith]
+          values:
+            - [/kubectl, tenant-]
+      override:
+        exceptions: append
 ---
 apiVersion: v1
 data:
@@ -1607,7 +1740,7 @@ spec:
         app.kubernetes.io/instance: olaitan
       annotations:
         checksum/config: a72d6f229358572950c603eb17b8c4083d54a8e54645753b65053a36208e3f6c
-        checksum/rules: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        checksum/rules: 47fa61ea2a6d6307f5d7063d9b3c97934ef47cd6dad83c5077521ea6db46ee20
         checksum/certs: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
     spec:
       serviceAccountName: olaitan-falco
@@ -1708,23 +1841,8 @@ spec:
             - mountPath: /etc/falco/falco.yaml
               name: falco-yaml
               subPath: falco.yaml
-        - name: falcoctl-artifact-follow
-          image: docker.io/falcosecurity/falcoctl:0.13.0@sha256:0eeb79adc580ae6a5abfdefd7f8f0fed9151fcb545f015c84e8f1d7b2d8a6b02
-          imagePullPolicy: IfNotPresent
-          args:
-            - artifact
-            - follow
-            - --log-format=json
-          securityContext:
-          volumeMounts:
-            - mountPath: /plugins
-              name: plugins-install-dir
-            - mountPath: /rulesfiles
-              name: rulesfiles-install-dir
-            - mountPath: /etc/falcoctl
-              name: falcoctl-config-volume
-            - mountPath: /artifactstate
-              name: artifact-state-dir
+            - mountPath: /etc/falco/rules.d
+              name: rules-volume
       initContainers:
         - name: falcoctl-artifact-install
           image: docker.io/falcosecurity/falcoctl:0.13.0@sha256:0eeb79adc580ae6a5abfdefd7f8f0fed9151fcb545f015c84e8f1d7b2d8a6b02
@@ -1800,6 +1918,9 @@ spec:
             items:
             - key: falco.yaml
               path: falco.yaml
+        - name: rules-volume
+          configMap:
+            name: olaitan-falco-rules
   updateStrategy:
     type: RollingUpdate
 ---

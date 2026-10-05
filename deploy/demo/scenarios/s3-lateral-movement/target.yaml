@@ -8,3 +8,18 @@ target_time_to_detect_seconds: 90
 floor: false
 triggering_rules:
   - OLT-LATERAL-001
+
+# Story 11.2a (AC3): the real in-cluster primitives the runner executes,
+# mapped to their MITRE ATT&CK for Containers ID(s). Cited from the repo rule
+# corpus (OLT-LATERAL-001 tags T1613) and the ATT&CK for Containers matrix
+# (T1609). No egress: the /kubectl-named binary is built in-pod from busybox.
+attack_steps:
+  - id: kubectl-exec-into-pod
+    mitre:
+      - T1609   # Container Administration Command
+    primitive: kubectl exec into the tenant pod
+  - id: in-pod-kubectl-process
+    mitre:
+      - T1613   # Container and Resource Discovery
+      - T1609   # Container Administration Command
+    primitive: launch a /kubectl-named process in-pod (busybox copied to /tmp/kubectl)
