@@ -31,9 +31,3 @@ allow:
       tests to real attacks is beyond Story 11.2a's named scope, so the shared
       helper and rs_smoke's own S1 trigger de-injection are tracked in issue
       #198 rather than silently changing other stories' coverage.
-  - path: scenarios_smoke_test.go
-    reason: >-
-      S1-S3 are real in-cluster attacks through internal/eval/attack since
-      Story 11.2a (no NATS publish). injectScenario still drives S4 and S5,
-      which need attacker-side sink / pool infrastructure and belong to Story
-      11.2b (#192); the entry is removed when they move to real attacks.

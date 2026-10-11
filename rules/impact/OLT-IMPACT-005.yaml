@@ -1,9 +1,15 @@
 title: Cryptominer process pattern in unprivileged Pod
 id: OLT-IMPACT-005
 description: |
-  Detects xmrig / minerd-style executable launches in workload Pods
-  not labelled as crypto workloads, with elevated CPU and outbound
-  traffic to a known mining pool port range.
+  Detects an xmrig / minerd / cpuminer-style executable launch in a
+  tenant workload Pod not labelled as a crypto workload. This is the
+  process half of a cryptomining detection and fires on the real Falco
+  execve event alone; the network (stratum pool) half is a separate
+  single-source signal, OLT-IMPACT-006 on the CNI flow, and the
+  correlator fuses the two into one high-confidence incident. (A real
+  single event never carries both a process name and a destination
+  port, so requiring both in one rule was un-trippable on real
+  telemetry.)
 status: experimental
 attack:
   - T1496
@@ -17,16 +23,10 @@ detection:
   k8s_context:
     k8s.workload.owner_kind: Deployment
     k8s.pod.namespace|startswith: 'tenant-'
-  network_match:
-    network.dst_port:
-      - 3333
-      - 4444
-      - 5555
-  condition: process_match and k8s_context and network_match
+  condition: process_match and k8s_context
 falsepositives:
   - Legitimate crypto-bridge workloads (label `app.kubernetes.io/component=crypto`)
 fields:
   - process.exe
   - k8s.pod.namespace
   - k8s.workload.owner_kind
-  - network.dst_port

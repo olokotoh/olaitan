@@ -71,7 +71,7 @@ func TestNewScenario_DispatchAllFive(t *testing.T) {
 		{"s1", "s1-container-escape", "T1611", "QUARANTINED", 30, false, []string{"OLT-PRIV-001"}},
 		{"s2", "s2-credential-exfil", "T1552", "RESTRICTED", 60, true, []string{"OLT-CRED-001", "OLT-CRED-002"}},
 		{"s3", "s3-lateral-movement", "T1613", "QUARANTINED", 90, false, []string{"OLT-LATERAL-001"}},
-		{"s4", "s4-c2-beaconing", "T1071", "SUSPICIOUS", 300, true, []string{"OLT-NET-001", "OLT-NET-002"}},
+		{"s4", "s4-c2-beaconing", "T1071", "SUSPICIOUS", 300, true, []string{"OLT-NET-002"}},
 		{"s5", "s5-cryptomining", "T1496", "RESTRICTED", 120, false, []string{"OLT-IMPACT-005", "OLT-IMPACT-006"}},
 	}
 	for _, tc := range cases {
@@ -130,21 +130,12 @@ func TestNewScenario_DispatchAllFive(t *testing.T) {
 					t.Errorf("triggering_rules[%d] = %q; want %q", i, h.target.TriggeringRules[i], r)
 				}
 			}
-			// Story 11.2a: Run dispatches the REAL in-cluster attack. S1-S3
-			// are implemented here and dispatch cleanly through the injected
-			// fake runner; S4-S5 need attacker-side sink / pool infra and
-			// land in Story 11.2b (#192), so Run returns a loud error rather
-			// than a silent no-op.
-			runErr := sc.Run(context.Background())
-			switch tc.id {
-			case "s1", "s2", "s3":
-				if runErr != nil {
-					t.Errorf("Run(%q): %v", tc.id, runErr)
-				}
-			default:
-				if runErr == nil {
-					t.Errorf("Run(%q): want a not-implemented error (S4/S5 are Story 11.2b), got nil", tc.id)
-				}
+			// Run dispatches the REAL in-cluster attack. S1-S3 (Story 11.2a)
+			// and now S4-S5 (Story 11.2b: beacon to an in-cluster sink; miner
+			// process + stratum-pool connection) all dispatch cleanly through
+			// the injected fake runner, so every scenario's Run succeeds here.
+			if runErr := sc.Run(context.Background()); runErr != nil {
+				t.Errorf("Run(%q): %v", tc.id, runErr)
 			}
 		})
 	}
@@ -412,6 +403,8 @@ func TestScenarioManifestsMapAttackStepsToMitre(t *testing.T) {
 		"s1": {"T1611"},
 		"s2": {"T1552", "T1552.005", "T1552.007"},
 		"s3": {"T1613", "T1609"},
+		"s4": {"T1071", "T1071.001"},
+		"s5": {"T1496"},
 	}
 	for id, wantIDs := range want {
 		t.Run(id, func(t *testing.T) {

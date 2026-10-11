@@ -46,7 +46,6 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/olokotoh/olaitan/internal/eval/attack"
-	evalscenario "github.com/olokotoh/olaitan/internal/eval/scenario"
 )
 
 // scenarioSmokeTarget mirrors the fields the AC8 assertion reads off a
@@ -65,21 +64,6 @@ var scenarioSmokeSlugs = map[string]string{
 	"s3": "s3-lateral-movement",
 	"s4": "s4-c2-beaconing",
 	"s5": "s5-cryptomining",
-}
-
-// scenarioWorkloadName returns the per-scenario Deployment name in tenant-acme.
-// Each scenario gets its OWN Deployment (Review Round 2, CI-caught): the
-// correlator derives workloadID = `tenant-acme/Deployment/<name>` and keys its
-// rising-edge `fired` flag on it (internal/correlator/window/window.go:171-185),
-// so a distinct Deployment per scenario gives each scenario INDEPENDENT
-// rising-edge state. This makes each scenario's first multi-signal convergence
-// emit a fresh EvidencePackage regardless of rs_smoke (which uses `web`) or the
-// sibling scenarios, instead of being suppressed by a `fired` flag the FIRST
-// converger set on the shared `tenant-acme/Deployment/web` workload within the
-// still-open 60s window. The OLT rules key on namespace + owner_kind, NOT the
-// Deployment name, so every scenario's rule still matches under its own name.
-func scenarioWorkloadName(scenarioID string) string {
-	return "scenario-" + scenarioID
 }
 
 // loadScenarioSmokeTarget reads a harness target.yaml from the committed tree
@@ -104,11 +88,6 @@ func loadScenarioSmokeTarget(t *testing.T, scenarioID string) scenarioSmokeTarge
 	}
 	return tgt
 }
-
-// realAttackScenarios are driven by the real in-cluster attack (Story 11.2a).
-// S4 and S5 are not yet: they need attacker-side sink / pool infrastructure
-// (Story 11.2b, #192) and still inject synthetic events.
-var realAttackScenarios = map[string]bool{"s1": true, "s2": true, "s3": true}
 
 // correlatorWindow is the chart default correlator.windowDuration (60s),
 // which the RS install does not override. A real Falco alert opens an
@@ -199,62 +178,6 @@ func runRealAttack(t *testing.T, tgt scenarioSmokeTarget) (scenarioCounterSnapsh
 	return before, cleanup
 }
 
-// injectScenario fires scenario scenarioID's deterministic synthetic-event
-// stimulus against the warmed cluster (BI-3) and returns the counter snapshot
-// captured immediately BEFORE the rule-match events were published, so the
-// caller can assert a per-scenario DELTA (the deviation/evidence counters are
-// cumulative + shared across the sequential subtests). The event recipes come
-// from the SINGLE SOURCE OF TRUTH evalscenario.Events (shared with
-// cmd/olaitan-eval), so the e2e injection and the in-process binary cannot
-// drift. For S4 it ALSO pre-seeds the per-workload baseline with the rs_smoke
-// 10-priming-plus-1-spike EvidencePackage pattern so the outbound_unique_dst_ips
-// deviation half can fire (BI-4) BEFORE the rule-match events are published; the
-// snapshot is taken BEFORE the pre-seed so the pre-seed spike's deviation (the
-// one S4 actually relies on per BI-4) lands INSIDE the per-scenario delta rather
-// than being folded into `before` and leaving the deviation half inert. All
-// recipe events share one injection
-// timestamp so the correlator's 60s window cannot straddle a boundary (the
-// rs_smoke precedent).
-func injectScenario(t *testing.T, js jetstream.JetStream, scenarioID, podName, deployName string) scenarioCounterSnapshot {
-	t.Helper()
-	if _, ok := scenarioSmokeSlugs[scenarioID]; !ok {
-		t.Fatalf("injectScenario: unknown scenario %q", scenarioID)
-	}
-	// Review round 3 (C8): S1-S3 are REAL in-cluster attacks (Story 11.2a) and
-	// must never regress to synthetic NATS injection; refuse them here so a
-	// future caller cannot quietly re-fabricate their events.
-	if realAttackScenarios[scenarioID] {
-		t.Fatalf("injectScenario must not be used for real-attack scenario %q (Story 11.2a); drive it through runRealAttack", scenarioID)
-	}
-	// Snapshot the cumulative counters BEFORE any of this scenario's stimuli
-	// (including the S4 baseline pre-seed) so the per-scenario delta captures
-	// every signal THIS scenario produces. For S4 the deviation it relies on
-	// (BI-4) is fired by the pre-seed spike itself, so the snapshot must precede
-	// the pre-seed or that deviation would be folded into `before` and the delta
-	// would be inert.
-	before := snapshotScenarioCounters(t, loadScenarioSmokeTarget(t, scenarioID))
-	// S4 rests partly on a baseline deviation: pre-seed the per-workload
-	// baseline so outbound_unique_dst_ips crosses 3 sigma and let the baseline
-	// consumer drain BEFORE the rule-match flow events arrive (BI-4).
-	if evalscenario.BaselinePreseed(scenarioID) {
-		// The pre-seed Welford history MUST land on the SAME workload key the
-		// scenario's rule-match/trigger packages use, so it carries the
-		// scenario's own Deployment name (owner_name) rather than the rs_smoke
-		// default `web` -- otherwise the primed baseline and the live deviation
-		// would split across two keys and the deviation half would never fire.
-		publishSyntheticEvidencePackagesFor(t, js, podName, deployName)
-		waitForBaselineConsumerDrained(t, js)
-	}
-	events := evalscenario.Events(scenarioID, podName, time.Now().UTC())
-	if len(events) == 0 {
-		t.Fatalf("injectScenario: no recipe events for scenario %q", scenarioID)
-	}
-	for _, ev := range events {
-		publishJS(t, js, ev.Subject, ev.Payload)
-	}
-	return before
-}
-
 // smokePollCeiling caps the per-scenario smoke poll budget. The EVIDENCE-
 // package signal arrives near-instantly on kind; a scenario's full
 // target_time_to_detect_seconds window (up to S4=300s) is the Story-5.4 /
@@ -299,6 +222,25 @@ func snapshotScenarioCounters(t *testing.T, tgt scenarioSmokeTarget) scenarioCou
 	}
 }
 
+// scenarioNeedsCalicoFlows reports whether a scenario is detected through the
+// Calico Goldmane CNI flow path (S4 C2 beaconing, S5 cryptomining). Those
+// flows exist only on a Calico-enabled cluster; on plain kindnet the real
+// attack still runs and reverses, but no flow record is produced to detect.
+func scenarioNeedsCalicoFlows(scenarioID string) bool {
+	return scenarioID == "s4" || scenarioID == "s5"
+}
+
+// calicoFlowsAvailable reports whether the cluster runs Calico with the
+// Goldmane flow collector, i.e. whether the CNI flow path that S4/S5 detection
+// depends on can emit flow records at all. It checks for the calico-system
+// namespace (the Tigera operator install); absent it, kindnet is the CNI and
+// no Goldmane flow is produced.
+func calicoFlowsAvailable(t *testing.T) bool {
+	t.Helper()
+	out := kubectl(t, "get", "namespace", "calico-system", "--ignore-not-found", "-o", "name")
+	return strings.TrimSpace(out) != ""
+}
+
 // assertScenarioSignal polls the aggregator's Prometheus surface until AT
 // LEAST ONE of the scenario's triggering rules matches OR a baseline deviation
 // fires, AND (when requireFreshPackage is true) a correlator EvidencePackage
@@ -323,18 +265,21 @@ func snapshotScenarioCounters(t *testing.T, tgt scenarioSmokeTarget) scenarioCou
 // It returns nil on success and the last error on timeout.
 func assertScenarioSignal(t *testing.T, tgt scenarioSmokeTarget, before scenarioCounterSnapshot, requireFreshPackage bool) error {
 	t.Helper()
+	// Flow-detected scenarios (S4/S5) go through Calico Goldmane, whose ~15s
+	// aggregation window plus the 60s correlator window can legitimately land
+	// a real detection past the 90s smoke ceiling; let them poll their own
+	// target budget so the smoke is never stricter than the scenario contract
+	// it enforces (Story 11.2b, D-PLATFORM/CI). Other scenarios keep the
+	// proven 90s cap.
 	budget := time.Duration(tgt.TargetTimeToDetectSeconds) * time.Second
-	if budget > smokePollCeiling {
+	if !scenarioNeedsCalicoFlows(tgt.ScenarioID) && budget > smokePollCeiling {
 		budget = smokePollCeiling
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
-	// Review round 3 (C8): only a scenario that genuinely rests on a baseline
-	// deviation (S4 C2-beaconing, the one BaselinePreseed scenario) may pass on
-	// the GLOBAL baseline-deviation delta. Every other scenario -- all the real
-	// in-cluster attacks (S1-S3) and S5 -- MUST show its OWN rule-match delta, so
-	// an unrelated deviation elsewhere on the cluster cannot pass it.
-	allowDeviation := evalscenario.BaselinePreseed(tgt.ScenarioID)
+	// Story 11.2b (D-S4-BASELINE): the synthetic baseline pre-seed is retired,
+	// so EVERY scenario must now show its OWN rule-match delta. A global
+	// baseline deviation elsewhere on the cluster never passes a scenario.
 	var lastErr error
 	tick := 0
 	for {
@@ -358,14 +303,12 @@ func assertScenarioSignal(t *testing.T, tgt scenarioSmokeTarget, before scenario
 		// delta reached the bus. The idempotency repeat passes
 		// requireFreshPackage=false because the correlator legitimately
 		// coalesces a same-workload repeat (see the helper doc comment).
-		redetected := ruleMatches >= 1 || (allowDeviation && deviations >= 1)
+		redetected := ruleMatches >= 1
 		freshPackage := !requireFreshPackage || evidence >= 1
 		if redetected && freshPackage {
 			return nil
 		}
 		switch {
-		case !redetected && allowDeviation:
-			lastErr = fmt.Errorf("no rule-match delta for %v and no baseline-deviation delta yet", tgt.TriggeringRules)
 		case !redetected:
 			lastErr = fmt.Errorf("no own rule-match delta for %v yet (a global baseline deviation does not pass a real-attack scenario)", tgt.TriggeringRules)
 		case !freshPackage:
@@ -414,21 +357,12 @@ func TestKindSmoke_Scenarios_S1toS5_ReachEvidence(t *testing.T) {
 	requireKindCluster(t)
 	waitForPodsReady(t)
 
-	// S4 and S5 each get their OWN synthetic Deployment in tenant-acme so the
-	// correlator's rising-edge `fired` flag (keyed on workloadID =
-	// tenant-acme/Deployment/<name>) is independent per scenario (Review
-	// Round 2, CI-caught). They are created on the parent test so a finishing
-	// subtest's namespace-teardown cleanup cannot delete a later subtest's
-	// workload. S1-S3 apply their own real Story 11.1 target (tenant-acme/web)
-	// through the executor and delete it again; each fires a different chart
-	// Falco rule, so each opens its own investigation on that workload.
+	// Every scenario applies its own real Story 11.1 target (tenant-acme/web)
+	// through the executor and deletes it again; S1-S3 (Story 11.2a) and now
+	// S4-S5 (Story 11.2b) each fire a different chart rule, so each opens its
+	// own investigation on that workload. No scenario injects synthetic NATS
+	// events any more.
 	scenarioIDs := []string{"s1", "s2", "s3", "s4", "s5"}
-	pods := map[string]string{}
-	for _, scenarioID := range scenarioIDs {
-		if !realAttackScenarios[scenarioID] {
-			pods[scenarioID] = applyScenarioWorkload(t, scenarioWorkloadName(scenarioID))
-		}
-	}
 
 	js := connectScenarioJS(t)
 
@@ -436,13 +370,20 @@ func TestKindSmoke_Scenarios_S1toS5_ReachEvidence(t *testing.T) {
 		scenarioID := scenarioID
 		t.Run(scenarioID, func(t *testing.T) {
 			tgt := loadScenarioSmokeTarget(t, scenarioID)
-			var before scenarioCounterSnapshot
-			if realAttackScenarios[scenarioID] {
-				var cleanup func()
-				before, cleanup = runRealAttack(t, tgt)
-				defer cleanup()
-			} else {
-				before = injectScenario(t, js, scenarioID, pods[scenarioID], scenarioWorkloadName(scenarioID))
+			// Every scenario S1-S5 is a REAL in-cluster attack through
+			// internal/eval/attack (Story 11.2a for S1-S3; Story 11.2b adds
+			// S4's beacon-to-sink and S5's miner + stratum-pool connection).
+			before, cleanup := runRealAttack(t, tgt)
+			defer cleanup()
+			// S4/S5 detect through the Calico Goldmane CNI flow path, which a
+			// plain-kindnet smoke cluster does not run. The real attack still
+			// executes and reverses here (exercising the executor + cleanup),
+			// but the flow-based detection assertion is the reserved live gate
+			// on a Calico-capable cluster (kind+Calico / full profile /
+			// kubeadm). Skip it when Goldmane is absent rather than fail a
+			// signal the cluster cannot physically produce.
+			if scenarioNeedsCalicoFlows(scenarioID) && !calicoFlowsAvailable(t) {
+				t.Skipf("scenario %s detects via Calico Goldmane flows; this cluster has no Calico - the real attack ran and reversed, detection is asserted on the Calico live gate", scenarioID)
 			}
 			// PRIMARY AC8 pin: a first detection MUST emit a fresh EVIDENCE
 			// package (requireFreshPackage = true). This is the full-signal

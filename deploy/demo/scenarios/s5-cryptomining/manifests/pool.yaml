@@ -1,0 +1,50 @@
+# S5 in-cluster fake stratum pool (Story 11.2b). The ONLY destination the
+# miner connects to, so nothing leaves the cluster (AC2). A busybox TCP
+# listener on the stratum miner port 3333: the real pod->pool flow Goldmane
+# records trips OLT-IMPACT-006 (stratum-port match) through the CNI path.
+# Pinned by tag AND digest (Story 12.6). The Namespace is declared here too so
+# this manifest applies cleanly before the workload manifest.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-acme
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s5-stratum-pool
+  namespace: tenant-acme
+  labels:
+    olaitan.scenario: s5-cryptomining
+    app: s5-stratum-pool
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: s5-stratum-pool
+  template:
+    metadata:
+      labels:
+        app: s5-stratum-pool
+    spec:
+      containers:
+        - name: pool
+          image: busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+          command: ["/bin/sh", "-c", "while true; do nc -l -p 3333 -w 2 >/dev/null 2>&1 || sleep 1; done"]
+          ports:
+            - containerPort: 3333
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s5-stratum-pool
+  namespace: tenant-acme
+  labels:
+    olaitan.scenario: s5-cryptomining
+spec:
+  selector:
+    app: s5-stratum-pool
+  ports:
+    - port: 3333
+      targetPort: 3333
+      protocol: TCP
