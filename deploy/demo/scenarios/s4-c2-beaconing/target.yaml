@@ -10,6 +10,21 @@ mitre_technique: T1071
 target_fsm_state: SUSPICIOUS
 target_time_to_detect_seconds: 300
 floor: true
+# Story 11.2b: the real S4 beacon goes to an IN-CLUSTER sink (a Calico
+# WorkloadEndpoint, AC2), so it trips OLT-NET-002 (C2 destination port) only.
+# OLT-NET-001 now keys on a PUBLIC destination (dest_type=network/dest_name=pub)
+# the in-cluster sink is not, by design, so it is no longer an S4 detector.
 triggering_rules:
-  - OLT-NET-001
   - OLT-NET-002
+
+# Story 11.2b (AC4): the real in-cluster primitives the runner executes,
+# mapped to their MITRE ATT&CK for Containers ID(s). Cited from the repo rule
+# corpus (OLT-NET-001/OLT-NET-002 both tag T1071; OLT-NET-002 is T1071.001
+# Web Protocols) and the ATT&CK for Containers matrix. No egress leaves the
+# cluster: the beacon flows go to the in-cluster sink 11.2b stands up.
+attack_steps:
+  - id: c2-beacon-flows
+    mitre:
+      - T1071        # Application Layer Protocol (C2 beaconing)
+      - T1071.001    # Web Protocols (the 8443 beacon port)
+    primitive: small periodic outbound TCP flows from the tenant pod to the in-cluster C2 sink on a web-looking port
