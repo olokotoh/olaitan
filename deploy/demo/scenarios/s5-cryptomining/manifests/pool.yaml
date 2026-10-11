@@ -30,7 +30,7 @@ spec:
       containers:
         - name: pool
           image: busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
-          command: ["/bin/sh", "-c", "while true; do nc -l -p 3333 -w 2 >/dev/null 2>&1 || sleep 1; done"]
+          command: ["/bin/sh", "-c", "while true; do nc -l -p 3333 >/dev/null 2>&1 || true; done"]
           ports:
             - containerPort: 3333
 ---
