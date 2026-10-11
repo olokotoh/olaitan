@@ -3,7 +3,8 @@
 #
 # A tenant Deployment NOT labelled as a crypto workload. OLT-IMPACT-005 fires
 # on an xmrig/minerd/cpuminer-style process launch in a Deployment-owned
-# tenant pod with outbound traffic to a mining-pool port (3333/4444/5555);
+# tenant pod (the process half, matched on the real Falco execve alone since
+# Story 11.2b; the pool-connection half is OLT-IMPACT-006 on the CNI flow);
 # OLT-IMPACT-006 fires on an outbound TCP flow to a stratum pool port
 # (3333/4444/5555/7777/14444) with WARNING severity from a tenant pod. The
 # workload is a Deployment in a tenant-* namespace so the rules'

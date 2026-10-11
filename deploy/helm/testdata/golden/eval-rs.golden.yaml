@@ -1526,7 +1526,10 @@ data:
       `network` named `pub` (Calico's label for public, non-cluster
       destinations). Flows to in-cluster workload endpoints are therefore
       NOT matched by this rule by design; port-association beaconing to a
-      C2-favoured port is covered by OLT-NET-002.
+      C2-favoured port is covered by OLT-NET-002. The small-payload clause
+      (bytes_out under 1000, the projected per-window Goldmane counter) keeps
+      the rule a beacon signature rather than firing on every public egress
+      (DNS, API calls); FPR tuning of this bound is Story 11.5's job.
     status: experimental
     attack:
       - T1071
@@ -1539,13 +1542,16 @@ data:
         network.dest_name: 'pub'
       tenant_namespace:
         k8s.pod.namespace|startswith: 'tenant-'
-      condition: outbound_flow and public_destination and tenant_namespace
+      small_payload:
+        network.bytes_out|re: '^[0-9]{1,3}$'
+      condition: outbound_flow and public_destination and tenant_namespace and small_payload
     falsepositives:
       - DNS probes to public resolvers such as 8.8.8.8 or 1.1.1.1; allowlist via a dedicated outbound NetworkPolicy
       - Health check pings to cloud SaaS endpoints; allowlist via a FQDN resolved CIDR set
     fields:
       - network.dest_type
       - network.dest_name
+      - network.bytes_out
       - k8s.pod.namespace
     
   OLT-NET-002.yaml: |

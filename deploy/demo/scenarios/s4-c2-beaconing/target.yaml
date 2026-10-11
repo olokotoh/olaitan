@@ -20,8 +20,9 @@ triggering_rules:
 # Story 11.2b (AC4): the real in-cluster primitives the runner executes,
 # mapped to their MITRE ATT&CK for Containers ID(s). Cited from the repo rule
 # corpus (OLT-NET-001/OLT-NET-002 both tag T1071; OLT-NET-002 is T1071.001
-# Web Protocols) and the ATT&CK for Containers matrix. No egress leaves the
-# cluster: the beacon flows go to the in-cluster sink 11.2b stands up.
+# Web Protocols) -- T1071 is the Enterprise ATT&CK C2 technique the rules
+# carry (not on the Containers matrix). No egress leaves the cluster: the
+# beacon flows go to the in-cluster sink 11.2b stands up.
 attack_steps:
   - id: c2-beacon-flows
     mitre:

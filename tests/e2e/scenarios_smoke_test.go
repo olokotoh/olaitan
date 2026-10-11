@@ -230,15 +230,18 @@ func scenarioNeedsCalicoFlows(scenarioID string) bool {
 	return scenarioID == "s4" || scenarioID == "s5"
 }
 
-// calicoFlowsAvailable reports whether the cluster runs Calico with the
-// Goldmane flow collector, i.e. whether the CNI flow path that S4/S5 detection
-// depends on can emit flow records at all. It checks for the calico-system
-// namespace (the Tigera operator install); absent it, kindnet is the CNI and
-// no Goldmane flow is produced.
+// calicoFlowsAvailable reports whether the cluster runs the Calico Goldmane
+// flow collector, i.e. whether the CNI flow path that S4/S5 detection depends
+// on can emit flow records at all. It probes for the Goldmane (or Whisker)
+// Deployment itself rather than the calico-system namespace, so a Calico
+// cluster with flow export disabled, or Calico installed by manifest outside
+// calico-system, is classified by the component that actually matters
+// (review round 1, Edge Case Hunter). Absent it, kindnet is the CNI and no
+// Goldmane flow is produced, so S4/S5 detection is skipped.
 func calicoFlowsAvailable(t *testing.T) bool {
 	t.Helper()
-	out := kubectl(t, "get", "namespace", "calico-system", "--ignore-not-found", "-o", "name")
-	return strings.TrimSpace(out) != ""
+	out := kubectl(t, "get", "deploy", "-A", "-o", "name")
+	return strings.Contains(out, "goldmane") || strings.Contains(out, "whisker")
 }
 
 // assertScenarioSignal polls the aggregator's Prometheus surface until AT
