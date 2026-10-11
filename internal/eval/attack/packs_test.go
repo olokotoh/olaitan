@@ -2,9 +2,13 @@ package attack
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -234,5 +238,72 @@ func TestPackRunner_UnknownTechnique(t *testing.T) {
 	}
 	if len(rec.calls) != 0 {
 		t.Errorf("unknown technique issued %d kubectl calls, want 0: %v", len(rec.calls), rec.calls)
+	}
+}
+
+// stratusCatalogue is the committed Stratus citation fixture (D6).
+type stratusCatalogue struct {
+	Version    string `json:"version"`
+	Techniques map[string]struct {
+		Tactics     []string `json:"tactics"`
+		TechniqueID string   `json:"technique_id"`
+	} `json:"techniques"`
+}
+
+// TestStratusMitreMatchesCatalogue is the offline contract test for the
+// Stratus pack (D6, Murat): it holds the Go table in agreement with the
+// citation fixture extracted from the pinned Stratus docs, so a Stratus
+// version bump that re-tactics a technique or renames one fails HERE rather
+// than drifting silently. It is the anti-tautology check - the table is
+// asserted against the EXTERNAL tool's advertised mapping, not itself.
+func TestStratusMitreMatchesCatalogue(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller(0) failed")
+	}
+	path := filepath.Join(filepath.Dir(thisFile), "testdata", "stratus-catalogue-v2.37.0.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read stratus catalogue fixture: %v", err)
+	}
+	var cat stratusCatalogue
+	if err := json.Unmarshal(data, &cat); err != nil {
+		t.Fatalf("unmarshal stratus catalogue: %v", err)
+	}
+	if cat.Version != StratusVersion {
+		t.Fatalf("fixture version %q != StratusVersion %q; the citation pin drifted", cat.Version, StratusVersion)
+	}
+
+	techs := StratusTechniques()
+	for _, tc := range techs {
+		entry, ok := cat.Techniques[tc.ID]
+		if !ok {
+			t.Errorf("%q: not in the pinned Stratus catalogue fixture; cite it from the pinned docs or remove it", tc.ID)
+			continue
+		}
+		if tc.MitreTechniqueID != entry.TechniqueID {
+			t.Errorf("%q: MitreTechniqueID = %q, catalogue says %q (cite, do not mint - AC3)", tc.ID, tc.MitreTechniqueID, entry.TechniqueID)
+		}
+		if len(tc.MitreTactics) != len(entry.Tactics) {
+			t.Errorf("%q: %d tactics, catalogue has %d (%v vs %v)", tc.ID, len(tc.MitreTactics), len(entry.Tactics), tc.MitreTactics, entry.Tactics)
+			continue
+		}
+		for i := range tc.MitreTactics {
+			if tc.MitreTactics[i] != entry.Tactics[i] {
+				t.Errorf("%q: tactic[%d] = %q, catalogue says %q", tc.ID, i, tc.MitreTactics[i], entry.Tactics[i])
+			}
+		}
+	}
+
+	// And every catalogue technique must be represented in the table (no
+	// silent drop): the fixture and the curated set are the same universe.
+	table := map[string]bool{}
+	for _, tc := range techs {
+		table[tc.ID] = true
+	}
+	for id := range cat.Techniques {
+		if !table[id] {
+			t.Errorf("catalogue technique %q is not in the curated Stratus table", id)
+		}
 	}
 }

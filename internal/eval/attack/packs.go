@@ -143,6 +143,12 @@ func (t Technique) validate() error {
 	return nil
 }
 
+// StratusVersion is the Stratus Red Team release the technique IDs and MITRE
+// citations are taken from (and the wrapper image builds, deploy/images/
+// stratus). The contract fixture testdata/stratus-catalogue-v2.37.0.json is
+// extracted from this version's docs.
+const StratusVersion = "v2.37.0"
+
 // stratusTechniques is the curated Stratus Red Team subset (D5): each entry is
 // bound to an organ Olaitan actually has, and its MITRE mapping is cited from
 // the tool's own source docs (DataDog/stratus-red-team/docs/attack-techniques/
@@ -183,7 +189,7 @@ var stratusTechniques = []Technique{
 		ID:               "k8s.privilege-escalation.hostpath-volume",
 		Pack:             PackStratus,
 		MitreTactics:     []string{"Privilege Escalation"},
-		MitreTechniqueID: "T1611", // Escape to Host - the ONE k8s technique Stratus pins to a T-number
+		MitreTechniqueID: "T1611", // Escape to Host - cited from this technique's References in the v2.37.0 doc (its structured Mappings list the tactic only); the one Stratus k8s technique that references a T-number
 		Organ:            OrganAudit,
 		ExpectOLT:        "",
 		Privileged:       true, // restricted PSA rejects hostPath (D10)
