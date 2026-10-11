@@ -1,8 +1,13 @@
 package attack
 
 import (
+	"context"
+	"errors"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestTechniqueValidate_RejectsBadShapes proves the validator itself fails on
@@ -113,5 +118,121 @@ func TestStratusTechniques_MitreCitedNotMinted(t *testing.T) {
 		if tc.MitreTechniqueID != want {
 			t.Errorf("%q: MitreTechniqueID = %q, want %q (cited from the tool, not minted - AC3)", tc.ID, tc.MitreTechniqueID, want)
 		}
+	}
+}
+
+// cmdRecorder is a fake RunFunc that records every kubectl invocation (in
+// order) and can be told to fail a specific one, keyed by the space-joined
+// args after the binary name. It is how the pack tests prove command
+// construction and revert ordering WITHOUT a cluster.
+type cmdRecorder struct {
+	calls [][]string
+	fail  map[string]error
+}
+
+func (r *cmdRecorder) run(_ context.Context, name string, args ...string) (string, error) {
+	full := append([]string{name}, args...)
+	r.calls = append(r.calls, full)
+	return "", r.fail[strings.Join(args, " ")]
+}
+
+// indexOf returns the index of the first recorded call whose args contain all
+// of needles in order of first appearance, or -1. Good enough to assert "the
+// delete ran after the apply" without pinning the exact argv twice.
+func (r *cmdRecorder) indexOf(needles ...string) int {
+	for i, c := range r.calls {
+		joined := strings.Join(c, " ")
+		ok := true
+		for _, n := range needles {
+			if !strings.Contains(joined, n) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return i
+		}
+	}
+	return -1
+}
+
+// newTestStratusRunner builds a PackRunner over the real Stratus table but
+// with a deterministic namespace and a stub renderer, so Detonate is exercised
+// end to end against the recorder.
+func newTestStratusRunner(t *testing.T, rec *cmdRecorder) *PackRunner {
+	t.Helper()
+	p, err := NewPackRunner(PackStratus, rec.run, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("NewPackRunner: %v", err)
+	}
+	p.newRunID = func() string { return "test" }
+	p.waitTimeout = time.Second
+	p.renderJob = func(_ Technique, ns string) (string, error) { return "/fake/" + ns + "/job.yaml", nil }
+	return p
+}
+
+// TestPackRunner_DetonateHappyPath asserts the exact kubectl sequence for a
+// clean run: create namespace, apply the pinned Job, wait for completion, then
+// delete the namespace (the guaranteed teardown).
+func TestPackRunner_DetonateHappyPath(t *testing.T) {
+	rec := &cmdRecorder{}
+	p := newTestStratusRunner(t, rec)
+
+	if err := p.Detonate(context.Background(), "k8s.credential-access.dump-secrets"); err != nil {
+		t.Fatalf("Detonate() = %v, want nil", err)
+	}
+	create := rec.indexOf("create", "namespace", "olt-pack-test")
+	apply := rec.indexOf("apply", "-n", "olt-pack-test", "-f")
+	wait := rec.indexOf("wait", "olt-pack-test", "--for=condition=complete")
+	del := rec.indexOf("delete", "namespace", "olt-pack-test")
+	if create < 0 || apply < 0 || wait < 0 || del < 0 {
+		t.Fatalf("missing a step: create=%d apply=%d wait=%d delete=%d\ncalls=%v", create, apply, wait, del, rec.calls)
+	}
+	if !(create < apply && apply < wait && wait < del) {
+		t.Errorf("steps out of order: create=%d apply=%d wait=%d delete=%d", create, apply, wait, del)
+	}
+}
+
+// TestPackRunner_RevertAlwaysRuns is THE safety test (Amelia: write it first):
+// when detonation fails, the namespace is still deleted, and when the revert
+// ALSO fails the returned error wraps both failures.
+func TestPackRunner_RevertAlwaysRuns(t *testing.T) {
+	// (a) detonate fails at apply -> revert (delete) still runs.
+	rec := &cmdRecorder{fail: map[string]error{
+		"apply -n olt-pack-test -f /fake/olt-pack-test/job.yaml": errors.New("boom-apply"),
+	}}
+	p := newTestStratusRunner(t, rec)
+	err := p.Detonate(context.Background(), "k8s.credential-access.dump-secrets")
+	if err == nil || !strings.Contains(err.Error(), "boom-apply") {
+		t.Fatalf("Detonate() = %v, want an error wrapping boom-apply", err)
+	}
+	if rec.indexOf("delete", "namespace", "olt-pack-test") < 0 {
+		t.Errorf("revert did not run after a failed detonation; calls=%v", rec.calls)
+	}
+
+	// (b) both detonate AND revert fail -> error wraps both.
+	rec2 := &cmdRecorder{fail: map[string]error{
+		"apply -n olt-pack-test -f /fake/olt-pack-test/job.yaml":        errors.New("boom-apply"),
+		"delete namespace olt-pack-test --ignore-not-found --wait=true": errors.New("boom-revert"),
+	}}
+	p2 := newTestStratusRunner(t, rec2)
+	err2 := p2.Detonate(context.Background(), "k8s.credential-access.dump-secrets")
+	if err2 == nil || !strings.Contains(err2.Error(), "boom-apply") || !strings.Contains(err2.Error(), "boom-revert") {
+		t.Fatalf("Detonate() = %v, want an error wrapping BOTH boom-apply and boom-revert", err2)
+	}
+}
+
+// TestPackRunner_UnknownTechnique proves an unknown technique returns before
+// anything is created on the cluster (the defer never registers, so no stray
+// namespace to clean up).
+func TestPackRunner_UnknownTechnique(t *testing.T) {
+	rec := &cmdRecorder{}
+	p := newTestStratusRunner(t, rec)
+	err := p.Detonate(context.Background(), "k8s.not-a-real-technique")
+	if err == nil || !strings.Contains(err.Error(), "unknown technique") {
+		t.Fatalf("Detonate() = %v, want an unknown-technique error", err)
+	}
+	if len(rec.calls) != 0 {
+		t.Errorf("unknown technique issued %d kubectl calls, want 0: %v", len(rec.calls), rec.calls)
 	}
 }
