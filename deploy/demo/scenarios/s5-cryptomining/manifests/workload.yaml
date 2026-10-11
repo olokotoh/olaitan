@@ -6,7 +6,7 @@
 # tenant pod (the process half, matched on the real Falco execve alone since
 # Story 11.2b; the pool-connection half is OLT-IMPACT-006 on the CNI flow);
 # OLT-IMPACT-006 fires on an outbound TCP flow to a stratum pool port
-# (3333/4444/5555/7777/14444) with WARNING severity from a tenant pod. The
+# (3333/4444/5555/7777/14444) from a tenant pod (no severity; Goldmane emits none). The
 # workload is a Deployment in a tenant-* namespace so the rules'
 # k8s_context / tenant_namespace clauses match; the absence of an
 # app.kubernetes.io/component=crypto label keeps the false-positive allowlist
