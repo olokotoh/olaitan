@@ -443,12 +443,17 @@ const packRevertTimeout = 90 * time.Second
 // jobPollInterval is how often waitForJob polls the Job status.
 const jobPollInterval = 3 * time.Second
 
-// waitForJob polls the per-run namespace's Job(s) until one completes or FAILS,
+// waitForJob polls the per-run namespace's Job until it completes or FAILS,
 // instead of `kubectl wait --for=condition=complete`, which never matches a
-// Failed Job and would therefore burn the full timeout on any in-pod failure or
-// ImagePullBackOff (review round 1, Edge Case Hunter). A failed Job returns
-// immediately with its status, so the real cause surfaces fast rather than as a
-// generic timeout.
+// Failed Job and would therefore burn the full timeout on an in-pod non-zero
+// exit (review round 1, Edge Case Hunter). With the pack Job's backoffLimit:0 +
+// restartPolicy:Never a failed pod is terminal, so status.failed is set and the
+// real cause surfaces immediately rather than as a generic timeout. (A pull
+// that merely stalls keeps the pod Pending with neither count set and is still
+// bounded by the timeout - this fast-paths an actual Failed Job, not every
+// slow start.) It assumes one Job per pack namespace, which is what the
+// committed templates deploy; {.items[*]} would sum several if a future
+// template deployed more.
 func (p *PackRunner) waitForJob(ctx context.Context, ns string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
