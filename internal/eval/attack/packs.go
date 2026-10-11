@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -54,6 +55,43 @@ const (
 // empty MitreTechniqueID is honest (the tool advertises only a tactic for most
 // Stratus k8s techniques, AC3 forbids minting a technique number it does not).
 var mitreTechniqueRE = regexp.MustCompile(`^T\d{4}(\.\d{3})?$`)
+
+// pinnedImageRE is name:tag@sha256:<64 hex>, the same shape the Story 12.6
+// chart guard enforces (deploy/helm/image_pin_test.go). It is restated here so
+// the pack code can refuse an unpinned image at its source, and so the pack
+// manifest pin-guard extension can reuse one predicate.
+var pinnedImageRE = regexp.MustCompile(
+	`^(?:[a-zA-Z0-9.-]+(?::[0-9]+)?/)?[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*` +
+		`:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}` +
+		`@sha256:[a-f0-9]{64}$`)
+
+// imagePinShape returns "" for a tag@sha256-pinned reference and a reason
+// otherwise (AC2). It rejects :latest and a digest-without-tag the same way
+// the Story 12.6 guard does.
+func imagePinShape(ref string) string {
+	name, digest, hasDigest := strings.Cut(ref, "@")
+	tag := ""
+	if i := strings.LastIndex(name, ":"); i > strings.LastIndex(name, "/") {
+		tag = name[i+1:]
+	}
+	switch {
+	case ref == "":
+		return "empty image reference"
+	case tag == "" && !hasDigest:
+		return "untagged (resolves to :latest)"
+	case tag == "":
+		return "digest without a tag (nobody can tell what the digest is meant to be)"
+	case tag == "latest":
+		return ":latest is not a version"
+	case !hasDigest:
+		return "tag without a digest (a tag can be re-pushed)"
+	case !regexp.MustCompile(`^sha256:[a-f0-9]{64}$`).MatchString(digest):
+		return "malformed digest (want sha256:<64 lowercase hex>)"
+	case !pinnedImageRE.MatchString(ref):
+		return "not a valid name:tag@sha256 reference"
+	}
+	return ""
+}
 
 // Technique is one attack primitive from a third-party pack, bound to the
 // Olaitan sensor organ it exercises (D5) and carrying the MITRE mapping CITED
@@ -176,6 +214,8 @@ func techniquesFor(pack PackID) []Technique {
 	switch pack {
 	case PackStratus:
 		return StratusTechniques()
+	case PackFalcoEventGen:
+		return EventGenTechniques()
 	default:
 		return nil
 	}

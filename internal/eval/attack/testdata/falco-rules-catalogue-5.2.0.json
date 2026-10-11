@@ -1,0 +1,19 @@
+{
+  "_comment": "Story 11.2c D6/AC3 citation source: the MITRE mapping for each event-generator syscall action, extracted VERBATIM from the pinned Falco rules package. Regenerate ONLY by re-extracting from the pinned version below; do not hand-edit the mappings. TestEventGenMitreMatchesFalcoCatalogue holds internal/eval/attack/packs_eventgen.go in agreement with this file, so a rules bump that renames a rule or re-tags a technique fails CI here.",
+  "source": "falcosecurity/rules",
+  "version": "falco-rules-5.2.0",
+  "retrieved": "2026-10-11",
+  "url": "https://raw.githubusercontent.com/falcosecurity/rules/falco-rules-5.2.0/rules/falco_rules.yaml",
+  "actions": {
+    "syscall.ReadSensitiveFileUntrusted": {
+      "falco_rule": "Read sensitive file untrusted",
+      "tactics": ["Credential Access"],
+      "technique_id": "T1555"
+    },
+    "syscall.SearchPrivateKeysOrPasswords": {
+      "falco_rule": "Search Private Keys or Passwords",
+      "tactics": ["Credential Access"],
+      "technique_id": "T1552.001"
+    }
+  }
+}
