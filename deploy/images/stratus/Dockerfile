@@ -25,7 +25,7 @@ WORKDIR /out
 # wget (busybox) fetches the exact release asset; sha256sum -c fails the build
 # if the download does not match the checked-in checksum.
 RUN set -eux; \
-    wget -q -O stratus.tar.gz \
+    wget -q --tries=3 --timeout=30 -O stratus.tar.gz \
       "https://github.com/DataDog/stratus-red-team/releases/download/${STRATUS_VERSION}/stratus-red-team_Linux_x86_64.tar.gz"; \
     echo "${STRATUS_SHA256}  stratus.tar.gz" | sha256sum -c -; \
     tar -xzf stratus.tar.gz stratus; \

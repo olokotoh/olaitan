@@ -17,6 +17,8 @@ package attack
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -168,8 +170,12 @@ var stratusTechniques = []Technique{
 		ID:           "k8s.credential-access.steal-serviceaccount-token",
 		Pack:         PackStratus,
 		MitreTactics: []string{"Credential Access"},
-		Organ:        OrganAudit, // reads the projected SA token; API access audited
-		ExpectOLT:    "",
+		Organ:        OrganFalco, // reads the projected SA token OFF DISK inside a pod -> Falco
+		// The one technique with an honest keyed OLT expectation: OLT-CRED-001
+		// fires on a projected-SA-token read by a non-system process, which is
+		// exactly this technique. The live gate confirms it fires (and a
+		// non-firing is a real finding, not a silent pass).
+		ExpectOLT: "OLT-CRED-001",
 	},
 	{
 		ID:           "k8s.persistence.create-admin-clusterrole",
@@ -258,10 +264,18 @@ func NewPackRunner(pack PackID, runCmd RunFunc, logger *slog.Logger) (*PackRunne
 	return r, nil
 }
 
-// randRunID returns a short, lowercase, DNS-label-safe unique suffix for a
-// per-run namespace.
+// randRunID returns a short, lowercase, DNS-label-safe GENUINELY RANDOM suffix
+// for a per-run namespace. It uses crypto/rand, not the clock: a time-derived
+// suffix can collide across fast or concurrent runs, and a collision would let
+// one run's teardown delete another run's still-live namespace (review round 1,
+// Edge Case Hunter). On the vanishingly unlikely rand failure it falls back to
+// the nanosecond clock so a run never blocks on entropy.
 func randRunID() string {
-	return fmt.Sprintf("%08x", time.Now().UnixNano()&0xffffffff)
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%012x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // PackRunner detonates a pack's technique through the 11.2a RunFunc seam and
@@ -374,12 +388,16 @@ func (p *PackRunner) Detonate(ctx context.Context, techID string) (err error) {
 	ns := fmt.Sprintf("olt-pack-%s", p.newRunID())
 
 	// Guaranteed teardown. Registered only after the technique is known, so an
-	// unknown technique creates nothing. Uses context.WithoutCancel so a
-	// cancelled or timed-out detonation still reverts rather than leaking
-	// attack infrastructure on the cluster.
+	// unknown technique creates nothing. context.WithoutCancel keeps the revert
+	// running even when the detonation context was cancelled or timed out, but
+	// it is layered with its OWN bounded timeout (+ an explicit --timeout) so a
+	// namespace stuck Terminating cannot hang the revert forever - the sibling
+	// 11.2a Cleanup pattern (review round 1, Edge Case Hunter / Blind Hunter).
 	defer func() {
-		revertCtx := context.WithoutCancel(ctx)
-		if _, rerr := p.kubectl(revertCtx, "delete", "namespace", ns, "--ignore-not-found", "--wait=true"); rerr != nil {
+		revertCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), packRevertTimeout)
+		defer cancel()
+		if _, rerr := p.kubectl(revertCtx, "delete", "namespace", ns,
+			"--ignore-not-found", "--wait=true", fmt.Sprintf("--timeout=%s", packRevertTimeout)); rerr != nil {
 			err = errors.Join(err, fmt.Errorf("revert %s: delete namespace %s: %w", t.ID, ns, rerr))
 		}
 	}()
@@ -387,11 +405,23 @@ func (p *PackRunner) Detonate(ctx context.Context, techID string) (err error) {
 	if _, cerr := p.kubectl(ctx, "create", "namespace", ns); cerr != nil {
 		return fmt.Errorf("detonate %s: create namespace %s: %w", t.ID, ns, cerr)
 	}
+	// Label the per-run namespace privileged for Pod Security Admission: the
+	// attack pods run as root (event-generator writes /etc,/bin; Stratus
+	// privileged techniques mount hostPath), which restricted PSA on a kubeadm
+	// cluster rejects (review round 1, AC5 risk). The namespace is ephemeral and
+	// torn down after the run, so the exemption is scoped to the attack, not the
+	// tenant workloads.
+	if _, lerr := p.kubectl(ctx, "label", "namespace", ns,
+		"pod-security.kubernetes.io/enforce=privileged",
+		"pod-security.kubernetes.io/warn=privileged", "--overwrite"); lerr != nil {
+		return fmt.Errorf("detonate %s: label namespace %s privileged: %w", t.ID, ns, lerr)
+	}
 
 	manifest, rerr := p.renderJob(t, ns)
 	if rerr != nil {
 		return fmt.Errorf("detonate %s: render job: %w", t.ID, rerr)
 	}
+	defer func() { _ = os.Remove(manifest) }() // the rendered temp file is local scratch, not cluster state
 	if _, aerr := p.kubectl(ctx, "apply", "-n", ns, "-f", manifest); aerr != nil {
 		return fmt.Errorf("detonate %s: apply job: %w", t.ID, aerr)
 	}
@@ -400,9 +430,43 @@ func (p *PackRunner) Detonate(ctx context.Context, techID string) (err error) {
 	if timeout <= 0 {
 		timeout = DefaultPackWaitTimeout
 	}
-	if _, werr := p.kubectl(ctx, "wait", "-n", ns, "--for=condition=complete",
-		"job", "--all", fmt.Sprintf("--timeout=%s", timeout)); werr != nil {
-		return fmt.Errorf("detonate %s: wait for job: %w", t.ID, werr)
+	if werr := p.waitForJob(ctx, ns, timeout); werr != nil {
+		return fmt.Errorf("detonate %s: %w", t.ID, werr)
 	}
 	return nil
+}
+
+// packRevertTimeout bounds the teardown so a namespace stuck Terminating
+// cannot hang the revert forever.
+const packRevertTimeout = 90 * time.Second
+
+// jobPollInterval is how often waitForJob polls the Job status.
+const jobPollInterval = 3 * time.Second
+
+// waitForJob polls the per-run namespace's Job(s) until one completes or FAILS,
+// instead of `kubectl wait --for=condition=complete`, which never matches a
+// Failed Job and would therefore burn the full timeout on any in-pod failure or
+// ImagePullBackOff (review round 1, Edge Case Hunter). A failed Job returns
+// immediately with its status, so the real cause surfaces fast rather than as a
+// generic timeout.
+func (p *PackRunner) waitForJob(ctx context.Context, ns string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		failed, _ := p.kubectl(ctx, "get", "job", "-n", ns, "-o", "jsonpath={.items[*].status.failed}")
+		if strings.ContainsAny(failed, "123456789") {
+			return fmt.Errorf("job in %s failed (status.failed=%q)", ns, failed)
+		}
+		succeeded, _ := p.kubectl(ctx, "get", "job", "-n", ns, "-o", "jsonpath={.items[*].status.succeeded}")
+		if strings.ContainsAny(succeeded, "123456789") {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after %s waiting for job completion in %s (succeeded=%q failed=%q)", timeout, ns, succeeded, failed)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(jobPollInterval):
+		}
+	}
 }

@@ -32,7 +32,7 @@ func packManifestsDir(t *testing.T) string {
 // mis-globbed path cannot make the guard vacuously pass.
 func TestPackImagesArePinned(t *testing.T) {
 	root := packManifestsDir(t)
-	matches, err := filepath.Glob(filepath.Join(root, "*", "manifests", "*.yaml"))
+	matches, err := filepath.Glob(filepath.Join(root, "*", "manifests", "*.y*ml"))
 	if err != nil {
 		t.Fatalf("glob pack manifests: %v", err)
 	}

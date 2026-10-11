@@ -166,3 +166,31 @@ func TestDefaultRenderJob_StratusDeferred(t *testing.T) {
 		t.Fatalf("renderJob(stratus) = %v, want an explicit deferral error until the wrapper image is built", err)
 	}
 }
+
+// TestImagePinShape_RejectsBadShapes proves imagePinShape fails on every bad
+// shape (not just that one good image passes), mirroring the
+// TestTechniqueValidate discipline so a green pin check is not blind.
+func TestImagePinShape_RejectsBadShapes(t *testing.T) {
+	const d = "@sha256:1cfc36e2e5e638243d8c722f72c954cd0ec4b15ee82fadbc718ce12e2b3c1652"
+	bad := map[string]string{
+		"":                                "empty",
+		"busybox":                         "untagged",
+		"busybox:1.37.0":                  "tag without a digest",
+		"busybox:latest" + d:              ":latest",
+		"busybox" + d:                     "digest without a tag",
+		"busybox:1.37.0@sha256:deadbeef":  "malformed digest",
+		"docker.io/falcosecurity/x:1" + d: "", // good: registry/path:tag@sha256
+	}
+	for ref, want := range bad {
+		got := imagePinShape(ref)
+		if want == "" {
+			if got != "" {
+				t.Errorf("imagePinShape(%q) = %q, want ok", ref, got)
+			}
+			continue
+		}
+		if !strings.Contains(got, want) {
+			t.Errorf("imagePinShape(%q) = %q, want a problem containing %q", ref, got, want)
+		}
+	}
+}

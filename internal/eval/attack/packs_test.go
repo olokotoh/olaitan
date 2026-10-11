@@ -131,13 +131,34 @@ func TestStratusTechniques_MitreCitedNotMinted(t *testing.T) {
 // construction and revert ordering WITHOUT a cluster.
 type cmdRecorder struct {
 	calls [][]string
-	fail  map[string]error
+	// fail maps a SUBSTRING of a call's joined args to the error it should
+	// return (substring so a test is not broken by an added flag).
+	fail map[string]error
+	// stdout maps a SUBSTRING of a call's joined args to canned stdout.
+	stdout map[string]string
 }
 
 func (r *cmdRecorder) run(_ context.Context, name string, args ...string) (string, error) {
 	full := append([]string{name}, args...)
 	r.calls = append(r.calls, full)
-	return "", r.fail[strings.Join(args, " ")]
+	joined := strings.Join(args, " ")
+	// Default: a `get job ... status.succeeded` poll reports one succeeded Job
+	// so waitForJob terminates; a test can override via stdout.
+	out := ""
+	if strings.Contains(joined, "status.succeeded") {
+		out = "1"
+	}
+	for sub, v := range r.stdout {
+		if strings.Contains(joined, sub) {
+			out = v
+		}
+	}
+	for sub, e := range r.fail {
+		if strings.Contains(joined, sub) {
+			return out, e
+		}
+	}
+	return out, nil
 }
 
 // indexOf returns the index of the first recorded call whose args contain all
@@ -175,9 +196,9 @@ func newTestStratusRunner(t *testing.T, rec *cmdRecorder) *PackRunner {
 	return p
 }
 
-// TestPackRunner_DetonateHappyPath asserts the exact kubectl sequence for a
-// clean run: create namespace, apply the pinned Job, wait for completion, then
-// delete the namespace (the guaranteed teardown).
+// TestPackRunner_DetonateHappyPath asserts the kubectl sequence for a clean
+// run: create namespace, label it privileged (PSA), apply the pinned Job, poll
+// the Job to completion, then delete the namespace (the guaranteed teardown).
 func TestPackRunner_DetonateHappyPath(t *testing.T) {
 	rec := &cmdRecorder{}
 	p := newTestStratusRunner(t, rec)
@@ -186,14 +207,38 @@ func TestPackRunner_DetonateHappyPath(t *testing.T) {
 		t.Fatalf("Detonate() = %v, want nil", err)
 	}
 	create := rec.indexOf("create", "namespace", "olt-pack-test")
+	label := rec.indexOf("label", "namespace", "olt-pack-test", "pod-security.kubernetes.io/enforce=privileged")
 	apply := rec.indexOf("apply", "-n", "olt-pack-test", "-f")
-	wait := rec.indexOf("wait", "olt-pack-test", "--for=condition=complete")
+	poll := rec.indexOf("get", "job", "-n", "olt-pack-test", "status.succeeded")
 	del := rec.indexOf("delete", "namespace", "olt-pack-test")
-	if create < 0 || apply < 0 || wait < 0 || del < 0 {
-		t.Fatalf("missing a step: create=%d apply=%d wait=%d delete=%d\ncalls=%v", create, apply, wait, del, rec.calls)
+	if create < 0 || label < 0 || apply < 0 || poll < 0 || del < 0 {
+		t.Fatalf("missing a step: create=%d label=%d apply=%d poll=%d delete=%d\ncalls=%v", create, label, apply, poll, del, rec.calls)
 	}
-	if create >= apply || apply >= wait || wait >= del {
-		t.Errorf("steps out of order: create=%d apply=%d wait=%d delete=%d", create, apply, wait, del)
+	if create >= label || label >= apply || apply >= poll || poll >= del {
+		t.Errorf("steps out of order: create=%d label=%d apply=%d poll=%d delete=%d", create, label, apply, poll, del)
+	}
+}
+
+// TestPackRunner_WaitFailsFastOnFailedJob proves a Failed Job surfaces its
+// status immediately instead of burning the whole timeout (review round 1,
+// Edge Case Hunter).
+func TestPackRunner_WaitFailsFastOnFailedJob(t *testing.T) {
+	rec := &cmdRecorder{stdout: map[string]string{
+		"status.failed":    "1",
+		"status.succeeded": "", // never completes
+	}}
+	p := newTestStratusRunner(t, rec)
+	p.waitTimeout = 10 * time.Second // generous; the test should return well under this
+	start := time.Now()
+	err := p.Detonate(context.Background(), "k8s.credential-access.dump-secrets")
+	if err == nil || !strings.Contains(err.Error(), "failed") {
+		t.Fatalf("Detonate() = %v, want a job-failed error", err)
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Errorf("Detonate took %s on a failed job; it should fail fast, not wait out the timeout", time.Since(start))
+	}
+	if rec.indexOf("delete", "namespace", "olt-pack-test") < 0 {
+		t.Errorf("revert did not run after a failed job")
 	}
 }
 
@@ -216,8 +261,8 @@ func TestPackRunner_RevertAlwaysRuns(t *testing.T) {
 
 	// (b) both detonate AND revert fail -> error wraps both.
 	rec2 := &cmdRecorder{fail: map[string]error{
-		"apply -n olt-pack-test -f /fake/olt-pack-test/job.yaml":        errors.New("boom-apply"),
-		"delete namespace olt-pack-test --ignore-not-found --wait=true": errors.New("boom-revert"),
+		"apply -n olt-pack-test -f /fake/olt-pack-test/job.yaml": errors.New("boom-apply"),
+		"delete namespace olt-pack-test":                         errors.New("boom-revert"),
 	}}
 	p2 := newTestStratusRunner(t, rec2)
 	err2 := p2.Detonate(context.Background(), "k8s.credential-access.dump-secrets")

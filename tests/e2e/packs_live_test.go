@@ -115,14 +115,29 @@ func TestPackLive(t *testing.T) {
 		t.Run(string(c.pack)+"/"+c.techID, func(t *testing.T) {
 			runner := runners[c.pack]
 
-			// NEGATIVE CONTROL: with no detonation, the signal must be absent.
-			// A short window where the rule/evidence delta stays zero proves a
-			// later positive delta is THIS technique's doing.
+			// NEGATIVE CONTROL. The signal must be ABSENT without a detonation.
+			// Two regimes, because the evidence counter is GLOBAL (labelled only
+			// by trigger_type, not namespace) while a rule_id match is scoped
+			// (review round 1, Blind/Edge Case Hunter):
+			//   - expectRule != "" (keyed): the rule_id is attributable even on a
+			//     busy cluster; the negative control asserts it does NOT match in
+			//     the quiet window.
+			//   - expectRule == "" (unkeyed, evidence-only): evidence is only
+			//     attributable if the cluster is QUIET. If the global evidence
+			//     counter moves on its own during the quiet window, this test
+			//     CANNOT honestly attribute a later rise to the detonation, so it
+			//     SKIPS with guidance (wire an OLT rule) rather than claiming a
+			//     detection it cannot stand behind.
 			base := snapshotPackSignal(t, c.expectRule)
 			time.Sleep(negativeControlWindow)
-			if nc := snapshotPackSignal(t, c.expectRule); c.expectRule != "" && nc.ruleMatches > base.ruleMatches {
-				t.Fatalf("negative control FAILED: rule %s matched %v->%v with no detonation; the signal is not attributable",
+			nc := snapshotPackSignal(t, c.expectRule)
+			if c.expectRule != "" && nc.ruleMatches > base.ruleMatches {
+				t.Fatalf("negative control FAILED: rule %s matched %v->%v with no detonation; not attributable",
 					c.expectRule, base.ruleMatches, nc.ruleMatches)
+			}
+			if c.expectRule == "" && nc.evidence > base.evidence {
+				t.Skipf("environment too noisy for evidence-based attribution of %s (global evidence %v->%v in the quiet window with no detonation); wire an OLT rule (ExpectOLT) to get a scoped, attributable signal",
+					c.techID, base.evidence, nc.evidence)
 			}
 
 			// DETONATE (real, in its own per-run namespace; the runner tears
@@ -139,21 +154,25 @@ func TestPackLive(t *testing.T) {
 				t.Fatalf("detonate %s: %v", c.techID, err)
 			}
 
-			// POLL for the keyed detection delta within budget.
+			// POLL for the detection delta within budget. The signal is the
+			// scoped rule_id delta when keyed, else the evidence delta (valid
+			// because the negative control proved the quiet baseline stable).
 			deadline := time.Now().Add(packLiveDetectBudget)
 			detected := false
 			var last packSignal
 			for time.Now().Before(deadline) {
 				last = snapshotPackSignal(t, c.expectRule)
-				ruleFired := c.expectRule != "" && last.ruleMatches > before.ruleMatches
-				evidenceRose := last.evidence > before.evidence
-				if ruleFired || evidenceRose {
-					detected = true
+				if c.expectRule != "" {
+					detected = last.ruleMatches > before.ruleMatches
+				} else {
+					detected = last.evidence > before.evidence
+				}
+				if detected {
 					t.Logf("DETECTED %s via %s after %s: rule %s %v->%v, evidence %v->%v",
 						c.techID, c.organ, time.Since(tDet).Round(time.Second),
 						c.expectRule, before.ruleMatches, last.ruleMatches, before.evidence, last.evidence)
 					if c.expectRule == "" {
-						t.Logf("NOTE: no OLT rule wired for %s; detected via correlator evidence only (expected-signal map: OLT rule is future work)", c.techID)
+						t.Logf("NOTE: no OLT rule keys on %s; attributed via correlator evidence under a proven-quiet negative control (expected-signal map: an OLT rule is future work)", c.techID)
 					}
 					break
 				}
