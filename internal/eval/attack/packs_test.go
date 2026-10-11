@@ -381,3 +381,25 @@ func TestPackFilesDoNotInjectEvents(t *testing.T) {
 		}
 	}
 }
+
+// TestPackRunner_LabelFailureStillReverts proves a failure at the PSA-label
+// step (after namespace creation) still runs the guaranteed revert, closing the
+// one revert-path coverage gap round 2 flagged (apply-failure is already tested;
+// this is structurally the same defer, one step earlier).
+func TestPackRunner_LabelFailureStillReverts(t *testing.T) {
+	rec := &cmdRecorder{fail: map[string]error{
+		"label namespace olt-pack-test": errors.New("boom-label"),
+	}}
+	p := newTestStratusRunner(t, rec)
+	err := p.Detonate(context.Background(), "k8s.credential-access.dump-secrets")
+	if err == nil || !strings.Contains(err.Error(), "boom-label") {
+		t.Fatalf("Detonate() = %v, want an error wrapping boom-label", err)
+	}
+	if rec.indexOf("delete", "namespace", "olt-pack-test") < 0 {
+		t.Errorf("revert did not run after a failed label step; calls=%v", rec.calls)
+	}
+	// And the Job was never applied (we failed before apply).
+	if rec.indexOf("apply", "-n", "olt-pack-test") >= 0 {
+		t.Errorf("apply ran despite the label step failing")
+	}
+}
