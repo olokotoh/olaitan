@@ -1,10 +1,14 @@
 package attack
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -100,5 +104,65 @@ func TestEventGenMitreMatchesFalcoCatalogue(t *testing.T) {
 func TestEventGenImageIsPinned(t *testing.T) {
 	if p := imagePinShape(EventGenImage); p != "" {
 		t.Errorf("EventGenImage %q: %s", EventGenImage, p)
+	}
+}
+
+// repoDemoPacksRoot resolves deploy/demo/packs from this test's location
+// (internal/eval/attack -> three dirs up to the repo root).
+func repoDemoPacksRoot(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller(0) failed")
+	}
+	return filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "deploy", "demo", "packs")
+}
+
+// TestDefaultRenderJob_EventGen proves the real renderer reads the COMMITTED
+// event-generator Job template, substitutes the concrete action, leaves no
+// placeholder behind, and keeps the pinned image (AC2). This exercises Task 5
+// offline: the template the pack actually applies at the live gate is the one
+// under test.
+func TestDefaultRenderJob_EventGen(t *testing.T) {
+	p, err := NewPackRunner(PackFalcoEventGen, func(context.Context, string, ...string) (string, error) { return "", nil }, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("NewPackRunner: %v", err)
+	}
+	p.PacksRoot = repoDemoPacksRoot(t)
+
+	path, err := p.renderJob(Technique{ID: "syscall.ReadSensitiveFileUntrusted", Pack: PackFalcoEventGen}, "olt-pack-test")
+	if err != nil {
+		t.Fatalf("renderJob: %v", err)
+	}
+	defer os.Remove(path)
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read rendered: %v", err)
+	}
+	got := string(body)
+	if strings.Contains(got, eventGenActionPlaceholder) {
+		t.Errorf("rendered manifest still contains the %s placeholder", eventGenActionPlaceholder)
+	}
+	if !strings.Contains(got, "syscall.ReadSensitiveFileUntrusted") {
+		t.Errorf("rendered manifest does not carry the substituted action")
+	}
+	if !strings.Contains(got, EventGenImage) {
+		t.Errorf("rendered manifest does not carry the pinned event-generator image %q", EventGenImage)
+	}
+}
+
+// TestDefaultRenderJob_StratusDeferred proves the renderer returns an explicit
+// deferral (not a silent miss) for Stratus until its wrapper image manifest is
+// committed at the supervised build step - the honest handling of the one AC
+// piece that cannot be done offline.
+func TestDefaultRenderJob_StratusDeferred(t *testing.T) {
+	p, err := NewPackRunner(PackStratus, func(context.Context, string, ...string) (string, error) { return "", nil }, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("NewPackRunner: %v", err)
+	}
+	p.PacksRoot = repoDemoPacksRoot(t)
+	_, err = p.renderJob(StratusTechniques()[0], "olt-pack-test")
+	if err == nil || !strings.Contains(err.Error(), "deferred") {
+		t.Fatalf("renderJob(stratus) = %v, want an explicit deferral error until the wrapper image is built", err)
 	}
 }

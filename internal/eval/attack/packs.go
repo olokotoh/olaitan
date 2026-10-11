@@ -20,6 +20,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -238,14 +240,16 @@ func NewPackRunner(pack PackID, runCmd RunFunc, logger *slog.Logger) (*PackRunne
 		}
 		m[t.ID] = t
 	}
-	return &PackRunner{
+	r := &PackRunner{
 		pack:        pack,
 		runCmd:      runCmd,
 		logger:      logger,
 		techs:       m,
 		waitTimeout: DefaultPackWaitTimeout,
 		newRunID:    randRunID,
-	}, nil
+	}
+	r.renderJob = r.defaultRenderJob
+	return r, nil
 }
 
 // randRunID returns a short, lowercase, DNS-label-safe unique suffix for a
@@ -272,11 +276,60 @@ type PackRunner struct {
 	// field so a unit test gets a deterministic namespace name.
 	newRunID func() string
 	// renderJob writes the technique's Job manifest (pinned image + the
-	// detonate command) into ns and returns the path to apply. A field so a
-	// unit test injects a fixture without the real committed manifests, which
-	// land with the Dockerfile/manifest task. The real renderer reads the
-	// committed per-pack template under deploy/demo/packs/<pack>/manifests.
+	// detonate command) and returns the path to apply. A field so a unit test
+	// injects a fixture. The real renderer (defaultRenderJob) reads the
+	// committed per-pack template under PacksRoot/<pack>/manifests/job.yaml.
 	renderJob func(t Technique, ns string) (manifestPath string, err error)
+	// PacksRoot is the directory holding committed per-pack manifests. Empty
+	// defaults to deploy/demo/packs (relative to the runner's working dir).
+	PacksRoot string
+}
+
+// eventGenActionPlaceholder and stratusTechniquePlaceholder are the tokens the
+// committed Job templates carry; defaultRenderJob substitutes the concrete
+// technique for them so one template serves every technique in a pack.
+const (
+	eventGenActionPlaceholder   = "OLT_EVENTGEN_ACTION"
+	stratusTechniquePlaceholder = "OLT_STRATUS_TECHNIQUE"
+)
+
+// defaultRenderJob reads the committed per-pack Job template, substitutes the
+// concrete technique, and writes the result to a temp file for `kubectl apply`.
+// For Stratus it returns an explicit deferral error until the wrapper image is
+// built and its manifest committed (the supervised build step), rather than
+// pretending a manifest exists.
+func (p *PackRunner) defaultRenderJob(t Technique, _ string) (string, error) {
+	root := p.PacksRoot
+	if root == "" {
+		root = filepath.Join("deploy", "demo", "packs")
+	}
+	tmpl := filepath.Join(root, string(p.pack), "manifests", "job.yaml")
+	raw, err := os.ReadFile(tmpl)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) && p.pack == PackStratus {
+			return "", fmt.Errorf("stratus job manifest %s not found: the wrapper image is built and pinned at the supervised build step (Story 11.2c); stratus detonation is deferred until then", tmpl)
+		}
+		return "", fmt.Errorf("read pack job template %s: %w", tmpl, err)
+	}
+	out := string(raw)
+	switch p.pack {
+	case PackFalcoEventGen:
+		out = strings.ReplaceAll(out, eventGenActionPlaceholder, t.ID)
+	case PackStratus:
+		out = strings.ReplaceAll(out, stratusTechniquePlaceholder, t.ID)
+	}
+	f, err := os.CreateTemp("", "olt-pack-*.yaml")
+	if err != nil {
+		return "", fmt.Errorf("render job: temp file: %w", err)
+	}
+	if _, err := f.WriteString(out); err != nil {
+		f.Close()
+		return "", fmt.Errorf("render job: write: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return "", fmt.Errorf("render job: close: %w", err)
+	}
+	return f.Name(), nil
 }
 
 // lookup returns the technique by ID.
