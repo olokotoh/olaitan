@@ -1,0 +1,39 @@
+# Story 11.2c: falcosecurity/event-generator attack Job. The runner applies
+# this into a per-run Namespace (kubectl apply -n olt-pack-<id>) and substitutes
+# the OLT_EVENTGEN_ACTION placeholder with the specific syscall action it is
+# detonating (e.g. syscall.ReadSensitiveFileUntrusted). The image is pinned by
+# tag AND digest (AC2/D2) - the pack pin guard (deploy/helm/pack_pin_test.go)
+# re-checks that here, and kubectl pulls it by digest at the live gate.
+#
+# This generates REAL syscall activity Falco catches; it does NOT inject any
+# synthetic NATS event (AC4). Reversal is by deleting the per-run Namespace
+# (the runner's guaranteed teardown); backoffLimit/activeDeadline/ttl keep it
+# from lingering if the runner dies.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: olt-pack-event-generator
+  labels:
+    app.kubernetes.io/managed-by: olaitan-attack-pack
+    olaitan.dev/pack: falco-event-generator
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 120
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/managed-by: olaitan-attack-pack
+        olaitan.dev/pack: falco-event-generator
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      containers:
+        - name: event-generator
+          image: docker.io/falcosecurity/event-generator:0.13.0@sha256:885d150fb9e3f7a643a2c5234a04898bc4d08cddabdb18aa7be820ffece8f453
+          args: ["run", "OLT_EVENTGEN_ACTION"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: false
+            capabilities:
+              drop: ["ALL"]
