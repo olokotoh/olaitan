@@ -744,6 +744,35 @@ jobs:
   # self-tested by .github/scripts/check-traceability.bats; the bats
   # tests run before the live gate so a broken script never silently
   # passes the gate.
+  # Story 11.2c (D7, honesty fence): the third-party attack packs' WIRING is
+  # gated here - argv construction, tag@sha256 image pins, MITRE cited (not
+  # minted) against the pinned tool catalogues, revert-always, and the no-NATS
+  # pack-path guard. This job proves the packs are WIRED correctly; it does NOT
+  # and CANNOT prove detection. The real detonation -> sensor -> OLT -> isolation
+  # chain is the RESERVED live gate (tests/e2e/packs_live_test.go,
+  # //go:build e2e && live), run on a supervised Calico+Falco cluster.
+  attack-pack-wiring:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: DETECTION NOT ASSERTED (honesty banner)
+        run: |
+          echo "::notice title=attack-pack-wiring::DETECTION NOT ASSERTED here. This job proves pack WIRING only (image pins, MITRE cited-not-minted, revert-always, no-NATS). Real detonation then detection is the reserved live gate (go test -tags e2e,live ./tests/e2e -run TestPackLive on a Calico+Falco cluster)."
+
+      - name: Pack unit tests (wiring, pins, MITRE citation, revert)
+        run: go test -count=1 ./internal/eval/attack/...
+
+      - name: Pack image-pin guard
+        run: go test -tags=helm -count=1 -run TestPackImagesArePinned ./deploy/helm/...
+
+      - name: Live gate compiles but never runs in CI
+        run: go vet -tags=e2e,live ./tests/e2e/...
+
   traceability:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
