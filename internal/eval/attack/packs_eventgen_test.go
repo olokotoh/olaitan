@@ -134,7 +134,7 @@ func TestDefaultRenderJob_EventGen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("renderJob: %v", err)
 	}
-	defer os.Remove(path)
+	defer func() { _ = os.Remove(path) }()
 	body, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read rendered: %v", err)

@@ -192,7 +192,7 @@ func TestPackRunner_DetonateHappyPath(t *testing.T) {
 	if create < 0 || apply < 0 || wait < 0 || del < 0 {
 		t.Fatalf("missing a step: create=%d apply=%d wait=%d delete=%d\ncalls=%v", create, apply, wait, del, rec.calls)
 	}
-	if !(create < apply && apply < wait && wait < del) {
+	if create >= apply || apply >= wait || wait >= del {
 		t.Errorf("steps out of order: create=%d apply=%d wait=%d delete=%d", create, apply, wait, del)
 	}
 }
@@ -304,6 +304,35 @@ func TestStratusMitreMatchesCatalogue(t *testing.T) {
 	for id := range cat.Techniques {
 		if !table[id] {
 			t.Errorf("catalogue technique %q is not in the curated Stratus table", id)
+		}
+	}
+}
+
+// TestPackFilesDoNotInjectEvents is the Story 11.2c AC4 guard for the pack
+// code path. The Story 11.2a grep guard scans tests/e2e; it does NOT scan
+// internal/eval/attack, so this test closes that gap for the pack files: they
+// must drive REAL in-cluster detonation through the kubectl/RunFunc seam and
+// NEVER publish a synthetic attack event onto NATS as a stand-in. It fails if
+// a pack source file acquires a forbidden event-injection token.
+func TestPackFilesDoNotInjectEvents(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller(0) failed")
+	}
+	dir := filepath.Dir(thisFile)
+	packFiles := []string{"packs.go", "packs_eventgen.go"}
+	forbidden := []string{"nats", "jetstream", "JetStream", "raw.falco", "raw.network", ".Publish("}
+	for _, f := range packFiles {
+		raw, err := os.ReadFile(filepath.Join(dir, f))
+		if err != nil {
+			t.Errorf("read %s: %v", f, err)
+			continue
+		}
+		body := string(raw)
+		for _, tok := range forbidden {
+			if strings.Contains(body, tok) {
+				t.Errorf("%s contains forbidden event-injection token %q: packs must detonate REAL attacks in-cluster, never publish a synthetic event (AC4)", f, tok)
+			}
 		}
 	}
 }
