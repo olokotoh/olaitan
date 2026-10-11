@@ -329,7 +329,7 @@ func (p *PackRunner) defaultRenderJob(t Technique, _ string) (string, error) {
 		return "", fmt.Errorf("render job: temp file: %w", err)
 	}
 	if _, err := f.WriteString(out); err != nil {
-		f.Close()
+		_ = f.Close()
 		return "", fmt.Errorf("render job: write: %w", err)
 	}
 	if err := f.Close(); err != nil {
