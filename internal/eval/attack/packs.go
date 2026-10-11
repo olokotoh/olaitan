@@ -16,10 +16,12 @@ package attack
 // reserved supervised live gate (packs_live_test.go, //go:build live).
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
+	"time"
 )
 
 // PackID names a third-party attack-technique pack.
@@ -164,18 +166,144 @@ func StratusTechniques() []Technique {
 	return out
 }
 
+// DefaultPackWaitTimeout bounds how long Detonate waits for a technique Job to
+// finish before it gives up (and still reverts). A field on PackRunner so a
+// unit test can shrink it.
+const DefaultPackWaitTimeout = 3 * time.Minute
+
+// techniquesFor returns the curated table for a pack.
+func techniquesFor(pack PackID) []Technique {
+	switch pack {
+	case PackStratus:
+		return StratusTechniques()
+	default:
+		return nil
+	}
+}
+
+// NewPackRunner builds a runner for a pack, keyed by the pack's curated
+// technique table. runCmd is the 11.2a command seam (ExecCmd in the real
+// path, a recorder in tests). The caller sets renderJob (and may override
+// newRunID / waitTimeout); the real job renderer lands with the committed
+// pack manifests.
+func NewPackRunner(pack PackID, runCmd RunFunc, logger *slog.Logger) (*PackRunner, error) {
+	techs := techniquesFor(pack)
+	if len(techs) == 0 {
+		return nil, fmt.Errorf("pack %q: no techniques registered", pack)
+	}
+	m := make(map[string]Technique, len(techs))
+	for _, t := range techs {
+		if err := t.validate(); err != nil {
+			return nil, fmt.Errorf("pack %q: %w", pack, err)
+		}
+		m[t.ID] = t
+	}
+	return &PackRunner{
+		pack:        pack,
+		runCmd:      runCmd,
+		logger:      logger,
+		techs:       m,
+		waitTimeout: DefaultPackWaitTimeout,
+		newRunID:    randRunID,
+	}, nil
+}
+
+// randRunID returns a short, lowercase, DNS-label-safe unique suffix for a
+// per-run namespace.
+func randRunID() string {
+	return fmt.Sprintf("%08x", time.Now().UnixNano()&0xffffffff)
+}
+
 // PackRunner detonates a pack's technique through the 11.2a RunFunc seam and
-// guarantees a revert. It reuses the command seam rather than re-implementing
-// kubectl, and never touches the s1-s5 switch (D1).
+// GUARANTEES a revert. It reuses the command seam rather than re-implementing
+// kubectl, and never touches the s1-s5 switch (D1). Every technique runs in
+// its own per-run Namespace so teardown is a single `kubectl delete namespace`
+// whose success is the cheap, total "the cluster is clean" assertion (D8,
+// Murat): if the namespace is gone, everything namespaced inside it is gone.
 type PackRunner struct {
 	pack   PackID
 	runCmd RunFunc
 	logger *slog.Logger
 	techs  map[string]Technique
+
+	// waitTimeout bounds the Job wait; defaults to DefaultPackWaitTimeout.
+	waitTimeout time.Duration
+	// newRunID returns a short unique suffix for the per-run namespace; a
+	// field so a unit test gets a deterministic namespace name.
+	newRunID func() string
+	// renderJob writes the technique's Job manifest (pinned image + the
+	// detonate command) into ns and returns the path to apply. A field so a
+	// unit test injects a fixture without the real committed manifests, which
+	// land with the Dockerfile/manifest task. The real renderer reads the
+	// committed per-pack template under deploy/demo/packs/<pack>/manifests.
+	renderJob func(t Technique, ns string) (manifestPath string, err error)
 }
 
 // lookup returns the technique by ID.
 func (p *PackRunner) lookup(id string) (Technique, bool) {
 	t, ok := p.techs[id]
 	return t, ok
+}
+
+// kubectl runs a kubectl subcommand through the injected seam.
+func (p *PackRunner) kubectl(ctx context.Context, args ...string) (string, error) {
+	return p.runCmd(ctx, "kubectl", args...)
+}
+
+// Detonate runs ONE technique in its own per-run Namespace and guarantees the
+// Namespace is deleted afterwards, even if detonation fails (D4, Amelia).
+//
+// The revert is a deferred step with a named return and errors.Join, so:
+//   - a detonate failure never skips the revert (defer),
+//   - a revert failure surfaces even when detonate already failed (Join),
+//   - an unknown technique returns BEFORE the defer registers, so no stray
+//     namespace is created and nothing is left to clean up.
+//
+// Honesty fence (D7): a nil return means the technique Job ran to completion
+// and the namespace was torn down. It does NOT mean Olaitan detected anything;
+// that is asserted ONLY at the reserved live gate (packs_live_test.go).
+func (p *PackRunner) Detonate(ctx context.Context, techID string) (err error) {
+	t, ok := p.lookup(techID)
+	if !ok {
+		return fmt.Errorf("pack %q: unknown technique %q", p.pack, techID)
+	}
+
+	if p.renderJob == nil {
+		return fmt.Errorf("pack %q: no job renderer configured", p.pack)
+	}
+
+	ns := fmt.Sprintf("olt-pack-%s", p.newRunID())
+
+	// Guaranteed teardown. Registered only after the technique is known, so an
+	// unknown technique creates nothing. Uses context.WithoutCancel so a
+	// cancelled or timed-out detonation still reverts rather than leaking
+	// attack infrastructure on the cluster.
+	defer func() {
+		revertCtx := context.WithoutCancel(ctx)
+		if _, rerr := p.kubectl(revertCtx, "delete", "namespace", ns, "--ignore-not-found", "--wait=true"); rerr != nil {
+			err = errors.Join(err, fmt.Errorf("revert %s: delete namespace %s: %w", t.ID, ns, rerr))
+		}
+	}()
+
+	if _, cerr := p.kubectl(ctx, "create", "namespace", ns); cerr != nil {
+		return fmt.Errorf("detonate %s: create namespace %s: %w", t.ID, ns, cerr)
+	}
+
+	manifest, rerr := p.renderJob(t, ns)
+	if rerr != nil {
+		return fmt.Errorf("detonate %s: render job: %w", t.ID, rerr)
+	}
+	if _, aerr := p.kubectl(ctx, "apply", "-n", ns, "-f", manifest); aerr != nil {
+		return fmt.Errorf("detonate %s: apply job: %w", t.ID, aerr)
+	}
+
+	timeout := p.waitTimeout
+	if timeout <= 0 {
+		timeout = DefaultPackWaitTimeout
+	}
+	if _, werr := p.kubectl(ctx, "wait", "-n", ns, "--for=condition=complete",
+		"job", "--all", fmt.Sprintf("--timeout=%s", timeout)); werr != nil {
+		return fmt.Errorf("detonate %s: wait for job: %w", t.ID, werr)
+	}
+	return nil
 }
