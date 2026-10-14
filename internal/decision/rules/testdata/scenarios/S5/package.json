@@ -31,10 +31,9 @@
       "source": "falco",
       "category": "syscall",
       "severity": "WARNING",
-      "summary": "Cryptominer process launched in tenant Pod with outbound to mining pool port",
+      "summary": "Cryptominer-named process launched in tenant Pod (Falco execve)",
       "raw": {
-        "process.exe": "/usr/local/bin/xmrig",
-        "network.dst_port": 3333
+        "process.exe": "/tmp/xmrig"
       }
     },
     {
@@ -42,13 +41,16 @@
       "timestamp": "2026-05-22T10:00:01Z",
       "source": "network",
       "category": "flow",
-      "severity": "WARNING",
-      "summary": "Outbound flow to stratum mining pool port flagged by CNI",
+      "severity": "informational",
+      "summary": "Outbound flow from the tenant Pod to the stratum mining pool port (real Goldmane flow)",
       "raw": {
-        "event.category": "flow",
-        "event.severity": "WARNING",
-        "network.dst_port": 3333,
-        "k8s.pod.namespace": "tenant-acme"
+        "network.dst_port": "3333",
+        "network.protocol": "TCP",
+        "network.dest_type": "workload",
+        "network.dest_name": "s5-stratum-pool",
+        "network.bytes_out": "512",
+        "network.connections_started": "1",
+        "network.connections_live": "1"
       }
     }
   ]

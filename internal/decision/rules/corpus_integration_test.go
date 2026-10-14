@@ -55,7 +55,12 @@ func TestIntegration_CorpusMatchesScenarioFixture(t *testing.T) {
 		{"S1", "testdata/scenarios/S1/package.json", []string{"OLT-PRIV-001", "OLT-EXEC-001"}},
 		{"S2", "testdata/scenarios/S2/package.json", []string{"OLT-CRED-001", "OLT-CRED-002"}},
 		{"S3", "testdata/scenarios/S3/package.json", []string{"OLT-RECON-001", "OLT-LATERAL-001"}},
-		{"S4", "testdata/scenarios/S4/package.json", []string{"OLT-NET-001", "OLT-NET-002"}},
+		// Story 11.2b: the real S4 attack beacons to an IN-CLUSTER sink
+		// (a WorkloadEndpoint, AC2), so it trips OLT-NET-002 (C2 port) only.
+		// OLT-NET-001 now keys on a public (dest_type=network/dest_name=pub)
+		// destination the in-cluster sink is not, by design - see
+		// TestOLTNet001FiresOnRealPublicEgress for its own coverage.
+		{"S4", "testdata/scenarios/S4/package.json", []string{"OLT-NET-002"}},
 		{"S5", "testdata/scenarios/S5/package.json", []string{"OLT-IMPACT-005", "OLT-IMPACT-006"}},
 	}
 
@@ -149,4 +154,57 @@ func symmetricDifference(want, got []string) (missing, unexpected []string) {
 		}
 	}
 	return missing, unexpected
+}
+
+// TestOLTNet001FiresOnRealPublicEgress proves the Story 11.2b rewrite of
+// OLT-NET-001 is live, not dead: a real Calico Goldmane flow to a PUBLIC
+// destination (dest_type=network, dest_name=pub - the only truthful
+// public-egress marker Goldmane emits, since it carries no dst IP) from a
+// tenant Pod trips OLT-NET-001. This is the complement to the S4 scenario,
+// whose in-cluster sink (a WorkloadEndpoint) deliberately does NOT match this
+// rule. The event.raw fields are exactly those internal/collector/cni's
+// Translate now projects onto the top level.
+func TestOLTNet001FiresOnRealPublicEgress(t *testing.T) {
+	root := corpusRoot(t)
+	l := loader.New(root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := l.Load(); err != nil {
+		t.Fatalf("loader.Load(%s): %v", root, err)
+	}
+	corpus := l.Get()
+	engine := &Engine{log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	pkg := schema.EvidencePackage{
+		SchemaVersion: "1",
+		PackageID:     "pkg-net001-public-egress",
+		WorkloadID:    "tenant-acme/Deployment/web",
+		WorkloadPosture: &schema.WorkloadPosture{
+			Identity: schema.WorkloadIdentity{
+				Namespace: "tenant-acme",
+				OwnerKind: "Deployment",
+				OwnerName: "web",
+			},
+		},
+		Events: []schema.Event{{
+			ID:       "ev-net001-1",
+			Source:   schema.SourceNetwork,
+			Category: schema.CategoryFlow,
+			Severity: "informational",
+			Summary:  "Outbound flow to a public destination",
+			Raw: json.RawMessage(`{
+				"network.dst_port": "8443",
+				"network.protocol": "TCP",
+				"network.dest_type": "network",
+				"network.dest_name": "pub",
+				"network.bytes_out": "128"
+			}`),
+		}},
+	}
+	matches := engine.evaluatePackage(&pkg, corpus)
+	got := map[string]bool{}
+	for _, m := range matches {
+		got[m.RuleID] = true
+	}
+	if !got["OLT-NET-001"] {
+		t.Errorf("OLT-NET-001 did not fire on a real public-egress flow; fired: %v", sortedRuleIDs(got))
+	}
 }

@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/olokotoh/olaitan/internal/collector/cni/goldmanepb"
+	"github.com/olokotoh/olaitan/internal/decision/rules/matcher"
 	"github.com/olokotoh/olaitan/internal/schema"
 )
 
@@ -494,4 +495,57 @@ func containsTag(tags []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestTranslate_ProjectsCanonicalFieldsForRules is the Story 11.2b adapter
+// conformance guard (Winston's party-mode recommendation): it proves the OLT
+// network rules can actually resolve their fields from a REAL translated
+// Goldmane flow. Before 11.2b the adapter emitted only nested protojson and
+// the one-level rule resolver saw none of network.*, so OLT-NET-002 /
+// OLT-IMPACT-006 were silently dead on real data. This test fails CI (not the
+// live demo) if a future change drops the top-level projection.
+func TestTranslate_ProjectsCanonicalFieldsForRules(t *testing.T) {
+	// A real in-cluster beacon/miner flow: WorkloadEndpoint destination on a
+	// C2/stratum port. matcher.EventFields is the exact flattener the rule
+	// engine runs, so this asserts resolution the way a rule match would.
+	fr := validFixture()
+	fr.Flow.Key.DestPort = 8443
+	fr.Flow.Key.Proto = "tcp"
+	fr.Flow.Key.DestType = goldmanepb.EndpointType_WorkloadEndpoint
+	fr.Flow.Key.DestName = "s4-c2-sink"
+	fr.Flow.BytesOut = 256
+
+	ev, err := Translate(fr, "node-1", 0)
+	if err != nil {
+		t.Fatalf("Translate: %v", err)
+	}
+	got := matcher.EventFields(ev)
+	want := map[string]string{
+		"network.dst_port":  "8443",
+		"network.protocol":  "TCP", // upper-cased to match the rule literal
+		"network.dest_type": "workload",
+		"network.dest_name": "s4-c2-sink",
+		"network.bytes_out": "256",
+		"event.category":    "flow",
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("EventFields[%q] = %q; want %q (rules read canonical names from the top level of Event.Raw)", k, got[k], v)
+		}
+	}
+
+	// A real PUBLIC egress: dest_type=network, dest_name=pub (the only
+	// public-egress marker Goldmane provides) must resolve so the rewritten
+	// OLT-NET-001 can fire.
+	pub := validFixture()
+	pub.Flow.Key.DestType = goldmanepb.EndpointType_Network
+	pub.Flow.Key.DestName = "pub"
+	pev, err := Translate(pub, "node-1", 0)
+	if err != nil {
+		t.Fatalf("Translate public: %v", err)
+	}
+	pgot := matcher.EventFields(pev)
+	if pgot["network.dest_type"] != "network" || pgot["network.dest_name"] != "pub" {
+		t.Errorf("public-egress flow resolved dest_type=%q dest_name=%q; want network/pub", pgot["network.dest_type"], pgot["network.dest_name"])
+	}
 }

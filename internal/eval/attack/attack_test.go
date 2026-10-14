@@ -1098,3 +1098,135 @@ func (e errDummy) Error() string { return string(e) }
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
+
+// --- Story 11.2b: S4 (C2 beaconing) and S5 (cryptomining) real-attack dispatch ---
+// These assert the executor STRUCTURE for S4/S5 (manifest apply order, the
+// in-cluster exec primitive, and surgical cleanup that never deletes the
+// shared namespace). The detection-shape specifics (sink/pool ports, rule
+// field names) are proven on the live cluster + the rule tests, not here.
+
+// TestAttackExecutor_S4_AppliesSinkAndWorkloadThenBeaconsThenCleansUp proves
+// S4 stands up its in-cluster C2 sink AND the target workload before beaconing,
+// execs the beacon primitive into the live target pod, and cleans up the sink,
+// its Service and the workload (never the namespace).
+func TestAttackExecutor_S4_AppliesSinkAndWorkloadThenBeaconsThenCleansUp(t *testing.T) {
+	var calls []recordedCall
+	run := recordingRunner(&calls, runningPodStdout(nil), "")
+	e, err := New("s4", harnessDir("s4-c2-beaconing"), run, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	e.SettleWait = 0
+	if err := e.Execute(context.Background()); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if err := e.Cleanup(context.Background()); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+
+	sinkIdx := firstCallContaining(calls, filepath.Join("s4-c2-beaconing", "manifests", "sink.yaml"))
+	workIdx := firstCallContaining(calls, filepath.Join("s4-c2-beaconing", "manifests", "workload.yaml"))
+	execIdx := firstCallContaining(calls, "exec")
+	delIdx := firstCallContaining(calls, "delete")
+	if sinkIdx < 0 {
+		t.Fatalf("S4 did not apply the in-cluster C2 sink manifest; calls=%v", calls)
+	}
+	if workIdx < 0 {
+		t.Fatalf("S4 did not apply the target workload manifest; calls=%v", calls)
+	}
+	if execIdx < 0 {
+		t.Fatalf("S4 did not exec the beacon primitive; calls=%v", calls)
+	}
+	// Sink up before the workload (the beacon needs a target), workload before
+	// the beacon exec, and no delete until Cleanup.
+	if sinkIdx >= workIdx || workIdx >= execIdx || execIdx >= delIdx {
+		t.Errorf("expected sink(%d) < workload(%d) < beacon-exec(%d) < delete(%d)", sinkIdx, workIdx, execIdx, delIdx)
+	}
+	// The beacon runs IN the resolved tenant pod (not the sink).
+	if !strings.Contains(joinCall(calls[execIdx]), "tenant-acme") {
+		t.Errorf("beacon exec did not target the tenant namespace: %s", joinCall(calls[execIdx]))
+	}
+}
+
+// TestAttackExecutor_S5_StagesMinerAndConnectsToPoolThenCleansUp proves S5
+// stands up the fake stratum pool AND the workload, stages a miner-named
+// process in the tenant pod and connects it to the pool, then cleans up.
+func TestAttackExecutor_S5_StagesMinerAndConnectsToPoolThenCleansUp(t *testing.T) {
+	var calls []recordedCall
+	run := recordingRunner(&calls, runningPodStdout(nil), "")
+	e, err := New("s5", harnessDir("s5-cryptomining"), run, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	e.SettleWait = 0
+	if err := e.Execute(context.Background()); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if err := e.Cleanup(context.Background()); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+
+	poolIdx := firstCallContaining(calls, filepath.Join("s5-cryptomining", "manifests", "pool.yaml"))
+	workIdx := firstCallContaining(calls, filepath.Join("s5-cryptomining", "manifests", "workload.yaml"))
+	execIdx := firstCallContaining(calls, "exec")
+	if poolIdx < 0 {
+		t.Fatalf("S5 did not apply the fake stratum pool manifest; calls=%v", calls)
+	}
+	if workIdx < 0 {
+		t.Fatalf("S5 did not apply the target workload manifest; calls=%v", calls)
+	}
+	if execIdx < 0 {
+		t.Fatalf("S5 did not exec the miner primitive; calls=%v", calls)
+	}
+	if poolIdx >= workIdx || workIdx >= execIdx {
+		t.Errorf("expected pool(%d) < workload(%d) < miner-exec(%d)", poolIdx, workIdx, execIdx)
+	}
+	// The miner is staged under a miner name (xmrig) so OLT-IMPACT-005's
+	// process signature can fire; the exec runs in the tenant pod.
+	execJoined := joinCall(calls[execIdx])
+	if !strings.Contains(execJoined, "tenant-acme") {
+		t.Errorf("miner exec did not target the tenant namespace: %s", execJoined)
+	}
+	if !strings.Contains(execJoined, "xmrig") {
+		t.Errorf("S5 exec does not stage a miner-named (xmrig) process (OLT-IMPACT-005 signature): %s", execJoined)
+	}
+}
+
+// TestAttackExecutor_S4S5_CleanupIsSurgical proves S4 and S5 cleanup deletes
+// the attacker infra (sink/pool + Service) and the workload but never the
+// shared namespace, and is idempotent.
+func TestAttackExecutor_S4S5_CleanupIsSurgical(t *testing.T) {
+	cases := []struct {
+		id, dir string
+	}{
+		{"s4", "s4-c2-beaconing"},
+		{"s5", "s5-cryptomining"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.id, func(t *testing.T) {
+			var calls []recordedCall
+			e, err := New(tc.id, harnessDir(tc.dir), recordingRunner(&calls, nil, ""), testLogger())
+			if err != nil {
+				t.Fatalf("New(%q): %v", tc.id, err)
+			}
+			if err := e.Cleanup(context.Background()); err != nil {
+				t.Fatalf("Cleanup: %v", err)
+			}
+			if firstCallContaining(calls, "deployment/web") < 0 {
+				t.Errorf("%s cleanup did not delete the target workload; calls=%v", tc.id, calls)
+			}
+			if firstCallContaining(calls, "service/") < 0 {
+				t.Errorf("%s cleanup did not delete the attacker-infra Service; calls=%v", tc.id, calls)
+			}
+			for _, c := range calls {
+				j := joinCall(c)
+				if strings.Contains(j, "delete") && (strings.Contains(j, "namespace/") || strings.Contains(j, " ns ")) {
+					t.Errorf("%s cleanup must NOT delete the shared namespace: %s", tc.id, j)
+				}
+				if strings.Contains(j, "delete") && !strings.Contains(j, "--ignore-not-found") {
+					t.Errorf("%s cleanup delete is not idempotent: %s", tc.id, j)
+				}
+			}
+		})
+	}
+}
