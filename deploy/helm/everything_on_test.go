@@ -478,3 +478,90 @@ func toYAML(t *testing.T, v any) string {
 	}
 	return string(b)
 }
+
+// podAnnotation returns a pod-template annotation of a workload.
+func podAnnotation(w map[string]any, key string) string {
+	v, _ := dig(w, "spec", "template", "metadata", "annotations", key).(string)
+	return v
+}
+
+// TestConfigChangeRollsThePods (live finding, 2026-10-19): a helm upgrade
+// that changed analyst.provider left the aggregator running the old config
+// until a manual rollout restart, because the rendered config lives in a
+// ConfigMap and the pod template did not change. A checksum of the rendered
+// config on the aggregator and collector pod templates rolls them on any
+// config change, and only then.
+func TestConfigChangeRollsThePods(t *testing.T) {
+	sum := func(args ...string) (agg, col string) {
+		r := renderArgs(t, args...)
+		return podAnnotation(docNamed(t, r, "Deployment", "olaitan-aggregator"), "checksum/config"),
+			podAnnotation(docNamed(t, r, "DaemonSet", "olaitan-collector"), "checksum/config")
+	}
+	a1, c1 := sum()
+	if a1 == "" || c1 == "" {
+		t.Fatalf("no checksum/config on the aggregator (%q) or the collector (%q) pod template", a1, c1)
+	}
+	a2, c2 := sum()
+	if a1 != a2 || c1 != c2 {
+		t.Error("the same values gave two different config checksums; every upgrade would roll the pods")
+	}
+	a3, c3 := sum("--set", "analyst.provider=none")
+	if a3 == a1 || c3 == c1 {
+		t.Error("changing analyst.provider did not change the config checksum, so helm upgrade would not restart the pods")
+	}
+	a4, _ := sum("--set", "rules.enabled=false")
+	if a4 == a1 {
+		t.Error("changing rules.enabled did not change the config checksum")
+	}
+}
+
+// TestRiskWindowOnByDefault (live finding, 2026-10-19): without the risk
+// window no single evidence package can reach RESTRICTED (the rule term
+// alone tops out at 0.4 x 95 = 38), so the one blocking flag would never
+// block. The window is on by default; the evaluation overlays and
+// values-minimal.yaml pin it off so recorded campaigns stay reproducible.
+func TestRiskWindowOnByDefault(t *testing.T) {
+	envOf := func(args ...string) (string, int) {
+		c := podContainers(docNamed(t, renderArgs(t, args...), "Deployment", "olaitan-aggregator"), "containers")["aggregator"]
+		n := 0
+		val := ""
+		for _, e := range asList(c["env"]) {
+			em, _ := e.(map[string]any)
+			if em["name"] == "OLT_RISK_WINDOW_SECONDS" {
+				n++
+				val, _ = em["value"].(string)
+			}
+		}
+		return val, n
+	}
+	if v, n := envOf(); v != "900" || n != 1 {
+		t.Errorf("default OLT_RISK_WINDOW_SECONDS = %q (x%d), want 900 once", v, n)
+	}
+	if v, n := envOf("--set", "aggregator.riskWindowSeconds=0"); n != 0 {
+		t.Errorf("riskWindowSeconds=0 still renders OLT_RISK_WINDOW_SECONDS=%q", v)
+	}
+	if v, n := envOf("--set", "aggregator.extraEnv[0].name=OLT_RISK_WINDOW_SECONDS", "--set-string", "aggregator.extraEnv[0].value=60"); v != "60" || n != 1 {
+		t.Errorf("an extraEnv OLT_RISK_WINDOW_SECONDS must win, once: got %q (x%d)", v, n)
+	}
+	for _, bad := range []string{"-1", "604801", "15m"} {
+		if _, err := renderArgsErr(t, "--set-string", "aggregator.riskWindowSeconds="+bad); err == nil {
+			t.Errorf("riskWindowSeconds=%s rendered; want a render error", bad)
+		}
+	}
+	files, _ := filepath.Glob(filepath.Join(chartDir(t), "values-eval*.yaml"))
+	files = append(files, filepath.Join(chartDir(t), "values-minimal.yaml"))
+	for _, f := range files {
+		if filepath.Base(f) == "values-eval-egress.yaml" {
+			continue
+		}
+		if v, n := envOf("-f", f); n != 0 {
+			t.Errorf("%s leaves the risk window on (%s); the evaluation overlays pin the pre-12.7 per-package scoring", filepath.Base(f), v)
+		}
+	}
+	notes := renderNotes(t, nil)
+	for _, want := range []string{"risk window", "RESTRICTED blocks only egress outside the private ranges", "QUARANTINED blocks all"} {
+		if !strings.Contains(notes, want) {
+			t.Errorf("install notes lack %q next to the blocking switch", want)
+		}
+	}
+}
