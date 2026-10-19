@@ -784,3 +784,43 @@ func ordered(line string, keys []string) bool {
 	}
 	return true
 }
+
+// The sink context outlives the ring context until the FSM consumer's drain
+// is done, and is bounded when the consumer never signals (PR #209 round 2).
+func TestDrainAwareContext_WaitsForFSMDrainWithBound(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	dctx := drainAwareContext(ctx, done, 5*time.Second)
+	cancel()
+	select {
+	case <-dctx.Done():
+		t.Fatal("sink context ended before the FSM drain finished")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(done)
+	select {
+	case <-dctx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("sink context not cancelled after the FSM drain finished")
+	}
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	never := make(chan struct{})
+	dctx2 := drainAwareContext(ctx2, never, 50*time.Millisecond)
+	cancel2()
+	select {
+	case <-dctx2.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("the wait for the FSM drain must be bounded")
+	}
+}
+
+// The bound covers the consumer's own drain budget.
+func TestFSMShutdownBoundCoversDrain(t *testing.T) {
+	if fsmShutdownBound <= chainShutdownGrace+chainAbortGrace {
+		t.Fatalf("fsmShutdownBound %v must exceed the drain budget %v", fsmShutdownBound, chainShutdownGrace+chainAbortGrace)
+	}
+	if fsmShutdownBound+2*time.Second > 30*time.Second {
+		t.Fatalf("fsmShutdownBound %v plus the 2s NATS close must fit the 30s termination grace", fsmShutdownBound)
+	}
+}

@@ -1446,7 +1446,10 @@ dispatched chain is acked only after its verdict is applied (heartbeated
 with `InProgress` from dispatch), so the Story 3.9 checkpoint resume still
 works across a restart; a redelivery of that package while its chain is in
 flight is left to the chain. Shutdown starts no queued chain, lets running
-chains finish within 10 s, applies their verdicts, then cancels the rest.
+chains finish within 10 s, applies their verdicts, then cancels the rest. The ring's NATS close and the FSM transition sinks wait
+for that drain (bounded by `fsmShutdownBound`, 17 s), mirroring the
+collector ring's adapter-before-drain ordering, so drained verdicts are
+audited and acked on a live connection.
 
 **Alternatives considered and rejected.**
 

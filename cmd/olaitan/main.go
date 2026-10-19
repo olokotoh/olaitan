@@ -955,6 +955,14 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		})
 	}
 
+	// Story 7.4 (PR #209 round-2 review): the FSM consumer applies chain
+	// verdicts that finish during its shutdown drain, so the transition sinks
+	// must outlive ctx until that drain is done (bounded by
+	// fsmShutdownBound). fsmDone is closed by the consumer goroutine (or by
+	// the wiring error path); an earlier startup failure only delays the
+	// sinks' exit by the bound.
+	fsmDone := make(chan struct{})
+	sinkCtx := drainAwareContext(ctx, fsmDone, fsmShutdownBound)
 	var sinks fsm.MultiSink
 	var fsmStore *fsm.Store
 	if cfg.Detection.FSM.PersistenceEnabledOrDefault() {
@@ -971,7 +979,7 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		// goroutines would race, and the closer could shut Redis before the
 		// final flush, losing a buffer Redis was healthy enough to accept.
 		g.Go(func() error {
-			err := redisSink.Run(ctx)
+			err := redisSink.Run(sinkCtx)
 			fsmCloser()
 			return err
 		})
@@ -999,7 +1007,7 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	// buffered drainer runs on the errgroup, off the FSM hot path.
 	if auditTransitionSink != nil {
 		sinks = append(sinks, auditTransitionSink)
-		g.Go(func() error { return auditTransitionSink.Run(ctx) })
+		g.Go(func() error { return auditTransitionSink.Run(sinkCtx) })
 	}
 	// Story 4.2 (BI-3/BI-4): the forensic capture controller is a further
 	// MultiSink member, appended BEFORE fsm.New so the FSM fans the
@@ -1066,12 +1074,14 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		// otherwise); the SetStateOracle ordering precedent.
 		if auditPolicySink != nil {
 			npMgr.SetPolicyAuditPublisher(auditPolicySink)
-			g.Go(func() error { return auditPolicySink.Run(ctx) })
+			g.Go(func() error { return auditPolicySink.Run(sinkCtx) })
 		}
 		// Launch the worker only now that the oracle (and audit seam) are
-		// installed. Starting the goroutine here establishes a happens-before edge
+		// installed. It and the policy audit drainer run on sinkCtx so a
+		// transition the FSM consumer applies during its shutdown drain is
+		// still enforced and audited (Story 7.4). Starting the goroutine here establishes a happens-before edge
 		// for the setter writes above, so the reconcile loop never races on them.
-		g.Go(func() error { return npMgr.Run(ctx) })
+		g.Go(func() error { return npMgr.Run(sinkCtx) })
 	}
 	// Story 4.2 (BI-5): install the FSM as the forensic controller's
 	// PRESERVED_KILLED confirmation oracle, then launch its background drainer.
@@ -1194,7 +1204,8 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	} else {
 		log.Info("aggregator: risk window disabled (per-package scoring)")
 	}
-	if err := wireFSMConsumer(ctx, g, log, nc, scoreCalc, stateMachine, chain, chainMode, breaker, assessmentPub, chainRuns, chainDispatches, riskWindow); err != nil {
+	if err := wireFSMConsumer(ctx, g, log, nc, scoreCalc, stateMachine, chain, chainMode, breaker, assessmentPub, chainRuns, chainDispatches, riskWindow, fsmDone); err != nil {
+		close(fsmDone)
 		closeNATS()
 		return fmt.Errorf("aggregator: fsm consumer: %w", err)
 	}
@@ -1212,11 +1223,11 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		"audit_enabled", auditEnabled,
 		"redactions_audit_enabled", redactAuditEnabled)
 
-	g.Go(func() error {
-		<-ctx.Done()
-		closeNATS()
-		return nil
-	})
+	// Story 7.4 (PR #209 round-2 review): drain NATS only after the FSM
+	// consumer has finished its shutdown drain (bounded), so verdicts that
+	// finish inside the shutdown grace are audited, persisted and acked on a
+	// live connection.
+	startNATSCloserAfterFSM(ctx, g, fsmDone, fsmShutdownBound, closeNATS)
 	log.Info("aggregator: correlator wired",
 		"window_duration", cfg.Detection.Correlator.WindowDuration.Duration(),
 		"max_package_bytes", cfg.Detection.Correlator.MaxPackageBytesOrDefault(),
@@ -1755,8 +1766,9 @@ func envSeconds(log *slog.Logger, key string, def int) int {
 // mode / analyst.provider=none) builds no pool and keeps the deterministic
 // Epic 2 behaviour byte-identical. It runs on its own errgroup goroutine and
 // returns nil on graceful ctx cancellation, after waiting (bounded) for
-// in-flight chains.
-func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, nc *natsclient.Client, scoreCalc *score.Calculator, stateMachine *fsm.Machine, chain *analyst.Chain, chainMode string, breaker *analyst.CircuitBreaker, auditPub responseaudit.AssessmentAuditPublisher, chainRuns *prometheus.CounterVec, chainDispatches *prometheus.CounterVec, riskWindow *risk.Window) error {
+// in-flight chains. It closes fsmDone when that goroutine has fully exited;
+// the caller must close fsmDone itself if wireFSMConsumer returns an error.
+func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, nc *natsclient.Client, scoreCalc *score.Calculator, stateMachine *fsm.Machine, chain *analyst.Chain, chainMode string, breaker *analyst.CircuitBreaker, auditPub responseaudit.AssessmentAuditPublisher, chainRuns *prometheus.CounterVec, chainDispatches *prometheus.CounterVec, riskWindow *risk.Window, fsmDone chan struct{}) error {
 	stream, err := nc.JetStream().Stream(ctx, "EVIDENCE")
 	if err != nil {
 		return fmt.Errorf("stream EVIDENCE: %w", err)
@@ -1794,6 +1806,10 @@ func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, n
 	}
 
 	g.Go(func() error {
+		// Closed LAST (deferred first): the ring's NATS close and the FSM
+		// sinks wait on it, so everything the drain below applies is
+		// published, persisted and acked before the connection drains.
+		defer close(fsmDone)
 		defer func() {
 			if driver.dispatcher == nil {
 				return

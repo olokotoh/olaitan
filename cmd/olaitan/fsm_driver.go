@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/olokotoh/olaitan/internal/decision/analyst"
 	"github.com/olokotoh/olaitan/internal/decision/score"
@@ -74,6 +75,53 @@ const (
 	// chainAbortGrace bounds the wait for workers after that cancellation.
 	chainAbortGrace = 2 * time.Second
 )
+
+// fsmShutdownBound bounds how long the aggregator's NATS close and the FSM
+// transition sinks wait, after the ring context is cancelled, for the FSM
+// consumer's shutdown drain (chainShutdownGrace + chainAbortGrace, plus
+// margin for applying the drained verdicts). It stays inside the pod's
+// default 30 s termination grace together with the 2 s NATS close.
+const fsmShutdownBound = chainShutdownGrace + chainAbortGrace + 5*time.Second
+
+// waitFSMDrained blocks until ctx is done and then until fsmDone is closed
+// (the FSM consumer finished its shutdown drain) or bound elapses.
+func waitFSMDrained(ctx context.Context, fsmDone <-chan struct{}, bound time.Duration) {
+	<-ctx.Done()
+	t := time.NewTimer(bound)
+	defer t.Stop()
+	select {
+	case <-fsmDone:
+	case <-t.C:
+	}
+}
+
+// drainAwareContext returns a context that is cancelled only once ctx is
+// done AND the FSM consumer has finished its shutdown drain (or bound
+// elapsed). The FSM transition sinks (Redis persistence, AUDIT.transitions,
+// NetworkPolicy) run on it, so a model-driven transition applied during the
+// drain still reaches them instead of landing after their final flush
+// (PR #209 round-2 review).
+func drainAwareContext(ctx context.Context, fsmDone <-chan struct{}, bound time.Duration) context.Context {
+	dctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	go func() {
+		waitFSMDrained(ctx, fsmDone, bound)
+		cancel()
+	}()
+	return dctx
+}
+
+// startNATSCloserAfterFSM runs closeFn on g once ctx is done and the FSM
+// consumer has finished its shutdown drain (or bound elapsed), so the
+// drained verdicts' AUDIT.assessments publishes, acks and transition audit
+// publishes happen before the connection is drained (PR #209 round-2
+// review; mirrors the collector ring's adapterDone ordering).
+func startNATSCloserAfterFSM(ctx context.Context, g *errgroup.Group, fsmDone <-chan struct{}, bound time.Duration, closeFn func()) {
+	g.Go(func() error {
+		waitFSMDrained(ctx, fsmDone, bound)
+		closeFn()
+		return nil
+	})
+}
 
 // chainRunFunc runs the chain for one admitted package and returns the
 // per-provider-capped LLM confidence (0 on error / degrade / panic) and

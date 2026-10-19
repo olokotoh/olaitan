@@ -914,7 +914,11 @@ rest. Packages whose chain did not finish stay un-acked and are redelivered
 after restart, where the deterministic score is evaluated again
 (at-least-once, as before) and the chain resumes from its checkpoints. A
 heartbeat or ack failure is logged (`in-flight chain heartbeat failed`,
-`fsm consumer ack failed`). Checkpointing is best-effort durability: a publish
+`fsm consumer ack failed`). The aggregator's NATS close and the FSM transition sinks
+(Redis persistence, `AUDIT.transitions`, NetworkPolicy and its policy
+audit) wait for that drain (bounded at 17 s), so a verdict applied during
+shutdown is audited, persisted, enforced and acked before the connection
+drains. Checkpointing is best-effort durability: a publish
 or read failure logs and the step re-runs, never aborting the chain. A
 6h-stale checkpoint simply means the chain re-runs from scratch (the retention
 floor). Operational note: the INVESTIGATIONS stream is NOT a SIEM audit
