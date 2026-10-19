@@ -1550,8 +1550,8 @@ now follow `response.network_policy.enabled`.
 the download by default (`ollama.pull.waitForModels`, kept by values-full):
 gating it made a plain `helm install --wait` wait on 1.9 GB and, with no
 internet, end in Init:CrashLoopBackOff. The default model is CPU-limited to
-2 cores, because an unlimited CPU model starved NATS and the aggregator on a
-4-vCPU CI node. The NetworkPolicy write verbs follow the blocking switch too.
+2 cores so inference cannot take every core from Falco, NATS and the
+aggregator on a small node (a judgement; values-full lifts it). The NetworkPolicy write verbs follow the blocking switch too.
 The CPU-model role budget became a first-class value
 (`aggregator.llmRoleTimeoutMultiplier`, rendered with provider local only),
 so an operator's `extraEnv` list does not drop it and hosted-provider arms

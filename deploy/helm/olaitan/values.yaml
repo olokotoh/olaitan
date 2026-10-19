@@ -1549,11 +1549,12 @@ ollama:
     pullPolicy: IfNotPresent
   # Story 12.7: sized for the default model. Memory is what it needs to
   # hold the model and a 16k context (under-requesting gets it OOM-killed).
-  # CPU: request 1 and LIMIT 2. On a small node an unlimited CPU model
-  # starves NATS, Falco and the aggregator while it thinks (seen in CI on
-  # 4-vCPU runners: every JetStream fetch timed out), and detection matters
-  # more than verdict speed. values-full.yaml (8 vCPU, measured) requests 2
-  # and lifts the limit.
+  # CPU: request 1 and LIMIT 2. Inference uses every core it is given, and
+  # on a small node an unlimited model competes with Falco, NATS and the
+  # aggregator while it thinks; detection matters more than verdict speed,
+  # so the default keeps half of a 4-vCPU node free (a judgement, not a
+  # measurement). values-full.yaml (8 vCPU, measured) requests 2 and lifts
+  # the limit.
   resources:
     requests:
       cpu: "1"
