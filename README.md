@@ -106,7 +106,12 @@ uploaded. A workload gets there through the risk window, on by default
 (`aggregator.riskWindowSeconds`, 900 s): it adds up a workload's rule,
 baseline and capped LLM signals across packages. Without it each package is
 scored alone and none scores high enough for RESTRICTED (the rule term tops
-out at 38), so blocking would never trigger.
+out at 38), so blocking would never trigger. The evaluation overlays and
+`values-minimal.yaml` set it to 0, to reproduce campaigns recorded before.
+
+On v1.0.0-rc4 itself (the version the commands above name until the next
+release) the flag turns on isolation only: the forensic-kill gate, the risk
+window default and everything above arrive with the first release after it.
 
 Prove your CNI enforces NetworkPolicy before you rely on it
 (`hack/check-netpol-enforcement.sh`): stock kind accepts every policy and
@@ -605,8 +610,9 @@ The other two optional sources are often described as needing a self-managed
 control plane. They do not. The containerd CRI sensor needs a **host socket**
 at a path that matches your runtime (see `values-k3s.yaml` and
 `values-eks.yaml`, which ship the right paths for those platforms), and the
-Calico flow adapter needs **Calico**. Both are off by default, and both are
-available on managed platforms.
+Calico flow adapter needs **Calico**. Both are on by default from the first
+release after v1.0.0-rc4 (DEGRADED, and saying so, where their prerequisite is
+missing), and both are available on managed platforms.
 
 A default install mounts nothing from the host in Olaitan's own templates.
 Falco posts its alerts to the collector over HTTP (`http_output`, through the
@@ -624,7 +630,7 @@ what happens after a rule fires.
 | --- | --- | --- |
 | Signal sources | eBPF syscalls | eBPF, K8s audit, CRI, CNI flows, app logs, correlated |
 | Output | an alert stream | an evidence package with a score and a workload state |
-| Repeated weak signals | each alert stands alone | correlated into one evidence package; an optional rolling risk window (off by default) also lets them accumulate over time |
+| Repeated weak signals | each alert stands alone | correlated into one evidence package; a rolling risk window (on by default in the chart from the first release after v1.0.0-rc4) also lets them accumulate over time |
 | Statistical drift | not modelled | Welford baselines per workload |
 | Response | left to you (Talon and falcosidekick are separate components) | graduated NetworkPolicy isolation, cooldown-gated de-escalation |
 | Explanation | the rule text | optional LLM analyst, score-capped and schema-validated |
@@ -662,10 +668,12 @@ Read this section before trusting it with anything.
 - **Targets Kubernetes 1.29 and newer.** The chart's `kubeVersion` floor is
   `>=1.29.0`: the optional applog sidecar defaults to the native sidecar form,
   which needs 1.29.
-- **The LLM tier costs money and adds latency.** It is off by default for both
-  reasons. Everything except tier-3 reasoning works with it disabled. The
-  kind-full reference profile turns it on with an in-cluster CPU model: no
-  money, but minutes of latency per investigation.
+- **The LLM tier adds latency.** From the first release after v1.0.0-rc4 it is
+  on by default with an in-cluster CPU model: no money and no API key, but
+  minutes of latency per investigation, and the default model's weights are
+  under the Qwen Research licence (pick another for commercial use).
+  Everything except tier-3 reasoning works with it off
+  (`--set analyst.provider=none`, or `-f values-minimal.yaml`).
 - **The agent writes NetworkPolicies into your cluster when enforcement is on.**
   Review [SECURITY.md](SECURITY.md) for the blast radius and the guards that
   bound it.

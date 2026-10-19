@@ -17,9 +17,26 @@ control plane and follow step 4; on EKS, AKS and GKE it is impossible (the
 platform overlays switch it off). Supplying all six TLS values yourself
 (the steps below, and the kind full profile, whose apiserver needs the CA
 before the cluster exists) skips certgen; half a set fails the render.
-Certgen never replaces existing material; to rotate, delete both Secrets and
-re-run the Job (`kubectl -n <ns> get secret -l
-app.kubernetes.io/managed-by=olaitan-certgen`).
+Certgen reuses a complete set it made itself for the same address and
+names, and makes a new set when either Secret is missing or incomplete,
+was not made by certgen, or was made for another server address or Service
+name (a changed `serverAddress` or `servicePort` changes the Job, so this
+runs on that upgrade). A new set means the collector must restart and the
+kubeconfig must be copied to the API server again.
+
+To rotate: delete both Secrets and the finished Job, then re-run the
+install (`helm upgrade` or `kubectl apply`), which recreates the Job:
+
+```bash
+kubectl -n <ns> delete secret -l app.kubernetes.io/managed-by=olaitan-certgen
+kubectl -n <ns> delete job -l app.kubernetes.io/component=certgen
+```
+
+The same two commands repair a webhook configuration that was deleted and
+recreated outside helm (its caBundle is empty until the Job runs again).
+These Secrets are not helm's, so `helm uninstall` leaves them; delete them
+the same way. Switching to your own material (Path B) or back: delete the
+certgen Secrets first, or helm refuses to take over Secrets it does not own.
 
 ## What this gives you
 

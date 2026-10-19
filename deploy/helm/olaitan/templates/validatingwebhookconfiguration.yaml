@@ -15,7 +15,8 @@ templates/audit-webhook-kubeconfig-secret.yaml -- there is no
 "ValidatingWebhookConfiguration audit variant" in Kubernetes
 terminology.
 
-This stub remains default-off via auditWebhook.enabled and continues
+This stub follows auditWebhook.enabled (on by default since Story 12.7;
+its failing calls are #155) and continues
 to gate on the same flag because the keys (caBundle, servicePort) were
 introduced for the future admission-control feature in Story 1.1; they
 are also reused by the audit-webhook-receiver story for the

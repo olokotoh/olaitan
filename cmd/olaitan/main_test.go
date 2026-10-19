@@ -846,7 +846,13 @@ func TestStartCollectorRing_MissingTLSDegradesAuditAndCalico(t *testing.T) {
 	}
 	out := buf.String()
 	for _, src := range []string{`"source":"audit"`, `"source":"network"`} {
-		if !strings.Contains(out, src) {
+		var found bool
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, src) && strings.Contains(line, `"level":"ERROR"`) && strings.Contains(line, "optional source failed") {
+				found = true
+			}
+		}
+		if !found {
 			t.Errorf("no optional-source ERROR log for %s:\n%s", src, out)
 		}
 	}

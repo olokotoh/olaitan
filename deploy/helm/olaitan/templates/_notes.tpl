@@ -145,14 +145,24 @@ ANALYSIS
 {{- if eq $provider "local" }}
   {{- $model := (default (dict) $an.local).model }}
   {{- $noDefaultSC := false }}
+  {{- /* lookup returns an empty dict under `helm template` (no cluster: say
+         nothing) and a list, possibly with no items, from a real cluster. */}}
   {{- $scs := lookup "storage.k8s.io/v1" "StorageClass" "" "" }}
-  {{- if and $scs $scs.items }}
+  {{- if hasKey $scs "items" }}
     {{- $noDefaultSC = true }}
     {{- range $scs.items }}
-      {{- if eq (index (default (dict) .metadata.annotations) "storageclass.kubernetes.io/is-default-class") "true" }}{{- $noDefaultSC = false }}{{- end }}
+      {{- $ann := default (dict) .metadata.annotations }}
+      {{- if or (eq (index $ann "storageclass.kubernetes.io/is-default-class") "true") (eq (index $ann "storageclass.beta.kubernetes.io/is-default-class") "true") }}{{- $noDefaultSC = false }}{{- end }}
     {{- end }}
   {{- end }}
-  {{- if and $ol.enabled $noDefaultSC (default (dict) $ol.persistence).create (not (default (dict) $ol.persistence).storageClassName) }}
+  {{- $olp := default (dict) $ol.persistence }}
+  {{- if and $ol.enabled (not (include "olaitan.ollama.pullModels" .)) (not $olp.existingClaim) }}
+  [DEGRADED] LLM analyst (L1, L2, Senior) -- {{ $model }} is not provisioned:
+         nothing pulls it (ollama.pull.models is empty) and no
+         ollama.persistence.existingClaim holds it. Until the model is on the
+         server, every incident is scored by rules and baselines only
+         (llm_unavailable). See docs/runbook.md, air-gapped section.
+  {{- else if and $ol.enabled $noDefaultSC $olp.create (not $olp.storageClassName) }}
   [DEGRADED] LLM analyst (L1, L2, Senior) -- {{ $model }} on the in-cluster
          Ollama, but this cluster has no default StorageClass, so the model
          volume stays Pending and the model never loads. Set
@@ -173,6 +183,11 @@ ANALYSIS
          {{- end }}
          On CPU each chain role takes minutes; give Ollama a GPU node or layer
          values-llm-claude.yaml / values-llm-deepseek.yaml for a hosted model.
+         {{- if hasPrefix "qwen2.5:3b" $model }}
+         Licence: the 3B Qwen2.5 weights are under the Qwen Research licence,
+         not Apache-2.0; for commercial use pick another model (values.yaml,
+         analyst.local.model and ollama.pull.models).
+         {{- end }}
   {{- end }}
 {{- else if eq $provider "api" }}
   [ON ] LLM analyst (L1, L2, Senior) -- hosted model through analyst.api
@@ -205,9 +220,10 @@ RESPONSE (observe-only unless blocking is on, see ENFORCEMENT)
 {{- end }}
 {{- if (default (dict) $rsp.forensics).enabled }}
   {{- if include "olaitan.forensics.storeConfigured" . }}
-  [ON ] Forensic capture -- evidence of a killed workload to the object store
-         {{- if include "olaitan.blocking" . }}, then the pod is deleted.
-         {{- else }}; the pod is left running (blocking is off).
+  [ON ] Forensic capture -- when a workload reaches PRESERVED_KILLED its
+         evidence goes to the object store
+         {{- if include "olaitan.blocking" . }}, then its pods are deleted.
+         {{- else }}; its pods are left running (blocking is off).
          {{- end }}
   {{- else }}
   [DEGRADED] Forensic capture -- no object store configured. Set
@@ -237,9 +253,16 @@ RESPONSE (observe-only unless blocking is on, see ENFORCEMENT)
 
 ENFORCEMENT
 {{- if $netpol.enabled }}
-  [ON ] NetworkPolicy isolation -- Olaitan WILL write policies that cut traffic,
-        and forensic capture deletes a killed workload's pods after their
-        evidence is uploaded (response.networkPolicy.enabled, the blocking switch).
+  [ON ] NetworkPolicy isolation -- Olaitan WILL write policies that cut traffic
+        (response.networkPolicy.enabled, the blocking switch).
+  {{- $rsp0 := default (dict) .Values.response }}
+  {{- if and (default (dict) $rsp0.forensics).enabled (include "olaitan.forensics.storeConfigured" .) }}
+        Forensic capture also deletes a killed workload's pods once their
+        evidence is uploaded.
+  {{- else }}
+        Forensic capture is not wired (off, or no object store), so a workload
+        reaching PRESERVED_KILLED stays QUARANTINED and is not deleted.
+  {{- end }}
 
   Read this before you rely on it. Olaitan reports a workload QUARANTINED once
   it has written the policy. Whether that workload is actually cut off is
@@ -257,17 +280,17 @@ ENFORCEMENT
 
       hack/check-netpol-enforcement.sh
 
-{{- include "olaitan.notes.blockingSemantics" . }}
-
   It pushes real traffic through a deny-all policy and tells you which of the
   two worlds you are in. If it reports NOT ENFORCED, set
   response.networkPolicy.enabled=false until you have a CNI that enforces --
   otherwise this tool will report containment it did not achieve.
+{{- include "olaitan.notes.blockingSemantics" . }}
   {{- if not $netpol.clusterCidrs }}
 
-  Also: response.networkPolicy.clusterCidrs is EMPTY. Set it to your real
-  pod/service CIDRs before relying on this. Left empty, egress blocking under
-  RESTRICTED takes DNS down with the workload.
+  Also: response.networkPolicy.clusterCidrs is empty, so RESTRICTED allows
+  the kind/Calico defaults (10.244.0.0/16, 10.96.0.0/12) on top of the RFC
+  1918 ranges it always allows. Set your real pod/service CIDRs if either
+  lies outside RFC 1918, or DNS goes down with a RESTRICTED workload.
   {{- end }}
 {{- else }}
   [OFF] NetworkPolicy isolation -- observe-only, the default.
@@ -350,7 +373,8 @@ the risk window that lets a workload reach those states at all.
   {{- if $rw }}
   The risk window ({{ $rw }} s, aggregator.riskWindowSeconds) adds up a
   workload's signals across packages; without it no single package scores
-  high enough to reach RESTRICTED.
+  high enough to reach RESTRICTED. The evaluation overlays and
+  values-minimal.yaml set it to 0 to reproduce earlier campaigns.
   {{- else }}
   The risk window is OFF (aggregator.riskWindowSeconds=0): each package is
   scored alone, and no single package scores high enough to reach

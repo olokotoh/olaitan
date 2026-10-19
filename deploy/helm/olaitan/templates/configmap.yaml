@@ -715,7 +715,10 @@ data:
     {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.report_archive.deferred_enabled anchor not found (pattern %q)" $p) }}{{- end }}
     {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v${2}" $ra.deferredEnabled) }}
     {{- end }}
-    {{- if hasKey $ra "deferredRedisAddr" }}
+    {{- /* Story 12.7 review (E7): bridged whenever the queue is on, even
+           when the key was deleted (--set ...deferredRedisAddr=null), so the
+           auto-fill below always applies. */ -}}
+    {{- if or (hasKey $ra "deferredRedisAddr") $ra.deferredEnabled }}
     {{- $p := "(\\n    deferred_redis_addr: )\"[^\"]*\"" -}}
     {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.report_archive.deferred_redis_addr anchor not found (pattern %q)" $p) }}{{- end }}
     {{- /* Story 12.7: the deferred queue is on by default; an empty address

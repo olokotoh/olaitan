@@ -1546,8 +1546,24 @@ transition regardless of enforcement. With forensics on by default that
 would have deleted workloads with blocking off, so the delete and its RBAC
 now follow `response.network_policy.enabled`.
 
-**Deferred.** Certificate rotation for certgen material (validity 10 years;
-delete the Secrets and re-run the Job), running the in-cluster Ollama as
-non-root, and a thesis-evaluation decision on whether arms run on the
-minimal or the full default posture (EVAL.md) are tracked on the Story 12.7
-follow-up issue.
+**Review round 1 additions.** The model server no longer waits in Init for
+the download by default (`ollama.pull.waitForModels`, kept by values-full):
+gating it made a plain `helm install --wait` wait on 1.9 GB and, with no
+internet, end in Init:CrashLoopBackOff. The default model is CPU-limited to
+2 cores, because an unlimited CPU model starved NATS and the aggregator on a
+4-vCPU CI node. The NetworkPolicy write verbs follow the blocking switch too.
+The CPU-model role budget became a first-class value
+(`aggregator.llmRoleTimeoutMultiplier`, rendered with provider local only),
+so an operator's `extraEnv` list does not drop it and hosted-provider arms
+keep their own budgets.
+
+**Deferred** (#213). Rotation of certgen material that rolls the pods
+(today: delete the Secrets and the Job, re-run the install); running the
+in-cluster Ollama as non-root; the evaluation-posture decision (EVAL.md);
+the audit admission stub (#155); certgen's namespace-wide `create secrets`
+(Kubernetes cannot limit create by name; the alternative, helm-rendered
+empty placeholder Secrets, collides with the immutable `kubernetes.io/tls`
+type of operator-mode Secrets on a mode switch); Secret and prompt changes
+in the config checksum; an SCC binding for certgen on OpenShift; and the
+default model's Qwen Research licence (a commercial default would be a
+different model and a new live measurement).

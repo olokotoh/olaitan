@@ -2511,7 +2511,7 @@ func logDegradedSources(log *slog.Logger, sources map[string]sourcehealth.Reader
 		if lastErr != nil {
 			reason = lastErr.Error()
 		}
-		log.Warn("collector: source DEGRADED: it is on but not producing events; see the reason, and the helm NOTES for what this source needs",
+		log.Warn("collector: source DEGRADED: it is on but not healthy (a missing prerequisite, or on and idle: no event yet); see the reason, and the helm NOTES for what this source needs",
 			"source", name, "reason", reason)
 	}
 }

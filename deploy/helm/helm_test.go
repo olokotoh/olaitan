@@ -314,8 +314,16 @@ func TestRedisDisabledOnly(t *testing.T) {
 // would pass the wildcard check but break the architectural boundary.
 // We therefore also assert the EXACT verb/resource set per role.
 func TestRBACVerbs(t *testing.T) {
+	// Story 12.7: the NetworkPolicy write verbs follow the blocking switch,
+	// so the full aggregator verb set is asserted with it on (the default,
+	// with it off, is TestBlockingIsOffByDefaultAndOneFlagTurnsItOn).
 	rendered := helmTemplate(t, []string{
 		"falco.enabled=false", "nats.enabled=false", "redis.enabled=false",
+		"response.networkPolicy.enabled=true",
+		// The pod delete is the forensic kill (Story 4.2, gated on forensics
+		// and, since 12.7, on the blocking switch); off here so the base
+		// verb set below stays exact.
+		"response.forensics.enabled=false",
 	})
 	ms := parseManifests(t, rendered)
 
@@ -1427,27 +1435,18 @@ func TestContainerdSensorMountReadOnly(t *testing.T) {
 // the path; with type: Directory the pod fails loudly so the
 // operator notices.
 func TestContainerdSensorHostPathTypeDirectory(t *testing.T) {
-	// Story 12.7 (D3) supersedes Story 1.8 P3: the sensor is on by default,
-	// and `type: Directory` kept the whole collector pod, Falco ingest
-	// included, from starting on any node without the socket directory.
-	// The Olaitan-owned containerd-socket volume is DirectoryOrCreate; a
-	// missing socket then leaves only the runtime source DEGRADED.
-	rendered := helmTemplate(t, []string{
-		"containerdSensor.enabled=true",
-	})
-	idx := strings.Index(rendered, "- name: containerd-socket\n          hostPath:")
-	if idx < 0 {
-		t.Fatalf("no containerd-socket hostPath volume; rendered sample:\n%s", snippet(rendered, "containerd-socket"))
+	// Story 12.7 (D3) supersedes Story 1.8 P3 for /run: the sensor is on by
+	// default, and `type: Directory` kept the whole collector pod, Falco
+	// ingest included, from starting on any node without the socket
+	// directory. Under /run the volume is DirectoryOrCreate; a path outside
+	// /run keeps Directory (TestReviewRound1Guards).
+	rendered := helmTemplate(t, []string{"containerdSensor.enabled=true"})
+	vol := volumeNamed(docNamed(t, rendered, "DaemonSet", "olaitan-collector"), "containerd-socket")
+	if vol == nil {
+		t.Fatalf("no containerd-socket volume; rendered sample:\n%s", snippet(rendered, "containerd-socket"))
 	}
-	window := rendered[idx:]
-	if end := strings.Index(window, "{{"); end > 0 {
-		window = window[:end]
-	}
-	if len(window) > 900 {
-		window = window[:900]
-	}
-	if !strings.Contains(window, "type: DirectoryOrCreate") {
-		t.Errorf("containerd-socket hostPath is not DirectoryOrCreate; window:\n%s", window)
+	if typ, _ := dig(vol, "hostPath", "type").(string); typ != "DirectoryOrCreate" {
+		t.Errorf("containerd-socket hostPath type = %q, want DirectoryOrCreate", typ)
 	}
 }
 
@@ -4701,26 +4700,40 @@ func TestStreamMaxBytesOverride_OnBothAggregatorAndCollector(t *testing.T) {
 // knobs could only be set by out-of-band `kubectl set env`, leaving no
 // repo-recorded provenance for a deployed configuration.
 func TestAggregatorExtraEnv_Projected(t *testing.T) {
-	rendered := helmTemplate(t, []string{
+	aggEnv := func(sets []string) map[string][]string {
+		c := podContainers(docNamed(t, helmTemplate(t, sets), "Deployment", "olaitan-aggregator"), "containers")["aggregator"]
+		out := map[string][]string{}
+		for _, e := range asList(c["env"]) {
+			em, _ := e.(map[string]any)
+			n, _ := em["name"].(string)
+			v, _ := em["value"].(string)
+			out[n] = append(out[n], v)
+		}
+		return out
+	}
+	set := aggEnv([]string{
 		"aggregator.extraEnv[0].name=OLT_RISK_WINDOW_SECONDS",
 		"aggregator.extraEnv[0].value=60",
 	})
-	if !strings.Contains(rendered, "name: \"OLT_RISK_WINDOW_SECONDS\"") ||
-		!strings.Contains(rendered, "value: \"60\"") {
-		t.Errorf("aggregator.extraEnv did not project onto the aggregator Deployment\n%s",
-			snippet(rendered, "olaitan-aggregator"))
+	if got := set["OLT_RISK_WINDOW_SECONDS"]; len(got) != 1 || got[0] != "60" {
+		t.Errorf("an extraEnv OLT_RISK_WINDOW_SECONDS must be projected once and win: %v", got)
 	}
-	// Default render carries only the Story 12.7 role-budget entry for the
-	// in-cluster CPU model, and a list the operator sets replaces it.
-	plain := helmTemplate(t, nil)
-	if strings.Contains(plain, "name: \"OLT_RISK_WINDOW_SECONDS\"") {
-		t.Error("default render must not carry OLT_RISK_WINDOW_SECONDS")
+	// Story 12.7: the chart's own entries (risk window 900, the CPU-model
+	// role budget 30 with provider local) are first-class values, so an
+	// operator's extraEnv list does not drop the one it does not name.
+	if got := set["OLT_LLM_ROLE_TIMEOUT_MULTIPLIER"]; len(got) != 1 || got[0] != "30" {
+		t.Errorf("an unrelated extraEnv dropped the CPU-model role budget: %v", got)
 	}
-	if !strings.Contains(plain, "name: \"OLT_LLM_ROLE_TIMEOUT_MULTIPLIER\"") {
-		t.Error("default render must carry OLT_LLM_ROLE_TIMEOUT_MULTIPLIER for the in-cluster CPU model")
+	def := aggEnv(nil)
+	if got := def["OLT_RISK_WINDOW_SECONDS"]; len(got) != 1 || got[0] != "900" {
+		t.Errorf("default OLT_RISK_WINDOW_SECONDS = %v, want [900]", got)
 	}
-	if strings.Contains(rendered, "name: \"OLT_LLM_ROLE_TIMEOUT_MULTIPLIER\"") {
-		t.Error("an operator-set extraEnv must replace the default list (Helm replaces lists)")
+	if got := def["OLT_LLM_ROLE_TIMEOUT_MULTIPLIER"]; len(got) != 1 || got[0] != "30" {
+		t.Errorf("default OLT_LLM_ROLE_TIMEOUT_MULTIPLIER = %v, want [30]", got)
+	}
+	// A hosted provider (an evaluation arm) gets its own budgets.
+	if got := aggEnv([]string{"evaluation.config=RSL"})["OLT_LLM_ROLE_TIMEOUT_MULTIPLIER"]; len(got) != 0 {
+		t.Errorf("the RSL arm (hosted provider) renders the CPU-model multiplier: %v", got)
 	}
 }
 
@@ -6166,15 +6179,17 @@ func TestNotesSurfaceTheEnforcementRiskAtInstallTime(t *testing.T) {
 			t.Errorf("enforcement-on notes are missing %q; the operator would trust containment that may not exist", want)
 		}
 	}
-	// Empty clusterCidrs with egress blocking on takes DNS down with the
-	// workload. Say so while the operator is still reading.
-	if !strings.Contains(notes, "clusterCidrs is EMPTY") {
+	// Empty clusterCidrs: RESTRICTED falls back to the kind/Calico CIDRs on
+	// top of RFC 1918 (Story 12.7 review corrected the old "takes DNS down"
+	// wording, which RFC 1918 being always allowed made untrue on private
+	// CIDRs). Say so while the operator is still reading.
+	if !strings.Contains(notes, "clusterCidrs is empty") {
 		t.Error("enforcement-on notes do not warn that clusterCidrs is unset")
 	}
 	// Observe-only must NOT carry the same alarm, or the warning stops
 	// meaning anything.
 	def := renderNotes(t, nil)
-	if strings.Contains(def, "clusterCidrs is EMPTY") {
+	if strings.Contains(def, "clusterCidrs is empty") {
 		t.Error("observe-only install raises the enforcement alarm; that trains operators to ignore it")
 	}
 	if !strings.Contains(def, "observe-only") {

@@ -236,6 +236,10 @@ correlator's identity resolution) and `preseed_transitions` (whether the
 preseed itself escalated the workload during setup; the driver drains and
 re-purges the measurement streams after preseeding so settle/capture see only
 scenario-driven signals, but the FSM state in Redis survives the purge).
-To enable the risk window for a campaign, set `OLT_RISK_WINDOW_SECONDS` via
-`aggregator.extraEnv` (see `docs/runbook.md`, "The rolling per-workload risk
-window"); the value is recorded per run as `risk_window_seconds`.
+The chart turns the risk window on by default (Story 12.7,
+`aggregator.riskWindowSeconds: 900`) and every arm overlay sets it to 0, so a
+campaign scores each package on its own unless you choose otherwise. To run a
+campaign WITH the window, set `aggregator.riskWindowSeconds` (or
+`OLT_RISK_WINDOW_SECONDS` via `aggregator.extraEnv`, which wins) after the
+arm overlay (see `docs/runbook.md`, "The rolling per-workload risk window");
+the value is recorded per run as `risk_window_seconds`.

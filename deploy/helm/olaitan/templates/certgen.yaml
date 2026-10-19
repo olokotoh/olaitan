@@ -44,7 +44,11 @@ them with `kubectl -n <ns> get secret -l app.kubernetes.io/managed-by=olaitan-ce
 {{- $svc := printf "%s-applog-injector" $full -}}
 {{- $args = concat $args (list (printf "--applog-secret=%s-applog-injector-tls" $full) (printf "--applog-dns=%s" (join "," (list $svc (printf "%s.%s" $svc $ns) (printf "%s.%s.svc" $svc $ns) (printf "%s.%s.svc.cluster.local" $svc $ns)))) (printf "--mutating-webhook=%s-applog-injector" $full)) -}}
 {{- end -}}
-{{- $jobName := printf "%s-certgen-%s" ($full | trunc 40 | trimSuffix "-") (printf "%s|%s" (include "olaitan.image" .) (join " " $args) | sha256sum | trunc 10) -}}
+{{- /* Review (E6): the name hashes the WHOLE pod template, not only the
+       image and arguments, so any change to it (pull policy, pull secrets,
+       a chart edit) is a new Job rather than an immutable-field error. */ -}}
+{{- $pod := include "olaitan.certgen.podTemplate" (dict "root" . "full" $full "args" $args) -}}
+{{- $jobName := printf "%s-certgen-%s" ($full | trunc 40 | trimSuffix "-") ($pod | sha256sum | trunc 10) -}}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -147,42 +151,51 @@ spec:
   backoffLimit: 6
   activeDeadlineSeconds: 600
   template:
-    metadata:
-      labels:
-        {{- include "olaitan.selectorLabels" . | nindent 8 }}
-        app.kubernetes.io/component: certgen
-    spec:
-      restartPolicy: OnFailure
-      serviceAccountName: {{ $full }}-certgen
-      {{- with .Values.imagePullSecrets }}
-      imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 65532
-        runAsGroup: 65532
-        seccompProfile:
-          type: RuntimeDefault
-      containers:
-        - name: certgen
-          image: {{ include "olaitan.image" . | quote }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["/olaitan"]
-          args:
-            {{- range $args }}
-            - {{ . | quote }}
-            {{- end }}
-          resources:
-            requests:
-              cpu: 10m
-              memory: 32Mi
-            limits:
-              cpu: 200m
-              memory: 64Mi
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: [ALL]
+    {{- $pod | nindent 4 }}
 {{- end }}
+
+{{/* The certgen Job's pod template (Story 12.7 review E6), one define so the
+     Job name can hash exactly what the Job runs. */}}
+{{- define "olaitan.certgen.podTemplate" -}}
+{{- $root := .root -}}
+{{- $full := .full -}}
+{{- $args := .args -}}
+metadata:
+  labels:
+    {{- include "olaitan.selectorLabels" $root | nindent 4 }}
+    app.kubernetes.io/component: certgen
+spec:
+  restartPolicy: OnFailure
+  serviceAccountName: {{ $full }}-certgen
+  {{- with $root.Values.imagePullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: certgen
+      image: {{ include "olaitan.image" $root | quote }}
+      imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+      command: ["/olaitan"]
+      args:
+        {{- range $args }}
+        - {{ . | quote }}
+        {{- end }}
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          cpu: 200m
+          memory: 64Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+{{- end -}}

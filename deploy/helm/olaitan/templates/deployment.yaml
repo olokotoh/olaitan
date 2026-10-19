@@ -158,8 +158,10 @@ spec:
                   name: {{ include "olaitan.fullname" . }}-secrets
                   key: s3-access-key
                   # Story 12.7: optional, so a Secret made without this key
-                  # (the install.yaml recipe) does not stop the pod; empty
-                  # leaves the consumer DEGRADED or unwired, and says so.
+                  # (the install.yaml recipe) does not stop the pod. With no
+                  # object store configured the consumer is DEGRADED and
+                  # never reads it; with a store configured, missing S3
+                  # credentials are still a startup error (half a store).
                   optional: true
             - name: S3_SECRET_KEY
               valueFrom:
@@ -167,8 +169,10 @@ spec:
                   name: {{ include "olaitan.fullname" . }}-secrets
                   key: s3-secret-key
                   # Story 12.7: optional, so a Secret made without this key
-                  # (the install.yaml recipe) does not stop the pod; empty
-                  # leaves the consumer DEGRADED or unwired, and says so.
+                  # (the install.yaml recipe) does not stop the pod. With no
+                  # object store configured the consumer is DEGRADED and
+                  # never reads it; with a store configured, missing S3
+                  # credentials are still a startup error (half a store).
                   optional: true
             {{- end }}
             {{- if or (and .Values.response .Values.response.notifications .Values.response.notifications.enabled) (and .Values.notifications .Values.notifications.enabled) }}
@@ -188,8 +192,10 @@ spec:
                   name: {{ include "olaitan.fullname" . }}-secrets
                   key: notifications-webhook-url
                   # Story 12.7: optional, so a Secret made without this key
-                  # (the install.yaml recipe) does not stop the pod; empty
-                  # leaves the consumer DEGRADED or unwired, and says so.
+                  # (the install.yaml recipe) does not stop the pod. With no
+                  # object store configured the consumer is DEGRADED and
+                  # never reads it; with a store configured, missing S3
+                  # credentials are still a startup error (half a store).
                   optional: true
             {{- end }}
             {{- with .Values.nats.streamMaxBytesOverride }}
@@ -203,6 +209,17 @@ spec:
             {{- end }}
             {{- $extraNames := list }}
             {{- range .Values.aggregator.extraEnv }}{{ $extraNames = append $extraNames .name }}{{ end }}
+            {{- $provider := include "olaitan.evaluation.effectiveAnalystProvider" . | lower }}
+            {{- $mult := toString (default 0 .Values.aggregator.llmRoleTimeoutMultiplier) }}
+            {{- if not (regexMatch "^[0-9]+(\\.[0-9]+)?$" $mult) }}
+            {{- fail (printf "aggregator.llmRoleTimeoutMultiplier is %q: want a positive number, or 0 to render none" $mult) }}
+            {{- end }}
+            {{- if and (eq $provider "local") (ne $mult "0") (not (has "OLT_LLM_ROLE_TIMEOUT_MULTIPLIER" $extraNames)) }}
+            # Story 12.7: role budgets for the in-cluster CPU model
+            # (aggregator.llmRoleTimeoutMultiplier).
+            - name: OLT_LLM_ROLE_TIMEOUT_MULTIPLIER
+              value: {{ $mult | quote }}
+            {{- end }}
             {{- with include "olaitan.riskWindowSeconds" . }}
             {{- if not (has "OLT_RISK_WINDOW_SECONDS" $extraNames) }}
             # Story 12.7: the rolling per-workload risk window, on by default

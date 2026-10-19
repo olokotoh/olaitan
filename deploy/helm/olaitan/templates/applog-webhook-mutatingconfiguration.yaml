@@ -32,6 +32,13 @@ double-quoted: the apiserver expects a plain base64 string).
 {{- if and (ne $failurePolicy "Ignore") (ne $failurePolicy "Fail") -}}
 {{- fail (printf "applogSidecar.webhook.failurePolicy must be Ignore or Fail (got %q)" $failurePolicy) -}}
 {{- end -}}
+{{- /* Story 12.7 review (E2): with generated TLS the webhook has no caBundle
+       until the certgen Job writes it, and under Fail every pod CREATE in a
+       selected namespace is refused until then, the certgen pod's own
+       included: a deadlock. Fail needs material that exists at install. */ -}}
+{{- if and (eq $failurePolicy "Fail") (eq (include "olaitan.applog.tlsMode" .) "auto") -}}
+{{- fail "applogSidecar.webhook.failurePolicy=Fail needs TLS that exists before the webhook does (cert-manager, applogSidecar.tls.certManagerEnabled, or Path B values): with the in-cluster generated certificate every pod create, the certgen pod's included, would be refused until it ran" -}}
+{{- end -}}
 {{/*
   namespaceSelector safe-default. When the operator passes nil or an
   empty selector, render the kube-system / kube-public exclusion as

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 	"sigs.k8s.io/yaml"
@@ -238,5 +239,62 @@ func TestSpecValidate(t *testing.T) {
 	s = Spec{Namespace: ns}
 	if err := s.Validate(); err == nil {
 		t.Error("a spec with nothing to do validated")
+	}
+}
+
+// Review (Edge Case Hunter E1): a change of the address the apiserver dials
+// (serverAddress, servicePort) or of the Service names makes a new Job run,
+// and reusing the old material would leave a cert without the new name and
+// a kubeconfig pointing at the old server.
+func TestRunRegeneratesWhenTheSpecMoved(t *testing.T) {
+	m, v := webhookObjects()
+	cs := fake.NewSimpleClientset(m, v)
+	ctx := context.Background()
+	if err := Run(ctx, cs, fullSpec(), quietLog()); err != nil {
+		t.Fatal(err)
+	}
+	moved := fullSpec()
+	moved.AuditServer = "127.0.0.1:31443"
+	moved.AuditIPs = []string{"127.0.0.1", "10.0.0.7"}
+	moved.ApplogDNSNames = append(moved.ApplogDNSNames, "olaitan-applog-injector.olaitan.svc.cluster.local")
+	if err := Run(ctx, cs, moved, quietLog()); err != nil {
+		t.Fatal(err)
+	}
+	audit, _ := cs.CoreV1().Secrets(ns).Get(ctx, "olaitan-audit-tls", metav1.GetOptions{})
+	if _, err := parseCert(t, audit.Data["tls.crt"]).Verify(x509.VerifyOptions{DNSName: "10.0.0.7", Roots: pool(t, audit.Data["ca.crt"])}); err != nil {
+		t.Errorf("audit cert was not regenerated for the new IP: %v", err)
+	}
+	kc, _ := cs.CoreV1().Secrets(ns).Get(ctx, "olaitan-audit-webhook-kubeconfig", metav1.GetOptions{})
+	if !strings.Contains(string(kc.Data["webhook-kubeconfig.yaml"]), "https://127.0.0.1:31443/audit") {
+		t.Errorf("kubeconfig still points at the old server:\n%s", kc.Data["webhook-kubeconfig.yaml"])
+	}
+	applog, _ := cs.CoreV1().Secrets(ns).Get(ctx, "olaitan-applog-injector-tls", metav1.GetOptions{})
+	if _, err := parseCert(t, applog.Data["tls.crt"]).Verify(x509.VerifyOptions{DNSName: "olaitan-applog-injector.olaitan.svc.cluster.local", Roots: pool(t, applog.Data["ca.crt"])}); err != nil {
+		t.Errorf("applog cert was not regenerated for the new name: %v", err)
+	}
+	gv, _ := cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(ctx, "olaitan-audit", metav1.GetOptions{})
+	if string(gv.Webhooks[0].ClientConfig.CABundle) != string(audit.Data["ca.crt"]) {
+		t.Error("validating webhook caBundle was not moved to the new CA")
+	}
+}
+
+// Review (Edge Case Hunter E4): a complete Secret certgen did not make (an
+// operator-mode Secret left behind on a switch to auto mode, whose ca.crt is
+// the apiserver CLIENT CA, not a serving CA) must not be adopted.
+func TestRunReplacesASecretItDidNotMake(t *testing.T) {
+	m, v := webhookObjects()
+	foreign := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "olaitan-applog-injector-tls", Namespace: ns},
+		Type:       corev1.SecretTypeTLS,
+		Data:       map[string][]byte{"tls.crt": []byte("x"), "tls.key": []byte("y"), "ca.crt": []byte("operator-ca")},
+	}
+	cs := fake.NewSimpleClientset(m, v, foreign)
+	ctx := context.Background()
+	if err := Run(ctx, cs, fullSpec(), quietLog()); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := cs.CoreV1().Secrets(ns).Get(ctx, "olaitan-applog-injector-tls", metav1.GetOptions{})
+	if string(s.Data["ca.crt"]) == "operator-ca" || s.Labels["app.kubernetes.io/managed-by"] != ManagedByLabel {
+		t.Errorf("a Secret certgen did not make was adopted: ca=%q labels=%v", s.Data["ca.crt"], s.Labels)
 	}
 }

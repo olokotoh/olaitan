@@ -930,6 +930,7 @@ chart version, and hashing them would roll on every version bump.
 {{- $data := list -}}
 {{- range $doc := splitList "\n---" (include (print .Template.BasePath "/configmap.yaml") .) -}}
 {{- $m := fromYaml $doc -}}
+{{- if hasKey $m "Error" -}}{{- fail (printf "olaitan.configChecksum: a document in templates/configmap.yaml did not parse: %s" $m.Error) -}}{{- end -}}
 {{- if $m.data -}}{{- $data = append $data $m.data -}}{{- end -}}
 {{- end -}}
 {{- if not $data -}}{{- fail "olaitan.configChecksum: templates/configmap.yaml rendered no ConfigMap data" -}}{{- end -}}

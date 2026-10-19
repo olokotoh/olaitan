@@ -26,7 +26,8 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 | Value | Type | Default | Valid range | Effect | Ref |
 |-------|------|---------|-------------|--------|-----|
 | `aggregator.replicas` | integer | `1` | 1 to 1 | aggregator replica count and the chart's worker-pool surface; HARD CONSTRAINT at 1 (rings are cooperative goroutines in one process) until leader election lands | NFR20 |
-| `aggregator.extraEnv` | array | `[{name: "OLT_LLM_ROLE_TIMEOUT_MULTIPLIER", value: "30"}]` | - | operator-supplied aggregator environment as {name, value} pairs; the committed mechanism for OLT_RISK_WINDOW_SECONDS, OLT_LLM_ROLE_TIMEOUT_MULTIPLIER, OLT_LLM_CHAIN_WORKERS and OLT_LLM_CHAIN_QUEUE; the default carries the 30x role budget the in-cluster CPU model needs | FR30 |
+| `aggregator.extraEnv` | array | `[]` | - | operator-supplied aggregator environment as {name, value} pairs; the committed mechanism for OLT_RISK_WINDOW_SECONDS, OLT_LLM_ROLE_TIMEOUT_MULTIPLIER, OLT_LLM_CHAIN_WORKERS and OLT_LLM_CHAIN_QUEUE; an entry wins over the chart's own | FR30 |
+| `aggregator.llmRoleTimeoutMultiplier` | number | `30` | minimum 0 | LLM per-role timeout multiplier for the in-cluster CPU model (OLT_LLM_ROLE_TIMEOUT_MULTIPLIER, rendered with analyst.provider=local only); 0 renders none | FR30 |
 | `aggregator.riskWindowSeconds` | integer | `900` | 0 to 604800 | rolling per-workload risk window in seconds (OLT_RISK_WINDOW_SECONDS); 0 is per-package scoring | FR30 |
 
 ## `correlator`
@@ -213,6 +214,7 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 | `ollama.pull.backoffLimit` | integer | `4` | minimum 0 | retries of the model pull Job before it is marked failed | FR48 |
 | `ollama.pull.activeDeadlineSeconds` | integer | `1800` | minimum 1 | seconds the model pull Job may run before it is killed; the server's wait for the models gives up 300s after it | FR48 |
 | `ollama.pull.expectedIds` | object | `{qwen2.5:3b-instruct: "357c53fb659c"}` | - | expected `ollama list` ID per pulled model; the pull Job fails on drift | NFR31 |
+| `ollama.pull.waitForModels` | boolean | `false` | - | hold the model server until the pulled models are on disk (helm --wait then waits for the download) | FR48 |
 
 ## `openshift`
 

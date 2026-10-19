@@ -13,7 +13,12 @@ are deployed by a plain install. Injection is still opt-in per pod (the
 Path B set, the chart's certgen Job creates the serving-cert Secret in the
 cluster, per install, and writes its CA into the webhook's caBundle (the
 template leaves caBundle out in that mode, so an upgrade or a re-apply does
-not reset it). Known issues on this path are tracked in #156, #157 and #159.
+not reset it). `applogSidecar.webhook.failurePolicy=Fail` needs Path A or
+Path B: with a generated certificate the render fails, because every pod
+create (the certgen pod's included) would be refused until the Job ran.
+Rotation, recovery of a recreated webhook, and switching paths work as for
+the audit receiver (AUDIT.md, Story 12.7 paragraph). Known issues on this
+path are tracked in #156, #157 and #159.
 
 When `applogSidecar.enabled=true` (the default) the chart deploys four resources
 beyond the agent DaemonSet:

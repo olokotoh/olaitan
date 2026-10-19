@@ -83,9 +83,16 @@ metadata:
     app.kubernetes.io/component: aggregator
 rules:
   # Ring 4: response engine writes NetworkPolicy into every pod's ns.
+  # Story 12.7 review: only with THE blocking switch
+  # (response.networkPolicy.enabled); with it off the NetworkPolicy manager
+  # is not wired and the aggregator holds no write power over traffic.
+  # Turning the switch off later leaves any policy it wrote in place:
+  # kubectl delete networkpolicy -A -l app.kubernetes.io/managed-by=olaitan
+  {{- if include "olaitan.blocking" . }}
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "update", "delete"]
+  {{- end }}
   # Ring 4a: annotation-based FSM state transitions — patch only, no
   # delete, no exec. The agent flips pod labels/annotations to mark FSM
   # state; it never kills pods directly (that is kubelet's job via the

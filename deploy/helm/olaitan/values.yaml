@@ -125,20 +125,24 @@ aggregator:
   #                                   yet applied. When all are taken a
   #                                   dispatch is rejected (queue_full). Invalid
   #                                   values of either fall back to the default.
-  
-  #
-  # Story 12.7: the default ships the one entry the default LLM needs. The
-  # in-cluster CPU model (analyst.provider: local, below) reads 8k to 10k
-  # prompt tokens per chain role before it writes a word, about 5 to 10
-  # minutes on 8 vCPUs (Story 10.6, measured), so the per-role budgets
-  # (30s L1, 30s L2, 60s Senior) are scaled 30x: 900s, 900s, 1800s. A list
-  # you set REPLACES this one (Helm replaces lists), so keep this entry
-  # when you add your own, or set your own multiplier (the values-llm-*
-  # overlays set 2 for a hosted model).
-  # @schema type:array effect:"operator-supplied aggregator environment as {name, value} pairs; the committed mechanism for OLT_RISK_WINDOW_SECONDS, OLT_LLM_ROLE_TIMEOUT_MULTIPLIER, OLT_LLM_CHAIN_WORKERS and OLT_LLM_CHAIN_QUEUE; the default carries the 30x role budget the in-cluster CPU model needs" ref:FR30
-  extraEnv:
-    - name: OLT_LLM_ROLE_TIMEOUT_MULTIPLIER
-      value: "30"
+  # An entry here wins over the chart's own OLT_RISK_WINDOW_SECONDS,
+  # OLT_LLM_ROLE_TIMEOUT_MULTIPLIER and OLT_LLM_CHAIN_WORKERS
+  # (riskWindowSeconds and llmRoleTimeoutMultiplier below, and the chain
+  # workers the chart derives from OLLAMA_NUM_PARALLEL), which are then not
+  # rendered.
+  # @schema type:array effect:"operator-supplied aggregator environment as {name, value} pairs; the committed mechanism for OLT_RISK_WINDOW_SECONDS, OLT_LLM_ROLE_TIMEOUT_MULTIPLIER, OLT_LLM_CHAIN_WORKERS and OLT_LLM_CHAIN_QUEUE; an entry wins over the chart's own" ref:FR30
+  extraEnv: []
+  # Story 12.7: the per-role LLM budget multiplier the in-cluster CPU model
+  # needs, rendered as OLT_LLM_ROLE_TIMEOUT_MULTIPLIER only when the
+  # analyst runs on it (effective analyst.provider "local"). The model reads
+  # 8k to 10k prompt tokens per chain role before it writes a word, about
+  # 5 to 10 minutes on 8 vCPUs (Story 10.6, measured), so the per-role
+  # budgets (30s L1, 30s L2, 60s Senior) are scaled 30x: 900s, 900s, 1800s.
+  # A first-class value rather than an extraEnv entry, so an operator's own
+  # extraEnv list does not silently drop it; a hosted provider (the
+  # values-llm-* overlays, the evaluation arms) gets its own budgets.
+  # @schema type:number minimum:0 effect:"LLM per-role timeout multiplier for the in-cluster CPU model (OLT_LLM_ROLE_TIMEOUT_MULTIPLIER, rendered with analyst.provider=local only); 0 renders none" ref:FR30
+  llmRoleTimeoutMultiplier: 30
   # Story 12.7 (live finding, 2026-10-19): the rolling per-workload risk
   # window (ADR-2026-08-17-01 Option B), rendered as OLT_RISK_WINDOW_SECONDS.
   # ON by default: without it the FSM scores each evidence package alone, and
@@ -566,8 +570,9 @@ containerdSensor:
 # Story 1.10 -- fifth Ring 1 streaming sensor source. Subscribes to
 # the Calico Goldmane gRPC API (`goldmane.Flows.Stream`) over mTLS,
 # translating each FlowResult into a schema.Event of source=network /
-# category=flow. Default-off because Goldmane requires the Tigera
-# operator install path on Calico v3.31.5+; see CNI.md for the full
+# category=flow. Story 12.7: on by default, DEGRADED until Calico with
+# Goldmane (the Tigera operator install path on Calico v3.31.5+) and a
+# Goldmane client certificate exist; see CNI.md for the full
 # operator workflow and ADR-2026-04-30-01 / ADR-2026-05-12-01 in
 # docs/deferred-decisions.md for the install-path migration rationale.
 #
@@ -1198,7 +1203,8 @@ response:
   # that stays stable in a non-CLEAN FSM state for windowSeconds (default 60)
   # finalises into an IncidentFinalised event on INCIDENTS.finalised, which the
   # Story 4.4 DFIR agent consumes. retentionDays drives the INCIDENTS JetStream
-  # stream MaxAge (365 d, append-only LimitsPolicy, audit-grade). Off by default.
+  # stream MaxAge (365 d, append-only LimitsPolicy, audit-grade). On by default
+  # since Story 12.7.
   settling:
     enabled: true
     # @schema type:integer minimum:1 effect:"stable non-CLEAN seconds before a workload finalises into an IncidentFinalised event" ref:FR42
@@ -1209,7 +1215,7 @@ response:
   # JetStream consumer on INCIDENTS.finalised produces an analyst-grade
   # ForensicReport via the LLM provider and announces it on REPORTS.generated.
   # The DFIR LLM provider/model are config under analyst.dfir_provider /
-  # analyst.dfir_model. Off by default (opt-in).
+  # analyst.dfir_model. On by default since Story 12.7.
   dfir:
     enabled: true
   # Story 4.6: durable report writer (FR45). When enabled, the DFIR agent PUTs
@@ -1220,7 +1226,8 @@ response:
   # (different bucket; the report bucket MUST be object-lock-enabled + versioned,
   # an operator precondition the writer never creates). On a durable-write
   # failure the writer fails LOUD (a metric) without an inline retry (Story 4.7
-  # owns the deferred queue). Off by default. S3 credentials are NFR8 secrets read
+  # owns the deferred queue). On by default since Story 12.7, DEGRADED until a
+  # store is set (see forensics above). S3 credentials are NFR8 secrets read
   # from S3_ACCESS_KEY / S3_SECRET_KEY env vars (wire via secrets.s3AccessKey /
   # secrets.s3SecretKey), never YAML.
   #
@@ -1541,15 +1548,18 @@ ollama:
     digest: "sha256:2ea3b768a8f2dcd4d910f838d79702bb952089414dd578146619c0a939647ac6"
     pullPolicy: IfNotPresent
   # Story 12.7: sized for the default model. Memory is what it needs to
-  # hold the model and a 16k context (under-requesting gets it OOM-killed);
-  # CPU request 1 with NO limit, so it fits a 4-vCPU node next to everything
-  # else and still uses every idle core. values-full.yaml requests the
-  # measured 2.
+  # hold the model and a 16k context (under-requesting gets it OOM-killed).
+  # CPU: request 1 and LIMIT 2. On a small node an unlimited CPU model
+  # starves NATS, Falco and the aggregator while it thinks (seen in CI on
+  # 4-vCPU runners: every JetStream fetch timed out), and detection matters
+  # more than verdict speed. values-full.yaml (8 vCPU, measured) requests 2
+  # and lifts the limit.
   resources:
     requests:
       cpu: "1"
       memory: 3Gi
     limits:
+      cpu: "2"
       memory: 6Gi
   # Extra environment for the Ollama server, e.g. OLLAMA_CONTEXT_LENGTH
   # (pair with the provider's MaxContextTokens knob per the runbook's
@@ -1615,6 +1625,13 @@ ollama:
     # @schema type:object effect:"expected `ollama list` ID per pulled model; the pull Job fails on drift" ref:NFR31
     expectedIds:
       "qwen2.5:3b-instruct": "357c53fb659c"
+    # Story 12.7 review: hold the model server in Init until every pulled
+    # model is on disk (the Story 10.6 behaviour, kept by values-full.yaml).
+    # Off by default so a plain install never waits on, or fails over, the
+    # download: the server starts at once and picks the model up when the
+    # pull Job has written it; until then the chain is llm_unavailable.
+    # @schema type:boolean effect:"hold the model server until the pulled models are on disk (helm --wait then waits for the download)" ref:FR48
+    waitForModels: false
 
 # --- Subchart overrides ------------------------------------------------
 # Only opinions we impose on the downstream charts live here -- upstream

@@ -9,11 +9,13 @@
 // private key published in a release asset and shared by every install. Here
 // every install gets its own material, and it never leaves the cluster.
 //
-// Run is idempotent. A Secret that already holds the expected keys is reused
-// as it is, never replaced, so a re-run (an upgrade, a re-apply of
-// install.yaml) cannot rotate a certificate under a running receiver. The
-// webhook caBundle is written on every run, which repairs a webhook
-// configuration that was recreated.
+// Run is idempotent. A complete set certgen made itself, for the same names
+// and server address, is reused as it is, so a re-run (a re-apply of
+// install.yaml) cannot rotate a certificate under a running receiver. A
+// set that is incomplete, not certgen's, or made for other names or another
+// server is replaced. The webhook caBundle is written on every run; the Job
+// runs again only when its pod template changes or it is deleted (see
+// AUDIT.md for rotation and recovery).
 package certgen
 
 import (
@@ -217,13 +219,18 @@ func (g generator) ensureAudit(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if tlsOK && kcOK {
+	if tlsOK && kcOK && ours(tlsS) && ours(kcS) &&
+		covers(tlsS.Data[keyCert], g.spec.AuditDNSNames, g.spec.AuditIPs) &&
+		bytes.Contains(kcS.Data[keyKubeconfig], []byte("server: https://"+g.spec.AuditServer+"/audit\n")) {
 		g.log.Info("certgen: audit material exists; reusing it", "secret", g.spec.AuditSecret)
 		return tlsS.Data[keyCA], nil
 	}
 	if tlsS != nil || kcS != nil {
-		g.log.Warn("certgen: audit material is incomplete; generating a new set (restart the collector so the receiver loads it)",
-			"secret", g.spec.AuditSecret, "kubeconfig_secret", g.spec.AuditKubeconfigSecret)
+		// Incomplete, not made by certgen (an operator-mode Secret left
+		// behind, whose ca.crt is the apiserver client CA), or made for
+		// another address or Service name: a new set.
+		g.log.Warn("certgen: audit material is incomplete, foreign, or for another address; generating a new set (restart the collector so the receiver loads it, and re-copy the kubeconfig to the API server)",
+			"secret", g.spec.AuditSecret, "kubeconfig_secret", g.spec.AuditKubeconfigSecret, "server", g.spec.AuditServer)
 	}
 
 	ca, caKey, err := newCA("olaitan-audit-ca", g.validity)
@@ -271,9 +278,13 @@ func (g generator) ensureApplog(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if ok {
+	if ok && ours(s) && covers(s.Data[keyCert], g.spec.ApplogDNSNames, nil) {
 		g.log.Info("certgen: applog material exists; reusing it", "secret", g.spec.ApplogSecret)
 		return s.Data[keyCA], nil
+	}
+	if s != nil {
+		g.log.Warn("certgen: applog material is incomplete, foreign, or for other names; generating a new set (restart the injector so it loads it)",
+			"secret", g.spec.ApplogSecret)
 	}
 	ca, caKey, err := newCA("olaitan-applog-ca", g.validity)
 	if err != nil {
@@ -297,19 +308,28 @@ func (g generator) ensureApplog(ctx context.Context) ([]byte, error) {
 // race (AlreadyExists) it returns whatever the winner stored.
 func (g generator) put(ctx context.Context, name string, typ corev1.SecretType, data map[string][]byte, current *corev1.Secret) (*corev1.Secret, error) {
 	if current != nil {
-		upd := current.DeepCopy()
-		upd.Data = data
-		if upd.Labels == nil {
-			upd.Labels = map[string]string{}
+		// Two tries: a write between our Get and this Update (a conflict)
+		// is retried once on the fresh object.
+		for attempt := 0; ; attempt++ {
+			upd := current.DeepCopy()
+			upd.Data = data
+			if upd.Labels == nil {
+				upd.Labels = map[string]string{}
+			}
+			for k, v := range g.labels() {
+				upd.Labels[k] = v
+			}
+			out, err := g.secrets().Update(ctx, upd, metav1.UpdateOptions{})
+			if err == nil {
+				return out, nil
+			}
+			if !apierrors.IsConflict(err) || attempt > 0 {
+				return nil, fmt.Errorf("certgen: update Secret %s: %w", name, err)
+			}
+			if current, err = g.secrets().Get(ctx, name, metav1.GetOptions{}); err != nil {
+				return nil, fmt.Errorf("certgen: re-read Secret %s after a conflict: %w", name, err)
+			}
 		}
-		for k, v := range g.labels() {
-			upd.Labels[k] = v
-		}
-		out, err := g.secrets().Update(ctx, upd, metav1.UpdateOptions{})
-		if err != nil {
-			return nil, fmt.Errorf("certgen: update Secret %s: %w", name, err)
-		}
-		return out, nil
 	}
 	s := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: g.spec.Namespace, Labels: g.labels()},
@@ -412,6 +432,30 @@ func untilFound(ctx context.Context, wait time.Duration, what string, fn func() 
 			delay *= 2
 		}
 	}
+}
+
+// ours reports whether certgen made the Secret (its managed-by label).
+func ours(s *corev1.Secret) bool {
+	return s != nil && s.Labels["app.kubernetes.io/managed-by"] == ManagedByLabel
+}
+
+// covers reports whether the PEM serving cert is valid for every DNS name
+// and IP the spec asks for.
+func covers(certPEM []byte, dns, ips []string) bool {
+	blk, _ := pem.Decode(certPEM)
+	if blk == nil {
+		return false
+	}
+	c, err := x509.ParseCertificate(blk.Bytes)
+	if err != nil {
+		return false
+	}
+	for _, n := range append(append([]string{}, dns...), ips...) {
+		if c.VerifyHostname(n) != nil {
+			return false
+		}
+	}
+	return true
 }
 
 func serial() (*big.Int, error) {

@@ -338,15 +338,21 @@ spec:
         - name: containerd-socket
           hostPath:
             path: {{ dir (include "olaitan.containerd.socketPath" .) | quote }}
-            # Story 12.7 (supersedes Story 1.8 P3's `Directory`): the
-            # sensor is on by default, and `Directory` kept the WHOLE
+            # Story 12.7 (supersedes Story 1.8 P3's `Directory` for /run):
+            # the sensor is on by default, and `Directory` kept the WHOLE
             # collector pod, Falco ingest included, from starting on any
             # node without this directory (CRI-O, a k3s the chart did not
-            # detect). DirectoryOrCreate costs an empty directory on the
-            # node's /run (tmpfs, gone on reboot) where containerd is
-            # absent; the adapter then finds no socket, the source stays
-            # unhealthy and the collector log names the path.
+            # detect). Under /run, DirectoryOrCreate costs an empty
+            # directory on the node's tmpfs (gone on reboot) where
+            # containerd is absent; the adapter then finds no socket, the
+            # source stays unhealthy and the collector log names the path.
+            # A socket path you set OUTSIDE /run keeps `Directory`: a typo
+            # there must fail loudly, not leave a directory on every node.
+            {{- if hasPrefix "/run/" (include "olaitan.containerd.socketPath" .) }}
             type: DirectoryOrCreate
+            {{- else }}
+            type: Directory
+            {{- end }}
         {{- end }}
         {{- if and .Values.calicoSensor.enabled (ne (include "olaitan.calico.tlsMode" .) "none") }}
         - name: cni-tls

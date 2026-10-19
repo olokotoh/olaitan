@@ -47,10 +47,8 @@ ollama:
     # null, not {}: Helm merges a map, so {} would keep the default's key.
     expectedIds: null
 aggregator:
-  # The default carries the 30x role budget for the CPU model; with no LLM
-  # tier it has nothing to scale.
-  extraEnv: []
-  # The pre-12.7 per-package scoring (no risk window).
+  # The pre-12.7 per-package scoring (no risk window). With no LLM tier the
+  # chart renders no role-budget multiplier either.
   riskWindowSeconds: 0
 
 response:

@@ -145,6 +145,14 @@ ollama:
   resources:
     requests:
       cpu: "2"
+    limits:
+      # null lifts the default's 2-CPU limit: the measured profile uses
+      # every idle core of an 8-vCPU node.
+      cpu: null
+  pull:
+    # Story 10.6 behaviour: the model server is Ready only once the model is
+    # on disk, so make up / e2e-full start with a model that can answer.
+    waitForModels: true
 
 # --- Falco on kind (moved here from the Story 10.7 overlay) -------------
 # The kind mount-product-files hook exception, copied verbatim from

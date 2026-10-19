@@ -206,6 +206,16 @@ func TestBlockingIsOffByDefaultAndOneFlagTurnsItOn(t *testing.T) {
 	if aggregatorGrants(t, def, "pods", "delete") {
 		t.Error("the default aggregator can delete pods; with forensics on by default that would kill workloads with blocking off")
 	}
+	for _, kind := range []string{"ClusterRole", "Role"} {
+		for _, r := range docsOfKind(t, def, kind) {
+			for _, rule := range asList(r["rules"]) {
+				rm, _ := rule.(map[string]any)
+				if containsAny(asList(rm["resources"]), "networkpolicies") && (containsAny(asList(rm["verbs"]), "create") || containsAny(asList(rm["verbs"]), "delete")) {
+					t.Errorf("%s %v can write NetworkPolicies with blocking off", kind, dig(r, "metadata", "name"))
+				}
+			}
+		}
+	}
 
 	on := renderArgs(t, "--set", "response.networkPolicy.enabled=true")
 	if !renderedConfig(t, on).Response.NetworkPolicy.EnabledOrDefault() {
@@ -213,6 +223,20 @@ func TestBlockingIsOffByDefaultAndOneFlagTurnsItOn(t *testing.T) {
 	}
 	if !aggregatorGrants(t, on, "pods", "delete") {
 		t.Error("with the blocking switch on, the aggregator cannot delete pods, so the post-capture kill cannot run")
+	}
+	for _, v := range []string{"create", "update", "delete"} {
+		found := false
+		for _, r := range docsOfKind(t, on, "ClusterRole") {
+			for _, rule := range asList(r["rules"]) {
+				rm, _ := rule.(map[string]any)
+				if containsAny(asList(rm["resources"]), "networkpolicies") && containsAny(asList(rm["verbs"]), v) {
+					found = true
+				}
+			}
+		}
+		if !found {
+			t.Errorf("with the blocking switch on, no ClusterRole grants %s on networkpolicies", v)
+		}
 	}
 	if !aggregatorGrants(t, on, "pods/log", "get") {
 		t.Error("forensic capture needs pods/log get")
@@ -242,7 +266,8 @@ func TestDefaultRenderHoldsNoKeyMaterial(t *testing.T) {
 	for _, kind := range []string{"MutatingWebhookConfiguration", "ValidatingWebhookConfiguration"} {
 		for _, w := range docsOfKind(t, rendered, kind) {
 			for _, hook := range asList(w["webhooks"]) {
-				if _, ok := dig(hook, "clientConfig").(map[string]any)["caBundle"]; ok {
+				cc, _ := dig(hook, "clientConfig").(map[string]any)
+				if _, ok := cc["caBundle"]; ok {
 					t.Errorf("%s %v renders a caBundle; certgen patches it and a rendered one would be reset on every apply", kind, dig(w, "metadata", "name"))
 				}
 			}
@@ -551,6 +576,9 @@ func TestRiskWindowOnByDefault(t *testing.T) {
 	files, _ := filepath.Glob(filepath.Join(chartDir(t), "values-eval*.yaml"))
 	files = append(files, filepath.Join(chartDir(t), "values-minimal.yaml"))
 	for _, f := range files {
+		// values-eval-egress.yaml is not an arm: it only opens TCP 443
+		// egress for a hosted model and is layered with an arm overlay,
+		// which carries the pin.
 		if filepath.Base(f) == "values-eval-egress.yaml" {
 			continue
 		}
@@ -563,5 +591,62 @@ func TestRiskWindowOnByDefault(t *testing.T) {
 		if !strings.Contains(notes, want) {
 			t.Errorf("install notes lack %q next to the blocking switch", want)
 		}
+	}
+}
+
+// TestReviewRound1Guards pins the bmad-code-review round-1 patches.
+func TestReviewRound1Guards(t *testing.T) {
+	// E2: Fail + generated TLS would deadlock pod creation.
+	if _, err := renderArgsErr(t, "--set", "applogSidecar.webhook.failurePolicy=Fail"); err == nil {
+		t.Error("applog failurePolicy=Fail with generated TLS rendered; it deadlocks pod creation until certgen runs")
+	}
+	// E7: a deleted deferredRedisAddr is still auto-filled.
+	cfg := renderedConfig(t, renderArgs(t, "--set", "response.reportArchive.deferredRedisAddr=null"))
+	if cfg.Response.ReportArchive.DeferredRedisAddr == "" {
+		t.Error("deferredRedisAddr=null left the deferred queue without an address; the aggregator would refuse its config")
+	}
+	// E12: a socket path outside /run keeps the loud Directory check.
+	ds := docNamed(t, renderArgs(t, "--set", "containerdSensor.socketPath=/var/lib/custom/containerd.sock"), "DaemonSet", "olaitan-collector")
+	if typ, _ := dig(volumeNamed(ds, "containerd-socket"), "hostPath", "type").(string); typ != "Directory" {
+		t.Errorf("a custom socket path outside /run renders hostPath type %q, want Directory", typ)
+	}
+	// A1/A2: the default model server does not wait for the download; the
+	// full profile does; the default CPU-limits the model, the full profile
+	// does not.
+	def := renderArgs(t)
+	if strings.Contains(def, "wait-for-models") {
+		t.Error("the default model server waits in Init for the download; a plain helm install --wait would block on 1.9 GB")
+	}
+	stub := filepath.Join(filepath.Dir(chartDir(t)), "testdata", "full-profile", "stub-key-material.yaml")
+	full := renderArgs(t, "-f", filepath.Join(chartDir(t), "values-full.yaml"), "-f", stub)
+	if !strings.Contains(full, "wait-for-models") {
+		t.Error("the full profile lost the Story 10.6 wait for the model")
+	}
+	cpuLimit := func(r string) any {
+		c := podContainers(docNamed(t, r, "Deployment", "olaitan-ollama"), "containers")["ollama"]
+		return dig(c, "resources", "limits", "cpu")
+	}
+	if l := cpuLimit(def); l != "2" {
+		t.Errorf("default Ollama CPU limit = %v, want 2 (an unlimited CPU model starves detection on a small node)", l)
+	}
+	if l := cpuLimit(full); l != nil {
+		t.Errorf("full profile Ollama CPU limit = %v, want none", l)
+	}
+	// E6: any pod-template change renames the certgen Job.
+	jobName := func(args ...string) string {
+		for _, j := range docsOfKind(t, renderArgs(t, args...), "Job") {
+			if n, _ := dig(j, "metadata", "name").(string); strings.HasPrefix(n, "olaitan-certgen-") {
+				return n
+			}
+		}
+		return ""
+	}
+	if a, b := jobName(), jobName("--set", "image.pullPolicy=Always"); a == "" || a == b {
+		t.Errorf("certgen Job name did not change with the pod template (%q, %q); an upgrade would hit an immutable field", a, b)
+	}
+	// A11: an in-cluster model nobody provisions is DEGRADED in the notes.
+	air := renderNotes(t, []string{"ollama.pull.models=null", "ollama.pull.expectedIds=null"})
+	if !strings.Contains(air, "[DEGRADED] LLM analyst") {
+		t.Error("notes report the LLM ON although no model is pulled or provided")
 	}
 }

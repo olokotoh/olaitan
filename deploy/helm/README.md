@@ -228,8 +228,8 @@ kubectl delete pvc olaitan-reports
 ## Scope — what this chart does NOT do
 
 - **CRDs** — `OlaitanStatus` (Target tier, Story 10.5) is not scaffolded here.
-- **Audit webhook** — rendered by the chart (on by default since Story 12.7); wiring the kube-apiserver to it is operator-side, see AUDIT.md.
-- **TLS material for Calico** — the audit webhook and applog injector
+- **Audit webhook**: rendered by the chart (on by default since Story 12.7); wiring the kube-apiserver to it is operator-side, see AUDIT.md.
+- **TLS material for Calico**: the audit webhook and applog injector
   certificates are generated in the cluster by the certgen Job (Story
   12.7), but the Goldmane client certificate must come from the Tigera CA
   (CNI.md Path A or B).
