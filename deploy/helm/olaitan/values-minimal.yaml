@@ -50,6 +50,8 @@ aggregator:
   # The default carries the 30x role budget for the CPU model; with no LLM
   # tier it has nothing to scale.
   extraEnv: []
+  # The pre-12.7 per-package scoring (no risk window).
+  riskWindowSeconds: 0
 
 response:
   override:

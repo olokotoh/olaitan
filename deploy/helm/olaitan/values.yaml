@@ -139,6 +139,21 @@ aggregator:
   extraEnv:
     - name: OLT_LLM_ROLE_TIMEOUT_MULTIPLIER
       value: "30"
+  # Story 12.7 (live finding, 2026-10-19): the rolling per-workload risk
+  # window (ADR-2026-08-17-01 Option B), rendered as OLT_RISK_WINDOW_SECONDS.
+  # ON by default: without it the FSM scores each evidence package alone, and
+  # no single package can reach RESTRICTED (the rule term tops out at
+  # 0.4 x 95 = 38, below the band), so the blocking switch would never
+  # block. With it, a workload's strongest rule match, baseline deviation and
+  # capped LLM confidence within the window add up. 900 s (15 minutes): long
+  # enough to hold a multi-step attack's signals together, as verified live
+  # (kind-full, AWS, 2026-10-19), and short enough that a quiet workload
+  # de-escalates within the hour. 0 turns it off (the pre-12.7 per-package
+  # scoring, which the evaluation overlays and values-minimal.yaml pin so
+  # recorded campaigns stay reproducible). An OLT_RISK_WINDOW_SECONDS entry
+  # in extraEnv wins. Restart-required (the env change rolls the pod).
+  # @schema type:integer minimum:0 maximum:604800 effect:"rolling per-workload risk window in seconds (OLT_RISK_WINDOW_SECONDS); 0 is per-package scoring" ref:FR30
+  riskWindowSeconds: 900
   # 256Mi request / 512Mi limit. NFR5 targets "< 200 MB steady state",
   # but 256Mi leaves headroom for fsnotify watch buffers (1.6) and
   # future LLM context assembly (Epic 4). The 512Mi limit prevents OOM

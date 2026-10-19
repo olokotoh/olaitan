@@ -917,6 +917,43 @@ Fail on values the chart-owned Redis cannot honour (review round 1 of Story
 {{- end -}}
 
 {{/*
+Story 12.7 (live finding, 2026-10-19): checksum of the rendered config, the
+`data` of every ConfigMap in templates/configmap.yaml (olaitan.yaml and the
+rules). A helm upgrade that changed only the config (analyst.provider, say)
+left the aggregator on the old config, because restart-required settings are
+read at startup and the pod template did not move. With this on the pod
+templates, a config change rolls the aggregator and the collector, and a
+no-change upgrade rolls nothing. Only `data` is hashed: the labels carry the
+chart version, and hashing them would roll on every version bump.
+*/}}
+{{- define "olaitan.configChecksum" -}}
+{{- $data := list -}}
+{{- range $doc := splitList "\n---" (include (print .Template.BasePath "/configmap.yaml") .) -}}
+{{- $m := fromYaml $doc -}}
+{{- if $m.data -}}{{- $data = append $data $m.data -}}{{- end -}}
+{{- end -}}
+{{- if not $data -}}{{- fail "olaitan.configChecksum: templates/configmap.yaml rendered no ConfigMap data" -}}{{- end -}}
+{{- $data | toJson | sha256sum -}}
+{{- end -}}
+
+{{/*
+Story 12.7 (live finding): the risk window TTL, validated. Prints the seconds
+as plain digits, or nothing when it is 0 (off). Without the window no single
+evidence package reaches RESTRICTED (the rule term alone tops out at 0.4 x 95
+= 38), so the blocking switch would never block.
+*/}}
+{{- define "olaitan.riskWindowSeconds" -}}
+{{- $v := toString (default 0 .Values.aggregator.riskWindowSeconds) -}}
+{{- if not (regexMatch "^(0|[1-9][0-9]*)$" $v) -}}
+{{- fail (printf "aggregator.riskWindowSeconds is %q: want whole seconds, 0 to 604800 (0 turns the risk window off)" $v) -}}
+{{- end -}}
+{{- if gt (int64 $v) 604800 -}}
+{{- fail (printf "aggregator.riskWindowSeconds is %s: the aggregator caps the window at 604800 (7 days)" $v) -}}
+{{- end -}}
+{{- if ne $v "0" -}}{{- $v -}}{{- end -}}
+{{- end -}}
+
+{{/*
 Story 12.7: everything on by default. These helpers decide, per part, how
 the chart renders it on THIS cluster, so the templates, the config bridge
 and NOTES.txt can never disagree.

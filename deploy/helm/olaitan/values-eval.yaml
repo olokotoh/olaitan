@@ -59,3 +59,10 @@ baselines:
 # docs/helm-values.md, "logging level"). The eval base sets the knobs that
 # DO exist; the debug-level intent is recorded as a follow-up rather than
 # fabricated as a fake key.
+
+# Story 12.7: the chart turns the risk window on by default (900 s). The
+# recorded evaluation campaigns scored each package on its own
+# (ADR-2026-08-17-01: off was the reproducible default), so this arm pins
+# it off to stay comparable with them.
+aggregator:
+  riskWindowSeconds: 0

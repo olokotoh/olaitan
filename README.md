@@ -98,6 +98,16 @@ helm upgrade olaitan oci://ghcr.io/olokotoh/charts/olaitan \
   --set response.networkPolicy.enabled=true
 ```
 
+What blocking does at each state: RESTRICTED blocks only egress outside the
+private ranges (RFC 1918 and the cluster CIDRs stay open, so in-cluster
+traffic and DNS keep flowing, by design), QUARANTINED blocks all traffic in
+and out, and PRESERVED_KILLED deletes the pods once their evidence is
+uploaded. A workload gets there through the risk window, on by default
+(`aggregator.riskWindowSeconds`, 900 s): it adds up a workload's rule,
+baseline and capped LLM signals across packages. Without it each package is
+scored alone and none scores high enough for RESTRICTED (the rule term tops
+out at 38), so blocking would never trigger.
+
 Prove your CNI enforces NetworkPolicy before you rely on it
 (`hack/check-netpol-enforcement.sh`): stock kind accepts every policy and
 enforces none. `install.yaml` is the default values, so it is observe-only;

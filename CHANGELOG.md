@@ -134,7 +134,15 @@ and false-positive numbers; see [Unreleased](#unreleased).
   or in `install.yaml`; operator material and cert-manager work as before.
   `values-full.yaml` keeps only the kind full-profile specifics; the new
   `values-minimal.yaml` is the earlier observe-only core, and the
-  ring-level e2e targets and CI jobs layer it. Upgrading: a plain
+  ring-level e2e targets and CI jobs layer it. The rolling risk window
+  (ADR-2026-08-17-01) is on by default, `aggregator.riskWindowSeconds:
+  900`: without it no single package can reach RESTRICTED, so the
+  blocking switch would never block; the evaluation overlays and
+  `values-minimal.yaml` pin it to 0 so recorded campaigns stay
+  reproducible. A `checksum/config` annotation on the aggregator and
+  collector pod templates now rolls them when the rendered config changes
+  (a `helm upgrade` that changed `analyst.provider` used to leave the
+  aggregator on the old config until a manual restart). Upgrading: a plain
   `helm upgrade` picks the new defaults up; `--reuse-values` keeps the
   previous chart's defaults (Helm 3 reuses them, see Story 12.6), so it
   turns nothing new on. Use `--reset-then-reuse-values` to keep your own

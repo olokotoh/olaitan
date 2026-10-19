@@ -2368,6 +2368,9 @@ spec:
         app.kubernetes.io/instance: olaitan
         app.kubernetes.io/component: collector
       annotations:
+        # Story 12.7: a config change rolls the collector (the source
+        # adapters are wired at startup).
+        checksum/config: "bc6ab008354f76e9264c52096070776c3f3ebf1cafcc359777bbbc41a08b704c"
         prometheus.io/scrape: "true"
         prometheus.io/port: "9090"
         prometheus.io/path: "/metrics"
@@ -2799,6 +2802,9 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9090"
         prometheus.io/path: "/metrics"
+        # Story 12.7: a config change rolls the aggregator (restart-required
+        # settings such as analyst.provider are read at startup).
+        checksum/config: "bc6ab008354f76e9264c52096070776c3f3ebf1cafcc359777bbbc41a08b704c"
     spec:
       serviceAccountName: olaitan-aggregator
       securityContext:
@@ -2921,6 +2927,11 @@ spec:
             # this empty and size the NATS PVC instead.
             - name: OLT_NATS_STREAM_MAXBYTES_OVERRIDE
               value: "536870912"
+            # Story 12.7: the rolling per-workload risk window, on by default
+            # (aggregator.riskWindowSeconds; 0 turns it off). An
+            # OLT_RISK_WINDOW_SECONDS in aggregator.extraEnv wins.
+            - name: OLT_RISK_WINDOW_SECONDS
+              value: "900"
             # Operator-supplied aggregator environment (PR #92 review: the
             # risk-window and LLM-timeout knobs, OLT_RISK_WINDOW_SECONDS and
             # OLT_LLM_ROLE_TIMEOUT_MULTIPLIER, previously had no committed

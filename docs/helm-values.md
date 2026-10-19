@@ -27,6 +27,7 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 |-------|------|---------|-------------|--------|-----|
 | `aggregator.replicas` | integer | `1` | 1 to 1 | aggregator replica count and the chart's worker-pool surface; HARD CONSTRAINT at 1 (rings are cooperative goroutines in one process) until leader election lands | NFR20 |
 | `aggregator.extraEnv` | array | `[{name: "OLT_LLM_ROLE_TIMEOUT_MULTIPLIER", value: "30"}]` | - | operator-supplied aggregator environment as {name, value} pairs; the committed mechanism for OLT_RISK_WINDOW_SECONDS, OLT_LLM_ROLE_TIMEOUT_MULTIPLIER, OLT_LLM_CHAIN_WORKERS and OLT_LLM_CHAIN_QUEUE; the default carries the 30x role budget the in-cluster CPU model needs | FR30 |
+| `aggregator.riskWindowSeconds` | integer | `900` | 0 to 604800 | rolling per-workload risk window in seconds (OLT_RISK_WINDOW_SECONDS); 0 is per-package scoring | FR30 |
 
 ## `correlator`
 

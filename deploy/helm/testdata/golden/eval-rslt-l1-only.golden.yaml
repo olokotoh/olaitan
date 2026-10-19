@@ -2368,6 +2368,9 @@ spec:
         app.kubernetes.io/instance: olaitan
         app.kubernetes.io/component: collector
       annotations:
+        # Story 12.7: a config change rolls the collector (the source
+        # adapters are wired at startup).
+        checksum/config: "5aa4baeafc5e4045b5db88faa8765ca45905f9cd44a9ef428f8987bf1c234054"
         prometheus.io/scrape: "true"
         prometheus.io/port: "9090"
         prometheus.io/path: "/metrics"
@@ -2799,6 +2802,9 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9090"
         prometheus.io/path: "/metrics"
+        # Story 12.7: a config change rolls the aggregator (restart-required
+        # settings such as analyst.provider are read at startup).
+        checksum/config: "5aa4baeafc5e4045b5db88faa8765ca45905f9cd44a9ef428f8987bf1c234054"
     spec:
       serviceAccountName: olaitan-aggregator
       securityContext:

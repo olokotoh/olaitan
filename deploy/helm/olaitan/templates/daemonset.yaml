@@ -76,8 +76,10 @@ spec:
       {{- /* Story 12.7: certgen-made material is not rendered, so it has no
              render-time checksum (and certgen never replaces it). */ -}}
       {{- $auditChartTLS := and .Values.auditWebhook.enabled (eq (include "olaitan.auditWebhook.tlsMode" .) "operator") }}
-      {{- if or $scrape $auditChartTLS $cniPathB }}
       annotations:
+        # Story 12.7: a config change rolls the collector (the source
+        # adapters are wired at startup).
+        checksum/config: {{ include "olaitan.configChecksum" . | quote }}
         {{- if $scrape }}
         prometheus.io/scrape: "true"
         prometheus.io/port: {{ .Values.metrics.containerPort | quote }}
@@ -89,7 +91,6 @@ spec:
         {{- if $cniPathB }}
         checksum/cni-tls: {{ include "olaitan.tlsSecretChecksum" (dict "root" . "template" "cni-tls-secret.yaml") | quote }}
         {{- end }}
-      {{- end }}
     spec:
       serviceAccountName: {{ include "olaitan.collector.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}

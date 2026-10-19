@@ -1660,6 +1660,8 @@ eval_run_ids:   TBD (Epic 5 evaluation harness wires the metric surface into per
 
 ### The rolling per-workload risk window (PR #92, ADR-2026-08-17-01)
 
+**Story 12.7.** The Helm chart now turns the window ON by default (`aggregator.riskWindowSeconds: 900`, rendered as `OLT_RISK_WINDOW_SECONDS`): without it no single package reaches RESTRICTED, so the blocking switch (`response.networkPolicy.enabled`) would never block. "Off by default" below is the binary's own default (the env var unset); the evaluation overlays and `values-minimal.yaml` set `riskWindowSeconds: 0` to keep that per-package scoring for reproducible campaigns. A config or env change now rolls the aggregator (a `checksum/config` pod annotation), so a value change takes effect on `helm upgrade` with no manual restart.
+
 **What it is.** Off by default, the FSM consumer scores each package's own
 signals in isolation (the pre-window behaviour, byte-identical). With
 `OLT_RISK_WINDOW_SECONDS=<ttl>` set on the aggregator, the consumer scores a

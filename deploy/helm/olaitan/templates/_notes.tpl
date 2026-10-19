@@ -257,6 +257,8 @@ ENFORCEMENT
 
       hack/check-netpol-enforcement.sh
 
+{{- include "olaitan.notes.blockingSemantics" . }}
+
   It pushes real traffic through a deny-all policy and tells you which of the
   two worlds you are in. If it reports NOT ENFORCED, set
   response.networkPolicy.enabled=false until you have a CNI that enforces --
@@ -281,6 +283,7 @@ ENFORCEMENT
   It turns on NetworkPolicy isolation AND the post-capture kill of forensic
   capture. Turning it on is a deliberate act: run
   hack/check-netpol-enforcement.sh first to confirm your CNI really enforces.
+{{- include "olaitan.notes.blockingSemantics" . }}
 {{- end }}
 
 STORAGE
@@ -330,4 +333,27 @@ IF SOMETHING IS OFF THAT YOU EXPECTED TO BE ON
   It probes storage, privileged-workload admission, NetworkPolicy ENFORCEMENT
   and each optional source against this cluster, and prints the exact remedy
   flag for each one. It changes nothing.
+{{- end -}}
+
+
+{{/*
+Story 12.7 (live finding, 2026-10-19): what blocking does at each state, and
+the risk window that lets a workload reach those states at all.
+*/}}
+{{- define "olaitan.notes.blockingSemantics" -}}
+{{- $rw := include "olaitan.riskWindowSeconds" . }}
+
+  What blocking does: RESTRICTED blocks only egress outside the private ranges
+  (RFC 1918 and the cluster CIDRs stay open, so in-cluster traffic and DNS
+  keep flowing, by design); QUARANTINED blocks all traffic in and out;
+  PRESERVED_KILLED deletes the pods after their evidence is uploaded.
+  {{- if $rw }}
+  The risk window ({{ $rw }} s, aggregator.riskWindowSeconds) adds up a
+  workload's signals across packages; without it no single package scores
+  high enough to reach RESTRICTED.
+  {{- else }}
+  The risk window is OFF (aggregator.riskWindowSeconds=0): each package is
+  scored alone, and no single package scores high enough to reach
+  RESTRICTED, so blocking would never trigger. Set it (900 is the default).
+  {{- end }}
 {{- end -}}

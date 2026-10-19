@@ -43,3 +43,10 @@ analyst:
 # The Epic-5 cmd/olaitan-eval runner applies this arm overlay on its own
 # (single --values); the layered composition is render-tested in
 # deploy/helm/helm_test.go.
+
+# Story 12.7: the chart turns the risk window on by default (900 s). The
+# recorded evaluation campaigns scored each package on its own
+# (ADR-2026-08-17-01: off was the reproducible default), so this arm pins
+# it off to stay comparable with them.
+aggregator:
+  riskWindowSeconds: 0
