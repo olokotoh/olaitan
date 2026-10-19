@@ -54,6 +54,12 @@ const fetchBackoff = time.Second
 // outlive the window's typical workload churn.
 const identityCacheTTLCeiling = 60 * time.Second
 
+// aggregateNegativeTTL bounds how long an unresolvable Goldmane aggregate
+// stays negative-cached. It matches Goldmane's 15s aggregation interval: a
+// workload created moments before its first flow batch is looked up again
+// on the next batch instead of staying blind for a whole identity TTL.
+const aggregateNegativeTTL = 15 * time.Second
+
 // Config configures a Correlator.
 type Config struct {
 	NATS                  *natsclient.Client
@@ -98,6 +104,13 @@ type Correlator struct {
 
 	identityCache    sync.Map // map[string]identityCacheEntry, key = namespace + "/" + podName
 	identityCacheTTL time.Duration
+	// aggregateMisses negative-caches Goldmane aggregates that no pod or
+	// ReplicaSet backs (key = namespace + "/" + aggregate name, value =
+	// expiry time.Time), so a stream of their flows costs one lookup per
+	// aggregateNegativeTTL rather than one per event (Story 10.7 property).
+	aggregateMisses sync.Map
+	// now is the clock for cache expiry; nil means time.Now (tests inject).
+	now func() time.Time
 
 	// Story 1.18 observability surface. metrics handles are nil when
 	// cfg.MetricsRegistry was nil at construction time; every hot-path
@@ -487,7 +500,7 @@ func (c *Correlator) resolveAndCacheIdentity(ctx context.Context, ev schema.Even
 		return "", schema.WorkloadIdentity{}, nil, fmt.Errorf("event %q missing pod namespace/name", ev.ID)
 	}
 	key := ref.Namespace + "/" + ref.Name
-	now := time.Now()
+	now := c.clock()
 	if entry, ok := c.identityCache.Load(key); ok {
 		ce, _ := entry.(identityCacheEntry)
 		if now.Before(ce.expiry) {
@@ -496,7 +509,17 @@ func (c *Correlator) resolveAndCacheIdentity(ctx context.Context, ev schema.Even
 		c.identityCache.Delete(key)
 	}
 
-	workloadID, identity, pod, err := c.resolveIdentityUncached(ctx, ref)
+	var (
+		workloadID string
+		identity   schema.WorkloadIdentity
+		pod        *corev1.Pod
+		err        error
+	)
+	if prefix, ok := goldmaneAggregatePrefix(ev); ok {
+		workloadID, identity, pod, err = c.resolveAggregateCached(ctx, key, ref.Namespace, prefix, now)
+	} else {
+		workloadID, identity, pod, err = c.resolveIdentityUncached(ctx, ref)
+	}
 	if err != nil {
 		return "", schema.WorkloadIdentity{}, nil, err
 	}
@@ -509,14 +532,25 @@ func (c *Correlator) resolveAndCacheIdentity(ctx context.Context, ev schema.Even
 	return workloadID, identity, pod, nil
 }
 
+// clock returns the correlator's notion of now (time.Now unless a test
+// injected a clock).
+func (c *Correlator) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
 func (c *Correlator) resolveIdentityUncached(ctx context.Context, ref schema.PodRef) (string, schema.WorkloadIdentity, *corev1.Pod, error) {
 	// Story 10.7. Validate the ref as a key BEFORE asking the apiserver. A ref
-	// the key layer rejects (a Goldmane aggregate such as "coredns-abc-*", or
-	// the "-" namespace of a non-pod endpoint) cannot name a real pod, since
-	// Kubernetes names are a strict subset of the allowed token characters,
-	// and every branch below would reject it anyway. Rejected refs are not
-	// cached, so without this each one cost a rate-limited Pod GET and the
-	// correlator fell behind the event stream on a five-source install.
+	// the key layer rejects (the "-" namespace of a non-pod endpoint, or a "*"
+	// that is not a network-source Goldmane aggregate) cannot name a real pod,
+	// since Kubernetes names are a strict subset of the allowed token
+	// characters, and every branch below would reject it anyway. Rejected refs
+	// are not cached, so without this each one cost a rate-limited Pod GET and
+	// the correlator fell behind the event stream on a five-source install.
+	// Goldmane aggregates ("web-bd846c7f-*") never reach this function: they
+	// take resolveAggregateCached (Story 11.2b).
 	fallbackID, err := keys.PodFallbackID(ref.Namespace, ref.Name)
 	if err != nil {
 		return "", schema.WorkloadIdentity{}, nil, err
@@ -531,9 +565,17 @@ func (c *Correlator) resolveIdentityUncached(ctx context.Context, ref schema.Pod
 		}
 		return "", schema.WorkloadIdentity{}, nil, fmt.Errorf("resolve pod %s/%s: %w", ref.Namespace, ref.Name, err)
 	}
+	return c.identityForPod(ctx, pod, fallbackID)
+}
+
+// identityForPod walks a real pod's owner chain to its workload identity
+// (posture.ResolveWorkloadIdentity, the walk every Falco/audit/runtime event
+// takes) and keys it. fallbackID is the orphan-pod ID used when the owner
+// walk fails.
+func (c *Correlator) identityForPod(ctx context.Context, pod *corev1.Pod, fallbackID string) (string, schema.WorkloadIdentity, *corev1.Pod, error) {
 	identity, err := posture.ResolveWorkloadIdentity(ctx, c.kube, pod)
 	if err != nil {
-		return fallbackID, schema.WorkloadIdentity{Namespace: ref.Namespace, OwnerKind: "Pod", OwnerName: ref.Name, PodName: ref.Name}, pod, nil
+		return fallbackID, schema.WorkloadIdentity{Namespace: pod.Namespace, OwnerKind: "Pod", OwnerName: pod.Name, PodName: pod.Name}, pod, nil
 	}
 	if identity.OwnerKind == "Pod" {
 		id, ferr := keys.PodFallbackID(identity.Namespace, identity.OwnerName)

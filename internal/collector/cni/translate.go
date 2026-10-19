@@ -28,7 +28,12 @@
 // on-demand workload posture client (Story 1.11) at
 // EvidencePackage assembly time. Doing the K8s API lookup inline
 // would violate the read-on-demand posture pattern and break the
-// NFR1 50 ms receive-to-publish budget.
+// NFR1 50 ms receive-to-publish budget. The correlator side lives in
+// internal/correlator/goldmane_aggregate.go (Story 11.2b): Goldmane
+// renders the set as the GenerateName plus "*" ("web-bd846c7f-*"),
+// which the correlator resolves to a live pod of the set and that
+// pod's owning workload, so a flow and a Falco event from the same
+// Deployment share one WorkloadID.
 //
 // Source-health naming. The schema enum value is "network" (the
 // abstract category, mirroring the five-source enum bootstrap in
