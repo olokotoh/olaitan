@@ -816,8 +816,13 @@ returns, the consumer folds the capped LLM confidence into the workload's
 risk window, re-scores, and evaluates the FSM again with the triggering
 `package_id`, so a model verdict that changes the state is its own
 `AUDIT.transitions` event (its transition log line carries
-`"source":"analyst_chain"` and `llm_capped`). A zero verdict (degraded,
-error, no citable evidence) is not re-evaluated. A chain panic is recovered
+`"source":"analyst_chain"` and `llm_capped`). The re-score is
+escalate-only: it is evaluated only when it points to a band ABOVE the
+workload's current state, so a model verdict can never start the
+de-escalation cooldown or reset the kill-sustain clock (the deterministic
+path keeps sole ownership of de-escalation); a non-escalating verdict is
+still folded into the risk window for later packages. A zero verdict
+(degraded, error, no citable evidence) is not re-evaluated. A chain panic is recovered
 to a zero verdict, never crashing a worker or the FSM. `mode` is the configured chain
 boundary: `full` (L1->L2->Senior), `l1_l2` (Senior ablated off), or
 `l1_only` (L2 + Senior ablated off). `outcome` is `not_triggered` (the
@@ -836,11 +841,13 @@ provider/transport problem:
 `result`; Story 7.4). One increment per LLM-eligible package (past the FR19
 gate and the breaker) by the async dispatch decision: `dispatched` (queued
 for a worker), `coalesced` (a chain for the same workload was already
-queued or running, so none was started; the in-flight chain already
-investigates that workload), or `queue_full` (all
-`OLT_LLM_CHAIN_WORKERS` + `OLT_LLM_CHAIN_QUEUE` slots were taken; the
-deterministic score still drove the FSM, only the model verdict is
-skipped). The breaker counts coalesced and rejected packages exactly as
+queued, running or not yet applied, so none was started; the in-flight
+chain already investigates that workload, and the newer package's own
+evidence still drove the FSM deterministically), or `queue_full` (all
+`OLT_LLM_CHAIN_WORKERS` + `OLT_LLM_CHAIN_QUEUE` in-flight slots were taken;
+the deterministic score still drove the FSM, only the model verdict is
+skipped). A JetStream redelivery of the package whose chain is still in
+flight is left to that chain (not acked, not re-evaluated, not counted). The breaker counts coalesced and rejected packages exactly as
 before, so FR51 cost accounting is unchanged. A sustained `queue_full`
 rate means the model is too slow for the alert volume: add workers (if the
 model can serve them), use a GPU or hosted model, or lower the breaker
@@ -848,8 +855,9 @@ rate: `sum(rate(olaitan_investigation_chain_dispatch_total{result="queue_full"}[
 
 **Chain pool knobs (Story 7.4).** Set through `aggregator.extraEnv`:
 `OLT_LLM_CHAIN_WORKERS` (concurrent chains, 1 to 32, default 2) and
-`OLT_LLM_CHAIN_QUEUE` (admitted chains waiting for a worker, 0 to 1024,
-default 16). An invalid value logs `invalid integer value; using default`
+`OLT_LLM_CHAIN_QUEUE` (extra in-flight slots beyond the workers: chains
+waiting for a worker or finished but not yet applied, 0 to 1024, default
+16). An invalid value logs `invalid integer value; using default`
 naming the variable. The startup line `aggregator: investigation chain runs
 async (deterministic score first) workers=N queue=M` confirms the values.
 With a single CPU model, more workers only make each chain slower; keep the
@@ -898,11 +906,15 @@ un-checkpointed steps (the Senior is never checkpointed, so a post-L2 restart
 re-runs only the Senior). Story 7.4 keeps this: the deterministic transition
 happens at once, but a package whose chain was dispatched stays un-acked
 until the chain's verdict has been applied, and the consumer marks it
-in-progress every 10 s so JetStream (AckWait 30 s) does not redeliver it
-while a slow model runs. On shutdown the consumer waits up to 10 s for
-in-flight chains; packages whose chain did not finish stay un-acked and are
-redelivered after restart, where the deterministic score is evaluated again
-(at-least-once, as before) and the chain resumes from its checkpoints. Checkpointing is best-effort durability: a publish
+in-progress every 10 s from dispatch (queued chains included) so JetStream
+(AckWait 30 s) does not redeliver it while it waits or a slow model runs.
+On shutdown the consumer starts no queued chain, gives running chains up to
+10 s to finish, applies and acks every finished verdict, then cancels the
+rest. Packages whose chain did not finish stay un-acked and are redelivered
+after restart, where the deterministic score is evaluated again
+(at-least-once, as before) and the chain resumes from its checkpoints. A
+heartbeat or ack failure is logged (`in-flight chain heartbeat failed`,
+`fsm consumer ack failed`). Checkpointing is best-effort durability: a publish
 or read failure logs and the step re-runs, never aborting the chain. A
 6h-stale checkpoint simply means the chain re-runs from scratch (the retention
 floor). Operational note: the INVESTIGATIONS stream is NOT a SIEM audit
@@ -1685,7 +1697,9 @@ after its package was scored. It is folded into the window with its own TTL
 starting when it ARRIVES, and the re-score uses the workload's LIVE signals
 only: a verdict that lands after the triggering rule match decayed does not
 revive it. With the window disabled the re-score is the triggering
-package's own signals plus the verdict.
+package's own signals plus the verdict, and the verdict is NOT retained for
+later packages (as before, each package scores on its own signals); the
+escalate-only rule keeps that stale re-score from pulling the FSM down.
 
 **Related knobs.** `OLT_LLM_ROLE_TIMEOUT_MULTIPLIER` (same `aggregator.extraEnv`
 mechanism) scales every per-role LLM timeout budget by a positive finite

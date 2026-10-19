@@ -918,8 +918,10 @@ jobs:
 
       - name: In-process integration suites
         run: |
+          # Story 7.4: only the embedded-JetStream consumer test from the
+          # main package (its unit tests already run in `make test`).
+          go test -tags=integration -race -count=1 -run '^TestIntegration_' ./cmd/olaitan/
           go test -tags=integration -race -count=1 \
-            ./cmd/olaitan/... \
             ./internal/admission/applog/... \
             ./internal/collector/applog/... \
             ./internal/collector/cni/... \

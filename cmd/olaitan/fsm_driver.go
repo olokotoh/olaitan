@@ -56,29 +56,38 @@ const (
 	// keeps a single in-cluster CPU model from being oversubscribed while
 	// still letting a second workload's investigation proceed.
 	defaultChainWorkers = 2
-	// defaultChainQueue is the default number of admitted chains that may
-	// wait for a free worker before new dispatches are rejected.
+	// defaultChainQueue is the default number of extra in-flight slots
+	// beyond the workers (chains waiting for a worker, or finished but not
+	// yet applied) before new dispatches are rejected.
 	defaultChainQueue = 16
 	maxChainWorkers   = 32
 	maxChainQueue     = 1024
 
-	// chainHeartbeat is how often an in-flight chain's message is marked
-	// InProgress. It must stay well under fsmConsumerAckWait.
+	// chainHeartbeat is how often a dispatched package's message is marked
+	// InProgress, from dispatch until its verdict is applied (queued jobs
+	// included). TestChainHeartbeatWellUnderAckWait pins it below a third of
+	// fsmConsumerAckWait.
 	chainHeartbeat = 10 * time.Second
-	// chainShutdownGrace bounds how long the consumer waits for in-flight
-	// chains after cancellation.
+	// chainShutdownGrace bounds how long shutdown lets RUNNING chains finish
+	// (their verdicts are then applied and acked) before cancelling them.
 	chainShutdownGrace = 10 * time.Second
+	// chainAbortGrace bounds the wait for workers after that cancellation.
+	chainAbortGrace = 2 * time.Second
 )
 
 // chainRunFunc runs the chain for one admitted package and returns the
-// per-provider-capped LLM confidence (0 on error / degrade / panic).
-type chainRunFunc func(ctx context.Context, pkg schema.EvidencePackage) int
+// per-provider-capped LLM confidence (0 on error / degrade / panic) and
+// whether the chain reached an outcome. completed is false only when the
+// run was cut short by cancellation: that package must stay un-acked so
+// JetStream redelivers it and the Story 3.9 checkpoints resume the chain.
+type chainRunFunc func(ctx context.Context, pkg schema.EvidencePackage) (capped int, completed bool)
 
 // chainJob is one admitted package plus its JetStream message controls.
 type chainJob struct {
 	pkg        schema.EvidencePackage
 	ack        func()
 	inProgress func()
+	stopBeat   func() // stops the dispatch-time heartbeat; set by dispatch
 }
 
 // chainResult is a finished chain, handed back to the consumer goroutine.
@@ -101,14 +110,20 @@ type chainDispatcher struct {
 	log        *slog.Logger
 	heartbeat  time.Duration
 
+	ctx      context.Context // worker + heartbeat context, set by start
+	cancel   context.CancelFunc
+	quit     chan struct{} // closed by shutdown: workers take no new job
+	quitOnce sync.Once
+
 	mu       sync.Mutex
-	inflight map[string]struct{}
+	inflight map[string]string // workload id -> triggering package id
 	wg       sync.WaitGroup
 }
 
-// newChainDispatcher builds a pool of workers goroutines (min 1) with room
-// for queue admitted chains waiting for a worker (min 0). The total in-flight
-// capacity is workers+queue; the job and result channels are sized to it, so
+// newChainDispatcher builds a pool of workers goroutines (min 1) with queue
+// extra in-flight slots (min 0). The total in-flight capacity is
+// workers+queue and counts chains waiting for a worker, running, or finished
+// but not yet applied; the job and result channels are sized to it, so
 // neither a dispatch nor a worker's result hand-off ever blocks.
 func newChainDispatcher(workers, queue int, run chainRunFunc, dispatches *prometheus.CounterVec, log *slog.Logger) *chainDispatcher {
 	if workers < 1 {
@@ -127,47 +142,62 @@ func newChainDispatcher(workers, queue int, run chainRunFunc, dispatches *promet
 		dispatches: dispatches,
 		log:        log,
 		heartbeat:  chainHeartbeat,
-		inflight:   make(map[string]struct{}, capacity),
+		quit:       make(chan struct{}),
+		inflight:   make(map[string]string, capacity),
 	}
 }
 
-// start launches the workers. They stop when ctx is cancelled.
-func (d *chainDispatcher) start(ctx context.Context) {
+// start launches the workers under a child of parent. Production passes a
+// parent that is NOT cancelled with the consumer (context.WithoutCancel), so
+// shutdown can let running chains finish within chainShutdownGrace before it
+// cancels them itself; cancelling parent still stops everything at once.
+func (d *chainDispatcher) start(parent context.Context) {
+	d.ctx, d.cancel = context.WithCancel(parent)
 	for i := 0; i < d.workers; i++ {
 		d.wg.Add(1)
-		go d.worker(ctx)
+		go d.worker()
 	}
 }
 
-func (d *chainDispatcher) worker(ctx context.Context) {
+func (d *chainDispatcher) worker() {
 	defer d.wg.Done()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-d.ctx.Done():
+			return
+		case <-d.quit:
 			return
 		case job := <-d.jobs:
-			stop := d.keepAlive(ctx, job.inProgress)
-			capped := d.run(ctx, job.pkg)
-			stop()
-			if ctx.Err() != nil {
-				// Shutdown cut the chain short: leave the message un-acked
-				// so JetStream redelivers it and the Story 3.9 checkpoints
+			select {
+			case <-d.quit:
+				// Shutting down: do not start a new chain. The package stays
+				// un-acked for redelivery.
+				return
+			default:
+			}
+			capped, completed := d.run(d.ctx, job.pkg)
+			if !completed {
+				// Cancelled mid-chain: leave the message un-acked so
+				// JetStream redelivers it and the Story 3.9 checkpoints
 				// resume the chain after restart.
 				return
 			}
 			select {
 			case d.out <- chainResult{job: job, capped: capped}:
-			case <-ctx.Done():
-				return
+			default:
+				// Unreachable by construction (len(out) <= len(inflight) <=
+				// capacity == cap(out)); never block a worker on it.
+				d.log.Error("aggregator: chain result channel full; result dropped (package stays un-acked for redelivery)",
+					"package_id", job.pkg.PackageID)
 			}
 		}
 	}
 }
 
-// keepAlive marks the job's message InProgress every heartbeat until the
-// returned stop func is called, so a slow chain does not exceed AckWait.
-func (d *chainDispatcher) keepAlive(ctx context.Context, inProgress func()) (stop func()) {
-	if inProgress == nil || d.heartbeat <= 0 {
+// keepAlive marks a message InProgress every heartbeat until the returned
+// stop func is called or the dispatcher context ends.
+func (d *chainDispatcher) keepAlive(inProgress func()) (stop func()) {
+	if inProgress == nil || d.heartbeat <= 0 || d.ctx == nil {
 		return func() {}
 	}
 	done := make(chan struct{})
@@ -180,22 +210,26 @@ func (d *chainDispatcher) keepAlive(ctx context.Context, inProgress func()) (sto
 			select {
 			case <-done:
 				return
-			case <-ctx.Done():
+			case <-d.ctx.Done():
 				return
 			case <-t.C:
 				inProgress()
 			}
 		}
 	}()
+	var once sync.Once
 	return func() {
-		close(done)
-		<-finished
+		once.Do(func() {
+			close(done)
+			<-finished
+		})
 	}
 }
 
 // dispatch admits job to the pool, or coalesces / rejects it, and records the
 // decision. It never blocks. The caller acks the message itself unless the
-// result is dispatched.
+// result is dispatched. A dispatched job is heartbeated from here (not from
+// worker pickup), so a job waiting in the queue does not outlive AckWait.
 func (d *chainDispatcher) dispatch(job chainJob) string {
 	wl := job.pkg.WorkloadID
 	d.mu.Lock()
@@ -206,7 +240,8 @@ func (d *chainDispatcher) dispatch(job chainJob) string {
 	case len(d.inflight) >= d.capacity:
 		result = analyst.ChainDispatchQueueFull
 	default:
-		d.inflight[wl] = struct{}{}
+		d.inflight[wl] = job.pkg.PackageID
+		job.stopBeat = d.keepAlive(job.inProgress)
 		// Cannot block: len(jobs) <= len(inflight) <= capacity == cap(jobs).
 		d.jobs <- job
 	}
@@ -220,6 +255,14 @@ func (d *chainDispatcher) dispatch(job chainJob) string {
 func (d *chainDispatcher) hasLocked(wl string) bool {
 	_, ok := d.inflight[wl]
 	return ok
+}
+
+// inflightPackage returns the triggering package id of the workload's
+// in-flight chain, or "" when none is in flight.
+func (d *chainDispatcher) inflightPackage(wl string) string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.inflight[wl]
 }
 
 // results is the channel of finished chains the consumer drains.
@@ -244,12 +287,29 @@ func (d *chainDispatcher) inflightIDs() []string {
 	return ids
 }
 
-// wait blocks until every worker has exited or bound elapses, and reports
-// whether the workers exited. Call it after cancelling the start context.
-func (d *chainDispatcher) wait(bound time.Duration) bool {
+// shutdown stops the pool: no queued chain is started any more, running
+// chains get up to grace to finish (their results stay in the result channel
+// for the caller to apply), then the rest are cancelled and the workers are
+// waited for up to chainAbortGrace. It reports whether every running chain
+// finished within grace. Heartbeats stop when it returns, so un-applied
+// packages are redelivered after AckWait.
+func (d *chainDispatcher) shutdown(grace time.Duration) bool {
+	d.quitOnce.Do(func() { close(d.quit) })
+	finished := waitGroupWithin(&d.wg, grace)
+	if d.cancel != nil {
+		d.cancel()
+	}
+	if !finished {
+		waitGroupWithin(&d.wg, chainAbortGrace)
+	}
+	return finished
+}
+
+// waitGroupWithin waits for wg up to bound and reports whether it finished.
+func waitGroupWithin(wg *sync.WaitGroup, bound time.Duration) bool {
 	done := make(chan struct{})
 	go func() {
-		d.wg.Wait()
+		wg.Wait()
 		close(done)
 	}()
 	t := time.NewTimer(bound)
@@ -275,8 +335,8 @@ type fsmDriver struct {
 	dispatcher *chainDispatcher // nil = no chain (RS mode / provider=none)
 	now        func() time.Time
 
-	// lastScore is the most recent total passed to Evaluate (diagnostics).
-	lastScore float64
+	// last is the most recent score composition computed (diagnostics).
+	last schema.ConfidenceScore
 }
 
 // handlePackage scores pkg deterministically, evaluates the FSM at once, and
@@ -284,6 +344,17 @@ type fsmDriver struct {
 // ack is called here unless the chain was dispatched, in which case
 // applyResult calls it.
 func (d *fsmDriver) handlePackage(pkg schema.EvidencePackage, ack, inProgress func()) {
+	// A JetStream redelivery of the package whose chain is still in flight
+	// (its AckWait lapsed despite the heartbeat, e.g. across a NATS
+	// reconnect) is the SAME stream message: leave it to the in-flight job,
+	// which acks it when the verdict is applied. Acking it here would settle
+	// the message and lose the Story 3.9 resume; re-evaluating or re-admitting
+	// it would double-count the package in the FSM and the breaker.
+	if d.dispatcher != nil && pkg.PackageID != "" && d.dispatcher.inflightPackage(pkg.WorkloadID) == pkg.PackageID {
+		d.log.Debug("aggregator: redelivery of a package whose chain is in flight; left to the in-flight chain",
+			"workload_id", pkg.WorkloadID, "package_id", pkg.PackageID)
+		return
+	}
 	// time.Now() keeps the monotonic reading so the window's TTL arithmetic
 	// is immune to wall-clock steps (PR #92 review).
 	now := d.now()
@@ -317,7 +388,7 @@ func (d *fsmDriver) handlePackage(pkg schema.EvidencePackage, ack, inProgress fu
 	case analyst.ChainDispatchDispatched:
 		// Acked by applyResult once the verdict is folded (Story 3.9 resume).
 	default:
-		d.log.Info("aggregator: investigation chain not dispatched",
+		d.log.Debug("aggregator: investigation chain not dispatched",
 			"result", res, "workload_id", pkg.WorkloadID, "package_id", pkg.PackageID)
 		ack()
 	}
@@ -330,6 +401,9 @@ func (d *fsmDriver) handlePackage(pkg schema.EvidencePackage, ack, inProgress fu
 // no citable evidence) has nothing to fold and is not re-evaluated.
 func (d *fsmDriver) applyResult(r chainResult) {
 	pkg := r.job.pkg
+	if r.job.stopBeat != nil {
+		r.job.stopBeat()
+	}
 	defer r.job.ack()
 	defer d.dispatcher.complete(pkg.WorkloadID)
 	if r.capped <= 0 {
@@ -342,6 +416,19 @@ func (d *fsmDriver) applyResult(r chainResult) {
 	sc, err := d.scoreCalc.Score(&agg, llm)
 	if err != nil {
 		d.log.Warn("aggregator: fsm re-score failed", "err", err, "package_id", pkg.PackageID)
+		return
+	}
+	// Escalate-only: the verdict re-score is fed to the FSM only when it
+	// points ABOVE the current state. A re-score at or below the current band
+	// (for example because signals decayed while the chain ran, or because a
+	// later package already escalated the workload) would otherwise start the
+	// de-escalation cooldown or reset the kill-sustain anchor on the strength
+	// of a model verdict. The verdict is still folded into the window above,
+	// so later deterministic packages carry it.
+	if !d.machine.ScoreJustifiesEscalation(pkg.WorkloadID, sc.Total) {
+		d.last = sc
+		d.log.Debug("aggregator: analyst verdict folded; re-score does not escalate",
+			"workload_id", pkg.WorkloadID, "package_id", pkg.PackageID, "score", sc.Total, "llm_capped", r.capped)
 		return
 	}
 	d.evaluate(pkg.WorkloadID, pkg.PackageID, sc, "source", "analyst_chain", "llm_capped", r.capped)
@@ -367,7 +454,7 @@ func (d *fsmDriver) drainResults() {
 // re-score, so the deterministic transition line is byte-identical to the
 // pre-Story-7.4 line.
 func (d *fsmDriver) evaluate(workloadID, packageID string, sc schema.ConfidenceScore, extra ...any) {
-	d.lastScore = sc.Total
+	d.last = sc
 	st := d.machine.Evaluate(workloadID, sc.Total, packageID)
 	if st.FromState == st.ToState {
 		return

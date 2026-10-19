@@ -556,6 +556,8 @@ func TestEncapsulation_EvaluateIsSoleMutator(t *testing.T) {
 		"ReleasePin":      true, // operator-override release mutator (Story 2.7 BI-2)
 		"IsPinned":        true, // read-only override-pin query (Story 2.7 BI-8)
 		"PinnedWorkloads": true, // read-only override-pin set query (Story 2.7 BI-4)
+		// read-only escalate-only check for the analyst-chain re-score (Story 7.4)
+		"ScoreJustifiesEscalation": true,
 	}
 	mt := reflect.TypeOf(&Machine{})
 	for i := 0; i < mt.NumMethod(); i++ {
@@ -844,5 +846,55 @@ func TestPin_CleanRoutesRemoval(t *testing.T) {
 	}
 	if last.TriggerType != "override" {
 		t.Errorf("re-pin TriggerType = %q, want override", last.TriggerType)
+	}
+}
+
+// TestScoreJustifiesEscalation pins the Story 7.4 read-only query the
+// analyst-chain re-score uses to stay escalate-only: true only when the score
+// targets a band above the current state, false for equal/lower bands, for a
+// pinned workload, and for QUARANTINED (the kill edge is not a band); and it
+// never inserts an unseen workload.
+func TestScoreJustifiesEscalation(t *testing.T) {
+	m, err := New(nil, nil, NopSink{}, nil) // defaults 20/40/70, SUSPICIOUS dwell 0
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if !m.ScoreJustifiesEscalation("new", 25) {
+		t.Fatal("unseen workload (CLEAN) with score 25 should point upward")
+	}
+	if _, ok := m.CurrentState("new"); ok {
+		t.Fatal("the query must not insert an unseen workload")
+	}
+	if m.ScoreJustifiesEscalation("new", 10) {
+		t.Fatal("score 10 stays CLEAN")
+	}
+	m.Evaluate("wl", 30, "p1") // CLEAN -> SUSPICIOUS
+	if m.ScoreJustifiesEscalation("wl", 35) {
+		t.Fatal("35 is still the SUSPICIOUS band")
+	}
+	if m.ScoreJustifiesEscalation("wl", 5) {
+		t.Fatal("a lower score must never point upward")
+	}
+	if !m.ScoreJustifiesEscalation("wl", 42.5) {
+		t.Fatal("42.5 targets RESTRICTED above SUSPICIOUS")
+	}
+	if err := m.Pin("wl", schema.StateSuspicious, "op"); err != nil {
+		t.Fatalf("Pin: %v", err)
+	}
+	if m.ScoreJustifiesEscalation("wl", 95) {
+		t.Fatal("a pinned workload must report false")
+	}
+	m.ReleasePin("wl")
+	// QUARANTINED is the top band: no score points above it.
+	m.Evaluate("q", 30, "p2")
+	if err := m.Pin("q", schema.StateQuarantined, "op"); err != nil {
+		t.Fatalf("Pin: %v", err)
+	}
+	m.ReleasePin("q")
+	if m.State("q") != schema.StateQuarantined {
+		t.Fatalf("setup: state = %s", m.State("q"))
+	}
+	if m.ScoreJustifiesEscalation("q", 100) {
+		t.Fatal("QUARANTINED must report false (the kill edge is not a band)")
 	}
 }

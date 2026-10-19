@@ -1438,9 +1438,15 @@ and the `AUDIT.assessments` publish; the capped verdict is handed back to
 the consumer goroutine, folded into the window (`risk.Window.FoldLLM`, TTL
 from arrival), re-scored, and evaluated again with the triggering
 `package_id`, so a verdict that moves the band is its own
-`AUDIT.transitions` event. A package with a dispatched chain is acked only
-after its verdict is applied (heartbeated with `InProgress`), so the
-Story 3.9 checkpoint resume still works across a restart.
+`AUDIT.transitions` event. The re-score is ESCALATE-ONLY
+(`fsm.Machine.ScoreJustifiesEscalation`): it reaches `Evaluate` only when
+it points above the current state, so a verdict never drives the
+de-escalation cooldown or resets the kill-sustain anchor. A package with a
+dispatched chain is acked only after its verdict is applied (heartbeated
+with `InProgress` from dispatch), so the Story 3.9 checkpoint resume still
+works across a restart; a redelivery of that package while its chain is in
+flight is left to the chain. Shutdown starts no queued chain, lets running
+chains finish within 10 s, applies their verdicts, then cancels the rest.
 
 **Alternatives considered and rejected.**
 
@@ -1461,7 +1467,8 @@ Story 3.9 checkpoint resume still works across a restart.
 **Trust bound.** Unchanged. Per-provider caps and the calculator's clamp at
 `llm_cap` are untouched; the re-score includes the workload's live
 deterministic terms, so it is never below the deterministic aggregate at
-that instant, and the FSM can only de-escalate through its cooldown path.
+that instant; and because the re-score is escalate-only, de-escalation
+stays with the deterministic path and its cooldown.
 
 **Chapter 3 / evaluation disclosure.** MTTD and "added latency" figures for
 the LLM arms (Table 4.8 RSLT ablation, and any MTTD measured with the chain
@@ -1474,8 +1481,16 @@ numbers are not comparable with post-change runs; they are reported as
 the deterministic (RS arm) MTTD and FPR campaign, whose code path is
 byte-identical (no pool is built when the chain is disabled).
 
-**Risk inherited.** Up to `workers + queue` packages can be un-acked at
-once; after a crash they are redelivered and their deterministic score is
+**Risk inherited.** Coalescing means a newer, stronger package for a
+workload whose chain is in flight is not investigated by the model (its
+deterministic score still acts); the brief asked for one chain per
+workload, and a follow-up re-run is left for operational evidence. With the
+risk window disabled (the shipped default) the verdict is not retained for
+later packages, so a package arriving after the verdict scores on its own
+deterministic signals (before this change each triggering package carried
+its own inline verdict); the FSM state the verdict reached only decays
+through the cooldown. Up to
+`workers + queue` packages can be un-acked at once; after a crash they are redelivered and their deterministic score is
 evaluated again (at-least-once, as for the single in-flight package
 before). The re-score transition is not marked in the `AUDIT.transitions`
 payload itself (the schema extension stays deferred, ADR-2026-08-17-01

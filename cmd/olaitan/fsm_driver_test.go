@@ -81,18 +81,19 @@ func newBlockingRunner(capped int) *blockingRunner {
 	return &blockingRunner{release: make(chan struct{}), capped: capped, started: make(chan string, 16)}
 }
 
-func (b *blockingRunner) run(ctx context.Context, pkg schema.EvidencePackage) int {
+func (b *blockingRunner) run(ctx context.Context, pkg schema.EvidencePackage) (int, bool) {
 	b.calls.Add(1)
 	b.started <- pkg.WorkloadID
 	select {
 	case <-b.release:
-		return b.capped
+		return b.capped, true
 	case <-ctx.Done():
-		return 0
+		return 0, false // cut short: not a verdict
 	}
 }
 
 type driverFixture struct {
+	t     *testing.T
 	d     *fsmDriver
 	sink  *recordingSink
 	logs  *syncBuffer
@@ -140,7 +141,7 @@ func newDriverFixture(t *testing.T, run chainRunFunc, window *risk.Window, worke
 	}
 	logs := &syncBuffer{}
 	log := slog.New(slog.NewJSONHandler(logs, nil))
-	f := &driverFixture{sink: sink, logs: logs, acked: &ackLog{}}
+	f := &driverFixture{t: t, sink: sink, logs: logs, acked: &ackLog{}}
 	f.d = &fsmDriver{log: log, scoreCalc: calc, machine: m, window: window, chainMode: analyst.ChainModeFull, now: time.Now}
 	if run != nil {
 		reg := metrics.NewRegistry()
@@ -157,14 +158,30 @@ func newDriverFixture(t *testing.T, run chainRunFunc, window *risk.Window, worke
 		f.d.dispatcher = f.disp
 		t.Cleanup(func() {
 			cancel()
-			f.disp.wait(2 * time.Second)
+			f.disp.shutdown(2 * time.Second)
 		})
 	}
 	return f
 }
 
+// handle runs the per-package handler under a deadline, so a regression
+// that blocks the consumer on the chain FAILS the test instead of hanging it.
 func (f *driverFixture) handle(pkg schema.EvidencePackage) {
-	f.d.handlePackage(pkg, f.acked.ackFor(pkg.PackageID), func() {})
+	f.handleWith(pkg, func() {})
+}
+
+func (f *driverFixture) handleWith(pkg schema.EvidencePackage, inProgress func()) {
+	f.t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.d.handlePackage(pkg, f.acked.ackFor(pkg.PackageID), inProgress)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		f.t.Fatalf("handlePackage(%s) blocked: the consumer must never wait on the chain", pkg.PackageID)
+	}
 }
 
 // awaitResult blocks until one chain result is available and applies it on
@@ -384,11 +401,11 @@ func TestFSMDriver_ReScoreNeverBelowDeterministic(t *testing.T) {
 		f := newDriverFixture(t, br.run, risk.New(60*time.Second), 2, 4)
 		f.handle(pkgFor("ns/Deployment/a", "p-1", sev))
 		awaitStarted(t, br)
-		det := f.d.lastScore
+		det := f.d.last.Total
 		close(br.release)
 		f.awaitResult(t)
-		if f.d.lastScore < det {
-			t.Fatalf("severity %s: re-score %v below deterministic %v", sev, f.d.lastScore, det)
+		if f.d.last.Total < det {
+			t.Fatalf("severity %s: re-score %v below deterministic %v", sev, f.d.last.Total, det)
 		}
 	}
 }
@@ -436,6 +453,7 @@ func TestFSMDriver_NilChainIdenticalToDeterministicPath(t *testing.T) {
 			}
 		}
 		wantKeys := "from_state,level,msg,package_id,reason,risk_window,score,score_baseline,score_llm,score_rules,time,to_state,workload_id"
+		wantOrder := []string{"time", "level", "msg", "workload_id", "from_state", "to_state", "reason", "score", "score_rules", "score_baseline", "score_llm", "risk_window", "package_id"}
 		for _, line := range strings.Split(strings.TrimSpace(f.logs.String()), "\n") {
 			if !strings.Contains(line, "aggregator: fsm transition") {
 				continue
@@ -452,34 +470,66 @@ func TestFSMDriver_NilChainIdenticalToDeterministicPath(t *testing.T) {
 			if strings.Join(keys, ",") != wantKeys {
 				t.Fatalf("ttl=%v: transition log keys changed:\n got %s\nwant %s", ttl, strings.Join(keys, ","), wantKeys)
 			}
+			// Attribute ORDER is part of the byte-identical line too.
+			if !ordered(line, wantOrder) {
+				t.Fatalf("ttl=%v: transition log attribute order changed: %s", ttl, line)
+			}
 		}
 	}
 }
 
-// (f) Shutdown with an in-flight chain: cancelling the context stops the
-// worker, wait returns within the bound, and the package is NOT acked so
-// JetStream redelivers it and Story 3.9 checkpoints resume the chain.
+// (f) Shutdown with an in-flight chain that does not finish within the
+// grace: it is cancelled, shutdown returns within the bound, and the package
+// is NOT acked, so JetStream redelivers it and Story 3.9 checkpoints resume.
 func TestChainDispatcher_ShutdownWithInFlightChain(t *testing.T) {
 	br := newBlockingRunner(35)
 	f := newDriverFixture(t, br.run, risk.New(0), 2, 4)
 	f.handle(pkgFor("ns/Deployment/a", "p-a1", "80"))
 	awaitStarted(t, br)
 
-	f.stop()
 	start := time.Now()
-	if !f.disp.wait(2 * time.Second) {
-		t.Fatal("workers did not stop after cancellation")
+	if f.disp.shutdown(100 * time.Millisecond) {
+		t.Fatal("a chain still running at the grace must be reported unfinished")
 	}
-	if time.Since(start) > time.Second {
-		t.Fatalf("shutdown took %v", time.Since(start))
+	if el := time.Since(start); el > time.Second {
+		t.Fatalf("shutdown took %v", el)
 	}
+	f.d.drainResults()
 	if f.acked.has("p-a1") {
 		t.Fatal("a chain cut short by shutdown must leave its package un-acked for redelivery")
 	}
-	select {
-	case r := <-f.disp.results():
-		t.Fatalf("a cancelled chain must not deliver a result: %+v", r)
-	default:
+	if n := len(f.sink.all()); n != 1 {
+		t.Fatalf("transitions = %d, want only the deterministic one", n)
+	}
+}
+
+// Graceful shutdown lets a RUNNING chain finish within the grace, and the
+// consumer then applies and acks its verdict (no duplicate assessment after
+// redelivery); a QUEUED chain is not started and stays un-acked.
+func TestChainDispatcher_ShutdownDrainsFinishedChains(t *testing.T) {
+	br := newBlockingRunner(35)
+	f := newDriverFixture(t, br.run, risk.New(0), 1, 4)
+	f.handle(pkgFor("ns/Deployment/a", "p-a1", "80"))
+	awaitStarted(t, br)
+	f.handle(pkgFor("ns/Deployment/b", "p-b1", "80")) // queued behind A
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		close(br.release) // A finishes inside the grace
+	}()
+	if !f.disp.shutdown(2 * time.Second) {
+		t.Fatal("the running chain finished inside the grace")
+	}
+	f.d.drainResults()
+	if !f.acked.has("p-a1") {
+		t.Fatal("a chain that finished inside the grace must be applied and acked")
+	}
+	if f.acked.has("p-b1") || br.calls.Load() != 1 {
+		t.Fatalf("a queued chain must not start during shutdown (runs=%d) and must stay un-acked", br.calls.Load())
+	}
+	got := f.sink.all()
+	if got[len(got)-1].ToState != schema.StateRestricted || got[len(got)-1].PackageID != "p-a1" {
+		t.Fatalf("the drained verdict must be applied as its own transition, got %+v", got)
 	}
 }
 
@@ -488,25 +538,116 @@ func TestChainDispatcher_ShutdownWaitIsBounded(t *testing.T) {
 	stuck := make(chan struct{})
 	defer close(stuck)
 	started := make(chan struct{}, 1)
-	run := func(context.Context, schema.EvidencePackage) int {
+	run := func(context.Context, schema.EvidencePackage) (int, bool) {
 		started <- struct{}{}
 		<-stuck // ignores ctx on purpose
-		return 0
+		return 0, true
 	}
 	d := newChainDispatcher(1, 0, run, nil, chainTestLogger())
-	ctx, cancel := context.WithCancel(context.Background())
-	d.start(ctx)
+	d.start(context.Background())
 	if got := d.dispatch(chainJob{pkg: pkgFor("w", "p", "80"), ack: func() {}, inProgress: func() {}}); got != analyst.ChainDispatchDispatched {
 		t.Fatalf("dispatch = %q", got)
 	}
 	<-started
-	cancel()
 	start := time.Now()
-	if d.wait(100 * time.Millisecond) {
-		t.Fatal("wait must report false when a chain outlives the bound")
+	if d.shutdown(100 * time.Millisecond) {
+		t.Fatal("shutdown must report false when a chain outlives the grace")
 	}
-	if el := time.Since(start); el > time.Second {
-		t.Fatalf("bounded wait took %v", el)
+	if el := time.Since(start); el > chainAbortGrace+time.Second {
+		t.Fatalf("bounded shutdown took %v", el)
+	}
+}
+
+// A queued job (worker busy) is heartbeated from DISPATCH, so it cannot
+// outlive AckWait while it waits for a worker; the heartbeat stops once the
+// verdict is applied.
+func TestChainDispatcher_HeartbeatsQueuedJob(t *testing.T) {
+	br := newBlockingRunner(35)
+	f := newDriverFixture(t, br.run, risk.New(0), 1, 4)
+	f.handle(pkgFor("ns/Deployment/a", "p-a1", "80"))
+	awaitStarted(t, br)
+	var beats atomic.Int64
+	f.handleWith(pkgFor("ns/Deployment/b", "p-b1", "80"), func() { beats.Add(1) })
+	deadline := time.Now().Add(2 * time.Second)
+	for beats.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if beats.Load() < 2 {
+		t.Fatalf("queued job heartbeats = %d, want >= 2 while it waits for a worker", beats.Load())
+	}
+	close(br.release)
+	f.awaitResult(t)
+	awaitStarted(t, br)
+	f.awaitResult(t)
+	n := beats.Load()
+	time.Sleep(30 * time.Millisecond)
+	if beats.Load() != n {
+		t.Fatal("heartbeat must stop once the verdict is applied")
+	}
+}
+
+// The heartbeat must stay well under the consumer's AckWait.
+func TestChainHeartbeatWellUnderAckWait(t *testing.T) {
+	if 3*chainHeartbeat > fsmConsumerAckWait {
+		t.Fatalf("chainHeartbeat %v must be at most a third of fsmConsumerAckWait %v", chainHeartbeat, fsmConsumerAckWait)
+	}
+}
+
+// A JetStream redelivery of the package whose chain is in flight is left to
+// the in-flight job: not acked (that would settle the message and lose the
+// Story 3.9 resume), not re-evaluated, not re-counted by the breaker.
+func TestFSMDriver_RedeliveryOfInFlightPackageLeftAlone(t *testing.T) {
+	br := newBlockingRunner(35)
+	f := newDriverFixture(t, br.run, risk.New(0), 2, 4)
+	f.d.breaker = analyst.NewCircuitBreaker(analyst.CircuitBreakerOptions{RatePerMin: 100, Cooling: time.Minute, Enabled: true})
+	pkg := pkgFor("ns/Deployment/a", "p-a1", "80")
+	f.handle(pkg)
+	awaitStarted(t, br)
+	before := len(f.sink.all())
+	redelivered := &ackLog{}
+	f.d.handlePackage(pkg, redelivered.ackFor("p-a1"), func() {})
+	if redelivered.has("p-a1") {
+		t.Fatal("the redelivered copy must not be acked while its chain is in flight")
+	}
+	if br.calls.Load() != 1 || len(f.sink.all()) != before {
+		t.Fatal("a redelivery must not re-run the chain or re-evaluate")
+	}
+	if v := testutil.ToFloat64(f.cnt.WithLabelValues(analyst.ChainDispatchCoalesced)); v != 0 {
+		t.Fatalf("a redelivery is not a coalesced package, got %v", v)
+	}
+	close(br.release)
+	f.awaitResult(t)
+	if !f.acked.has("p-a1") {
+		t.Fatal("the in-flight job acks the message once the verdict is applied")
+	}
+}
+
+// Escalate-only re-score: a verdict whose re-score does not point above the
+// current state is folded into the window but NOT fed to Evaluate, so it can
+// neither start de-escalation nor reset the kill-sustain anchor. Default
+// (window disabled) mode, where the re-score is the triggering package's own
+// signals: a later package already escalated the workload.
+func TestFSMDriver_StaleVerdictDoesNotEvaluate(t *testing.T) {
+	br := newBlockingRunner(35)
+	f := newDriverFixture(t, br.run, risk.New(0), 2, 4)
+	f.handle(pkgFor("ns/Deployment/a", "p-a1", "80")) // 32: SUSPICIOUS, chain dispatched
+	awaitStarted(t, br)
+	f.handle(pkgFor("ns/Deployment/a", "p-a2", "100")) // 40: RESTRICTED (coalesced)
+	got := f.sink.all()
+	if got[len(got)-1].ToState != schema.StateRestricted {
+		t.Fatalf("setup: want RESTRICTED, got %+v", got)
+	}
+	n := len(got)
+	close(br.release)
+	f.awaitResult(t) // re-score 32 + 10.5 = 42.5: RESTRICTED band = current
+	if len(f.sink.all()) != n {
+		t.Fatalf("a non-escalating verdict must not transition: %+v", f.sink.all())
+	}
+	if strings.Contains(f.logs.String(), `"source":"analyst_chain"`) {
+		t.Fatal("no analyst_chain transition expected")
+	}
+	if !f.acked.has("p-a1") {
+		t.Fatal("the package is still acked")
 	}
 }
 
@@ -517,7 +658,7 @@ func TestChainDispatcher_HeartbeatsInFlightMessage(t *testing.T) {
 	d := newChainDispatcher(1, 0, br.run, nil, chainTestLogger())
 	d.heartbeat = 5 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
-	defer func() { cancel(); d.wait(time.Second) }()
+	defer func() { cancel(); d.shutdown(time.Second) }()
 	d.start(ctx)
 	var beats atomic.Int64
 	d.dispatch(chainJob{pkg: pkgFor("w", "p", "80"), ack: func() {}, inProgress: func() { beats.Add(1) }})
@@ -601,8 +742,9 @@ func TestChainRunFunc_RecoversFromPanic(t *testing.T) {
 		t.Fatalf("NewChain: %v", err)
 	}
 	run := newChainRunFunc(chain, chain.Mode(), &fakeAssessmentPub{}, nil, chainTestLogger())
-	if got := run(context.Background(), triggeringPackage("80")); got != 0 {
-		t.Fatalf("a panicking chain must fold 0, got %d", got)
+	got, completed := run(context.Background(), triggeringPackage("80"))
+	if got != 0 || !completed {
+		t.Fatalf("a panicking chain must fold 0 and count as completed (so a poison package is acked), got %d/%v", got, completed)
 	}
 }
 
@@ -628,4 +770,17 @@ func TestChainPoolEnv(t *testing.T) {
 	if !strings.Contains(buf.String(), "OLT_LLM_CHAIN_WORKERS") || !strings.Contains(buf.String(), "OLT_LLM_CHAIN_QUEUE") {
 		t.Fatalf("invalid values must be warned about by name: %s", buf.String())
 	}
+}
+
+// ordered reports whether the JSON keys appear in line in the given order.
+func ordered(line string, keys []string) bool {
+	pos := -1
+	for _, k := range keys {
+		i := strings.Index(line, `"`+k+`":`)
+		if i <= pos {
+			return false
+		}
+		pos = i
+	}
+	return true
 }

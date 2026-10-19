@@ -150,15 +150,19 @@ func TestIntegration_FSMConsumerScoresBeforeChain(t *testing.T) {
 	close(bp.gate)
 	waitFor("A's model-driven second transition", has("ns/Deployment/a", schema.StateRestricted))
 
+	pending := -1
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if info, err = cons.Info(ctx); err == nil && info.NumAckPending == 0 {
-			break
+		if ci, ierr := cons.Info(ctx); ierr == nil {
+			pending = ci.NumAckPending
+			if pending == 0 {
+				break
+			}
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if info.NumAckPending != 0 {
-		t.Fatalf("ack pending = %d after the verdict was applied, want 0", info.NumAckPending)
+	if pending != 0 {
+		t.Fatalf("ack pending = %d after the verdicts were applied, want 0", pending)
 	}
 	var restricted schema.StateTransition
 	for _, st := range sink.all() {

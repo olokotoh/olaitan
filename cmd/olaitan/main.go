@@ -1785,16 +1785,29 @@ func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, n
 	if chain != nil {
 		workers, queue := chainPoolSize(log)
 		driver.dispatcher = newChainDispatcher(workers, queue, newChainRunFunc(chain, chainMode, auditPub, chainRuns, log), chainDispatches, log)
-		driver.dispatcher.start(ctx)
+		// Workers are NOT cancelled with the consumer: on shutdown the
+		// consumer lets running chains finish within chainShutdownGrace,
+		// applies their verdicts, and only then cancels the rest.
+		driver.dispatcher.start(context.WithoutCancel(ctx))
 		log.Info("aggregator: investigation chain runs async (deterministic score first)",
 			"workers", workers, "queue", queue, "mode", chainMode)
 	}
 
 	g.Go(func() error {
 		defer func() {
-			if driver.dispatcher != nil && !driver.dispatcher.wait(chainShutdownGrace) {
-				log.Warn("aggregator: in-flight investigation chains did not stop within the shutdown grace; their packages stay un-acked for redelivery",
-					"grace", chainShutdownGrace.String(), "workloads", driver.dispatcher.inflightIDs())
+			if driver.dispatcher == nil {
+				return
+			}
+			// Graceful shutdown: start no queued chain, give running chains
+			// up to chainShutdownGrace, apply (and ack) every verdict that
+			// finished, then cancel the rest. Packages whose chain did not
+			// finish stay un-acked: JetStream redelivers them after restart
+			// and the Story 3.9 checkpoints resume the chain.
+			finished := driver.dispatcher.shutdown(chainShutdownGrace)
+			driver.drainResults()
+			if !finished {
+				log.Warn("aggregator: investigation chains still running at the shutdown grace were cancelled; their packages stay un-acked for redelivery",
+					"grace", chainShutdownGrace.String(), "unapplied_workloads", driver.dispatcher.inflightIDs())
 			}
 		}()
 		for {
@@ -1838,7 +1851,18 @@ func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, n
 				continue
 			}
 
-			driver.handlePackage(pkg, func() { _ = msg.Ack() }, func() { _ = msg.InProgress() })
+			pkgID := pkg.PackageID
+			driver.handlePackage(pkg,
+				func() {
+					if aerr := msg.Ack(); aerr != nil {
+						log.Warn("aggregator: fsm consumer ack failed; the package may be redelivered", "err", aerr, "package_id", pkgID)
+					}
+				},
+				func() {
+					if perr := msg.InProgress(); perr != nil {
+						log.Warn("aggregator: in-flight chain heartbeat failed; the package may be redelivered", "err", perr, "package_id", pkgID)
+					}
+				})
 		}
 	})
 	return nil

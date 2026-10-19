@@ -434,15 +434,24 @@ func runChainPackage(ctx context.Context, pkg schema.EvidencePackage, chain *ana
 // that includes a crashing LLM tier. The deterministic rules+baselines score
 // has already driven the FSM by the time this runs (NFR27, Story 7.4).
 func newChainRunFunc(chain *analyst.Chain, mode string, auditPub responseaudit.AssessmentAuditPublisher, runs *prometheus.CounterVec, log *slog.Logger) chainRunFunc {
-	return func(ctx context.Context, pkg schema.EvidencePackage) (capped int) {
+	return func(ctx context.Context, pkg schema.EvidencePackage) (capped int, completed bool) {
 		defer func() {
 			if r := recover(); r != nil {
 				log.Error("aggregator: investigation chain panicked; folding zero LLM confidence (deterministic-only)", "panic", r, "package_id", pkg.PackageID, "mode", mode)
-				capped = 0
+				// A panic is an outcome, not an interruption: completing it
+				// acks the package, so a poison package cannot crash-loop
+				// the chain through redelivery.
+				capped, completed = 0, true
 			}
 		}()
-		capped, _ = runChainPackage(ctx, pkg, chain, auditPub, runs, log)
-		return capped
+		capped, outcome := runChainPackage(ctx, pkg, chain, auditPub, runs, log)
+		// An error while ctx is cancelled is shutdown cutting the chain
+		// short, not a verdict: report it incomplete so the package stays
+		// un-acked and the Story 3.9 checkpoints resume it after restart.
+		if outcome == analyst.ChainOutcomeError && ctx.Err() != nil {
+			return 0, false
+		}
+		return capped, true
 	}
 }
 

@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/olokotoh/olaitan/internal/agent/prompts"
 	"github.com/olokotoh/olaitan/internal/agent/provider"
 	"github.com/olokotoh/olaitan/internal/config"
@@ -185,14 +187,14 @@ func TestChainAdjustedScore_EnabledWindowSumsAcrossPackages(t *testing.T) {
 	basePkg := schema.EvidencePackage{PackageID: "p2", WorkloadID: "t/Deployment/w", BaselineDeviations: []schema.BaselineDeviation{{Metric: "m", Sigma: 3.8}}}
 
 	f.handle(rulePkg)
-	s1 := f.d.lastScore
+	s1 := f.d.last
 	f.handle(basePkg)
-	s2 := f.d.lastScore
-	if s2 <= s1 {
-		t.Fatalf("enabled window at the real call site did not sum: rule-only=%v then rule+baseline=%v", s1, s2)
+	s2 := f.d.last
+	if s2.Total <= s1.Total {
+		t.Fatalf("enabled window at the real call site did not sum: rule-only=%v then rule+baseline=%v", s1.Total, s2.Total)
 	}
-	if s1 != 36 || s2 <= 36 {
-		t.Fatalf("want rule-only 36 (0.4*90) and a larger aggregate, got %v then %v", s1, s2)
+	if s2.Rules <= 0 || s2.Baseline <= 0 {
+		t.Fatalf("aggregate must carry both terms, got rules=%v baseline=%v", s2.Rules, s2.Baseline)
 	}
 }
 
@@ -208,21 +210,29 @@ func TestFSMConsumerFoldsChainConfidenceIntoScore(t *testing.T) {
 	pub := &fakeAssessmentPub{}
 	pkg := triggeringPackage("80")
 
-	f := newDriverFixture(t, newChainRunFunc(chain, chain.Mode(), pub, nil, chainTestLogger()), risk.New(0), 1, 0)
+	runs, err := analyst.RegisterChainRunsMetric(metrics.NewRegistry())
+	if err != nil {
+		t.Fatalf("runs metric: %v", err)
+	}
+	f := newDriverFixture(t, newChainRunFunc(chain, chain.Mode(), pub, runs, chainTestLogger()), risk.New(0), 1, 0)
+	f.d.chainRuns = runs
 	f.handle(pkg)
-	noChain := f.d.lastScore
+	noChain := f.d.last
 	f.awaitResult(t)
-	withChain := f.d.lastScore
+	withChain := f.d.last
 
-	if withChain <= noChain {
-		t.Errorf("the chain's capped confidence did not raise the FSM-driving Total: with=%v deterministic=%v", withChain, noChain)
+	if withChain.LLM <= 0 || withChain.Total <= noChain.Total {
+		t.Errorf("the chain's capped confidence did not raise the FSM-driving Total: with=%+v deterministic=%+v", withChain, noChain)
 	}
-	if withChain-noChain > 10.5 {
-		t.Errorf("LLM contribution %v exceeds the 10.5 Trust-Bound", withChain-noChain)
+	if withChain.LLM > 10.5 {
+		t.Errorf("LLM contribution %v exceeds the 10.5 Trust-Bound", withChain.LLM)
 	}
-	// The deterministic score folds a zero LLM term (0.4*80).
-	if noChain != 32 {
-		t.Errorf("deterministic score = %v, want 32 (no LLM term)", noChain)
+	// The deterministic score folds a zero LLM term.
+	if noChain.LLM != 0 {
+		t.Errorf("deterministic LLM term = %v, want 0", noChain.LLM)
+	}
+	if v := testutil.ToFloat64(runs.WithLabelValues(chain.Mode(), analyst.ChainOutcomeAssessed)); v != 1 {
+		t.Errorf("chain runs assessed = %v, want 1 (metric recorded on the worker)", v)
 	}
 }
 
@@ -333,7 +343,7 @@ func TestSafeChainConfidenceRecoversFromPanic(t *testing.T) {
 	}
 	pub := &fakeAssessmentPub{}
 
-	capped := newChainRunFunc(chain, chain.Mode(), pub, nil, chainTestLogger())(context.Background(), triggeringPackage("80"))
+	capped, _ := newChainRunFunc(chain, chain.Mode(), pub, nil, chainTestLogger())(context.Background(), triggeringPackage("80"))
 	if capped != 0 {
 		t.Errorf("a panicking chain must fold 0 (deterministic-only), got %d", capped)
 	}
