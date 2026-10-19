@@ -96,6 +96,12 @@ func snapshotPackSignal(t *testing.T, rule string) packSignal {
 // TestPackLive is the reserved live gate for the attack packs.
 func TestPackLive(t *testing.T) {
 	requireKindContext(t) // refuse to attack anything but the sanctioned e2e cluster
+	// The detection deltas are read from the aggregator's /metrics on
+	// localhost:9090; open (and, via t.Cleanup, tear down) that port-forward
+	// here like the other e2e harnesses do, so the gate does not depend on an
+	// operator's hand-run forward (live gate 2026-10-19, run 1 failed with
+	// "connection refused" on every case).
+	portForward(t, "deploy/"+defaultReleaseName+"-aggregator", metricsLocalPort, "9090")
 
 	packsRoot := filepath.Join(repoRoot(), "deploy", "demo", "packs")
 	logger := slog.New(slog.NewTextHandler(logWriter{t}, nil))
