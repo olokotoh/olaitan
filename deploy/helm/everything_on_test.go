@@ -650,3 +650,80 @@ func TestReviewRound1Guards(t *testing.T) {
 		t.Error("notes report the LLM ON although no model is pulled or provided")
 	}
 }
+
+// TestReviewRound2Guards pins the round-2 review (Chief of Staff) changes.
+func TestReviewRound2Guards(t *testing.T) {
+	aggEnv := func(args ...string) map[string]string {
+		c := podContainers(docNamed(t, renderArgs(t, args...), "Deployment", "olaitan-aggregator"), "containers")["aggregator"]
+		out := map[string]string{}
+		for _, e := range asList(c["env"]) {
+			em, _ := e.(map[string]any)
+			n, _ := em["name"].(string)
+			v, _ := em["value"].(string)
+			out[n] = v
+		}
+		return out
+	}
+	// 1. The chain's worker count matches Ollama's OLLAMA_NUM_PARALLEL, so
+	// concurrent chain calls do not queue inside one role timeout.
+	if v := aggEnv()["OLT_LLM_CHAIN_WORKERS"]; v != "1" {
+		t.Errorf("default OLT_LLM_CHAIN_WORKERS = %q, want 1 (OLLAMA_NUM_PARALLEL is 1)", v)
+	}
+	if v := aggEnv("--set", "ollama.extraEnv[0].name=OLLAMA_NUM_PARALLEL", "--set-string", "ollama.extraEnv[0].value=3")["OLT_LLM_CHAIN_WORKERS"]; v != "3" {
+		t.Errorf("OLT_LLM_CHAIN_WORKERS = %q with OLLAMA_NUM_PARALLEL=3, want 3", v)
+	}
+	if v, ok := aggEnv("--set", "evaluation.config=RSL")["OLT_LLM_CHAIN_WORKERS"]; ok {
+		t.Errorf("a hosted-provider arm renders OLT_LLM_CHAIN_WORKERS=%q; the cap is for the in-cluster model only", v)
+	}
+
+	// 3. certgen is out of the release policy (whose API-server egress needs
+	// lookup) and has its own policy that does not.
+	r := renderArgs(t)
+	nps := decodeNetpols(t, r)
+	release := nps["olaitan"]
+	excluded := false
+	for _, e := range release.Spec.PodSelector.MatchExpressions {
+		if e.Key == "app.kubernetes.io/component" && e.Operator == "NotIn" {
+			for _, v := range e.Values {
+				if v == "certgen" {
+					excluded = true
+				}
+			}
+		}
+	}
+	if !excluded {
+		t.Error("the release NetworkPolicy selects the certgen pod; under helm template its API-server egress is only 10.96.0.1/32")
+	}
+	cg := docNamed(t, r, "NetworkPolicy", "olaitan-certgen")
+	if lbl, _ := dig(cg, "spec", "podSelector", "matchLabels", "app.kubernetes.io/component").(string); lbl != "certgen" {
+		t.Errorf("certgen policy selects %v, want the certgen component", dig(cg, "spec", "podSelector"))
+	}
+	if len(asList(dig(cg, "spec", "ingress"))) != 0 {
+		t.Error("certgen policy admits ingress; it serves nothing")
+	}
+	ports := map[any]bool{}
+	for _, rule := range asList(dig(cg, "spec", "egress")) {
+		if len(asList(dig(rule, "to"))) != 0 {
+			t.Errorf("certgen egress rule %v is limited to peers; the API server address is not knowable at render", rule)
+		}
+		for _, p := range asList(dig(rule, "ports")) {
+			ports[dig(p, "port")] = true
+		}
+	}
+	for _, p := range []int{443, 6443} {
+		if !ports[p] {
+			t.Errorf("certgen policy lacks API-server egress on %d", p)
+		}
+	}
+	if _, ok := decodeNetpols(t, renderArgs(t, "-f", filepath.Join(chartDir(t), "values-minimal.yaml")))["olaitan-certgen"]; ok {
+		t.Error("certgen policy renders without the certgen Job")
+	}
+
+	// 3/4. NOTES make a certgen failure findable and say the socket is read-only.
+	notes := renderNotes(t, nil)
+	for _, want := range []string{"kubectl -n default get job -l app.kubernetes.io/component=certgen", "mounted read-only"} {
+		if !strings.Contains(notes, want) {
+			t.Errorf("install notes lack %q", want)
+		}
+	}
+}
