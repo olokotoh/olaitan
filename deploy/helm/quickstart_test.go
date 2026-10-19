@@ -183,7 +183,11 @@ func shippedExclusions(t *testing.T) []string {
 var (
 	planInstall = regexp.MustCompile(`(?m)^\+ helm install olaitan (\S+)(.*)$`)
 	planExec    = regexp.MustCompile(`(?m)^\+ kubectl (?:--context \S+ )?-n (\S+) exec \S+ -- cat /etc/shadow$`)
-	planWaitAll = regexp.MustCompile(`(?m)^\+ kubectl (?:--context \S+ )?-n olaitan wait pod --all --for=condition=Ready`)
+	// Story 12.7: every workload pod; the default install's Job pods
+	// (certgen, the model pull) complete and are never Ready, and the model
+	// server is Ready only once the 1.9 GB model is down, which the
+	// detection does not need.
+	planWaitAll = regexp.MustCompile(`(?m)^\+ kubectl (?:--context \S+ )?-n olaitan wait pod -l !batch\.kubernetes\.io/job-name,app\.kubernetes\.io/component!=ollama --for=condition=Ready`)
 	planPodImg  = regexp.MustCompile(`--image=(\S+)`)
 )
 

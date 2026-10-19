@@ -370,28 +370,36 @@ func ollamaListID(list, model string) string {
 	return ""
 }
 
-// profileExpectedModelIDs reads ollama.pull.expectedIds from the profile
-// file in the repo: the IDs the profile pins its pulled model tags to.
+// profileExpectedModelIDs reads ollama.pull.expectedIds from the chart in the
+// repo: the IDs the pulled model tags are pinned to. Story 12.7 moved the pin
+// from values-full.yaml into the chart defaults (values.yaml), which the full
+// profile inherits; a values-full.yaml pin, if one is ever set again, wins.
 func profileExpectedModelIDs() (map[string]string, error) {
 	_, here, _, ok := runtime.Caller(0)
 	if !ok {
 		return nil, errors.New("runtime.Caller failed")
 	}
-	b, err := os.ReadFile(filepath.Join(filepath.Dir(here), "..", "..", "deploy", "helm", "olaitan", "values-full.yaml"))
-	if err != nil {
-		return nil, err
+	ids := map[string]string{}
+	for _, f := range []string{"values.yaml", "values-full.yaml"} {
+		b, err := os.ReadFile(filepath.Join(filepath.Dir(here), "..", "..", "deploy", "helm", "olaitan", f))
+		if err != nil {
+			return nil, err
+		}
+		var v struct {
+			Ollama struct {
+				Pull struct {
+					ExpectedIDs map[string]string `yaml:"expectedIds"`
+				} `yaml:"pull"`
+			} `yaml:"ollama"`
+		}
+		if err := yaml.Unmarshal(b, &v); err != nil {
+			return nil, fmt.Errorf("%s: %w", f, err)
+		}
+		for k, id := range v.Ollama.Pull.ExpectedIDs {
+			ids[k] = id
+		}
 	}
-	var v struct {
-		Ollama struct {
-			Pull struct {
-				ExpectedIDs map[string]string `yaml:"expectedIds"`
-			} `yaml:"pull"`
-		} `yaml:"ollama"`
-	}
-	if err := yaml.Unmarshal(b, &v); err != nil {
-		return nil, fmt.Errorf("values-full.yaml: %w", err)
-	}
-	return v.Ollama.Pull.ExpectedIDs, nil
+	return ids, nil
 }
 
 // configuredChain reads the analyst configuration of the LIVE release from
@@ -451,7 +459,7 @@ func TestRealLLM_RealIncidentOnFullProfile(t *testing.T) {
 			t.Fatal(err)
 		}
 		if exp := ids[want.Model]; exp == "" || got != exp {
-			t.Fatalf("the in-cluster %q has ID %q, want %q (values-full.yaml ollama.pull.expectedIds)", want.Model, got, exp)
+			t.Fatalf("the in-cluster %q has ID %q, want %q (the chart's ollama.pull.expectedIds)", want.Model, got, exp)
 		}
 	}
 

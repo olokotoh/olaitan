@@ -280,7 +280,7 @@ func TestRealLLMCheckUsesTheFamilyCap(t *testing.T) {
 }
 
 // TestOllamaListID (review round 1, P6): the e2e reads the model's ID from
-// `ollama list` and compares it with the ID values-full.yaml pins, so a
+// `ollama list` and compares it with the ID the chart pins, so a
 // re-pushed tag fails the proof instead of passing it with other weights.
 func TestOllamaListID(t *testing.T) {
 	list := "NAME                   ID              SIZE      MODIFIED\n" +
@@ -301,6 +301,6 @@ func TestOllamaListID(t *testing.T) {
 		t.Fatal(err)
 	}
 	if ids["qwen2.5:3b-instruct"] != "357c53fb659c" {
-		t.Errorf("values-full expectedIds = %v, want qwen2.5:3b-instruct pinned to 357c53fb659c", ids)
+		t.Errorf("chart expectedIds = %v, want qwen2.5:3b-instruct pinned to 357c53fb659c", ids)
 	}
 }

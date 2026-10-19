@@ -48,6 +48,14 @@ deviate from the canonical arms (e.g. a one-off experiment), leave
 
 ## Install recipes
 
+**Story 12.7.** The chart default now turns every part on, including the
+in-cluster model, which an RSL or RSLT arm then has configured as its FR28
+fallback. To keep an evaluation comparable with runs made before 12.7,
+install the base with `-f values-minimal.yaml` (the earlier observe-only
+core) before applying an arm overlay; the arm overlays themselves are
+unchanged. Whether the thesis campaign should run on the minimal or the
+full default posture is an open decision for the evaluation owner.
+
 The examples set the bundled Redis password (`secrets.redisPassword`)
 explicitly. It is optional: without it the chart generates one on first
 install and reuses it on upgrade.

@@ -144,7 +144,7 @@ func TestIntegration_SuccessPath(t *testing.T) {
 	sel := map[string]string{"app": "web"}
 	cs, ns := itK8s(sel)
 
-	c, err := New(Config{KMSKeyAlias: integrationState.kmsKey}, cs, up, reg, discardLog())
+	c, err := New(Config{KMSKeyAlias: integrationState.kmsKey, KillAfterCapture: true}, cs, up, reg, discardLog())
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestIntegration_S3Outage(t *testing.T) {
 	sel := map[string]string{"app": "web"}
 	cs, ns := itK8s(sel)
 
-	c, err := New(Config{UploadTimeout: time.Second}, cs, deadUploader, reg, discardLog())
+	c, err := New(Config{UploadTimeout: time.Second, KillAfterCapture: true}, cs, deadUploader, reg, discardLog())
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

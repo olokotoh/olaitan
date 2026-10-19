@@ -30,12 +30,15 @@ openshift:
   # Nobody has run this on a live OpenShift cluster. It is template-verified.
   scc: hostmount-anyuid
 
-auditWebhook:
-  # AVAILABLE on OpenShift, unlike the managed cloud platforms: you control the
-  # control plane, though the supported route is the APIServer config resource
-  # rather than editing kube-apiserver flags directly. Off by default because
-  # it still needs that reconfiguration.
-  enabled: false
+# AUDIT WEBHOOK. AVAILABLE on OpenShift, unlike the managed cloud platforms:
+# you control the control plane, though the supported route is the APIServer
+# config resource rather than editing kube-apiserver flags directly. Story
+# 12.7: on by default, DEGRADED until that reconfiguration points the API
+# server at the receiver.
+#
+# CONTAINERD. OpenShift runs CRI-O, so the chart renders no containerd socket
+# mount here and the NOTES report the sensor DEGRADED; container lifecycle
+# still reaches the agent through Falco.
 
 response:
   networkPolicy:

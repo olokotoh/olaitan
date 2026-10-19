@@ -66,8 +66,10 @@ func TestForensicsConfig_Validate(t *testing.T) {
 // the ResponseConfig.validate() boundary used by Config.Validate.
 func TestForensicsConfig_ValidateViaResponse(t *testing.T) {
 	enabled := true
-	rc := ResponseConfig{Forensics: ForensicsConfig{Enabled: &enabled}}
+	// Story 12.7 (D5): an enabled block with NO store at all is valid (the
+	// controller is DEGRADED at wiring); a partial store must still surface.
+	rc := ResponseConfig{Forensics: ForensicsConfig{Enabled: &enabled, S3Bucket: "b"}}
 	if err := rc.validate(); err == nil {
-		t.Fatal("ResponseConfig.validate must surface an enabled forensics block missing endpoint/bucket")
+		t.Fatal("ResponseConfig.validate must surface an enabled forensics block with a partial store (bucket, no endpoint)")
 	}
 }

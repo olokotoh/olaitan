@@ -154,11 +154,19 @@ spec:
                 secretKeyRef:
                   name: {{ include "olaitan.fullname" . }}-secrets
                   key: s3-access-key
+                  # Story 12.7: optional, so a Secret made without this key
+                  # (the install.yaml recipe) does not stop the pod; empty
+                  # leaves the consumer DEGRADED or unwired, and says so.
+                  optional: true
             - name: S3_SECRET_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ include "olaitan.fullname" . }}-secrets
                   key: s3-secret-key
+                  # Story 12.7: optional, so a Secret made without this key
+                  # (the install.yaml recipe) does not stop the pod; empty
+                  # leaves the consumer DEGRADED or unwired, and says so.
+                  optional: true
             {{- end }}
             {{- if or (and .Values.response .Values.response.notifications .Values.response.notifications.enabled) (and .Values.notifications .Values.notifications.enabled) }}
             # Story 4.8 (NFR8): project the OPTIONAL incident notification webhook
@@ -176,6 +184,10 @@ spec:
                 secretKeyRef:
                   name: {{ include "olaitan.fullname" . }}-secrets
                   key: notifications-webhook-url
+                  # Story 12.7: optional, so a Secret made without this key
+                  # (the install.yaml recipe) does not stop the pod; empty
+                  # leaves the consumer DEGRADED or unwired, and says so.
+                  optional: true
             {{- end }}
             {{- with .Values.nats.streamMaxBytesOverride }}
             # Story 1.19 D6: caps every JetStream stream's MaxBytes at

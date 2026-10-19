@@ -184,20 +184,21 @@ case "$DISTRO" in
   eks|aks|gke)
     no "K8s audit webhook: ${R}unavailable${X} on managed control planes"
     info "needs --audit-webhook-config-file on kube-apiserver, which $DISTRO does not expose."
-    info "leave auditWebhook.enabled=false (the default)." ;;
+    info "it is on by default and would sit DEGRADED: set auditWebhook.enabled=false (values-$DISTRO.yaml does)." ;;
   *)
     ok "K8s audit webhook: possible (you control the API server)"
-    info "enable with auditWebhook.enabled=true + hack/audit-apiserver-patch.yaml" ;;
+    info "on by default; it receives once kube-apiserver is pointed at it (hack/audit-apiserver-patch.yaml, AUDIT.md)" ;;
 esac
 case "$DISTRO" in
-  k3s)  no "containerd socket lives at /run/k3s/containerd/containerd.sock on k3s"
-        info "--set containerdSensor.socketPath=/run/k3s/containerd/containerd.sock" ;;
-  *)    info "containerd sensor: off by default; socket assumed /run/containerd/containerd.sock" ;;
+  k3s)  ok "containerd socket lives at /run/k3s/containerd/containerd.sock on k3s"
+        info "the chart switches to it when it detects k3s; values-k3s.yaml sets it explicitly" ;;
+  *)    info "containerd sensor: on by default; socket assumed /run/containerd/containerd.sock (DEGRADED if absent)" ;;
 esac
 if kubectl get crd 2>/dev/null | grep -q "tigera\|calico"; then
-  ok "Calico detected -- the CNI flow adapter is available"
+  ok "Calico detected -- the CNI flow adapter can work here"
+  info "on by default; DEGRADED until it has a Goldmane client certificate (CNI.md Path A or B)"
 else
-  info "Calico CNI flow adapter: off by default (needs Calico via the Tigera operator)"
+  info "Calico CNI flow adapter: on by default, DEGRADED here (needs Calico via the Tigera operator)"
 fi
 
 # ------------------------------------------------------- 5. host inotify room

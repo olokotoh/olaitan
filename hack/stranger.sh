@@ -223,7 +223,13 @@ main() {
 	st_rollout daemonset
 	st_rollout deployment
 	st_rollout statefulset
-	st_step "infra: rollout" kubectl -n "$ST_NS" wait pod --all --for=condition=Ready --timeout=10m
+	# Story 12.7: the default install runs two Jobs (certgen, the model
+	# pull) whose pods complete and are never Ready; wait for every other
+	# pod, then for both Jobs to complete.
+	st_step "infra: rollout" kubectl -n "$ST_NS" wait pod -l '!batch.kubernetes.io/job-name' --for=condition=Ready --timeout=15m
+	if [ "${STRANGER_PLAN:-}" = "1" ] || [ -n "$(kubectl -n "$ST_NS" get job -o name)" ]; then
+		st_step "infra: rollout" kubectl -n "$ST_NS" wait job --all --for=condition=Complete --timeout=15m
+	fi
 	st_step "infra: rollout" kubectl -n "$ST_NS" wait pod -l app.kubernetes.io/name=falco --for=condition=Ready --timeout=5m
 	st_step "infra: rollout" kubectl -n "$ST_NS" get pods -o wide
 	local t_ready

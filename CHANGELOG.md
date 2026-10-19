@@ -105,6 +105,45 @@ and false-positive numbers; see [Unreleased](#unreleased).
   rendering; the helm test suite runs it on every CI run. v1.0.0-rc4
   predates this and has no `install.yaml`. Deferred review items: #180.
 
+### Changed
+
+- **The default install turns every part on; blocking is one flag** (Story
+  12.7, #208). A plain `helm install` of the chart, and the release
+  `install.yaml`, now run all five sources (Falco, the audit webhook
+  receiver, the containerd runtime sensor, the Calico Goldmane flow sensor,
+  the applog sidecar injector), rules and baselines, the LLM analyst chain
+  (L1, L2, Senior) on the in-cluster `qwen2.5:3b-instruct` the chart pulls
+  (no API key), the SIEM audit trail, the override controller, forensic
+  capture, settling, the DFIR report, the report archive with its deferred
+  queue, and the notification gate. Blocking stays off:
+  `--set response.networkPolicy.enabled=true` is the single switch, and it
+  now also gates the forensic post-capture pod kill and its `delete pods`
+  RBAC (before, forensic capture deleted pods whether or not enforcement
+  was on). A part whose platform prerequisite is missing comes up DEGRADED
+  instead of failing: the install notes list every part as ON or DEGRADED
+  with the reason and the fix; the audit and Calico adapters no longer take
+  the collector down when their TLS material is missing; the collector logs
+  a `source DEGRADED` line per unhealthy source with its last error;
+  forensics and the report archive with no object store configured are
+  logged DEGRADED instead of stopping the aggregator (half a store is still
+  an error); the containerd mount is `DirectoryOrCreate` (a missing socket
+  directory no longer keeps the collector, and Falco ingest, from
+  starting), follows k3s/RKE2, and is not rendered on OpenShift (CRI-O).
+  TLS the chart used to require as values is made in the cluster by a new
+  `olaitan certgen` Job, per install, so no private key is ever in a render
+  or in `install.yaml`; operator material and cert-manager work as before.
+  `values-full.yaml` keeps only the kind full-profile specifics; the new
+  `values-minimal.yaml` is the earlier observe-only core, and the
+  ring-level e2e targets and CI jobs layer it. Upgrading: a plain
+  `helm upgrade` picks the new defaults up; `--reuse-values` keeps the
+  previous chart's defaults (Helm 3 reuses them, see Story 12.6), so it
+  turns nothing new on. Use `--reset-then-reuse-values` to keep your own
+  values and take the new defaults.
+
+### Security
+
+- **golang.org/x/net bumped to v0.61.0** (CVE-2026-78669, PR #207).
+
 ### Fixed
 
 - **The quickstart's score was not the read's** (follows up #177 and #181).

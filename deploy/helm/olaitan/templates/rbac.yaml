@@ -133,9 +133,16 @@ rules:
   # narrower posture (architecture.md RBAC errata: pod delete is a Story 4.2
   # addition gated on the forensic controller). Kubernetes RBAC unions verbs
   # per resource, so this composes additively with the patch/get/list rules.
+  #
+  # Story 12.7 (D6): forensics is on by default, blocking is not. The pod
+  # delete is the post-capture kill, so it renders only with THE blocking
+  # switch (response.networkPolicy.enabled); reading logs for the capture
+  # stays with forensics.
+  {{- if include "olaitan.blocking" . }}
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["delete"]
+  {{- end }}
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]

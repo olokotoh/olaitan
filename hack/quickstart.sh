@@ -369,7 +369,11 @@ main() {
 	# helm --wait counts a DaemonSet ready with one pod unavailable, so on one
 	# node it can return while the collector is still restarting (it and the
 	# aggregator restart a few times until NATS is up). This is the real check.
-	qs_run kubectl "${QS_KCTX[@]}" -n "$QS_NS" wait pod --all --for=condition=Ready --timeout=10m
+	# Story 12.7: everything is on by default, which brings two Jobs (certgen,
+	# the model pull) whose pods complete and are never Ready, so the wait
+	# skips Job pods. The model pull (about 1.9 GB) is not on the clock: the
+	# detection below does not need the model, and NOTES reports it.
+	qs_run kubectl "${QS_KCTX[@]}" -n "$QS_NS" wait pod -l '!batch.kubernetes.io/job-name,app.kubernetes.io/component!=ollama' --for=condition=Ready --timeout=10m
 	local t_ready
 	t_ready="$(date +%s)"
 	[ "$plan" = "1" ] || qs_say "every pod Ready after $((t_ready - t0))s"

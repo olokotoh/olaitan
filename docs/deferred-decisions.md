@@ -1503,3 +1503,51 @@ same `package_id` on a later transition, and by that package's
 
 **Provenance.** Story 7.4, issue #186; traceability row
 `c3.6.4-async-analyst-chain`.
+
+---
+
+## ADR-2026-10-19-02: Everything on by default; webhook TLS made in the cluster; blocking is one switch
+
+**Status.** Accepted (Story 12.7, #208). Decision owner: Aslim, 2026-10-19:
+a plain `helm install` and the release `install.yaml` turn every part on;
+blocking (`response.networkPolicy.enabled`) stays off behind one flag.
+
+**TLS material (D1).** The audit receiver and the applog injector need TLS
+material the chart used to require as values. Generating it in the template
+(`genCA`/`genSignedCert`, reused through `lookup`) was rejected: `helm
+template` renders `install.yaml`, so one private key would ship in a public
+release asset and be shared by every install (Story 12.4 D5). Requiring
+cert-manager was rejected: most fresh clusters lack it, and "everything on"
+would fail there. Chosen: a one-shot Job, `olaitan certgen`, on the Olaitan
+image (no new third-party image to pin). It creates the missing Secrets in
+the cluster, per install, never replaces existing ones, and writes the CA
+into the two webhook configurations' caBundle, which the templates leave out
+in this mode so an upgrade or re-apply keeps it. Its RBAC is limited by
+resource name. Operator material and cert-manager keep their paths; half a
+set fails the render. The Goldmane client certificate is not generated: it
+must be signed by the Tigera CA, and reading Tigera's keys out of
+`calico-system` by default is not acceptable, so the Calico sensor runs
+DEGRADED until Path A or B is configured.
+
+**Degraded, never broken.** Audit and Calico adapters became optional
+sources (as containerd did in Story 10.9); the collector logs a `source
+DEGRADED` line per unhealthy source with its last error. Forensics and the
+report archive with no object store at all are DEGRADED rather than a
+startup error (a partial store still fails). The containerd socket mount
+became `DirectoryOrCreate`, superseding the Story 1.8 P3 review choice of
+`Directory`: `Directory` stopped the whole collector pod, Falco ingest
+included, on any node without the directory; the cost is an empty directory
+on a tmpfs `/run`. In-cluster object storage (bundling MinIO) was rejected:
+evidence kept on the cluster under investigation is weak evidence, and it
+adds a stateful component and a KMS story.
+
+**Blocking.** Forensic capture deleted pods on every `PRESERVED_KILLED`
+transition regardless of enforcement. With forensics on by default that
+would have deleted workloads with blocking off, so the delete and its RBAC
+now follow `response.network_policy.enabled`.
+
+**Deferred.** Certificate rotation for certgen material (validity 10 years;
+delete the Secrets and re-run the Job), running the in-cluster Ollama as
+non-root, and a thesis-evaluation decision on whether arms run on the
+minimal or the full default posture (EVAL.md) are tracked on the Story 12.7
+follow-up issue.

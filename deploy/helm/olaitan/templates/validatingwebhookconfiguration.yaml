@@ -39,7 +39,15 @@ via `--set-file` must single-line base64-encode it first
 (`base64 -w0 ca.pem`) -- the chart does NOT auto-encode because
 Helm's `b64enc` would double-encode an already-encoded value.
 */ -}}
-{{- $caBundle := required "auditWebhook.caBundle is required when auditWebhook.enabled=true (base64-encoded PEM bytes; `base64 -w0 ca.pem`)" .Values.auditWebhook.caBundle -}}
+{{- /* Story 12.7: operator mode renders the supplied caBundle; auto mode
+       renders none and the certgen Job writes it. Leaving the field out of
+       the manifest is what keeps a later helm upgrade or kubectl apply
+       (three-way merge) from wiping the patched value. */ -}}
+{{- $operator := eq (include "olaitan.auditWebhook.tlsMode" .) "operator" -}}
+{{- $caBundle := "" -}}
+{{- if $operator -}}
+{{- $caBundle = required "auditWebhook.caBundle is required when auditWebhook.enabled=true (base64-encoded PEM bytes; `base64 -w0 ca.pem`)" .Values.auditWebhook.caBundle -}}
+{{- end -}}
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
 metadata:
@@ -72,7 +80,9 @@ webhooks:
         namespace: {{ .Release.Namespace }}
         port: {{ .Values.auditWebhook.servicePort }}
         path: /audit
+      {{- if $operator }}
       caBundle: {{ $caBundle | quote }}
+      {{- end }}
     {{- /*
     Scope rules to the workload-relevant resources Story 1.7 actually
     needs to audit. Story 1.7 may broaden this list -- but starting

@@ -1,0 +1,69 @@
+# values-minimal.yaml -- the observe-only core, the chart's posture before
+# Story 12.7 made everything on by default.
+#
+#   helm install olaitan deploy/helm/olaitan \
+#     -f deploy/helm/olaitan/values-minimal.yaml \
+#     --namespace olaitan --create-namespace
+#
+# What stays on: Falco (never off), the collector's Falco ingest, rules,
+# baselines, the correlator and the FSM, NetworkPolicy for Olaitan's own
+# pods. What goes off: the other four sources, the in-cluster model and the
+# LLM chain, the SIEM audit trail, the override controller, forensics,
+# settling, DFIR, the report archive and notifications.
+#
+# Who it is for:
+#   - the ring-level e2e targets and CI jobs (make e2e-local and friends):
+#     each tests one ring on a small runner, and must neither pull a 1.9 GB
+#     model nor route to an FR28 fallback it does not assert;
+#   - a small cluster that cannot spare 1 CPU and 3 GiB for the model;
+#   - an evaluation run that must stay comparable with runs made before
+#     Story 12.7 (install the base with this file, then apply the arm
+#     overlay; see EVAL.md). On the new default, an RSL or RSLT arm has the
+#     in-cluster model configured as its FR28 fallback.
+#
+# Layer a single part back on with --set (for example
+# --set containerdSensor.enabled=true).
+
+auditWebhook:
+  enabled: false
+containerdSensor:
+  enabled: false
+calicoSensor:
+  enabled: false
+applogSidecar:
+  enabled: false
+
+analyst:
+  provider: "none"
+  local:
+    model: ""
+ollama:
+  enabled: false
+  persistence:
+    enabled: false
+    create: false
+  pull:
+    models: []
+    # null, not {}: Helm merges a map, so {} would keep the default's key.
+    expectedIds: null
+aggregator:
+  # The default carries the 30x role budget for the CPU model; with no LLM
+  # tier it has nothing to scale.
+  extraEnv: []
+
+response:
+  override:
+    enabled: false
+  audit:
+    enabled: false
+  forensics:
+    enabled: false
+  settling:
+    enabled: false
+  dfir:
+    enabled: false
+  reportArchive:
+    enabled: false
+    deferredEnabled: false
+notifications:
+  enabled: false

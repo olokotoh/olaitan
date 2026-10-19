@@ -1,0 +1,188 @@
+{{/*
+Story 12.7 (D1): the certgen Job. Every part is on by default, and the audit
+webhook receiver and the applog injector each need TLS material. The chart
+used to require it as values and failed the render without it.
+
+Generating it in the template (genCA, the common Helm idiom) was rejected:
+`helm template` renders the release install.yaml (Story 12.4), so the key
+would be one private key in a public release asset, shared by every install
+(Story 12.4 D5 forbids exactly that). This Job runs `olaitan certgen` on the
+Olaitan image (no new third-party image to pin) INSIDE the cluster: it
+creates the Secrets that do not exist yet, per install, never replaces one
+that does, and writes the CA into the caBundle of the webhook
+configurations, which the templates leave out in this mode so a later
+upgrade or re-apply does not wipe it.
+
+Rendered only when a part needs generated material (no operator material,
+no cert-manager). The name carries a hash of the image and the arguments,
+as the Ollama pull Job's does: a Job's pod template is immutable, so a
+change is a new Job, and the same inputs are the same Job.
+
+The Secrets it creates are not helm's: `helm uninstall` leaves them. Find
+them with `kubectl -n <ns> get secret -l app.kubernetes.io/managed-by=olaitan-certgen`.
+*/}}
+{{- if include "olaitan.certgen.enabled" . }}
+{{- $full := include "olaitan.fullname" . -}}
+{{- $ns := .Release.Namespace -}}
+{{- $audit := and .Values.auditWebhook.enabled (eq (include "olaitan.auditWebhook.tlsMode" .) "auto") -}}
+{{- $applog := and .Values.applogSidecar.enabled (eq (include "olaitan.applog.tlsMode" .) "auto") -}}
+{{- $args := list "certgen" (printf "--namespace=%s" $ns) (printf "--label=app.kubernetes.io/instance=%s" .Release.Name) (printf "--label=app.kubernetes.io/name=%s" (include "olaitan.name" .)) -}}
+{{- if $audit -}}
+{{- include "olaitan.auditWebhook.validate" . -}}
+{{- $svc := printf "%s-audit-webhook" $full -}}
+{{- $server := include "olaitan.auditWebhook.server" . -}}
+{{- $dns := list $svc (printf "%s.%s" $svc $ns) (printf "%s.%s.svc" $svc $ns) (printf "%s.%s.svc.cluster.local" $svc $ns) -}}
+{{- $ips := list -}}
+{{- /* The serverAddress host (kind's 127.0.0.1, or a name) must be in the
+       serving cert too, or the apiserver's handshake fails. */ -}}
+{{- $host := regexFind "^(\\[[^\\]]*\\]|[^:]+)" $server | trimPrefix "[" | trimSuffix "]" -}}
+{{- if regexMatch "^[0-9.]+$|:" $host -}}{{- $ips = append $ips $host -}}{{- else if not (has $host $dns) -}}{{- $dns = append $dns $host -}}{{- end -}}
+{{- $args = concat $args (list (printf "--audit-secret=%s-audit-tls" $full) (printf "--audit-kubeconfig-secret=%s-audit-webhook-kubeconfig" $full) (printf "--audit-dns=%s" (join "," $dns)) (printf "--audit-server=%s" $server) (printf "--validating-webhook=%s-audit" $full)) -}}
+{{- if $ips }}{{- $args = append $args (printf "--audit-ip=%s" (join "," $ips)) -}}{{- end -}}
+{{- end -}}
+{{- if $applog -}}
+{{- $svc := printf "%s-applog-injector" $full -}}
+{{- $args = concat $args (list (printf "--applog-secret=%s-applog-injector-tls" $full) (printf "--applog-dns=%s" (join "," (list $svc (printf "%s.%s" $svc $ns) (printf "%s.%s.svc" $svc $ns) (printf "%s.%s.svc.cluster.local" $svc $ns)))) (printf "--mutating-webhook=%s-applog-injector" $full)) -}}
+{{- end -}}
+{{- $jobName := printf "%s-certgen-%s" ($full | trunc 40 | trimSuffix "-") (printf "%s|%s" (include "olaitan.image" .) (join " " $args) | sha256sum | trunc 10) -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $full }}-certgen
+  namespace: {{ $ns }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: certgen
+---
+# Namespaced: create the Secrets (create cannot be limited by name), and
+# read/fill only the three it owns.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $full }}-certgen
+  namespace: {{ $ns }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: certgen
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      {{- if $audit }}
+      - {{ $full }}-audit-tls
+      - {{ $full }}-audit-webhook-kubeconfig
+      {{- end }}
+      {{- if $applog }}
+      - {{ $full }}-applog-injector-tls
+      {{- end }}
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $full }}-certgen
+  namespace: {{ $ns }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: certgen
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $full }}-certgen
+subjects:
+  - kind: ServiceAccount
+    name: {{ $full }}-certgen
+    namespace: {{ $ns }}
+---
+# Cluster-scoped: only the release's own webhook configurations, by name.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $full }}-certgen
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: certgen
+rules:
+  {{- if $applog }}
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["mutatingwebhookconfigurations"]
+    resourceNames: [{{ printf "%s-applog-injector" $full | quote }}]
+    verbs: ["get", "update"]
+  {{- end }}
+  {{- if $audit }}
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["validatingwebhookconfigurations"]
+    resourceNames: [{{ printf "%s-audit" $full | quote }}]
+    verbs: ["get", "update"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $full }}-certgen
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: certgen
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $full }}-certgen
+subjects:
+  - kind: ServiceAccount
+    name: {{ $full }}-certgen
+    namespace: {{ $ns }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $jobName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: certgen
+spec:
+  backoffLimit: 6
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        {{- include "olaitan.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: certgen
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ $full }}-certgen
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: certgen
+          image: {{ include "olaitan.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/olaitan"]
+          args:
+            {{- range $args }}
+            - {{ . | quote }}
+            {{- end }}
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+{{- end }}

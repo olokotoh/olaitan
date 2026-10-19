@@ -330,8 +330,14 @@ func TestModelPullKeepsTheServerAirGapped(t *testing.T) {
 // Job, no pull policy and no wait container, so the default render and the
 // air-gapped overlay (model provisioned by the operator) are unchanged.
 func TestModelPullIsOptIn(t *testing.T) {
+	// Story 12.7: the DEFAULT now pulls the model (everything on). The pull
+	// stays out of the air-gapped overlay, where there is nowhere to pull
+	// from, and out of an install that lists no models.
+	if _, ok := decodeNetpols(t, helmTemplate(t, nil))["olaitan-ollama-pull"]; !ok {
+		t.Error("the default render has no model pull NetworkPolicy; Story 12.7 pulls the model by default")
+	}
 	for name, rendered := range map[string]string{
-		"default":   helmTemplate(t, nil),
+		"no models": helmTemplate(t, []string{"ollama.pull.models=null", "ollama.pull.expectedIds=null"}),
 		"airgapped": helmTemplateValues(t, filepath.Join(chartDir(t), "values-airgapped.yaml")),
 	} {
 		for _, j := range docsOfKind(t, rendered, "Job") {
@@ -373,6 +379,9 @@ func TestPullJobNameFollowsTheModelList(t *testing.T) {
 			"ollama.persistence.enabled=true",
 			"ollama.persistence.create=true",
 			"ollama.pull.models={" + models + "}",
+			// Story 12.7: the default pins the default model's ID; a
+			// different list must clear or replace it.
+			"ollama.pull.expectedIds=null",
 		})
 		n, _ := dig(pullJob(t, r), "metadata", "name").(string)
 		return n

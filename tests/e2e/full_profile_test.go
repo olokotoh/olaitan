@@ -75,8 +75,9 @@ func TestFullProfileAllFiveSourcesHealthy(t *testing.T) {
 	// pointed at it. On a developer box that still has olaitan-e2e lying
 	// around, that guard passes while the client talks to something else
 	// entirely, so a green result would prove nothing. Assert the profile
-	// itself: the audit webhook is off in every other values overlay, so its
-	// presence is a reliable marker that values-full.yaml is what is installed.
+	// itself: only values-full.yaml publishes the audit receiver on a node
+	// port (Story 12.7 turned the receiver itself on everywhere), so that
+	// hostPort is a reliable marker that values-full.yaml is what is installed.
 	requireFullProfile(t)
 
 	requirePodsExist(t, "app.kubernetes.io/component=collector")

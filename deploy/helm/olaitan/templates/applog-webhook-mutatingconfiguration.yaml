@@ -86,7 +86,10 @@ webhooks:
         namespace: {{ .Release.Namespace }}
         path: /mutate
         port: 443
-      {{- if not .Values.applogSidecar.tls.certManagerEnabled }}
+      {{- /* Story 12.7: Path B renders the supplied bundle; cert-manager
+             injects its own; auto renders none and certgen writes it (left
+             out of the manifest so an upgrade or re-apply keeps it). */}}
+      {{- if eq (include "olaitan.applog.tlsMode" .) "operator" }}
       caBundle: {{ required "applogSidecar.tls.caBundle is required when certManagerEnabled=false" .Values.applogSidecar.tls.caBundle }}
       {{- end }}
 {{- end }}

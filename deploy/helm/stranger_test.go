@@ -276,7 +276,9 @@ func TestStrangerExtractorSkipsCommentsInFences(t *testing.T) {
 
 var (
 	strangerRollout = regexp.MustCompile(`(?m)^\+ kubectl -n olaitan rollout status (daemonset|deployment|statefulset)`)
-	strangerWaitAll = regexp.MustCompile(`(?m)^\+ kubectl -n olaitan wait pod --all --for=condition=Ready`)
+	// Story 12.7: every pod that is not a Job's (certgen and the model pull
+	// complete and are never Ready); the Jobs are waited for to Complete.
+	strangerWaitAll = regexp.MustCompile(`(?m)^\+ kubectl -n olaitan wait pod -l !batch\.kubernetes\.io/job-name --for=condition=Ready.*\n\+ kubectl -n olaitan wait job --all --for=condition=Complete`)
 	strangerFalco   = regexp.MustCompile(`(?m)^\+ kubectl -n olaitan wait pod -l app\.kubernetes\.io/name=falco --for=condition=Ready`)
 	strangerExec    = regexp.MustCompile(`(?m)^\+ kubectl -n (\S+) exec \S+ -- cat /etc/shadow$`)
 )

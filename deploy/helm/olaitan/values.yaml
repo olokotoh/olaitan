@@ -125,8 +125,20 @@ aggregator:
   #                                   yet applied. When all are taken a
   #                                   dispatch is rejected (queue_full). Invalid
   #                                   values of either fall back to the default.
-  # @schema type:array effect:"operator-supplied aggregator environment as {name, value} pairs; the committed mechanism for OLT_RISK_WINDOW_SECONDS, OLT_LLM_ROLE_TIMEOUT_MULTIPLIER, OLT_LLM_CHAIN_WORKERS and OLT_LLM_CHAIN_QUEUE" ref:FR30
-  extraEnv: []
+  
+  #
+  # Story 12.7: the default ships the one entry the default LLM needs. The
+  # in-cluster CPU model (analyst.provider: local, below) reads 8k to 10k
+  # prompt tokens per chain role before it writes a word, about 5 to 10
+  # minutes on 8 vCPUs (Story 10.6, measured), so the per-role budgets
+  # (30s L1, 30s L2, 60s Senior) are scaled 30x: 900s, 900s, 1800s. A list
+  # you set REPLACES this one (Helm replaces lists), so keep this entry
+  # when you add your own, or set your own multiplier (the values-llm-*
+  # overlays set 2 for a hosted model).
+  # @schema type:array effect:"operator-supplied aggregator environment as {name, value} pairs; the committed mechanism for OLT_RISK_WINDOW_SECONDS, OLT_LLM_ROLE_TIMEOUT_MULTIPLIER, OLT_LLM_CHAIN_WORKERS and OLT_LLM_CHAIN_QUEUE; the default carries the 30x role budget the in-cluster CPU model needs" ref:FR30
+  extraEnv:
+    - name: OLT_LLM_ROLE_TIMEOUT_MULTIPLIER
+      value: "30"
   # 256Mi request / 512Mi limit. NFR5 targets "< 200 MB steady state",
   # but 256Mi leaves headroom for fsnotify watch buffers (1.6) and
   # future LLM context assembly (Epic 4). The 512Mi limit prevents OOM
@@ -338,11 +350,16 @@ networkPolicy:
   extraEgress: []
 
 # --- Audit webhook ----------------------------------------------------
-# Story 1.7 -- Kubernetes audit webhook receiver. Default-off so chart
-# installs without the operator-side kube-apiserver wiring continue to
-# render. Operators flip enabled=true after they have applied the
-# kube-apiserver --audit-webhook-config-file + --audit-policy-file
-# patches per deploy/helm/olaitan/AUDIT.md.
+# Story 1.7 -- Kubernetes audit webhook receiver. Story 12.7: ON by
+# default. The receiver comes up in the collector on every install, with
+# TLS material the certgen Job generates in the cluster (when you supply
+# none below), and the kubeconfig the kube-apiserver needs lands in the
+# Secret <fullname>-audit-webhook-kubeconfig. It receives nothing until the
+# kube-apiserver is pointed at it (--audit-webhook-config-file +
+# --audit-policy-file, see AUDIT.md), so until then the helm NOTES and the
+# collector log report it DEGRADED. On a managed control plane (EKS, AKS,
+# GKE) that wiring is impossible; values-eks/aks/gke.yaml switch it off so
+# the gap is explicit.
 #
 # Note on terminology: the architecture document refers to this as a
 # "ValidatingWebhookConfiguration audit-webhook variant" -- that is
@@ -355,7 +372,8 @@ networkPolicy:
 # left alone by this story. See AUDIT.md for the full reconciliation.
 # [Source: epics.md Story 1.7, architecture.md:§Audit Webhook TLS]
 auditWebhook:
-  enabled: false
+  # @schema type:boolean effect:"run the Kubernetes audit webhook receiver in the collector (TLS generated in-cluster unless supplied); bridges detection.sources.audit.enabled" ref:FR5
+  enabled: true
 
   # Service port the apiserver dials. 8443 is the convention for
   # webhook receivers in the K8s ecosystem.
@@ -392,6 +410,14 @@ auditWebhook:
   # @schema type:string effect:"node address the audit hostPort binds to (empty: every interface)" ref:FR5
   hostIP: "127.0.0.1"
 
+  # TLS material. Story 12.7: leave ALL six of caBundle, clusterCAData,
+  # apiserverClientCert, apiserverClientKey, servingCert and servingKey
+  # empty (the default) and the certgen Job creates them in the cluster,
+  # per install, so no private key is ever in a render or in the release
+  # install.yaml. Set all six to supply your own (Path B, the kind full
+  # profile does this because the kubeconfig must exist before the cluster
+  # does); setting only some fails the render.
+  #
   # base64-encoded PEM bytes of the CA that signed the receiver's
   # serving cert. The apiserver kubeconfig embeds this as
   # certificate-authority-data so the apiserver trusts the receiver
@@ -446,9 +472,12 @@ auditWebhook:
 # --- containerd CRI lifecycle sensor ---------------------------------
 # Story 1.8 -- third Ring 1 sensor source (FR3). Subscribes to the
 # containerd CRI runtime via RuntimeService.GetContainerEvents over a
-# Unix domain socket bind-mounted from the host. Default-off until the
-# operator confirms the socket path is correct on their cluster's
-# nodes and the security boundary documented in CRI.md is acceptable.
+# Unix domain socket bind-mounted from the host. Story 12.7: ON by
+# default. On a detected k3s or RKE2 the default socket path moves to
+# /run/k3s/containerd/containerd.sock; on a detected OpenShift (CRI-O, no
+# containerd) the mount is not rendered and the NOTES say DEGRADED. A node
+# with no socket at the path leaves the source DEGRADED (the collector log
+# names the path) and never stops the collector pod.
 #
 # The chart renders the per-node hostPath volume + volumeMount only
 # when containerdSensor.enabled=true; the runtime adapter knobs
@@ -463,7 +492,8 @@ auditWebhook:
 # Falco socket mount; threat model unchanged from the post-Story-1.6
 # baseline.
 containerdSensor:
-  enabled: false
+  # @schema type:boolean effect:"run the containerd CRI lifecycle sensor (hostPath mount of the socket directory); bridges detection.sources.containerd.enabled" ref:FR3
+  enabled: true
   # Group that owns the containerd socket; the collector joins it (as a
   # supplemental group, still non-root) so it can connect. 0 matches stock
   # containerd (0660 root:root) on kubeadm, kind and k3s. Check a node with
@@ -529,7 +559,13 @@ containerdSensor:
 # Dual-flag relationship: calicoSensor.enabled here AND
 # detection.sources.calico.enabled in config/olaitan.yaml must both
 # be true for the adapter to run. The chart fails render with a clear
-# message if calicoSensor.enabled=true but TLS material is missing.
+# message if calicoSensor.enabled=true and only PART of the Path B
+# material is set. Story 12.7: ON by default. With no Path A or Path B
+# material at all the chart mounts nothing and the source runs DEGRADED
+# ("no Goldmane client certificate"): Goldmane only accepts a client cert
+# signed by the Tigera CA, which the chart will not read out of
+# calico-system on its own. The NOTES name what is missing (Calico and
+# Goldmane, or the certificate) and the fix.
 #
 # Security boundary: mTLS-authenticated egress to
 # `goldmane.calico-system.svc:7443` (within-cluster). The agent must
@@ -538,7 +574,7 @@ containerdSensor:
 # operator-supplied) -- see CNI.md.
 calicoSensor:
   # @schema type:boolean effect:"enable the Calico Goldmane flow sensor; bridges detection.sources.calico.enabled too" ref:FR4
-  enabled: false
+  enabled: true
 
   # gRPC target for the Calico Goldmane Service. Default matches the
   # Tigera operator's v3.31.5 install layout. Operators with
@@ -633,8 +669,9 @@ calicoSensor:
   #   To select Path B, set tls.caBundle, tls.clientCert, and
   #   tls.clientKey.
   #
-  # The chart fails render when calicoSensor.enabled=true and neither
-  # path is configured. See CNI.md for the full provisioning recipe.
+  # With neither path configured (the default) the source runs DEGRADED
+  # until one is; half a Path B set fails the render. See CNI.md for the
+  # full provisioning recipe.
   tls:
     # @schema type:string effect:"name of the cert-manager-issued Secret to mount for Goldmane mTLS (empty: Path B, operator-supplied PEMs)" ref:FR4
     certManagerSecretName: ""
@@ -680,13 +717,17 @@ calicoSensor:
 # tails the cooperating application's stdout/stderr from a shared
 # emptyDir log volume and publishes lines to subjects.RawAppLog.
 #
-# Default disabled until the operator confirms (a) the cooperation
-# cost (the application must arrange to write its stdout/stderr to
-# /var/log/app/stdout.log and /var/log/app/stderr.log) and (b) the
-# security review of the admission-webhook surface is complete (see
-# APPLOG.md for the threat model).
+# Story 12.7: ON by default. The injector and its webhook come up on every
+# install, with a serving cert the certgen Job generates in the cluster
+# (unless you supply Path A or Path B below). Injection is still opt-in PER
+# POD (the olaitan.io/log-sidecar annotation), so nothing is injected into
+# a workload that did not ask, and the webhook is failurePolicy Ignore. The
+# cooperation cost (the application writes its stdout/stderr to
+# /var/log/app/stdout.log and /var/log/app/stderr.log) and the threat model
+# are in APPLOG.md.
 applogSidecar:
-  enabled: false
+  # @schema type:boolean effect:"deploy the applog sidecar injector and its MutatingWebhookConfiguration (injection stays opt-in per pod)" ref:FR9
+  enabled: true
 
   # Use the K8s 1.28+ native sidecar pattern (initContainer with
   # restartPolicy: Always per KEP-753). On older clusters where the
@@ -754,8 +795,10 @@ applogSidecar:
     timeoutSeconds: 5
 
   # TLS material. Path A: cert-manager Certificate (production).
-  # Path B: manual self-signed kubernetes.io/tls Secret (dev). The
-  # chart fails fast (Helm `{{ fail }}`) when neither is configured.
+  # Path B: manual self-signed kubernetes.io/tls Secret (dev). Story 12.7:
+  # neither (the default) has the certgen Job generate the serving cert in
+  # the cluster and write its CA into the webhook's caBundle. Half a Path B
+  # set fails the render.
   tls:
     certManagerEnabled: false
     issuerName: olaitan-ca
@@ -1073,12 +1116,21 @@ fsm:
   killThreatScore: null
   killSustainSeconds: null
 
-# Story 2.10: response-ring graduated-isolation controllers (Epic 2). All OFF
-# by default; an operator running RS-with-isolation enables them explicitly.
-# A block left empty leaves the config/olaitan.yaml defaults untouched.
+# Story 2.10: response-ring controllers (Epics 2 and 4). Story 12.7: every
+# one is ON by default EXCEPT blocking. networkPolicy.enabled is THE single
+# blocking switch:
+#
+#   --set response.networkPolicy.enabled=true
+#
+# turns on NetworkPolicy isolation (RESTRICTED / QUARANTINED) AND the
+# post-capture kill of forensics (pods deleted after their evidence is
+# uploaded), with the RBAC both need. With it off (the default) Olaitan
+# scores, records, captures and reports, and never cuts traffic or deletes a
+# pod. Prove your CNI enforces first: hack/check-netpol-enforcement.sh.
 response:
   # Story 2.4-2.6: RESTRICTED/QUARANTINED NetworkPolicy enforcement (FR33/NFR6).
   networkPolicy:
+    # @schema type:boolean effect:"THE blocking switch: NetworkPolicy isolation plus the forensic post-capture pod kill, and their RBAC; off by default" ref:FR33
     enabled: false
     # Cluster pod/service CIDRs allowed for egress under RESTRICTED. Operators
     # MUST set these to their cluster's real CIDRs so in-cluster traffic + DNS
@@ -1088,13 +1140,13 @@ response:
     reconcileIntervalSeconds: 30
   # Story 2.7: operator-override controller (FR38/FR39).
   override:
-    enabled: false
+    enabled: true
     pollIntervalSeconds: 15
     defaultTtlSeconds: 3600
   # Story 2.8: append-only SIEM audit subjects (FR40/NFR16). One flag gates the
   # three subjects; retention days drive the AUDIT_* JetStream stream MaxAge.
   audit:
-    enabled: false
+    enabled: true
     # @schema type:integer minimum:1 effect:"Redis/JetStream AUDIT_TRANSITIONS stream retention in days (append-only SIEM audit)" ref:NFR16
     retentionTransitionsDays: 90
     # @schema type:integer minimum:1 effect:"AUDIT_OVERRIDES stream retention in days" ref:NFR16
@@ -1112,8 +1164,16 @@ response:
   # Enabling this grants the aggregator pods get/list/delete + pods/log RBAC.
   # S3 credentials are NFR8 secrets read from the S3_ACCESS_KEY / S3_SECRET_KEY
   # env vars (wire via secrets.s3AccessKey / secrets.s3SecretKey), never YAML.
+  #
+  # Story 12.7: ON by default, and DEGRADED until an object store is set
+  # (forensics.s3.bucket + forensics.s3.kms_key_alias + s3Endpoint below +
+  # the two S3 secrets). With no store at all the aggregator says so at
+  # startup and leaves the controller unwired; half a store fails startup.
+  # The pod delete after capture runs only with response.networkPolicy
+  # .enabled (the blocking switch); without it the evidence is captured and
+  # the pod is left running.
   forensics:
-    enabled: false
+    enabled: true
     s3Endpoint: ""
     s3Bucket: ""
     s3Region: ""
@@ -1125,7 +1185,7 @@ response:
   # Story 4.4 DFIR agent consumes. retentionDays drives the INCIDENTS JetStream
   # stream MaxAge (365 d, append-only LimitsPolicy, audit-grade). Off by default.
   settling:
-    enabled: false
+    enabled: true
     # @schema type:integer minimum:1 effect:"stable non-CLEAN seconds before a workload finalises into an IncidentFinalised event" ref:FR42
     windowSeconds: 60
     # @schema type:integer minimum:1 effect:"INCIDENTS JetStream stream retention in days (Redis-adjacent audit-grade record)" ref:NFR7
@@ -1136,7 +1196,7 @@ response:
   # The DFIR LLM provider/model are config under analyst.dfir_provider /
   # analyst.dfir_model. Off by default (opt-in).
   dfir:
-    enabled: false
+    enabled: true
   # Story 4.6: durable report writer (FR45). When enabled, the DFIR agent PUTs
   # every redacted ForensicReport to an S3-compatible object store under the
   # content-addressed key, KMS-encrypted, with S3 object lock applied per object
@@ -1152,8 +1212,11 @@ response:
   # Least-privilege IAM (AC4): the writer identity gets ONLY s3:PutObject,
   # s3:PutObjectLegalHold, s3:HeadObject on the report bucket; read access goes to
   # a SEPARATE olaitan-reporter identity. See docs/iam.md.
+  #
+  # Story 12.7: ON by default, DEGRADED (reports generated and announced, not
+  # archived) until an object store is set, exactly as forensics above.
   reportArchive:
-    enabled: false
+    enabled: true
     s3Endpoint: ""
     s3Bucket: ""
     s3Region: ""
@@ -1172,7 +1235,9 @@ response:
     # supplies the password; required when deferredEnabled=true). deferredMaxLen
     # bounds the queue (default 1000; drop-oldest on overflow). deferredDrainSeconds
     # is the drain worker tick cadence (default 5).
-    deferredEnabled: false
+    # Story 12.7: on by default; an empty deferredRedisAddr is filled with
+    # the bundled Redis (endpoints.redis) so the default needs nothing set.
+    deferredEnabled: true
     deferredRedisAddr: ""
     deferredMaxLen: 1000
     deferredDrainSeconds: 5
@@ -1256,8 +1321,10 @@ forensics:
 notifications:
   # The one facade-level gate. Maps to response.notifications.enabled. A
   # no-op without a webhook_url (per Story 4.8: an enabled webhook with no URL
-  # leaves the controller unwired rather than failing fast).
-  enabled: false
+  # leaves the controller unwired rather than failing fast). Story 12.7: on
+  # by default, so setting webhook_url is the only step; the NOTES say it is
+  # idle until then.
+  enabled: true
   # The OPTIONAL incident webhook URL. This is a SECRET (a Slack/PagerDuty URL
   # embeds a token): when set, it OVERLAYS secrets.notificationsWebhookUrl and
   # is projected as the NOTIFICATIONS_WEBHOOK_URL env var (secretKeyRef) when
@@ -1326,8 +1393,12 @@ evaluation:
 # `kubectl rollout restart deploy/olaitan-aggregator` after
 # `helm upgrade --set analyst.provider=...`.
 analyst:
+  # Story 12.7: "local" by default: every chain role (L1, L2, Senior) and
+  # the DFIR agent run on the chart's own in-cluster Ollama (ollama below),
+  # no API key and no traffic leaving the cluster. A hosted model is one
+  # file away: values-llm-claude.yaml or values-llm-deepseek.yaml.
   # @schema type:string enum:none|api|local effect:"LLM analyst tier provider; none bypasses the multi-agent chain (chain-enable flag), api routes to claude/openai, local routes to Ollama" ref:FR25
-  provider: "none"
+  provider: "local"
 
   # Story 3.8 (FR25): per-role provider routing. Each *_provider is a
   # concrete family {claude, openai, ollama} or "" to inherit the
@@ -1422,18 +1493,26 @@ analyst:
   local:
     # @schema type:string effect:"Ollama endpoint for the local provider (air-gapped); empty keeps file-side default http://ollama:11434" ref:FR48
     endpoint: ""
+    # Story 12.7: the model the chart pulls by default (ollama.pull.models).
+    # Change both together.
     # @schema type:string effect:"Ollama model for the local provider; must be a model the operator provisioned (no cross-model default)" ref:FR48
-    model: ""
+    model: "qwen2.5:3b-instruct"
 
-# Story 3.4 (FR48): optional in-cluster Ollama for air-gapped /
-# data-residency-restricted deployments. Default OFF: the default
-# render is unchanged unless an operator opts in. See
-# values-airgapped.yaml for the documented air-gapped reference
-# overlay, and docs/runbook.md (air-gapped section) for model
-# provisioning, warm-up, and num_ctx pairing guidance. Story 3.16
-# wires this surface into the evaluation modes.
+# Story 3.4 (FR48): in-cluster Ollama, the self-contained LLM. Story 12.7:
+# ON by default, with the Story 10.6 model (qwen2.5:3b-instruct, Q4_K_M,
+# about 1.9 GB) pulled by the chart into a 10Gi volume. The pull needs
+# internet egress on 443 and a default StorageClass; without either the
+# model never lands, the chain degrades per incident (the aggregator says
+# llm_unavailable and keeps scoring with rules and baselines) and the
+# NOTES say so. Licence: the 3B Qwen2.5 weights are under the Qwen Research
+# licence (0.5B/1.5B/7B/14B/32B are Apache-2.0); for commercial use change
+# BOTH analyst.local.model and ollama.pull.models, for example to
+# qwen2.5:7b-instruct (Apache-2.0, about twice as slow on CPU). Speed on
+# CPU: 5 to 10 minutes per chain role (Story 10.6, 8 vCPU); give it a GPU
+# node or use a hosted model for real-time use. See values-airgapped.yaml
+# for a pre-provisioned model and docs/runbook.md (air-gapped section).
 ollama:
-  enabled: false
+  enabled: true
   image:
     repository: ollama/ollama
     # Pinned tag, never latest (reproducibility hygiene, NFR31).
@@ -1446,11 +1525,34 @@ ollama:
     # @schema type:string pattern:"sha256:<64 hex>, or empty for tag-only" effect:"image digest the in-cluster Ollama is pinned to" ref:NFR31
     digest: "sha256:2ea3b768a8f2dcd4d910f838d79702bb952089414dd578146619c0a939647ac6"
     pullPolicy: IfNotPresent
-  resources: {}
+  # Story 12.7: sized for the default model. Memory is what it needs to
+  # hold the model and a 16k context (under-requesting gets it OOM-killed);
+  # CPU request 1 with NO limit, so it fits a 4-vCPU node next to everything
+  # else and still uses every idle core. values-full.yaml requests the
+  # measured 2.
+  resources:
+    requests:
+      cpu: "1"
+      memory: 3Gi
+    limits:
+      memory: 6Gi
   # Extra environment for the Ollama server, e.g. OLLAMA_CONTEXT_LENGTH
   # (pair with the provider's MaxContextTokens knob per the runbook's
   # air-gapped section) or OLLAMA_KEEP_ALIVE for warm-model policy.
-  extraEnv: []
+  # Story 12.7: the Story 10.6 settings for the default model. The evidence
+  # package, the role schema and (for L2 and Senior) the earlier verdicts
+  # run 8k to 10k tokens, and Ollama silently truncates the FRONT of a
+  # prompt that does not fit (where the system prompt is), so 16384. The
+  # model stays loaded; one chain at a time, so one slot and one model.
+  extraEnv:
+    - name: OLLAMA_CONTEXT_LENGTH
+      value: "16384"
+    - name: OLLAMA_KEEP_ALIVE
+      value: "-1"
+    - name: OLLAMA_NUM_PARALLEL
+      value: "1"
+    - name: OLLAMA_MAX_LOADED_MODELS
+      value: "1"
   nodeSelector: {}
   tolerations: []
   # Model volume (mounted at /root/.ollama). Either name a claim you
@@ -1458,12 +1560,12 @@ ollama:
   # route), or set create: true and the chart creates an RWO claim of
   # size. existingClaim wins when both are set.
   persistence:
-    enabled: false
+    enabled: true
     existingClaim: ""
     # Story 10.6: chart-created model claim, for a profile that pulls its
     # own model (see pull below).
     # @schema type:boolean effect:"create the Ollama model claim in the chart when no existingClaim is named" ref:FR48
-    create: false
+    create: true
     # @schema type:string effect:"size of the chart-created Ollama model claim" ref:FR48
     size: 10Gi
     # @schema type:string effect:"storageClassName of the chart-created Ollama model claim; empty uses the cluster default" ref:FR48
@@ -1483,7 +1585,8 @@ ollama:
   # than failing an upgrade on an immutable pod template.
   pull:
     # @schema type:array effect:"Ollama models the chart pulls into the model volume; empty pulls nothing (operator-provisioned, air-gapped)" ref:FR48
-    models: []
+    models:
+      - "qwen2.5:3b-instruct"
     # @schema type:integer minimum:0 effect:"retries of the model pull Job before it is marked failed" ref:FR48
     backoffLimit: 4
     # @schema type:integer minimum:1 effect:"seconds the model pull Job may run before it is killed; the server's wait for the models gives up 300s after it" ref:FR48
@@ -1493,8 +1596,10 @@ ollama:
     # (quote the ID). The pull Job fails when the pulled weights have
     # another ID: a model tag can be re-pushed, the image digest cannot.
     # Empty checks nothing.
+    # Story 12.7: the ID the Story 10.6 live run pulled for the default tag.
     # @schema type:object effect:"expected `ollama list` ID per pulled model; the pull Job fails on drift" ref:NFR31
-    expectedIds: {}
+    expectedIds:
+      "qwen2.5:3b-instruct": "357c53fb659c"
 
 # --- Subchart overrides ------------------------------------------------
 # Only opinions we impose on the downstream charts live here -- upstream

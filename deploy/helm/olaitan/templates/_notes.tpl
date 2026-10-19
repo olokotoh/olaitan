@@ -70,68 +70,176 @@ DETECTION SOURCES
          and sees almost nothing, quietly. Verify before you trust it (see
          VERIFY THE INSTALL below).
 {{- end }}
-{{- if (default (dict) .Values.auditWebhook).enabled }}
-  [ON ] Kubernetes audit webhook
+{{- $aw := default (dict) .Values.auditWebhook }}
+{{- if $aw.enabled }}
   {{- if $managed }}
-         WARNING: {{ $platform }} is a managed control plane. It does not expose
-         --audit-webhook-config-file on kube-apiserver, so nothing will ever
-         reach this receiver. It is enabled and inert, and there is no
-         workaround. Set auditWebhook.enabled=false so the gap is visible.
+  [DEGRADED] Kubernetes audit webhook -- impossible on {{ $platform }}.
+         A managed control plane does not expose --audit-webhook-config-file
+         on kube-apiserver, so nothing will ever reach this receiver. Set
+         auditWebhook.enabled=false (values-{{ $platform }}.yaml does) so the
+         gap is explicit.
+  {{- else }}
+  [ON ] Kubernetes audit webhook -- the receiver is up in the collector
+         {{- if eq (include "olaitan.auditWebhook.tlsMode" .) "auto" }}
+         (TLS made in the cluster by the certgen Job)
+         {{- end }}.
+         It sees nothing until kube-apiserver sends to it: hand the kubeconfig
+         in Secret {{ include "olaitan.fullname" . }}-audit-webhook-kubeconfig to
+         --audit-webhook-config-file (AUDIT.md, hack/audit-apiserver-patch.yaml).
+         Until then it is DEGRADED: source_healthy{source="audit"} stays 0 and
+         the collector logs "source DEGRADED" for it.
   {{- end }}
 {{- else }}
-  [OFF] Kubernetes audit webhook
-  {{- if $managed }}
-         Impossible on {{ $platform }}, not merely off: a managed control plane does
-         not expose --audit-webhook-config-file. Nothing you can set here
-         turns this on.
-  {{- else if $platform }}
-         Off by default. On {{ $platform }} you control the API server, so it IS
-         available: auditWebhook.enabled=true plus hack/audit-apiserver-patch.yaml.
-  {{- else }}
-         Off by default, and whether you CAN turn it on depends on a
-         platform this chart could not identify. It needs
-         --audit-webhook-config-file on kube-apiserver, which self-managed
-         clusters expose and EKS, AKS and GKE do not. AKS in particular is
-         undetectable from inside the cluster, so an unidentified platform
-         may well be one where this is impossible. Set `platform` and these
-         notes will tell you which.
-  {{- end }}
+  [OFF] Kubernetes audit webhook -- auditWebhook.enabled=false.
 {{- end }}
-{{- if (default (dict) .Values.containerdSensor).enabled }}
-  [ON ] containerd CRI sensor -- {{ .Values.containerdSensor.socketPath }}
+{{- if include "olaitan.containerd.enabled" . }}
+  [ON ] containerd CRI sensor -- {{ include "olaitan.containerd.socketPath" . }}
+         A node with no socket there leaves it DEGRADED (the collector logs the
+         path); set containerdSensor.socketPath to your runtime's socket.
+{{- else if and (default (dict) .Values.containerdSensor).enabled (eq $platform "openshift") }}
+  [DEGRADED] containerd CRI sensor -- OpenShift runs CRI-O, not containerd,
+         so there is no socket to read and the chart mounts nothing. Container
+         lifecycle still reaches the agent through Falco.
 {{- else }}
-  [OFF] containerd CRI sensor
-  {{- if eq $platform "k3s" }}
-         Off by default. On k3s the socket is at
-         /run/k3s/containerd/containerd.sock, not the chart default, so
-         enabling it also needs containerdSensor.socketPath set.
-  {{- else }}
-         Off by default; needs a host socket path matching your runtime.
-  {{- end }}
+  [OFF] containerd CRI sensor -- containerdSensor.enabled=false.
 {{- end }}
-{{- if (default (dict) .Values.calicoSensor).enabled }}
-  [ON ] Calico CNI flow adapter
-{{- else }}
-  [OFF] Calico CNI flow adapter
-  {{- if eq $cni "Calico" }}
-         Calico IS present here, so this source is available to you:
-         calicoSensor.enabled=true (needs Goldmane and its mTLS material).
+{{- $cal := default (dict) .Values.calicoSensor }}
+{{- if $cal.enabled }}
+  {{- if eq (include "olaitan.calico.tlsMode" .) "none" }}
+  [DEGRADED] Calico CNI flow adapter -- no Goldmane client certificate.
+         Goldmane only accepts a client cert signed by the Tigera CA, and the
+         chart does not read that out of calico-system on its own.
+         {{- if eq $cni "Calico" }}
+         Calico IS present here: issue one with cert-manager (Path A,
+         calicoSensor.tls.certManagerSecretName) or supply the PEMs (Path B,
+         calicoSensor.tls.caBundle/clientCert/clientKey). See CNI.md.
+         {{- else }}
+         It also needs Calico v3.31.5+ installed through the Tigera operator
+         (which runs Goldmane); none was detected here. See CNI.md.
+         {{- end }}
   {{- else }}
-         Off by default; requires Calico installed via the Tigera operator.
+  [ON ] Calico CNI flow adapter -- Goldmane at {{ $cal.goldmaneAddr }}
+         (needs Calico v3.31.5+ through the Tigera operator; without it the
+         source stays DEGRADED and the collector says why).
   {{- end }}
+{{- else }}
+  [OFF] Calico CNI flow adapter -- calicoSensor.enabled=false.
 {{- end }}
 {{- if (default (dict) .Values.applogSidecar).enabled }}
-  [ON ] Application log sidecar -- injected by the admission webhook
+  [ON ] Application log sidecar -- injector and admission webhook up
+         {{- if eq (include "olaitan.applog.tlsMode" .) "auto" }}
+         (serving cert made in the cluster by the certgen Job)
+         {{- end }}.
+         Injection is opt-in per pod: annotate a pod
+         olaitan.io/log-sidecar: "enabled" (APPLOG.md). The source reports
+         healthy once a sidecar heartbeats.
 {{- else }}
-  [OFF] Application log sidecar
-         Off by default; it injects a sidecar into your workloads through an
-         admission webhook, which is a bigger consent decision than the
-         other sources and is left to you.
+  [OFF] Application log sidecar -- applogSidecar.enabled=false.
+{{- end }}
+
+ANALYSIS
+{{- $an := default (dict) .Values.analyst }}
+{{- $ol := default (dict) .Values.ollama }}
+{{- $provider := include "olaitan.evaluation.effectiveAnalystProvider" . | lower }}
+  [ON ] Rules and baselines -- the deterministic detection layer.
+{{- if eq $provider "local" }}
+  {{- $model := (default (dict) $an.local).model }}
+  {{- $noDefaultSC := false }}
+  {{- $scs := lookup "storage.k8s.io/v1" "StorageClass" "" "" }}
+  {{- if and $scs $scs.items }}
+    {{- $noDefaultSC = true }}
+    {{- range $scs.items }}
+      {{- if eq (index (default (dict) .metadata.annotations) "storageclass.kubernetes.io/is-default-class") "true" }}{{- $noDefaultSC = false }}{{- end }}
+    {{- end }}
+  {{- end }}
+  {{- if and $ol.enabled $noDefaultSC (default (dict) $ol.persistence).create (not (default (dict) $ol.persistence).storageClassName) }}
+  [DEGRADED] LLM analyst (L1, L2, Senior) -- {{ $model }} on the in-cluster
+         Ollama, but this cluster has no default StorageClass, so the model
+         volume stays Pending and the model never loads. Set
+         ollama.persistence.storageClassName (the same applies to the reports,
+         NATS and Redis volumes). Until then every incident is scored by rules
+         and baselines only (llm_unavailable).
+  {{- else }}
+  [ON ] LLM analyst (L1, L2, Senior) -- {{ $model }}
+         {{- if $ol.enabled }}
+         on the chart's in-cluster Ollama, no API key.
+         {{- else }}
+         on the Ollama at {{ default "analyst.local.endpoint" (default (dict) $an.local).endpoint }}.
+         {{- end }}
+         {{- if and $ol.enabled (include "olaitan.ollama.pullModels" .) }}
+         The {{ include "olaitan.ollama.pullJobName" . }} Job downloads it (needs
+         internet on 443 and a default StorageClass). Until it lands, incidents
+         are scored by rules and baselines only and marked llm_unavailable.
+         {{- end }}
+         On CPU each chain role takes minutes; give Ollama a GPU node or layer
+         values-llm-claude.yaml / values-llm-deepseek.yaml for a hosted model.
+  {{- end }}
+{{- else if eq $provider "api" }}
+  [ON ] LLM analyst (L1, L2, Senior) -- hosted model through analyst.api
+         (key from secrets.llmApiKey or secrets.llmApiKeyExistingSecret; with
+         no key the chain runs rules and baselines only, and says so).
+{{- else }}
+  [OFF] LLM analyst -- analyst.provider=none: rules and baselines only.
+{{- end }}
+{{- $rsp := default (dict) .Values.response }}
+{{- if (default (dict) $rsp.dfir).enabled }}
+  [ON ] DFIR report -- a post-mortem report per finalised incident.
+{{- else }}
+  [OFF] DFIR report -- response.dfir.enabled=false.
+{{- end }}
+
+RESPONSE (observe-only unless blocking is on, see ENFORCEMENT)
+{{- if (default (dict) $rsp.audit).enabled }}
+  [ON ] SIEM audit trail -- every state change, override and policy on the
+         append-only AUDIT_* streams.
+{{- else }}
+  [OFF] SIEM audit trail -- response.audit.enabled=false.
+{{- end }}
+{{- if (default (dict) $rsp.override).enabled }}
+  [ON ] Operator override -- pin a workload's state with the
+         olaitan.io/state-override pod annotation.
+{{- end }}
+{{- if (default (dict) $rsp.settling).enabled }}
+  [ON ] Settling -- an incident finalises after it has been stable for the
+         settling window, which triggers the DFIR report.
+{{- end }}
+{{- if (default (dict) $rsp.forensics).enabled }}
+  {{- if include "olaitan.forensics.storeConfigured" . }}
+  [ON ] Forensic capture -- evidence of a killed workload to the object store
+         {{- if include "olaitan.blocking" . }}, then the pod is deleted.
+         {{- else }}; the pod is left running (blocking is off).
+         {{- end }}
+  {{- else }}
+  [DEGRADED] Forensic capture -- no object store configured. Set
+         forensics.s3.bucket, forensics.s3.kms_key_alias,
+         response.forensics.s3Endpoint and the S3 secrets (deploy/helm/README.md
+         "Forensic mode"); until then the aggregator logs it DEGRADED.
+  {{- end }}
+{{- end }}
+{{- if (default (dict) $rsp.reportArchive).enabled }}
+  {{- if include "olaitan.reportArchive.storeConfigured" . }}
+  [ON ] Report archive -- DFIR reports to the object store under object lock.
+  {{- else }}
+  [DEGRADED] Report archive -- no object store configured; DFIR reports are
+         generated and announced but not archived until one is set (same
+         values as forensic capture, response.reportArchive.s3Endpoint).
+  {{- end }}
+{{- end }}
+{{- $nf := default (dict) .Values.notifications }}
+{{- if or $nf.enabled (default (dict) $rsp.notifications).enabled }}
+  {{- if or $nf.webhook_url .Values.secrets.notificationsWebhookUrl }}
+  [ON ] Notifications -- one POST per confirmed-incident report.
+  {{- else }}
+  [ON ] Notifications -- idle until notifications.webhook_url (or
+         secrets.notificationsWebhookUrl) is set.
+  {{- end }}
 {{- end }}
 
 ENFORCEMENT
 {{- if $netpol.enabled }}
-  [ON ] NetworkPolicy isolation -- Olaitan WILL write policies that cut traffic.
+  [ON ] NetworkPolicy isolation -- Olaitan WILL write policies that cut traffic,
+        and forensic capture deletes a killed workload's pods after their
+        evidence is uploaded (response.networkPolicy.enabled, the blocking switch).
 
   Read this before you rely on it. Olaitan reports a workload QUARANTINED once
   it has written the policy. Whether that workload is actually cut off is
@@ -162,11 +270,17 @@ ENFORCEMENT
 {{- else }}
   [OFF] NetworkPolicy isolation -- observe-only, the default.
 
-  Olaitan scores workloads and records evidence but writes no policies and
-  cuts no traffic. Nothing it reports can be mistaken for containment because
-  it is not attempting containment. Turning this on is a deliberate act: run
-  hack/check-netpol-enforcement.sh first to confirm your CNI really enforces,
-  and set response.networkPolicy.clusterCidrs to your cluster's real CIDRs.
+  Olaitan scores workloads, records and captures evidence and writes reports,
+  but writes no policies, cuts no traffic and deletes no pod. Nothing it
+  reports can be mistaken for containment because it is not attempting
+  containment. Blocking is ONE switch:
+
+      helm upgrade {{ .Release.Name }} <chart> -n {{ $ns }} --reuse-values \
+        --set response.networkPolicy.enabled=true
+
+  It turns on NetworkPolicy isolation AND the post-capture kill of forensic
+  capture. Turning it on is a deliberate act: run
+  hack/check-netpol-enforcement.sh first to confirm your CNI really enforces.
 {{- end }}
 
 STORAGE

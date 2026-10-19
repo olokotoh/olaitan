@@ -4,6 +4,23 @@ Story 1.7 introduces the Kubernetes audit-webhook receiver as the
 second Olaitan signal source (Falco gRPC was the first, Story 1.6).
 This document is the operator-facing wiring guide.
 
+**Story 12.7: on by default.** A plain install runs the receiver in the
+collector. With no TLS values set, the chart's certgen Job (`olaitan
+certgen`) creates, in the cluster and per install, the receiver Secret
+`<fullname>-audit-tls` and the kube-apiserver kubeconfig Secret
+`<fullname>-audit-webhook-kubeconfig` (CA, server address and the
+apiserver's client cert), and writes the CA into the admission stub's
+caBundle. No private key is in a render. The receiver is DEGRADED (the
+install notes and the collector log say so) until the kube-apiserver is
+pointed at it: on a self-managed cluster, copy that kubeconfig to the
+control plane and follow step 4; on EKS, AKS and GKE it is impossible (the
+platform overlays switch it off). Supplying all six TLS values yourself
+(the steps below, and the kind full profile, whose apiserver needs the CA
+before the cluster exists) skips certgen; half a set fails the render.
+Certgen never replaces existing material; to rotate, delete both Secrets and
+re-run the Job (`kubectl -n <ns> get secret -l
+app.kubernetes.io/managed-by=olaitan-certgen`).
+
 ## What this gives you
 
 The Olaitan audit adapter listens for `audit.k8s.io/v1` `EventList`

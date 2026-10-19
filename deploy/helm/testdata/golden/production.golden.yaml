@@ -15,10 +15,28 @@ spec:
     matchLabels:
       app.kubernetes.io/name: olaitan
       app.kubernetes.io/instance: olaitan
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: NotIn
+        values: ["ollama", "ollama-pull"]
   policyTypes:
     - Ingress
     - Egress
   ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: TCP
+          port: 8443
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: TCP
+          port: 8443
     - from:
         - podSelector:
             matchLabels:
@@ -55,6 +73,87 @@ spec:
           port: 6443
     - to:
         - podSelector: {}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: calico-system
+          podSelector:
+            matchLabels:
+              k8s-app: goldmane
+      ports:
+        - protocol: TCP
+          port: 7443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: olaitan-ollama
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: ollama
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: olaitan
+      app.kubernetes.io/instance: olaitan
+      app.kubernetes.io/component: ollama
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: olaitan
+              app.kubernetes.io/instance: olaitan
+              app.kubernetes.io/component: aggregator
+      ports:
+        - protocol: TCP
+          port: 11434
+  egress: []
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: olaitan-ollama-pull
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: ollama-pull
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: olaitan
+      app.kubernetes.io/instance: olaitan
+      app.kubernetes.io/component: ollama-pull
+  policyTypes:
+    - Ingress
+    - Egress
+  # No ingress rules: nothing dials the pull pod (its server is loopback-only).
+  ingress: []
+  egress:
+    # Resolve the model registry.
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Fetch the manifest and layers. The registry redirects layer
+    # downloads to a CDN whose addresses are not stable, so the rule is
+    # port-scoped rather than address-scoped; the pod lives only for the
+    # pull and has no credentials and no ServiceAccount token.
+    - ports:
+        - protocol: TCP
+          port: 443
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -116,6 +215,19 @@ metadata:
     app.kubernetes.io/instance: olaitan
     app.kubernetes.io/version: "APP_VERSION_REDACTED"
     app.kubernetes.io/managed-by: Helm
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: olaitan-certgen
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: certgen
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -561,6 +673,116 @@ metadata:
 apiVersion: v1
 kind: ConfigMap
 metadata:
+  name: olaitan-audit-policy
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+data:
+  policy.yaml: |-
+    # Default audit policy for the Olaitan audit-webhook receiver. Story
+    # 1.7. The kube-apiserver mounts this file via --audit-policy-file when
+    # the audit-webhook backend is wired up; see deploy/helm/olaitan/AUDIT.md
+    # for the operator workflow.
+    #
+    # Filter scope is justified in Story 1.7 Task 2.2 plus the bmad-code-
+    # review correctness fixes (P4: PolicyRule.Users is exact-match not
+    # globbed -> use userGroups; P5: endpointslices group is
+    # discovery.k8s.io not core; P6: Secret/ConfigMap list/watch must not
+    # inherit the RequestResponse level the mutating verbs need). Goal:
+    # keep within the NFR1 1000 events/sec/node budget by silencing the
+    # kubelet / controller-manager noise floor and recording full payload
+    # only for the resources that drive the academic detection scenarios
+    # (RBAC, NetPol, Secret access, exec/portforward).
+    #
+    # Operators can override by setting auditWebhook.policy.custom in the
+    # Helm values; the chart renders that verbatim into the ConfigMap when
+    # non-empty.
+    apiVersion: audit.k8s.io/v1
+    kind: Policy
+    omitStages:
+      # Filter at the source: the apiserver emits one event per stage, and
+      # RequestReceived events lack response context the correlator needs.
+      - "RequestReceived"
+    rules:
+      # Drop the noisiest read-only kubelet / controller-manager traffic.
+      # Note: endpointslices live in the discovery.k8s.io group, NOT the
+      # core ("") group; the previous shape silently never matched.
+      - level: None
+        resources:
+          - group: ""
+            resources: ["events", "endpoints"]
+          - group: "discovery.k8s.io"
+            resources: ["endpointslices"]
+          - group: "coordination.k8s.io"
+            resources: ["leases"]
+        verbs: ["get", "list", "watch"]
+    
+      # Drop kube-system service-account list/watch on nodes (high volume,
+      # low signal). audit.k8s.io/v1 PolicyRule.users is exact-match (not
+      # globbed); use the apiserver-synthesised group selector
+      # `system:serviceaccounts:kube-system` which matches every kube-
+      # system SA at request time.
+      - level: None
+        userGroups:
+          - "system:serviceaccounts:kube-system"
+        resources:
+          - group: ""
+            resources: ["nodes", "nodes/status"]
+        verbs: ["get", "list", "watch"]
+    
+      # Full request+response on Secret and ConfigMap mutations + reads.
+      # Credential-exfiltration / config-tampering signals key off these
+      # payloads. list/watch is captured at Metadata level only (next rule)
+      # because controller-manager continuously list-watches both resources
+      # and full-payload retention would dominate the audit firehose at
+      # scale.
+      - level: RequestResponse
+        resources:
+          - group: ""
+            resources: ["secrets", "configmaps"]
+        verbs: ["create", "update", "patch", "delete", "deletecollection", "get"]
+    
+      # Metadata-only on Secret/ConfigMap list/watch.
+      - level: Metadata
+        resources:
+          - group: ""
+            resources: ["secrets", "configmaps"]
+        verbs: ["list", "watch"]
+    
+      # Full request+response on RBAC and NetworkPolicy mutations.
+      - level: RequestResponse
+        resources:
+          - group: "rbac.authorization.k8s.io"
+            resources: ["rolebindings", "clusterrolebindings", "roles", "clusterroles"]
+          - group: "networking.k8s.io"
+            resources: ["networkpolicies"]
+        verbs: ["create", "update", "patch", "delete", "deletecollection"]
+    
+      # Privilege use through pods/exec, pods/portforward, pods/attach --
+      # request body only (response is an upgrade stream).
+      - level: Request
+        resources:
+          - group: ""
+            resources: ["pods/exec", "pods/portforward", "pods/attach"]
+    
+      # Pod CRUD: metadata only. The full pod spec is mostly noise; the
+      # admission decision and the verb are the actionable bits.
+      - level: Metadata
+        resources:
+          - group: ""
+            resources: ["pods"]
+        verbs: ["create", "update", "patch", "delete", "deletecollection"]
+    
+      # Catch-all: metadata for everything else.
+      - level: Metadata
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
   name: olaitan-config
   namespace: default
   labels:
@@ -611,7 +833,7 @@ data:
       # the collector subcommand does not spawn the audit goroutine.
       sources:
         audit:
-          enabled: false
+          enabled: true
           listen_addr: ":8443"
           tls_cert_file: "/etc/olaitan/audit-tls/tls.crt"
           tls_key_file: "/etc/olaitan/audit-tls/tls.key"
@@ -632,20 +854,20 @@ data:
         # exceeds the timeout: CRI lifecycle events are sparse on a stable
         # cluster, so staleness alone is not actionable.
         containerd:
-          enabled: false
+          enabled: true
           socket_path: "/run/containerd/containerd.sock"
           dial_timeout: "10s"
           staleness_timeout: "5m"
           connect_retry:
             min: "1s"
             max: "30s"
-            multiplier: 2.0
+            multiplier: 2
             jitter: 0.5
             max_attempts: 0
           publish_retry:
             min: "100ms"
             max: "1s"
-            multiplier: 2.0
+            multiplier: 2
             jitter: 0.1
             max_attempts: 3
         # Story 1.10: Calico CNI flow adapter (FR4). Default disabled
@@ -656,7 +878,7 @@ data:
         # The watchdog only flips unhealthy when stale AND not-Ready:
         # Goldmane flows are quiet by design.
         calico:
-          enabled: false
+          enabled: true
           goldmane_addr: "goldmane.calico-system.svc:7443"
           server_name: "goldmane.calico-system.svc"
           ca_bundle_path: "/etc/olaitan/cni/ca.crt"
@@ -670,14 +892,14 @@ data:
           connect_retry:
             min: "1s"
             max: "60s"
-            multiplier: 2.0
-            jitter: 1.0
+            multiplier: 2
+            jitter: 1
             max_attempts: 0
           publish_retry:
             min: "100ms"
             max: "1s"
-            multiplier: 2.0
-            jitter: 1.0
+            multiplier: 2
+            jitter: 1
             max_attempts: 3
       # Story 1.11: read-on-demand workload posture client (FR7,
       # architecture.md:45, :324, :751). The client queries the K8s API
@@ -829,7 +1051,7 @@ data:
       # default; observation is poll, never watch (no new RBAC). Full values.yaml
       # mode-surfacing is deferred to Story 2.10 (the Story 2.4 precedent).
       override:
-        enabled: false
+        enabled: true
         poll_interval_seconds: 15
         default_ttl_seconds: 3600
       # Story 2.8: append-only SIEM audit subjects (FR40/NFR16). One flag gates
@@ -852,7 +1074,7 @@ data:
       # access/secret keys are NFR8 secrets read from S3_ACCESS_KEY / S3_SECRET_KEY
       # env vars, never this file.
       forensics:
-        enabled: false
+        enabled: true
         s3_endpoint: ""
         s3_bucket: ""
         s3_region: ""
@@ -868,7 +1090,7 @@ data:
       # stream MaxAge (365 d, append-only via LimitsPolicy, audit-grade like the
       # AUDIT_* family). Off by default.
       settling:
-        enabled: false
+        enabled: true
         window_seconds: 60
         retention_days: 365
       # Story 4.4: DFIR forensic-report agent (FR43). When enabled, a durable
@@ -877,7 +1099,7 @@ data:
       # announces it on REPORTS.generated. The DFIR LLM provider/model are config
       # under analyst.dfir_provider / analyst.dfir_model. Off by default (opt-in).
       dfir:
-        enabled: false
+        enabled: true
       # Story 4.6: durable report writer (FR45). When enabled, the DFIR agent PUTs
       # every redacted ForensicReport to an S3-compatible object store under the
       # content-addressed key reports/{yyyy}/{mm}/{dd}/{sha256}.md, KMS-encrypted,
@@ -890,7 +1112,7 @@ data:
       # the deferred queue). Off by default. The S3 access/secret keys are NFR8
       # secrets read from S3_ACCESS_KEY / S3_SECRET_KEY env vars, never this file.
       report_archive:
-        enabled: false
+        enabled: true
         s3_endpoint: ""
         s3_bucket: ""
         s3_region: ""
@@ -912,8 +1134,8 @@ data:
         # true). deferred_max_len bounds the queue (default 1000; drop-oldest on
         # overflow, keeping the freshest reports). deferred_drain_seconds is the drain
         # worker tick cadence (default 5).
-        deferred_enabled: false
-        deferred_redis_addr: ""
+        deferred_enabled: true
+        deferred_redis_addr: "olaitan-redis-master:6379"
         deferred_max_len: 1000
         deferred_drain_seconds: 5
       # Story 4.8: OPTIONAL incident notification webhook. When enabled AND a
@@ -930,7 +1152,7 @@ data:
       # token): supply it via the NOTIFICATIONS_WEBHOOK_URL env var (which overrides
       # this value); it is scrubbed (host only) in all logs, never this file.
       notifications:
-        enabled: false
+        enabled: true
         webhook_url: ""
         retry_max_attempts: 5
         retry_min_seconds: 1
@@ -951,14 +1173,14 @@ data:
         retention_redactions_days: 365
     
     analyst:
-      provider: none
+      provider: local
       api:
         endpoint: ""
         model: ""
         api_key_secret: "olaitan-llm"
       local:
-        endpoint: "http://ollama:11434"
-        model: "gemma:2b"
+        endpoint: "http://olaitan-ollama.default.svc.cluster.local:11434"
+        model: "qwen2.5:3b-instruct"
       score_cap: 35
       # Story 3.8 (FR25/FR53): per-role provider routing + ablation toggles.
       # Each *_provider is a concrete family {claude, openai, ollama, none} or
@@ -1463,6 +1685,25 @@ data:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
+  name: olaitan-ollama-models
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: ollama
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: "10Gi"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
   name: olaitan-reports
   namespace: default
   labels:
@@ -1477,6 +1718,28 @@ spec:
   resources:
     requests:
       storage: "1Gi"
+---
+# Cluster-scoped: only the release's own webhook configurations, by name.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: olaitan-certgen
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: certgen
+rules:
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["mutatingwebhookconfigurations"]
+    resourceNames: ["olaitan-applog-injector"]
+    verbs: ["get", "update"]
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["validatingwebhookconfigurations"]
+    resourceNames: ["olaitan-audit"]
+    verbs: ["get", "update"]
 ---
 # Aggregator: cluster-wide. NetworkPolicy writes and pod annotation
 # patches must reach every workload namespace; a Role would constrain
@@ -1534,6 +1797,43 @@ rules:
   - apiGroups: [""]
     resources: ["serviceaccounts"]
     verbs: ["get", "list"]
+  # Story 4.2 forensic capture (FR36): when the PRESERVED_KILLED forensic
+  # controller is enabled, the aggregator must read each doomed pod's logs
+  # (including the previous terminated container's logs) and DELETE the pod
+  # strictly AFTER the forensic bundle is durably uploaded to S3. This widens
+  # the Ring-4 pod verb-set beyond the default patch/get/list ONLY when
+  # forensics.enabled=true, so a deployment that never kills pods keeps the
+  # narrower posture (architecture.md RBAC errata: pod delete is a Story 4.2
+  # addition gated on the forensic controller). Kubernetes RBAC unions verbs
+  # per resource, so this composes additively with the patch/get/list rules.
+  #
+  # Story 12.7 (D6): forensics is on by default, blocking is not. The pod
+  # delete is the post-capture kill, so it renders only with THE blocking
+  # switch (response.networkPolicy.enabled); reading logs for the capture
+  # stays with forensics.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: olaitan-certgen
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: certgen
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: olaitan-certgen
+subjects:
+  - kind: ServiceAccount
+    name: olaitan-certgen
+    namespace: default
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -1555,6 +1855,32 @@ subjects:
     name: olaitan-aggregator
     namespace: default
 ---
+# Namespaced: create the Secrets (create cannot be limited by name), and
+# read/fill only the three it owns.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: olaitan-certgen
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: certgen
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - olaitan-audit-tls
+      - olaitan-audit-webhook-kubeconfig
+      - olaitan-applog-injector-tls
+    verbs: ["get", "update"]
+---
 # Collector: namespace-scoped pod/event reads. The collector enriches
 # events for pods it sees on its own node; it MUST NOT be able to
 # enumerate pods in unrelated namespaces.
@@ -1574,6 +1900,27 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "events"]
     verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: olaitan-certgen
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: certgen
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: olaitan-certgen
+subjects:
+  - kind: ServiceAccount
+    name: olaitan-certgen
+    namespace: default
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -1649,6 +1996,30 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
+  name: olaitan-applog-injector
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: applog-injector
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/component: applog-injector
+  ports:
+    - name: tls
+      port: 443
+      targetPort: 8443
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
   name: olaitan-falco-ingest
   namespace: default
   labels:
@@ -1670,6 +2041,30 @@ spec:
       protocol: TCP
       port: 8765
       targetPort: falco-ingest
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: olaitan-ollama
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: ollama
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/component: ollama
+  ports:
+    - name: http
+      port: 11434
+      targetPort: http
+      protocol: TCP
 ---
 apiVersion: v1
 kind: Service
@@ -1715,6 +2110,30 @@ spec:
     app.kubernetes.io/instance: olaitan
     app.kubernetes.io/name: redis
     app.kubernetes.io/component: master
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: olaitan-audit-webhook
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: audit-webhook
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/component: collector
+  ports:
+    - name: webhook
+      protocol: TCP
+      port: 8443
+      targetPort: 8443
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -1964,6 +2383,12 @@ spec:
         runAsUser: 65532
         runAsGroup: 65532
         fsGroup: 65532
+        # Story 10.9: the containerd socket is 0660 root:root on stock
+        # nodes, so the non-root collector joins the socket's group to
+        # connect(2). It stays UID 65532; group 0 only matters on the
+        # read-only socket mount, since the image's own filesystem is
+        # read-only. Set containerdSensor.socketGroup to your socket's GID.
+        supplementalGroups: [0]
         seccompProfile:
           type: RuntimeDefault
       tolerations:
@@ -1996,6 +2421,19 @@ spec:
             - name: falco-ingest
               containerPort: 8765
               protocol: TCP
+            # Story 1.7 audit-webhook receiver port, dialled by the
+            # kube-apiserver at the address in the audit kubeconfig
+            # (templates/audit-webhook-kubeconfig-secret.yaml).
+            #
+            # Story 10.8 (#137 B2): with auditWebhook.hostPort set, the
+            # receiver is also published on the node, so an apiserver on
+            # the host network reaches its OWN node's collector at
+            # 127.0.0.1 with no cluster DNS and no Service in the path.
+            # auditWebhook.hostIP (default 127.0.0.1) keeps that port off
+            # the node's other interfaces; empty binds all of them.
+            - name: audit-webhook
+              containerPort: 8443
+              protocol: TCP
           env:
             - name: NATS_URL
               value: "nats://olaitan-nats:4222"
@@ -2003,7 +2441,7 @@ spec:
               value: "olaitan-redis-master:6379"
             # Story 10.10: track applog sidecar heartbeats only when applog is on.
             - name: OLAITAN_APPLOG_ENABLED
-              value: "false"
+              value: "true"
             - name: FALCO_LISTEN_ADDR
               value: ":8765"
             # Read from the mounted release Secret (below), not an env
@@ -2080,6 +2518,29 @@ spec:
             # artefacts on crash which need a writable path.
             - name: tmp
               mountPath: /tmp
+            # Story 1.7: receiver TLS material (serving cert+key plus
+            # cluster-CA bundle for verifying the apiserver client
+            # cert). Mounted readonly; rendered by templates/
+            # audit-webhook-tls-secret.yaml only when enabled=true.
+            - name: audit-tls
+              mountPath: /etc/olaitan/audit-tls
+              readOnly: true
+            # Story 1.8: containerd CRI socket bind-mounted from the
+            # host. We mount the parent directory rather than the
+            # socket file directly so a containerd restart that
+            # removes-and-recreates the socket inode is observed by
+            # the agent without a remount. Security boundary: this is
+            # the collector's only host mount; see
+            # deploy/helm/olaitan/CRI.md for the threat model.
+            - name: containerd-socket
+              mountPath: "/run/containerd"
+              # P2: read-only. The adapter only opens GetContainerEvents
+              # (a server-streaming RPC) and never writes to the socket
+              # inode. K8s hostPath best practice and 2026 Falco install
+              # guidance both treat runtime-socket mounts as read-only;
+              # no production CRI client requires write permission on
+              # the parent directory.
+              readOnly: true
       volumes:
         - name: config
           configMap:
@@ -2095,6 +2556,28 @@ spec:
             defaultMode: 0400
         - name: tmp
           emptyDir: {}
+        - name: audit-tls
+          secret:
+            secretName: olaitan-audit-tls
+            defaultMode: 0400
+            # Story 12.7: the certgen Job creates this Secret in the cluster.
+            # Optional, so the collector (and Falco ingest with it) starts
+            # even before certgen has run; the receiver is retried as an
+            # optional source and picks the files up once the kubelet
+            # projects them.
+            optional: true
+        - name: containerd-socket
+          hostPath:
+            path: "/run/containerd"
+            # Story 12.7 (supersedes Story 1.8 P3's `Directory`): the
+            # sensor is on by default, and `Directory` kept the WHOLE
+            # collector pod, Falco ingest included, from starting on any
+            # node without this directory (CRI-O, a k3s the chart did not
+            # detect). DirectoryOrCreate costs an empty directory on the
+            # node's /run (tmpfs, gone on reboot) where containerd is
+            # absent; the adapter then finds no socket, the source stays
+            # unhealthy and the collector log names the path.
+            type: DirectoryOrCreate
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -2156,6 +2639,131 @@ spec:
       - name: contexts
         secret:
           secretName: olaitan-nats-box-contexts
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: olaitan-applog-injector
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: applog-injector
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: olaitan
+      app.kubernetes.io/instance: olaitan
+      app.kubernetes.io/component: applog-injector
+  template:
+    metadata:
+      labels:
+        helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+        app.kubernetes.io/name: olaitan
+        app.kubernetes.io/instance: olaitan
+        app.kubernetes.io/version: "APP_VERSION_REDACTED"
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/component: applog-injector
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: applog-injector
+          image: ghcr.io/olokotoh/olaitan:edge
+          imagePullPolicy: IfNotPresent
+          # Absolute: the image is distroless with no PATH entry for
+          # /olaitan, so a bare "olaitan" fails at container init.
+          command:
+            - /olaitan
+          args:
+            - applog-webhook
+          ports:
+            - name: tls
+              containerPort: 8443
+              protocol: TCP
+          env:
+            - name: OLAITAN_WEBHOOK_LISTEN_ADDR
+              value: ":8443"
+            - name: OLAITAN_WEBHOOK_TLS_CERT
+              value: /etc/olaitan/tls/tls.crt
+            - name: OLAITAN_WEBHOOK_TLS_KEY
+              value: /etc/olaitan/tls/tls.key
+            - name: OLAITAN_WEBHOOK_USE_NATIVE_SIDECAR
+              value: "true"
+            - name: OLAITAN_WEBHOOK_SIDECAR_IMAGE
+              value: "ghcr.io/olokotoh/olaitan:edge"
+            # Sidecar runtime knobs forwarded through the webhook env
+            # into the injected sidecar's OLAITAN_APPLOG_* env vars.
+            # Story 1.9 D1+D2+H3: dead-knobs defect closure.
+            # Story 10.10: the NATS address every injected sidecar publishes
+            # to. Fully qualified, because the sidecar runs in the workload's
+            # namespace, where the short Service name does not resolve.
+            - name: OLAITAN_WEBHOOK_SIDECAR_NATS_URL
+              value: "nats://olaitan-nats.default.svc:4222"
+            - name: OLAITAN_WEBHOOK_SIDECAR_STDOUT_PATH
+              value: "/var/log/app/stdout.log"
+            - name: OLAITAN_WEBHOOK_SIDECAR_STDERR_PATH
+              value: "/var/log/app/stderr.log"
+            - name: OLAITAN_WEBHOOK_SIDECAR_CHANNEL_BUFFER
+              value: "1024"
+            - name: OLAITAN_WEBHOOK_SIDECAR_MAX_LINE_BYTES
+              value: "65536"
+            - name: OLAITAN_WEBHOOK_SIDECAR_PUBLISH_STALL_TIMEOUT
+              value: "5s"
+            - name: OLAITAN_WEBHOOK_SIDECAR_STALENESS_TIMEOUT
+              value: "30m"
+            - name: OLAITAN_WEBHOOK_RATE_LIMIT_ENABLED
+              value: "true"
+            - name: OLAITAN_WEBHOOK_RATE_LIMIT_THRESHOLD_EVENTS_PER_SEC
+              value: "1000"
+            - name: OLAITAN_WEBHOOK_RATE_LIMIT_COOLDOWN_SECONDS
+              value: "60"
+            - name: OLAITAN_WEBHOOK_RATE_LIMIT_SAMPLING_RATE
+              value: "0.1"
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/olaitan/tls
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: tls
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: tls
+              scheme: HTTPS
+            initialDelaySeconds: 1
+            periodSeconds: 5
+      volumes:
+        - name: tls
+          secret:
+            secretName: olaitan-applog-injector-tls
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -2257,6 +2865,55 @@ spec:
                 secretKeyRef:
                   name: olaitan-secrets
                   key: llm-api-key
+            # Story 4.2 (FR36/NFR8): project the S3 credentials into the env
+            # vars the S3 uploaders read. Only mounted when something actually
+            # uploads, so a deployment with neither carries no S3 credentials.
+            # An empty value makes the enabled consumer fail fast at startup
+            # (wireForensicsController for forensics, wireReportArchive for
+            # the report archive; the REDIS_PASSWORD precedent).
+            #
+            # Story 10.7: reportArchive is the SECOND consumer of this bucket
+            # and is gated by its own flag. Until this story the condition read
+            # forensics.enabled alone, so an operator who wanted archived
+            # reports without forensics got an archive uploader with no
+            # credentials at all, failing at runtime rather than at install.
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: olaitan-secrets
+                  key: s3-access-key
+                  # Story 12.7: optional, so a Secret made without this key
+                  # (the install.yaml recipe) does not stop the pod; empty
+                  # leaves the consumer DEGRADED or unwired, and says so.
+                  optional: true
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: olaitan-secrets
+                  key: s3-secret-key
+                  # Story 12.7: optional, so a Secret made without this key
+                  # (the install.yaml recipe) does not stop the pod; empty
+                  # leaves the consumer DEGRADED or unwired, and says so.
+                  optional: true
+            # Story 4.8 (NFR8): project the OPTIONAL incident notification webhook
+            # URL secret into NOTIFICATIONS_WEBHOOK_URL. Only mounted when
+            # notifications is enabled so a deployment without the webhook carries
+            # no token-bearing URL. Honour BOTH the response.notifications.enabled
+            # block AND the Story 4.10 `notifications.enabled` facade (the facade
+            # bridges enabled into the config, but the env projection condition must
+            # also see it, else a facade-only deployment enables the webhook in
+            # config yet never projects the URL secret, silently un-wiring it). The
+            # env var overrides the plain response.notifications.webhookUrl value;
+            # an empty value leaves the webhook unwired (AC2). Scrubbed in all logs.
+            - name: NOTIFICATIONS_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: olaitan-secrets
+                  key: notifications-webhook-url
+                  # Story 12.7: optional, so a Secret made without this key
+                  # (the install.yaml recipe) does not stop the pod; empty
+                  # leaves the consumer DEGRADED or unwired, and says so.
+                  optional: true
             # Story 1.19 D6: caps every JetStream stream's MaxBytes at
             # the given int64 byte count. Set this in CI/kind where the
             # NATS PVC backing is smaller than the production
@@ -2264,6 +2921,13 @@ spec:
             # this empty and size the NATS PVC instead.
             - name: OLT_NATS_STREAM_MAXBYTES_OVERRIDE
               value: "536870912"
+            # Operator-supplied aggregator environment (PR #92 review: the
+            # risk-window and LLM-timeout knobs, OLT_RISK_WINDOW_SECONDS and
+            # OLT_LLM_ROLE_TIMEOUT_MULTIPLIER, previously had no committed
+            # deploy mechanism and could only be set by out-of-band
+            # `kubectl set env`).
+            - name: "OLT_LLM_ROLE_TIMEOUT_MULTIPLIER"
+              value: "30"
           livenessProbe:
             httpGet:
               path: /healthz
@@ -2332,6 +2996,134 @@ spec:
             claimName: olaitan-reports
         - name: tmp
           emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: olaitan-ollama
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: ollama
+spec:
+  # Single replica: one model server per release; the provider retries
+  # transient failures and the FSM tolerates an unhealthy LLM tier
+  # (rules-only degradation, FR27).
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: olaitan
+      app.kubernetes.io/instance: olaitan
+      app.kubernetes.io/component: ollama
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: olaitan
+        app.kubernetes.io/instance: olaitan
+        app.kubernetes.io/component: ollama
+    spec:
+      automountServiceAccountToken: false
+      initContainers:
+        - name: wait-for-models
+          image: "ollama/ollama:0.9.0@sha256:2ea3b768a8f2dcd4d910f838d79702bb952089414dd578146619c0a939647ac6"
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
+          env:
+            - name: OLAITAN_OLLAMA_MODELS
+              value: "qwen2.5:3b-instruct"
+            - name: OLLAMA_HOST
+              value: "127.0.0.1:11434"
+            - name: OLLAMA_NOPRUNE
+              value: "1"
+            # Review round 1 (P5): give up a little after the pull Job's own
+            # deadline instead of waiting in Init forever. A failed Job is
+            # not retried by `helm upgrade` (same name, same spec).
+            - name: OLAITAN_OLLAMA_WAIT_SECONDS
+              value: "2100"
+            - name: OLAITAN_OLLAMA_PULL_JOB
+              value: "olaitan-ollama-pull-8a97ca238a"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              ollama serve >/dev/null 2>&1 &
+              server=$!
+              until ollama list >/dev/null 2>&1; do sleep 1; done
+              waited=0
+              for m in $OLAITAN_OLLAMA_MODELS; do
+                until ollama show "$m" >/dev/null 2>&1; do
+                  if [ "$waited" -ge "$OLAITAN_OLLAMA_WAIT_SECONDS" ]; then
+                    echo "model $m is still missing after ${waited}s: the pull Job $OLAITAN_OLLAMA_PULL_JOB failed or never ran."
+                    echo "See: kubectl logs job/$OLAITAN_OLLAMA_PULL_JOB"
+                    echo "A failed Job is not retried by helm upgrade: kubectl delete job $OLAITAN_OLLAMA_PULL_JOB, then run the upgrade again."
+                    kill "$server"
+                    exit 1
+                  fi
+                  echo "waiting for model $m (pulled by the Job $OLAITAN_OLLAMA_PULL_JOB, ${waited}s)"
+                  sleep 10
+                  waited=$((waited+10))
+                done
+                echo "model $m present"
+              done
+              kill "$server"
+          volumeMounts:
+            - name: models
+              mountPath: /root/.ollama
+      containers:
+        - name: ollama
+          image: "ollama/ollama:0.9.0@sha256:2ea3b768a8f2dcd4d910f838d79702bb952089414dd578146619c0a939647ac6"
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
+          ports:
+            - name: http
+              containerPort: 11434
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          env:
+            - name: OLLAMA_CONTEXT_LENGTH
+              value: "16384"
+            - name: OLLAMA_KEEP_ALIVE
+              value: "-1"
+            - name: OLLAMA_NUM_PARALLEL
+              value: "1"
+            - name: OLLAMA_MAX_LOADED_MODELS
+              value: "1"
+          resources:
+            limits:
+              memory: 6Gi
+            requests:
+              cpu: "1"
+              memory: 3Gi
+          volumeMounts:
+            - name: models
+              mountPath: /root/.ollama
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: olaitan-ollama-models
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -2599,6 +3391,258 @@ spec:
         resources:
           requests:
             storage: "8Gi"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: olaitan-certgen-718681f0d3
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: certgen
+spec:
+  backoffLimit: 6
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: olaitan
+        app.kubernetes.io/instance: olaitan
+        app.kubernetes.io/component: certgen
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: olaitan-certgen
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: certgen
+          image: "ghcr.io/olokotoh/olaitan:edge"
+          imagePullPolicy: IfNotPresent
+          command: ["/olaitan"]
+          args:
+            - "certgen"
+            - "--namespace=default"
+            - "--label=app.kubernetes.io/instance=olaitan"
+            - "--label=app.kubernetes.io/name=olaitan"
+            - "--audit-secret=olaitan-audit-tls"
+            - "--audit-kubeconfig-secret=olaitan-audit-webhook-kubeconfig"
+            - "--audit-dns=olaitan-audit-webhook,olaitan-audit-webhook.default,olaitan-audit-webhook.default.svc,olaitan-audit-webhook.default.svc.cluster.local"
+            - "--audit-server=olaitan-audit-webhook.default.svc.cluster.local:8443"
+            - "--validating-webhook=olaitan-audit"
+            - "--applog-secret=olaitan-applog-injector-tls"
+            - "--applog-dns=olaitan-applog-injector,olaitan-applog-injector.default,olaitan-applog-injector.default.svc,olaitan-applog-injector.default.svc.cluster.local"
+            - "--mutating-webhook=olaitan-applog-injector"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: olaitan-ollama-pull-8a97ca238a
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: ollama-pull
+spec:
+  backoffLimit: 4
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: olaitan
+        app.kubernetes.io/instance: olaitan
+        app.kubernetes.io/component: ollama-pull
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      # Review round 1 (P4): run on the server pod's node. Both pods mount
+      # the same ReadWriteOnce claim, and RWO is per node: a node-local
+      # provisioner (kind local-path) would force one node anyway, but
+      # attachable block storage (EBS, PD, Azure Disk) would not, and the
+      # second pod would hit Multi-Attach. The server pod is bound to its
+      # node while it sits in Init waiting for this Job, so this pod
+      # follows it there.
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: olaitan
+                  app.kubernetes.io/instance: olaitan
+                  app.kubernetes.io/component: ollama
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: pull
+          image: "ollama/ollama:0.9.0@sha256:2ea3b768a8f2dcd4d910f838d79702bb952089414dd578146619c0a939647ac6"
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
+          env:
+            - name: OLAITAN_OLLAMA_MODELS
+              value: "qwen2.5:3b-instruct"
+            # model=ID pairs to verify after the pull (ollama.pull.expectedIds).
+            - name: OLAITAN_OLLAMA_EXPECT
+              value: "qwen2.5:3b-instruct=357c53fb659c"
+            - name: OLLAMA_HOST
+              value: "127.0.0.1:11434"
+            # The serving pod may start its own server on this volume while
+            # the pull is still writing; neither side may prune.
+            - name: OLLAMA_NOPRUNE
+              value: "1"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              ollama serve >/tmp/ollama-serve.log 2>&1 &
+              server=$!
+              tries=0
+              until ollama list >/dev/null 2>&1; do
+                tries=$((tries+1))
+                if [ "$tries" -gt 60 ]; then cat /tmp/ollama-serve.log; exit 1; fi
+                sleep 1
+              done
+              for m in $OLAITAN_OLLAMA_MODELS; do
+                echo "pulling $m"
+                ollama pull "$m"
+              done
+              ollama list
+              # A tag can be re-pushed; the expected IDs pin what we got.
+              for pair in $OLAITAN_OLLAMA_EXPECT; do
+                m=${pair%=*}
+                want=${pair##*=}
+                got=$(ollama list | while read -r name id _; do
+                  if [ "$name" = "$m" ] || [ "$name" = "$m:latest" ]; then echo "$id"; fi
+                done)
+                if [ "$got" != "$want" ]; then
+                  echo "model $m has ID ${got:-<missing>}, want $want: the registry tag now points at different weights; check them, then update ollama.pull.expectedIds"
+                  kill "$server"
+                  exit 1
+                fi
+                echo "model $m ID $got matches"
+              done
+              kill "$server"
+          volumeMounts:
+            - name: models
+              mountPath: /root/.ollama
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: olaitan-ollama-models
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: olaitan-applog-injector
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: applog-injector
+webhooks:
+  - name: applog.olaitan.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    reinvocationPolicy: Never
+    failurePolicy: Ignore
+    timeoutSeconds: 5
+    namespaceSelector:
+      matchExpressions:
+      - key: kubernetes.io/metadata.name
+        operator: NotIn
+        values:
+        - kube-system
+        - kube-public
+    rules:
+      - operations: ["CREATE"]
+        apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+        scope: "Namespaced"
+    clientConfig:
+      service:
+        name: olaitan-applog-injector
+        namespace: default
+        path: /mutate
+        port: 443
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: olaitan-audit
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+webhooks:
+  - name: audit.olaitan.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Ignore
+    timeoutSeconds: 5
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - default
+            - kube-system
+            - kube-public
+            - kube-node-lease
+    clientConfig:
+      service:
+        name: olaitan-audit-webhook
+        namespace: default
+        port: 8443
+        path: /audit
+    rules:
+      - operations: ["CREATE", "UPDATE", "DELETE"]
+        apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods", "services", "configmaps", "secrets"]
+        scope: "Namespaced"
+      - operations: ["CREATE", "UPDATE", "DELETE"]
+        apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        resources: ["deployments", "daemonsets", "statefulsets"]
+        scope: "Namespaced"
+      - operations: ["CREATE", "UPDATE", "DELETE"]
+        apiGroups: ["networking.k8s.io"]
+        apiVersions: ["v1"]
+        resources: ["networkpolicies"]
+        scope: "Namespaced"
+      - operations: ["CREATE", "UPDATE", "DELETE"]
+        apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        resources: ["rolebindings", "clusterrolebindings"]
+        scope: "*"
 ---
 apiVersion: v1
 kind: Pod

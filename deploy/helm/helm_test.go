@@ -245,22 +245,32 @@ func TestSubchartsDisabled(t *testing.T) {
 	// Exact expected manifest kind counts. New chart resources MUST be
 	// added here so a future PR that introduces an unintended kind
 	// (e.g. an extra Secret) trips this test.
+	// Story 12.7: every part is on by default, so the default adds the
+	// certgen Job (+ its ServiceAccount, Role, RoleBinding, ClusterRole,
+	// ClusterRoleBinding), the audit webhook (Service, audit-policy
+	// ConfigMap, the admission stub), the applog injector (Deployment,
+	// Service, MutatingWebhookConfiguration) and Ollama (Deployment,
+	// Service, model PVC, its two NetworkPolicies, the model pull Job).
 	want := map[string]int{
-		"ServiceAccount":     2,
-		"Role":               1,
-		"RoleBinding":        1,
-		"ClusterRole":        1,
-		"ClusterRoleBinding": 1,
+		"ServiceAccount":     3,
+		"Role":               2,
+		"RoleBinding":        2,
+		"ClusterRole":        2,
+		"ClusterRoleBinding": 2,
 		"Secret":             1,
-		// config + rules + prompts (Story 3.13 added the prompts ConfigMap).
-		"ConfigMap":             3,
-		"PersistentVolumeClaim": 1,
-		"NetworkPolicy":         1,
-		"DaemonSet":             1,
-		"Deployment":            1,
+		// config + rules + prompts (Story 3.13 added the prompts
+		// ConfigMap) + the audit policy.
+		"ConfigMap":                      4,
+		"PersistentVolumeClaim":          2,
+		"NetworkPolicy":                  3,
+		"DaemonSet":                      1,
+		"Deployment":                     3,
+		"Job":                            2,
+		"MutatingWebhookConfiguration":   1,
+		"ValidatingWebhookConfiguration": 1,
 		// Story 10.2: the falco-ingest Service renders even with the
 		// Falco subchart off; it is where an operator's own Falco posts.
-		"Service": 1,
+		"Service": 4,
 	}
 	got := map[string]int{}
 	for _, m := range ms {
@@ -480,6 +490,15 @@ func TestPodSecurityContext(t *testing.T) {
 		if !strings.HasPrefix(m.Metadata.Name, "olaitan") {
 			continue
 		}
+		// The in-cluster Ollama runs the third-party ollama/ollama image,
+		// which runs as root and writes /root/.ollama (Story 3.4 round-1
+		// review: runAsNonRoot is not imposed; no SA token, no privilege
+		// escalation, RuntimeDefault seccomp on the container). Story 12.7
+		// made it part of the default install; running it non-root is
+		// tracked as a follow-up and needs a live model load to verify.
+		if m.Metadata.Name == "olaitan-ollama" {
+			continue
+		}
 		var obj struct {
 			Spec struct {
 				Template struct {
@@ -635,6 +654,14 @@ func TestAuditWebhookCABundleGuard(t *testing.T) {
 		"template", "olaitan", chartDir(t),
 		"--set", "secrets.redisPassword=test-password",
 		"--set", "auditWebhook.enabled=true",
+		// Story 12.7: with no material at all the certgen Job makes it in
+		// the cluster, so the guard now fires on a PARTIAL set: here every
+		// value but caBundle.
+		"--set", "auditWebhook.clusterCAData=ZmFrZQ==",
+		"--set", "auditWebhook.apiserverClientCert=ZmFrZQ==",
+		"--set", "auditWebhook.apiserverClientKey=ZmFrZQ==",
+		"--set", "auditWebhook.servingCert=ZmFrZQ==",
+		"--set", "auditWebhook.servingKey=ZmFrZQ==",
 	}
 	cmd := exec.Command("helm", args...)
 	var stdout, stderr bytes.Buffer
@@ -643,7 +670,7 @@ func TestAuditWebhookCABundleGuard(t *testing.T) {
 	if err := cmd.Run(); err == nil {
 		t.Fatalf("helm template with audit webhook enabled but no caBundle succeeded; expected guard to fire")
 	}
-	if !strings.Contains(stderr.String(), "auditWebhook.caBundle is required") {
+	if !strings.Contains(stderr.String(), "auditWebhook.caBundle") {
 		t.Errorf("expected auditWebhook.caBundle guard message in stderr; got:\n%s", stderr.String())
 	}
 }
@@ -792,6 +819,9 @@ func TestNetworkPolicyDefault(t *testing.T) {
 	disabled := helmTemplate(t, []string{
 		"falco.enabled=false", "nats.enabled=false", "redis.enabled=false",
 		"networkPolicy.enabled=false",
+		// Story 12.7: Ollama is on by default; its own policies are the
+		// air-gap statement (Story 3.4) and do not follow this switch.
+		"ollama.enabled=false",
 	})
 	disabledMs := parseManifests(t, disabled)
 	for _, m := range findByKind(disabledMs, "NetworkPolicy") {
@@ -827,8 +857,10 @@ func auditWebhookEnabledArgs() []string {
 // present when the gate is flipped. All gated resources must come and
 // go together — a partial render is a chart-rot signal.
 func TestAuditWebhookGate_AllResourcesGated(t *testing.T) {
+	// Story 12.7: on by default, so "off" is explicit.
 	defaultRender := helmTemplate(t, []string{
 		"falco.enabled=false", "nats.enabled=false", "redis.enabled=false",
+		"auditWebhook.enabled=false",
 	})
 	defaultMs := parseManifests(t, defaultRender)
 	for _, m := range findByKind(defaultMs, "Service") {
@@ -1015,7 +1047,8 @@ func TestAuditWebhookFailsFast_WhenApiserverClientCertEmpty(t *testing.T) {
 	if err := cmd.Run(); err == nil {
 		t.Fatalf("helm template with empty apiserverClientCert succeeded; expected guard to fire")
 	}
-	if !strings.Contains(stderr.String(), "auditWebhook.apiserverClientCert is required") {
+	// Story 12.7: the partial-set guard names every missing value.
+	if !strings.Contains(stderr.String(), "auditWebhook.apiserverClientCert is empty") {
 		t.Errorf("expected apiserverClientCert guard, got:\n%s", stderr.String())
 	}
 }
@@ -1039,7 +1072,7 @@ func TestAuditWebhookFailsFast_WhenClusterCADataEmpty(t *testing.T) {
 	if err := cmd.Run(); err == nil {
 		t.Fatalf("helm template with empty clusterCAData succeeded; expected guard to fire")
 	}
-	if !strings.Contains(stderr.String(), "auditWebhook.clusterCAData is required") {
+	if !strings.Contains(stderr.String(), "auditWebhook.clusterCAData is empty") {
 		t.Errorf("expected clusterCAData guard, got:\n%s", stderr.String())
 	}
 }
@@ -1051,7 +1084,7 @@ func TestAuditWebhookFailsFast_WhenClusterCADataEmpty(t *testing.T) {
 // string also appears in the baked olaitan.yaml ConfigMap, which is
 // inert until the adapter is gated on).
 func TestDaemonsetMountsAuditTLSSecret_WhenEnabled(t *testing.T) {
-	disabledRender := helmTemplate(t, []string{"falco.enabled=false", "nats.enabled=false", "redis.enabled=false"})
+	disabledRender := helmTemplate(t, []string{"falco.enabled=false", "nats.enabled=false", "redis.enabled=false", "auditWebhook.enabled=false"})
 	disabledMs := parseManifests(t, disabledRender)
 	for _, m := range findByKind(disabledMs, "DaemonSet") {
 		if strings.Contains(m.Metadata.Name, "collector") {
@@ -1121,9 +1154,10 @@ func TestValidatingWebhookConfigurationUntouched(t *testing.T) {
 // surface on every existing install -- catching it here keeps the
 // default-off promise honest.
 func TestContainerdSensorAbsent_WhenDisabled(t *testing.T) {
-	rendered := helmTemplate(t, nil)
+	// Story 12.7: on by default, so "off" is explicit.
+	rendered := helmTemplate(t, []string{"containerdSensor.enabled=false"})
 	if strings.Contains(rendered, "containerd-socket") {
-		t.Errorf("containerd-socket volume/mount rendered with containerdSensor disabled by default; rendered sample:\n%s",
+		t.Errorf("containerd-socket volume/mount rendered with containerdSensor disabled; rendered sample:\n%s",
 			snippet(rendered, "containerd-socket"))
 	}
 }
@@ -1393,29 +1427,27 @@ func TestContainerdSensorMountReadOnly(t *testing.T) {
 // the path; with type: Directory the pod fails loudly so the
 // operator notices.
 func TestContainerdSensorHostPathTypeDirectory(t *testing.T) {
+	// Story 12.7 (D3) supersedes Story 1.8 P3: the sensor is on by default,
+	// and `type: Directory` kept the whole collector pod, Falco ingest
+	// included, from starting on any node without the socket directory.
+	// The Olaitan-owned containerd-socket volume is DirectoryOrCreate; a
+	// missing socket then leaves only the runtime source DEGRADED.
 	rendered := helmTemplate(t, []string{
 		"containerdSensor.enabled=true",
 	})
-	if !strings.Contains(rendered, `type: Directory`) {
-		t.Errorf("containerd-socket hostPath missing type: Directory; rendered sample:\n%s",
-			snippet(rendered, "containerd-socket"))
+	idx := strings.Index(rendered, "- name: containerd-socket\n          hostPath:")
+	if idx < 0 {
+		t.Fatalf("no containerd-socket hostPath volume; rendered sample:\n%s", snippet(rendered, "containerd-socket"))
 	}
-	if strings.Contains(rendered, `type: DirectoryOrCreate`) {
-		// The Olaitan-owned containerd-socket volume must NOT use
-		// DirectoryOrCreate. The Falco subchart may legitimately use
-		// it for its own runtime-discovery hostPaths; scope the
-		// assertion to a window around the containerd-socket name to
-		// keep that subchart's behaviour out of the assertion.
-		idx := strings.Index(rendered, "name: containerd-socket")
-		if idx >= 0 {
-			window := rendered[idx:]
-			if end := strings.Index(window, "---"); end > 0 && end < 600 {
-				window = window[:end]
-			}
-			if strings.Contains(window, "DirectoryOrCreate") {
-				t.Errorf("containerd-socket hostPath still rendered with DirectoryOrCreate (P3 regression); window:\n%s", window)
-			}
-		}
+	window := rendered[idx:]
+	if end := strings.Index(window, "{{"); end > 0 {
+		window = window[:end]
+	}
+	if len(window) > 900 {
+		window = window[:900]
+	}
+	if !strings.Contains(window, "type: DirectoryOrCreate") {
+		t.Errorf("containerd-socket hostPath is not DirectoryOrCreate; window:\n%s", window)
 	}
 }
 
@@ -1570,9 +1602,9 @@ func TestApplogWebhookCommandIsAbsolute(t *testing.T) {
 }
 
 // TestApplogSidecarAbsent_WhenDisabled asserts none of the four
-// resources render when the gate is off (the default).
+// resources render when the gate is off (on by default since Story 12.7).
 func TestApplogSidecarAbsent_WhenDisabled(t *testing.T) {
-	rendered := helmTemplate(t, []string{"falco.enabled=false", "nats.enabled=false", "redis.enabled=false"})
+	rendered := helmTemplate(t, []string{"falco.enabled=false", "nats.enabled=false", "redis.enabled=false", "applogSidecar.enabled=false"})
 	for _, off := range []string{
 		"olaitan/templates/applog-webhook-deployment.yaml",
 		"olaitan/templates/applog-webhook-service.yaml",
@@ -2205,19 +2237,25 @@ func TestCalicoSensorPathAKeyNamesAreValidatedAsSecretKeys(t *testing.T) {
 	}
 }
 
-// TestCalicoSensorEnabled_RequiresTLS asserts the chart fails render
-// with a clear message if calicoSensor.enabled=true but no TLS
-// material is supplied (neither Path A nor Path B).
+// TestCalicoSensorEnabled_RequiresTLS: Story 12.7 changed the contract.
+// With NO material the source renders and runs DEGRADED (no cni-tls
+// volume; the collector keeps running and says why); HALF a Path B set
+// still fails the render and names the missing values.
 func TestCalicoSensorEnabled_RequiresTLS(t *testing.T) {
+	none := helmTemplate(t, []string{"calicoSensor.enabled=true"})
+	if strings.Contains(none, "name: cni-tls") {
+		t.Errorf("calicoSensor with no material mounts a cni-tls volume; it must render without one")
+	}
 	cmd := exec.Command("helm", "template", "olaitan", chartDir(t),
-		"--set", "redis.auth.password=test",
 		"--set", "secrets.redisPassword=test",
 		"--set", "calicoSensor.enabled=true",
+		"--set", "calicoSensor.tls.clientCert=ZmFrZQ==",
+		"--set", "calicoSensor.tls.clientKey=ZmFrZQ==",
 	)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err == nil {
-		t.Fatalf("expected helm template to fail when calicoSensor.enabled=true but no TLS configured")
+		t.Fatalf("expected helm template to fail on a partial Path B set (no caBundle)")
 	}
 	if !strings.Contains(stderr.String(), "calicoSensor.tls.caBundle is required") {
 		t.Errorf("expected fail-fast message mentioning caBundle; stderr:\n%s", stderr.String())
@@ -2242,7 +2280,8 @@ func TestCalicoSensorDaemonsetMountsTLS(t *testing.T) {
 // rendered NetworkPolicy permits egress from the agent namespace to
 // calico-system/goldmane:7443 only when calicoSensor.enabled=true.
 func TestCalicoSensorNetworkPolicyAllowsGoldmaneEgress(t *testing.T) {
-	disabled := helmTemplate(t, nil)
+	// Story 12.7: on by default, so "off" is explicit.
+	disabled := helmTemplate(t, []string{"calicoSensor.enabled=false"})
 	if strings.Contains(disabled, "k8s-app: goldmane") {
 		t.Errorf("NetworkPolicy carries Goldmane egress rule by default; should be gated on calicoSensor")
 	}
@@ -3175,7 +3214,8 @@ func min(a, b int) int {
 	return b
 }
 
-// TestEvaluationConfig_Default_NoOverlay locks AC1: with no
+// TestEvaluationConfig_Default_NoOverlay (Story 12.7: the chart default
+// provider is now "local", the in-cluster model) locks AC1: with no
 // evaluation.config and no individual overrides, the operator-supplied
 // defaults flow through verbatim. The chart-side analyst.provider
 // default is "none" (Task 2.2), so the analyst line bridges to "none"
@@ -3188,8 +3228,8 @@ func TestEvaluationConfig_Default_NoOverlay(t *testing.T) {
 	if got := findEvalLine(t, rendered, "baselines", "enabled"); got != "true" {
 		t.Errorf("default render: baselines.enabled = %q, want true", got)
 	}
-	if got := findEvalLine(t, rendered, "analyst", "provider"); got != "none" {
-		t.Errorf("default render: analyst.provider = %q, want none", got)
+	if got := findEvalLine(t, rendered, "analyst", "provider"); got != "local" {
+		t.Errorf("default render: analyst.provider = %q, want local (Story 12.7)", got)
 	}
 }
 
@@ -3888,12 +3928,14 @@ func TestGraduatedIsolationAnchorsPresentInOlaitanYAML(t *testing.T) {
 // partial render is a chart-rot signal), and the default render stays
 // byte-identical to the pre-3.4 chart.
 func TestOllamaGate_AllResourcesGated(t *testing.T) {
+	// Story 12.7: on by default, so "off" is explicit.
 	defaultRender := helmTemplate(t, []string{
 		"falco.enabled=false", "nats.enabled=false", "redis.enabled=false",
+		"ollama.enabled=false",
 	})
 	for _, m := range parseManifests(t, defaultRender) {
 		if strings.HasSuffix(m.Metadata.Name, "-ollama") {
-			t.Errorf("%s %s rendered with ollama.enabled=false (default)", m.Kind, m.Metadata.Name)
+			t.Errorf("%s %s rendered with ollama.enabled=false", m.Kind, m.Metadata.Name)
 		}
 	}
 
@@ -4039,10 +4081,11 @@ func TestOllamaNetworkPolicyRestrictsToAggregator(t *testing.T) {
 		t.Error("release NetworkPolicy does not exclude the ollama component; the policy union re-grants ingress/egress the ollama policy denies")
 	}
 
-	// And the exclusion must NOT appear in the default render (the
-	// byte-identical fence).
+	// And the exclusion must NOT appear in a render without Ollama (the
+	// byte-identical fence; Ollama is on by default since Story 12.7).
 	defaultRender := helmTemplate(t, []string{
 		"falco.enabled=false", "nats.enabled=false", "redis.enabled=false",
+		"ollama.enabled=false",
 	})
 	defaultNps := decodeNetpols(t, defaultRender)
 	if len(defaultNps["olaitan"].Spec.PodSelector.MatchExpressions) != 0 {
@@ -4081,7 +4124,10 @@ func TestAnalystLocalBridge(t *testing.T) {
 		t.Errorf("loaded analyst.local = %+v, want the bridged values", cfg.Analyst.Local)
 	}
 
-	defaults := helmTemplate(t, nil)
+	// Unset values keep the file-side defaults. Story 12.7: the chart now
+	// defaults analyst.local.model and runs its own Ollama (whose Service the
+	// endpoint is derived from), so "unset" means the minimal profile.
+	defaults := helmTemplate(t, []string{"ollama.enabled=false", "analyst.local.model="})
 	embeddedDefaults := extractEmbeddedConfigYAML(t, defaults)
 	assertContains(t, embeddedDefaults, `endpoint: "http://ollama:11434"`,
 		"unset analyst.local.endpoint must keep the file-side default")
@@ -4490,7 +4536,10 @@ func helmTemplateExpectError(t *testing.T, sets []string) string {
 // (response.forensics.s3_bucket) AND the durable-report bucket
 // (response.report_archive.s3_bucket), the common single-bucket operator case.
 func TestForensicsFacade_S3BucketFansOutToBothBuckets(t *testing.T) {
-	cfg := loadEmbedded(t, []string{"forensics.s3.bucket=olaitan-forensics-shared"})
+	// Story 12.7: both consumers are on by default, and one store field on
+	// its own is a partial store the binary refuses. The gates are switched
+	// off here because the subject is the bridge, not the validation.
+	cfg := loadEmbedded(t, append(storeGatesOff(), "forensics.s3.bucket=olaitan-forensics-shared"))
 	if cfg.Response.Forensics.S3Bucket != "olaitan-forensics-shared" {
 		t.Errorf("forensics.s3.bucket facade did not reach response.forensics.s3_bucket: got %q",
 			cfg.Response.Forensics.S3Bucket)
@@ -4505,7 +4554,7 @@ func TestForensicsFacade_S3BucketFansOutToBothBuckets(t *testing.T) {
 // forensics.s3.kms_key_alias sets BOTH response.forensics.kms_key_alias AND
 // response.report_archive.kms_key_alias.
 func TestForensicsFacade_KMSKeyAliasFansOutToBothBuckets(t *testing.T) {
-	cfg := loadEmbedded(t, []string{"forensics.s3.kms_key_alias=alias/olaitan-shared"})
+	cfg := loadEmbedded(t, append(storeGatesOff(), "forensics.s3.kms_key_alias=alias/olaitan-shared"))
 	if cfg.Response.Forensics.KMSKeyAlias != "alias/olaitan-shared" {
 		t.Errorf("forensics.s3.kms_key_alias facade did not reach response.forensics.kms_key_alias: got %q",
 			cfg.Response.Forensics.KMSKeyAlias)
@@ -4661,10 +4710,17 @@ func TestAggregatorExtraEnv_Projected(t *testing.T) {
 		t.Errorf("aggregator.extraEnv did not project onto the aggregator Deployment\n%s",
 			snippet(rendered, "olaitan-aggregator"))
 	}
-	// Default render carries no extraEnv (golden-file stability).
+	// Default render carries only the Story 12.7 role-budget entry for the
+	// in-cluster CPU model, and a list the operator sets replaces it.
 	plain := helmTemplate(t, nil)
-	if strings.Contains(plain, "OLT_RISK_WINDOW_SECONDS") {
+	if strings.Contains(plain, "name: \"OLT_RISK_WINDOW_SECONDS\"") {
 		t.Error("default render must not carry OLT_RISK_WINDOW_SECONDS")
+	}
+	if !strings.Contains(plain, "name: \"OLT_LLM_ROLE_TIMEOUT_MULTIPLIER\"") {
+		t.Error("default render must carry OLT_LLM_ROLE_TIMEOUT_MULTIPLIER for the in-cluster CPU model")
+	}
+	if strings.Contains(rendered, "name: \"OLT_LLM_ROLE_TIMEOUT_MULTIPLIER\"") {
+		t.Error("an operator-set extraEnv must replace the default list (Helm replaces lists)")
 	}
 }
 
@@ -4691,6 +4747,7 @@ func TestNotificationsFacade_WebhookUrlOverridesSecret(t *testing.T) {
 // and its response.* counterpart are set, the facade WINS (it overlays last).
 func TestForensicsFacade_WinsOverResponseBlock(t *testing.T) {
 	cfg := loadEmbedded(t, []string{
+		"response.forensics.enabled=false", "response.reportArchive.enabled=false",
 		"response.forensics.s3Bucket=advanced-escape-hatch",
 		"forensics.s3.bucket=facade-surface",
 		"response.settling.windowSeconds=15",
@@ -4735,45 +4792,49 @@ func TestForensicsFacade_PathCriuRejectedAtTemplateTime(t *testing.T) {
 	}
 }
 
-// TestForensicsFacade_DefaultsAreAdditiveOffByDefault pins BI-7 (AC1
-// upgrade-safety): under the default render the Epic-4 controller gates all
-// default OFF, so a helm upgrade from an Epic-3 RSLT-full deployment installs
-// the Epic-4 surface without disrupting in-flight investigations (the facade
-// sets PARAMETERS only; it enables NO controller). Also asserts the default
-// facade params overlay the SAME file-side values (idempotent render), which
-// is why the goldens are unchanged for the rendered config.
+// storeGatesOff switches off the two object-store consumers, for tests whose
+// subject is a facade bridge rather than store validation (Story 12.7: both
+// are on by default, and one store field alone is a partial store).
+func storeGatesOff() []string {
+	return []string{"response.forensics.enabled=false", "response.reportArchive.enabled=false"}
+}
+
+// TestForensicsFacade_DefaultsAreAdditiveOffByDefault: Story 12.7 reversed
+// the Story 4.10 AC1 default (Aslim, 2026-10-19: everything on by default).
+// The upgrade-safety property now lives in values-minimal.yaml: layered on
+// the chart it keeps every Epic-4 gate OFF, so an upgrade that must not
+// change behaviour has one file to pass. The defaults themselves are on, and
+// the default render still loads (no store is DEGRADED, not invalid).
 func TestForensicsFacade_DefaultsAreAdditiveOffByDefault(t *testing.T) {
-	cfg := loadEmbedded(t, nil)
-	if cfg.Response.Forensics.EnabledOrDefault() {
-		t.Error("response.forensics must default OFF (AC1 additive upgrade-safety)")
+	def := loadEmbedded(t, nil)
+	if !def.Response.Forensics.EnabledOrDefault() || !def.Response.Settling.EnabledOrDefault() ||
+		!def.Response.DFIR.EnabledOrDefault() || !def.Response.ReportArchive.EnabledOrDefault() ||
+		!def.Response.Notifications.EnabledOrDefault() {
+		t.Error("the Epic-4 gates must default ON since Story 12.7")
 	}
-	if cfg.Response.Settling.EnabledOrDefault() {
-		t.Error("response.settling must default OFF (AC1)")
-	}
-	if cfg.Response.DFIR.Enabled != nil && *cfg.Response.DFIR.Enabled {
-		t.Error("response.dfir must default OFF (AC1)")
-	}
-	if cfg.Response.ReportArchive.EnabledOrDefault() {
-		t.Error("response.report_archive must default OFF (AC1)")
-	}
-	if cfg.Response.Notifications.EnabledOrDefault() {
-		t.Error("response.notifications must default OFF (AC1)")
+	minimal := renderedConfig(t, renderArgs(t, "-f", filepath.Join(chartDir(t), "values-minimal.yaml")))
+	if minimal.Response.Forensics.EnabledOrDefault() || minimal.Response.Settling.EnabledOrDefault() ||
+		minimal.Response.DFIR.EnabledOrDefault() || minimal.Response.ReportArchive.EnabledOrDefault() ||
+		minimal.Response.Notifications.EnabledOrDefault() {
+		t.Error("values-minimal.yaml must keep every Epic-4 gate OFF (the upgrade-safety file)")
 	}
 }
 
-// TestForensicsFacade_RSLTFullArmKeepsEpic4GatesOff pins BI-7: the Epic-3-arm
-// render (evaluation.config=RSLT-full, no Epic-4 gates flipped) leaves every
-// Epic-4 controller OFF, so the Epic-4 chart is a strict additive superset of
-// the Epic-3 render. The settling window timers re-arm from the Redis-backed
-// FSM on restart, so a rolling pod replacement during the upgrade does not drop
-// an in-flight settling window (documented in the runbook upgrade-safety note).
+// TestForensicsFacade_RSLTFullArmKeepsEpic4GatesOff pins BI-7: an evaluation
+// arm never TOGGLES an Epic-4 gate; it leaves them as the base install set
+// them. With the gates off (values-minimal) the RSLT-full arm keeps them off;
+// with the default (on) it keeps them on.
 func TestForensicsFacade_RSLTFullArmKeepsEpic4GatesOff(t *testing.T) {
-	cfg := loadEmbedded(t, []string{"evaluation.config=RSLT-full"})
-	if cfg.Response.Forensics.EnabledOrDefault() ||
-		cfg.Response.Settling.EnabledOrDefault() ||
-		cfg.Response.ReportArchive.EnabledOrDefault() ||
-		cfg.Response.Notifications.EnabledOrDefault() {
-		t.Error("the RSLT-full arm must NOT auto-enable any Epic-4 controller gate (AC1 additive upgrade-safety)")
+	off := renderedConfig(t, renderArgs(t, "-f", filepath.Join(chartDir(t), "values-minimal.yaml"), "--set", "evaluation.config=RSLT-full"))
+	if off.Response.Forensics.EnabledOrDefault() ||
+		off.Response.Settling.EnabledOrDefault() ||
+		off.Response.ReportArchive.EnabledOrDefault() ||
+		off.Response.Notifications.EnabledOrDefault() {
+		t.Error("the RSLT-full arm must NOT auto-enable any Epic-4 controller gate")
+	}
+	on := renderedConfig(t, renderArgs(t, "--set", "evaluation.config=RSLT-full"))
+	if !on.Response.Forensics.EnabledOrDefault() || !on.Response.Settling.EnabledOrDefault() {
+		t.Error("the RSLT-full arm must NOT switch off an Epic-4 gate the base install turned on")
 	}
 }
 
@@ -5544,11 +5605,13 @@ func TestCollectorReceivesFalcoOverHTTPWithNoHostMount(t *testing.T) {
 	rendered := helmTemplate(t, nil)
 	pod := collectorDaemonSet(t, rendered)["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)
 
-	// Default install: no hostPath at all and no permission sidecar. The
-	// socket mount was the collector's only default host access.
+	// Default install: no Falco hostPath and no permission sidecar (Story
+	// 10.2 removed the socket mount). Story 12.7 turned the containerd
+	// sensor on by default, so its socket directory is the ONE host mount.
 	for _, v := range pod["volumes"].([]any) {
-		if _, ok := v.(map[string]any)["hostPath"]; ok {
-			t.Errorf("default collector still mounts a hostPath volume: %v", v)
+		vm := v.(map[string]any)
+		if _, ok := vm["hostPath"]; ok && vm["name"] != "containerd-socket" {
+			t.Errorf("default collector mounts a hostPath volume other than the containerd socket directory: %v", v)
 		}
 	}
 	if ic, ok := pod["initContainers"]; ok && ic != nil {
@@ -6018,42 +6081,43 @@ func TestNotesReportEverySourceAndItsReason(t *testing.T) {
 			t.Errorf("install notes never mention %q", want)
 		}
 	}
-	// Every OFF source must carry a reason on the lines that follow, not a
-	// bare "[OFF]". Asserted structurally: the previous version counted
-	// "[OFF]" occurrences and grepped for one stock phrase, and passed
-	// while the applog sidecar shipped with no reason line at all.
-	lines := strings.Split(notes, "\n")
-	var offCount int
-	for i, l := range lines {
-		if !strings.Contains(l, "[OFF]") {
-			continue
-		}
-		offCount++
-		if i+1 >= len(lines) {
-			t.Errorf("%q is the last line; no reason follows", strings.TrimSpace(l))
-			continue
-		}
-		// The reason may sit after a blank line (the ENFORCEMENT block
-		// separates its explanation into a paragraph), so look ahead a
-		// little -- but not past the next source, which would let a
-		// reasonless entry borrow its neighbour's text.
-		var reasoned bool
-		for j := i + 1; j < len(lines) && j <= i+3; j++ {
-			nxt := strings.TrimSpace(lines[j])
-			if strings.Contains(nxt, "[OFF]") || strings.Contains(nxt, "[ON ]") || strings.Contains(nxt, "[ ? ]") {
-				break
+	// Every OFF or DEGRADED entry must carry a reason, inline after " -- "
+	// or on the lines that follow, never a bare tag. Story 12.7: the default
+	// reports only isolation OFF, so the minimal posture (every optional
+	// part off) is checked as well.
+	minimal := renderNotes(t, []string{
+		"auditWebhook.enabled=false", "containerdSensor.enabled=false",
+		"calicoSensor.enabled=false", "applogSidecar.enabled=false",
+	})
+	for name, n := range map[string]string{"default": notes, "minimal": minimal} {
+		lines := strings.Split(n, "\n")
+		var offCount int
+		for i, l := range lines {
+			if !strings.Contains(l, "[OFF]") && !strings.Contains(l, "[DEGRADED]") {
+				continue
 			}
-			if nxt != "" {
-				reasoned = true
-				break
+			offCount++
+			if _, inline, ok := strings.Cut(l, " -- "); ok && strings.TrimSpace(inline) != "" {
+				continue
+			}
+			var reasoned bool
+			for j := i + 1; j < len(lines) && j <= i+3; j++ {
+				nxt := strings.TrimSpace(lines[j])
+				if strings.Contains(nxt, "[OFF]") || strings.Contains(nxt, "[ON ]") || strings.Contains(nxt, "[ ? ]") || strings.Contains(nxt, "[DEGRADED]") {
+					break
+				}
+				if nxt != "" {
+					reasoned = true
+					break
+				}
+			}
+			if !reasoned {
+				t.Errorf("%s: %q is reported with no reason after it", name, strings.TrimSpace(l))
 			}
 		}
-		if !reasoned {
-			t.Errorf("source %q is reported OFF with no reason after it", strings.TrimSpace(l))
+		if name == "minimal" && offCount < 4 {
+			t.Errorf("expected the minimal posture to report several sources OFF, got %d", offCount)
 		}
-	}
-	if offCount < 4 {
-		t.Errorf("expected the default install to report several sources OFF, got %d", offCount)
 	}
 }
 
@@ -6069,7 +6133,9 @@ func TestNotesStateAuditWebhookIsImpossibleOnManagedControlPlanes(t *testing.T) 
 			if !strings.Contains(notes, "audit-webhook-config-file") {
 				t.Errorf("notes on %s do not explain WHY the audit webhook is unavailable", platform)
 			}
-			if !strings.Contains(notes, "Impossible on "+platform) {
+			// Story 12.7: on by default, so a managed platform shows it
+			// DEGRADED and says why it can never work there.
+			if !strings.Contains(notes, "[DEGRADED] Kubernetes audit webhook -- impossible on "+platform) {
 				t.Errorf("notes on %s do not distinguish 'impossible here' from 'off by default'; notes:\n%s", platform, notes)
 			}
 		})
@@ -6077,7 +6143,7 @@ func TestNotesStateAuditWebhookIsImpossibleOnManagedControlPlanes(t *testing.T) 
 	// And the inverse: on a self-managed control plane it is genuinely
 	// available, so the notes must say so rather than repeat the warning.
 	notes := renderNotes(t, nil)
-	if strings.Contains(notes, "Impossible on") {
+	if strings.Contains(notes, "impossible on") {
 		t.Error("notes claim the audit webhook is impossible on a cluster where it is available")
 	}
 }
@@ -6543,8 +6609,10 @@ func TestContainerdSensorGrantsTheSocketGroup(t *testing.T) {
 	if g, _ := pod([]string{"containerdSensor.enabled=true", "containerdSensor.socketGroup=1001"})["supplementalGroups"].([]any); len(g) != 1 || g[0] != 1001 {
 		t.Errorf("socketGroup override ignored: %v", g)
 	}
-	if _, ok := pod(nil)["supplementalGroups"]; ok {
-		t.Error("the default install (sensor off) grants a supplemental group it does not need")
+	// Story 12.7: the sensor is on by default; with it off (and on
+	// OpenShift, where it is not rendered) no group is needed.
+	if _, ok := pod([]string{"containerdSensor.enabled=false"})["supplementalGroups"]; ok {
+		t.Error("an install with the sensor off grants a supplemental group it does not need")
 	}
 	// Review of #141: sprig's int turns a typo into 0, root's group.
 	for _, bad := range []string{"l001", "-1", ""} {
@@ -6607,8 +6675,9 @@ func TestApplogWebhookRejectsNATSURLWithCredentials(t *testing.T) {
 			t.Errorf("endpoints.nats=%s: want a failure naming endpoints.nats, credentials and #130, got: %s", url, msg)
 		}
 	}
-	// Without the applog sidecar nothing copies the URL into workload pods.
-	helmTemplate(t, []string{"endpoints.nats=nats://user:pass@nats.infra.svc:4222"})
+	// Without the applog sidecar nothing copies the URL into workload pods
+	// (Story 12.7: it is on by default, so "without" is explicit).
+	helmTemplate(t, []string{"applogSidecar.enabled=false", "endpoints.nats=nats://user:pass@nats.infra.svc:4222"})
 }
 
 // TestApplogWebhookNATSURLHostParsing: Story 10.10 review. The short-name
@@ -6665,8 +6734,12 @@ func TestCollectorKnowsWhetherApplogIsOn(t *testing.T) {
 		}
 		return nil
 	}
-	if v := envOf(nil); v != "false" {
-		t.Errorf("OLAITAN_APPLOG_ENABLED default = %v, want \"false\"", v)
+	// Story 12.7: on by default.
+	if v := envOf(nil); v != "true" {
+		t.Errorf("OLAITAN_APPLOG_ENABLED default = %v, want \"true\"", v)
+	}
+	if v := envOf([]string{"applogSidecar.enabled=false"}); v != "false" {
+		t.Errorf("OLAITAN_APPLOG_ENABLED with applog off = %v, want \"false\"", v)
 	}
 	if v := envOf([]string{"applogSidecar.enabled=true", "applogSidecar.tls.servingCert=Yw==", "applogSidecar.tls.servingKey=aw==", "applogSidecar.tls.caBundle=Yw=="}); v != "true" {
 		t.Errorf("OLAITAN_APPLOG_ENABLED with applog on = %v, want \"true\"", v)
