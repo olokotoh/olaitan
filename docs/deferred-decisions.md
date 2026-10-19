@@ -1411,3 +1411,77 @@ installed from a chart before Story 12.6, all covered in docs/runbook.md
   newer than 8.10.2 has written data an 8.10.2 server may not load; pin
   `redis.image.tag` and `redis.image.digest` to that version or newer.
 
+
+---
+
+## ADR-2026-10-19-01: The analyst chain runs off the FSM path (score first, re-score when the chain returns)
+
+**Status:** Accepted.
+
+**Date:** 2026-10-19 (Story 7.4, issue #186).
+
+**Context.** Since Story 3.11 the single FSM consumer ran the L1/L2/Senior
+investigation chain INLINE before `fsm.Evaluate`. With the in-cluster CPU
+model of the full profile, a real attack whose rule score already crossed
+SUSPICIOUS went unflagged until all three roles returned: 727 s in one live
+run, no transition within 900 s in another (#185, #183). Because the
+consumer is single-threaded, every other workload's packages also waited.
+
+**Decision.** Full async. Each package is folded into the risk window with
+a zero LLM term from that package (a still-live verdict already in the
+window is kept), scored and evaluated at once. An LLM-eligible package
+(FR19 gate, then the Story 3.12 breaker, both still on the consumer
+goroutine) is dispatched to a bounded worker pool
+(`OLT_LLM_CHAIN_WORKERS`, default 2; `OLT_LLM_CHAIN_QUEUE`, default 16)
+with at most one chain in flight per workload. Workers run only the chain
+and the `AUDIT.assessments` publish; the capped verdict is handed back to
+the consumer goroutine, folded into the window (`risk.Window.FoldLLM`, TTL
+from arrival), re-scored, and evaluated again with the triggering
+`package_id`, so a verdict that moves the band is its own
+`AUDIT.transitions` event. A package with a dispatched chain is acked only
+after its verdict is applied (heartbeated with `InProgress`), so the
+Story 3.9 checkpoint resume still works across a restart.
+
+**Alternatives considered and rejected.**
+
+- *Thin slice* (evaluate the deterministic score, then run the chain inline
+  and re-score): fixes the first transition of the triggering workload but
+  still blocks the single consumer for the whole chain, so every other
+  workload's detection stalls for up to the chain duration.
+- *Evaluate from the worker goroutines*: `Machine.Evaluate` publishes to the
+  sink after releasing its lock, so concurrent callers could deliver
+  transitions to the audit and Redis sinks out of order. Handing results
+  back to the consumer keeps one FSM driver.
+- *Ack at once*: simpler, but a restart mid-chain would silently drop the
+  chain (FR29 resume lost).
+- *Block or spawn when the pool is full*: blocking re-creates the stall;
+  unbounded goroutines let a workload spray grow memory. A full pool
+  rejects (`queue_full`) and the deterministic score has already acted.
+
+**Trust bound.** Unchanged. Per-provider caps and the calculator's clamp at
+`llm_cap` are untouched; the re-score includes the workload's live
+deterministic terms, so it is never below the deterministic aggregate at
+that instant, and the FSM can only de-escalate through its cooldown path.
+
+**Chapter 3 / evaluation disclosure.** MTTD and "added latency" figures for
+the LLM arms (Table 4.8 RSLT ablation, and any MTTD measured with the chain
+enabled) that were measured BEFORE this change ran with the analyst chain
+INLINE: the first transition of a triggering package waited for the whole
+chain. After this change the deterministic transition comes first and the
+model verdict is a later, separate transition, so those LLM-arm latency
+numbers are not comparable with post-change runs; they are reported as
+"chain inline" figures or re-measured. UNCHANGED: the FR55 trust bound, and
+the deterministic (RS arm) MTTD and FPR campaign, whose code path is
+byte-identical (no pool is built when the chain is disabled).
+
+**Risk inherited.** Up to `workers + queue` packages can be un-acked at
+once; after a crash they are redelivered and their deterministic score is
+evaluated again (at-least-once, as for the single in-flight package
+before). The re-score transition is not marked in the `AUDIT.transitions`
+payload itself (the schema extension stays deferred, ADR-2026-08-17-01
+item 4); it is identified by the `source` field on its log line, by the
+same `package_id` on a later transition, and by that package's
+`AUDIT.assessments` event.
+
+**Provenance.** Story 7.4, issue #186; traceability row
+`c3.6.4-async-analyst-chain`.

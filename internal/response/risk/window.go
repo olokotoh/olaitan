@@ -130,23 +130,7 @@ func (w *Window) Observe(workloadID string, pkg schema.EvidencePackage, llmCappe
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Lazy sweep at most once per TTL: drop entries whose signals have all
-	// expired so churned workload IDs do not accumulate forever.
-	if now.Sub(w.lastSweep) > w.ttl {
-		for id, e := range w.m {
-			if !e.expire(now, w.ttl) {
-				delete(w.m, id)
-			}
-		}
-		w.lastSweep = now
-	}
-
-	e, ok := w.m[workloadID]
-	if !ok {
-		e = &entry{}
-	} else {
-		e.expire(now, w.ttl)
-	}
+	e := w.entryLocked(workloadID, now)
 
 	// Strongest rule match by numeric severity (non-numeric ranks -1 and can
 	// never displace a numeric match; the calculator scores it zero anyway).
@@ -184,11 +168,7 @@ func (w *Window) Observe(workloadID string, pkg schema.EvidencePackage, llmCappe
 
 	// Persist the entry only when it retains something; a signal-less
 	// package must neither create map growth nor refresh anyone's decay.
-	if e.rule != nil || e.dev != nil || e.llmCapped > 0 {
-		w.m[workloadID] = e
-	} else {
-		delete(w.m, workloadID)
-	}
+	w.storeLocked(workloadID, e)
 
 	rules := pkg.RuleMatches
 	if e.rule != nil {
@@ -203,4 +183,76 @@ func (w *Window) Observe(workloadID string, pkg schema.EvidencePackage, llmCappe
 		llm = e.llmCapped
 	}
 	return rules, devs, llm
+}
+
+// FoldLLM folds a capped LLM confidence that arrived AFTER its triggering
+// package was already scored (Story 7.4: the analyst chain runs off the FSM
+// path, so its verdict lands later) and returns the workload's aggregate to
+// re-score. Only the LLM term is folded: the triggering package's rule and
+// baseline signals were already folded by Observe when it arrived, and the
+// returned rules/deviations are the LIVE stored ones, so a verdict that lands
+// after those signals decayed does not resurrect them (honest decay). The
+// verdict's own TTL starts at now (its arrival), because that is when the FSM
+// can first use it. The live deterministic terms are always included, so the
+// re-score is never below the deterministic aggregate at the same instant.
+//
+// With a disabled window (ttl <= 0) it returns the triggering package's own
+// signals and llmCapped unchanged, i.e. the re-score equals the pre-Story-7.4
+// inline score Score(pkg, llmCapped). The caller passes time.Now() directly
+// (see Observe).
+func (w *Window) FoldLLM(workloadID string, pkg schema.EvidencePackage, llmCapped int, now time.Time) ([]schema.RuleMatch, []schema.BaselineDeviation, int) {
+	if w == nil || w.ttl <= 0 {
+		return pkg.RuleMatches, pkg.BaselineDeviations, llmCapped
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	e := w.entryLocked(workloadID, now)
+	if llmCapped > e.llmCapped {
+		e.llmCapped = llmCapped
+		e.llmAt = now
+	}
+	w.storeLocked(workloadID, e)
+
+	var rules []schema.RuleMatch
+	if e.rule != nil {
+		rules = []schema.RuleMatch{*e.rule}
+	}
+	var devs []schema.BaselineDeviation
+	if e.dev != nil {
+		devs = []schema.BaselineDeviation{*e.dev}
+	}
+	return rules, devs, e.llmCapped
+}
+
+// entryLocked runs the lazy sweep (at most once per TTL: drop entries whose
+// signals have all expired so churned workload IDs do not accumulate
+// forever) and returns the workload's entry with its stale signals expired,
+// or a fresh empty entry. Called with w.mu held.
+func (w *Window) entryLocked(workloadID string, now time.Time) *entry {
+	if now.Sub(w.lastSweep) > w.ttl {
+		for id, e := range w.m {
+			if !e.expire(now, w.ttl) {
+				delete(w.m, id)
+			}
+		}
+		w.lastSweep = now
+	}
+	e, ok := w.m[workloadID]
+	if !ok {
+		return &entry{}
+	}
+	e.expire(now, w.ttl)
+	return e
+}
+
+// storeLocked persists e only when it retains a signal, else deletes the
+// workload's entry. Called with w.mu held.
+func (w *Window) storeLocked(workloadID string, e *entry) {
+	if e.rule != nil || e.dev != nil || e.llmCapped > 0 {
+		w.m[workloadID] = e
+	} else {
+		delete(w.m, workloadID)
+	}
 }

@@ -210,3 +210,74 @@ func TestWindow_SumsAcrossPackagesCrossesThresholds(t *testing.T) {
 		t.Fatalf("critical rule + baseline + llm aggregate = %.1f, want >= QUARANTINED (70)", s3)
 	}
 }
+
+// TestFoldLLM_DisabledPassesTriggeringPackageThrough pins the Story 7.4
+// disabled-window contract: with no window the late-arriving verdict re-scores
+// the triggering package exactly as the old inline path did (Score(pkg, llm)).
+func TestFoldLLM_DisabledPassesTriggeringPackageThrough(t *testing.T) {
+	var w *Window
+	r, d, llm := w.FoldLLM("wl", rulePkg("wl", "80"), 25, time.Now())
+	if len(r) != 1 || r[0].Severity != "80" || len(d) != 0 || llm != 25 {
+		t.Fatalf("nil window: got rules=%v devs=%v llm=%d, want the package's own signals and llm 25", r, d, llm)
+	}
+	r, _, llm = New(0).FoldLLM("wl", rulePkg("wl", "80"), 25, time.Now())
+	if len(r) != 1 || llm != 25 {
+		t.Fatalf("zero-ttl window: got rules=%v llm=%d", r, llm)
+	}
+}
+
+// TestFoldLLM_AddsVerdictToLiveAggregate pins Story 7.4 AC3/AC4: the verdict
+// is folded into the workload's live aggregate (the deterministic terms are
+// kept, so the re-score is never below the deterministic one) and the LLM
+// term is retained for later packages with its own TTL from arrival.
+func TestFoldLLM_AddsVerdictToLiveAggregate(t *testing.T) {
+	w := New(60 * time.Second)
+	now := time.Unix(20000, 0)
+	pkg := rulePkg("wl", "80")
+	w.Observe("wl", pkg, 0, now)
+	r, d, llm := w.FoldLLM("wl", pkg, 30, now.Add(5*time.Second))
+	if len(r) != 1 || r[0].Severity != "80" || len(d) != 0 || llm != 30 {
+		t.Fatalf("fold: got rules=%v devs=%v llm=%d, want live rule 80 and llm 30", r, d, llm)
+	}
+	// A later signal-less package still sees the retained verdict.
+	_, _, llm = w.Observe("wl", schema.EvidencePackage{WorkloadID: "wl"}, 0, now.Add(10*time.Second))
+	if llm != 30 {
+		t.Fatalf("retained llm = %d, want 30", llm)
+	}
+	// The verdict's TTL runs from ARRIVAL (t+5s): live at t+65s, gone at t+66s.
+	if _, _, llm = w.Observe("wl", schema.EvidencePackage{WorkloadID: "wl"}, 0, now.Add(65*time.Second)); llm != 30 {
+		t.Fatalf("llm at t+65s = %d, want 30 (TTL from arrival)", llm)
+	}
+	if _, _, llm = w.Observe("wl", schema.EvidencePackage{WorkloadID: "wl"}, 0, now.Add(66*time.Second)); llm != 0 {
+		t.Fatalf("llm at t+66s = %d, want 0 (decayed)", llm)
+	}
+}
+
+// TestFoldLLM_DoesNotResurrectDecayedSignals pins design decision 7: a verdict
+// that arrives after the triggering package's rule decayed re-scores on the
+// LIVE aggregate only; the stale rule is not revived (honest decay).
+func TestFoldLLM_DoesNotResurrectDecayedSignals(t *testing.T) {
+	w := New(30 * time.Second)
+	now := time.Unix(30000, 0)
+	pkg := rulePkg("wl", "80")
+	w.Observe("wl", pkg, 0, now)
+	r, d, llm := w.FoldLLM("wl", pkg, 30, now.Add(31*time.Second))
+	if len(r) != 0 || len(d) != 0 || llm != 30 {
+		t.Fatalf("late fold: got rules=%v devs=%v llm=%d, want no rule (decayed) and llm 30", r, d, llm)
+	}
+	// A zero verdict creates no entry.
+	if _, _, llm = New(30*time.Second).FoldLLM("other", pkg, 0, now); llm != 0 {
+		t.Fatalf("zero verdict llm = %d", llm)
+	}
+}
+
+// TestFoldLLM_KeepsHigherLiveVerdict: a weaker late verdict never lowers a
+// stronger still-live one (max semantics, as Observe).
+func TestFoldLLM_KeepsHigherLiveVerdict(t *testing.T) {
+	w := New(60 * time.Second)
+	now := time.Unix(40000, 0)
+	w.FoldLLM("wl", rulePkg("wl", "80"), 30, now)
+	if _, _, llm := w.FoldLLM("wl", rulePkg("wl", "80"), 10, now.Add(time.Second)); llm != 30 {
+		t.Fatalf("llm = %d, want the stronger live 30", llm)
+	}
+}

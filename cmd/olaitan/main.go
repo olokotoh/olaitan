@@ -814,11 +814,14 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		return fmt.Errorf("aggregator: chain-enabled gauge: %w", gerr)
 	}
 	chainEnabledGauge.WithLabelValues().Set(0)
-	// Story 3.11: the chain (when enabled) is run INLINE by the single FSM
-	// driver (wireFSMConsumer), not a separate consumer. These carry the chain
-	// plumbing into that call; they stay nil/zero when the chain is disabled.
+	// Story 3.11: the chain (when enabled) is driven by the single FSM driver
+	// (wireFSMConsumer), not a separate consumer; since Story 7.4 it runs on
+	// that driver's bounded worker pool, off the FSM path. These carry the
+	// chain plumbing into that call; they stay nil/zero when the chain is
+	// disabled.
 	var assessmentPub responseaudit.AssessmentAuditPublisher
 	var chainRuns *prometheus.CounterVec
+	var chainDispatches *prometheus.CounterVec
 	var chainMode string
 	var breaker *analyst.CircuitBreaker
 	if chainEnabled {
@@ -846,6 +849,12 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 			return fmt.Errorf("aggregator: chain-runs metric: %w", merr)
 		}
 		chainRuns = runs
+		dispatches, derr := analyst.RegisterChainDispatchMetric(metricsReg)
+		if derr != nil {
+			closeNATS()
+			return fmt.Errorf("aggregator: chain-dispatch metric: %w", derr)
+		}
+		chainDispatches = dispatches
 
 		// Story 3.12: the LLM-tier circuit breaker. It counts LLM-eligible
 		// packages (post-FR19-gate) and bypasses the chain when the global
@@ -1185,7 +1194,7 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	} else {
 		log.Info("aggregator: risk window disabled (per-package scoring)")
 	}
-	if err := wireFSMConsumer(ctx, g, log, nc, scoreCalc, stateMachine, chain, chainMode, breaker, assessmentPub, chainRuns, riskWindow); err != nil {
+	if err := wireFSMConsumer(ctx, g, log, nc, scoreCalc, stateMachine, chain, chainMode, breaker, assessmentPub, chainRuns, chainDispatches, riskWindow); err != nil {
 		closeNATS()
 		return fmt.Errorf("aggregator: fsm consumer: %w", err)
 	}
@@ -1699,6 +1708,12 @@ func wireOverrideController(cfg *config.Config, cs kubernetes.Interface, nc *nat
 // rules-engine consumerMaxDeliver (Story 1.14 P18 closure).
 const fsmConsumerMaxDeliver = 5
 
+// fsmConsumerAckWait is the JetStream AckWait of the FSM consumer, pinned
+// explicitly (it equals the JetStream default) because Story 7.4 defers the
+// ack of a package whose analyst chain is in flight and heartbeats it every
+// chainHeartbeat, which must stay well under this value.
+const fsmConsumerAckWait = 30 * time.Second
+
 // fsmFetchBackoff is the bounded sleep between consumer.Next attempts
 // after a non-timeout error; the consumer honours context cancellation
 // immediately rather than completing the backoff. Mirrors the rules
@@ -1729,41 +1744,19 @@ func envSeconds(log *slog.Logger, key string, def int) int {
 	return n
 }
 
-// chainAdjustedScore runs the investigation chain inline when enabled, folds
-// its per-provider-capped LLM confidence into the deterministic ThreatScore,
-// and returns the combined score that drives the FSM (Story 3.11). A nil chain
-// folds 0 (deterministic-only, byte-identical to Epic 2). Extracted from the
-// FSM consumer loop so the chain->fold->score wiring is unit-testable without
-// a live JetStream consumer (round-2 review: the inline call site was
-// otherwise untested -- a regression feeding 0 instead of llmCapped shipped
-// green).
-func chainAdjustedScore(ctx context.Context, pkg schema.EvidencePackage, scoreCalc *score.Calculator, chain *analyst.Chain, chainMode string, breaker *analyst.CircuitBreaker, auditPub responseaudit.AssessmentAuditPublisher, chainRuns *prometheus.CounterVec, riskWindow *risk.Window, now time.Time, log *slog.Logger) (schema.ConfidenceScore, error) {
-	llmCapped := 0
-	if chain != nil {
-		llmCapped = safeChainConfidence(ctx, pkg, chain, chainMode, breaker, auditPub, chainRuns, log)
-	}
-	// Fold this package's signals into the workload's rolling risk aggregate and
-	// score the aggregate, so recent correlated evidence (rule + baseline + LLM)
-	// sums rather than each single-signal package scoring alone. A disabled
-	// window returns the package's own signals, so the score is unchanged.
-	rules, devs, llm := riskWindow.Observe(pkg.WorkloadID, pkg, llmCapped, now)
-	agg := pkg
-	agg.RuleMatches = rules
-	agg.BaselineDeviations = devs
-	return scoreCalc.Score(&agg, llm)
-}
-
-// wireFSMConsumer wires the Story 2.2 scoring + FSM evidence consumer, which
-// Story 3.11 makes the SINGLE FSM driver: for each package it (optionally)
-// runs the investigation chain inline when the FR19 gate triggers, folds the
-// chain's per-provider-capped LLM confidence into the ThreatScore (FR30), and
-// drives stateMachine.Evaluate once keyed by WorkloadID. A nil chain (RS mode
-// / analyst.provider=none) folds a zero LLM term, keeping the deterministic
-// Epic 2 behaviour byte-identical. The chain's audit publish + run metric are
-// recorded inline (the standalone investigation-chain consumer is removed).
-// It runs on its own errgroup goroutine and returns nil on graceful ctx
-// cancellation.
-func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, nc *natsclient.Client, scoreCalc *score.Calculator, stateMachine *fsm.Machine, chain *analyst.Chain, chainMode string, breaker *analyst.CircuitBreaker, auditPub responseaudit.AssessmentAuditPublisher, chainRuns *prometheus.CounterVec, riskWindow *risk.Window) error {
+// wireFSMConsumer wires the Story 2.2 scoring + FSM evidence consumer, the
+// SINGLE FSM driver (Story 3.11). Since Story 7.4 the analyst chain no longer
+// runs inline: each package is scored on its deterministic (rules + baseline,
+// risk-windowed) signals and evaluated at once; when the chain is enabled and
+// the FR19 gate + breaker admit the package it is dispatched to a bounded
+// worker pool (one in-flight chain per workload), and the chain's capped
+// verdict is folded back in and re-evaluated on THIS goroutine when it
+// returns, as its own audited transition (see fsm_driver.go). A nil chain (RS
+// mode / analyst.provider=none) builds no pool and keeps the deterministic
+// Epic 2 behaviour byte-identical. It runs on its own errgroup goroutine and
+// returns nil on graceful ctx cancellation, after waiting (bounded) for
+// in-flight chains.
+func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, nc *natsclient.Client, scoreCalc *score.Calculator, stateMachine *fsm.Machine, chain *analyst.Chain, chainMode string, breaker *analyst.CircuitBreaker, auditPub responseaudit.AssessmentAuditPublisher, chainRuns *prometheus.CounterVec, chainDispatches *prometheus.CounterVec, riskWindow *risk.Window) error {
 	stream, err := nc.JetStream().Stream(ctx, "EVIDENCE")
 	if err != nil {
 		return fmt.Errorf("stream EVIDENCE: %w", err)
@@ -1771,6 +1764,7 @@ func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, n
 	consumer, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
 		Durable:       "olaitan-response-fsm",
 		AckPolicy:     jetstream.AckExplicitPolicy,
+		AckWait:       fsmConsumerAckWait,
 		FilterSubject: subjects.EvidencePackages,
 		MaxDeliver:    fsmConsumerMaxDeliver,
 	})
@@ -1778,11 +1772,38 @@ func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, n
 		return fmt.Errorf("consumer: %w", err)
 	}
 
+	driver := &fsmDriver{
+		log:       log,
+		scoreCalc: scoreCalc,
+		machine:   stateMachine,
+		window:    riskWindow,
+		chainMode: chainMode,
+		breaker:   breaker,
+		chainRuns: chainRuns,
+		now:       time.Now,
+	}
+	if chain != nil {
+		workers, queue := chainPoolSize(log)
+		driver.dispatcher = newChainDispatcher(workers, queue, newChainRunFunc(chain, chainMode, auditPub, chainRuns, log), chainDispatches, log)
+		driver.dispatcher.start(ctx)
+		log.Info("aggregator: investigation chain runs async (deterministic score first)",
+			"workers", workers, "queue", queue, "mode", chainMode)
+	}
+
 	g.Go(func() error {
+		defer func() {
+			if driver.dispatcher != nil && !driver.dispatcher.wait(chainShutdownGrace) {
+				log.Warn("aggregator: in-flight investigation chains did not stop within the shutdown grace; their packages stay un-acked for redelivery",
+					"grace", chainShutdownGrace.String(), "workloads", driver.dispatcher.inflightIDs())
+			}
+		}()
 		for {
 			if err := ctx.Err(); err != nil {
 				return nil
 			}
+			// Apply any finished chains before the next fetch (at most one
+			// FetchMaxWait of extra latency for a verdict).
+			driver.drainResults()
 			msg, err := consumer.Next(jetstream.FetchMaxWait(250 * time.Millisecond))
 			if err != nil {
 				if isFSMFetchTimeout(err) {
@@ -1817,44 +1838,7 @@ func wireFSMConsumer(ctx context.Context, g *errgroup.Group, log *slog.Logger, n
 				continue
 			}
 
-			// Story 3.11: run the investigation chain inline when enabled and
-			// the FR19 gate triggers, fold its capped LLM confidence into the
-			// score (a nil chain folds 0 = deterministic-only, Epic 2). The
-			// chain->fold->score wiring lives in chainAdjustedScore so it is
-			// unit-testable without a live JetStream consumer.
-			// time.Now() keeps the monotonic reading so the window's TTL
-			// arithmetic is immune to wall-clock steps (PR #92 review).
-			sc, serr := chainAdjustedScore(ctx, pkg, scoreCalc, chain, chainMode, breaker, auditPub, chainRuns, riskWindow, time.Now(), log)
-			if serr != nil {
-				log.Warn("aggregator: fsm score failed; dropping", "err", serr, "package_id", pkg.PackageID)
-				_ = msg.Ack()
-				continue
-			}
-
-			st := stateMachine.Evaluate(pkg.WorkloadID, sc.Total, pkg.PackageID)
-			if st.FromState != st.ToState {
-				// The per-term composition is logged with every transition so
-				// a windowed score is explainable: the audit event records the
-				// total against the triggering package, and this structured
-				// line records WHY the total is what it is, including signals
-				// the risk window inherited from earlier packages (PR #92
-				// review: a windowed QUARANTINED score attached to a weak
-				// package was otherwise unexplainable from the audit trail;
-				// the AUDIT.transitions schema extension is deferred, see
-				// docs/deferred-decisions.md).
-				log.Info("aggregator: fsm transition",
-					"workload_id", st.WorkloadID,
-					"from_state", string(st.FromState),
-					"to_state", string(st.ToState),
-					"reason", st.Reason,
-					"score", st.Confidence,
-					"score_rules", sc.Rules,
-					"score_baseline", sc.Baseline,
-					"score_llm", sc.LLM,
-					"risk_window", riskWindow.Enabled(),
-					"package_id", st.PackageID)
-			}
-			_ = msg.Ack()
+			driver.handlePackage(pkg, func() { _ = msg.Ack() }, func() { _ = msg.InProgress() })
 		}
 	})
 	return nil

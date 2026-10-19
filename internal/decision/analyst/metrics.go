@@ -121,3 +121,28 @@ func RecordChainRun(vec *prometheus.CounterVec, mode, outcome string) {
 func RegisterDecisionCallsMetric(reg *metrics.Registry) (*prometheus.CounterVec, error) {
 	return registerCounterVec(reg, DecisionCallsMetricName, decisionCallsMetricHelp, []string{"provider", "role", "status"})
 }
+
+// ChainDispatchMetricName counts the FSM consumer's async dispatch decisions
+// for LLM-eligible packages (Story 7.4: the chain runs on a bounded worker
+// pool, off the FSM path). It is separate from the chain-runs counter, which
+// still counts one increment per chain the consumer handles.
+const ChainDispatchMetricName = "olaitan_investigation_chain_dispatch_total"
+
+const chainDispatchMetricHelp = "Async investigation-chain dispatch decisions for LLM-eligible packages " +
+	"(past the FR19 gate and the LLM-tier breaker), by result: dispatched (queued " +
+	"for a worker), coalesced (a chain for the same workload was already queued " +
+	"or running, so none was started), queue_full (the bounded pool was " +
+	"saturated; the deterministic score still drove the FSM) (Story 7.4)."
+
+// Chain dispatch result label values (bounded, Story 7.4).
+const (
+	ChainDispatchDispatched = "dispatched"
+	ChainDispatchCoalesced  = "coalesced"
+	ChainDispatchQueueFull  = "queue_full"
+)
+
+// RegisterChainDispatchMetric registers (or re-uses) the dispatch counter on
+// reg, idempotently like the other decision-ring families.
+func RegisterChainDispatchMetric(reg *metrics.Registry) (*prometheus.CounterVec, error) {
+	return registerCounterVec(reg, ChainDispatchMetricName, chainDispatchMetricHelp, []string{"result"})
+}
