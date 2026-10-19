@@ -500,6 +500,12 @@ func (c *Correlator) resolveAndCacheIdentity(ctx context.Context, ev schema.Even
 		return "", schema.WorkloadIdentity{}, nil, fmt.Errorf("event %q missing pod namespace/name", ev.ID)
 	}
 	key := ref.Namespace + "/" + ref.Name
+	aggPrefix, isAggregate := goldmaneAggregatePrefix(ev)
+	if !isAggregate && strings.Contains(ref.Name, "*") {
+		// A "*" name from a non-network source must not ride a cache entry
+		// a network aggregate of the same name filled (review round 1).
+		return "", schema.WorkloadIdentity{}, nil, fmt.Errorf("event %q: pod name %q is not a pod name", ev.ID, ref.Name)
+	}
 	now := c.clock()
 	if entry, ok := c.identityCache.Load(key); ok {
 		ce, _ := entry.(identityCacheEntry)
@@ -515,19 +521,25 @@ func (c *Correlator) resolveAndCacheIdentity(ctx context.Context, ev schema.Even
 		pod        *corev1.Pod
 		err        error
 	)
-	if prefix, ok := goldmaneAggregatePrefix(ev); ok {
-		workloadID, identity, pod, err = c.resolveAggregateCached(ctx, key, ref.Namespace, prefix, now)
+	if isAggregate {
+		workloadID, identity, pod, err = c.resolveAggregateCached(ctx, key, ref.Namespace, aggPrefix, now)
 	} else {
 		workloadID, identity, pod, err = c.resolveIdentityUncached(ctx, ref)
 	}
 	if err != nil {
 		return "", schema.WorkloadIdentity{}, nil, err
 	}
+	ttl := c.identityCacheTTL
+	if isAggregate && pod == nil && ttl > aggregateNegativeTTL {
+		// Resolved through the ReplicaSet fallback with no live pod: keep it
+		// short so posture is taken from a real pod once one appears.
+		ttl = aggregateNegativeTTL
+	}
 	c.identityCache.Store(key, identityCacheEntry{
 		workloadID: workloadID,
 		identity:   identity,
 		pod:        pod,
-		expiry:     now.Add(c.identityCacheTTL),
+		expiry:     now.Add(ttl),
 	})
 	return workloadID, identity, pod, nil
 }

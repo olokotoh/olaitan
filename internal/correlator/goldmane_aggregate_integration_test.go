@@ -25,6 +25,12 @@ import (
 // engine (which evaluates every event of a multi_signal package) can match
 // OLT-NET-002 on it. Before the fix the flow was dropped at identity
 // resolution and never reached any window.
+//
+// Scope: this proves attribution only, with the flow arriving as the second
+// source. On the live run Goldmane flows arrive 15-30s after Falco/runtime/
+// audit, into a window that has usually already fired; under the Story 1.14
+// D1 rising edge that window does not re-publish, so this ordering is NOT the
+// live one. That timing gap is an OPEN decision, not fixed here.
 func TestIntegration_GoldmaneFlowJoinsItsDeploymentWindow(t *testing.T) {
 	srv := startTestNATSServer(t)
 	nc, err := natsclient.NewClient(natsclient.ClientConfig{URL: srv.ClientURL(), Name: "goldmane-aggregate-test"})

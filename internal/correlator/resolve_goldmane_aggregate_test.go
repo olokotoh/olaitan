@@ -211,8 +211,14 @@ func TestResolveGoldmaneAggregateIsCached(t *testing.T) {
 		t.Fatalf("first resolve: %v", err)
 	}
 	first := len(kube.Actions())
-	if first == 0 {
-		t.Fatal("first resolve made no apiserver call; the aggregate must be looked up once")
+	lists := 0
+	for _, a := range kube.Actions() {
+		if a.GetVerb() == "list" {
+			lists++
+		}
+	}
+	if lists != 1 {
+		t.Fatalf("cold resolve made %d pod LISTs, want exactly 1: %v", lists, kube.Actions())
 	}
 	for _, ev := range flows {
 		if _, _, _, err := c.resolveAndCacheIdentity(context.Background(), ev); err != nil {
@@ -247,10 +253,33 @@ func TestUnresolvableGoldmaneAggregateIsNegativeCached(t *testing.T) {
 	}
 	// After the negative TTL the aggregate is looked up again, so a
 	// workload created moments after its first flow is not blind for long.
+	if _, ok := c.identityCache.Load("tenant-acme/ghost-5f9c7d-*"); ok {
+		t.Fatal("an unresolved aggregate was stored in the positive identity cache")
+	}
 	now = now.Add(aggregateNegativeTTL + time.Second)
-	_, _, _, _ = c.resolveAndCacheIdentity(context.Background(), ghost)
+	if _, _, _, err := c.resolveAndCacheIdentity(context.Background(), ghost); err == nil {
+		t.Fatal("ghost aggregate resolved after the negative TTL")
+	}
 	if got := len(kube.Actions()); got == first {
 		t.Fatal("negative cache never expired")
+	}
+}
+
+// Review round 1: a failed owner walk of the representative pod must be a
+// miss, never a pod-level identity cached under the aggregate key (that would
+// split the replicas' flows away from the Deployment window).
+func TestAggregateOwnerWalkFailureIsNotCachedAsPodIdentity(t *testing.T) {
+	// The pod names a ReplicaSet controller that does not exist.
+	c, _ := newAggregateTestCorrelator(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "web-bd846c7f-kx8cv", GenerateName: "web-bd846c7f-", Namespace: "tenant-acme",
+		OwnerReferences: controllerRef("ReplicaSet", "web-bd846c7f"),
+	}})
+	flow := loadLiveS4Flows(t)[0]
+	if id, _, _, err := c.resolveAndCacheIdentity(context.Background(), flow); err == nil {
+		t.Fatalf("aggregate resolved to %q despite a failed owner walk", id)
+	}
+	if _, ok := c.identityCache.Load(flow.Pod.Namespace + "/" + flow.Pod.Name); ok {
+		t.Fatal("failed owner walk was cached as a positive identity")
 	}
 }
 
@@ -279,5 +308,35 @@ func TestNonAggregateUnkeyableRefsStayRejectedWithoutAPICall(t *testing.T) {
 				t.Fatalf("ref %+v cost %d apiserver call(s) before rejection, want 0: %v", tc.ev.Pod, n, kube.Actions())
 			}
 		})
+	}
+}
+
+// Review round 1: bare pods sharing a GenerateName are separate orphans; the
+// aggregate must not be pinned to one of them.
+func TestAggregateOfBarePodsIsUnresolved(t *testing.T) {
+	c, _ := newAggregateTestCorrelator(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "runner-abcde", GenerateName: "runner-", Namespace: "tenant-acme",
+	}})
+	ev := schema.Event{ID: "flow", Source: schema.SourceNetwork, Pod: schema.PodRef{Namespace: "tenant-acme", Name: "runner-*"}}
+	if id, _, _, err := c.resolveAndCacheIdentity(context.Background(), ev); err == nil {
+		t.Fatalf("bare-pod aggregate resolved to %q", id)
+	}
+}
+
+// Review round 1: a cached aggregate must not let a non-network event with the
+// same "*" name through.
+func TestStarNameFromOtherSourceDoesNotHitAggregateCache(t *testing.T) {
+	c, kube := newAggregateTestCorrelator(s4Cluster()...)
+	flow := loadLiveS4Flows(t)[0]
+	if _, _, _, err := c.resolveAndCacheIdentity(context.Background(), flow); err != nil {
+		t.Fatal(err)
+	}
+	n := len(kube.Actions())
+	falco := schema.Event{ID: "f", Source: schema.SourceFalco, Pod: flow.Pod}
+	if _, _, _, err := c.resolveAndCacheIdentity(context.Background(), falco); err == nil {
+		t.Fatal("non-network '*' name resolved through the aggregate cache")
+	}
+	if len(kube.Actions()) != n {
+		t.Fatal("rejection cost an apiserver call")
 	}
 }

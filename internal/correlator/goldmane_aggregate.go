@@ -78,14 +78,19 @@ func (c *Correlator) resolveAggregateCached(ctx context.Context, key, namespace,
 		if exp, _ := v.(time.Time); now.Before(exp) {
 			return "", schema.WorkloadIdentity{}, nil, fmt.Errorf("goldmane aggregate %s/%s* (negative-cached): %w", namespace, prefix, errAggregateUnresolved)
 		}
-		c.aggregateMisses.Delete(key)
+		c.aggregateMisses.CompareAndDelete(key, v)
 	}
 	id, identity, pod, err := c.resolveAggregate(ctx, namespace, prefix)
 	if err != nil {
-		// Every failure is negative-cached, transient apiserver errors
+		// Every apiserver failure is negative-cached, transient ones
 		// included: retrying per event is exactly the rate-limiter storm
-		// Story 10.7 removed.
-		c.rememberAggregateMiss(key, now)
+		// Story 10.7 removed. The cost is that flows of that aggregate are
+		// dropped for up to aggregateNegativeTTL (one Goldmane batch). A
+		// cancelled caller context is not the aggregate's fault and is not
+		// cached.
+		if ctx.Err() == nil {
+			c.rememberAggregateMiss(key, now)
+		}
 		return "", schema.WorkloadIdentity{}, nil, err
 	}
 	return id, identity, pod, nil
@@ -97,7 +102,7 @@ func (c *Correlator) resolveAggregateCached(ctx context.Context, key, namespace,
 func (c *Correlator) rememberAggregateMiss(key string, now time.Time) {
 	c.aggregateMisses.Range(func(k, v any) bool {
 		if exp, _ := v.(time.Time); !now.Before(exp) {
-			c.aggregateMisses.Delete(k)
+			c.aggregateMisses.CompareAndDelete(k, v)
 		}
 		return true
 	})
@@ -123,11 +128,26 @@ func (c *Correlator) resolveAggregate(ctx context.Context, namespace, prefix str
 		return "", schema.WorkloadIdentity{}, nil, fmt.Errorf("goldmane aggregate %s/%s*: list pods: %w", namespace, prefix, err)
 	}
 	if rep := representativePod(pods.Items, prefix); rep != nil {
-		fallbackID, err := keys.PodFallbackID(rep.Namespace, rep.Name)
+		// Unlike a single pod's own event, an aggregate must NOT fall back to
+		// the representative's orphan-pod ID when the owner walk fails: that ID
+		// would be cached under the aggregate key and split every replica's
+		// flows away from the Deployment window Falco events use (review round
+		// 1). A failed walk is a miss, retried after the negative TTL.
+		identity, err := posture.ResolveWorkloadIdentity(ctx, c.kube, rep)
+		if err != nil {
+			return "", schema.WorkloadIdentity{}, nil, fmt.Errorf("goldmane aggregate %s/%s*: owner walk of %s: %w", namespace, prefix, rep.Name, err)
+		}
+		if identity.OwnerKind == "Pod" {
+			// Bare pods that merely share a GenerateName are separate
+			// orphan workloads; picking one would attribute every flow of
+			// the set to that one pod (review round 1).
+			return "", schema.WorkloadIdentity{}, nil, fmt.Errorf("goldmane aggregate %s/%s*: pods have no controller: %w", namespace, prefix, errAggregateUnresolved)
+		}
+		id, err := keys.WorkloadID(identity.Namespace, identity.OwnerKind, identity.OwnerName)
 		if err != nil {
 			return "", schema.WorkloadIdentity{}, nil, err
 		}
-		return c.identityForPod(ctx, rep, fallbackID)
+		return id, identity, rep, nil
 	}
 
 	rsName := strings.TrimSuffix(prefix, "-")

@@ -122,15 +122,25 @@ func TestLiveS4GoldmaneFlowsMatchOLTNet002(t *testing.T) {
 	}
 }
 
-// S5: no S5 pool flow was captured on the live run (the correlator dropped
-// them before anything recorded them), so the S5 flow is rebuilt from the
+// S5: the live evidence holds no S5 pool flow (only S4 flows were saved from
+// EVENTS_RAW; whether the S5 flows reached EVENTS_RAW is unverified and is a
+// re-run check), so this is a SYNTHETIC live-shape flow rebuilt from the
 // REAL S4 FlowResult with only the destination swapped to the S5 stratum pool
 // (s5-stratum-pool:3333), then run through the real CNI Translate so the
 // projection is the adapter's, not hand-written.
 func TestLiveShapeS5PoolFlowMatchesOLTImpact006(t *testing.T) {
 	corpus := liveCorpus(t)
 	engine := &Engine{log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	live := loadLiveFlows(t)[1] // the Src-reported record: the pod opened it
+	var live schema.Event
+	for _, ev := range loadLiveFlows(t) {
+		if strings.Contains(string(ev.Raw), `"reporter":"Src"`) {
+			live = ev // the Src-reported record: the pod opened the connection
+			break
+		}
+	}
+	if live.ID == "" {
+		t.Fatal("live fixture holds no Src-reported flow")
+	}
 
 	var raw struct {
 		ID   json.Number     `json:"id"`
