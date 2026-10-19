@@ -615,7 +615,16 @@ func projectCanonicalFlowFields(raw map[string]any, key *goldmanepb.FlowKey, flo
 	// Real volumetric fields aggregated over the Goldmane window, projected so
 	// rules and later stories can key on genuine volume rather than a phantom
 	// severity.
-	raw["network.bytes_out"] = strconv.FormatInt(flow.GetBytesOut(), 10)
+	// Goldmane reports each connection once per reporter with the byte
+	// counters seen from THAT side, so a Dst record's bytes_out is the
+	// destination's reply, not what the source sent. network.bytes_out means
+	// the source workload's outbound bytes, so it is projected from the Src
+	// record only; the Dst record omits it. network.reporter keeps the
+	// reporter visible to rules and the baseline.
+	raw["network.reporter"] = reporterString(key.GetReporter())
+	if key.GetReporter() == goldmanepb.Reporter_Src {
+		raw["network.bytes_out"] = strconv.FormatInt(flow.GetBytesOut(), 10)
+	}
 	raw["network.connections_started"] = strconv.FormatInt(flow.GetNumConnectionsStarted(), 10)
 	raw["network.connections_live"] = strconv.FormatInt(flow.GetNumConnectionsLive(), 10)
 }
