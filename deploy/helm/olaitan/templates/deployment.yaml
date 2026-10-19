@@ -220,6 +220,19 @@ spec:
             - name: OLT_LLM_ROLE_TIMEOUT_MULTIPLIER
               value: {{ $mult | quote }}
             {{- end }}
+            {{- if and (eq $provider "local") (not (has "OLT_LLM_CHAIN_WORKERS" $extraNames)) }}
+            {{- /* Story 12.7 review round 2: as many concurrent chain runs
+                   as the in-cluster Ollama serves (OLLAMA_NUM_PARALLEL, the
+                   last entry wins as in the kubelet; 1 by default). More
+                   would queue inside Ollama and spend the role timeout
+                   waiting. Read by the async chain (#209); unused before. */}}
+            {{- $par := "1" }}
+            {{- range (default (list) (default (dict) .Values.ollama).extraEnv) }}
+            {{- if eq .name "OLLAMA_NUM_PARALLEL" }}{{ $par = toString .value }}{{ end }}
+            {{- end }}
+            - name: OLT_LLM_CHAIN_WORKERS
+              value: {{ $par | quote }}
+            {{- end }}
             {{- with include "olaitan.riskWindowSeconds" . }}
             {{- if not (has "OLT_RISK_WINDOW_SECONDS" $extraNames) }}
             # Story 12.7: the rolling per-workload risk window, on by default

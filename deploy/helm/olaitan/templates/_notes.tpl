@@ -94,6 +94,9 @@ DETECTION SOURCES
 {{- end }}
 {{- if include "olaitan.containerd.enabled" . }}
   [ON ] containerd CRI sensor -- {{ include "olaitan.containerd.socketPath" . }}
+         The socket directory is mounted read-only: the adapter only reads
+         container lifecycle events, but the socket itself is the full CRI API
+         of the node (CRI.md, security boundary).
          A node with no socket there leaves it DEGRADED (the collector logs the
          path); set containerdSensor.socketPath to your runtime's socket.
 {{- else if and (default (dict) .Values.containerdSensor).enabled (eq $platform "openshift") }}
@@ -348,6 +351,16 @@ SEE A DETECTION
 
   Clean up:  kubectl delete namespace olaitan-demo
 
+{{- if include "olaitan.certgen.enabled" . }}
+CERTIFICATES
+  The audit receiver's and the applog injector's TLS is made in the cluster
+  by a Job. If it failed, both stay DEGRADED and say "no such file" for
+  their certificates. Check it:
+
+  kubectl -n {{ $ns }} get job -l app.kubernetes.io/component=certgen
+  kubectl -n {{ $ns }} logs -l app.kubernetes.io/component=certgen --tail=50
+
+{{ end -}}
 IF SOMETHING IS OFF THAT YOU EXPECTED TO BE ON
   From a clone of https://github.com/olokotoh/olaitan:
 

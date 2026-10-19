@@ -34,7 +34,10 @@ func runCertgen(ctx context.Context, args []string, stderr io.Writer) int {
 		return 1
 	}
 	if err := certgen.Run(ctx, cs, spec, log); err != nil {
-		log.Error("certgen: failed", "err", err)
+		// Story 12.7 review round 2: say what a failure costs and where to
+		// look, since nothing else will.
+		log.Error("certgen: failed; the audit webhook receiver and the applog injector stay DEGRADED (no TLS) until this Job succeeds. A timeout usually means a NetworkPolicy keeps this pod from the API server (the chart's own certgen policy allows TCP 443, 6443 and 8443)",
+			"err", err)
 		return 1
 	}
 	log.Info("certgen: done")

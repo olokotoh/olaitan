@@ -2,6 +2,37 @@
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
+  name: olaitan-certgen
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: certgen
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: olaitan
+      app.kubernetes.io/instance: olaitan
+      app.kubernetes.io/component: certgen
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+        - protocol: TCP
+          port: 8443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
   name: olaitan
   namespace: default
   labels:
@@ -18,7 +49,7 @@ spec:
     matchExpressions:
       - key: app.kubernetes.io/component
         operator: NotIn
-        values: ["ollama", "ollama-pull"]
+        values: ["ollama","ollama-pull","certgen"]
   policyTypes:
     - Ingress
     - Egress
@@ -2941,6 +2972,8 @@ spec:
             # (aggregator.llmRoleTimeoutMultiplier).
             - name: OLT_LLM_ROLE_TIMEOUT_MULTIPLIER
               value: "30"
+            - name: OLT_LLM_CHAIN_WORKERS
+              value: "1"
           livenessProbe:
             httpGet:
               path: /healthz

@@ -260,9 +260,10 @@ func TestSubchartsDisabled(t *testing.T) {
 		"Secret":             1,
 		// config + rules + prompts (Story 3.13 added the prompts
 		// ConfigMap) + the audit policy.
-		"ConfigMap":                      4,
-		"PersistentVolumeClaim":          2,
-		"NetworkPolicy":                  3,
+		"ConfigMap":             4,
+		"PersistentVolumeClaim": 2,
+		// release + ollama + ollama-pull + certgen (12.7 round 2).
+		"NetworkPolicy":                  4,
 		"DaemonSet":                      1,
 		"Deployment":                     3,
 		"Job":                            2,
@@ -4087,8 +4088,14 @@ func TestOllamaNetworkPolicyRestrictsToAggregator(t *testing.T) {
 		"ollama.enabled=false",
 	})
 	defaultNps := decodeNetpols(t, defaultRender)
-	if len(defaultNps["olaitan"].Spec.PodSelector.MatchExpressions) != 0 {
-		t.Error("release NetworkPolicy carries matchExpressions in the default render; the exclusion must be gated on ollama.enabled")
+	// Story 12.7 round 2: the certgen pod is excluded too, so the selector
+	// may carry an expression; it must not name ollama.
+	for _, expr := range defaultNps["olaitan"].Spec.PodSelector.MatchExpressions {
+		for _, v := range expr.Values {
+			if v == "ollama" || v == "ollama-pull" {
+				t.Error("release NetworkPolicy excludes the ollama component in a render without Ollama; the exclusion must be gated on ollama.enabled")
+			}
+		}
 	}
 }
 

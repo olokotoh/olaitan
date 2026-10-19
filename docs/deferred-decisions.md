@@ -1265,6 +1265,11 @@ demonstrated mechanism plus future work. The degree completed on
 2026-08-15; the reserved supervision gate is thereby discharged, and
 decision authority rests with the project owner.
 
+**Superseded in part by ADR-2026-10-19-01 (Story 12.7):** the Helm chart
+now turns the window on by default (900 s); the evaluation overlays and
+values-minimal.yaml pin it to 0, so the reproducibility argument below
+still holds for every evaluation run.
+
 **Decision.** The project owner ratifies **Option B**, the rolling
 per-workload risk window (`internal/response/risk`), as the shipped
 scoring model, off by default (`OLT_RISK_WINDOW_SECONDS` unset = the
@@ -1508,7 +1513,19 @@ same `package_id` on a later transition, and by that package's
 
 ## ADR-2026-10-19-02: Everything on by default; webhook TLS made in the cluster; blocking is one switch
 
-**Status.** Accepted (Story 12.7, #208). Decision owner: Aslim, 2026-10-19:
+**Status.** Accepted (Story 12.7, #208). **Supersedes ADR-2026-08-17-01 in
+part:** that ADR shipped the rolling risk window "off by default
+(`OLT_RISK_WINDOW_SECONDS` unset), so the pre-window behaviour remains the
+default and reproducible". From Story 12.7 the Helm chart turns it ON by
+default (`aggregator.riskWindowSeconds: 900`, rendered as
+`OLT_RISK_WINDOW_SECONDS`), because without it no single evidence package
+reaches RESTRICTED (the rule term tops out at 0.4 x 95 = 38) and the one
+blocking switch would never block (live run, 2026-10-19). Reproducibility
+is kept where it is needed: every evaluation arm overlay
+(`values-eval*.yaml`) and `values-minimal.yaml` pin
+`aggregator.riskWindowSeconds: 0`, the binary's own default is unchanged
+(env unset = per-package scoring), and the Option B model itself, the
+trust bound and the evaluation decisions recorded there stand. Decision owner: Aslim, 2026-10-19:
 a plain `helm install` and the release `install.yaml` turn every part on;
 blocking (`response.networkPolicy.enabled`) stays off behind one flag.
 
