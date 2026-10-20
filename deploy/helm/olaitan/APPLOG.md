@@ -39,7 +39,7 @@ beyond the agent DaemonSet:
 4. `Secret <fullname>-applog-injector-tls` (or a cert-manager
    `Certificate` resource when `applogSidecar.tls.certManagerEnabled=
    true`) providing the webhook's serving cert + key.
-5. `PodDisruptionBudget <fullname>-applog-injector` (`minAvailable: 1`)
+5. `PodDisruptionBudget <fullname>-applog-injector` (`maxUnavailable: 1`)
    when `applogSidecar.webhook.replicaCount` is 2 or more (#156).
 
 The Olaitan agent DaemonSet pod-spec is unchanged by Story 1.9 -- the
@@ -202,19 +202,25 @@ every Pod cluster-wide. Threat model:
 The injector re-reads `tls.crt` and `tls.key` from its mounted Secret
 every 10 seconds (`OLAITAN_WEBHOOK_CERT_RELOAD_INTERVAL`) and serves the
 new pair on the next TLS handshake, with no restart (#157). The kubelet
-refreshes a mounted Secret on its own sync period (about a minute), so a
-renewal is served within roughly a minute of the Secret changing. A pair
-that does not parse or does not match is logged
+refreshes a mounted Secret on its sync period plus its Secret cache delay,
+so a renewal is served one to two minutes after the Secret changes. A pair
+that does not parse, does not match, or whose certificate is expired or
+not yet valid is logged once
 (`serving cert reload failed; still serving the last good certificate`)
-and the last good pair keeps serving.
+and the last good pair keeps serving; `serving cert reload recovered`
+follows when a good pair arrives.
 
 - **Path A (cert-manager).** A renewal is picked up in place. A renewal
   under the **same** CA has no gap. If the Issuer's CA changes, cainjector
-  moves the caBundle at once while the files catch up within the kubelet
-  sync period; under `failurePolicy: Ignore` pods admitted in that window
-  get no sidecar.
-- **Certgen (default).** certgen never replaces an existing Secret; if you
-  delete it and re-run the install, the new pair is picked up in place.
+  moves the caBundle at once while the files catch up (one to two
+  minutes): under `failurePolicy: Ignore` pods admitted in that window get
+  no sidecar, and under `Fail` they are refused. Change an Issuer's CA the
+  way Path B does below: first a caBundle that trusts both CAs.
+- **Certgen (default).** certgen never replaces an existing Secret. To
+  rotate, delete the Secret and the finished Job and re-run the install
+  (AUDIT.md, Story 12.7 paragraph). Each run makes a new CA and writes the
+  caBundle at once, so pods admitted before the injector picks up the new
+  files (one to two minutes) get no sidecar.
 - **Path B (manual).** The injector Deployment's pod template also
   carries a `checksum/applog-tls` annotation: the sha256 of the data of
   the Secret the chart renders. A `helm upgrade` that changes
@@ -240,7 +246,8 @@ and the last good pair keeps serving.
   cert. It no longer blocks the injector's own replacement pods: the
   webhook's `objectSelector` excludes pods labelled
   `app.kubernetes.io/component=applog-injector` (#159), so the rollout
-  that fixes it always proceeds.
+  that fixes it always proceeds. Any other pod carrying that exact label
+  is skipped too; do not reuse it on workloads.
 
 ### Rollouts and node drains
 
@@ -248,13 +255,20 @@ A rollout or drain does not drop admission calls (#156):
 
 - The Deployment surges (`maxSurge: 1`, `maxUnavailable: 0`), so a
   replacement pod is Ready before an old one is told to stop.
-- On SIGTERM an injector answers `/readyz` with 503 at once but keeps
-  its listener open for `applogSidecar.webhook.shutdownDelaySeconds`
-  (default 5), so calls that race the endpoint removal are still served.
+  The surge pod needs room: under a tight ResourceQuota the rollout waits
+  for it.
+- On SIGTERM an injector keeps its listener open for
+  `applogSidecar.webhook.shutdownDelaySeconds` (default 5, whole seconds
+  in [0, 120]). The pod leaves the Service endpoints as soon as it starts
+  terminating, but kube-proxy applies that a moment later; the delay keeps
+  serving the calls still routed to it. During the delay `/readyz`
+  answers 503 and keep-alives are off, so clients reconnect elsewhere.
   `terminationGracePeriodSeconds` is that delay plus 20.
-- With two or more replicas a PodDisruptionBudget (`minAvailable: 1`)
-  keeps one injector up through a node drain. With one replica no PDB is
-  rendered, since it would block every drain.
+- With two or more replicas a PodDisruptionBudget (`maxUnavailable: 1`,
+  `unhealthyPodEvictionPolicy: AlwaysAllow`) stops a drain from evicting
+  every injector at once, without letting a broken injector pin a node.
+  It covers voluntary evictions only; the chart sets no anti-affinity, so
+  both replicas can share a node.
 
 This matters more than it looks: the webhook ships
 `failurePolicy: Ignore`, so while the injector serves a certificate the

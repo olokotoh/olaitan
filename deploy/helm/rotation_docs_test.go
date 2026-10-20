@@ -55,7 +55,8 @@ func TestApplogRotationDocCoversFailurePolicyFail(t *testing.T) {
 		"failurePolicy: Fail",
 		"mandatory",
 		"never change `caBundle` and `servingCert` in the same upgrade",
-		"the injector's own replacement pods",
+		"no longer blocks the injector's own replacement pods",
+		"objectSelector",
 	} {
 		if !strings.Contains(sec, want) {
 			t.Errorf("APPLOG.md 'Rotating the serving cert' does not say %q", want)

@@ -932,12 +932,27 @@ func TestGetenvDurationDefault(t *testing.T) {
 	}
 }
 
-func TestRun_AppLogWebhook_BadShutdownDelay_Exits1(t *testing.T) {
-	t.Setenv("OLAITAN_WEBHOOK_TLS_CERT", "/nonexistent/tls.crt")
-	t.Setenv("OLAITAN_WEBHOOK_TLS_KEY", "/nonexistent/tls.key")
-	t.Setenv("OLAITAN_WEBHOOK_SIDECAR_IMAGE", "olaitan:test")
-	t.Setenv("OLAITAN_WEBHOOK_SHUTDOWN_DELAY", "soon")
-	if code := run([]string{"applog-webhook"}, io.Discard); code != 1 {
-		t.Errorf("bad OLAITAN_WEBHOOK_SHUTDOWN_DELAY: got %d want 1", code)
+func TestRun_AppLogWebhook_BadLifecycleEnv_Exits1(t *testing.T) {
+	for _, tc := range []struct{ name, value, want string }{
+		{"OLAITAN_WEBHOOK_SHUTDOWN_DELAY", "soon", "OLAITAN_WEBHOOK_SHUTDOWN_DELAY"},
+		{"OLAITAN_WEBHOOK_SHUTDOWN_DELAY", "121s", "OLAITAN_WEBHOOK_SHUTDOWN_DELAY"},
+		{"OLAITAN_WEBHOOK_CERT_RELOAD_INTERVAL", "1ms", "OLAITAN_WEBHOOK_CERT_RELOAD_INTERVAL"},
+		{"OLAITAN_WEBHOOK_CERT_RELOAD_INTERVAL", "0s", "OLAITAN_WEBHOOK_CERT_RELOAD_INTERVAL"},
+	} {
+		t.Run(tc.name+"="+tc.value, func(t *testing.T) {
+			t.Setenv("OLAITAN_WEBHOOK_TLS_CERT", "/nonexistent/tls.crt")
+			t.Setenv("OLAITAN_WEBHOOK_TLS_KEY", "/nonexistent/tls.key")
+			t.Setenv("OLAITAN_WEBHOOK_SIDECAR_IMAGE", "olaitan:test")
+			t.Setenv("OLAITAN_WEBHOOK_SHUTDOWN_DELAY", "")
+			t.Setenv("OLAITAN_WEBHOOK_CERT_RELOAD_INTERVAL", "")
+			t.Setenv(tc.name, tc.value)
+			var stderr bytes.Buffer
+			if code := run([]string{"applog-webhook"}, &stderr); code != 1 {
+				t.Errorf("got exit %d, want 1", code)
+			}
+			if !strings.Contains(stderr.String(), tc.want) {
+				t.Errorf("exit 1 for another reason; stderr does not name %s:\n%s", tc.want, stderr.String())
+			}
+		})
 	}
 }

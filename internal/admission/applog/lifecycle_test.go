@@ -5,6 +5,7 @@ package applog
 // not only the in-process mux.
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -13,6 +14,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"log/slog"
 	"math/big"
@@ -20,15 +22,51 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 func quietLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
+// logBuf is a goroutine-safe log sink the tests can wait on.
+type logBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *logBuf) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *logBuf) count(sub string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Count(l.b.String(), sub)
+}
+
+func (l *logBuf) waitFor(t *testing.T, sub string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for l.count(sub) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("log never said %q", sub)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // newKeyPairPEM returns a self-signed serving cert for 127.0.0.1 with the
 // given serial, and its key, PEM-encoded.
 func newKeyPairPEM(t *testing.T, serial int64) (certPEM, keyPEM []byte) {
+	t.Helper()
+	return newKeyPairPEMValid(t, serial, time.Now().Add(-time.Minute), time.Now().Add(time.Hour))
+}
+
+func newKeyPairPEMValid(t *testing.T, serial int64, notBefore, notAfter time.Time) (certPEM, keyPEM []byte) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -37,8 +75,8 @@ func newKeyPairPEM(t *testing.T, serial int64) (certPEM, keyPEM []byte) {
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(serial),
 		Subject:      pkix.Name{CommonName: "olaitan-applog-injector"},
-		NotBefore:    time.Now().Add(-time.Minute),
-		NotAfter:     time.Now().Add(time.Hour),
+		NotBefore:    notBefore,
+		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
@@ -80,7 +118,7 @@ func newSecretVolume(t *testing.T, certPEM, keyPEM []byte) *secretVolume {
 func (v *secretVolume) write(certPEM, keyPEM []byte) {
 	v.t.Helper()
 	v.gen++
-	ts := filepath.Join(v.dir, "..gen"+string(rune('0'+v.gen)))
+	ts := filepath.Join(v.dir, fmt.Sprintf("..gen%d", v.gen))
 	if err := os.Mkdir(ts, 0o755); err != nil {
 		v.t.Fatal(err)
 	}
@@ -97,39 +135,61 @@ func (v *secretVolume) write(certPEM, keyPEM []byte) {
 	if err := os.Rename(tmp, filepath.Join(v.dir, "..data")); err != nil {
 		v.t.Fatal(err)
 	}
+	// Like the kubelet, remove the previous generation right after the swap.
+	if v.gen > 1 {
+		if err := os.RemoveAll(filepath.Join(v.dir, fmt.Sprintf("..gen%d", v.gen-1))); err != nil {
+			v.t.Fatal(err)
+		}
+	}
 }
 
 func (v *secretVolume) cert() string { return filepath.Join(v.dir, "tls.crt") }
 func (v *secretVolume) key() string  { return filepath.Join(v.dir, "tls.key") }
 
-func startWebhook(t *testing.T, cfg WebhookConfig) (*Webhook, context.CancelFunc, <-chan error) {
+// runResult lets both a test and its cleanup wait for Run's result.
+type runResult struct {
+	done chan struct{}
+	err  error
+}
+
+func (r *runResult) wait(d time.Duration) (error, bool) {
+	select {
+	case <-r.done:
+		return r.err, true
+	case <-time.After(d):
+		return nil, false
+	}
+}
+
+func startWebhook(t *testing.T, cfg WebhookConfig, log *slog.Logger) (*Webhook, context.CancelFunc, *runResult) {
 	t.Helper()
 	cfg.ListenAddr = "127.0.0.1:0"
 	cfg.SidecarImage = "olaitan:test"
 	cfg.SidecarNATSURL = "nats://nats.olaitan.svc.cluster.local:4222"
-	w, err := NewWebhook(cfg, quietLogger())
+	if log == nil {
+		log = quietLogger()
+	}
+	w, err := NewWebhook(cfg, log)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- w.Run(ctx) }()
+	res := &runResult{done: make(chan struct{})}
+	go func() { res.err = w.Run(ctx); close(res.done) }()
 	deadline := time.Now().Add(5 * time.Second)
 	for w.Addr() == nil {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("webhook did not start listening: %v", <-done)
+			err, _ := res.wait(5 * time.Second)
+			t.Fatalf("webhook did not start listening: %v", err)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Cleanup(func() {
 		cancel()
-		select {
-		case <-done:
-		case <-time.After(30 * time.Second):
-		}
+		_, _ = res.wait(30 * time.Second)
 	})
-	return w, cancel, done
+	return w, cancel, res
 }
 
 // servedSerial dials the webhook and returns the serial of the leaf it
@@ -149,23 +209,25 @@ func servedSerial(t *testing.T, addr string) int64 {
 func TestWebhookReloadsRotatedServingCert(t *testing.T) {
 	c1, k1 := newKeyPairPEM(t, 1)
 	vol := newSecretVolume(t, c1, k1)
+	logs := &logBuf{}
 	w, _, _ := startWebhook(t, WebhookConfig{
 		TLSCertFile: vol.cert(), TLSKeyFile: vol.key(),
 		CertReloadInterval: 20 * time.Millisecond,
-	})
+	}, slog.New(slog.NewTextHandler(logs, nil)))
 	addr := w.Addr().String()
 	if got := servedSerial(t, addr); got != 1 {
 		t.Fatalf("served serial %d before rotation, want 1", got)
 	}
 	c2, k2 := newKeyPairPEM(t, 2)
 	vol.write(c2, k2)
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for servedSerial(t, addr) != 2 {
 		if time.Now().After(deadline) {
 			t.Fatal("rotated serving cert was not picked up without a restart (#157)")
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	logs.waitFor(t, "serving cert reloaded")
 }
 
 // A half-written or mismatched pair must not take the webhook down: it keeps
@@ -173,20 +235,34 @@ func TestWebhookReloadsRotatedServingCert(t *testing.T) {
 func TestWebhookKeepsLastGoodCertOnBrokenPair(t *testing.T) {
 	c1, k1 := newKeyPairPEM(t, 1)
 	vol := newSecretVolume(t, c1, k1)
+	logs := &logBuf{}
 	w, _, _ := startWebhook(t, WebhookConfig{
 		TLSCertFile: vol.cert(), TLSKeyFile: vol.key(),
 		CertReloadInterval: 20 * time.Millisecond,
-	})
+	}, slog.New(slog.NewTextHandler(logs, nil)))
 	addr := w.Addr().String()
 	_, kOther := newKeyPairPEM(t, 9)
 	c3, k3 := newKeyPairPEM(t, 3)
 	vol.write(c3, kOther) // cert and key do not match
-	time.Sleep(150 * time.Millisecond)
+	logs.waitFor(t, "serving cert reload failed")
+	// Several more polls: the same failure is logged once, not every tick.
+	time.Sleep(200 * time.Millisecond)
+	if n := logs.count("serving cert reload failed"); n != 1 {
+		t.Errorf("the same broken pair was logged %d times, want once", n)
+	}
 	if got := servedSerial(t, addr); got != 1 {
 		t.Fatalf("served serial %d after a broken pair, want the last good one (1)", got)
 	}
+	// An expired pair is skipped the same way.
+	ce, ke := newKeyPairPEMValid(t, 4, time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour))
+	vol.write(ce, ke)
+	logs.waitFor(t, "is not valid now")
+	if got := servedSerial(t, addr); got != 1 {
+		t.Fatalf("served serial %d after an expired pair, want the last good one (1)", got)
+	}
 	vol.write(c3, k3)
-	deadline := time.Now().Add(5 * time.Second)
+	logs.waitFor(t, "serving cert reload recovered")
+	deadline := time.Now().Add(10 * time.Second)
 	for servedSerial(t, addr) != 3 {
 		if time.Now().After(deadline) {
 			t.Fatal("the next good pair was not picked up")
@@ -227,15 +303,16 @@ func get(t *testing.T, addr, path string) (int, error) {
 
 // #156: on shutdown the injector reports not-ready at once but keeps
 // accepting connections for ShutdownDelay, so the API server's calls that
-// race the endpoint removal are served instead of refused.
+// race the endpoint removal are served instead of refused. Timings leave
+// wide margins so the test holds under -race on a slow machine.
 func TestWebhookDrainsBeforeClosingTheListener(t *testing.T) {
 	c1, k1 := newKeyPairPEM(t, 1)
 	vol := newSecretVolume(t, c1, k1)
-	delay := 600 * time.Millisecond
-	w, cancel, done := startWebhook(t, WebhookConfig{
+	delay := 2 * time.Second
+	w, cancel, res := startWebhook(t, WebhookConfig{
 		TLSCertFile: vol.cert(), TLSKeyFile: vol.key(),
 		ShutdownDelay: delay,
-	})
+	}, nil)
 	addr := w.Addr().String()
 	if code, err := get(t, addr, "/readyz"); err != nil || code != http.StatusOK {
 		t.Fatalf("/readyz before shutdown = %d, %v; want 200", code, err)
@@ -243,7 +320,6 @@ func TestWebhookDrainsBeforeClosingTheListener(t *testing.T) {
 	start := time.Now()
 	cancel()
 	// Ready flips first.
-	deadline := time.Now().Add(delay / 2)
 	for {
 		code, err := get(t, addr, "/readyz")
 		if err != nil {
@@ -252,25 +328,25 @@ func TestWebhookDrainsBeforeClosingTheListener(t *testing.T) {
 		if code == http.StatusServiceUnavailable {
 			break
 		}
-		if time.Now().After(deadline) {
+		if time.Since(start) > delay/2 {
 			t.Fatalf("/readyz still %d while draining, want 503", code)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	// Liveness and admission connections are still served inside the window.
-	for time.Since(start) < delay*3/4 {
+	// Liveness and admission connections are still served in the first
+	// half of the window.
+	for time.Since(start) < delay/2 {
 		if code, err := get(t, addr, "/healthz"); err != nil || code != http.StatusOK {
 			t.Fatalf("/healthz during the drain window = %d, %v; the listener closed early (#156)", code, err)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("Run returned %v after a graceful drain", err)
-		}
-	case <-time.After(15 * time.Second):
+	err, ok := res.wait(20 * time.Second)
+	if !ok {
 		t.Fatal("Run did not return after the drain")
+	}
+	if err != nil {
+		t.Fatalf("Run returned %v after a graceful drain", err)
 	}
 	if took := time.Since(start); took < delay {
 		t.Fatalf("Run returned after %v, before the %v drain delay", took, delay)

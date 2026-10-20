@@ -248,8 +248,8 @@ func buildAppLogRateLimiter(log *slog.Logger) (*ratelimit.Limiter, error) {
 //
 //   - OLAITAN_WEBHOOK_LISTEN_ADDR          default :8443
 //   - OLAITAN_WEBHOOK_USE_NATIVE_SIDECAR   default true (KEP-753 native sidecar)
-//   - OLAITAN_WEBHOOK_SHUTDOWN_DELAY       default 0s; the chart sets 5s (#156 drain)
-//   - OLAITAN_WEBHOOK_CERT_RELOAD_INTERVAL default 10s (#157 serving-cert reload)
+//   - OLAITAN_WEBHOOK_SHUTDOWN_DELAY       default 0s, max 120s; the chart sets 5s (#156 drain)
+//   - OLAITAN_WEBHOOK_CERT_RELOAD_INTERVAL default 10s, min 1s (#157 serving-cert reload)
 func runApplogWebhook(ctx context.Context, args []string, stderr io.Writer) int {
 	fs := flag.NewFlagSet("olaitan applog-webhook", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -288,14 +288,17 @@ func runApplogWebhook(ctx context.Context, args []string, stderr io.Writer) int 
 		}
 	}
 
+	// The chart sets terminationGracePeriodSeconds to the delay plus 20,
+	// and caps the delay at 120 s; a larger value set some other way would
+	// be cut short by SIGKILL mid-drain.
 	shutdownDelay, err := getenvDurationDefault("OLAITAN_WEBHOOK_SHUTDOWN_DELAY", 0)
-	if err != nil {
-		log.Error("startup: webhook", "err", err)
+	if err != nil || shutdownDelay > 120*time.Second {
+		log.Error("startup: OLAITAN_WEBHOOK_SHUTDOWN_DELAY must be a duration in [0s, 120s]", "err", err, "value", os.Getenv("OLAITAN_WEBHOOK_SHUTDOWN_DELAY"))
 		return 1
 	}
 	reloadInterval, err := getenvDurationDefault("OLAITAN_WEBHOOK_CERT_RELOAD_INTERVAL", applog.DefaultCertReloadInterval)
-	if err != nil || reloadInterval <= 0 {
-		log.Error("startup: OLAITAN_WEBHOOK_CERT_RELOAD_INTERVAL must be a positive duration", "err", err)
+	if err != nil || reloadInterval < applog.MinCertReloadInterval {
+		log.Error("startup: OLAITAN_WEBHOOK_CERT_RELOAD_INTERVAL must be a duration of at least 1s", "err", err, "value", os.Getenv("OLAITAN_WEBHOOK_CERT_RELOAD_INTERVAL"))
 		return 1
 	}
 

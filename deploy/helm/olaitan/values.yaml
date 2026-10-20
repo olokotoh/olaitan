@@ -813,12 +813,12 @@ applogSidecar:
     # Apiserver-side timeout for the admission call. The webhook
     # itself is in-memory pure; 5s is generous.
     timeoutSeconds: 5
-    # #156: seconds an injector pod keeps serving after SIGTERM, with
-    # /readyz answering 503, before it closes its listener. A terminating
-    # pod stays a Service endpoint until kube-proxy drops it; closing at
-    # once refused the API server's calls in that window (each one a pod
-    # admitted with no sidecar under failurePolicy Ignore). The pod's
-    # terminationGracePeriodSeconds is this plus 20. Range [0, 120].
+    # #156: seconds an injector pod keeps serving after SIGTERM before it
+    # closes its listener. A terminating pod leaves the endpoints at once,
+    # but kube-proxy applies that a moment later; closing at once refused
+    # the API server's calls in that window (each one a pod admitted with
+    # no sidecar under failurePolicy Ignore). The pod's
+    # terminationGracePeriodSeconds is this plus 20. Whole seconds, [0, 120].
     shutdownDelaySeconds: 5
 
   # TLS material. Path A: cert-manager Certificate (production).

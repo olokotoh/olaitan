@@ -45,6 +45,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -168,17 +169,20 @@ type WebhookConfig struct {
 	SidecarRateLimitSampling  string
 
 	// ShutdownDelay is how long the server keeps serving after its
-	// context is cancelled (SIGTERM), with /readyz answering 503, before
-	// it closes the listener (#156). A terminating pod stays a Service
-	// endpoint until the EndpointSlice change reaches kube-proxy; closing
-	// at once refused the API server's calls in that window, and under
-	// failurePolicy Ignore each refused call admitted a pod with no
-	// sidecar. Zero closes at once (tests, local runs).
+	// context is cancelled (SIGTERM) before it closes the listener (#156).
+	// The delay is the fix: the EndpointSlice controller drops a
+	// terminating pod at once, but kube-proxy on the node the API server
+	// dials from applies that a moment later, and closing at once refused
+	// the calls still routed to it (each one a pod admitted with no
+	// sidecar under failurePolicy Ignore). During the delay /readyz
+	// answers 503 and keep-alives are off. Zero closes at once (tests,
+	// local runs).
 	ShutdownDelay time.Duration
 
 	// CertReloadInterval is how often the serving cert and key are
 	// re-read from TLSCertFile / TLSKeyFile (#157). Zero means
-	// DefaultCertReloadInterval.
+	// DefaultCertReloadInterval. The binary enforces
+	// MinCertReloadInterval on its env var; tests use shorter values.
 	CertReloadInterval time.Duration
 }
 
@@ -286,8 +290,10 @@ func (w *Webhook) Run(ctx context.Context) error {
 		interval = DefaultCertReloadInterval
 	}
 	reloadCtx, stopReload := context.WithCancel(context.Background())
-	defer stopReload()
-	go certs.watch(reloadCtx, interval)
+	var reloadDone sync.WaitGroup
+	reloadDone.Add(1)
+	go func() { defer reloadDone.Done(); certs.watch(reloadCtx, interval) }()
+	defer func() { stopReload(); reloadDone.Wait() }()
 
 	w.srv.TLSConfig.GetCertificate = certs.GetCertificate
 	ln, err := net.Listen("tcp", w.cfg.ListenAddr)
@@ -310,6 +316,10 @@ func (w *Webhook) Run(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		w.draining.Store(true)
+		// Ask clients to move: HTTP/1.1 responses carry Connection: close
+		// and idle connections close, so the API server's next call dials
+		// the Service again and lands on a pod that is not terminating.
+		w.srv.SetKeepAlivesEnabled(false)
 		if d := w.cfg.ShutdownDelay; d > 0 {
 			w.log.Info("applog/webhook: draining before shutdown", "delay", d.String())
 			select {
@@ -320,7 +330,12 @@ func (w *Webhook) Run(ctx context.Context) error {
 		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_ = w.srv.Shutdown(shutdownCtx)
+		if err := w.srv.Shutdown(shutdownCtx); err != nil {
+			// In-flight calls outlived the window: close them rather than
+			// leaving their goroutines behind Run.
+			w.log.Warn("applog/webhook: graceful shutdown timed out; closing connections", "err", err)
+			_ = w.srv.Close()
+		}
 		// Bounded receive: if Shutdown's 10 s window expires while a
 		// long-running in-flight admission call is still draining,
 		// ServeTLS may not return immediately. Block for at most 5 s on
@@ -369,10 +384,11 @@ func (w *Webhook) handleHealthz(rw http.ResponseWriter, _ *http.Request) {
 }
 
 // handleReadyz is the readiness probe (#156). It answers 200 while the
-// server takes new admission calls and 503 once shutdown has started, so
-// the kubelet marks a draining pod not-ready while its listener is still
-// open. Liveness stays on /healthz, which never turns 503 on a drain (a
-// liveness restart mid-drain would refuse the very calls the drain keeps).
+// server takes new admission calls and 503 once shutdown has started. A
+// terminating pod leaves the endpoints on its own; /readyz makes the state
+// visible to anything else that probes it. Liveness stays on /healthz,
+// which never turns 503 on a drain (a liveness restart mid-drain would
+// refuse the very calls the drain keeps).
 func (w *Webhook) handleReadyz(rw http.ResponseWriter, _ *http.Request) {
 	if w.draining.Load() {
 		http.Error(rw, "draining", http.StatusServiceUnavailable)

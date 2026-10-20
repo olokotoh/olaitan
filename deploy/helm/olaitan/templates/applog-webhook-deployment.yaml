@@ -56,8 +56,16 @@ no host-level operations.
   when unset, default to true; when set, take the operator value
   as-is.
 */}}
+{{- /* #156: a release upgraded with --reuse-values from before this key
+       existed has no value: take the chart default. A string ("5s",
+       "abc") or a fraction would otherwise coerce to 0 through `int` and
+       silently turn the drain off, so only whole numbers pass. */ -}}
 {{- $delay := .Values.applogSidecar.webhook.shutdownDelaySeconds -}}
-{{- if or (kindIs "invalid" $delay) (lt (int $delay) 0) (gt (int $delay) 120) -}}
+{{- if kindIs "invalid" $delay -}}{{- $delay = 5 -}}{{- end -}}
+{{- if not (regexMatch "^[0-9]+$" (toString $delay)) -}}
+{{- fail (printf "applogSidecar.webhook.shutdownDelaySeconds must be a whole number of seconds in [0, 120] (got %v)" $delay) -}}
+{{- end -}}
+{{- if gt (int $delay) 120 -}}
 {{- fail (printf "applogSidecar.webhook.shutdownDelaySeconds must be in [0, 120] (got %v)" $delay) -}}
 {{- end -}}
 {{- $useNative := true -}}
@@ -75,8 +83,9 @@ metadata:
 spec:
   replicas: {{ .Values.applogSidecar.webhook.replicaCount | default 2 }}
   {{- /* #156: surge a ready replacement before any serving pod goes, so a
-         rollout (every cert rotation rolls it, #148) never leaves fewer
-         serving endpoints than replicas. */}}
+         rollout (a Path B cert change rolls it, #148) never leaves fewer
+         serving endpoints than replicas. The surge pod needs room to
+         schedule: under a tight ResourceQuota the rollout waits for it. */}}
   strategy:
     type: RollingUpdate
     rollingUpdate:

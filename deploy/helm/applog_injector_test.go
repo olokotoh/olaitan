@@ -8,8 +8,8 @@ package helm_test
 //        stopped listening while it was still an endpoint. The pods now drain
 //        (not-ready, keep serving for shutdownDelaySeconds), the rollout
 //        surges before it removes a pod, and a PDB keeps one up on a drain.
-//   #157 the injector reloads its serving cert from the mounted Secret, so the
-//        readiness probe it answers is /readyz (drain-aware), not /healthz.
+//   #157 the injector reloads its serving cert from the mounted Secret (Go
+//        tests in internal/admission/applog; nothing to render here).
 //   #159 the webhook no longer admits the injector's own pods, so under
 //        failurePolicy Fail a broken injector cannot block its replacements.
 
@@ -42,7 +42,8 @@ func excludedBy(selector map[string]any, labels map[string]any) bool {
 		key, _ := dig(ex, "key").(string)
 		op, _ := dig(ex, "operator").(string)
 		v, has := labels[key]
-		if op == "NotIn" && has && containsAny(asList(dig(ex, "values")), v.(string)) {
+		sv, isStr := v.(string)
+		if op == "NotIn" && has && isStr && containsAny(asList(dig(ex, "values")), sv) {
 			return true
 		}
 	}
@@ -116,8 +117,11 @@ func TestApplogInjectorRolloutNeverDropsACall(t *testing.T) {
 
 	// A PDB keeps one injector up through a node drain.
 	pdb := docNamed(t, rendered, "PodDisruptionBudget", "olaitan-applog-injector")
-	if ma := dig(pdb, "spec", "minAvailable"); ma != 1 {
-		t.Errorf("PDB minAvailable = %v, want 1", ma)
+	if mu := dig(pdb, "spec", "maxUnavailable"); mu != 1 {
+		t.Errorf("PDB maxUnavailable = %v, want 1", mu)
+	}
+	if p := dig(pdb, "spec", "unhealthyPodEvictionPolicy"); p != "AlwaysAllow" {
+		t.Errorf("PDB unhealthyPodEvictionPolicy = %v, want AlwaysAllow (a broken injector must not block a drain)", p)
 	}
 	podLabels, _ := dig(d, "spec", "template", "metadata", "labels").(map[string]any)
 	sel, _ := dig(pdb, "spec", "selector", "matchLabels").(map[string]any)
@@ -138,15 +142,25 @@ func TestApplogInjectorRolloutNeverDropsACall(t *testing.T) {
 	if g, _ := dig(injectorDeployment(t, r), "spec", "template", "spec", "terminationGracePeriodSeconds").(int); g < 12+15 {
 		t.Errorf("grace %d does not cover a 12 s delay", g)
 	}
-	for _, bad := range []string{"-1", "121"} {
-		if _, err := renderArgsErr(t, "--set", "applogSidecar.webhook.shutdownDelaySeconds="+bad); err == nil || !strings.Contains(err.Error(), "shutdownDelaySeconds") {
-			t.Errorf("shutdownDelaySeconds=%s rendered (err %v)", bad, err)
+	for _, bad := range [][]string{
+		{"--set", "applogSidecar.webhook.shutdownDelaySeconds=-1"},
+		{"--set", "applogSidecar.webhook.shutdownDelaySeconds=121"},
+		{"--set", "applogSidecar.webhook.shutdownDelaySeconds=7.9"},
+		{"--set-string", "applogSidecar.webhook.shutdownDelaySeconds=5s"},
+		{"--set-string", "applogSidecar.webhook.shutdownDelaySeconds=abc"},
+	} {
+		if _, err := renderArgsErr(t, bad...); err == nil || !strings.Contains(err.Error(), "shutdownDelaySeconds") {
+			t.Errorf("%v rendered (err %v); a non-integer must not coerce to a 0 s drain", bad, err)
 		}
+	}
+	// --reuse-values from a release that predates the key: the default.
+	r = renderArgs(t, "--set", "applogSidecar.webhook.shutdownDelaySeconds=null")
+	if v, _ := envValue(injectorContainer(t, r), "OLAITAN_WEBHOOK_SHUTDOWN_DELAY"); v != "5s" {
+		t.Errorf("an unset shutdownDelaySeconds renders %q, want the 5s default", v)
 	}
 }
 
-// A single replica cannot have a minAvailable 1 PDB: it would block every
-// node drain. One replica renders none (and NOTES-level docs say why).
+// One replica renders no PDB: there is nothing to keep up through a drain.
 func TestApplogInjectorPDBNeedsTwoReplicas(t *testing.T) {
 	for n, want := range map[int]bool{1: false, 2: true, 3: true} {
 		r := renderArgs(t, "--set", "applogSidecar.webhook.replicaCount="+strconv.Itoa(n))
