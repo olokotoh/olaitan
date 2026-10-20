@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -37,12 +38,20 @@ func TestParseCertgenFlags(t *testing.T) {
 	if _, err := parseCertgenFlags([]string{"--namespace=olaitan"}, &stderr); err == nil {
 		t.Error("a certgen run with nothing to do parsed")
 	}
-	// #155: the audit admission stub is gone, so certgen has no
-	// ValidatingWebhookConfiguration to patch and must not accept the flag.
-	if _, err := parseCertgenFlags([]string{"--namespace=olaitan",
+	// #155: the audit admission stub is gone. An older chart's Job may still
+	// pass --validating-webhook; it parses, warns and changes nothing.
+	stderr.Reset()
+	old, err := parseCertgenFlags([]string{"--namespace=olaitan",
 		"--audit-secret=a", "--audit-kubeconfig-secret=k", "--audit-dns=a", "--audit-server=a:8443",
-		"--validating-webhook=olaitan-audit"}, &stderr); err == nil {
-		t.Error("--validating-webhook still parses (#155)")
+		"--validating-webhook=olaitan-audit"}, &stderr)
+	if err != nil {
+		t.Errorf("--validating-webhook from an older chart failed the run: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "deprecated and ignored") {
+		t.Errorf("no deprecation warning for --validating-webhook: %q", stderr.String())
+	}
+	if old.AuditSecret != "a" || old.MutatingWebhook != "" {
+		t.Errorf("spec = %+v", old)
 	}
 	if _, err := parseCertgenFlags([]string{"--namespace=olaitan", "--applog-secret=x", "--label=novalue"}, &stderr); err == nil {
 		t.Error("a malformed --label parsed")

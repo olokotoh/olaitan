@@ -9,8 +9,8 @@ collector. With no TLS values set, the chart's certgen Job (`olaitan
 certgen`) creates, in the cluster and per install, the receiver Secret
 `<fullname>-audit-tls` and the kube-apiserver kubeconfig Secret
 `<fullname>-audit-webhook-kubeconfig` (CA, server address and the
-apiserver's client cert), and writes the CA into the admission stub's
-caBundle. No private key is in a render. The receiver is DEGRADED (the
+apiserver's client cert). The audit CA goes into no webhook configuration
+(#155). No private key is in a render. The receiver is DEGRADED (the
 install notes and the collector log say so) until the kube-apiserver is
 pointed at it: on a self-managed cluster, copy that kubeconfig to the
 control plane and follow step 4; on EKS, AKS and GKE it is impossible (the
@@ -32,8 +32,9 @@ kubectl -n <ns> delete secret -l app.kubernetes.io/managed-by=olaitan-certgen
 kubectl -n <ns> delete job -l app.kubernetes.io/component=certgen
 ```
 
-The same two commands repair a webhook configuration that was deleted and
-recreated outside helm (its caBundle is empty until the Job runs again).
+The same two commands repair the applog injector's webhook configuration
+if it was deleted and recreated outside helm (its caBundle is empty until
+the Job runs again); the audit path has no webhook configuration.
 These Secrets are not helm's, so `helm uninstall` leaves them; delete them
 the same way. Switching to your own material (Path B) or back: delete the
 certgen Secrets first, or helm refuses to take over Secrets it does not own.
@@ -66,8 +67,11 @@ presents none, so every call failed with `tls: certificate required` and
 failed open. The receiver also decodes audit `EventList` batches, not
 `AdmissionReview`. The audit backend already receives every request the
 stub covered, so the stub was removed rather than given its own
-unauthenticated listener (ADR-2026-10-19-02). After upgrading through
-`install.yaml` rather than helm, delete the leftover object:
+unauthenticated listener (ADR-2026-10-19-02). `helm upgrade` deletes the
+old object. `kubectl apply` never prunes, so after re-applying an
+`install.yaml` (or a `helm template` render) over an install that had the
+stub, delete it by hand (`<fullname>-audit`; `olaitan-audit` for the
+release name `olaitan`):
 
 ```bash
 kubectl delete validatingwebhookconfiguration olaitan-audit --ignore-not-found

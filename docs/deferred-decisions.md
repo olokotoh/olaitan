@@ -1538,8 +1538,7 @@ cert-manager was rejected: most fresh clusters lack it, and "everything on"
 would fail there. Chosen: a one-shot Job, `olaitan certgen`, on the Olaitan
 image (no new third-party image to pin). It creates the missing Secrets in
 the cluster, per install, never replaces existing ones, and writes the CA
-into the two webhook configurations' caBundle (one since #155,
-ADR-2026-10-19-02), which the templates leave out
+into the two webhook configurations' caBundle, which the templates leave out
 in this mode so an upgrade or re-apply keeps it. Its RBAC is limited by
 resource name. Operator material and cert-manager keep their paths; half a
 set fails the render. The Goldmane client certificate is not generated: it
@@ -1617,18 +1616,26 @@ burying real webhook failures such as #148's.
    client certificate. Rejected: it needs `--admission-control-config-file`
    on the control plane (impossible on EKS, AKS and GKE, extra manual wiring
    elsewhere) and still meets the missing handler.
-3. Remove the stub. Chosen. The audit backend already receives every API
-   request at the audit policy's level, a superset of the stub's rules
-   (pods, services, configmaps, secrets, workloads, NetworkPolicies, role
-   bindings), with the response and the authenticated user. The stub added
-   only a guaranteed failed round-trip per request.
+3. Remove the stub. Chosen. Once the API server is wired to the audit
+   backend (`--audit-webhook-config-file`), the default audit policy
+   records every request the stub's rules covered (pods, services,
+   configmaps, secrets, workloads, NetworkPolicies, role bindings; its
+   `level: None` rules drop only reads of events, endpoints, leases and
+   nodes), with the response and the authenticated user. Where that wiring
+   is impossible (EKS, AKS, GKE) or a custom policy drops those resources,
+   the stub could not have filled the gap either: it never completed a
+   call. It added only a guaranteed failed round-trip per request.
 
 **Consequences.** The receiver keeps `RequireAndVerifyClientCert` and CN
-pinning unchanged. `olaitan certgen` loses `--validating-webhook` and its
-ClusterRole no longer names a ValidatingWebhookConfiguration (it renders
+pinning unchanged. `olaitan certgen` no longer patches a
+ValidatingWebhookConfiguration (`--validating-webhook` is accepted and
+ignored with a warning, so an older chart's Job on a newer image does not
+fail), and its ClusterRole no longer names a ValidatingWebhookConfiguration (it renders
 only when the applog injector needs one). A render test pins that no
 admission webhook in any shipped profile dials the audit receiver. `helm
 upgrade` deletes the old object; an install.yaml user who enabled the audit
 webhook deletes `validatingwebhookconfiguration/<fullname>-audit` by hand
-(AUDIT.md). Admission-time policy, if it is ever built, gets its own
+(AUDIT.md). Leaving certgen to delete it was rejected: it would need a
+cluster-scoped delete verb in every install for a leftover that only a
+`kubectl apply` upgrade over an unreleased (Story 12.7) default can leave. Admission-time policy, if it is ever built, gets its own
 handler, Service and certificate.

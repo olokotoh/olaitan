@@ -655,3 +655,19 @@ func TestIsPermanentPublishError_RejectsSubstringOnlyMatch(t *testing.T) {
 		t.Errorf("isPermanentPublishError(ErrStreamNotFound): got false, want true")
 	}
 }
+
+// #155 review: the receiver pins the client CN as well as the CA. A
+// certificate from the trusted CA whose CN is not in client_cn_allow (any
+// other cluster-CA-signed workload) must fail the handshake.
+func TestReceiver_Rejects_TrustedCAWrongCN(t *testing.T) {
+	t.Parallel()
+	pub := &stubPublisher{}
+	_, url, tc, _ := startAdapter(t, pub, func(c *Config) { c.ClientCNAllow = []string{"not-the-apiserver"} })
+	_, err := mtlsClient(t, tc, true).Post(url, "application/json", bytes.NewReader(mustEventList(t)))
+	if err == nil {
+		t.Fatal("a trusted-CA client cert with a CN outside client_cn_allow was accepted")
+	}
+	if n := pub.attempts.Load(); n != 0 {
+		t.Fatalf("published %d events for a rejected client", n)
+	}
+}

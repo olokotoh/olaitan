@@ -46,11 +46,14 @@ func webhookObjects() *admissionv1.MutatingWebhookConfiguration {
 }
 
 // leftoverAuditStub is the ValidatingWebhookConfiguration an install from
-// before #155 may still carry. certgen must not write the audit CA into it.
+// before #155 may still carry. certgen must leave it exactly as it is.
 func leftoverAuditStub() *admissionv1.ValidatingWebhookConfiguration {
 	return &admissionv1.ValidatingWebhookConfiguration{
 		ObjectMeta: metav1.ObjectMeta{Name: "olaitan-audit"},
-		Webhooks:   []admissionv1.ValidatingWebhook{{Name: "audit.olaitan.io"}},
+		Webhooks: []admissionv1.ValidatingWebhook{{
+			Name:         "audit.olaitan.io",
+			ClientConfig: admissionv1.WebhookClientConfig{CABundle: []byte("old-bundle")},
+		}},
 	}
 }
 
@@ -154,10 +157,13 @@ func TestRunCreatesTheMaterialAndPatchesTheWebhooks(t *testing.T) {
 		t.Error("mutating webhook caBundle is not the applog CA")
 	}
 	// #155: the audit CA goes into no admission webhook. A leftover stub
-	// from an older install keeps an empty caBundle.
-	gv, _ := cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(ctx, "olaitan-audit", metav1.GetOptions{})
-	if len(gv.Webhooks[0].ClientConfig.CABundle) != 0 {
-		t.Error("certgen wrote the audit CA into a ValidatingWebhookConfiguration (#155)")
+	// from an older install is left untouched.
+	gv, err := cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(ctx, "olaitan-audit", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(gv.Webhooks[0].ClientConfig.CABundle); got != "old-bundle" {
+		t.Errorf("certgen touched a leftover ValidatingWebhookConfiguration (#155): caBundle now %q", got)
 	}
 	for _, b := range [][]byte{audit.Data["tls.crt"], kc.Data["webhook-kubeconfig.yaml"], applog.Data["tls.crt"]} {
 		if strings.Contains(string(b), "BEGIN RSA") {
