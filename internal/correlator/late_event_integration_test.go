@@ -227,12 +227,29 @@ func TestIntegration_LateFlowAfterFiredWindowYieldsOneRuleMatch(t *testing.T) {
 	}
 
 	// S5: a pool flow is a different rule, so it gets its own package.
-	if _, err := r.c.AddEvent(r.ctx, poolFlowFrom(t, flows[1], "pool-1")); err != nil {
+	pf := poolFlowFrom(t, flows[1], "pool-1")
+	pf.Timestamp = now.Add(15 * time.Second)
+	if _, err := r.c.AddEvent(r.ctx, pf); err != nil {
 		t.Fatal(err)
 	}
 	pool := r.drain(t)
-	if len(pool) != 1 || len(pool[0].RuleMatches) != 1 || pool[0].RuleMatches[0].RuleID != "OLT-IMPACT-006" {
-		t.Fatalf("pool flow: want one OLT-IMPACT-006 package, got %+v", pool)
+	if len(pool) != 1 || len(pool[0].RuleMatches) != 1 || pool[0].RuleMatches[0].RuleID != "OLT-IMPACT-006" ||
+		pool[0].Trigger.Origin != schema.TriggerOriginLateEvent || len(pool[0].Events) != 1 {
+		t.Fatalf("pool flow: want one late_event OLT-IMPACT-006 package with one event, got %+v", pool)
+	}
+	if v := testutil.ToFloat64(r.c.metrics.lateEventRulePackages.WithLabelValues("OLT-IMPACT-006")); v != 1 {
+		t.Fatalf("late_event_rule_packages_total{OLT-IMPACT-006} = %v, want 1", v)
+	}
+
+	// A late event older than the window cutoff is in no window: no package.
+	stale := flows[0]
+	stale.ID = "stale-1"
+	stale.Timestamp = now.Add(-2 * time.Minute)
+	if _, err := r.c.AddEvent(r.ctx, poolFlowFrom(t, stale, "stale-pool")); err != nil {
+		t.Fatal(err)
+	}
+	if extra := r.drain(t); len(extra) != 0 {
+		t.Fatalf("an event evicted on arrival published %d package(s), want 0", len(extra))
 	}
 	if v := testutil.ToFloat64(r.c.metrics.lateEventRulePackages.WithLabelValues("OLT-NET-002")); v != 1 {
 		t.Fatalf("late_event_rule_packages_total{OLT-NET-002} = %v, want 1", v)

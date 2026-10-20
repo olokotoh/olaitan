@@ -26,9 +26,11 @@ type EventRuleEvaluator interface {
 
 type evaluatorHolder struct{ e EventRuleEvaluator }
 
-// SetEventRuleEvaluator wires the per-event rule path. nil turns it off.
-// Wire it before Run (the rules engine is built after the correlator, since
-// the engine emits through the correlator).
+// SetEventRuleEvaluator wires the per-event rule path. nil turns it off. It
+// is safe to call at any time, including after Run has started (the rules
+// engine is built after the correlator, since it emits through it); until it
+// is set the path is off, and windows that fired before it was set carry no
+// pre-claims.
 func (c *Correlator) SetEventRuleEvaluator(e EventRuleEvaluator) {
 	if e == nil {
 		c.evaluator.Store(nil)
@@ -82,6 +84,9 @@ func (c *Correlator) fireLateEventRules(ctx context.Context, workloadID string, 
 	if len(matches) == 0 {
 		return nil, nil
 	}
+	if ev.Timestamp.IsZero() {
+		ev.Timestamp = c.clock().UTC() // the window stamps only its own copy
+	}
 	snap := window.Snapshot{WorkloadID: workloadID, Events: []schema.Event{ev}, Start: ev.Timestamp, End: ev.Timestamp}
 	var (
 		first *schema.EvidencePackage
@@ -106,6 +111,12 @@ func (c *Correlator) fireLateEventRules(ctx context.Context, workloadID string, 
 			continue // size-cap skip, logged by publishTrigger
 		}
 		eval.NoteEmitted(m)
+		// The audit half of the distinct label: the package itself carries
+		// trigger.origin=late_event on EVIDENCE; this line ties it to the
+		// event for the operator log.
+		c.log.Info("correlator: late-event rule match published",
+			"workload_id", workloadID, "rule_id", m.RuleID, "event_id", ev.ID,
+			"source", ev.Source, "package_id", pkg.PackageID, "origin", schema.TriggerOriginLateEvent)
 		if c.metrics.lateEventRulePackages != nil {
 			c.metrics.lateEventRulePackages.WithLabelValues(m.RuleID).Inc()
 		}
@@ -114,4 +125,16 @@ func (c *Correlator) fireLateEventRules(ctx context.Context, workloadID string, 
 		}
 	}
 	return first, errors.Join(errs...)
+}
+
+// inSnapshot reports whether the event survived the window's eviction on
+// arrival: a late event older than the window cutoff is in no window, so it
+// gets no late package either.
+func inSnapshot(snap window.Snapshot, id string) bool {
+	for i := range snap.Events {
+		if snap.Events[i].ID == id {
+			return true
+		}
+	}
+	return false
 }

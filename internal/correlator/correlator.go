@@ -394,7 +394,9 @@ func (c *Correlator) AddEvent(ctx context.Context, ev schema.Event) (*schema.Evi
 		}
 		// The rules engine evaluates this snapshot; claim what it will
 		// match so the per-event path never repeats it in this window.
-		c.preclaimSnapshotRules(workloadID, identity, snap)
+		if multi != nil {
+			c.preclaimSnapshotRules(workloadID, identity, snap)
+		}
 	}
 	// Story 10.3: a serious Falco alert starts an investigation on its own,
 	// once per (workload, rule) per window.
@@ -406,12 +408,8 @@ func (c *Correlator) AddEvent(ctx context.Context, ev schema.Event) (*schema.Evi
 		// package of its own, so a single-event OLT rule (OLT-NET-002 on a
 		// Goldmane flow that arrives 15-30s after Falco) could never be
 		// evaluated. Evaluate that one event now.
-		if !transitioned && added.AlreadyFired && !c.isExcluded(ev.Pod.Namespace) {
-			late, lerr := c.fireLateEventRules(ctx, workloadID, identity, pod, ev)
-			if multi == nil {
-				return late, lerr
-			}
-			return multi, lerr
+		if !transitioned && added.AlreadyFired && !c.isExcluded(ev.Pod.Namespace) && inSnapshot(added.Snapshot, ev.ID) {
+			return c.fireLateEventRules(ctx, workloadID, identity, pod, ev)
 		}
 		return multi, nil
 	}
@@ -426,7 +424,9 @@ func (c *Correlator) AddEvent(ctx context.Context, ev schema.Event) (*schema.Evi
 	}
 	// A Falco-only rule_match package is evaluated by the rules engine
 	// (Story 10.3 guard), snapshot included: claim what it will match.
-	c.preclaimSnapshotRules(workloadID, identity, snap)
+	if pkg != nil {
+		c.preclaimSnapshotRules(workloadID, identity, snap)
+	}
 	if multi != nil {
 		return multi, nil
 	}
@@ -443,7 +443,7 @@ func (c *Correlator) claimFalcoTrigger(workloadID, ruleID string) bool {
 
 // claimIn is the Story 10.3 per-(workload, rule)-per-window claim on fired.
 func (c *Correlator) claimIn(fired *sync.Map, workloadID, ruleID string) bool {
-	now := time.Now()
+	now := c.clock()
 	win := time.Duration(c.windowNanos.Load())
 	key := workloadID + "\x00" + ruleID
 	if prev, loaded := fired.LoadOrStore(key, now); loaded {

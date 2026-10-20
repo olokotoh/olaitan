@@ -32,6 +32,9 @@ func TestFSMDriver_LateRuleRepeatDoesNotInflateScore(t *testing.T) {
 	wl := "tenant-acme/Deployment/web"
 	f.handle(latePkg(wl, "late-1", "OLT-NET-002", "50"))
 	first := f.d.last.Total
+	if first <= 0 {
+		t.Fatalf("late OLT-NET-002 package scored %v; it must contribute to the score", first)
+	}
 	f.handle(latePkg(wl, "late-2", "OLT-NET-002", "50"))
 	if f.d.last.Total != first {
 		t.Fatalf("repeat of OLT-NET-002 moved the score %v -> %v; the risk window must keep the max, not sum", first, f.d.last.Total)
