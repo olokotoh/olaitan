@@ -180,7 +180,8 @@ and false-positive numbers; see [Unreleased](#unreleased).
     got no sidecar. The injector now drains: on SIGTERM its listener
     keeps serving for `applogSidecar.webhook.shutdownDelaySeconds`
     (default 5, `terminationGracePeriodSeconds` is that plus 20) while
-    `/readyz` answers 503 and keep-alives are off. The Deployment surges
+    `/readyz` answers 503, then Shutdown's HTTP/2 GOAWAY moves the API
+    server's connection to another pod. The Deployment surges
     (`maxSurge: 1`, `maxUnavailable: 0`), and with two or more replicas a
     PodDisruptionBudget (`maxUnavailable: 1`, unhealthy pods always
     evictable) stops a drain from taking every injector at once.

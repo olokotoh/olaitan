@@ -247,7 +247,10 @@ follows when a good pair arrives.
   webhook's `objectSelector` excludes pods labelled
   `app.kubernetes.io/component=applog-injector` (#159), so the rollout
   that fixes it always proceeds. Any other pod carrying that exact label
-  is skipped too; do not reuse it on workloads.
+  is skipped too; do not reuse it on workloads. The label is not a trust
+  boundary: injection is opt-in through the pod's own
+  `olaitan.io/log-sidecar` annotation, so a pod that spoofs the label gains
+  nothing it could not get by leaving the annotation out.
 
 ### Rollouts and node drains
 
@@ -262,7 +265,9 @@ A rollout or drain does not drop admission calls (#156):
   in [0, 120]). The pod leaves the Service endpoints as soon as it starts
   terminating, but kube-proxy applies that a moment later; the delay keeps
   serving the calls still routed to it. During the delay `/readyz`
-  answers 503 and keep-alives are off, so clients reconnect elsewhere.
+  answers 503; Shutdown then sends HTTP/2 GOAWAY, which moves the API
+  server's (h2) connection to another pod. Keep-alives are also turned
+  off, which only affects HTTP/1.1 clients.
   `terminationGracePeriodSeconds` is that delay plus 20.
 - With two or more replicas a PodDisruptionBudget (`maxUnavailable: 1`,
   `unhealthyPodEvictionPolicy: AlwaysAllow`) stops a drain from evicting

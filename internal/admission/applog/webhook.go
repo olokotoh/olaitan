@@ -175,7 +175,8 @@ type WebhookConfig struct {
 	// dials from applies that a moment later, and closing at once refused
 	// the calls still routed to it (each one a pod admitted with no
 	// sidecar under failurePolicy Ignore). During the delay /readyz
-	// answers 503 and keep-alives are off. Zero closes at once (tests,
+	// answers 503; Shutdown's GOAWAY then moves HTTP/2 clients (keep-alives
+	// are also turned off, which only affects HTTP/1.1). Zero closes at once (tests,
 	// local runs).
 	ShutdownDelay time.Duration
 
@@ -316,9 +317,11 @@ func (w *Webhook) Run(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		w.draining.Store(true)
-		// Ask clients to move: HTTP/1.1 responses carry Connection: close
-		// and idle connections close, so the API server's next call dials
-		// the Service again and lands on a pod that is not terminating.
+		// The drain works because the listener keeps serving for the whole
+		// delay, and Shutdown then sends HTTP/2 GOAWAY so the API server's
+		// webhook client (which negotiates h2 here) opens a new connection
+		// elsewhere. Turning keep-alives off has no effect on HTTP/2; it
+		// only makes HTTP/1.1 clients close and reconnect sooner.
 		w.srv.SetKeepAlivesEnabled(false)
 		if d := w.cfg.ShutdownDelay; d > 0 {
 			w.log.Info("applog/webhook: draining before shutdown", "delay", d.String())
