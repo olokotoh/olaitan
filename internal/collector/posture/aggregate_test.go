@@ -278,4 +278,14 @@ func TestResolveGoldmaneAggregate_IndexedJob(t *testing.T) {
 	if _, rep, err := posture.ResolveGoldmaneAggregate(context.Background(), cs, "olt-bl", "web-0-"); err == nil || rep != nil {
 		t.Fatalf("a ReplicaSet named web owning web-0- pods must not pass the Job-index rule: pod %v err %v", rep, err)
 	}
+	// Round 3: the index must be digits only.
+	for _, gen := range []string{"train-canary-", "train-0a-"} {
+		cs := fake.NewSimpleClientset(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: gen + "x7k2p", GenerateName: gen, Namespace: "olt-bl",
+			OwnerReferences: []metav1.OwnerReference{{Kind: "Job", Name: "train", Controller: boolPtrLocal(true)}},
+		}})
+		if _, rep, err := posture.ResolveGoldmaneAggregate(context.Background(), cs, "olt-bl", gen); err == nil || rep != nil {
+			t.Errorf("%s* owned by Job train passed the Job-index rule: pod %v err %v", gen, rep, err)
+		}
+	}
 }
