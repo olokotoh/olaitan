@@ -53,6 +53,16 @@ cannot see before you trust it.
 !   into the `olaitan` namespace. Setting
 !   correlator.neverScoreReleaseNamespace=false scores "{{ $ns }}" again,
 !   and then Olaitan can score its own pods too.
+{{- else if eq $ns "kube-system" }}
+
+! NAMESPACE
+!
+!   You installed into "kube-system", not "olaitan". kube-system is never
+!   added to detection.correlator.never_scored_namespaces, whatever
+!   correlator.neverScoreReleaseNamespace says: a compromised CoreDNS or CNI
+!   agent must stay visible. So Olaitan can score, and if enforcement is on
+!   isolate, its own aggregator and collector here. Install into the
+!   `olaitan` namespace instead.
 {{- else }}
 
 ! NAMESPACE
@@ -65,11 +75,6 @@ cannot see before you trust it.
 !   correlator.neverScoreReleaseNamespace=true to add "{{ $ns }}" to
 !   detection.correlator.never_scored_namespaces (nothing else in it is
 !   scored then either).
-{{- if eq $ns "kube-system" }}
-!   kube-system is never added to that list, whatever the setting: a
-!   compromised CoreDNS or CNI agent must stay visible. Install into the
-!   `olaitan` namespace instead.
-{{- end }}
 {{- end }}
 {{- end }}
 

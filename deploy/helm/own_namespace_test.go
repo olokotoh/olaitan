@@ -65,7 +65,7 @@ func TestKubeSystemIsNeverAddedToTheNeverScoredList(t *testing.T) {
 		t.Errorf("-n kube-system never_scored_namespaces = %q, want olaitan", got)
 	}
 	notes := renderNotesInNamespace(t, "kube-system")
-	if !strings.Contains(notes, "kube-system is never added to that list") || strings.Contains(notes, "NOTHING in") {
+	if !strings.Contains(notes, "kube-system is never") || strings.Contains(notes, "NOTHING in") || strings.Contains(notes, "neverScoreReleaseNamespace=true") {
 		t.Errorf("kube-system notes do not explain that it stays scored; notes:\n%s", notes)
 	}
 }

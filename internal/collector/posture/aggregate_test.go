@@ -9,6 +9,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -252,5 +253,29 @@ func TestCheckAggregateRefRejectsWhatCannotBeAPodSet(t *testing.T) {
 	}
 	if err := posture.CheckAggregateRef("olt-bl", "steady-6c8f4c97cc-"); err != nil {
 		t.Errorf("valid ref rejected: %v", err)
+	}
+}
+
+// Review round 2: an Indexed Job's pods carry the GenerateName
+// "<job>-<index>-", so Goldmane reports "<job>-<index>-*"; the controller is
+// the Job itself. A ReplicaSet "<x>-0" is not an Indexed Job.
+func TestResolveGoldmaneAggregate_IndexedJob(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "train", Namespace: "olt-bl"}},
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: "train-0-x7k2p", GenerateName: "train-0-", Namespace: "olt-bl",
+			OwnerReferences: []metav1.OwnerReference{{Kind: "Job", Name: "train", Controller: boolPtrLocal(true)}},
+		}},
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: "web-0-x7k2p", GenerateName: "web-0-", Namespace: "olt-bl",
+			OwnerReferences: []metav1.OwnerReference{{Kind: "ReplicaSet", Name: "web", Controller: boolPtrLocal(true)}},
+		}},
+	)
+	id, rep, err := posture.ResolveGoldmaneAggregate(context.Background(), cs, "olt-bl", "train-0-")
+	if err != nil || rep == nil || id.OwnerKind != "Job" || id.OwnerName != "train" {
+		t.Fatalf("indexed Job aggregate: %+v, pod %v, err %v; want Job/train", id, rep, err)
+	}
+	if _, rep, err := posture.ResolveGoldmaneAggregate(context.Background(), cs, "olt-bl", "web-0-"); err == nil || rep != nil {
+		t.Fatalf("a ReplicaSet named web owning web-0- pods must not pass the Job-index rule: pod %v err %v", rep, err)
 	}
 }

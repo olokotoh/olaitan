@@ -131,8 +131,8 @@ func ResolveGoldmaneAggregate(ctx context.Context, cs kubernetes.Interface, name
 // representativePod picks a pod of the aggregate. GenerateName must equal the
 // prefix exactly (so "web-" never matches a "web-canary-" pod), and the pod's
 // controller must be the object the prefix is named after (the ReplicaSet,
-// DaemonSet, StatefulSet or Job whose name is the prefix without its trailing
-// "-"; Story 12.8 review). That skips a bare pod, or one owned by something
+// DaemonSet or Job whose name is the prefix without its trailing "-", or an
+// Indexed Job; see controlledByAggregateOwner; Story 12.8 review). That skips a bare pod, or one owned by something
 // else, that merely shares the GenerateName: it would otherwise make the set
 // unresolvable, or lend its ServiceAccount and security context to the
 // workload's posture. A running pod (not terminating, not Succeeded or
@@ -147,7 +147,7 @@ func representativePod(pods []corev1.Pod, prefix string) *corev1.Pod {
 		if p.GenerateName != prefix {
 			continue
 		}
-		if ctrl := metav1.GetControllerOf(p); ctrl == nil || ctrl.Name != owner {
+		if !controlledByAggregateOwner(p, owner) {
 			continue
 		}
 		if p.DeletionTimestamp == nil && p.Status.Phase != corev1.PodSucceeded && p.Status.Phase != corev1.PodFailed {
@@ -161,4 +161,32 @@ func representativePod(pods []corev1.Pod, prefix string) *corev1.Pod {
 		return fallback.DeepCopy()
 	}
 	return nil
+}
+
+// controlledByAggregateOwner reports whether pod's controller is the object
+// an aggregate prefix names: its name is the prefix without the trailing "-"
+// (ReplicaSet, DaemonSet, Job), or, for an Indexed Job, whose pods carry the
+// GenerateName "<job>-<index>-", the Job whose name plus "-<index>" it is
+// (review round 2).
+func controlledByAggregateOwner(pod *corev1.Pod, owner string) bool {
+	ctrl := metav1.GetControllerOf(pod)
+	if ctrl == nil {
+		return false
+	}
+	if ctrl.Name == owner {
+		return true
+	}
+	if ctrl.Kind != "Job" {
+		return false
+	}
+	idx, ok := strings.CutPrefix(owner, ctrl.Name+"-")
+	if !ok || idx == "" {
+		return false
+	}
+	for _, r := range idx {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
