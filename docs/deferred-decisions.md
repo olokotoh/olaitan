@@ -1585,9 +1585,9 @@ in the config checksum; an SCC binding for certgen on OpenShift; and the
 default model's Qwen Research licence (a commercial default would be a
 different model and a new live measurement).
 
-## ADR-2026-10-19-02: No audit admission webhook; the audit receiver stays audit-backend only, with mTLS
+## ADR-2026-10-19-03: No audit admission webhook; the audit receiver stays audit-backend only, with mTLS
 
-**Status.** Accepted (#155). Amends ADR-2026-10-19-01 D1: certgen now
+**Status.** Accepted (#155). Amends ADR-2026-10-19-02 D1: certgen now
 writes a caBundle into one webhook configuration (the applog injector's),
 not two.
 

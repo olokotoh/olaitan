@@ -1135,7 +1135,7 @@ func TestDaemonsetMountsAuditTLSSecret_WhenEnabled(t *testing.T) {
 }
 
 // TestValidatingWebhookConfigurationUntouched (Story 1.7) pinned the Story
-// 1.1 admission stub. #155 removed the stub on purpose (ADR-2026-10-19-02);
+// 1.1 admission stub. #155 removed the stub on purpose (ADR-2026-10-19-03);
 // admission_webhook_test.go pins its absence in every shipped profile.
 
 // TestContainerdSensorAbsent_WhenDisabled is the negative-default

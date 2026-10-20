@@ -14,7 +14,7 @@ MutatingWebhookConfiguration, which the template leaves out in this mode so
 a later upgrade or re-apply does not wipe it. The audit CA goes into no
 webhook configuration: the audit receiver is an audit backend reached through
 the apiserver kubeconfig, and the admission stub that dialled it is gone
-(#155, ADR-2026-10-19-02).
+(#155, ADR-2026-10-19-03).
 
 Rendered only when a part needs generated material (no operator material,
 no cert-manager). The name carries a hash of the image and the arguments,

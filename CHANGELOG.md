@@ -162,7 +162,7 @@ and false-positive numbers; see [Unreleased](#unreleased).
   server's admission client presents none, so each call failed with
   `tls: certificate required` and failed open, and the apiserver log filled
   with the line. The receiver also has no AdmissionReview handler, so the
-  stub could never have worked. The stub is removed (ADR-2026-10-19-02):
+  stub could never have worked. The stub is removed (ADR-2026-10-19-03):
   once the API server is wired to the audit backend, the default audit
   policy already records every request the stub covered, with more detail. The audit receiver keeps mTLS unchanged. `olaitan certgen` loses
   `--validating-webhook` and its ClusterRole no longer names a

@@ -67,7 +67,7 @@ presents none, so every call failed with `tls: certificate required` and
 failed open. The receiver also decodes audit `EventList` batches, not
 `AdmissionReview`. The audit backend already receives every request the
 stub covered, so the stub was removed rather than given its own
-unauthenticated listener (ADR-2026-10-19-02). `helm upgrade` deletes the
+unauthenticated listener (ADR-2026-10-19-03). `helm upgrade` deletes the
 old object. `kubectl apply` never prunes, so after re-applying an
 `install.yaml` (or a `helm template` render) over an install that had the
 stub, delete it by hand (`<fullname>-audit`; `olaitan-audit` for the

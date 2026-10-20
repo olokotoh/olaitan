@@ -8,7 +8,7 @@ package helm_test
 // kube-apiserver (mTLS, internal/collector/audit/audit.go); the API server's
 // admission client presents none, so every covered admission call failed with
 // "tls: certificate required" and failed open. The stub is gone
-// (ADR-2026-10-19-02).
+// (ADR-2026-10-19-03).
 //
 // The issue asks for a render test that the rendered admission webhooks can
 // authenticate to what they dial. Both halves are pinned here, in every
