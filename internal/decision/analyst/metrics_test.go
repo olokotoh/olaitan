@@ -55,3 +55,33 @@ func TestRegisterDecisionCallsMetricNilRegistry(t *testing.T) {
 		t.Fatal("nil registry: err = nil, want error")
 	}
 }
+
+// Story 7.4: the async dispatch counter registers idempotently and is a
+// separate family from the chain-runs counter.
+func TestRegisterChainDispatchMetricIdempotent(t *testing.T) {
+	reg := metrics.NewRegistry()
+	first, err := RegisterChainDispatchMetric(reg)
+	if err != nil {
+		t.Fatalf("first registration: %v", err)
+	}
+	second, err := RegisterChainDispatchMetric(reg)
+	if err != nil || first != second {
+		t.Fatalf("second registration must reuse the collector: err=%v same=%v", err, first == second)
+	}
+	for _, r := range []string{ChainDispatchDispatched, ChainDispatchCoalesced, ChainDispatchQueueFull} {
+		first.WithLabelValues(r).Inc()
+	}
+	mfs, err := reg.Gatherer().Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() == ChainDispatchMetricName {
+			if got := len(mf.GetMetric()); got != 3 {
+				t.Fatalf("family has %d series, want 3", got)
+			}
+			return
+		}
+	}
+	t.Fatalf("%s not gathered", ChainDispatchMetricName)
+}

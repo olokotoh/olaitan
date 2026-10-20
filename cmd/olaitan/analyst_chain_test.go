@@ -5,15 +5,17 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/olokotoh/olaitan/internal/agent/prompts"
 	"github.com/olokotoh/olaitan/internal/agent/provider"
 	"github.com/olokotoh/olaitan/internal/config"
 	"github.com/olokotoh/olaitan/internal/decision/analyst"
-	"github.com/olokotoh/olaitan/internal/decision/score"
 	"github.com/olokotoh/olaitan/internal/metrics"
 	responseaudit "github.com/olokotoh/olaitan/internal/response/audit"
 	"github.com/olokotoh/olaitan/internal/response/risk"
@@ -173,29 +175,21 @@ func TestBuildInvestigationChainOpenAIReachable(t *testing.T) {
 
 // TestChainAdjustedScore_EnabledWindowSumsAcrossPackages drives the ACTUAL
 // FSM-consumer wiring with an ENABLED risk window (PR #92 review: every prior
-// test through chainAdjustedScore passed risk.New(0), recreating the exact
-// unprotected-call-site hazard the function's own comment documents). A
-// rule-only package then a baseline-only package for the same workload must
-// score, through this call site, as one aggregate exceeding either solo score.
+// test through the call site passed risk.New(0), recreating the exact
+// unprotected-call-site hazard). A rule-only package then a baseline-only
+// package for the same workload must score, through this call site, as one
+// aggregate exceeding either solo score. Story 7.4: the call site is now
+// fsmDriver.handlePackage (the deterministic path); the name is kept so the
+// traceability row stays stable.
 func TestChainAdjustedScore_EnabledWindowSumsAcrossPackages(t *testing.T) {
-	calc, err := score.New(nil, metrics.NewRegistry())
-	if err != nil {
-		t.Fatalf("score.New: %v", err)
-	}
-	w := risk.New(60 * time.Second)
-	now := time.Now()
+	f := newDriverFixture(t, nil, risk.New(60*time.Second), 0, 0)
+	rulePkg := schema.EvidencePackage{PackageID: "p1", WorkloadID: "t/Deployment/w", RuleMatches: []schema.RuleMatch{{RuleID: "OLT-EXEC-001", Severity: "90"}}}
+	basePkg := schema.EvidencePackage{PackageID: "p2", WorkloadID: "t/Deployment/w", BaselineDeviations: []schema.BaselineDeviation{{Metric: "m", Sigma: 3.8}}}
 
-	rulePkg := schema.EvidencePackage{WorkloadID: "t/Deployment/w", RuleMatches: []schema.RuleMatch{{RuleID: "OLT-EXEC-001", Severity: "90"}}}
-	basePkg := schema.EvidencePackage{WorkloadID: "t/Deployment/w", BaselineDeviations: []schema.BaselineDeviation{{Metric: "m", Sigma: 3.8}}}
-
-	s1, err := chainAdjustedScore(context.Background(), rulePkg, calc, nil, "", nil, nil, nil, w, now, chainTestLogger())
-	if err != nil {
-		t.Fatalf("chainAdjustedScore(rule pkg): %v", err)
-	}
-	s2, err := chainAdjustedScore(context.Background(), basePkg, calc, nil, "", nil, nil, nil, w, now.Add(2*time.Second), chainTestLogger())
-	if err != nil {
-		t.Fatalf("chainAdjustedScore(baseline pkg): %v", err)
-	}
+	f.handle(rulePkg)
+	s1 := f.d.last
+	f.handle(basePkg)
+	s2 := f.d.last
 	if s2.Total <= s1.Total {
 		t.Fatalf("enabled window at the real call site did not sum: rule-only=%v then rule+baseline=%v", s1.Total, s2.Total)
 	}
@@ -205,48 +199,40 @@ func TestChainAdjustedScore_EnabledWindowSumsAcrossPackages(t *testing.T) {
 }
 
 // TestFSMConsumerFoldsChainConfidenceIntoScore is the Story 3.11 round-1
-// integration proof (the merge BI-7 gap all three reviewers flagged): it
-// threads a triggering package through the SAME composition the merged FSM
-// driver does -- processChainPackage -> Score -- and proves the chain's capped
-// confidence actually RAISES the FSM-driving Total, while the Trust-Bound
-// (LLM contribution <= 10.5) still holds. (The score isolation tests prove the
-// fold; this proves the wiring from the chain into the calculator.)
+// integration proof that the chain's capped confidence actually RAISES the
+// FSM-driving Total while the Trust-Bound (LLM contribution <= 10.5) holds.
+// Story 7.4 changed WHEN the fold happens (the spec, issue #186): the
+// deterministic score drives the FSM first, and the chain's verdict is folded
+// and re-evaluated when it returns. So this test now drives the real chain
+// through the production worker run func and asserts on the RE-SCORE.
 func TestFSMConsumerFoldsChainConfidenceIntoScore(t *testing.T) {
 	chain := scriptedFullChain(t)
 	pub := &fakeAssessmentPub{}
 	pkg := triggeringPackage("80")
 
-	calc, err := score.New(nil, metrics.NewRegistry())
+	runs, err := analyst.RegisterChainRunsMetric(metrics.NewRegistry())
 	if err != nil {
-		t.Fatalf("score.New: %v", err)
+		t.Fatalf("runs metric: %v", err)
 	}
+	f := newDriverFixture(t, newChainRunFunc(chain, chain.Mode(), pub, runs, chainTestLogger()), risk.New(0), 1, 0)
+	f.d.chainRuns = runs
+	f.handle(pkg)
+	noChain := f.d.last
+	f.awaitResult(t)
+	withChain := f.d.last
 
-	// Drive the ACTUAL FSM-consumer wiring (chainAdjustedScore), not a
-	// hand-reassembled composition: a regression that fed 0 instead of the
-	// chain's capped confidence at this call site must fail this test
-	// (round-2 Regression Hunter: the inline call site was previously
-	// unprotected).
-	withChain, err := chainAdjustedScore(context.Background(), pkg, calc, chain, chain.Mode(), nil, pub, nil, risk.New(0), time.Now().UTC(), chainTestLogger())
-	if err != nil {
-		t.Fatalf("chainAdjustedScore(with chain): %v", err)
-	}
-	noChain, err := chainAdjustedScore(context.Background(), pkg, calc, nil, "", nil, nil, nil, risk.New(0), time.Now().UTC(), chainTestLogger())
-	if err != nil {
-		t.Fatalf("chainAdjustedScore(nil chain): %v", err)
-	}
-
-	if withChain.LLM <= 0 {
-		t.Errorf("folded LLM term = %v, want > 0 (the chain confidence must reach the score)", withChain.LLM)
-	}
-	if withChain.Total <= noChain.Total {
-		t.Errorf("the chain's capped confidence did not raise the FSM-driving Total: with=%v no-chain=%v", withChain.Total, noChain.Total)
+	if withChain.LLM <= 0 || withChain.Total <= noChain.Total {
+		t.Errorf("the chain's capped confidence did not raise the FSM-driving Total: with=%+v deterministic=%+v", withChain, noChain)
 	}
 	if withChain.LLM > 10.5 {
 		t.Errorf("LLM contribution %v exceeds the 10.5 Trust-Bound", withChain.LLM)
 	}
-	// A nil chain (RS mode) folds a zero LLM term -- byte-identical to Epic 2.
+	// The deterministic score folds a zero LLM term.
 	if noChain.LLM != 0 {
-		t.Errorf("nil chain must fold a zero LLM term, got %v", noChain.LLM)
+		t.Errorf("deterministic LLM term = %v, want 0", noChain.LLM)
+	}
+	if v := testutil.ToFloat64(runs.WithLabelValues(chain.Mode(), analyst.ChainOutcomeAssessed)); v != 1 {
+		t.Errorf("chain runs assessed = %v, want 1 (metric recorded on the worker)", v)
 	}
 }
 
@@ -264,9 +250,9 @@ func TestProcessChainPackageBreakerBypass(t *testing.T) {
 		t.Fatal("setup: breaker should be engaged")
 	}
 
-	llm, out := processChainPackage(context.Background(), triggeringPackage("80"), chain, chain.Mode(), breaker, pub, nil, chainTestLogger())
-	if out != analyst.ChainOutcomeBreakerBypassed || llm != 0 {
-		t.Errorf("engaged breaker: out=%q llm=%d, want breaker_bypassed/0", out, llm)
+	ok, out := admitChainPackage(triggeringPackage("80"), chain.Mode(), breaker, nil)
+	if out != analyst.ChainOutcomeBreakerBypassed || ok {
+		t.Errorf("engaged breaker: out=%q admitted=%v, want breaker_bypassed/false", out, ok)
 	}
 	// The cost-amplification guarantee: NO LLM call was made.
 	if cp.calls.Load() != 0 {
@@ -283,7 +269,10 @@ func TestProcessChainPackageBreakerDisengagedRuns(t *testing.T) {
 	chain := scriptedFullChain(t)
 	pub := &fakeAssessmentPub{}
 	breaker := analyst.NewCircuitBreaker(analyst.CircuitBreakerOptions{RatePerMin: 100, Cooling: 60 * time.Second, Enabled: true})
-	llm, out := processChainPackage(context.Background(), triggeringPackage("80"), chain, chain.Mode(), breaker, pub, nil, chainTestLogger())
+	if ok, out := admitChainPackage(triggeringPackage("80"), chain.Mode(), breaker, nil); !ok {
+		t.Fatalf("disengaged breaker must admit, got %q", out)
+	}
+	llm, out := runChainPackage(context.Background(), triggeringPackage("80"), chain, pub, nil, chainTestLogger())
 	if out != analyst.ChainOutcomeAssessed || llm <= 0 {
 		t.Errorf("disengaged breaker: out=%q llm=%d, want assessed/>0", out, llm)
 	}
@@ -354,7 +343,7 @@ func TestSafeChainConfidenceRecoversFromPanic(t *testing.T) {
 	}
 	pub := &fakeAssessmentPub{}
 
-	capped := safeChainConfidence(context.Background(), triggeringPackage("80"), chain, chain.Mode(), nil, pub, nil, chainTestLogger())
+	capped, _ := newChainRunFunc(chain, chain.Mode(), pub, nil, chainTestLogger())(context.Background(), triggeringPackage("80"))
 	if capped != 0 {
 		t.Errorf("a panicking chain must fold 0 (deterministic-only), got %d", capped)
 	}
@@ -415,7 +404,7 @@ func triggeringPackage(severity string) schema.EvidencePackage {
 func TestProcessChainPackageAssessedAndAudited(t *testing.T) {
 	chain := scriptedFullChain(t)
 	pub := &fakeAssessmentPub{}
-	llm, out := processChainPackage(context.Background(), triggeringPackage("80"), chain, chain.Mode(), nil, pub, nil, chainTestLogger())
+	llm, out := runChainPackage(context.Background(), triggeringPackage("80"), chain, pub, nil, chainTestLogger())
 	if out != analyst.ChainOutcomeAssessed {
 		t.Errorf("outcome = %q, want assessed", out)
 	}
@@ -439,23 +428,34 @@ func TestProcessChainPackageAssessedAndAudited(t *testing.T) {
 func TestProcessChainPackageNotTriggered(t *testing.T) {
 	chain := scriptedFullChain(t)
 	pub := &fakeAssessmentPub{}
-	llm, out := processChainPackage(context.Background(), triggeringPackage("10"), chain, chain.Mode(), nil, pub, nil, chainTestLogger())
+	ok, out := admitChainPackage(triggeringPackage("10"), chain.Mode(), nil, nil)
 	if out != analyst.ChainOutcomeNotTriggered {
 		t.Errorf("outcome = %q, want not_triggered", out)
 	}
-	if llm != 0 {
-		t.Errorf("a non-triggering package must fold zero LLM confidence, got %d", llm)
+	if ok {
+		t.Errorf("a non-triggering package must not be admitted to the chain")
 	}
 	if len(pub.got) != 0 {
 		t.Errorf("a non-triggering package must not publish an assessment: %v", pub.got)
 	}
 }
 
+// fakeAssessmentPub records published assessments. Story 7.4: the chain now
+// publishes from worker goroutines, so it is mutex-guarded.
 type fakeAssessmentPub struct {
+	mu  sync.Mutex
 	got []responseaudit.AuditAssessment
 }
 
 func (f *fakeAssessmentPub) PublishAuditAssessment(_ context.Context, evt responseaudit.AuditAssessment) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.got = append(f.got, evt)
 	return nil
+}
+
+func (f *fakeAssessmentPub) all() []responseaudit.AuditAssessment {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]responseaudit.AuditAssessment(nil), f.got...)
 }

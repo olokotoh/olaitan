@@ -873,6 +873,35 @@ func (m *Machine) CurrentState(workloadID string) (PodState, bool) {
 	return schema.StateClean, false
 }
 
+// ScoreJustifiesEscalation reports whether score, evaluated now, would put
+// workloadID in a band ABOVE its current state, i.e. whether Evaluate with
+// this score is an escalation candidate. It is read-only (an unseen workload
+// counts as CLEAN and is not inserted) and ignores the dwell guard: a true
+// result means "the score points upward", not "a transition will happen".
+// A pinned (operator-overridden) workload always reports false.
+//
+// Story 7.4 uses it to keep the analyst-chain re-score escalate-only: a
+// model verdict arrives after its package was scored and may be re-scored
+// against signals that have since decayed, so a re-score that does not point
+// upward is not fed to Evaluate, where it could otherwise start the
+// de-escalation cooldown or reset the kill-sustain anchor (Story 4.1) on the
+// strength of a verdict. The deterministic path keeps sole ownership of
+// de-escalation.
+func (m *Machine) ScoreJustifiesEscalation(workloadID string, score float64) bool {
+	t := m.resolve()
+	score = clamp(score, 0, 100)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	current := schema.StateClean
+	if ws, ok := m.states[workloadID]; ok {
+		if ws.overridden {
+			return false
+		}
+		current = ws.current
+	}
+	return stateOrder(t.targetState(score)) > stateOrder(current)
+}
+
 // Restore rehydrates the in-memory FSM map from durable Redis state on
 // controller startup (Story 2.3 AC2). It MUST run before the FSM consumer
 // begins so a recovered workload is never re-initialised to CLEAN by

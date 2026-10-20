@@ -372,17 +372,17 @@ func buildInvestigationChain(cfg *config.Config, apiKey string, promptSet *promp
 	return chain, true, nil
 }
 
-// processChainPackage applies the FR19 trigger gate, runs the chain on a
-// qualifying package, publishes the assessment to AUDIT.assessments, and
-// records the outcome metric. It is the per-message body of the merged FSM
-// driver (Story 3.11), factored out so it is unit-testable without a live
-// JetStream connection. It returns the per-provider-capped LLM confidence to
-// fold into the ThreatScore (0 when not triggered / errored / unavailable)
-// and the recorded outcome label.
-func processChainPackage(ctx context.Context, pkg schema.EvidencePackage, chain *analyst.Chain, mode string, breaker *analyst.CircuitBreaker, auditPub responseaudit.AssessmentAuditPublisher, runs *prometheus.CounterVec, log *slog.Logger) (int, string) {
+// admitChainPackage applies the FR19 trigger gate and the Story 3.12 LLM-tier
+// circuit breaker to one package. It runs on the FSM consumer goroutine
+// BEFORE any async dispatch (Story 7.4), so the breaker still counts every
+// LLM-eligible package at its arrival rate exactly as the inline chain did,
+// including a package that is later coalesced or rejected by a full pool. It
+// records the not_triggered / breaker_bypassed outcomes on the chain-runs
+// counter and reports whether the chain should run for pkg.
+func admitChainPackage(pkg schema.EvidencePackage, mode string, breaker *analyst.CircuitBreaker, runs *prometheus.CounterVec) (bool, string) {
 	if !analyst.ShouldTriggerChain(pkg) {
 		analyst.RecordChainRun(runs, mode, analyst.ChainOutcomeNotTriggered)
-		return 0, analyst.ChainOutcomeNotTriggered
+		return false, analyst.ChainOutcomeNotTriggered
 	}
 
 	// Story 3.12: the LLM-tier circuit breaker counts every LLM-eligible
@@ -393,9 +393,17 @@ func processChainPackage(ctx context.Context, pkg schema.EvidencePackage, chain 
 	// emitted by the breaker's transition callback, NOT per package.
 	if breaker != nil && !breaker.Admit() {
 		analyst.RecordChainRun(runs, mode, analyst.ChainOutcomeBreakerBypassed)
-		return 0, analyst.ChainOutcomeBreakerBypassed
+		return false, analyst.ChainOutcomeBreakerBypassed
 	}
+	return true, ""
+}
 
+// runChainPackage runs the chain on an ADMITTED package, publishes the
+// assessment to AUDIT.assessments, and records the outcome metric. Since
+// Story 7.4 it runs on a chain worker goroutine, off the FSM path. It returns
+// the per-provider-capped LLM confidence to fold into the ThreatScore (0 when
+// errored / unavailable) and the recorded outcome label.
+func runChainPackage(ctx context.Context, pkg schema.EvidencePackage, chain *analyst.Chain, auditPub responseaudit.AssessmentAuditPublisher, runs *prometheus.CounterVec, log *slog.Logger) (int, string) {
 	res, rerr := chain.Run(ctx, pkg)
 	if rerr != nil {
 		outcome := analyst.ChainOutcomeError
@@ -417,6 +425,34 @@ func processChainPackage(ctx context.Context, pkg schema.EvidencePackage, chain 
 	// LLMCappedConfidence is 0 on the llm_unavailable degrade (Story 3.10),
 	// so a degraded assessment folds a zero LLM term -> deterministic-only.
 	return res.Assessment.LLMCappedConfidence, analyst.ChainOutcomeAssessed
+}
+
+// newChainRunFunc returns the chain worker's run func: runChainPackage inside
+// a recover, so a panic in the LLM tier (a provider SDK, JSON handling, etc.)
+// degrades to a zero LLM contribution rather than killing the worker. The
+// Trust-Bound's promise is that the LLM tier can never break containment;
+// that includes a crashing LLM tier. The deterministic rules+baselines score
+// has already driven the FSM by the time this runs (NFR27, Story 7.4).
+func newChainRunFunc(chain *analyst.Chain, mode string, auditPub responseaudit.AssessmentAuditPublisher, runs *prometheus.CounterVec, log *slog.Logger) chainRunFunc {
+	return func(ctx context.Context, pkg schema.EvidencePackage) (capped int, completed bool) {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error("aggregator: investigation chain panicked; folding zero LLM confidence (deterministic-only)", "panic", r, "package_id", pkg.PackageID, "mode", mode)
+				// A panic is an outcome, not an interruption: completing it
+				// acks the package, so a poison package cannot crash-loop
+				// the chain through redelivery.
+				capped, completed = 0, true
+			}
+		}()
+		capped, outcome := runChainPackage(ctx, pkg, chain, auditPub, runs, log)
+		// An error while ctx is cancelled is shutdown cutting the chain
+		// short, not a verdict: report it incomplete so the package stays
+		// un-acked and the Story 3.9 checkpoints resume it after restart.
+		if outcome == analyst.ChainOutcomeError && ctx.Err() != nil {
+			return 0, false
+		}
+		return capped, true
+	}
 }
 
 // applyPromptVersionGauge maintains the olaitan_llm_prompt_version info gauge
@@ -508,21 +544,4 @@ func buildAssessmentInput(pkg schema.EvidencePackage, res analyst.ChainResult, n
 		in.Models = nil
 	}
 	return in
-}
-
-// safeChainConfidence runs processChainPackage inside a recover so a panic in
-// the LLM tier (a provider SDK, JSON handling, etc.) degrades to a zero LLM
-// contribution rather than tearing down the single FSM-driver goroutine the
-// merge (Story 3.11) put it on. The Trust-Bound's promise is that the LLM tier
-// can never break containment; that must include a crashing LLM tier. On a
-// panic the deterministic rules+baselines score still drives the FSM (NFR27).
-func safeChainConfidence(ctx context.Context, pkg schema.EvidencePackage, chain *analyst.Chain, mode string, breaker *analyst.CircuitBreaker, auditPub responseaudit.AssessmentAuditPublisher, runs *prometheus.CounterVec, log *slog.Logger) (capped int) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Error("aggregator: investigation chain panicked; folding zero LLM confidence (deterministic-only)", "panic", r, "package_id", pkg.PackageID)
-			capped = 0
-		}
-	}()
-	capped, _ = processChainPackage(ctx, pkg, chain, mode, breaker, auditPub, runs, log)
-	return capped
 }

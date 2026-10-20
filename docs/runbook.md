@@ -806,12 +806,24 @@ TestCapBoundProperty against the score package constants.
 **Metric: `olaitan_investigation_chain_runs_total`** (counter, labels
 `mode`, `outcome`). One increment per `EvidencePackage` for which the chain
 is invoked. **Story 3.11:** the standalone `olaitan-investigation-chain`
-consumer was REMOVED and the chain is now run INLINE by the single
-deterministic FSM consumer (`olaitan-response-fsm`) -- it runs the chain on
-the FR19 trigger, folds the capped LLM confidence into the ThreatScore, and
-drives the FSM once, so a workload's LLM contribution and its FSM transition
-are decided in one place (and an inline-chain panic is recovered to a
-deterministic-only score, never crashing the FSM). `mode` is the configured chain
+consumer was REMOVED and the chain is driven by the single deterministic FSM
+consumer (`olaitan-response-fsm`). **Story 7.4 (issue #186):** the chain no
+longer runs inline. The consumer scores every package on its deterministic
+(rules + baseline, risk-windowed) signals and drives the FSM at once; an
+LLM-eligible package (past the FR19 gate and the breaker) is then dispatched
+to a bounded worker pool, at most one chain per workload. When the chain
+returns, the consumer folds the capped LLM confidence into the workload's
+risk window, re-scores, and evaluates the FSM again with the triggering
+`package_id`, so a model verdict that changes the state is its own
+`AUDIT.transitions` event (its transition log line carries
+`"source":"analyst_chain"` and `llm_capped`). The re-score is
+escalate-only: it is evaluated only when it points to a band ABOVE the
+workload's current state, so a model verdict can never start the
+de-escalation cooldown or reset the kill-sustain clock (the deterministic
+path keeps sole ownership of de-escalation); a non-escalating verdict is
+still folded into the risk window for later packages. A zero verdict
+(degraded, error, no citable evidence) is not re-evaluated. A chain panic is recovered
+to a zero verdict, never crashing a worker or the FSM. `mode` is the configured chain
 boundary: `full` (L1->L2->Senior), `l1_l2` (Senior ablated off), or
 `l1_only` (L2 + Senior ablated off). `outcome` is `not_triggered` (the
 FR19 gate declined: no rule severity >= 50 and no baseline sigma >= 3.0),
@@ -824,6 +836,32 @@ retries), or `error`. A high `not_triggered` ratio is expected and
 healthy (the gate controls LLM cost). A sustained `error` rate is a
 provider/transport problem:
 `sum(rate(olaitan_investigation_chain_runs_total{outcome="error"}[10m]))`.
+
+**Metric: `olaitan_investigation_chain_dispatch_total`** (counter, label
+`result`; Story 7.4). One increment per LLM-eligible package (past the FR19
+gate and the breaker) by the async dispatch decision: `dispatched` (queued
+for a worker), `coalesced` (a chain for the same workload was already
+queued, running or not yet applied, so none was started; the in-flight
+chain already investigates that workload, and the newer package's own
+evidence still drove the FSM deterministically), or `queue_full` (all
+`OLT_LLM_CHAIN_WORKERS` + `OLT_LLM_CHAIN_QUEUE` in-flight slots were taken;
+the deterministic score still drove the FSM, only the model verdict is
+skipped). A JetStream redelivery of the package whose chain is still in
+flight is left to that chain (not acked, not re-evaluated, not counted). The breaker counts coalesced and rejected packages exactly as
+before, so FR51 cost accounting is unchanged. A sustained `queue_full`
+rate means the model is too slow for the alert volume: add workers (if the
+model can serve them), use a GPU or hosted model, or lower the breaker
+rate: `sum(rate(olaitan_investigation_chain_dispatch_total{result="queue_full"}[10m])) > 0`.
+
+**Chain pool knobs (Story 7.4).** Set through `aggregator.extraEnv`:
+`OLT_LLM_CHAIN_WORKERS` (concurrent chains, 1 to 32, default 2) and
+`OLT_LLM_CHAIN_QUEUE` (extra in-flight slots beyond the workers: chains
+waiting for a worker or finished but not yet applied, 0 to 1024, default
+16). An invalid value logs `invalid integer value; using default`
+naming the variable. The startup line `aggregator: investigation chain runs
+async (deterministic score first) workers=N queue=M` confirms the values.
+With a single CPU model, more workers only make each chain slower; keep the
+default.
 
 **Investigation chain (Story 3.8, FR19/FR25/FR27/FR53).** The chain is
 TRIGGERED only on qualifying packages (FR19 gate above) and routes each
@@ -865,7 +903,22 @@ structural:** the chain consumer acks the `EvidencePackage` only AFTER the
 chain completes, so a crash mid-chain leaves it un-acked; JetStream
 redelivers it and the chain re-checks the checkpoints, re-running only the
 un-checkpointed steps (the Senior is never checkpointed, so a post-L2 restart
-re-runs only the Senior). Checkpointing is best-effort durability: a publish
+re-runs only the Senior). Story 7.4 keeps this: the deterministic transition
+happens at once, but a package whose chain was dispatched stays un-acked
+until the chain's verdict has been applied, and the consumer marks it
+in-progress every 10 s from dispatch (queued chains included) so JetStream
+(AckWait 30 s) does not redeliver it while it waits or a slow model runs.
+On shutdown the consumer starts no queued chain, gives running chains up to
+10 s to finish, applies and acks every finished verdict, then cancels the
+rest. Packages whose chain did not finish stay un-acked and are redelivered
+after restart, where the deterministic score is evaluated again
+(at-least-once, as before) and the chain resumes from its checkpoints. A
+heartbeat or ack failure is logged (`in-flight chain heartbeat failed`,
+`fsm consumer ack failed`). The aggregator's NATS close and the FSM transition sinks
+(Redis persistence, `AUDIT.transitions`, NetworkPolicy and its policy
+audit) wait for that drain (bounded at 17 s), so a verdict applied during
+shutdown is audited, persisted, enforced and acked before the connection
+drains. Checkpointing is best-effort durability: a publish
 or read failure logs and the step re-runs, never aborting the chain. A
 6h-stale checkpoint simply means the chain re-runs from scratch (the retention
 floor). Operational note: the INVESTIGATIONS stream is NOT a SIEM audit
@@ -1146,9 +1199,11 @@ client (no SDK, no external egress).
   `aggregator.extraEnv` `OLT_LLM_ROLE_TIMEOUT_MULTIPLIER` (values-full sets
   30: 900s, 900s, 1800s, which covers the slow end of the measured numbers
   above, about 10.5 minutes, with margin; it also sets
-  `OLLAMA_CONTEXT_LENGTH` to 16384 because the prompts outgrow 8192). The
-  chain runs inline in the FSM consumer, so a slow model delays FSM
-  evaluation behind it; the circuit breaker (FR51) bounds a burst.
+  `OLLAMA_CONTEXT_LENGTH` to 16384 because the prompts outgrow 8192). Since
+  Story 7.4 the chain runs off the FSM path: a slow model no longer delays
+  the deterministic transition, it only delays the model's re-score (its
+  own later transition). The circuit breaker (FR51) and the bounded chain
+  pool (`OLT_LLM_CHAIN_WORKERS`, `OLT_LLM_CHAIN_QUEUE`) bound a burst.
 - **Hosted model, key out of band (Story 10.6).** Layer
   `values-llm-deepseek.yaml` (openai family, cap 30) or
   `values-llm-claude.yaml` (claude family, cap 35) after the profile.
@@ -1641,9 +1696,20 @@ under an enabled window reflects signal expiry: a workload's score drops
 when its strongest retained signal ages past TTL, not merely when packages
 stop arriving.
 
-**Related knob.** `OLT_LLM_ROLE_TIMEOUT_MULTIPLIER` (same `aggregator.extraEnv`
+**Late model verdicts (Story 7.4).** The analyst chain's verdict arrives
+after its package was scored. It is folded into the window with its own TTL
+starting when it ARRIVES, and the re-score uses the workload's LIVE signals
+only: a verdict that lands after the triggering rule match decayed does not
+revive it. With the window disabled the re-score is the triggering
+package's own signals plus the verdict, and the verdict is NOT retained for
+later packages (as before, each package scores on its own signals); the
+escalate-only rule keeps that stale re-score from pulling the FSM down.
+
+**Related knobs.** `OLT_LLM_ROLE_TIMEOUT_MULTIPLIER` (same `aggregator.extraEnv`
 mechanism) scales every per-role LLM timeout budget by a positive finite
 float (at most 100) for slow providers; invalid values fall back to 1.0.
+`OLT_LLM_CHAIN_WORKERS` / `OLT_LLM_CHAIN_QUEUE` size the async chain pool
+(see `olaitan_investigation_chain_dispatch_total` above).
 
 ## Section 2. Operational scenarios (NFR34)
 
