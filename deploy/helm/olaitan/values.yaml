@@ -197,14 +197,19 @@ correlator:
   # detection.correlator.never_scored_namespaces (shipped: olaitan), so
   # Olaitan never scores its own pods when it is installed somewhere other
   # than `olaitan`. Its events are then dropped before correlation, by every
-  # path. Everything else in that namespace is never scored either, which is
-  # why it is off by default; the kind-full profile, which installs into
-  # `default` and attacks from its own namespaces, turns it on. This is not
-  # response.excluded_namespaces (config-file only): that list is never
-  # isolated but still detected, which is why kube-system is on it and not
-  # here.
+  # path, and the baseline does not learn them. On by default since Story
+  # 12.8 (ADR-2026-10-20-02): with every part on (Story 12.7), a plain
+  # install into `default` scored its own pods and restricted its own
+  # model-pull Job. The cost: nothing else in the release namespace is
+  # scored either, so run the workloads you want watched elsewhere (or
+  # install into `olaitan`, where this is a no-op). kube-system is never
+  # added, whatever this says. Set false to score the
+  # release namespace again; Olaitan can then score, and with enforcement
+  # on isolate, its own pods. This is not response.excluded_namespaces
+  # (config-file only): that list is never isolated but still detected,
+  # which is why kube-system is on it and not here.
   # @schema type:boolean effect:"never score workloads in the release namespace (added to detection.correlator.never_scored_namespaces)" ref:FR47
-  neverScoreReleaseNamespace: false
+  neverScoreReleaseNamespace: true
 
 # --- Service endpoints -------------------------------------------------
 # Where Olaitan dials its dependencies. Empty by default -- the templates

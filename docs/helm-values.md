@@ -38,7 +38,7 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 | `correlator.multiSignalMinSources` | integer | `2` | minimum 1 | minimum distinct sources for a multi-signal EvidencePackage | FR14 |
 | `correlator.highSeverityThreshold` | integer | `50` | 0 to 100 | event severity at or above which an event is kept first when a package overflows its size cap | FR14 |
 | `correlator.falcoTriggerMinPriority` | string | `"warning"` | off, warning, error, critical, alert or emergency | Falco priority at or above which one Falco alert on a pod starts an investigation | FR14 |
-| `correlator.neverScoreReleaseNamespace` | boolean | `false` | - | never score workloads in the release namespace (added to detection.correlator.never_scored_namespaces) | FR47 |
+| `correlator.neverScoreReleaseNamespace` | boolean | `true` | - | never score workloads in the release namespace (added to detection.correlator.never_scored_namespaces) | FR47 |
 
 ## `falcoIngest`
 
