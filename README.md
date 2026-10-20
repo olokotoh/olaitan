@@ -524,9 +524,10 @@ the tier on a live cluster: a real in-pod attack, then schema-valid L1, L2
 and Senior output from the model, the configured provider and model recorded
 in `AUDIT.assessments`, and the model's own confidence capped at its family's
 trust cap (ollama 25, openai 30, claude 35). The profile raises the per-role
-LLM timeouts thirtyfold for the CPU model, and never scores its own namespace
-(`correlator.neverScoreReleaseNamespace`) so Olaitan does not investigate its
-own pods ahead of a real incident. The 3B Qwen2.5 weights are under the Qwen Research licence, so for commercial use
+LLM timeouts thirtyfold for the CPU model. Like every install outside the
+`olaitan` namespace, it never scores its own namespace
+(`correlator.neverScoreReleaseNamespace`, on by default since Story 12.8) so
+Olaitan does not investigate its own pods ahead of a real incident. The 3B Qwen2.5 weights are under the Qwen Research licence, so for commercial use
 switch `analyst.local.model` and `ollama.pull.models` to an Apache-2.0 size
 such as `qwen2.5:7b-instruct`.
 

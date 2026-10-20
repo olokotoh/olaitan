@@ -107,6 +107,16 @@ and false-positive numbers; see [Unreleased](#unreleased).
 
 ### Changed
 
+- **A plain install never scores its own namespace** (Story 12.8, #227,
+  ADR-2026-10-20-02). `correlator.neverScoreReleaseNamespace` now defaults
+  to `true`: installed anywhere other than `olaitan`, the release namespace
+  joins `detection.correlator.never_scored_namespaces`, so Olaitan no longer
+  scores or isolates its own pods (the 2026-10-20 live run restricted its
+  own model-pull Job in `default`). Nothing else in that namespace is scored
+  either; NOTES say so and name the override (`=false`). `values-minimal.yaml`
+  and the evaluation arm overlays keep `false` for comparability;
+  `values-full.yaml` no longer sets it.
+
 - **The default install turns every part on; blocking is one flag** (Story
   12.7, #208). A plain `helm install` of the chart, and the release
   `install.yaml`, now run all five sources (Falco, the audit webhook
@@ -153,6 +163,19 @@ and false-positive numbers; see [Unreleased](#unreleased).
 - **golang.org/x/net bumped to v0.61.0** (CVE-2026-78669, PR #207).
 
 ### Fixed
+
+- **Posture on Calico Goldmane aggregates** (Story 12.8, #226). A package led
+  by a Goldmane flow (`web-bd846c7f-*`) lost its posture snapshot: the
+  posture client looked the aggregate up as a pod name and the workload-id
+  builder rejected the `*`. The posture client now resolves it to a live pod
+  of the set with the same resolver the correlator uses (moved to
+  `internal/collector/posture`), and a set with no live pod is reported as
+  `not_found` with its owner instead of an error log.
+- **Baseline live gate API burst** (Story 12.8, #230). The steady workload's
+  busybox `wget` could not complete TLS with kube-apiserver and `|| true` hid
+  it, so the `audit_events_per_min` deviation could never fire. It now uses
+  curl (pinned, verifying the cluster CA), logs how many GETs got 200, and
+  the test fails early, and after the switch, when the burst did not land.
 
 - **Every admission request in a covered namespace paid a failed TLS
   handshake** (#155). The chart rendered a ValidatingWebhookConfiguration

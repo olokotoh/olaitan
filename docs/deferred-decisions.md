@@ -1667,3 +1667,18 @@ handler, Service and certificate.
 **Recorded simple choices (review round 1).** Pre-claims run only when the package was actually published; a late event older than the window cutoff (evicted on arrival) gets no late package; claims run on the correlator clock. Deferred: claims are per window DURATION from the first claim (the Story 10.3 semantics), not per window lifecycle, so a window converged longer than its duration can repeat a rule once per duration; a late package of severity >= 50 with no chain in flight dispatches the analyst chain on one event (Story 7.4 behaviour for any rule_match); pre-claim cost is one extra corpus pass per published snapshot.
 
 **Risk inherited.** The per-event path evaluates with the identity half of the posture (the corpus reads only `k8s.pod.namespace` and `k8s.workload.owner_kind` today); a future rule on a non-identity posture field would not match on this path until posture is fetched for it. Excluded namespaces get no late-event package, as they get no single-alert Falco package (Story 10.3).
+
+---
+
+## ADR-2026-10-20-02: A plain install never scores its own release namespace
+
+**Status.** Accepted (Story 12.8, #227). Amends the Story 10.6 default of `correlator.neverScoreReleaseNamespace` (false) and completes ADR-2026-10-19-02 (everything on by default).
+
+**Context.** The 2026-10-20 live run (kind-full, Falco ON) installed the chart into `default` with the Story 12.7 default values. Olaitan scored its own pods there and moved its own model-pull Job to RESTRICTED. The shipped never-scored list is `olaitan` only, so any install into another namespace could score, and with enforcement on isolate, itself.
+
+**Decision.** The chart default is `correlator.neverScoreReleaseNamespace: true`: the release namespace is appended to `detection.correlator.never_scored_namespaces` (a no-op when it is `olaitan`). Events from it are dropped before correlation and the baseline does not learn them. The knob stays: `false` restores the old behaviour. NOTES state, for an install outside `olaitan`, that nothing in that namespace is scored and how to change it. `values-minimal.yaml` and every evaluation arm overlay (`values-eval*.yaml` except the egress one, the same set that pins the risk window to 0) pin `false`, so runs on them stay comparable with earlier ones; `values-full.yaml` drops its own line. The binary's config default is unchanged (`olaitan` only).
+
+**Cost.** User workloads in the release namespace are not scored. NOTES and the values comment say so; the documented install namespace is `olaitan`, where nothing changes.
+
+**Rejected.** (a) Never score only Olaitan's own pods, by release label: the drop happens in the correlator on events that carry a pod reference, not labels, so it needs a label lookup on the hot path and a new config list; larger than the defect and not asked for. (b) Refuse any namespace but `olaitan`: breaks `helm -n` and install.yaml users who rename the namespace. (c) Leave the default and rely on the NOTES warning: the live run shows the warning alone does not stop a plain install from containing itself.
+

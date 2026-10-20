@@ -97,16 +97,12 @@ collector:
   runOnControlPlane: true
 
 # --- Self-exclusion ----------------------------------------------------
-correlator:
-  # Story 10.6 (the part of issue #151 it needs): this profile installs into
-  # `default`, which is not on the shipped never-scored list (olaitan).
-  # Without this, Olaitan's own aggregator and Ollama crossed the
-  # multi-signal threshold at startup and their FR19 chains queued ahead of
-  # a real attack. Test workloads run in their own namespaces, so never
-  # scoring all of `default` costs nothing here. kube-system is still
-  # detected (it is only never isolated). Whether the profile should move to
-  # its own namespace instead stays open on issue #151.
-  neverScoreReleaseNamespace: true
+# Story 10.6 turned correlator.neverScoreReleaseNamespace on here because this
+# profile installs into `default`, and Olaitan's own aggregator and Ollama
+# otherwise crossed the multi-signal threshold at startup. Since Story 12.8
+# it is the chart default (ADR-2026-10-20-02), so this file no longer sets
+# it. Test workloads run in their own namespaces, so never scoring all of
+# `default` costs nothing here.
 
 # --- Enforcement -------------------------------------------------------
 # The blocking switch (Story 12.7: off in the chart default). On here

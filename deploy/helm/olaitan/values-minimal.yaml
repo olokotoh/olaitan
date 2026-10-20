@@ -46,6 +46,13 @@ ollama:
     models: []
     # null, not {}: Helm merges a map, so {} would keep the default's key.
     expectedIds: null
+correlator:
+  # Story 12.8: the chart now never scores its release namespace by default
+  # (ADR-2026-10-20-02). This file keeps the earlier behaviour, like the
+  # other pre-12.7 settings in it, so a run on it stays comparable with runs
+  # made before; installed outside `olaitan`, Olaitan's own pods are scored
+  # (NOTES warn).
+  neverScoreReleaseNamespace: false
 aggregator:
   # The pre-12.7 per-package scoring (no risk window). With no LLM tier the
   # chart renders no role-budget multiplier either.

@@ -56,7 +56,10 @@ core) before applying an arm overlay; the arm overlays themselves are
 unchanged except one line: each arm overlay (and `values-eval.yaml`) pins
 `aggregator.riskWindowSeconds: 0`, because the chart now turns the risk
 window on by default and the recorded campaigns scored each package on its
-own. Whether the thesis campaign should run on the minimal or the full
+own. Since Story 12.8 they also pin `correlator.neverScoreReleaseNamespace:
+false` (as `values-minimal.yaml` does): the chart now never scores its
+release namespace by default, and the recorded campaigns installed into
+`default` with it scored (ADR-2026-10-20-02). Whether the thesis campaign should run on the minimal or the full
 default posture is an open decision for the evaluation owner.
 
 The examples set the bundled Redis password (`secrets.redisPassword`)
