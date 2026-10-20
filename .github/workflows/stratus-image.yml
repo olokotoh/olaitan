@@ -1,0 +1,129 @@
+# Story 11.2c (D2): build, push and sign the pinned Stratus Red Team wrapper
+# image (deploy/images/stratus) to ghcr.io/<owner>/olaitan-stratus.
+#
+# Runs in CI rather than on a workstation so the push uses the job's
+# short-lived GITHUB_TOKEN (no personal token with packages: write ever
+# leaves a laptop or lands on a test VM), the package is linked to this
+# repository, and the image is signed keylessly like the main release image.
+#
+# The digest printed in the job summary is the one to stamp into the Stratus
+# pack Job manifest (tag@sha256), so the pack pin guard sees a real pin.
+name: Stratus image
+
+on:
+  push:
+    paths:
+      - deploy/images/stratus/**
+      - .github/workflows/stratus-image.yml
+  workflow_dispatch:
+
+concurrency:
+  group: stratus-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve image name and Stratus version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          version="$(sed -n 's/^ARG STRATUS_VERSION=//p' deploy/images/stratus/Dockerfile)"
+          [ -n "$version" ] || { echo "STRATUS_VERSION not found in Dockerfile" >&2; exit 1; }
+          echo "image=ghcr.io/${owner}/olaitan-stratus" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # amd64 only: the Dockerfile fetches and sha256-verifies the
+      # Linux_x86_64 Stratus release asset.
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: deploy/images/stratus
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=Pinned Stratus Red Team wrapper for the Olaitan attack packs
+          sbom: true
+          provenance: mode=max
+
+      # Smoke test on the DIGEST: the binary runs and reports a version.
+      - name: Verify binary runs
+        shell: bash
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker run --rm "${IMAGE}@${DIGEST}" version
+
+      # Report-only CVE scan. This image is an attack tool that only runs in
+      # throwaway evaluation clusters, and its CVEs belong to the upstream
+      # Stratus release we pin; gating on them would block the pin without
+      # a fix we can ship. Findings are printed for the record.
+      - name: Trivy CVE report
+        shell: bash
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.71.1 image \
+              --scanners vuln \
+              --severity CRITICAL,HIGH \
+              --ignore-unfixed \
+              --exit-code 0 \
+              "${IMAGE}@${DIGEST}"
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign image
+        shell: bash
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes --recursive "${IMAGE}@${DIGEST}"
+
+      - name: Job summary
+        shell: bash
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### Stratus wrapper image"
+            echo
+            echo "Pin this in the Stratus pack Job manifest:"
+            echo
+            echo '```'
+            echo "${IMAGE}:${VERSION}@${DIGEST}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

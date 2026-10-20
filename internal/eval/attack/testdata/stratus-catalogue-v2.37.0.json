@@ -1,0 +1,14 @@
+{
+  "_comment": "Story 11.2c D6/AC3 citation source for the Stratus Red Team pack, extracted from DataDog/stratus-red-team v2.37.0 docs/attack-techniques/kubernetes/. 'tactics' is the structured '## Mappings -> MITRE ATT&CK' list. 'technique_id' is a MITRE technique the tool's doc cites for that technique; at v2.37.0 only hostpath-volume cites one (attack.mitre.org/techniques/T1611 in its References section), so every other technique is tactic-only and 'technique_id' is empty - that is honest, not a gap. Regenerate ONLY by re-extracting from the pinned version; TestStratusMitreMatchesCatalogue holds the Go table in agreement with this file.",
+  "source": "DataDog/stratus-red-team",
+  "version": "v2.37.0",
+  "retrieved": "2026-10-11",
+  "techniques": {
+    "k8s.credential-access.dump-secrets": {"tactics": ["Credential Access"], "technique_id": ""},
+    "k8s.credential-access.steal-serviceaccount-token": {"tactics": ["Credential Access"], "technique_id": ""},
+    "k8s.persistence.create-admin-clusterrole": {"tactics": ["Persistence", "Privilege Escalation"], "technique_id": ""},
+    "k8s.persistence.create-token": {"tactics": ["Persistence"], "technique_id": ""},
+    "k8s.privilege-escalation.hostpath-volume": {"tactics": ["Privilege Escalation"], "technique_id": "T1611"},
+    "k8s.privilege-escalation.privileged-pod": {"tactics": ["Privilege Escalation"], "technique_id": ""}
+  }
+}
