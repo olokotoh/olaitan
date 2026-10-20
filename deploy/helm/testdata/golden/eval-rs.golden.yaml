@@ -2425,7 +2425,7 @@ spec:
       annotations:
         # Story 12.7: a config change rolls the collector (the source
         # adapters are wired at startup).
-        checksum/config: "467d1e45d61312fc3e0d56f19762bbb2971afd3d8add5c651e8b4e5b64bd579a"
+        checksum/config: "9180a2b8e60419187601f3e15794af97e964779660d37573eb2229fb9840a528"
         prometheus.io/scrape: "true"
         prometheus.io/port: "9090"
         prometheus.io/path: "/metrics"
@@ -2872,7 +2872,7 @@ spec:
         prometheus.io/path: "/metrics"
         # Story 12.7: a config change rolls the aggregator (restart-required
         # settings such as analyst.provider are read at startup).
-        checksum/config: "467d1e45d61312fc3e0d56f19762bbb2971afd3d8add5c651e8b4e5b64bd579a"
+        checksum/config: "9180a2b8e60419187601f3e15794af97e964779660d37573eb2229fb9840a528"
     spec:
       serviceAccountName: olaitan-aggregator
       securityContext:
