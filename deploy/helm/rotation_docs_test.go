@@ -43,20 +43,20 @@ func docSection(t *testing.T, rel, heading string) string {
 func oneLine(s string) string { return strings.Join(strings.Fields(s), " ") }
 
 // TestApplogRotationDocCoversFailurePolicyFail: review round 2 of #158
-// (R2-1). The applog MutatingWebhookConfiguration has no objectSelector,
-// so under failurePolicy Fail a caBundle switch while the old injector
-// still serves the old cert makes the apiserver reject every Pod CREATE
-// outside kube-system and kube-public, the injector's own replacement
-// pods included. The doc must say that the three-step CA rotation is
-// mandatory there and that caBundle and servingCert never change in the
-// same upgrade.
+// (R2-1). Under failurePolicy Fail a caBundle switch while the old
+// injector still serves the old cert makes the apiserver reject every Pod
+// CREATE in the selected namespaces. Since #159 the injector's own
+// replacement pods are exempt (objectSelector), and the doc must say so.
+// It must still say that the three-step CA rotation is mandatory there and
+// that caBundle and servingCert never change in the same upgrade.
 func TestApplogRotationDocCoversFailurePolicyFail(t *testing.T) {
 	sec := oneLine(docSection(t, "APPLOG.md", "### Rotating the serving cert"))
 	for _, want := range []string{
 		"failurePolicy: Fail",
 		"mandatory",
 		"never change `caBundle` and `servingCert` in the same upgrade",
-		"the injector's own replacement pods",
+		"no longer blocks the injector's own replacement pods",
+		"objectSelector",
 	} {
 		if !strings.Contains(sec, want) {
 			t.Errorf("APPLOG.md 'Rotating the serving cert' does not say %q", want)

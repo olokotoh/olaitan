@@ -12,6 +12,8 @@ paths and are baked in here:
     request -- inject.go is a pure JSON-Patch builder).
   - reinvocationPolicy: Never (the webhook is idempotent; no need to
     re-fire when another mutating webhook rewrites the spec).
+  - objectSelector: excludes the injector's own pods (#159), so a
+    failing injector cannot block its own rollout under Fail.
   - namespaceSelector: excludes kube-system / kube-public by default
     (operators can scope further). When the operator passes a null
     or unset namespaceSelector through chart values, the chart
@@ -81,6 +83,16 @@ webhooks:
             - kube-system
             - kube-public
       {{- end }}
+    {{- /* #159: never admit the injector's own pods. Under failurePolicy
+           Fail a broken injector (bad cert, caBundle changed in the same
+           upgrade) would otherwise refuse its own replacement pods and the
+           rollout that fixes it would stall. */}}
+    objectSelector:
+      matchExpressions:
+        - key: app.kubernetes.io/component
+          operator: NotIn
+          values:
+            - applog-injector
     rules:
       - operations: ["CREATE"]
         apiGroups: [""]

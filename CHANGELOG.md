@@ -172,6 +172,30 @@ and false-positive numbers; see [Unreleased](#unreleased).
   had the stub and is upgraded by re-applying `install.yaml` removes it with
   `kubectl delete validatingwebhookconfiguration olaitan-audit
   --ignore-not-found` (`<fullname>-audit` for another release name).
+- **The applog injector dropped admission calls on rollouts, never reloaded
+  its serving cert, and admitted its own pods** (#156, #157, #159). All
+  three sit on the default install since Story 12.7.
+  - #156: a rollout left one call `connection refused` (an old pod closed
+    its listener while still a Service endpoint), so a pod admitted then
+    got no sidecar. The injector now drains: on SIGTERM its listener
+    keeps serving for `applogSidecar.webhook.shutdownDelaySeconds`
+    (default 5, `terminationGracePeriodSeconds` is that plus 20) while
+    `/readyz` answers 503, then Shutdown's HTTP/2 GOAWAY moves the API
+    server's connection to another pod. The Deployment surges
+    (`maxSurge: 1`, `maxUnavailable: 0`), and with two or more replicas a
+    PodDisruptionBudget (`maxUnavailable: 1`, unhealthy pods always
+    evictable) stops a drain from taking every injector at once.
+    Readiness moved to `/readyz`; liveness stays on `/healthz`.
+  - #157: the injector loaded `tls.crt`/`tls.key` once, so a cert-manager
+    (Path A) or certgen renewal was never served. It now serves through
+    `tls.Config.GetCertificate` and re-reads the pair every 10 s
+    (`OLAITAN_WEBHOOK_CERT_RELOAD_INTERVAL`, at least 1 s), keeping the
+    last good pair when a new one does not parse, does not match or is not
+    valid now. Path B keeps its rolling checksum.
+  - #159: the MutatingWebhookConfiguration gains an `objectSelector`
+    excluding `app.kubernetes.io/component=applog-injector`, so under
+    `failurePolicy: Fail` a broken injector no longer refuses its own
+    replacement pods.
 
 - **The quickstart's score was not the read's** (follows up #177 and #181).
   The README and `make quickstart` showed "CLEAN to SUSPICIOUS at score 36"

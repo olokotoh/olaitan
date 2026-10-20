@@ -268,6 +268,8 @@ func TestSubchartsDisabled(t *testing.T) {
 		"Deployment":                   3,
 		"Job":                          2,
 		"MutatingWebhookConfiguration": 1,
+		// #156: the applog injector's PDB (2 replicas by default).
+		"PodDisruptionBudget": 1,
 		// #155: no ValidatingWebhookConfiguration (the audit admission
 		// stub could never authenticate to the mTLS receiver).
 		"ValidatingWebhookConfiguration": 0,

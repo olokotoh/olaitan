@@ -17,10 +17,12 @@ not reset it). `applogSidecar.webhook.failurePolicy=Fail` needs Path A or
 Path B: with a generated certificate the render fails, because every pod
 create (the certgen pod's included) would be refused until the Job ran.
 Rotation, recovery of a recreated webhook, and switching paths work as for
-the audit receiver (AUDIT.md, Story 12.7 paragraph). Known issues on this
-path are tracked in #156, #157 and #159.
+the audit receiver (AUDIT.md, Story 12.7 paragraph). The injector reloads
+its serving cert in place (#157), drains on rollouts (#156) and is exempt
+from its own webhook (#159); see "Rotating the serving cert" and "Rollouts
+and node drains" below.
 
-When `applogSidecar.enabled=true` (the default) the chart deploys four resources
+When `applogSidecar.enabled=true` (the default) the chart deploys these resources
 beyond the agent DaemonSet:
 
 1. `Deployment <fullname>-applog-injector` running the multi-call
@@ -31,11 +33,14 @@ beyond the agent DaemonSet:
    8443) routing apiserver admission traffic to the webhook pods.
 3. `MutatingWebhookConfiguration <fullname>-applog-injector` with
    `failurePolicy: Ignore`, `sideEffects: None`,
-   `reinvocationPolicy: Never`, and a `namespaceSelector` excluding
-   `kube-system` and `kube-public` by default.
+   `reinvocationPolicy: Never`, a `namespaceSelector` excluding
+   `kube-system` and `kube-public` by default, and an `objectSelector`
+   excluding the injector's own pods (#159).
 4. `Secret <fullname>-applog-injector-tls` (or a cert-manager
    `Certificate` resource when `applogSidecar.tls.certManagerEnabled=
    true`) providing the webhook's serving cert + key.
+5. `PodDisruptionBudget <fullname>-applog-injector` (`maxUnavailable: 1`)
+   when `applogSidecar.webhook.replicaCount` is 2 or more (#156).
 
 The Olaitan agent DaemonSet pod-spec is unchanged by Story 1.9 -- the
 sidecar runs in operator workload pods, not the agent pod.
@@ -194,26 +199,40 @@ every Pod cluster-wide. Threat model:
 
 ### Rotating the serving cert
 
-The injector reads `tls.crt` and `tls.key` once, when it starts. A
-running injector never picks up a new certificate from its mounted
-Secret, even after the kubelet has refreshed the files.
+The injector re-reads `tls.crt` and `tls.key` from its mounted Secret
+every 10 seconds (`OLAITAN_WEBHOOK_CERT_RELOAD_INTERVAL`) and serves the
+new pair on the next TLS handshake, with no restart (#157). The kubelet
+refreshes a mounted Secret on its sync period plus its Secret cache delay,
+so a renewal is served one to two minutes after the Secret changes. A pair
+that does not parse, does not match, or whose certificate is expired or
+not yet valid is logged once
+(`serving cert reload failed; still serving the last good certificate`)
+and the last good pair keeps serving; `serving cert reload recovered`
+follows when a good pair arrives.
 
-- **Path B (manual).** The injector Deployment's pod template carries a
-  `checksum/applog-tls` annotation: the sha256 of the data of the Secret
-  the chart renders. A `helm upgrade` that changes
-  `applogSidecar.tls.servingCert` or `servingKey` changes the checksum,
-  so the Deployment rolls on its own; no `kubectl rollout restart` is
-  needed. Upgrades that change no cert leave the checksum, and the
-  pods, alone. `applogSidecar.tls.caBundle` is not part of the checksum:
-  it lives on the MutatingWebhookConfiguration, which the apiserver
-  reads, not in the Secret the injector mounts.
+- **Path A (cert-manager).** A renewal is picked up in place. A renewal
+  under the **same** CA has no gap. If the Issuer's CA changes, cainjector
+  moves the caBundle at once while the files catch up (one to two
+  minutes): under `failurePolicy: Ignore` pods admitted in that window get
+  no sidecar, and under `Fail` they are refused. Change an Issuer's CA the
+  way Path B does below: first a caBundle that trusts both CAs.
+- **Certgen (default).** certgen never replaces an existing Secret. To
+  rotate, delete the Secret and the finished Job and re-run the install
+  (AUDIT.md, Story 12.7 paragraph). Each run makes a new CA and writes the
+  caBundle at once, so pods admitted before the injector picks up the new
+  files (one to two minutes) get no sidecar.
+- **Path B (manual).** The injector Deployment's pod template also
+  carries a `checksum/applog-tls` annotation: the sha256 of the data of
+  the Secret the chart renders. A `helm upgrade` that changes
+  `applogSidecar.tls.servingCert` or `servingKey` rolls the Deployment,
+  which puts the new cert in front of the apiserver faster than waiting
+  for the kubelet to refresh the files. `applogSidecar.tls.caBundle` is not
+  part of the checksum: it lives on the MutatingWebhookConfiguration.
 
   A new cert signed by the **same** CA needs one upgrade and has no
-  gap. A new **CA** needs care, because the MutatingWebhookConfiguration
-  switches to the new caBundle at once while old injector pods keep
-  serving the old cert until the rollout replaces them; any Pod
-  admitted in that window gets no sidecar. For a gap-free CA change,
-  use three upgrades:
+  gap. A new **CA** is still best done in three upgrades, because the
+  MutatingWebhookConfiguration switches to the new caBundle at once
+  while the injector keeps the old cert until it rolls:
   1. set `caBundle` to the old and new CA PEMs concatenated (base64 of
      both), cert unchanged;
   2. set `servingCert` / `servingKey` to the pair the new CA signed
@@ -221,24 +240,40 @@ Secret, even after the kubelet has refreshed the files.
   3. set `caBundle` to the new CA alone.
 
   With `applogSidecar.webhook.failurePolicy: Fail` these three steps
-  are mandatory, not a nicety: never change `caBundle` and
-  `servingCert` in the same upgrade. The MutatingWebhookConfiguration
-  has no objectSelector and its namespaceSelector skips only
-  `kube-system` and `kube-public`, so the injector's own pods go through
-  it too. If the apiserver stops trusting the cert the old injector
-  pods serve, it rejects every Pod CREATE in every other namespace,
-  the injector's own replacement pods included. The roll that would
-  fix it then stalls, and no Pod can be created until the CA change is
-  rolled back (`helm rollback`, or patching `caBundle` on the
-  MutatingWebhookConfiguration by hand). Exempting the injector from
-  its own webhook is tracked in #159.
-- **Path A (cert-manager).** cert-manager writes the Secret, not helm,
-  so a render-time checksum cannot see a renewal and the chart does not
-  add one. After cert-manager renews the Certificate, restart the
-  injector (`kubectl -n <namespace> rollout restart deploy -l
-  app.kubernetes.io/component=applog-injector`) or run a Secret-watching
-  reloader against it. In-process reload is
-  tracked in #157.
+  are still mandatory: never change `caBundle` and `servingCert` in the
+  same upgrade. A one-step CA change makes the apiserver refuse every Pod
+  CREATE in the selected namespaces until the injector serves the new
+  cert. It no longer blocks the injector's own replacement pods: the
+  webhook's `objectSelector` excludes pods labelled
+  `app.kubernetes.io/component=applog-injector` (#159), so the rollout
+  that fixes it always proceeds. Any other pod carrying that exact label
+  is skipped too; do not reuse it on workloads. The label is not a trust
+  boundary: injection is opt-in through the pod's own
+  `olaitan.io/log-sidecar` annotation, so a pod that spoofs the label gains
+  nothing it could not get by leaving the annotation out.
+
+### Rollouts and node drains
+
+A rollout or drain does not drop admission calls (#156):
+
+- The Deployment surges (`maxSurge: 1`, `maxUnavailable: 0`), so a
+  replacement pod is Ready before an old one is told to stop.
+  The surge pod needs room: under a tight ResourceQuota the rollout waits
+  for it.
+- On SIGTERM an injector keeps its listener open for
+  `applogSidecar.webhook.shutdownDelaySeconds` (default 5, whole seconds
+  in [0, 120]). The pod leaves the Service endpoints as soon as it starts
+  terminating, but kube-proxy applies that a moment later; the delay keeps
+  serving the calls still routed to it. During the delay `/readyz`
+  answers 503; Shutdown then sends HTTP/2 GOAWAY, which moves the API
+  server's (h2) connection to another pod. Keep-alives are also turned
+  off, which only affects HTTP/1.1 clients.
+  `terminationGracePeriodSeconds` is that delay plus 20.
+- With two or more replicas a PodDisruptionBudget (`maxUnavailable: 1`,
+  `unhealthyPodEvictionPolicy: AlwaysAllow`) stops a drain from evicting
+  every injector at once, without letting a broken injector pin a node.
+  It covers voluntary evictions only; the chart sets no anti-affinity, so
+  both replicas can share a node.
 
 This matters more than it looks: the webhook ships
 `failurePolicy: Ignore`, so while the injector serves a certificate the
