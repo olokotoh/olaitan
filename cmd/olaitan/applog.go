@@ -248,6 +248,8 @@ func buildAppLogRateLimiter(log *slog.Logger) (*ratelimit.Limiter, error) {
 //
 //   - OLAITAN_WEBHOOK_LISTEN_ADDR          default :8443
 //   - OLAITAN_WEBHOOK_USE_NATIVE_SIDECAR   default true (KEP-753 native sidecar)
+//   - OLAITAN_WEBHOOK_SHUTDOWN_DELAY       default 0s; the chart sets 5s (#156 drain)
+//   - OLAITAN_WEBHOOK_CERT_RELOAD_INTERVAL default 10s (#157 serving-cert reload)
 func runApplogWebhook(ctx context.Context, args []string, stderr io.Writer) int {
 	fs := flag.NewFlagSet("olaitan applog-webhook", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -286,12 +288,25 @@ func runApplogWebhook(ctx context.Context, args []string, stderr io.Writer) int 
 		}
 	}
 
+	shutdownDelay, err := getenvDurationDefault("OLAITAN_WEBHOOK_SHUTDOWN_DELAY", 0)
+	if err != nil {
+		log.Error("startup: webhook", "err", err)
+		return 1
+	}
+	reloadInterval, err := getenvDurationDefault("OLAITAN_WEBHOOK_CERT_RELOAD_INTERVAL", applog.DefaultCertReloadInterval)
+	if err != nil || reloadInterval <= 0 {
+		log.Error("startup: OLAITAN_WEBHOOK_CERT_RELOAD_INTERVAL must be a positive duration", "err", err)
+		return 1
+	}
+
 	cfg := applog.WebhookConfig{
-		ListenAddr:       getenvDefault("OLAITAN_WEBHOOK_LISTEN_ADDR", ":8443"),
-		TLSCertFile:      cert,
-		TLSKeyFile:       key,
-		UseNativeSidecar: useNative,
-		SidecarImage:     sidecarImage,
+		ShutdownDelay:      shutdownDelay,
+		CertReloadInterval: reloadInterval,
+		ListenAddr:         getenvDefault("OLAITAN_WEBHOOK_LISTEN_ADDR", ":8443"),
+		TLSCertFile:        cert,
+		TLSKeyFile:         key,
+		UseNativeSidecar:   useNative,
+		SidecarImage:       sidecarImage,
 		// Per-Pod sidecar-runtime knobs surface to the webhook as
 		// env vars and are forwarded into the injection patch's env
 		// list so the sidecar container picks them up via the
@@ -326,6 +341,23 @@ func runApplogWebhook(ctx context.Context, args []string, stderr io.Writer) int 
 	}
 	log.Info("applog-webhook: graceful shutdown")
 	return 0
+}
+
+// getenvDurationDefault parses a Go duration from name, def when unset. A
+// negative value is an error.
+func getenvDurationDefault(name string, def time.Duration) (time.Duration, error) {
+	v := os.Getenv(name)
+	if v == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a duration such as 5s (got %q): %w", name, v, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("%s must not be negative (got %q)", name, v)
+	}
+	return d, nil
 }
 
 // getenvDefault returns os.Getenv(name) if non-empty, otherwise def.

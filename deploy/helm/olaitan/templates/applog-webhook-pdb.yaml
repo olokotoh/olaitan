@@ -1,0 +1,23 @@
+{{/*
+#156: PodDisruptionBudget for the applog injector. A node drain must not
+evict every injector at once: with none serving, each Pod CREATE in a
+selected namespace is either admitted with no sidecar (failurePolicy
+Ignore) or refused (Fail). Rendered only with two or more replicas: a
+minAvailable 1 budget on a single replica would block every node drain.
+*/}}
+{{- if and .Values.applogSidecar.enabled (ge (int (.Values.applogSidecar.webhook.replicaCount | default 2)) 2) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "olaitan.fullname" . }}-applog-injector
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: applog-injector
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "olaitan.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: applog-injector
+{{- end }}

@@ -39,9 +39,11 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"mime"
+	"net"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -164,6 +166,20 @@ type WebhookConfig struct {
 	SidecarRateLimitThreshold string
 	SidecarRateLimitCooldown  string
 	SidecarRateLimitSampling  string
+
+	// ShutdownDelay is how long the server keeps serving after its
+	// context is cancelled (SIGTERM), with /readyz answering 503, before
+	// it closes the listener (#156). A terminating pod stays a Service
+	// endpoint until the EndpointSlice change reaches kube-proxy; closing
+	// at once refused the API server's calls in that window, and under
+	// failurePolicy Ignore each refused call admitted a pod with no
+	// sidecar. Zero closes at once (tests, local runs).
+	ShutdownDelay time.Duration
+
+	// CertReloadInterval is how often the serving cert and key are
+	// re-read from TLSCertFile / TLSKeyFile (#157). Zero means
+	// DefaultCertReloadInterval.
+	CertReloadInterval time.Duration
 }
 
 // Webhook is the HTTPS admission server.
@@ -175,6 +191,12 @@ type Webhook struct {
 	// mutateHandler exposed for tests via the ServeHTTP entry-point on
 	// the dedicated ServeMux.
 	mux *http.ServeMux
+
+	// draining is set when shutdown starts (#156); /readyz then answers
+	// 503 while the listener keeps serving for ShutdownDelay.
+	draining atomic.Bool
+	// addr is the bound listener address once Run is serving.
+	addr atomic.Pointer[net.Addr]
 
 	// counters for tests / Prometheus binding (Story 1.12).
 	//
@@ -230,6 +252,7 @@ func NewWebhook(cfg WebhookConfig, log *slog.Logger) (*Webhook, error) {
 	}
 	w.mux.HandleFunc("/mutate", w.handleMutate)
 	w.mux.HandleFunc("/healthz", w.handleHealthz)
+	w.mux.HandleFunc("/readyz", w.handleReadyz)
 	w.srv = &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           w.mux,
@@ -245,12 +268,38 @@ func NewWebhook(cfg WebhookConfig, log *slog.Logger) (*Webhook, error) {
 }
 
 // Run blocks until ctx is cancelled. Returns nil on graceful
-// shutdown. Returns the underlying ListenAndServeTLS error on a
-// startup failure (port already bound, cert/key files missing).
+// shutdown. Returns an error on a startup failure (port already bound,
+// cert/key files missing or not a matching pair).
+//
+// The serving certificate comes from a certReloader (#157), so a renewed
+// Secret is served without a restart. On cancellation the server drains
+// (#156): /readyz turns 503 at once, the listener keeps serving for
+// ShutdownDelay so calls racing the endpoint removal still succeed, and
+// only then does Shutdown close it.
 func (w *Webhook) Run(ctx context.Context) error {
+	certs, err := newCertReloader(w.cfg.TLSCertFile, w.cfg.TLSKeyFile, w.log)
+	if err != nil {
+		return err
+	}
+	interval := w.cfg.CertReloadInterval
+	if interval <= 0 {
+		interval = DefaultCertReloadInterval
+	}
+	reloadCtx, stopReload := context.WithCancel(context.Background())
+	defer stopReload()
+	go certs.watch(reloadCtx, interval)
+
+	w.srv.TLSConfig.GetCertificate = certs.GetCertificate
+	ln, err := net.Listen("tcp", w.cfg.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("applog/webhook: listen %s: %w", w.cfg.ListenAddr, err)
+	}
+	a := ln.Addr()
+	w.addr.Store(&a)
+
 	serveErr := make(chan error, 1)
 	go func() {
-		err := w.srv.ListenAndServeTLS(w.cfg.TLSCertFile, w.cfg.TLSKeyFile)
+		err := w.srv.ServeTLS(ln, "", "")
 		if errors.Is(err, http.ErrServerClosed) {
 			serveErr <- nil
 			return
@@ -260,14 +309,23 @@ func (w *Webhook) Run(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
+		w.draining.Store(true)
+		if d := w.cfg.ShutdownDelay; d > 0 {
+			w.log.Info("applog/webhook: draining before shutdown", "delay", d.String())
+			select {
+			case <-time.After(d):
+			case err := <-serveErr:
+				return err
+			}
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = w.srv.Shutdown(shutdownCtx)
 		// Bounded receive: if Shutdown's 10 s window expires while a
 		// long-running in-flight admission call is still draining,
-		// ListenAndServeTLS may not return immediately. Block for at
-		// most 5 s on serveErr; if nothing arrives, log and proceed
-		// to caller cleanup so the Run goroutine cannot deadlock.
+		// ServeTLS may not return immediately. Block for at most 5 s on
+		// serveErr; if nothing arrives, log and proceed to caller cleanup
+		// so the Run goroutine cannot deadlock.
 		select {
 		case <-serveErr:
 		case <-time.After(5 * time.Second):
@@ -277,6 +335,14 @@ func (w *Webhook) Run(ctx context.Context) error {
 	case err := <-serveErr:
 		return err
 	}
+}
+
+// Addr is the bound listener address once Run is serving, nil before.
+func (w *Webhook) Addr() net.Addr {
+	if p := w.addr.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 // Mux exposes the underlying ServeMux for tests that drive the
@@ -298,6 +364,20 @@ func (w *Webhook) DryRunTotal() int64           { return w.dryRunTotal.Load() }
 // GET; the apiserver does not probe this endpoint -- kubelet does for
 // liveness/readiness on the webhook Deployment.
 func (w *Webhook) handleHealthz(rw http.ResponseWriter, _ *http.Request) {
+	rw.WriteHeader(http.StatusOK)
+	_, _ = rw.Write([]byte("ok\n"))
+}
+
+// handleReadyz is the readiness probe (#156). It answers 200 while the
+// server takes new admission calls and 503 once shutdown has started, so
+// the kubelet marks a draining pod not-ready while its listener is still
+// open. Liveness stays on /healthz, which never turns 503 on a drain (a
+// liveness restart mid-drain would refuse the very calls the drain keeps).
+func (w *Webhook) handleReadyz(rw http.ResponseWriter, _ *http.Request) {
+	if w.draining.Load() {
+		http.Error(rw, "draining", http.StatusServiceUnavailable)
+		return
+	}
 	rw.WriteHeader(http.StatusOK)
 	_, _ = rw.Write([]byte("ok\n"))
 }

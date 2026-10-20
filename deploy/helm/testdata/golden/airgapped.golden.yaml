@@ -197,6 +197,26 @@ spec:
       app.kubernetes.io/instance: olaitan
       app.kubernetes.io/name: nats
 ---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: olaitan-applog-injector
+  namespace: default
+  labels:
+    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
+    app.kubernetes.io/name: olaitan
+    app.kubernetes.io/instance: olaitan
+    app.kubernetes.io/version: "APP_VERSION_REDACTED"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: applog-injector
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: olaitan
+      app.kubernetes.io/instance: olaitan
+      app.kubernetes.io/component: applog-injector
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -2633,6 +2653,11 @@ metadata:
     app.kubernetes.io/component: applog-injector
 spec:
   replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: olaitan
@@ -2648,6 +2673,7 @@ spec:
         app.kubernetes.io/managed-by: Helm
         app.kubernetes.io/component: applog-injector
     spec:
+      terminationGracePeriodSeconds: 25
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -2676,6 +2702,9 @@ spec:
               value: /etc/olaitan/tls/tls.crt
             - name: OLAITAN_WEBHOOK_TLS_KEY
               value: /etc/olaitan/tls/tls.key
+            # #156: keep serving (not ready) this long after SIGTERM.
+            - name: OLAITAN_WEBHOOK_SHUTDOWN_DELAY
+              value: "5s"
             - name: OLAITAN_WEBHOOK_USE_NATIVE_SIDECAR
               value: "true"
             - name: OLAITAN_WEBHOOK_SIDECAR_IMAGE
@@ -2732,9 +2761,11 @@ spec:
               scheme: HTTPS
             initialDelaySeconds: 5
             periodSeconds: 10
+          # #156: /readyz turns 503 the moment a drain starts; liveness
+          # stays on /healthz so a draining pod is not restarted.
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: tls
               scheme: HTTPS
             initialDelaySeconds: 1
@@ -3386,6 +3417,12 @@ webhooks:
         values:
         - kube-system
         - kube-public
+    objectSelector:
+      matchExpressions:
+        - key: app.kubernetes.io/component
+          operator: NotIn
+          values:
+            - applog-injector
     rules:
       - operations: ["CREATE"]
         apiGroups: [""]

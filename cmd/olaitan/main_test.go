@@ -912,3 +912,32 @@ func TestLogDegradedSources(t *testing.T) {
 		t.Errorf("a healthy source was reported as degraded: %s", out)
 	}
 }
+
+// #156/#157: the injector's drain delay and cert reload interval env vars.
+func TestGetenvDurationDefault(t *testing.T) {
+	const name = "OLAITAN_WEBHOOK_SHUTDOWN_DELAY"
+	t.Setenv(name, "")
+	if d, err := getenvDurationDefault(name, 3*time.Second); err != nil || d != 3*time.Second {
+		t.Errorf("unset: %v, %v", d, err)
+	}
+	t.Setenv(name, "5s")
+	if d, err := getenvDurationDefault(name, 0); err != nil || d != 5*time.Second {
+		t.Errorf("5s: %v, %v", d, err)
+	}
+	for _, bad := range []string{"5", "-1s", "soon"} {
+		t.Setenv(name, bad)
+		if _, err := getenvDurationDefault(name, 0); err == nil {
+			t.Errorf("%q parsed", bad)
+		}
+	}
+}
+
+func TestRun_AppLogWebhook_BadShutdownDelay_Exits1(t *testing.T) {
+	t.Setenv("OLAITAN_WEBHOOK_TLS_CERT", "/nonexistent/tls.crt")
+	t.Setenv("OLAITAN_WEBHOOK_TLS_KEY", "/nonexistent/tls.key")
+	t.Setenv("OLAITAN_WEBHOOK_SIDECAR_IMAGE", "olaitan:test")
+	t.Setenv("OLAITAN_WEBHOOK_SHUTDOWN_DELAY", "soon")
+	if code := run([]string{"applog-webhook"}, io.Discard); code != 1 {
+		t.Errorf("bad OLAITAN_WEBHOOK_SHUTDOWN_DELAY: got %d want 1", code)
+	}
+}
