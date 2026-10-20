@@ -709,7 +709,7 @@ jobs:
             --wait --timeout 5m
 
       - name: Run smoke test
-        run: go test -tags=e2e -v -count=1 -run 'TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation|TestFalcoSourceIsLive' ./tests/e2e/...
+        run: go test -tags=e2e -v -count=1 -run 'TestKindSmoke_RS_EmitsRuleMatch|TestFalcoSourceIsLive' ./tests/e2e/...
 
       # Story 5.1 (AC5): the olaitan-eval harness smoke rides on the SAME
       # RS-arm bring-up above (Falco-off, NO LLM). It builds the

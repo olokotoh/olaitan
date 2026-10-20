@@ -2,130 +2,152 @@ package baseline
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
-	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/olokotoh/olaitan/internal/correlator/trigger"
 	"github.com/olokotoh/olaitan/internal/metrics"
 	natsclient "github.com/olokotoh/olaitan/internal/nats"
 	"github.com/olokotoh/olaitan/internal/schema"
-	"github.com/olokotoh/olaitan/internal/subjects"
 )
 
 const (
-	// consumerMaxDeliver caps JetStream's per-message redelivery for
-	// the baseline-engine consumer. Mirrors Story 1.14 P18 and the
-	// Story 1.15 rules engine so a poison package cannot loop forever.
-	consumerMaxDeliver = 5
-
 	// publishAttemptTimeout caps a single FireBaselineDeviation
-	// invocation. The realistic worst case is up to 5 deviations per
-	// package, so cap the inbound consumer's AckWait at strictly
-	// above 5 * publishAttemptTimeout + Redis Load + Save. See
-	// consumerAckWait below.
+	// invocation (at most five per closed bucket).
 	publishAttemptTimeout = 2 * time.Second
-
-	// consumerAckWait sizes the inbound consumer's AckWait window.
-	// Per the Story 1.17 review web validation: worst-case wall-time
-	// is ~13 s (5 metric emits at 2 s + Redis HGETALL + HSET + GC),
-	// and the oneuptime jetstream-consumer guide recommends
-	// AckWait = 3-6x p95 processing time. 60 s is the explicit
-	// upper bound chosen so a slow handle() never races the AckWait
-	// timer and triggers a spurious redelivery while the engine is
-	// still working. Blind Hunter B7 + Edge Case Hunter E4 surfaced
-	// the implicit-30s-default footgun.
-	consumerAckWait = 60 * time.Second
-
-	// fetchBackoff is the bounded sleep between consumer.Next attempts
-	// after a non-timeout error. The engine honours context
-	// cancellation immediately rather than completing the backoff.
-	fetchBackoff = time.Second
 
 	// DefaultSigmaMultiplier is the AC2 explicit "default 3 sigma"
 	// threshold above the rolling per-workload mean.
 	DefaultSigmaMultiplier = 3.0
+
+	// MinSamples is the number of one-minute samples a metric needs
+	// before it can deviate (Story 10.12 D4). It backs up warm-up when
+	// warm-up is configured very short (the e2e overlays use 5 s): no
+	// sigma is meaningful on a handful of samples.
+	MinSamples = 10
+
+	// observationQueueSize bounds the correlator-to-engine hand-off. The
+	// correlator never blocks on it: a full queue drops the observation
+	// and counts it in olaitan_decision_baseline_observations_dropped_total.
+	observationQueueSize = 8192
+
+	// evalTimeout bounds the Redis work of one evaluation (load, warm-up
+	// check, save) so a slow Redis cannot stall the engine's only
+	// goroutine and overflow the observation queue for long.
+	evalTimeout = 3 * time.Second
+
+	// maxLateness: an event older than this on arrival (by its own
+	// timestamp) is not folded into the current minute. It is a replayed
+	// backlog (correlator or aggregator restart, an outage) whose burst
+	// would otherwise land in one bucket and fire a false deviation.
+	// Goldmane flows arrive up to about a minute after the start of their
+	// aggregation window, which this allows.
+	maxLateness = 2 * time.Minute
+
+	// tickInterval is how often the engine closes due buckets of
+	// workloads that produced no event since their minute ended.
+	tickInterval = 5 * time.Second
+
+	// legacyConsumerName is the EVIDENCE durable the engine used before
+	// Story 10.12, when it baselined EvidencePackages. Run deletes it so
+	// it does not linger on an upgraded cluster.
+	legacyConsumerName = "olaitan-baseline-engine"
 )
 
 // histogramBuckets sizes the evaluation_seconds histogram against
-// the NFR3 100 ms p99 gate. The buckets stop at 250 ms so a package
-// that blows past the budget still buckets visibly rather than
-// landing in +Inf; everything above 100 ms is already a regression.
+// the NFR3 100 ms p99 gate.
 var histogramBuckets = []float64{0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250}
 
 // BaselineDeviationEmitter is the engine's only outbound dependency.
-// The correlator's FireBaselineDeviation method satisfies it.
-// Defining a local interface keeps the engine package one-way: the
-// engine does NOT import correlator, so future cross-engine chaining
-// can extend the trigger contract without inviting an import cycle.
+// The correlator's FireBaselineDeviation method satisfies it. Defining a
+// local interface keeps the engine package one-way: the engine does NOT
+// import correlator.
 type BaselineDeviationEmitter interface {
-	FireBaselineDeviation(ctx context.Context, workloadID string, deviation schema.BaselineDeviation) (*schema.EvidencePackage, error)
+	// identity is the workload identity the correlator resolved for the
+	// workload's events, so the deviation package is attributed to the
+	// workload rather than to whichever pod ref sits first in the window.
+	FireBaselineDeviation(ctx context.Context, workloadID string, identity schema.WorkloadIdentity, deviation schema.BaselineDeviation) (*schema.EvidencePackage, error)
 }
 
 // Config configures an Engine.
 type Config struct {
+	// NATS is optional. When set, Run deletes the pre-Story-10.12
+	// EVIDENCE durable consumer.
 	NATS            *natsclient.Client
 	Store           *Store
 	Warmup          *Warmup
 	Emitter         BaselineDeviationEmitter
 	Metrics         *metrics.Registry
 	Log             *slog.Logger
-	Extractors      map[string]MetricExtractor
 	SigmaMultiplier float64
+	// OwnNamespaces are Olaitan's own namespaces (the correlator's
+	// never-scored list). Audit events whose actor is a ServiceAccount in
+	// one of them are Olaitan's own lookups, not workload behaviour, and
+	// are not counted in audit_events_per_min. Hot-reloadable via
+	// SetOwnNamespaces.
+	OwnNamespaces []string
+	// OwnActors are the exact usernames of Olaitan's own identities (the
+	// aggregator's ServiceAccount, read from its projected token at
+	// start). Their audit calls are excluded too, wherever Olaitan is
+	// installed, without excluding every ServiceAccount of a shared
+	// release namespace.
+	OwnActors []string
 }
 
-// Engine subscribes to subjects.EvidencePackages and updates the
-// per-workload Welford state for the five default metrics on every
-// inbound package, emitting a BaselineDeviation through the
-// correlator for each metric whose observation crosses sigma.
+// Observation is one event the correlator attributed to a workload.
+type Observation struct {
+	WorkloadID string
+	Identity   schema.WorkloadIdentity
+	Event      schema.Event
+}
+
+// Engine keeps per-workload Welford state for the five default metrics,
+// sampled on fixed one-minute buckets of the events the correlator
+// attributes to each workload (Story 10.12), and emits a
+// BaselineDeviation through the correlator for each metric whose
+// one-minute sample crosses sigma.
+//
+// Concurrency: ObserveEvent, SetSigmaMultiplier, SetWarmupDuration and
+// SetOwnNamespaces are safe from any goroutine. Ingest and Tick mutate
+// the trackers and must only be called by one goroutine at a time: Run
+// in production, the test itself in tests.
 type Engine struct {
 	nc         *natsclient.Client
 	store      *Store
 	warmup     *Warmup
 	emit       BaselineDeviationEmitter
 	log        *slog.Logger
-	extractors map[string]MetricExtractor
 	metricList []string
 
-	sigmaMul atomic.Pointer[float64]
+	sigmaMul  atomic.Pointer[float64]
+	ownNS     atomic.Pointer[map[string]struct{}]
+	ownActors map[string]struct{}
+	now       func() time.Time
 
-	evalDeviation    atomic.Int64
-	evalNormal       atomic.Int64
-	evalError        atomic.Int64
-	skippedSelf      atomic.Int64
-	evalSeconds      prometheus.Histogram
-	warmupActiveCard atomic.Int64
+	obs      chan Observation
+	trackers map[string]*tracker
+	live     map[schema.EventSource]bool
 
-	// Story 1.18 AC3: labelled per-deviation counter. Replaces the
-	// Story 1.17 per-metric atomic map with a {metric, sigma_bucket}
-	// CounterVec. Cardinality 5 (metrics) × 3 (buckets) = 15 series,
-	// bounded for the lifetime of the project. Per BI-2 of Story
-	// 1.18, the warmup_active gauge stays unlabelled (architecture
-	// forbids the {workload} label suggested by the AC text).
-	deviationsVec *prometheus.CounterVec
+	evalDeviation       atomic.Int64
+	evalNormal          atomic.Int64
+	evalError           atomic.Int64
+	observationsDropped atomic.Int64
+	observationsLate    atomic.Int64
+	missingIdentity     atomic.Int64
+	trackedWorkloads    atomic.Int64
+	warmupActiveCard    atomic.Int64
+	evalSeconds         prometheus.Histogram
+	deviationsVec       *prometheus.CounterVec
 }
 
 // New constructs an Engine wired against the given dependencies.
-// Returns an error if any required dependency is nil or if metric
-// registration fails. The constructor does not subscribe to NATS;
-// Run does.
-//
-// Copilot C6: validation reaches into Store.client and Warmup.store
-// so a caller that passes a zero-valued &Store{} / &Warmup{} (a
-// realistic test-fixture mistake) fails fast at construction
-// instead of panicking on the first inbound package.
 func New(cfg Config) (*Engine, error) {
-	if cfg.NATS == nil {
-		return nil, errors.New("baseline: nats client is nil")
-	}
 	if cfg.Store == nil {
 		return nil, errors.New("baseline: store is nil")
 	}
@@ -147,30 +169,30 @@ func New(cfg Config) (*Engine, error) {
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
 	}
-	if cfg.Extractors == nil {
-		cfg.Extractors = DefaultExtractors()
-	}
 	if cfg.SigmaMultiplier <= 0 {
 		cfg.SigmaMultiplier = DefaultSigmaMultiplier
 	}
-	names := make([]string, 0, len(cfg.Extractors))
-	for n := range cfg.Extractors {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-
 	e := &Engine{
 		nc:         cfg.NATS,
 		store:      cfg.Store,
 		warmup:     cfg.Warmup,
 		emit:       cfg.Emitter,
 		log:        cfg.Log.With("component", "baseline-engine"),
-		extractors: cfg.Extractors,
-		metricList: names,
+		metricList: MetricNames(),
+		now:        time.Now,
+		obs:        make(chan Observation, observationQueueSize),
+		trackers:   map[string]*tracker{},
+		live:       map[schema.EventSource]bool{},
 	}
 	sigma := cfg.SigmaMultiplier
 	e.sigmaMul.Store(&sigma)
-
+	e.SetOwnNamespaces(cfg.OwnNamespaces)
+	e.ownActors = make(map[string]struct{}, len(cfg.OwnActors))
+	for _, a := range cfg.OwnActors {
+		if a != "" {
+			e.ownActors[a] = struct{}{}
+		}
+	}
 	if cfg.Metrics != nil {
 		if err := e.registerMetrics(cfg.Metrics); err != nil {
 			return nil, fmt.Errorf("baseline: register metrics: %w", err)
@@ -188,14 +210,8 @@ func (e *Engine) SetSigmaMultiplier(v float64) {
 	e.sigmaMul.Store(&v)
 }
 
-// SetWarmupDuration forwards a hot-reloaded warm-up window length
-// to the embedded Warmup controller. The aggregator's
-// config.Manager.Subscribe callback calls this so BI-3's
-// "warmupDuration is hot-reloadable" promise actually takes effect
-// (previously the subscribe callback only updated sigma, leaving
-// warmup_duration silently restart-required despite the BI-3 + helm
-// values docs claiming hot-reload). Copilot C5 + Edge Case Hunter
-// E1 + Acceptance Auditor A1.
+// SetWarmupDuration forwards a hot-reloaded warm-up window length to the
+// embedded Warmup controller.
 func (e *Engine) SetWarmupDuration(d time.Duration) {
 	if d <= 0 {
 		return
@@ -203,8 +219,38 @@ func (e *Engine) SetWarmupDuration(d time.Duration) {
 	e.warmup.SetConfig(WarmupConfig{Duration: d})
 }
 
-// SigmaMultiplier returns the currently-active threshold. Test-only
-// helper.
+// SetOwnNamespaces replaces Olaitan's own namespaces (hot-reloadable).
+func (e *Engine) SetOwnNamespaces(nss []string) {
+	m := make(map[string]struct{}, len(nss))
+	for _, ns := range nss {
+		m[ns] = struct{}{}
+	}
+	e.ownNS.Store(&m)
+}
+
+// isOwnActor reports whether an audit actor is one of Olaitan's own
+// identities: an exact OwnActors username, or a ServiceAccount in one of
+// OwnNamespaces.
+func (e *Engine) isOwnActor(username string) bool {
+	if _, ok := e.ownActors[username]; ok {
+		return true
+	}
+	if ns := serviceAccountNamespace(username); ns != "" {
+		return e.isOwnNamespace(ns)
+	}
+	return false
+}
+
+func (e *Engine) isOwnNamespace(ns string) bool {
+	p := e.ownNS.Load()
+	if p == nil {
+		return false
+	}
+	_, ok := (*p)[ns]
+	return ok
+}
+
+// SigmaMultiplier returns the currently-active threshold.
 func (e *Engine) SigmaMultiplier() float64 {
 	if p := e.sigmaMul.Load(); p != nil {
 		return *p
@@ -229,22 +275,16 @@ func (e *Engine) registerMetrics(reg *metrics.Registry) error {
 		if err := reg.RegisterCounter(
 			"olaitan_decision_baseline_evaluations_total",
 			"",
-			"Per-package baseline-evaluation outcome counter. One outcome per handled package: deviation (>=1 metric crossed sigma and every emit succeeded), normal (no metric crossed sigma), error (decode failed or any per-metric emit failed). For per-metric cardinality see olaitan_decision_baseline_deviations_total.",
+			"Per-sample baseline-evaluation outcome counter. One outcome per closed one-minute workload sample (Story 10.12): deviation (>=1 metric crossed sigma and every emit succeeded), normal (no metric crossed sigma), error (Redis or any per-metric emit failed). For per-metric cardinality see olaitan_decision_baseline_deviations_total.",
 			prometheus.Labels{"outcome": out},
 			getter,
 		); err != nil {
 			return err
 		}
 	}
-	// Story 1.18 AC3: labelled per-deviation counter. The Story 1.17
-	// per-metric atomic map is replaced with a {metric, sigma_bucket}
-	// CounterVec so dashboards can slice deviation rates by both the
-	// metric being baselined and the magnitude of the deviation. The
-	// cartesian is bounded at 5 metrics x 3 sigma buckets = 15
-	// series.
 	dv, err := reg.RegisterCounterVec(
 		"olaitan_decision_baseline_deviations_total",
-		"Per-(metric, sigma_bucket) baseline-deviation counter. Story 1.17 introduced the unlabelled-per-metric form; Story 1.18 AC3 adds the sigma_bucket label (one of \"3-5\", \">=5\", \">=10\"). Complements per-package evaluations_total{outcome=deviation}.",
+		"Per-(metric, sigma_bucket) baseline-deviation counter (sigma_bucket one of \"3-5\", \"5-10\", \"10+\"). Complements evaluations_total{outcome=deviation}.",
 		[]string{"metric", "sigma_bucket"},
 	)
 	if err != nil {
@@ -252,18 +292,36 @@ func (e *Engine) registerMetrics(reg *metrics.Registry) error {
 	}
 	e.deviationsVec = dv
 	if err := reg.RegisterCounter(
-		"olaitan_decision_baseline_skipped_self_total",
+		"olaitan_decision_baseline_observations_dropped_total",
 		"",
-		"Cumulative inbound packages skipped because their trigger type was baseline_deviation (re-entrancy guard).",
+		"Cumulative events the correlator handed to the baseline engine that were dropped because the engine's bounded queue was full (Story 10.12). Non-zero means the engine fell behind the event stream and baselines under-count.",
 		nil,
-		func() int64 { return e.skippedSelf.Load() },
+		func() int64 { return e.observationsDropped.Load() },
+	); err != nil {
+		return err
+	}
+	if err := reg.RegisterCounter(
+		"olaitan_decision_baseline_observations_late_total",
+		"",
+		"Cumulative events not folded into a baseline minute because they were more than 2 minutes old on arrival (Story 10.12): a replayed backlog after a restart or outage, which would otherwise land in one minute as a false burst.",
+		nil,
+		func() int64 { return e.observationsLate.Load() },
+	); err != nil {
+		return err
+	}
+	if err := reg.RegisterGauge(
+		"olaitan_decision_baseline_tracked_workloads",
+		"",
+		"Workloads the baseline engine currently samples every minute (Story 10.12). A workload is dropped after an hour without events; its learnt state stays in Redis.",
+		nil,
+		func() int64 { return e.trackedWorkloads.Load() },
 	); err != nil {
 		return err
 	}
 	if err := reg.RegisterGauge(
 		"olaitan_decision_baseline_warmup_active",
 		"",
-		"Count of workloads currently within an active warm-up window (FR18). Sampled from the Warmup controller cache; cardinality bounded by the workload set under the controller's reach.",
+		"Count of workloads currently within an active warm-up window (FR18). Since Story 10.12 a new workload starts warm-up on its first sample, as well as a restarted one.",
 		nil,
 		func() int64 { return e.warmupActiveCard.Load() },
 	); err != nil {
@@ -272,7 +330,7 @@ func (e *Engine) registerMetrics(reg *metrics.Registry) error {
 	h, err := reg.RegisterHistogram(
 		"olaitan_decision_baseline_evaluation_seconds",
 		"",
-		"Per-package baseline-engine evaluation latency in seconds; histogram buckets are sized against NFR3 (p99 <= 100 ms).",
+		"Per-sample baseline-engine evaluation latency in seconds (Redis load, Welford update, save, emit); histogram buckets are sized against NFR3 (p99 <= 100 ms).",
 		nil,
 		histogramBuckets,
 	)
@@ -283,73 +341,57 @@ func (e *Engine) registerMetrics(reg *metrics.Registry) error {
 	return nil
 }
 
-// applyReEntrancyGuard returns true and bumps skippedSelf if pkg is
-// a baseline_deviation-triggered package the engine must not
-// re-evaluate. Split out from handle() so unit tests can exercise
-// the guard contract without standing up a JetStream consumer
-// (mirrors Story 1.15 P8 closure).
-func (e *Engine) applyReEntrancyGuard(pkg *schema.EvidencePackage) bool {
-	if pkg.Trigger.Type == trigger.TypeBaselineDeviation {
-		e.skippedSelf.Add(1)
-		return true
+// ObserveEvent hands one correlator-attributed event to the engine. It
+// never blocks: when the queue is full the event is dropped and counted.
+// The correlator calls it after identity resolution and its host and
+// never-scored filters (correlator.EventObserver).
+func (e *Engine) ObserveEvent(workloadID string, identity schema.WorkloadIdentity, ev schema.Event) {
+	select {
+	case e.obs <- Observation{WorkloadID: workloadID, Identity: identity, Event: ev}:
+	default:
+		e.observationsDropped.Add(1)
 	}
-	return false
 }
 
-// Run subscribes to subjects.EvidencePackages and dispatches per
-// metric. Returns nil on graceful shutdown, a wrapped error if
-// stream/consumer setup fails. Run also spawns a warm-up gauge
-// sampler goroutine that updates warmupActiveCard every 5 s.
+// Run processes observations and closes one-minute buckets until ctx is
+// cancelled. It also deletes the pre-Story-10.12 EVIDENCE durable and
+// runs the warm-up gauge sampler. Returns nil on graceful shutdown.
 func (e *Engine) Run(ctx context.Context) error {
+	e.deleteLegacyConsumer(ctx)
+	go e.sampleWarmupGauge(ctx)
+	t := time.NewTicker(tickInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case o := <-e.obs:
+			e.Ingest(ctx, o, e.now())
+		case <-t.C:
+			e.Tick(ctx, e.now())
+		}
+	}
+}
+
+func (e *Engine) deleteLegacyConsumer(ctx context.Context) {
+	if e.nc == nil || e.nc.JetStream() == nil {
+		return
+	}
 	stream, err := e.nc.JetStream().Stream(ctx, "EVIDENCE")
 	if err != nil {
-		return fmt.Errorf("baseline: stream EVIDENCE: %w", err)
+		e.log.Debug("baseline: EVIDENCE stream not available for legacy consumer cleanup", "err", err)
+		return
 	}
-	// MaxAckPending = 1 makes the single-threaded handle() shape an
-	// explicit consumer-side invariant: even if a future refactor
-	// introduces concurrent dispatch the consumer will still serialise
-	// per-pending-message (per the byronruth jetstream-consumer guide
-	// and the oneuptime best-practices article cited in the Story 1.17
-	// review web validation).
-	consumer, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
-		Durable:       "olaitan-baseline-engine",
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		FilterSubject: subjects.EvidencePackages,
-		MaxDeliver:    consumerMaxDeliver,
-		AckWait:       consumerAckWait,
-		MaxAckPending: 1,
-	})
-	if err != nil {
-		return fmt.Errorf("baseline: consumer: %w", err)
-	}
-
-	go e.sampleWarmupGauge(ctx)
-
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil
+	if err := stream.DeleteConsumer(ctx, legacyConsumerName); err != nil {
+		if !errors.Is(err, jetstream.ErrConsumerNotFound) {
+			e.log.Warn("baseline: delete legacy EVIDENCE consumer", "consumer", legacyConsumerName, "err", err)
 		}
-		msg, err := consumer.Next(jetstream.FetchMaxWait(250 * time.Millisecond))
-		if err != nil {
-			if isExpectedFetchTimeout(err) {
-				continue
-			}
-			e.log.Warn("baseline: consumer fetch failed", "err", err)
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-time.After(fetchBackoff):
-			}
-			continue
-		}
-		e.handle(ctx, msg)
+		return
 	}
+	e.log.Info("baseline: deleted legacy EVIDENCE consumer (the engine samples correlator events since Story 10.12)", "consumer", legacyConsumerName)
 }
 
-// sampleWarmupGauge runs on a 5 s tick refreshing the warmup_active
-// gauge from the Warmup controller's cache. Cardinality is bounded
-// by the MVP-scale workload count; the gauge value is the integer
-// count of currently-active warm-up workloads.
+// sampleWarmupGauge refreshes the warmup_active gauge every 5 s.
 func (e *Engine) sampleWarmupGauge(ctx context.Context) {
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
@@ -363,292 +405,264 @@ func (e *Engine) sampleWarmupGauge(ctx context.Context) {
 	}
 }
 
-// HandleForBench exposes the in-process per-package evaluation path
-// to integration tests + benchmarks so the AC6 / NFR3 100ms p99
-// gate is measured against the same code the production consumer
-// runs (mirrors Story 1.15 P4+P5 closure: latency budgets must
-// drive the real evaluatePackage / handle path, not a hoisted
-// shortcut). Copilot C4 + Blind Hunter B11 surfaced the previous
-// bench's drift from production code.
-//
-// The function shares everything with handle() except: it accepts
-// a decoded *EvidencePackage rather than a JetStream msg, never
-// calls msg.Ack, and returns the per-package outcome string so the
-// bench can sanity-check it. The histogram is still observed via
-// the regular evalSeconds path.
-func (e *Engine) HandleForBench(ctx context.Context, pkg *schema.EvidencePackage) (outcome string, err error) {
-	return e.handleDecoded(ctx, pkg)
-}
-
-// handle decodes the inbound message, applies the re-entrancy guard,
-// performs restart detection, extracts metrics, updates Welford
-// state, and emits deviations through cfg.Emitter. Permanent decode
-// errors and per-metric emit errors are treated as drop-and-ack
-// (mirrors Story 1.15 engine.go drop-and-ack discipline). Advisory
-// routing to a future Story 1.18 DLQ surface is shared with the
-// rules engine.
-func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
-	var pkg schema.EvidencePackage
-	if err := json.Unmarshal(msg.Data(), &pkg); err != nil {
-		e.log.Warn("baseline: dropping malformed package", "err", err)
-		e.evalError.Add(1)
-		_ = msg.Ack()
+// Ingest folds one observation into its workload's current minute,
+// closing (and evaluating) the previous minute first when now has moved
+// past it. Not safe for concurrent use; see Engine.
+func (e *Engine) Ingest(ctx context.Context, o Observation, now time.Time) {
+	ev := o.Event
+	// Source liveness (Story 10.12 D2). Only flow records feed the
+	// network metrics, so only they prove the network source live.
+	if ev.Source != "" && (ev.Source != schema.SourceNetwork || ev.Category == schema.CategoryFlow) {
+		e.live[ev.Source] = true
+	}
+	if !ev.Timestamp.IsZero() && now.Sub(ev.Timestamp) > maxLateness {
+		e.observationsLate.Add(1)
 		return
 	}
-	_, _ = e.handleDecoded(ctx, &pkg)
-	_ = msg.Ack()
+	ns, key := workloadKey(o.Identity, ev.Pod)
+	if ns == "" || key == "" {
+		e.missingIdentity.Add(1)
+		return
+	}
+	id := ns + "/" + key
+	tr, ok := e.trackers[id]
+	if !ok {
+		tr = &tracker{
+			namespace: ns,
+			key:       key,
+			cur:       newBucket(now.Truncate(BucketWidth)),
+			restarts:  map[string]time.Time{},
+		}
+		e.trackers[id] = tr
+		e.trackedWorkloads.Store(int64(len(e.trackers)))
+	} else {
+		e.advance(ctx, tr, now)
+	}
+	if o.WorkloadID != "" {
+		tr.workloadID = o.WorkloadID
+		tr.identity = o.Identity
+	}
+	tr.add(&ev, now, e.isOwnActor)
+	tr.lastEvent = now
 }
 
-// handleDecoded is the pure in-process per-package evaluation path
-// shared by handle() (which adds msg decode + ack) and
-// HandleForBench() (which exposes the same code to integration
-// tests / benchmarks). Returns the per-package outcome string
-// ("deviation" / "normal" / "error" / "skipped_self" /
-// "missing_identity") + any persistent error encountered. Callers
-// never need to act on the error; counters and logs are emitted
-// internally to match the production observability contract.
-func (e *Engine) handleDecoded(ctx context.Context, pkg *schema.EvidencePackage) (string, error) {
+// Tick closes every bucket whose minute has ended, zero-filling minutes
+// with no events, and stops tracking workloads idle for idleEvictAfter.
+// Not safe for concurrent use; see Engine.
+func (e *Engine) Tick(ctx context.Context, now time.Time) {
+	ids := make([]string, 0, len(e.trackers))
+	for id := range e.trackers {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		tr := e.trackers[id]
+		e.advance(ctx, tr, now)
+		if now.Sub(tr.lastEvent) >= idleEvictAfter {
+			delete(e.trackers, id)
+		}
+	}
+	e.trackedWorkloads.Store(int64(len(e.trackers)))
+}
+
+// advance evaluates the tracker's current minute once now has left it,
+// then one zero sample per fully empty minute in between (at most
+// maxGapFill), in one batch (one Redis load and one save), and opens the
+// bucket for now's minute.
+func (e *Engine) advance(ctx context.Context, tr *tracker, now time.Time) {
+	cur := now.Truncate(BucketWidth)
+	if !cur.After(tr.cur.start) {
+		return
+	}
+	samples := []sample{tr.close(tr.cur, e.isLive)}
+	gaps := int(cur.Sub(tr.cur.start)/BucketWidth) - 1
+	if gaps > maxGapFill {
+		gaps = maxGapFill
+	}
+	for i := gaps; i >= 1; i-- {
+		samples = append(samples, tr.close(newBucket(cur.Add(-time.Duration(i)*BucketWidth)), e.isLive))
+	}
+	tr.prevIDs = tr.cur.ids
+	tr.cur = newBucket(cur)
+	e.evaluate(ctx, tr, samples)
+}
+
+func (e *Engine) isLive(src schema.EventSource) bool { return e.live[src] }
+
+// evaluate folds closed samples, oldest first, into the workload's
+// Welford state and emits a deviation per metric and sample that crosses
+// sigma. The Redis work runs under evalTimeout so a slow or failing Redis
+// cannot stall the engine's only goroutine for long (Story 10.12 review).
+func (e *Engine) evaluate(parent context.Context, tr *tracker, samples []sample) {
+	nonEmpty := samples[:0:0]
+	for _, s := range samples {
+		if len(s.values) > 0 || s.restart {
+			nonEmpty = append(nonEmpty, s)
+		}
+	}
+	if len(nonEmpty) == 0 {
+		return
+	}
 	start := time.Now()
-	observed := false
 	defer func() {
-		if observed && e.evalSeconds != nil {
+		if e.evalSeconds != nil {
 			e.evalSeconds.Observe(time.Since(start).Seconds())
 		}
 	}()
+	ns, pod := tr.namespace, tr.key
+	ctx, cancel := context.WithTimeout(parent, evalTimeout)
+	defer cancel()
 
-	if e.applyReEntrancyGuard(pkg) {
-		return "skipped_self", nil
-	}
-	observed = true
-
-	namespace, pod := resolveWorkloadKey(pkg)
-	if namespace == "" || pod == "" {
-		// No workload identity: nothing to baseline against. Treat as
-		// normal so the per-package histogram still observes the no-op
-		// path; ack and move on.
-		e.log.Warn("baseline: package missing workload identity, skipping", "workload_id", pkg.WorkloadID)
-		e.evalNormal.Add(1)
-		return "missing_identity", nil
-	}
-
-	// Restart detection: a CRI lifecycle event with attempt:N (N>0)
-	// triggers warm-up + Welford reset BEFORE this evaluation folds
-	// in the package's observations.
-	//
-	// Acceptance Auditor A10 dedupe: skip Begin+zero-Save when warm-up
-	// is already active for the workload. The same restart can show
-	// up across consecutive packages while the correlator's 60s
-	// sliding window absorbs the lifecycle event; without this
-	// dedupe each repeat would extend the warm-up window indefinitely
-	// and re-zero the Welford state, defeating AC3's bounded
-	// suppression.
-	//
-	// Blind Hunter B14 + Edge Case Hunter E6 atomicity: write zero
-	// Welford state FIRST then warmup.Begin so a process crash
-	// between the two leaves the durable hash in the zero-baseline
-	// state rather than a warm-up-active + stale-baseline pair.
-	//
-	// Blind Hunter B1: after the reset, fall THROUGH to the extract
-	// loop below so the package's other observations are folded into
-	// the freshly-zeroed Welford state. Warm-up suppression below
-	// then prevents any emission, satisfying AC3's "observations are
-	// recorded but no anomaly results are emitted" clause.
-	if e.detectRestart(pkg) {
-		alreadyActive, isActiveErr := e.warmup.IsActive(ctx, namespace, pod)
-		if isActiveErr != nil {
-			e.log.Warn("baseline: warmup IsActive failed during restart", "namespace", namespace, "pod", pod, "err", isActiveErr)
-			e.evalError.Add(1)
-			return "error", isActiveErr
-		}
-		if !alreadyActive {
-			zero := make(map[string]*Welford, len(e.metricList))
-			for _, n := range e.metricList {
-				zero[n] = &Welford{}
-			}
-			if err := e.store.Save(ctx, namespace, pod, zero); err != nil {
-				e.log.Warn("baseline: zero-store after restart failed", "namespace", namespace, "pod", pod, "err", err)
-				e.evalError.Add(1)
-				return "error", err
-			}
-			if err := e.warmup.Begin(ctx, namespace, pod); err != nil {
-				e.log.Warn("baseline: warmup Begin failed", "namespace", namespace, "pod", pod, "err", err)
-				e.evalError.Add(1)
-				return "error", err
-			}
-			e.log.Info("baseline: workload restart detected; warm-up engaged", "namespace", namespace, "pod", pod)
-		}
-	}
-
-	baselines, err := e.store.Load(ctx, namespace, pod, e.metricList)
+	st, err := e.store.LoadState(ctx, ns, pod, e.metricList)
 	if err != nil {
-		e.log.Warn("baseline: store load failed", "namespace", namespace, "pod", pod, "err", err)
-		e.evalError.Add(1)
-		return "error", err
+		e.fail("store load", ns, pod, err, len(nonEmpty))
+		return
+	}
+	active, err := e.warmup.IsActive(ctx, ns, pod)
+	if err != nil {
+		e.fail("warmup IsActive", ns, pod, err, len(nonEmpty))
+		return
 	}
 
-	active, err := e.warmup.IsActive(ctx, namespace, pod)
-	if err != nil {
-		e.log.Warn("baseline: warmup IsActive failed", "namespace", namespace, "pod", pod, "err", err)
-		e.evalError.Add(1)
-		return "error", err
+	switch {
+	case !st.SchemaCurrent && (st.HasHistory || st.WarmupRecorded):
+		// Learnt under the pre-10.12 package-window semantics: not
+		// comparable. Start over as a new workload.
+		if err := e.reset(ctx, ns, pod, st, false); err != nil {
+			e.fail("reset legacy baseline", ns, pod, err, len(nonEmpty))
+			return
+		}
+		active = true
+		e.log.Info("baseline: pre-10.12 baseline discarded; warm-up engaged", "namespace", ns, "workload", pod)
+	case !st.HasHistory && !st.WarmupRecorded:
+		// Story 10.12 B1: a new workload warms up before it can deviate.
+		if err := e.warmup.Begin(ctx, ns, pod); err != nil {
+			e.fail("warmup Begin (new workload)", ns, pod, err, len(nonEmpty))
+			return
+		}
+		active = true
+		e.log.Info("baseline: new workload; warm-up engaged", "namespace", ns, "workload", pod)
 	}
 
 	sigmaMul := e.SigmaMultiplier()
-	deviations := []schema.BaselineDeviation{}
+	var deviations []schema.BaselineDeviation
+	deviating := 0
+	for _, s := range nonEmpty {
+		if s.restart && !active {
+			// Restart-aware behaviour (Story 1.17 AC3), kept: zero the
+			// baselines and warm up. Deduped while warm-up is active so a
+			// crash loop cannot extend it forever. The restarts metric
+			// keeps its history (Story 10.12 D5).
+			if err := e.reset(ctx, ns, pod, st, true); err != nil {
+				e.fail("reset after restart", ns, pod, err, len(nonEmpty))
+				return
+			}
+			active = true
+			e.log.Info("baseline: workload restart detected; warm-up engaged", "namespace", ns, "workload", pod)
+		}
+		found := false
+		for _, name := range e.metricList {
+			value, ok := s.values[name]
+			if !ok {
+				continue
+			}
+			w := st.Welfords[name]
+			preCount, preMean := w.Count, w.Mean
+			eff := effectiveStdDev(name, w.StdDev(), preMean)
+			w.Update(value)
+			if active || preCount < MinSamples {
+				continue
+			}
+			sigma := (value - preMean) / eff
+			if sigma < sigmaMul {
+				continue
+			}
+			found = true
+			deviations = append(deviations, schema.BaselineDeviation{
+				Metric: name,
+				Value:  value,
+				Mean:   preMean,
+				StdDev: eff,
+				Sigma:  sigma,
+				PodUID: tr.podUID,
+			})
+		}
+		if found {
+			deviating++
+		}
+	}
+
+	if err := e.store.Save(ctx, ns, pod, st.Welfords); err != nil {
+		e.fail("store save", ns, pod, err, len(nonEmpty))
+		return
+	}
+
 	emitFailed := false
-
-	for _, name := range e.metricList {
-		ex, ok := e.extractors[name]
-		if !ok {
-			continue
-		}
-		value, present := ex(pkg)
-		if !present {
-			continue
-		}
-		w := baselines[name]
-		// Capture pre-update stats so the sigma check is against the
-		// historical baseline, not the post-update one.
-		preCount := w.Count
-		preMean := w.Mean
-		preStd := w.StdDev()
-
-		// AC3 explicit: observations during warm-up are recorded but no
-		// anomaly results are emitted. Update Welford in both branches;
-		// emit only when not active.
-		w.Update(value)
-
-		if active {
-			continue
-		}
-		if preCount < 2 || preStd <= 0 {
-			continue
-		}
-		sigma := (value - preMean) / preStd
-		if sigma < sigmaMul {
-			continue
-		}
-		deviations = append(deviations, schema.BaselineDeviation{
-			Metric: name,
-			Value:  value,
-			Mean:   preMean,
-			StdDev: preStd,
-			Sigma:  sigma,
-			PodUID: resolvePodUID(pkg),
-		})
-	}
-
-	if err := e.store.Save(ctx, namespace, pod, baselines); err != nil {
-		e.log.Warn("baseline: store save failed", "namespace", namespace, "pod", pod, "err", err)
-		e.evalError.Add(1)
-		return "error", err
-	}
-
 	for _, dev := range deviations {
-		fireCtx, cancel := context.WithTimeout(ctx, publishAttemptTimeout)
-		if _, err := e.emit.FireBaselineDeviation(fireCtx, pkg.WorkloadID, dev); err != nil {
+		fireCtx, cancelFire := context.WithTimeout(parent, publishAttemptTimeout)
+		if _, err := e.emit.FireBaselineDeviation(fireCtx, tr.workloadID, tr.identity, dev); err != nil {
 			emitFailed = true
 			e.log.Warn("baseline: emit FireBaselineDeviation failed",
-				"workload_id", pkg.WorkloadID, "metric", dev.Metric, "err", err)
+				"workload_id", tr.workloadID, "metric", dev.Metric, "err", err)
 		} else {
-			// Story 1.18 AC3 per-(metric, sigma_bucket) bump. nil-
-			// guarded for tests that constructed the engine without a
-			// metrics registry.
+			e.log.Info("baseline: deviation",
+				"workload_id", tr.workloadID, "metric", dev.Metric, "value", dev.Value,
+				"mean", dev.Mean, "std_dev", dev.StdDev, "sigma", dev.Sigma)
 			if e.deviationsVec != nil {
 				e.deviationsVec.WithLabelValues(dev.Metric, sigmaBucket(dev.Sigma)).Inc()
 			}
 		}
-		cancel()
+		cancelFire()
 	}
-
+	normal := int64(len(nonEmpty) - deviating)
 	switch {
 	case emitFailed:
-		e.evalError.Add(1)
-		return "error", nil
-	case len(deviations) > 0:
-		e.evalDeviation.Add(1)
-		return "deviation", nil
+		e.evalError.Add(int64(deviating))
 	default:
-		e.evalNormal.Add(1)
-		return "normal", nil
+		e.evalDeviation.Add(int64(deviating))
 	}
+	e.evalNormal.Add(normal)
 }
 
-// resolveWorkloadKey returns the (namespace, pod) pair used to
-// address this workload's baseline hash in Redis. The architecture
-// pins the key as baseline:<namespace>:<pod>:metrics; the
-// WorkloadIdentity carries Namespace and OwnerName/OwnerKind, which
-// we collapse to a single token via "<kind>-<name>" so a Deployment
-// "web" and a StatefulSet "web" in the same namespace land in
-// distinct hashes. Orphan pods carry the literal pod name and use it
-// directly. When neither path resolves we fall back to the first
-// event's PodRef so test fixtures that omit WorkloadIdentity still
-// produce a stable key.
-func resolveWorkloadKey(pkg *schema.EvidencePackage) (string, string) {
-	id := pkg.WorkloadIdentity
+// reset zeroes the workload's Welford state (keeping the restarts metric
+// when keepRestarts) and starts warm-up. The zeroed state is saved FIRST
+// so a crash between the two writes leaves a zero baseline, never a
+// warm-up next to a stale baseline (Story 1.17 B14/E6).
+func (e *Engine) reset(ctx context.Context, ns, pod string, st State, keepRestarts bool) error {
+	for _, n := range e.metricList {
+		if keepRestarts && n == MetricRestartsPerHour {
+			continue
+		}
+		st.Welfords[n].Reset()
+	}
+	if err := e.store.Save(ctx, ns, pod, st.Welfords); err != nil {
+		return err
+	}
+	return e.warmup.Begin(ctx, ns, pod)
+}
+
+func (e *Engine) fail(op, ns, pod string, err error, samples int) {
+	e.log.Warn("baseline: "+op+" failed; samples not folded in", "namespace", ns, "workload", pod, "samples", samples, "err", err)
+	e.evalError.Add(int64(samples))
+}
+
+// workloadKey returns the (namespace, workload token) pair addressing a
+// workload's baseline hash (baseline:<namespace>:<token>:metrics). The
+// token is the pod name for an orphan pod and "<OwnerKind>-<OwnerName>"
+// otherwise, so a Deployment "web" and a StatefulSet "web" stay
+// distinct and every pod of a Deployment shares one baseline. Falls back
+// to the event's PodRef when the identity is empty.
+func workloadKey(id schema.WorkloadIdentity, ref schema.PodRef) (string, string) {
 	if id.Namespace != "" {
-		if id.PodName != "" {
+		if id.OwnerKind == "Pod" && id.PodName != "" {
 			return id.Namespace, id.PodName
 		}
 		if id.OwnerKind != "" && id.OwnerName != "" {
 			return id.Namespace, id.OwnerKind + "-" + id.OwnerName
 		}
 	}
-	for i := range pkg.Events {
-		ref := pkg.Events[i].Pod
-		if ref.Namespace != "" && ref.Name != "" {
-			return ref.Namespace, ref.Name
-		}
+	if ref.Namespace != "" && ref.Name != "" {
+		return ref.Namespace, ref.Name
 	}
 	return "", ""
-}
-
-// resolvePodUID returns the first non-empty Pod.UID across events
-// in pkg. BI-5 explicit: an empty result is acceptable. The downstream
-// baseline trigger constructor (correlator/trigger.BaselineDeviation)
-// sets trigger.EventID to this Pod UID directly, so when no Pod UID
-// resolves the EventID is left empty; package uniqueness is guaranteed
-// by PackageID (the assembler's per-Assembler seq counter), NOT by
-// EventID. (Story 3.8 DW3.5-2: the earlier "PackageID hash fallback"
-// note described a derivation that was never implemented; corrected
-// here to match the trigger constructor's actual behaviour.)
-func resolvePodUID(pkg *schema.EvidencePackage) string {
-	for i := range pkg.Events {
-		if uid := pkg.Events[i].Pod.UID; uid != "" {
-			return uid
-		}
-	}
-	return ""
-}
-
-// detectRestart returns true when any event in pkg is a CRI
-// lifecycle event marking a non-zero attempt. The CRI adapter emits
-// "attempt:N" tags per internal/collector/cri/translate.go:51-57.
-func (e *Engine) detectRestart(pkg *schema.EvidencePackage) bool {
-	for i := range pkg.Events {
-		ev := &pkg.Events[i]
-		if ev.Category != schema.CategoryLifecycle {
-			continue
-		}
-		if hasRestartAttemptTag(ev.Tags) {
-			return true
-		}
-	}
-	return false
-}
-
-func isExpectedFetchTimeout(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, jetstream.ErrNoMessages) {
-		return true
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
-	if strings.Contains(err.Error(), "nats: no messages") {
-		return true
-	}
-	return false
 }

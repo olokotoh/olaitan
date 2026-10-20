@@ -36,6 +36,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -316,8 +317,8 @@ spec:
 	return podName
 }
 
-// publishSyntheticEvidencePackages pre-seeds the per-workload baseline
-// store by publishing synthetic EvidencePackages directly to the
+// publishSyntheticEvidencePackagesFor (below) was written to pre-seed the
+// per-workload baseline store by publishing synthetic EvidencePackages directly to the
 // `olaitan.evidence.packages` subject. This bypasses the correlator's
 // rising-edge constraint -- the correlator only emits ONE package per
 // workload per 60s window (window/window.go:171-184), which would
@@ -341,6 +342,14 @@ spec:
 // Posture identity is set so `extractOutboundUniqueDstIPs` does not
 // blank out on the package-level k8s.* path and so the package keys
 // resolve cleanly via `resolveWorkloadKey`.
+//
+// Story 10.12: the baseline engine no longer reads EVIDENCE. It samples
+// the events the correlator attributes to each workload on one-minute
+// buckets, with warm-up for new workloads and a ten-sample minimum, so
+// these synthetic packages no longer prime any baseline (they still
+// reach the rules engine). The rs smoke does not call it any more; the
+// eval_matrix and scenarios_smoke callers are inert for the baseline
+// until Epic 11 removes the injection.
 // publishJS publishes via JetStream so the test fails loudly if the
 // subject is not bound to any stream (core NATS publish silently
 // drops in that case, which is exactly the failure mode that hid the
@@ -355,10 +364,6 @@ func publishJS(t *testing.T, js jetstream.JetStream, subject string, payload []b
 		t.Fatalf("jetstream publish %s: %v", subject, err)
 	}
 	t.Logf("js publish ok subject=%s stream=%s seq=%d", subject, ack.Stream, ack.Sequence)
-}
-
-func publishSyntheticEvidencePackages(t *testing.T, js jetstream.JetStream, podName string) {
-	publishSyntheticEvidencePackagesFor(t, js, podName, "web")
 }
 
 // publishSyntheticEvidencePackagesFor is the deployName-parameterised form of
@@ -603,6 +608,12 @@ func waitForBaselineConsumerDrained(t *testing.T, js jetstream.JetStream) {
 		cctx, ccancel := context.WithTimeout(context.Background(), 1*time.Second)
 		cons, cerr := stream.Consumer(cctx, "olaitan-baseline-engine")
 		ccancel()
+		if errors.Is(cerr, jetstream.ErrConsumerNotFound) {
+			// Story 10.12: the baseline engine deletes this durable on
+			// start and no longer reads EVIDENCE; nothing to drain.
+			t.Logf("waitForBaselineConsumerDrained: no baseline EVIDENCE consumer (Story 10.12); nothing to wait for")
+			return
+		}
 		if cerr == nil {
 			info, ierr := cons.Info(context.Background())
 			if ierr == nil && info.NumPending == 0 {
@@ -737,15 +748,15 @@ sample:
 	return total
 }
 
-// TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation is the AC5
-// pin: with the chart installed under `evaluation.config=RS`, a
-// synthetic S1 container-escape event published to
-// `olaitan.events.raw.falco` should produce at least one rule match
-// and one baseline deviation visible on the aggregator's Prometheus
-// surface within the NFR3 100 ms detection budget plus a comfortable
+// TestKindSmoke_RS_EmitsRuleMatch is the AC5 pin: with the chart
+// installed under `evaluation.config=RS`, a synthetic S1
+// container-escape event published to `olaitan.events.raw.falco` should
+// produce at least one rule match visible on the aggregator's Prometheus
+// surface (Story 10.12 dropped the baseline-deviation half: it rested on
+// synthetic EvidencePackages the baseline engine no longer reads) within the NFR3 100 ms detection budget plus a comfortable
 // 30-second poll ceiling (the test's wall-clock budget; the engine
 // internals operate well below it).
-func TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation(t *testing.T) {
+func TestKindSmoke_RS_EmitsRuleMatch(t *testing.T) {
 	requireKindCluster(t)
 	waitForPodsReady(t)
 	// Create a real Deployment-owned pod so the aggregator's
@@ -778,20 +789,11 @@ func TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("JetStream context: %v", err)
 	}
-	// Pre-seed the per-workload baseline by publishing 11 synthetic
-	// EvidencePackages directly onto EVIDENCE.packages. The correlator
-	// only emits one package per rising-edge transition per workload
-	// in the 60s window, which is insufficient observation history
-	// for the baseline engine (preCount<2, preStd=0) to ever fire a
-	// deviation in the 30s assertion budget. See the docstring on
-	// publishSyntheticEvidencePackages for the design rationale.
-	publishSyntheticEvidencePackages(t, js, podName)
-	// Wait for the baseline-engine durable consumer to drain the
-	// pre-seed packages before the correlator-emitted package lands
-	// behind them on the EVIDENCE stream. Poll the consumer's
-	// NumPending instead of a fixed sleep so loaded CI runners don't
-	// flake when the engine takes longer than expected.
-	waitForBaselineConsumerDrained(t, js)
+	// Story 10.12: no baseline pre-seed. A baseline deviation needs a
+	// warmed-up workload with at least ten one-minute samples, which a
+	// 90 s smoke cannot honestly produce; the baseline is proven by the
+	// unit and integration suites and by TestBaselineLive_RealWorkload
+	// (baseline_live_test.go) on a live cluster.
 	publishCorrelatorTrigger(t, js, podName)
 	ctx, cancel := context.WithTimeout(context.Background(), assertionTimeout)
 	defer cancel()
@@ -809,11 +811,10 @@ func TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation(t *testing.T) {
 	for {
 		metrics := scrapeMetrics(t)
 		matches := metrics["olaitan_decision_rules_matches_by_attribute_total"].sumWhere(map[string]string{"rule_id": "OLT-PRIV-001"})
-		deviations := metrics["olaitan_decision_baseline_deviations_total"].sumWhere(nil)
 		evidence := metrics["olaitan_correlator_evidence_packages_total"].sumWhere(nil)
 		if tick%4 == 0 {
-			t.Logf("poll tick=%d: rules_match[OLT-PRIV-001]=%v baseline_deviations=%v correlator_packages=%v rules_eval_total=%v baseline_eval_total=%v",
-				tick, matches, deviations, evidence,
+			t.Logf("poll tick=%d: rules_match[OLT-PRIV-001]=%v correlator_packages=%v rules_eval_total=%v baseline_eval_total=%v",
+				tick, matches, evidence,
 				metrics["olaitan_decision_rules_evaluations_total"].sumWhere(nil),
 				metrics["olaitan_decision_baseline_evaluations_total"].sumWhere(nil))
 		}
@@ -822,8 +823,6 @@ func TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation(t *testing.T) {
 		switch {
 		case matches < 1:
 			lastErr = fmt.Errorf("rule matches for OLT-PRIV-001 = %v; want >= 1", matches)
-		case deviations < 1:
-			lastErr = fmt.Errorf("baseline deviations = %v; want >= 1", deviations)
 		case evidence < 1:
 			lastErr = fmt.Errorf("correlator evidence packages = %v; want >= 1", evidence)
 		default:

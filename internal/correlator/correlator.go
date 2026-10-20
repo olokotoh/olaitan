@@ -104,6 +104,10 @@ type Correlator struct {
 
 	identityCache    sync.Map // map[string]identityCacheEntry, key = namespace + "/" + podName
 	identityCacheTTL time.Duration
+	// identityTTLReload carries a hot-reloaded TTL (nanoseconds) so
+	// UpdateConfig never writes identityCacheTTL while the consume
+	// goroutine reads it (Story 10.12 review, a pre-existing race).
+	identityTTLReload atomic.Int64
 	// aggregateMisses negative-caches Goldmane aggregates that no pod or
 	// ReplicaSet backs (key = namespace + "/" + aggregate name, value =
 	// expiry time.Time), so a stream of their flows costs one lookup per
@@ -141,6 +145,10 @@ type Correlator struct {
 	// rules the rules engine already matches on a published snapshot.
 	evaluator atomic.Pointer[evaluatorHolder]
 	ruleFired sync.Map // key workloadID + "\x00" + ruleID -> time.Time
+
+	// Story 10.12. observer receives every attributed event (the
+	// baseline engine); nil when none is installed.
+	observer atomic.Pointer[observerBox]
 }
 
 type identityCacheEntry struct {
@@ -208,7 +216,7 @@ func (c *Correlator) UpdateConfig(windowDuration time.Duration, minSources int) 
 		if ttl > identityCacheTTLCeiling {
 			ttl = identityCacheTTLCeiling
 		}
-		c.identityCacheTTL = ttl
+		c.identityTTLReload.Store(int64(ttl))
 	}
 	if minSources >= 2 {
 		c.minSources.Store(int64(minSources))
@@ -374,6 +382,10 @@ func (c *Correlator) AddEvent(ctx context.Context, ev schema.Event) (*schema.Evi
 		// outer Run loop already swallows the error and acks.
 		return nil, fmt.Errorf("correlator: resolve workload: %w", err)
 	}
+	// Story 10.12: the baseline engine samples every attributed event
+	// (Goldmane flows included, under their owner's workload id), not
+	// only the rising-edge packages. Non-blocking by contract.
+	c.notifyObserver(workloadID, identity, ev)
 	minSources := int(c.minSources.Load())
 	added, err := c.window.AddAndCheck(workloadID, ev, minSources)
 	if err != nil {
@@ -466,9 +478,23 @@ func (c *Correlator) FireRuleMatch(ctx context.Context, workloadID string, match
 	return c.publishTrigger(ctx, trigger.RuleMatch(workloadID, match, time.Now().UTC()), c.window.Snapshot(workloadID))
 }
 
-// FireBaselineDeviation handles the future Story 1.17 external baseline trigger input.
-func (c *Correlator) FireBaselineDeviation(ctx context.Context, workloadID string, deviation schema.BaselineDeviation) (*schema.EvidencePackage, error) {
-	return c.publishTrigger(ctx, trigger.BaselineDeviation(workloadID, deviation, time.Now().UTC()), c.window.Snapshot(workloadID))
+// FireBaselineDeviation handles the Story 1.17 baseline trigger input.
+//
+// identity is the workload identity the baseline engine sampled under
+// (Story 10.12). It is attached when the assembler could not resolve the
+// workload from the window itself: an empty window, or a window whose
+// first event is a Goldmane aggregate ("web-abc-*", not a pod name).
+// Otherwise the assembler resolves the first pod as before, which keeps
+// the full pod object for posture.
+func (c *Correlator) FireBaselineDeviation(ctx context.Context, workloadID string, identity schema.WorkloadIdentity, deviation schema.BaselineDeviation) (*schema.EvidencePackage, error) {
+	tr := trigger.BaselineDeviation(workloadID, deviation, time.Now().UTC())
+	snap := c.window.Snapshot(workloadID)
+	unresolvable := len(snap.Events) == 0 || strings.Contains(snap.Events[0].Pod.Name, "*")
+	if unresolvable && identity.Namespace != "" && identity.OwnerKind != "" && identity.OwnerName != "" {
+		id := identity
+		tr.ResolvedIdentity = &id
+	}
+	return c.publishTrigger(ctx, tr, snap)
 }
 
 func (c *Correlator) publishTrigger(ctx context.Context, tr trigger.Trigger, snap window.Snapshot) (*schema.EvidencePackage, error) {
@@ -561,7 +587,7 @@ func (c *Correlator) resolveAndCacheIdentity(ctx context.Context, ev schema.Even
 	if err != nil {
 		return "", schema.WorkloadIdentity{}, nil, err
 	}
-	ttl := c.identityCacheTTL
+	ttl := c.cacheTTL()
 	if isAggregate && pod == nil && ttl > aggregateNegativeTTL {
 		// Resolved through the ReplicaSet fallback with no live pod: keep it
 		// short so posture is taken from a real pod once one appears.

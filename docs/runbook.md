@@ -259,14 +259,26 @@ Wiring of the rate-limit counters above is in `cmd/olaitan/metrics.go:140-260` v
 - **Sample PromQL (aggregate):** `histogram_quantile(0.99, sum(rate(olaitan_decision_rules_evaluation_seconds_bucket[5m])) by (le))` (p99 evaluation latency).
 - **Sample PromQL (alert):** `histogram_quantile(0.99, sum(rate(olaitan_decision_rules_evaluation_seconds_bucket[5m])) by (le)) > 0.1` for 5 minutes (page on NFR3 budget breach).
 
-### 1.4 Baseline engine ring (Stories 1.17, 1.18)
+### 1.4 Baseline engine ring (Stories 1.17, 1.18, 10.12)
+
+Since Story 10.12 the engine samples every event the correlator attributes to a workload, on fixed one-minute buckets per workload (idle minutes are real zeros; a workload idle for an hour stops being tracked, its state stays in Redis). What each metric measures:
+
+| Metric | One sample per minute | Source shape read |
+|---|---|---|
+| `outbound_unique_dst_ips` | distinct destination endpoints of the workload's source-reported flows (Goldmane has no destination IP, so `type/namespace/name:port`) | flat `network.dest_name`/`network.dst_port`, else `flow.Key.*` |
+| `outbound_bytes` | bytes sent, source-reported flows only (each flow is reported twice with bytes swapped) | `network.bytes_out`, else `flow.bytes_out` |
+| `distinct_exec_paths` | distinct executables in the workload's Falco alerts (`proc.name` is never used) | `process.exe`, else `proc.exepath`, else `proc.exe` |
+| `audit_events_per_min` | API calls on the workload, excluding calls by Olaitan itself (the aggregator's own ServiceAccount, read from its token, and any ServiceAccount in a never-scored namespace) | audit `user.username` |
+| `container_restarts_per_hour` | restarts in the trailing hour (a container restart, or a recreated sandbox counted once), from created/started events only | CRI `attempt:N` (sandbox) or `container_attempt:N` (container) |
+
+A metric is sampled only once its source has been seen from any workload. A new workload, and a restarted one, is in warm-up (`baselines.warmupDuration`, default 30m); a metric also needs 10 samples before it can deviate. Sigma uses `max(std, floor, 0.1 x |mean|)` with floors of 2 for API calls, 1 for the other counts and 1024 bytes, so a perfectly steady workload needs a change of at least 6 calls or 3 executables/destinations (or 30% of a large mean) to fire. An event more than 2 minutes old on arrival (a backlog replayed after a restart) is not folded into a minute; see `olaitan_decision_baseline_observations_late_total`. Goldmane flows from a workload's pods (`web-abc-*`, resolved to their owner by Story 11.2b) feed the baseline as well as the correlation window. A baseline learnt before Story 10.12 is discarded on first sight (warm-up again). A restart keeps the restarts metric's history.
 
 #### `olaitan_decision_baseline_evaluations_total`
 
 - **Type:** counter
 - **Unit:** count
 - **Labels:** `outcome` (one of `deviation`, `normal`, `error`; cardinality 3)
-- **Help:** Per-package baseline-evaluation outcome counter. One outcome per handled package: deviation (>=1 metric crossed sigma and every emit succeeded), normal (no metric crossed sigma), error (decode failed or any per-metric emit failed). For per-metric cardinality see olaitan_decision_baseline_deviations_total.
+- **Help:** Per-sample baseline-evaluation outcome counter. One outcome per closed one-minute workload sample (Story 10.12): deviation (>=1 metric crossed sigma and every emit succeeded), normal (no metric crossed sigma), error (Redis or any per-metric emit failed). For per-metric cardinality see olaitan_decision_baseline_deviations_total.
 - **Sample PromQL (aggregate):** `sum(rate(olaitan_decision_baseline_evaluations_total[5m])) by (outcome)`.
 - **Sample PromQL (alert):** `rate(olaitan_decision_baseline_evaluations_total{outcome="error"}[5m]) > 0.1` for 5 minutes.
 
@@ -279,20 +291,36 @@ Wiring of the rate-limit counters above is in `cmd/olaitan/metrics.go:140-260` v
 - **Sample PromQL (aggregate):** `sum(rate(olaitan_decision_baseline_deviations_total[5m])) by (metric, sigma_bucket)`.
 - **Sample PromQL (alert):** `rate(olaitan_decision_baseline_deviations_total{sigma_bucket="10+"}[5m]) > 0.05` for 10 minutes (page on sustained 10+ sigma deviation rate suggesting an unusual workload pattern).
 
-#### `olaitan_decision_baseline_skipped_self_total`
+#### `olaitan_decision_baseline_observations_dropped_total` (Story 10.12 NEW; replaces `olaitan_decision_baseline_skipped_self_total`, retired with the EVIDENCE consumer)
 
 - **Type:** counter
 - **Unit:** count
 - **Labels:** none
-- **Help:** Cumulative inbound packages skipped because their trigger type was baseline_deviation (re-entrancy guard).
-- **Sample PromQL (aggregate):** `rate(olaitan_decision_baseline_skipped_self_total[1h])`.
+- **Help:** Cumulative events the correlator handed to the baseline engine that were dropped because the engine's bounded queue was full (Story 10.12). Non-zero means the engine fell behind the event stream and baselines under-count.
+- **Sample PromQL (alert):** `rate(olaitan_decision_baseline_observations_dropped_total[5m]) > 0` for 10 minutes.
+
+#### `olaitan_decision_baseline_observations_late_total` (Story 10.12 NEW)
+
+- **Type:** counter
+- **Unit:** count
+- **Labels:** none
+- **Help:** Cumulative events not folded into a baseline minute because they were more than 2 minutes old on arrival (Story 10.12): a replayed backlog after a restart or outage, which would otherwise land in one minute as a false burst.
+- **Sample PromQL (aggregate):** `rate(olaitan_decision_baseline_observations_late_total[5m])` (a sustained non-zero rate means the pipeline runs more than 2 minutes behind).
+
+#### `olaitan_decision_baseline_tracked_workloads` (Story 10.12 NEW)
+
+- **Type:** gauge
+- **Unit:** count
+- **Labels:** none
+- **Help:** Workloads the baseline engine currently samples every minute (Story 10.12). A workload is dropped after an hour without events; its learnt state stays in Redis.
+- **Sample PromQL (aggregate):** `olaitan_decision_baseline_tracked_workloads`.
 
 #### `olaitan_decision_baseline_warmup_active`
 
 - **Type:** gauge
 - **Unit:** count
 - **Labels:** none (per BI-2 of Story 1.18; `architecture.md:476` forbids the `{workload}` label suggested by AC3's literal text because workload-keyed labels have unbounded cardinality)
-- **Help:** Count of workloads currently within an active warm-up window (FR18). Sampled from the Warmup controller cache; cardinality bounded by the workload set under the controller's reach.
+- **Help:** Count of workloads currently within an active warm-up window (FR18). Since Story 10.12 a new workload starts warm-up on its first sample, as well as a restarted one.
 - **Sample PromQL (aggregate):** `olaitan_decision_baseline_warmup_active`.
 - **Per-workload telemetry:** the per-workload warm-up detail (which specific workloads are in warm-up at any given moment) is surfaced through the `AUDIT.transitions` subject (shipped in Story 2.8; see "Append-only SIEM audit subjects" below), not through Prometheus. SIEM-side consumers subscribe to the audit subjects when they need pod-level granularity.
 
@@ -301,7 +329,7 @@ Wiring of the rate-limit counters above is in `cmd/olaitan/metrics.go:140-260` v
 - **Type:** histogram
 - **Unit:** seconds
 - **Labels:** none (buckets `[0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250]`, NFR3-sized)
-- **Help:** Per-package baseline-engine evaluation latency in seconds; histogram buckets are sized against NFR3 (p99 <= 100 ms).
+- **Help:** Per-sample baseline-engine evaluation latency in seconds (Redis load, Welford update, save, emit); histogram buckets are sized against NFR3 (p99 <= 100 ms).
 - **Sample PromQL (aggregate):** `histogram_quantile(0.99, sum(rate(olaitan_decision_baseline_evaluation_seconds_bucket[5m])) by (le))`.
 - **Sample PromQL (alert):** `histogram_quantile(0.99, sum(rate(olaitan_decision_baseline_evaluation_seconds_bucket[5m])) by (le)) > 0.1` for 5 minutes.
 
@@ -1827,7 +1855,7 @@ documented runtime is approximately 5 to 7 minutes end-to-end (kind bring-up +
 chart install + the readiness gate + the smoke test), comfortably inside the
 <= 15-minute window. **Honest provenance note:** this runbook does NOT assert a
 freshly-run live install from this writing session; the working-deployment proof
-is the green CI `e2e` job (`TestKindSmoke_RS_EmitsRuleMatchAndBaselineDeviation`
+is the green CI `e2e` job (`TestKindSmoke_RS_EmitsRuleMatch`
 + `TestEvalSmoke_S1_RS_OneTrial`, `tests/e2e/`) that exercises exactly the
 command above on every change. The documented invocation was render-verified
 (`helm lint` clean, `helm template` renders all 31 manifests) at authoring time.

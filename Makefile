@@ -10,7 +10,7 @@ AUDIT_POLICY_SRC := config/audit-policy-default.yaml
 CHART_FILES      := $(CHART_DIR)/files/olaitan.yaml $(CHART_DIR)/files/audit-policy-default.yaml
 
 .PHONY: quickstart quickstart-clean up down
-.PHONY: scenarios-validate e2e-full e2e-full-down e2e-full-real-llm build test lint olaitan-lint prereg-check analysis analysis-test docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics e2e-local-overlays eval-smoke scenarios-smoke capture-it e2e-local-down schemas helm-values-doc preflight
+.PHONY: scenarios-validate e2e-full e2e-full-down e2e-full-baseline-live e2e-full-real-llm build test lint olaitan-lint prereg-check analysis analysis-test docker-build clean helm-prepare helm-prepare-rules clean-staged-rules helm-prepare-prompts clean-staged-prompts helm-lint helm-template helm-deps version-tag envtest-bin e2e-local e2e-local-rslt e2e-local-forensics e2e-local-overlays eval-smoke scenarios-smoke capture-it e2e-local-down schemas helm-values-doc preflight
 
 # envtest-bin downloads the kube-apiserver and etcd binaries that the
 # Story 1.11 posture-client integration tests (and any future
@@ -452,6 +452,19 @@ e2e-local-forensics: helm-prepare helm-deps docker-build
 # upgrades without --reuse-values. FULL_CLUSTER_NAME and FULL_OUT_DIR are
 # defined once, with the Story 10.5 e2e-full target below.
 .PHONY: e2e-full-report-archive
+# Story 10.12 live gate: the baseline engine on real telemetry. A real
+# steady workload runs for the warm-up plus 15 evaluated minutes (no deviation
+# allowed), then switches to a real API burst, exec burst and new egress
+# (each must produce a baseline_deviation package). About 55 minutes. Run it
+# after `make e2e-full` on the build under test (a 30m warm-up, not an
+# overlay that shortened it); the test only reads EVIDENCE.
+e2e-full-baseline-live:
+	kind get clusters | grep -qx '$(FULL_CLUSTER_NAME)' || \
+		{ echo 'kind cluster $(FULL_CLUSTER_NAME) not found; run make e2e-full first' >&2; exit 1; }
+	KUBECONFIG=$(FULL_OUT_DIR)/kubeconfig \
+		KIND_CLUSTER_NAME=$(FULL_CLUSTER_NAME) OLT_E2E_FULL=1 OLT_E2E_BASELINE_LIVE=1 \
+		go test -tags=e2e -v -count=1 -timeout 80m -run 'TestBaselineLive_RealWorkload|TestFalcoSourceIsLive' ./tests/e2e/...
+
 e2e-full-report-archive: helm-prepare helm-deps docker-build
 	kind get clusters | grep -qx '$(FULL_CLUSTER_NAME)' || \
 		{ echo 'kind cluster $(FULL_CLUSTER_NAME) not found; run make e2e-full first' >&2; exit 1; }

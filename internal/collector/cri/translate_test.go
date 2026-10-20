@@ -547,3 +547,52 @@ func TestTranslate_SanitizesSummaryControlChars(t *testing.T) {
 		t.Errorf("Summary still carries control characters after P18 sanitization: %q", got.Summary)
 	}
 }
+
+// Story 10.12 B5. A container restarted in place (CrashLoopBackOff) keeps
+// its sandbox, so the sandbox attempt stays 0 and no "attempt:N" tag was
+// emitted: on the 2026-10-19 live run no lifecycle event carried one, and
+// the baseline's restart detection and container_restarts_per_hour never
+// fired. The event's own container status carries the container attempt.
+func TestTranslate_ContainerAttemptNonZero_Tagged(t *testing.T) {
+	ev := makeEvent(func(e *runtimeapi.ContainerEventResponse) {
+		e.ContainerEventType = runtimeapi.ContainerEventType_CONTAINER_CREATED_EVENT
+		e.ContainersStatuses = []*runtimeapi.ContainerStatus{
+			// A sibling container that restarted earlier must not tag
+			// this event.
+			{Id: "sibling", Metadata: &runtimeapi.ContainerMetadata{Name: "sidecar", Attempt: 5}},
+			{Id: e.ContainerId, Metadata: &runtimeapi.ContainerMetadata{Name: "app", Attempt: 2}},
+		}
+	})
+	got, err := Translate(ev, "node-1")
+	if err != nil {
+		t.Fatalf("Translate: %v", err)
+	}
+	if !containsTag(got.Tags, "container_attempt:2") {
+		t.Fatalf("tags %v lack container_attempt:2", got.Tags)
+	}
+	if containsTag(got.Tags, "container_attempt:5") || containsTag(got.Tags, "attempt:2") {
+		t.Fatalf("tags %v carry a sibling's attempt or a sandbox attempt that did not change", got.Tags)
+	}
+}
+
+func TestTranslate_ContainerAttemptZeroOrMissing_NoTag(t *testing.T) {
+	for name, statuses := range map[string][]*runtimeapi.ContainerStatus{
+		"attempt zero":       {{Id: "abc123def4567890aabbccddeeff0011", Metadata: &runtimeapi.ContainerMetadata{Name: "app", Attempt: 0}}},
+		"no metadata":        {{Id: "abc123def4567890aabbccddeeff0011"}},
+		"no own status":      {{Id: "other", Metadata: &runtimeapi.ContainerMetadata{Attempt: 3}}},
+		"no statuses at all": nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			ev := makeEvent(func(e *runtimeapi.ContainerEventResponse) { e.ContainersStatuses = statuses })
+			got, err := Translate(ev, "node-1")
+			if err != nil {
+				t.Fatalf("Translate: %v", err)
+			}
+			for _, tag := range got.Tags {
+				if strings.HasPrefix(tag, "container_attempt:") {
+					t.Fatalf("unexpected tag %q", tag)
+				}
+			}
+		})
+	}
+}

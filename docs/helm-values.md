@@ -142,7 +142,7 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 
 | Value | Type | Default | Valid range | Effect | Ref |
 |-------|------|---------|-------------|--------|-----|
-| `baselines.warmupDuration` | duration | `"30m"` | - | baseline warm-up window after a container restart; deviations are suppressed during it (FR18) | FR18 |
+| `baselines.warmupDuration` | duration | `"30m"` | - | baseline warm-up window for a new workload and after a container restart; deviations are suppressed during it (FR18) | FR18 |
 | `baselines.sigmaMultiplier` | number | `3.0` | minimum 0 | standard deviations above the rolling mean at which a BaselineDeviation is emitted | FR18 |
 
 ## `score`
