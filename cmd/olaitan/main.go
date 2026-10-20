@@ -601,14 +601,14 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		log.Info("aggregator: rules engine disabled in config; skipping")
 	}
 
-	// Story 1.17: Welford baseline engine wiring. The engine consumes
-	// EvidencePackages from EVIDENCE.packages, maintains per-workload
-	// Welford state for the five default metrics, and re-emits
-	// deviations through the correlator's FireBaselineDeviation entry
-	// point (the correlator satisfies the BaselineDeviationEmitter
-	// interface by signature). When baselines.enabled=false the engine
-	// is skipped entirely; the JetStream consumer
-	// olaitan-baseline-engine is not created and Redis is not dialled.
+	// Story 1.17: Welford baseline engine wiring. Since Story 10.12 the
+	// engine samples every event the correlator attributes to a workload
+	// (correlator.SetEventObserver) on fixed one-minute buckets, keeps
+	// per-workload Welford state for the five default metrics in Redis,
+	// and re-emits deviations through the correlator's
+	// FireBaselineDeviation entry point. It no longer reads EVIDENCE.
+	// When baselines.enabled=false the engine is skipped entirely: no
+	// observer is installed and Redis is not dialled.
 	if cfg.Detection.Baselines.EnabledOrDefault() {
 		// Defensive Path-non-empty equivalent (Story 1.15 P22 pattern):
 		// validate() skips the RedisAddr check when Enabled is nil.
@@ -630,6 +630,7 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 				}
 				baselineEngine.SetSigmaMultiplier(newCfg.Detection.Baselines.SigmaMultiplierOrDefault())
 				baselineEngine.SetWarmupDuration(newCfg.Detection.Baselines.WarmupDurationOrDefault())
+				baselineEngine.SetOwnNamespaces(newCfg.Detection.Correlator.NeverScoredNamespaces)
 				// Copilot C5 + Edge Case Hunter E1 + Acceptance
 				// Auditor A1: both knobs are hot-reloadable per BI-3.
 				// Without the SetWarmupDuration call, warmupDuration
@@ -637,6 +638,7 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 				// values comment + BI-3 docstring claiming hot-reload.
 			})
 		}
+		corr.SetEventObserver(baselineEngine)
 		g.Go(func() error {
 			if err := baselineEngine.Run(ctx); err != nil {
 				return fmt.Errorf("aggregator: baseline engine run: %w", err)
@@ -1314,6 +1316,10 @@ func wireBaselineEngine(ctx context.Context, cfg *config.Config, nc *natsclient.
 		Metrics:         metricsReg,
 		Log:             log,
 		SigmaMultiplier: cfg.Detection.Baselines.SigmaMultiplierOrDefault(),
+		// Story 10.12: audit calls by Olaitan's own ServiceAccounts are
+		// not workload behaviour.
+		OwnNamespaces: cfg.Detection.Correlator.NeverScoredNamespaces,
+		OwnActors:     []string{ownServiceAccountUsername(serviceAccountTokenPath)},
 	})
 	if err != nil {
 		closer()

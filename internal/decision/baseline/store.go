@@ -32,6 +32,15 @@ type MetricKey struct {
 const (
 	warmupFieldStartedAtNs = "warmup.started_at_ns"
 	warmupFieldDurationNs  = "warmup.duration_ns"
+
+	// schemaField records which sampling semantics the Welford state in
+	// the hash was learnt under. Story 10.12 moved every metric from the
+	// EvidencePackage window to fixed one-minute buckets; a hash without
+	// schemaField = schemaVersion holds means and variances of a
+	// different quantity, so the engine treats it as a new workload
+	// (zeroed, warm-up) instead of comparing new samples against it.
+	schemaField   = "baseline.schema"
+	schemaVersion = "2"
 )
 
 // Store persists per-workload Welford state into the baseline family
@@ -124,7 +133,8 @@ func (s *Store) Save(ctx context.Context, namespace, pod string, baselines map[s
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	fields := make(map[string]any, len(baselines)*3)
+	fields := make(map[string]any, len(baselines)*3+1)
+	fields[schemaField] = schemaVersion
 	for _, name := range names {
 		w := baselines[name]
 		if w == nil {
@@ -202,4 +212,64 @@ func (s *Store) SaveWarmup(ctx context.Context, namespace, pod string, startedAt
 		return fmt.Errorf("baseline: save warmup %q: %w", key, err)
 	}
 	return nil
+}
+
+// State is everything the engine needs from one workload's hash, read in
+// a single HGETALL.
+type State struct {
+	// Welfords holds one entry per requested metric (zero-valued when
+	// the hash has no fields for it).
+	Welfords map[string]*Welford
+	// SchemaCurrent is true when the hash was written under the current
+	// sampling semantics (schemaField = schemaVersion).
+	SchemaCurrent bool
+	// HasHistory is true when any requested metric has Count > 0.
+	HasHistory bool
+	// WarmupRecorded is true when a warm-up window was ever recorded for
+	// the workload (active or expired).
+	WarmupRecorded bool
+}
+
+// LoadState reads the workload's Welford state plus the schema and
+// warm-up markers in one round-trip. A missing hash returns a zero State
+// (no history, no warm-up, schema not current).
+func (s *Store) LoadState(ctx context.Context, namespace, pod string, metricNames []string) (State, error) {
+	st := State{Welfords: make(map[string]*Welford, len(metricNames))}
+	for _, m := range metricNames {
+		st.Welfords[m] = &Welford{}
+	}
+	key, err := keys.BaselineMetrics(namespace, pod)
+	if err != nil {
+		return State{}, fmt.Errorf("baseline: store load state: %w", err)
+	}
+	rdb := s.client.Raw()
+	if rdb == nil {
+		return State{}, redisclient.ErrClientClosed
+	}
+	all, err := rdb.HGetAll(ctx, key).Result()
+	if err != nil {
+		if errors.Is(err, goredis.Nil) {
+			return st, nil
+		}
+		return State{}, fmt.Errorf("baseline: hgetall %q: %w", key, err)
+	}
+	st.SchemaCurrent = all[schemaField] == schemaVersion
+	_, hasStart := all[warmupFieldStartedAtNs]
+	_, hasDur := all[warmupFieldDurationNs]
+	st.WarmupRecorded = hasStart && hasDur
+	for _, m := range metricNames {
+		fields := map[string]string{}
+		for _, f := range []string{"count", "mean", "m2"} {
+			if v, ok := all[m+"."+f]; ok {
+				fields[f] = v
+			}
+		}
+		if err := st.Welfords[m].UnmarshalRedisHash(fields); err != nil {
+			return State{}, fmt.Errorf("baseline: unmarshal metric %q: %w", m, err)
+		}
+		if st.Welfords[m].Count > 0 {
+			st.HasHistory = true
+		}
+	}
+	return st, nil
 }

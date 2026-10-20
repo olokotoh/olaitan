@@ -98,12 +98,16 @@ subscribes the whole hierarchy via the `olaitan.events.raw.>` wildcard.
 
 The correlator assembles per-pod evidence and publishes one
 `EvidencePackage` per correlated group. This is the central fan-out: a
-single producer feeds three parallel decision consumers (the
-deterministic FSM, the rule engine, and the baseline engine).
+single producer feeds the parallel decision consumers (the
+deterministic FSM and the rule engine). The baseline engine does not
+read this subject since Story 10.12: it samples the events the
+correlator attributes to each workload in process
+(`correlator.SetEventObserver`), and deletes its old
+`olaitan-baseline-engine` durable on start.
 
 | Subject | Constant | Producer | Consumers |
 |---|---|---|---|
-| `olaitan.evidence.packages` | `EvidencePackages` | Correlator, `internal/correlator/correlator.go:292` (`WithMsgID(pkg.PackageID)`) | `olaitan-response-fsm`, `cmd/olaitan/main.go:1718`; `olaitan-rules-engine`, `internal/decision/rules/engine.go:314`; `olaitan-baseline-engine`, `internal/decision/baseline/engine.go:315` |
+| `olaitan.evidence.packages` | `EvidencePackages` | Correlator, `internal/correlator/correlator.go:292` (`WithMsgID(pkg.PackageID)`) | `olaitan-response-fsm`, `cmd/olaitan/main.go:1718`; `olaitan-rules-engine`, `internal/decision/rules/engine.go:314` |
 
 - **Payload schema:** `internal/schema/` `EvidencePackage`. No committed
   YAML schema yet; Story 6.3 adds it.

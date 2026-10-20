@@ -1018,13 +1018,17 @@ rules:
 # block at the bottom of this file for the full arm semantics.
 baselines:
   # Whether startAggregatorRing constructs the baseline engine. Setting
-  # to false leaves the Redis client out of the aggregator ring and the
-  # JetStream consumer olaitan-baseline-engine is not created.
+  # to false leaves the Redis client out of the aggregator ring and no
+  # event observer is installed on the correlator. Since Story 10.12 the
+  # engine samples every event the correlator attributes to a workload on
+  # fixed one-minute buckets; it no longer reads EVIDENCE packages.
   enabled: true
 
-  # Warm-up window applied after each detected container restart. AC3
-  # default is 30 minutes. Hot-reloadable.
-  # @schema type:duration effect:"baseline warm-up window after a container restart; deviations are suppressed during it (FR18)" ref:FR18
+  # Warm-up window applied to a new workload from its first sample and
+  # after each detected container restart (Story 10.12). AC3 default is
+  # 30 minutes. Independently of it, a metric needs ten one-minute
+  # samples before it can deviate. Hot-reloadable.
+  # @schema type:duration effect:"baseline warm-up window for a new workload and after a container restart; deviations are suppressed during it (FR18)" ref:FR18
   warmupDuration: "30m"
 
   # Number of standard deviations above the rolling mean at which a

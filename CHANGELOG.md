@@ -196,6 +196,23 @@ and false-positive numbers; see [Unreleased](#unreleased).
     excluding `app.kubernetes.io/component=applog-injector`, so under
     `failurePolicy: Fail` a broken injector no longer refuses its own
     replacement pods.
+- **The baseline engine works on real telemetry** (Story 10.12, #212). It
+  used to baseline EvidencePackages, which are rising-edge snapshots with
+  windows often under a second: a benign workload raised false
+  `audit_events_per_min` deviations and a real 80-call API burst was missed.
+  It now samples every event the correlator attributes to a workload on
+  fixed one-minute buckets, reads the real Falco, Calico Goldmane, audit and
+  CRI shapes (flat `process.exe` / `network.*`, nested `flow.*`, Src-reported
+  flows only), ignores Olaitan's own API calls, warms up new workloads, needs
+  ten samples and applies a stddev floor before sigma counts, and does not
+  fold a replayed backlog into one minute. Goldmane flows (resolved to
+  their workload by Story 11.2b) feed the baseline as well as the
+  correlation window, and the CRI adapter tags
+  in-place container restarts (`container_attempt:N`). Baselines learnt before this change are discarded
+  once (a fresh warm-up). New metrics: `olaitan_decision_baseline_observations_dropped_total`,
+  `olaitan_decision_baseline_observations_late_total`,
+  `olaitan_decision_baseline_tracked_workloads`; `olaitan_decision_baseline_skipped_self_total`
+  is retired. Live gate: `make e2e-full-baseline-live`.
 
 - **The quickstart's score was not the read's** (follows up #177 and #181).
   The README and `make quickstart` showed "CLEAN to SUSPICIOUS at score 36"

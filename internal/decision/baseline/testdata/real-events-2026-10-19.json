@@ -1,0 +1,825 @@
+{
+ "audit_olaitan_self_lookup": {
+  "category": "audit",
+  "id": "01743b1f-3254-4e88-b318-532fe1040b9b",
+  "pod": {
+   "name": "steady-7d8fc54b55-n4psz",
+   "namespace": "olt-baseline",
+   "node": "olaitan-full-control-plane",
+   "uid": ""
+  },
+  "raw": {
+   "apiVersion": "audit.k8s.io/v1",
+   "auditID": "01743b1f-3254-4e88-b318-532fe1040b9b",
+   "kind": "Event",
+   "level": "Metadata",
+   "objectRef": {
+    "apiVersion": "v1",
+    "name": "steady-7d8fc54b55-n4psz",
+    "namespace": "olt-baseline",
+    "resource": "pods"
+   },
+   "requestReceivedTimestamp": "2026-10-19T20:54:19.299706Z",
+   "requestURI": "/api/v1/namespaces/olt-baseline/pods/steady-7d8fc54b55-n4psz",
+   "responseStatus": {
+    "code": 200,
+    "metadata": {}
+   },
+   "stage": "ResponseComplete",
+   "stageTimestamp": "2026-10-19T20:54:19.302182Z",
+   "user": {
+    "groups": [
+     "system:serviceaccounts",
+     "system:serviceaccounts:default",
+     "system:authenticated"
+    ],
+    "username": "system:serviceaccount:default:olaitan-aggregator"
+   },
+   "verb": "get"
+  },
+  "severity": "informational",
+  "source": "audit",
+  "summary": "get olt-baseline/pods/steady-7d8fc54b55-n4psz by system:serviceaccount:default:olaitan-aggregator",
+  "tags": [
+   "verb:get",
+   "resource:pods",
+   "stage:ResponseComplete",
+   "decision:allow"
+  ],
+  "timestamp": "2026-10-19T20:54:19.299706Z"
+ },
+ "audit_operator_exec": {
+  "category": "audit",
+  "id": "2234c875-fb52-4624-bbdb-6128e0ff06d9",
+  "pod": {
+   "name": "steady-7d8fc54b55-n4psz",
+   "namespace": "olt-baseline",
+   "node": "olaitan-full-control-plane",
+   "uid": ""
+  },
+  "raw": {
+   "apiVersion": "audit.k8s.io/v1",
+   "auditID": "2234c875-fb52-4624-bbdb-6128e0ff06d9",
+   "kind": "Event",
+   "level": "Request",
+   "objectRef": {
+    "apiVersion": "v1",
+    "name": "steady-7d8fc54b55-n4psz",
+    "namespace": "olt-baseline",
+    "resource": "pods",
+    "subresource": "exec"
+   },
+   "requestReceivedTimestamp": "2026-10-19T21:02:33.16031Z",
+   "requestURI": "/api/v1/namespaces/olt-baseline/pods/steady-7d8fc54b55-n4psz/exec?command=wget&command=-q&command=-T&command=5&command=-O&command=-&command=http%3A%2F%2Fpeer.olt-peer.svc%3A8080%2F&container=app&stderr=true&stdout=true",
+   "responseStatus": {
+    "code": 101,
+    "metadata": {}
+   },
+   "stage": "ResponseComplete",
+   "stageTimestamp": "2026-10-19T21:02:33.201956Z",
+   "user": {
+    "groups": [
+     "kubeadm:cluster-admins",
+     "system:authenticated"
+    ],
+    "username": "kubernetes-admin"
+   },
+   "verb": "get"
+  },
+  "severity": "warning",
+  "source": "audit",
+  "summary": "get olt-baseline/pods/exec/steady-7d8fc54b55-n4psz by kubernetes-admin",
+  "tags": [
+   "verb:get",
+   "resource:pods/exec",
+   "stage:ResponseComplete",
+   "decision:allow"
+  ],
+  "timestamp": "2026-10-19T21:02:33.16031Z"
+ },
+ "cni_flows_s4": [
+  {
+   "category": "flow",
+   "id": "calico-flow-1792443135-74",
+   "pod": {
+    "name": "web-bd846c7f-*",
+    "namespace": "tenant-acme",
+    "node": "olaitan-full-worker",
+    "uid": ""
+   },
+   "raw": {
+    "flow": {
+     "Key": {
+      "action": "Allow",
+      "dest_name": "s4-c2-sink-65cbd8c966-*",
+      "dest_namespace": "tenant-acme",
+      "dest_port": "8443",
+      "dest_service_name": "s4-c2-sink",
+      "dest_service_namespace": "tenant-acme",
+      "dest_service_port": "8443",
+      "dest_service_port_name": "-",
+      "dest_type": "WorkloadEndpoint",
+      "policies": {
+       "enforced_policies": [
+        {
+         "action": "Allow",
+         "kind": "Profile",
+         "name": "kns.tenant-acme"
+        }
+       ],
+       "pending_policies": [
+        {
+         "action": "Allow",
+         "kind": "Profile",
+         "name": "kns.tenant-acme"
+        }
+       ]
+      },
+      "proto": "tcp",
+      "reporter": "Dst",
+      "source_name": "web-bd846c7f-*",
+      "source_namespace": "tenant-acme",
+      "source_type": "WorkloadEndpoint"
+     },
+     "bytes_in": "275",
+     "bytes_out": "164",
+     "dest_labels": [
+      "app=s4-c2-sink",
+      "pod-template-hash=65cbd8c966"
+     ],
+     "end_time": "1792443150",
+     "num_connections_completed": "1",
+     "num_connections_live": "1",
+     "num_connections_started": "1",
+     "packets_in": "5",
+     "packets_out": "3",
+     "source_labels": [
+      "app=web",
+      "pod-template-hash=bd846c7f"
+     ],
+     "start_time": "1792443135"
+    },
+    "id": "74",
+    "network.bytes_out": "164",
+    "network.connections_live": "1",
+    "network.connections_started": "1",
+    "network.dest_name": "s4-c2-sink-65cbd8c966-*",
+    "network.dest_type": "workload",
+    "network.dst_port": "8443",
+    "network.protocol": "TCP"
+   },
+   "severity": "informational",
+   "source": "network",
+   "summary": "tenant-acme/web-bd846c7f-* -> tenant-acme/s4-c2-sink-65cbd8c966-*:8443 (tcp, allow, dst)",
+   "tags": [
+    "proto:tcp",
+    "action:allow",
+    "reporter:dst",
+    "src-type:workload",
+    "dst-type:workload",
+    "dst-port:8443",
+    "pod_name_kind:generatename",
+    "svc:tenant-acme/s4-c2-sink",
+    "conns-started:1",
+    "policy:profile/-/kns.tenant-acme:allow",
+    "policy:profile/-/kns.tenant-acme:allow"
+   ],
+   "timestamp": "2026-10-19T20:52:15Z"
+  },
+  {
+   "category": "flow",
+   "id": "calico-flow-1792443135-77",
+   "pod": {
+    "name": "web-bd846c7f-*",
+    "namespace": "tenant-acme",
+    "node": "olaitan-full-worker2",
+    "uid": ""
+   },
+   "raw": {
+    "flow": {
+     "Key": {
+      "action": "Allow",
+      "dest_name": "s4-c2-sink-65cbd8c966-*",
+      "dest_namespace": "tenant-acme",
+      "dest_port": "8443",
+      "dest_service_name": "s4-c2-sink",
+      "dest_service_namespace": "tenant-acme",
+      "dest_service_port": "8443",
+      "dest_service_port_name": "-",
+      "dest_type": "WorkloadEndpoint",
+      "policies": {
+       "enforced_policies": [
+        {
+         "action": "Allow",
+         "kind": "Profile",
+         "name": "kns.tenant-acme"
+        }
+       ],
+       "pending_policies": [
+        {
+         "action": "Allow",
+         "kind": "Profile",
+         "name": "kns.tenant-acme"
+        }
+       ]
+      },
+      "proto": "tcp",
+      "reporter": "Src",
+      "source_name": "web-bd846c7f-*",
+      "source_namespace": "tenant-acme",
+      "source_type": "WorkloadEndpoint"
+     },
+     "bytes_in": "164",
+     "bytes_out": "275",
+     "dest_labels": [
+      "app=s4-c2-sink",
+      "pod-template-hash=65cbd8c966"
+     ],
+     "end_time": "1792443150",
+     "num_connections_completed": "1",
+     "num_connections_live": "1",
+     "num_connections_started": "1",
+     "packets_in": "3",
+     "packets_out": "5",
+     "source_labels": [
+      "app=web",
+      "pod-template-hash=bd846c7f"
+     ],
+     "start_time": "1792443135"
+    },
+    "id": "77",
+    "network.bytes_out": "275",
+    "network.connections_live": "1",
+    "network.connections_started": "1",
+    "network.dest_name": "s4-c2-sink-65cbd8c966-*",
+    "network.dest_type": "workload",
+    "network.dst_port": "8443",
+    "network.protocol": "TCP"
+   },
+   "severity": "informational",
+   "source": "network",
+   "summary": "tenant-acme/web-bd846c7f-* -> tenant-acme/s4-c2-sink-65cbd8c966-*:8443 (tcp, allow, src)",
+   "tags": [
+    "proto:tcp",
+    "action:allow",
+    "reporter:src",
+    "src-type:workload",
+    "dst-type:workload",
+    "dst-port:8443",
+    "pod_name_kind:generatename",
+    "svc:tenant-acme/s4-c2-sink",
+    "conns-started:1",
+    "policy:profile/-/kns.tenant-acme:allow",
+    "policy:profile/-/kns.tenant-acme:allow"
+   ],
+   "timestamp": "2026-10-19T20:52:15Z"
+  },
+  {
+   "category": "flow",
+   "id": "calico-flow-1792443150-77",
+   "pod": {
+    "name": "web-bd846c7f-*",
+    "namespace": "tenant-acme",
+    "node": "olaitan-full-worker2",
+    "uid": ""
+   },
+   "raw": {
+    "flow": {
+     "Key": {
+      "action": "Allow",
+      "dest_name": "s4-c2-sink-65cbd8c966-*",
+      "dest_namespace": "tenant-acme",
+      "dest_port": "8443",
+      "dest_service_name": "s4-c2-sink",
+      "dest_service_namespace": "tenant-acme",
+      "dest_service_port": "8443",
+      "dest_service_port_name": "-",
+      "dest_type": "WorkloadEndpoint",
+      "policies": {
+       "enforced_policies": [
+        {
+         "action": "Allow",
+         "kind": "Profile",
+         "name": "kns.tenant-acme"
+        }
+       ],
+       "pending_policies": [
+        {
+         "action": "Allow",
+         "kind": "Profile",
+         "name": "kns.tenant-acme"
+        }
+       ]
+      },
+      "proto": "tcp",
+      "reporter": "Src",
+      "source_name": "web-bd846c7f-*",
+      "source_namespace": "tenant-acme",
+      "source_type": "WorkloadEndpoint"
+     },
+     "bytes_in": "872",
+     "bytes_out": "1323",
+     "dest_labels": [
+      "app=s4-c2-sink",
+      "pod-template-hash=65cbd8c966"
+     ],
+     "end_time": "1792443165",
+     "num_connections_completed": "5",
+     "num_connections_live": "5",
+     "num_connections_started": "5",
+     "packets_in": "16",
+     "packets_out": "24",
+     "source_labels": [
+      "app=web",
+      "pod-template-hash=bd846c7f"
+     ],
+     "start_time": "1792443150"
+    },
+    "id": "77",
+    "network.bytes_out": "1323",
+    "network.connections_live": "5",
+    "network.connections_started": "5",
+    "network.dest_name": "s4-c2-sink-65cbd8c966-*",
+    "network.dest_type": "workload",
+    "network.dst_port": "8443",
+    "network.protocol": "TCP"
+   },
+   "severity": "informational",
+   "source": "network",
+   "summary": "tenant-acme/web-bd846c7f-* -> tenant-acme/s4-c2-sink-65cbd8c966-*:8443 (tcp, allow, src)",
+   "tags": [
+    "proto:tcp",
+    "action:allow",
+    "reporter:src",
+    "src-type:workload",
+    "dst-type:workload",
+    "dst-port:8443",
+    "pod_name_kind:generatename",
+    "svc:tenant-acme/s4-c2-sink",
+    "conns-started:5",
+    "policy:profile/-/kns.tenant-acme:allow",
+    "policy:profile/-/kns.tenant-acme:allow"
+   ],
+   "timestamp": "2026-10-19T20:52:30Z"
+  },
+  {
+   "category": "flow",
+   "id": "calico-flow-1792443150-74",
+   "pod": {
+    "name": "web-bd846c7f-*",
+    "namespace": "tenant-acme",
+    "node": "olaitan-full-control-plane",
+    "uid": ""
+   },
+   "raw": {
+    "flow": {
+     "Key": {
+      "action": "Allow",
+      "dest_name": "s4-c2-sink-65cbd8c966-*",
+      "dest_namespace": "tenant-acme",
+      "dest_port": "8443",
+      "dest_service_name": "s4-c2-sink",
+      "dest_service_namespace": "tenant-acme",
+      "dest_service_port": "8443",
+      "dest_service_port_name": "-",
+      "dest_type": "WorkloadEndpoint",
+      "policies": {
+       "enforced_policies": [
+        {
+         "action": "Allow",
+         "kind": "Profile",
+         "name": "kns.tenant-acme"
+        }
+       ],
+       "pending_policies": [
+        {
+         "action": "Allow",
+         "kind": "Profile",
+         "name": "kns.tenant-acme"
+        }
+       ]
+      },
+      "proto": "tcp",
+      "reporter": "Dst",
+      "source_name": "web-bd846c7f-*",
+      "source_namespace": "tenant-acme",
+      "source_type": "WorkloadEndpoint"
+     },
+     "bytes_in": "1323",
+     "bytes_out": "872",
+     "dest_labels": [
+      "app=s4-c2-sink",
+      "pod-template-hash=65cbd8c966"
+     ],
+     "end_time": "1792443165",
+     "num_connections_completed": "5",
+     "num_connections_live": "5",
+     "num_connections_started": "5",
+     "packets_in": "24",
+     "packets_out": "16",
+     "source_labels": [
+      "app=web",
+      "pod-template-hash=bd846c7f"
+     ],
+     "start_time": "1792443150"
+    },
+    "id": "74",
+    "network.bytes_out": "872",
+    "network.connections_live": "5",
+    "network.connections_started": "5",
+    "network.dest_name": "s4-c2-sink-65cbd8c966-*",
+    "network.dest_type": "workload",
+    "network.dst_port": "8443",
+    "network.protocol": "TCP"
+   },
+   "severity": "informational",
+   "source": "network",
+   "summary": "tenant-acme/web-bd846c7f-* -> tenant-acme/s4-c2-sink-65cbd8c966-*:8443 (tcp, allow, dst)",
+   "tags": [
+    "proto:tcp",
+    "action:allow",
+    "reporter:dst",
+    "src-type:workload",
+    "dst-type:workload",
+    "dst-port:8443",
+    "pod_name_kind:generatename",
+    "svc:tenant-acme/s4-c2-sink",
+    "conns-started:5",
+    "policy:profile/-/kns.tenant-acme:allow",
+    "policy:profile/-/kns.tenant-acme:allow"
+   ],
+   "timestamp": "2026-10-19T20:52:30Z"
+  }
+ ],
+ "cri_container_created": {
+  "category": "lifecycle",
+  "id": "895a637034d9e28a4b4b38fa322f9dee",
+  "pod": {
+   "name": "steady-7d8fc54b55-n4psz",
+   "namespace": "olt-baseline",
+   "node": "olaitan-full-worker2",
+   "uid": "2fd2d826-a168-414f-90c1-45e0788f8ba4"
+  },
+  "raw": {
+   "container_event_type": "CONTAINER_CREATED_EVENT",
+   "container_id": "aa8de4c5d6989219265f3efd3cf90166a7be5c5193aa68a0fe438887a3a75e12",
+   "created_at": 1792443077098120582,
+   "pod_sandbox": {
+    "created_at": 1792443076941935283,
+    "id": "aa8de4c5d6989219265f3efd3cf90166a7be5c5193aa68a0fe438887a3a75e12",
+    "metadata": {
+     "name": "steady-7d8fc54b55-n4psz",
+     "namespace": "olt-baseline",
+     "uid": "2fd2d826-a168-414f-90c1-45e0788f8ba4"
+    },
+    "state": "SANDBOX_READY"
+   }
+  },
+  "severity": "informational",
+  "source": "runtime",
+  "summary": "CONTAINER_CREATED_EVENT container=aa8de4c5d698 pod=olt-baseline/steady-7d8fc54b55-n4psz",
+  "tags": [
+   "event_type:created"
+  ],
+  "timestamp": "2026-10-19T20:51:17.098120582Z"
+ },
+ "falco_drop_and_exec": {
+  "category": "syscall",
+  "id": "8e2383966bab25311aba154f61fbd9a5",
+  "pod": {
+   "name": "web-bd846c7f-zdhz7",
+   "namespace": "tenant-acme",
+   "node": "olaitan-full-worker2",
+   "uid": ""
+  },
+  "raw": {
+   "container.id": "540de6801f3b",
+   "falco_hostname": "olaitan-full-worker2",
+   "output_fields": [
+    [
+     "container.id",
+     "540de6801f3b"
+    ],
+    [
+     "container.image.repository",
+     "docker.io/library/busybox"
+    ],
+    [
+     "container.image.tag",
+     "30ecbe1509090b38ef3260f3609d64d8261230464eaa4d235901db496e9647fb"
+    ],
+    [
+     "container.name",
+     "web"
+    ],
+    [
+     "container.start_ts",
+     "1792443470500616971"
+    ],
+    [
+     "evt.arg.flags",
+     "EXE_WRITABLE|EXE_UPPER_LAYER"
+    ],
+    [
+     "evt.time",
+     "1792443471546085734"
+    ],
+    [
+     "evt.type",
+     "execve"
+    ],
+    [
+     "k8s.ns.name",
+     "tenant-acme"
+    ],
+    [
+     "k8s.pod.name",
+     "web-bd846c7f-zdhz7"
+    ],
+    [
+     "proc.aname[2]",
+     "containerd-shim"
+    ],
+    [
+     "proc.cwd",
+     "/"
+    ],
+    [
+     "proc.exe",
+     "/tmp/xmrig"
+    ],
+    [
+     "proc.exe_ino.ctime",
+     "1792443471544910790"
+    ],
+    [
+     "proc.exe_ino.ctime_duration_proc_start",
+     "968926"
+    ],
+    [
+     "proc.exe_ino.mtime",
+     "1792443471543910801"
+    ],
+    [
+     "proc.exepath",
+     "/tmp/xmrig"
+    ],
+    [
+     "proc.name",
+     "xmrig"
+    ],
+    [
+     "proc.pname",
+     "sh"
+    ],
+    [
+     "proc.sname",
+     "sh"
+    ],
+    [
+     "proc.tty",
+     "0"
+    ],
+    [
+     "user.loginuid",
+     "-1"
+    ],
+    [
+     "user.name",
+     "root"
+    ],
+    [
+     "user.uid",
+     "0"
+    ]
+   ],
+   "priority": "CRITICAL",
+   "process.exe": "/tmp/xmrig",
+   "process.name": "xmrig",
+   "process.parent": "sh",
+   "rule": "Drop and execute new binary in container",
+   "source": "syscall",
+   "tags": [
+    "PCI_DSS_11.5.1",
+    "TA0003",
+    "container",
+    "maturity_stable",
+    "mitre_persistence",
+    "process"
+   ],
+   "user.uid": "0",
+   "user.username": "root"
+  },
+  "severity": "critical",
+  "source": "falco",
+  "summary": "20:57:51.546085734: Critical Executing binary not part of base image | proc_exe=/tmp/xmrig proc_sname=sh gparent=containerd-shim proc_exe_ino_ctime=179244347154",
+  "tags": [
+   "PCI_DSS_11.5.1",
+   "TA0003",
+   "container",
+   "maturity_stable",
+   "mitre_persistence",
+   "process"
+  ],
+  "timestamp": "2026-10-19T20:57:51.546085734Z"
+ },
+ "falco_k8s_api_wget": {
+  "category": "syscall",
+  "id": "8dd5d65bba645c81f4a0705af26ff10a",
+  "pod": {
+   "name": "steady-7d8fc54b55-n4psz",
+   "namespace": "olt-baseline",
+   "node": "olaitan-full-worker2",
+   "uid": ""
+  },
+  "raw": {
+   "container.id": "7026ef053ce7",
+   "falco_hostname": "olaitan-full-worker2",
+   "network.dst_port": "443",
+   "network.protocol": "tcp",
+   "output_fields": [
+    [
+     "container.id",
+     "7026ef053ce7"
+    ],
+    [
+     "container.image.repository",
+     "docker.io/library/busybox"
+    ],
+    [
+     "container.image.tag",
+     "1.36"
+    ],
+    [
+     "container.name",
+     "app"
+    ],
+    [
+     "evt.time",
+     "1792443078425525732"
+    ],
+    [
+     "evt.type",
+     "connect"
+    ],
+    [
+     "fd.l4proto",
+     "tcp"
+    ],
+    [
+     "fd.lport",
+     "54294"
+    ],
+    [
+     "fd.name",
+     "10.244.117.92:54294->10.96.0.1:443"
+    ],
+    [
+     "fd.rport",
+     "443"
+    ],
+    [
+     "fd.type",
+     "ipv4"
+    ],
+    [
+     "k8s.ns.name",
+     "olt-baseline"
+    ],
+    [
+     "k8s.pod.name",
+     "steady-7d8fc54b55-n4psz"
+    ],
+    [
+     "proc.exepath",
+     "/bin/wget"
+    ],
+    [
+     "proc.name",
+     "wget"
+    ],
+    [
+     "proc.pname",
+     "sh"
+    ],
+    [
+     "proc.tty",
+     "0"
+    ],
+    [
+     "user.loginuid",
+     "-1"
+    ],
+    [
+     "user.name",
+     "root"
+    ],
+    [
+     "user.uid",
+     "0"
+    ]
+   ],
+   "priority": "NOTICE",
+   "process.exe": "/bin/wget",
+   "process.name": "wget",
+   "process.parent": "sh",
+   "rule": "Contact K8S API Server From Container",
+   "source": "syscall",
+   "tags": [
+    "T1565",
+    "container",
+    "k8s",
+    "maturity_stable",
+    "mitre_discovery",
+    "network"
+   ],
+   "user.uid": "0",
+   "user.username": "root"
+  },
+  "severity": "notice",
+  "source": "falco",
+  "summary": "20:51:18.425525732: Notice Unexpected connection to K8s API Server from container | connection=10.244.117.92:54294->10.96.0.1:443 lport=54294 rport=443 fd_type=",
+  "tags": [
+   "T1565",
+   "container",
+   "k8s",
+   "maturity_stable",
+   "mitre_discovery",
+   "network"
+  ],
+  "timestamp": "2026-10-19T20:51:18.425525732Z"
+ },
+ "falco_token_read_flat_exe": {
+  "category": "syscall",
+  "id": "6c2f66878f64578950951f409c3009e9",
+  "pod": {
+   "name": "steady-7d8fc54b55-n4psz",
+   "namespace": "olt-baseline",
+   "node": "olaitan-full-worker2",
+   "uid": ""
+  },
+  "raw": {
+   "container.id": "7026ef053ce7",
+   "falco_hostname": "olaitan-full-worker2",
+   "file.path": "/var/run/secrets/kubernetes.io/serviceaccount/token",
+   "output_fields": [
+    [
+     "container.id",
+     "7026ef053ce7"
+    ],
+    [
+     "container.image.repository",
+     "docker.io/library/busybox"
+    ],
+    [
+     "container.image.tag",
+     "1.36"
+    ],
+    [
+     "container.name",
+     "app"
+    ],
+    [
+     "evt.time",
+     "1792443078422405518"
+    ],
+    [
+     "fd.name",
+     "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    ],
+    [
+     "k8s.ns.name",
+     "olt-baseline"
+    ],
+    [
+     "k8s.pod.name",
+     "steady-7d8fc54b55-n4psz"
+    ],
+    [
+     "proc.exepath",
+     "/bin/cat"
+    ]
+   ],
+   "priority": "WARNING",
+   "process.exe": "/bin/cat",
+   "rule": "Olaitan ServiceAccount Token Read",
+   "source": "syscall",
+   "tags": [
+    "T1552",
+    "container",
+    "mitre_credential_access",
+    "olaitan"
+   ]
+  },
+  "severity": "warning",
+  "source": "falco",
+  "summary": "20:51:18.422405518: Warning Olaitan serviceaccount token read (file=/var/run/secrets/kubernetes.io/serviceaccount/token proc_exepath=/bin/cat k8s_ns=olt-baseline k8s_pod=steady-7d8fc54b55-n4psz) container_id=7026ef053ce7 container_name=app container_image_repository=docker.io/library/busybox container_image_tag=1.36 k8s_pod_name=steady-7d8fc54b55-n4psz k8s_ns_name=olt-baseline",
+  "tags": [
+   "T1552",
+   "container",
+   "mitre_credential_access",
+   "olaitan"
+  ],
+  "timestamp": "2026-10-19T20:51:18.422405518Z"
+ }
+}

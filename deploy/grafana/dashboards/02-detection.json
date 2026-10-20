@@ -379,9 +379,9 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "rate(olaitan_decision_baseline_skipped_self_total[1h])",
+          "expr": "rate(olaitan_decision_baseline_observations_dropped_total[1h])",
           "refId": "D",
-          "legendFormat": "baseline skipped self"
+          "legendFormat": "baseline observations dropped"
         }
       ],
       "fieldConfig": {

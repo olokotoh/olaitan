@@ -223,6 +223,9 @@ func Translate(ev *runtimeapi.ContainerEventResponse, nodeName string) (schema.E
 	pod := podRefFromSandbox(ev.GetPodSandboxStatus(), nodeName)
 	summary := buildSummary(eventTypeName, ev.ContainerId, pod.Namespace, pod.Name)
 	tags := buildTags(eventTypeName, ev.GetPodSandboxStatus())
+	if t := containerAttemptTag(ev); t != "" {
+		tags = append(tags, t)
+	}
 
 	rawJSON, err := marshalTrimmedRaw(ev)
 	if err != nil {
@@ -313,6 +316,8 @@ func buildSummary(eventTypeName, containerID, podNS, podName string) string {
 //   - event_type:<lowercased>          always present
 //   - sandbox:notready                  when the sandbox is being torn down
 //   - attempt:<N>                       only when meta.Attempt > 0
+//     (the SANDBOX attempt; see containerAttemptTag for a container
+//     restarted in place)
 //   - app.kubernetes.io/* / olaitan.io/* labels   forwarded under the
 //     prefix whitelist; copied via slice append-from-nil so a future
 //     gRPC runtime that pools messages cannot mutate the published
@@ -603,4 +608,24 @@ func buildRawCanonical(ev *runtimeapi.ContainerEventResponse, forceStrip bool) *
 		c.ContainerStatuses = out
 	}
 	return c
+}
+
+// containerAttemptTag returns "container_attempt:<N>" when the event's
+// own container (the ContainersStatuses entry whose Id equals
+// ContainerId) has Metadata.Attempt > 0, else "". Story 10.12: a
+// container restarted in place (CrashLoopBackOff) keeps its sandbox, so
+// the sandbox "attempt:N" tag never changes and the restart was
+// invisible downstream. Siblings' attempts are ignored so one restarted
+// sidecar does not tag every later event of the pod.
+func containerAttemptTag(ev *runtimeapi.ContainerEventResponse) string {
+	for _, cs := range ev.GetContainersStatuses() {
+		if cs.GetId() != ev.GetContainerId() {
+			continue
+		}
+		if a := cs.GetMetadata().GetAttempt(); a > 0 {
+			return fmt.Sprintf("container_attempt:%d", a)
+		}
+		return ""
+	}
+	return ""
 }

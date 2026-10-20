@@ -106,7 +106,7 @@ func TestIntegration_CorrelatorPublishesEvidenceForAllTriggersAndCap(t *testing.
 	if _, err := c.AddEvent(ctx, testEvent("base-event", "base-pod", schema.SourceRuntime, schema.CategoryLifecycle, "warning", "runtime")); err != nil {
 		t.Fatalf("add baseline event: %v", err)
 	}
-	if _, err := c.FireBaselineDeviation(ctx, baseID, schema.BaselineDeviation{Metric: "exec_rate", Value: 9, Mean: 1, StdDev: 2, Sigma: 4, PodUID: "base-uid"}); err != nil {
+	if _, err := c.FireBaselineDeviation(ctx, baseID, schema.WorkloadIdentity{}, schema.BaselineDeviation{Metric: "exec_rate", Value: 9, Mean: 1, StdDev: 2, Sigma: 4, PodUID: "base-uid"}); err != nil {
 		t.Fatalf("FireBaselineDeviation: %v", err)
 	}
 	baseline := nextPackage(t, consumer)
