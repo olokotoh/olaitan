@@ -24,6 +24,9 @@ import (
 type correlatorMetrics struct {
 	evidencePackages *prometheus.CounterVec
 	windowSizeBytes  prometheus.Histogram
+	// lateEventRulePackages counts Story 11.2b per-event rule_match
+	// packages (trigger origin late_event) by rule_id.
+	lateEventRulePackages *prometheus.CounterVec
 	// overflow_summarised_total is registered as a reader-callback
 	// counter against c.overflowSummarisedCount, so no writeable
 	// handle is stored here; the production observe path bumps the
@@ -67,6 +70,16 @@ func (c *Correlator) registerMetrics(reg *metrics.Registry) error {
 		return err
 	}
 	c.metrics.evidencePackages = v
+
+	lv, err := reg.RegisterCounterVec(
+		"olaitan_correlator_late_event_rule_packages_total",
+		"Cumulative rule_match EvidencePackages the correlator published for a single event that joined an already-fired window (trigger origin late_event, Story 11.2b), grouped by OLT rule_id. These are also counted in olaitan_correlator_evidence_packages_total{trigger_type=\"rule_match\"}; this series isolates them so MTTD for flow-dependent detections is measured to this package.",
+		[]string{"rule_id"},
+	)
+	if err != nil {
+		return err
+	}
+	c.metrics.lateEventRulePackages = lv
 
 	h, err := reg.RegisterHistogram(
 		"olaitan_correlator_window_size_bytes",

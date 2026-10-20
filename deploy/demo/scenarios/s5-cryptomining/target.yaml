@@ -9,3 +9,18 @@ floor: false
 triggering_rules:
   - OLT-IMPACT-005
   - OLT-IMPACT-006
+
+# Story 11.2b (AC4): the real in-cluster primitives the runner executes,
+# mapped to their MITRE ATT&CK for Containers ID(s). Cited from the repo rule
+# corpus (OLT-IMPACT-005/OLT-IMPACT-006 both tag T1496) and the ATT&CK for
+# Containers matrix (T1496 Resource Hijacking). No egress leaves the cluster:
+# the miner connects to the in-cluster fake stratum pool 11.2b stands up.
+attack_steps:
+  - id: stage-miner-process
+    mitre:
+      - T1496        # Resource Hijacking (xmrig-named miner process launch)
+    primitive: copy busybox to a miner-named path (xmrig) and launch it in the tenant pod
+  - id: stratum-pool-connect
+    mitre:
+      - T1496        # Resource Hijacking (stratum pool connection)
+    primitive: open an outbound TCP connection from the miner to the in-cluster fake stratum pool on a miner port

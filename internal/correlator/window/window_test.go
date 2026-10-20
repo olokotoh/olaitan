@@ -250,3 +250,42 @@ func storeKeyCount(s *Store) int {
 	defer s.mu.RUnlock()
 	return len(s.workload)
 }
+
+// Story 11.2b: AlreadyFired is reported for an event that joins a window
+// which fired earlier and is still converged; the rising edge is unchanged.
+func TestStoreAddAndCheckReportsAlreadyFired(t *testing.T) {
+	now := time.Date(2026, 10, 19, 20, 52, 19, 0, time.UTC)
+	store := NewStore(60 * time.Second)
+	store.SetNow(func() time.Time { return now })
+	wl := "tenant-acme/Deployment/web"
+	r, _ := store.AddAndCheck(wl, event("f", now, schema.SourceFalco), 2)
+	if r.Transitioned || r.AlreadyFired {
+		t.Fatalf("single source: %+v", r)
+	}
+	r, _ = store.AddAndCheck(wl, event("rt", now, schema.SourceRuntime), 2)
+	if !r.Transitioned || r.AlreadyFired {
+		t.Fatalf("rising edge: transitioned=%v alreadyFired=%v", r.Transitioned, r.AlreadyFired)
+	}
+	// A Goldmane flow arrives ~30s later with its event time at the START of
+	// its 15s aggregation window, i.e. 15s+ before arrival (live 2026-10-19).
+	now = now.Add(30 * time.Second)
+	flow := event("flow", now.Add(-15*time.Second), schema.SourceNetwork)
+	r, _ = store.AddAndCheck(wl, flow, 2)
+	if r.Transitioned {
+		t.Fatal("D1 changed: a late source must not re-fire the rising edge")
+	}
+	if !r.AlreadyFired {
+		t.Fatal("late flow into a fired window not reported as AlreadyFired")
+	}
+	// Window eviction is by event time (Story 1.14); at the observed lag the
+	// flow is NOT evicted on arrival: it is in the snapshot it was added to.
+	found := false
+	for _, e := range r.Snapshot.Events {
+		if e.ID == "flow" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("late flow evicted on arrival: %v", ids(r.Snapshot.Events))
+	}
+}

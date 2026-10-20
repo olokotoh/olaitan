@@ -51,6 +51,8 @@ bootstrap script.
   reproducibility (`eval/manifest.yaml` will need a single
   authoritative version).
 
+**Recorded simple choices (review round 1).** Pre-claims run only when the package was actually published; a late event older than the window cutoff (evicted on arrival) gets no late package; claims run on the correlator clock. Deferred: claims are per window DURATION from the first claim (the Story 10.3 semantics), not per window lifecycle, so a window converged longer than its duration can repeat a rule once per duration; a late package of severity >= 50 with no chain in flight dispatches the analyst chain on one event (Story 7.4 behaviour for any rule_match); pre-claim cost is one extra corpus pass per published snapshot.
+
 **Risk inherited.** None material. The chart's `kubeVersion`
 constraint (`>=1.29.0`) is unchanged. Calico's NetworkPolicy
 implementation moves forward only.
@@ -114,6 +116,8 @@ Dockerfile uses `gcr.io/distroless/static-debian12:nonroot` for both.
   text. Rejected because the binary genuinely does not need anything
   in `base` over `static`; it would be a regression.
 
+**Recorded simple choices (review round 1).** Pre-claims run only when the package was actually published; a late event older than the window cutoff (evicted on arrival) gets no late package; claims run on the correlator clock. Deferred: claims are per window DURATION from the first claim (the Story 10.3 semantics), not per window lifecycle, so a window converged longer than its duration can repeat a rule once per duration; a late package of severity >= 50 with no chain in flight dispatches the analyst chain on one event (Story 7.4 behaviour for any rule_match); pre-claim cost is one extra corpus pass per published snapshot.
+
 **Risk inherited.** None. The Dockerfile and Helm chart already
 agree on the single-base reality; this ADR records the architecture
 update that brings the doc into line with the running system.
@@ -171,6 +175,8 @@ the Olaitan registry) in a dedicated story.
 - Self-host the Redis chart in `ghcr.io/olokotoh`. Rejected because
   the chart artefact pipeline (sign + push) is itself non-trivial
   work that does not belong in a brownfield merge story.
+
+**Recorded simple choices (review round 1).** Pre-claims run only when the package was actually published; a late event older than the window cutoff (evicted on arrival) gets no late package; claims run on the correlator clock. Deferred: claims are per window DURATION from the first claim (the Story 10.3 semantics), not per window lifecycle, so a window converged longer than its duration can repeat a rule once per duration; a late package of severity >= 50 with no chain in flight dispatches the analyst chain on one event (Story 7.4 behaviour for any rule_match); pre-claim cost is one extra corpus pass per published snapshot.
 
 **Risk inherited.**
 
@@ -1386,6 +1392,8 @@ single replica) is not carried over.
   tag: that is publishing an artefact, and it still tracks an image Bitnami
   no longer versions in public.
 
+**Recorded simple choices (review round 1).** Pre-claims run only when the package was actually published; a late event older than the window cutoff (evicted on arrival) gets no late package; claims run on the correlator clock. Deferred: claims are per window DURATION from the first claim (the Story 10.3 semantics), not per window lifecycle, so a window converged longer than its duration can repeat a rule once per duration; a late package of severity >= 50 with no chain in flight dispatches the analyst chain on one event (Story 7.4 behaviour for any rule_match); pre-claim cost is one extra corpus pass per published snapshot.
+
 **Risk inherited.** The chart now owns one Redis template, about 270
 lines with its comments. It is standalone only (no Sentinel, no replicas),
 as the MVP was before. The upgrade
@@ -1488,6 +1496,8 @@ numbers are not comparable with post-change runs; they are reported as
 "chain inline" figures or re-measured. UNCHANGED: the FR55 trust bound, and
 the deterministic (RS arm) MTTD and FPR campaign, whose code path is
 byte-identical (no pool is built when the chain is disabled).
+
+**Recorded simple choices (review round 1).** Pre-claims run only when the package was actually published; a late event older than the window cutoff (evicted on arrival) gets no late package; claims run on the correlator clock. Deferred: claims are per window DURATION from the first claim (the Story 10.3 semantics), not per window lifecycle, so a window converged longer than its duration can repeat a rule once per duration; a late package of severity >= 50 with no chain in flight dispatches the analyst chain on one event (Story 7.4 behaviour for any rule_match); pre-claim cost is one extra corpus pass per published snapshot.
 
 **Risk inherited.** Coalescing means a newer, stronger package for a
 workload whose chain is in flight is not investigated by the model (its
@@ -1639,3 +1649,21 @@ webhook deletes `validatingwebhookconfiguration/<fullname>-audit` by hand
 cluster-scoped delete verb in every install for a leftover that only a
 `kubectl apply` upgrade over an unreleased (Story 12.7) default can leave. Admission-time policy, if it is ever built, gets its own
 handler, Service and certificate.
+
+---
+
+---
+
+## ADR-2026-10-20-01: Per-event rule evaluation for late events (an ADDITION to Story 1.14 D1; Story 1.15 realised)
+
+**Context.** The 2026-10-19 live gate (kind-full, Falco ON) showed that a Goldmane flow reaches the correlator 15-30s after the Falco, runtime and audit events of the same attack. By then the workload's window has usually already crossed the multi-signal threshold and published its package. Under Story 1.14 D1 (rising edge: fire once per climb, re-arm only when the source set drops below the threshold) the late flow publishes nothing, and the rules engine evaluates only published packages. A single-event OLT rule on a flow (OLT-NET-002 for S4, OLT-IMPACT-006 for S5) could therefore never match. The rules engine's re-entrancy guard was not the cause: it already evaluates Falco-only packages (Story 10.3).
+
+**Decision** (BMad party mode, Winston / Amelia / Murat / Dr. Quinn; option D, resolved by the Chief of Staff under Aslim's delegation). D1 stays exactly as written. In addition, when an event joins a window that has ALREADY fired, the correlator evaluates the OLT corpus against that one event (`rules.Engine.EvaluateEvent`, through `correlator.EventRuleEvaluator`) and, on a match, publishes ONE `rule_match` package for that workload holding only that event, deduplicated per (workload, rule) per window with the Story 10.3 claim pattern. The rules a published snapshot will match are pre-claimed, so this path never repeats a match the rules engine already makes. The trigger carries `origin: "late_event"` (EvidencePackage `trigger.origin`, additive optional) and is counted in `olaitan_correlator_late_event_rule_packages_total{rule_id}`, so MTTD for flow-dependent detections can be measured to this package (the label exists; no eval code reads it yet). It publishes through the same publishTrigger path FireRuleMatch uses, but with a one-event snapshot: FireRuleMatch itself attaches the whole window, which this decision forbids.
+
+**Rejected.** (a) Re-fire the whole window when a new source joins: re-publishes old events, so the baseline and the analyst chain re-score them, and it amends D1. (b) Give each scenario its own Deployment and wait out the window: fixes the harness, not the detector. (c) Rules engine consumes EVENTS_RAW directly: duplicates the correlator's identity and window logic.
+
+**Guarantees (tests).** A late real S4 flow yields exactly one OLT-NET-002 package and a pool flow one OLT-IMPACT-006 package; a second same-rule event in the window yields none (`TestIntegration_LateFlowAfterFiredWindowYieldsOneRuleMatch`). A rule already matched on a snapshot is not repeated (`TestIntegration_SnapshotMatchedRuleIsNotRepeatedByLatePath`). Replaying the real S1-S3 events of the live run publishes the same packages with the path on or off, byte-identical once the per-run package ID, the wall-clock fired_at and the (pre-existing, map-ordered) distinct_sources order are normalised; assembled_at runs on the replay clock and is compared (`TestIntegration_S1S3ReplayIsUnchangedByLatePath`). The fixture holds no network event, so it shows the path is a no-op for S1-S3, not that it can never fire there. The risk window keeps the max, so a repeated rule does not inflate the score; a late package during an in-flight analyst chain is coalesced, scored and acked, never dropped (`cmd/olaitan/late_event_driver_test.go`). Window eviction is by event time (Story 1.14); at the observed 15-30s lag a flow is not evicted on arrival (`TestStoreAddAndCheckReportsAlreadyFired`), but its retention is shortened by its lag.
+
+**Recorded simple choices (review round 1).** Pre-claims run only when the package was actually published; a late event older than the window cutoff (evicted on arrival) gets no late package; claims run on the correlator clock. Deferred: claims are per window DURATION from the first claim (the Story 10.3 semantics), not per window lifecycle, so a window converged longer than its duration can repeat a rule once per duration; a late package of severity >= 50 with no chain in flight dispatches the analyst chain on one event (Story 7.4 behaviour for any rule_match); pre-claim cost is one extra corpus pass per published snapshot.
+
+**Risk inherited.** The per-event path evaluates with the identity half of the posture (the corpus reads only `k8s.pod.namespace` and `k8s.workload.owner_kind` today); a future rule on a non-identity posture field would not match on this path until posture is fetched for it. Excluded namespaces get no late-event package, as they get no single-alert Falco package (Story 10.3).

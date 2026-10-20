@@ -267,6 +267,7 @@ func toSchemaTrigger(tr trigger.Trigger) schema.EvidenceTrigger {
 		BaselineDeviation: tr.BaselineDeviation,
 		DistinctSources:   append([]schema.EventSource(nil), tr.DistinctSources...),
 		FiredAt:           tr.FiredAt,
+		Origin:            tr.Origin,
 	}
 }
 

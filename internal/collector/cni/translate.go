@@ -28,7 +28,12 @@
 // on-demand workload posture client (Story 1.11) at
 // EvidencePackage assembly time. Doing the K8s API lookup inline
 // would violate the read-on-demand posture pattern and break the
-// NFR1 50 ms receive-to-publish budget.
+// NFR1 50 ms receive-to-publish budget. The correlator side lives in
+// internal/correlator/goldmane_aggregate.go (Story 11.2b): Goldmane
+// renders the set as the GenerateName plus "*" ("web-bd846c7f-*"),
+// which the correlator resolves to a live pod of the set and that
+// pod's owning workload, so a flow and a Falco event from the same
+// Deployment share one WorkloadID.
 //
 // Source-health naming. The schema enum value is "network" (the
 // abstract category, mirroring the five-source enum bootstrap in
@@ -197,6 +202,15 @@ func Translate(fr *goldmanepb.FlowResult, hostname string, maxEventBytes int) (s
 	if err := json.Unmarshal(rawBytes, &rawObj); err != nil {
 		return schema.Event{}, fmt.Errorf("translate: re-decode raw: %w", err)
 	}
+	// Story 11.2b (Story 10.3 Falco precedent): the OLT rules and the rules
+	// resolver read canonical field names from the TOP level of Event.Raw,
+	// but protojson nests the Goldmane flow under flow.key.* and the resolver
+	// flattens Raw only one level, so no network.* rule could match a real
+	// CNI flow. Project the canonical names onto the top level. Pure
+	// source->canonical projection: only fields the flow actually carries are
+	// projected, nothing is invented (notably severity is NOT derived here -
+	// Goldmane emits none, so "informational" stays the only truthful value).
+	projectCanonicalFlowFields(rawObj, key, flow)
 	canonRaw, err := json.Marshal(rawObj)
 	if err != nil {
 		return schema.Event{}, fmt.Errorf("translate: re-marshal raw: %w", err)
@@ -569,6 +583,50 @@ func reporterString(r goldmanepb.Reporter) string {
 	default:
 		return "unspecified"
 	}
+}
+
+// projectCanonicalFlowFields writes the OLT canonical field names onto the
+// top level of the raw map so the one-level rule resolver can see them
+// (Story 11.2b; the Story 10.3 Falco canonicalFields precedent for the CNI
+// adapter). It projects ONLY what the real Goldmane flow carries - nothing is
+// fabricated: a destination port of 0 is legal (ICMP) and is projected as-is;
+// an empty proto or dest_name is omitted rather than invented. Values are
+// written as strings because the resolver stringifies every field, and the
+// OLT port/proto rules already compare the stringified form (the Falco path
+// projects the same way). Severity is deliberately NOT set here (Goldmane
+// emits none; see Translate).
+func projectCanonicalFlowFields(raw map[string]any, key *goldmanepb.FlowKey, flow *goldmanepb.Flow) {
+	if raw == nil || key == nil || flow == nil {
+		return
+	}
+	// Destination port: 0 is a legal value (ICMP), so always project it.
+	raw["network.dst_port"] = strconv.FormatInt(key.GetDestPort(), 10)
+	// Transport protocol, UPPER-cased to match the rule literals ('TCP'); the
+	// tag/summary form is lower-cased and must not be reused here.
+	if p := strings.ToUpper(sanitizeForTag(key.GetProto())); p != "" {
+		raw["network.protocol"] = p
+	}
+	// Destination identity: the only truthful public-egress signal Goldmane
+	// provides is dest_type=network + dest_name=pub (there is no dst IP).
+	raw["network.dest_type"] = endpointTypeString(key.GetDestType())
+	if dn := sanitizeForTag(key.GetDestName()); dn != "" {
+		raw["network.dest_name"] = dn
+	}
+	// Real volumetric fields aggregated over the Goldmane window, projected so
+	// rules and later stories can key on genuine volume rather than a phantom
+	// severity.
+	// Goldmane reports each connection once per reporter with the byte
+	// counters seen from THAT side, so a Dst record's bytes_out is the
+	// destination's reply, not what the source sent. network.bytes_out means
+	// the source workload's outbound bytes, so it is projected from the Src
+	// record only; the Dst record omits it. network.reporter keeps the
+	// reporter visible to rules and the baseline.
+	raw["network.reporter"] = reporterString(key.GetReporter())
+	if key.GetReporter() == goldmanepb.Reporter_Src {
+		raw["network.bytes_out"] = strconv.FormatInt(flow.GetBytesOut(), 10)
+	}
+	raw["network.connections_started"] = strconv.FormatInt(flow.GetNumConnectionsStarted(), 10)
+	raw["network.connections_live"] = strconv.FormatInt(flow.GetNumConnectionsLive(), 10)
 }
 
 // endpointTypeString maps the Goldmane EndpointType enum to the

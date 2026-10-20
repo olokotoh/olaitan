@@ -46,6 +46,21 @@ const (
 	saTokenPath       = "/run/secrets/kubernetes.io/serviceaccount/token"
 	kubeAPIHost       = "https://kubernetes.default.svc"
 	metadataIP        = "169.254.169.254"
+
+	// S4 (C2 beaconing) in-cluster sink: the beacon's only destination, so
+	// "nothing leaves the cluster except to our own sink" (AC2). The beacon
+	// port is a C2-favoured web-looking port OLT-NET-002 keys on.
+	s4SinkService = "s4-c2-sink"
+	s4BeaconPort  = "8443"
+	s4BeaconCount = 6
+
+	// S5 (cryptomining) in-cluster fake stratum pool: the miner's only
+	// destination, on a stratum miner port OLT-IMPACT-006 keys on. The miner
+	// process is a busybox copied to a miner-named path so the execve Falco
+	// observes carries proc.exepath ending /xmrig (OLT-IMPACT-005 signature).
+	s5PoolService = "s5-stratum-pool"
+	s5MinerPort   = "3333"
+	s5MinerPath   = "/tmp/xmrig"
 )
 
 // RunFunc runs an external command (kubectl) and returns its trimmed
@@ -162,10 +177,10 @@ func resolveUploadKubectl(path string) (string, string, error) {
 // so a mis-wired scenario fails loudly rather than silently no-opping.
 func New(scenarioID, dir string, runCmd RunFunc, logger *slog.Logger) (*Executor, error) {
 	switch scenarioID {
-	case "s1", "s2", "s3":
-		// implemented here
+	case "s1", "s2", "s3", "s4", "s5":
+		// implemented here (s1-s3 Story 11.2a; s4/s5 Story 11.2b)
 	default:
-		return nil, fmt.Errorf("attack executor: scenario %q has no S1-S3 technique (Story 11.2a implements s1, s2, s3; s4 and s5 land in Story 11.2b #192)", scenarioID)
+		return nil, fmt.Errorf("attack executor: scenario %q has no real technique (implemented: s1-s5)", scenarioID)
 	}
 	if logger == nil {
 		logger = slog.Default()
@@ -174,22 +189,45 @@ func New(scenarioID, dir string, runCmd RunFunc, logger *slog.Logger) (*Executor
 		runCmd = ExecCmd
 	}
 	var manifests []string
-	if scenarioID == "s2" {
+	switch scenarioID {
+	case "s2":
 		// Apply the least-privilege RBAC (SA + Role, DP1) BEFORE the workload
 		// so the s2-attacker ServiceAccount the pod binds to already exists.
 		manifests = append(manifests, filepath.Join(dir, "manifests", "rbac.yaml"))
+	case "s4":
+		// Stand up the in-cluster C2 sink BEFORE the workload so the beacon
+		// has a live destination the moment the target is Ready (the S2
+		// rbac.yaml prepend precedent). Nothing leaves the cluster (AC2).
+		manifests = append(manifests, filepath.Join(dir, "manifests", "sink.yaml"))
+	case "s5":
+		// Stand up the in-cluster fake stratum pool BEFORE the workload so the
+		// miner has a live pool to connect to (AC2: in-cluster only).
+		manifests = append(manifests, filepath.Join(dir, "manifests", "pool.yaml"))
 	}
 	manifests = append(manifests, filepath.Join(dir, "manifests", "workload.yaml"))
 
 	// Cleanup deletes exactly what the attack added, by name, leaving the
 	// shared tenant-acme Namespace in place. The target Deployment is common
-	// to S1-S3; S2 also adds the least-privilege SA + Role + RoleBinding.
+	// to all scenarios; S2 also adds the least-privilege SA + Role +
+	// RoleBinding; S4/S5 also add the attacker-side sink/pool Deployment +
+	// Service.
 	cleanupRefs := []string{"deployment/" + workloadName}
-	if scenarioID == "s2" {
+	switch scenarioID {
+	case "s2":
 		cleanupRefs = append(cleanupRefs,
 			"rolebinding/s2-attacker-secrets-reader",
 			"role/s2-secrets-reader",
 			"serviceaccount/s2-attacker",
+		)
+	case "s4":
+		cleanupRefs = append(cleanupRefs,
+			"service/"+s4SinkService,
+			"deployment/"+s4SinkService,
+		)
+	case "s5":
+		cleanupRefs = append(cleanupRefs,
+			"service/"+s5PoolService,
+			"deployment/"+s5PoolService,
 		)
 	}
 	// Resolve a real, standalone kubectl on the runner host for S3 to upload
@@ -235,6 +273,10 @@ func (e *Executor) Execute(ctx context.Context) error {
 		primErr = e.runS2(ctx)
 	case "s3":
 		primErr = e.runS3(ctx)
+	case "s4":
+		primErr = e.runS4(ctx)
+	case "s5":
+		primErr = e.runS5(ctx)
 	default:
 		return fmt.Errorf("attack executor: no primitive for scenario %q", e.scenarioID) // unreachable (New gate)
 	}
@@ -507,6 +549,16 @@ func (e *Executor) exec(ctx context.Context, script string) (string, error) {
 	return e.runCmd(ctx, "kubectl", "exec", "-n", Namespace, e.pod, "-c", containerName, "--", "sh", "-c", script)
 }
 
+// waitDeploymentReady blocks (bounded by attackWaitTimeout) until the named
+// attacker-infra Deployment in the shared namespace has rolled out, so the
+// S4/S5 primitive does not beacon/connect to a sink/pool with no live
+// listener (review round 1). Used only by the S4/S5 runners for their
+// sink/pool; the target workload's own rollout is gated in ensureTargetReady.
+func (e *Executor) waitDeploymentReady(ctx context.Context, name string) error {
+	_, err := e.runCmd(ctx, "kubectl", "rollout", "status", "deploy/"+name, "-n", Namespace, "--timeout", attackWaitTimeout)
+	return err
+}
+
 // runS1 executes the S1 container-escape technique (MITRE T1611 Escape to
 // Host; also T1610). From the privileged (CAP_SYS_ADMIN / CAP_SYS_PTRACE)
 // container it attempts to reach the host namespace / filesystem. The
@@ -636,6 +688,82 @@ func (e *Executor) runS3(ctx context.Context) error {
 		"mitre", "T1613", "also", "T1609", "rule", "OLT-LATERAL-001",
 		"detail", "kubectl exec + uploaded real /tmp/kubectl process",
 		"kubectl_version", version, "out_len", len(out))
+	return nil
+}
+
+// runS4 executes the S4 C2-beaconing technique (MITRE T1071 Application Layer
+// Protocol; also T1071.001 Web Protocols). From the tenant pod it opens small,
+// periodic outbound TCP flows to the in-cluster C2 sink on a web-looking port
+// (8443), the beacon signature. The flows go ONLY to our own sink, so nothing
+// leaves the cluster (AC2); the real Calico Goldmane flow records they
+// generate trip OLT-NET-002 (destination-port match) through the CNI path.
+// nc is busybox-provided; a MISSING nc is a hard failure (exit 97, the S1
+// precedent) so a toolless image is not mistaken for a detection miss. A
+// per-beacon connection failure is recorded but is still a real attempt (the
+// flow is emitted on the attempt), so it does not fail the trial.
+func (e *Executor) runS4(ctx context.Context) error {
+	// Wait for the in-cluster sink to be Ready before beaconing: it is applied
+	// before the workload but not gated on readiness, so an early beacon could
+	// hit a sink with no listener and produce no flow (review round 1, Blind
+	// Hunter + Edge Case Hunter). The 6 spaced beacons already ride out a brief
+	// gap, but the explicit wait removes the race.
+	if err := e.waitDeploymentReady(ctx, s4SinkService); err != nil {
+		return fmt.Errorf("s4 wait C2 sink ready: %w", err)
+	}
+	sink := s4SinkService + "." + Namespace + ".svc"
+	script := "command -v nc >/dev/null 2>&1 || { echo '[s4] nc missing'; exit 97; }; " +
+		"i=0; while [ $i -lt " + strconv.Itoa(s4BeaconCount) + " ]; do " +
+		"echo beacon | nc -w 2 " + sink + " " + s4BeaconPort + " >/dev/null 2>&1; " +
+		"echo \"[s4] beacon $i rc=$?\"; i=$((i+1)); sleep 2; done"
+	out, err := e.exec(ctx, script)
+	if err != nil {
+		return fmt.Errorf("s4 beacon primitive: %w", err)
+	}
+	e.logger.Info("s4 technique executed",
+		"mitre", "T1071", "also", "T1071.001", "rule", "OLT-NET-002",
+		"detail", "C2 beacon flows to in-cluster sink", "sink", sink,
+		"port", s4BeaconPort, "beacons", s4BeaconCount, "out_len", len(out))
+	return nil
+}
+
+// runS5 executes the S5 cryptomining technique (MITRE T1496 Resource
+// Hijacking) in two real primitives whose signals reach the pipeline on
+// different real sources: (1) stage a miner-named process by copying the
+// in-pod busybox to /tmp/xmrig and launching it, so Falco observes an execve
+// with proc.exepath ending /xmrig (the OLT-IMPACT-005 process signature,
+// matched on the real Falco path, Story 10.3); (2) open an outbound TCP
+// connection from the pod to the in-cluster fake stratum pool on a miner port
+// (3333), whose Goldmane flow trips OLT-IMPACT-006 through the CNI path. The
+// miner binary does nothing (busybox has no xmrig applet and exits at once);
+// only the named execve matters for detection. A missing nc is a hard failure
+// (exit 97). Nothing leaves the cluster (AC2).
+func (e *Executor) runS5(ctx context.Context) error {
+	// Wait for the fake stratum pool to be Ready before connecting: unlike S4
+	// (6 spaced beacons) S5 makes few connections, so an unready pool would
+	// silently drop the only flow and miss OLT-IMPACT-006 (review round 1).
+	if err := e.waitDeploymentReady(ctx, s5PoolService); err != nil {
+		return fmt.Errorf("s5 wait stratum pool ready: %w", err)
+	}
+	pool := s5PoolService + "." + Namespace + ".svc"
+	// The pool connection RETRIES (up to 5 attempts, spaced) rather than firing
+	// once: a single refused connection (the listener's brief re-listen gap,
+	// or a just-Ready endpoint) would otherwise drop the network half and the
+	// script would still exit 0 (review round 1, Blind + Edge Case Hunter).
+	script := "command -v nc >/dev/null 2>&1 || { echo '[s5] nc missing'; exit 97; }; " +
+		"bb=\"$(command -v busybox || echo /bin/busybox)\"; " +
+		"cp \"$bb\" " + s5MinerPath + " && chmod +x " + s5MinerPath + " || { echo '[s5] stage miner failed'; exit 97; }; " +
+		s5MinerPath + " 2>/dev/null; echo \"[s5] xmrig execve rc=$?\"; " +
+		"i=0; while [ $i -lt 5 ]; do " +
+		"echo mine | nc -w 3 " + pool + " " + s5MinerPort + " >/dev/null 2>&1 && { echo '[s5] pool-connect ok'; break; }; " +
+		"echo \"[s5] pool-connect retry $i rc=$?\"; i=$((i+1)); sleep 2; done"
+	out, err := e.exec(ctx, script)
+	if err != nil {
+		return fmt.Errorf("s5 miner primitive: %w", err)
+	}
+	e.logger.Info("s5 technique executed",
+		"mitre", "T1496", "rule", "OLT-IMPACT-005/OLT-IMPACT-006",
+		"detail", "miner-named process + stratum pool connection",
+		"miner", s5MinerPath, "pool", pool, "port", s5MinerPort, "out_len", len(out))
 	return nil
 }
 

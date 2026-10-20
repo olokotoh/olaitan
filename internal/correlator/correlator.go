@@ -54,6 +54,12 @@ const fetchBackoff = time.Second
 // outlive the window's typical workload churn.
 const identityCacheTTLCeiling = 60 * time.Second
 
+// aggregateNegativeTTL bounds how long an unresolvable Goldmane aggregate
+// stays negative-cached. It matches Goldmane's 15s aggregation interval: a
+// workload created moments before its first flow batch is looked up again
+// on the next batch instead of staying blind for a whole identity TTL.
+const aggregateNegativeTTL = 15 * time.Second
+
 // Config configures a Correlator.
 type Config struct {
 	NATS                  *natsclient.Client
@@ -98,6 +104,13 @@ type Correlator struct {
 
 	identityCache    sync.Map // map[string]identityCacheEntry, key = namespace + "/" + podName
 	identityCacheTTL time.Duration
+	// aggregateMisses negative-caches Goldmane aggregates that no pod or
+	// ReplicaSet backs (key = namespace + "/" + aggregate name, value =
+	// expiry time.Time), so a stream of their flows costs one lookup per
+	// aggregateNegativeTTL rather than one per event (Story 10.7 property).
+	aggregateMisses sync.Map
+	// now is the clock for cache expiry; nil means time.Now (tests inject).
+	now func() time.Time
 
 	// Story 1.18 observability surface. metrics handles are nil when
 	// cfg.MetricsRegistry was nil at construction time; every hot-path
@@ -120,6 +133,14 @@ type Correlator struct {
 	// neverScoredEventsDropped counts the events dropped for them.
 	neverScored              atomic.Value // map[string]struct{}
 	neverScoredEventsDropped atomic.Int64
+
+	// Story 11.2b, the per-event rule path (Story 1.15 realised; an
+	// ADDITION to Story 1.14 D1, which is unchanged). evaluator is the
+	// rule corpus (nil = path off); ruleFired dedupes one late-event
+	// rule_match package per (workload, OLT rule) per window, including
+	// rules the rules engine already matches on a published snapshot.
+	evaluator atomic.Pointer[evaluatorHolder]
+	ruleFired sync.Map // key workloadID + "\x00" + ruleID -> time.Time
 }
 
 type identityCacheEntry struct {
@@ -354,10 +375,11 @@ func (c *Correlator) AddEvent(ctx context.Context, ev schema.Event) (*schema.Evi
 		return nil, fmt.Errorf("correlator: resolve workload: %w", err)
 	}
 	minSources := int(c.minSources.Load())
-	snap, transitioned, err := c.window.AddAndCheckRisingEdge(workloadID, ev, minSources)
+	added, err := c.window.AddAndCheck(workloadID, ev, minSources)
 	if err != nil {
 		return nil, err
 	}
+	snap, transitioned := added.Snapshot, added.Transitioned
 	var multi *schema.EvidencePackage
 	if transitioned {
 		tr := trigger.MultiSignal(snap, distinctSources(snap.Events), time.Now().UTC())
@@ -370,12 +392,25 @@ func (c *Correlator) AddEvent(ctx context.Context, ev schema.Event) (*schema.Evi
 		if multi, err = c.publishTrigger(ctx, tr, snap); err != nil {
 			return nil, err
 		}
+		// The rules engine evaluates this snapshot; claim what it will
+		// match so the per-event path never repeats it in this window.
+		if multi != nil {
+			c.preclaimSnapshotRules(workloadID, identity, snap)
+		}
 	}
 	// Story 10.3: a serious Falco alert starts an investigation on its own,
 	// once per (workload, rule) per window.
 	floor, _ := c.falcoFloor.Load().(string)
 	match, ok := trigger.FalcoRuleMatch(ev, floor)
 	if !ok || c.isExcluded(ev.Pod.Namespace) || !c.claimFalcoTrigger(workloadID, match.RuleID) {
+		// Story 11.2b (Story 1.15 per-event path, an ADDITION to D1): an
+		// event that joined a window which had ALREADY fired publishes no
+		// package of its own, so a single-event OLT rule (OLT-NET-002 on a
+		// Goldmane flow that arrives 15-30s after Falco) could never be
+		// evaluated. Evaluate that one event now.
+		if !transitioned && added.AlreadyFired && !c.isExcluded(ev.Pod.Namespace) && inSnapshot(added.Snapshot, ev.ID) {
+			return c.fireLateEventRules(ctx, workloadID, identity, pod, ev)
+		}
 		return multi, nil
 	}
 	tr := trigger.RuleMatch(workloadID, match, time.Now().UTC())
@@ -386,6 +421,11 @@ func (c *Correlator) AddEvent(ctx context.Context, ev schema.Event) (*schema.Evi
 		// Release the claim so the next alert can retry the publish.
 		c.falcoFired.Delete(workloadID + "\x00" + match.RuleID)
 		return multi, err
+	}
+	// A Falco-only rule_match package is evaluated by the rules engine
+	// (Story 10.3 guard), snapshot included: claim what it will match.
+	if pkg != nil {
+		c.preclaimSnapshotRules(workloadID, identity, snap)
 	}
 	if multi != nil {
 		return multi, nil
@@ -398,18 +438,23 @@ func (c *Correlator) AddEvent(ctx context.Context, ev schema.Event) (*schema.Evi
 // the window is part of the same investigation. Stale entries are pruned
 // on the way.
 func (c *Correlator) claimFalcoTrigger(workloadID, ruleID string) bool {
-	now := time.Now()
+	return c.claimIn(&c.falcoFired, workloadID, ruleID)
+}
+
+// claimIn is the Story 10.3 per-(workload, rule)-per-window claim on fired.
+func (c *Correlator) claimIn(fired *sync.Map, workloadID, ruleID string) bool {
+	now := c.clock()
 	win := time.Duration(c.windowNanos.Load())
 	key := workloadID + "\x00" + ruleID
-	if prev, loaded := c.falcoFired.LoadOrStore(key, now); loaded {
+	if prev, loaded := fired.LoadOrStore(key, now); loaded {
 		if t, _ := prev.(time.Time); now.Sub(t) < win {
 			return false
 		}
-		c.falcoFired.Store(key, now)
+		fired.Store(key, now)
 	}
-	c.falcoFired.Range(func(k, v any) bool {
+	fired.Range(func(k, v any) bool {
 		if t, _ := v.(time.Time); now.Sub(t) >= win {
-			c.falcoFired.Delete(k)
+			fired.Delete(k)
 		}
 		return true
 	})
@@ -487,7 +532,13 @@ func (c *Correlator) resolveAndCacheIdentity(ctx context.Context, ev schema.Even
 		return "", schema.WorkloadIdentity{}, nil, fmt.Errorf("event %q missing pod namespace/name", ev.ID)
 	}
 	key := ref.Namespace + "/" + ref.Name
-	now := time.Now()
+	aggPrefix, isAggregate := goldmaneAggregatePrefix(ev)
+	if !isAggregate && strings.Contains(ref.Name, "*") {
+		// A "*" name from a non-network source must not ride a cache entry
+		// a network aggregate of the same name filled (review round 1).
+		return "", schema.WorkloadIdentity{}, nil, fmt.Errorf("event %q: pod name %q is not a pod name", ev.ID, ref.Name)
+	}
+	now := c.clock()
 	if entry, ok := c.identityCache.Load(key); ok {
 		ce, _ := entry.(identityCacheEntry)
 		if now.Before(ce.expiry) {
@@ -496,27 +547,54 @@ func (c *Correlator) resolveAndCacheIdentity(ctx context.Context, ev schema.Even
 		c.identityCache.Delete(key)
 	}
 
-	workloadID, identity, pod, err := c.resolveIdentityUncached(ctx, ref)
+	var (
+		workloadID string
+		identity   schema.WorkloadIdentity
+		pod        *corev1.Pod
+		err        error
+	)
+	if isAggregate {
+		workloadID, identity, pod, err = c.resolveAggregateCached(ctx, key, ref.Namespace, aggPrefix, now)
+	} else {
+		workloadID, identity, pod, err = c.resolveIdentityUncached(ctx, ref)
+	}
 	if err != nil {
 		return "", schema.WorkloadIdentity{}, nil, err
+	}
+	ttl := c.identityCacheTTL
+	if isAggregate && pod == nil && ttl > aggregateNegativeTTL {
+		// Resolved through the ReplicaSet fallback with no live pod: keep it
+		// short so posture is taken from a real pod once one appears.
+		ttl = aggregateNegativeTTL
 	}
 	c.identityCache.Store(key, identityCacheEntry{
 		workloadID: workloadID,
 		identity:   identity,
 		pod:        pod,
-		expiry:     now.Add(c.identityCacheTTL),
+		expiry:     now.Add(ttl),
 	})
 	return workloadID, identity, pod, nil
 }
 
+// clock returns the correlator's notion of now (time.Now unless a test
+// injected a clock).
+func (c *Correlator) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
 func (c *Correlator) resolveIdentityUncached(ctx context.Context, ref schema.PodRef) (string, schema.WorkloadIdentity, *corev1.Pod, error) {
 	// Story 10.7. Validate the ref as a key BEFORE asking the apiserver. A ref
-	// the key layer rejects (a Goldmane aggregate such as "coredns-abc-*", or
-	// the "-" namespace of a non-pod endpoint) cannot name a real pod, since
-	// Kubernetes names are a strict subset of the allowed token characters,
-	// and every branch below would reject it anyway. Rejected refs are not
-	// cached, so without this each one cost a rate-limited Pod GET and the
-	// correlator fell behind the event stream on a five-source install.
+	// the key layer rejects (the "-" namespace of a non-pod endpoint, or a "*"
+	// that is not a network-source Goldmane aggregate) cannot name a real pod,
+	// since Kubernetes names are a strict subset of the allowed token
+	// characters, and every branch below would reject it anyway. Rejected refs
+	// are not cached, so without this each one cost a rate-limited Pod GET and
+	// the correlator fell behind the event stream on a five-source install.
+	// Goldmane aggregates ("web-bd846c7f-*") never reach this function: they
+	// take resolveAggregateCached (Story 11.2b).
 	fallbackID, err := keys.PodFallbackID(ref.Namespace, ref.Name)
 	if err != nil {
 		return "", schema.WorkloadIdentity{}, nil, err
@@ -531,9 +609,17 @@ func (c *Correlator) resolveIdentityUncached(ctx context.Context, ref schema.Pod
 		}
 		return "", schema.WorkloadIdentity{}, nil, fmt.Errorf("resolve pod %s/%s: %w", ref.Namespace, ref.Name, err)
 	}
+	return c.identityForPod(ctx, pod, fallbackID)
+}
+
+// identityForPod walks a real pod's owner chain to its workload identity
+// (posture.ResolveWorkloadIdentity, the walk every Falco/audit/runtime event
+// takes) and keys it. fallbackID is the orphan-pod ID used when the owner
+// walk fails.
+func (c *Correlator) identityForPod(ctx context.Context, pod *corev1.Pod, fallbackID string) (string, schema.WorkloadIdentity, *corev1.Pod, error) {
 	identity, err := posture.ResolveWorkloadIdentity(ctx, c.kube, pod)
 	if err != nil {
-		return fallbackID, schema.WorkloadIdentity{Namespace: ref.Namespace, OwnerKind: "Pod", OwnerName: ref.Name, PodName: ref.Name}, pod, nil
+		return fallbackID, schema.WorkloadIdentity{Namespace: pod.Namespace, OwnerKind: "Pod", OwnerName: pod.Name, PodName: pod.Name}, pod, nil
 	}
 	if identity.OwnerKind == "Pod" {
 		id, ferr := keys.PodFallbackID(identity.Namespace, identity.OwnerName)

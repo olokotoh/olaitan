@@ -24,12 +24,17 @@ import (
 // without bound, and a real Falco alert from an in-pod attack was never
 // reached. A ref the key layer will reject must be rejected before any
 // apiserver call.
+//
+// Story 11.2b narrowed this: a NETWORK-source Goldmane aggregate is no longer
+// rejected but resolved to its owning workload, once per cache TTL (see
+// resolve_goldmane_aggregate_test.go). A "*" name from any other source, and
+// the "-" namespace of a non-pod endpoint, still cost zero apiserver calls.
 func TestResolveRejectsUnkeyableRefWithoutAPICall(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		ref  schema.PodRef
 	}{
-		{"goldmane aggregated pod name", schema.PodRef{Namespace: "kube-system", Name: "coredns-7db6d8ff4d-*"}},
+		{"aggregate-shaped name from a non-network source", schema.PodRef{Namespace: "kube-system", Name: "coredns-7db6d8ff4d-*"}},
 		{"goldmane non-pod namespace", schema.PodRef{Namespace: "-", Name: "some-host"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

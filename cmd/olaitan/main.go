@@ -568,6 +568,14 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 		// {outcome="rejected"} stays in sync with reload-rejected log
 		// lines (code-review P1).
 		rl.SubscribeRejected(func(error) { engine.NoteReloadRejected() })
+		// Story 11.2b: the per-event rule path. An event that joins a
+		// correlation window which already fired (a Goldmane flow lands
+		// 15-30s after Falco) reaches no package under the Story 1.14 D1
+		// rising edge; the correlator evaluates it against this corpus and
+		// publishes one rule_match package per (workload, rule) per window.
+		// The atomic store is safe although corr.Run has started: until it
+		// lands the path is simply off.
+		corr.SetEventRuleEvaluator(engine)
 		// Note: rules.path and rules.enabled changes are intentionally
 		// not wired through config.Manager.Subscribe (code-review D3).
 		// The loader path is a K8s volume mountPath; changing it via

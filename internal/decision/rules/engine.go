@@ -593,3 +593,32 @@ func isExpectedFetchTimeout(err error) bool {
 	}
 	return false
 }
+
+// EvaluateEvent runs the active corpus against ONE event with the given
+// posture and returns the matches. It is the correlator's per-event path
+// (Story 11.2b; correlator.EventRuleEvaluator): an event that joins an
+// already-fired window reaches no package, so the correlator asks here
+// directly. It publishes nothing and bumps no counter; NoteEmitted does
+// that once the correlator has published the match.
+func (e *Engine) EvaluateEvent(posture *schema.WorkloadPosture, ev schema.Event) []schema.RuleMatch {
+	corpus := e.loader.Get()
+	if corpus == nil || corpus.Len() == 0 {
+		return nil
+	}
+	pkg := schema.EvidencePackage{WorkloadPosture: posture}
+	matches, err := e.evaluateOnce(&pkg, ev, corpus.Rules)
+	if err != nil {
+		e.log.Warn("rules: evaluate late event failed", "event_id", ev.ID, "err", err)
+		e.evalError.Add(1)
+		return nil
+	}
+	return matches
+}
+
+// NoteEmitted records a match the correlator published through the per-event
+// path, so olaitan_decision_rules_matches_by_attribute_total counts it like a
+// match this engine emitted itself.
+func (e *Engine) NoteEmitted(m schema.RuleMatch) {
+	e.matchesTotal.Add(1)
+	e.bumpMatchesVec(m)
+}

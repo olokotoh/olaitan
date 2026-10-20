@@ -42,7 +42,16 @@ type EvidenceTrigger struct {
 	BaselineDeviation *BaselineDeviation `json:"baseline_deviation,omitempty"`
 	DistinctSources   []EventSource      `json:"distinct_sources,omitempty"`
 	FiredAt           time.Time          `json:"fired_at"`
+	// Origin labels a rule_match package the correlator raised itself for a
+	// single event that arrived after its window had already fired
+	// (TriggerOriginLateEvent, Story 11.2b). Empty for every other package,
+	// so existing packages serialise byte-identically.
+	Origin string `json:"origin,omitempty"`
 }
+
+// TriggerOriginLateEvent is EvidenceTrigger.Origin for the per-event rule
+// path: one OLT rule matched one event that joined an already-fired window.
+const TriggerOriginLateEvent = "late_event"
 
 // EvidenceOverflow describes deterministic package reduction when the
 // on-wire package would otherwise exceed the configured byte cap.
