@@ -1584,3 +1584,58 @@ type of operator-mode Secrets on a mode switch); Secret and prompt changes
 in the config checksum; an SCC binding for certgen on OpenShift; and the
 default model's Qwen Research licence (a commercial default would be a
 different model and a new live measurement).
+
+## ADR-2026-10-19-03: No audit admission webhook; the audit receiver stays audit-backend only, with mTLS
+
+**Status.** Accepted (#155). Amends ADR-2026-10-19-02 D1: certgen now
+writes a caBundle into one webhook configuration (the applog injector's),
+not two.
+
+**Context.** Since Story 1.1 the chart rendered a ValidatingWebhookConfiguration
+(`<fullname>-audit`, webhook `audit.olaitan.io`, failurePolicy Ignore) that
+pointed at the audit receiver's `:8443/audit`, gated on
+`auditWebhook.enabled`. Story 12.7 put it in every default install. The
+receiver serves the API server's audit webhook backend and requires a
+client certificate signed by its CA with CN `kube-apiserver` (mTLS, CN
+pinned). The backend presents one through its kubeconfig; the API
+server's admission client presents none by default. Every covered
+admission request failed with `tls: certificate required`, failed open,
+and logged a line (about 100 in three hours on an idle kind cluster),
+burying real webhook failures such as #148's.
+
+**Options.**
+1. A second listener or path on the receiver with no client-cert
+   requirement for admission. Rejected. The receiver has no AdmissionReview
+   handler: `/audit` decodes an audit `EventList`, so an AdmissionReview
+   would decode to an empty list and get a 204 with no AdmissionReview
+   response, which the API server also rejects. Fixing TLS would only change
+   the error. Making it work means building admission control, which the
+   project context lists as future work, and it would open an
+   unauthenticated port on the collector for no detection gain.
+2. An `AdmissionConfiguration` kubeconfig that gives the admission client a
+   client certificate. Rejected: it needs `--admission-control-config-file`
+   on the control plane (impossible on EKS, AKS and GKE, extra manual wiring
+   elsewhere) and still meets the missing handler.
+3. Remove the stub. Chosen. Once the API server is wired to the audit
+   backend (`--audit-webhook-config-file`), the default audit policy
+   records every request the stub's rules covered (pods, services,
+   configmaps, secrets, workloads, NetworkPolicies, role bindings; its
+   `level: None` rules drop only reads of events, endpoints, leases and
+   nodes), with the response and the authenticated user. Where that wiring
+   is impossible (EKS, AKS, GKE) or a custom policy drops those resources,
+   the stub could not have filled the gap either: it never completed a
+   call. It added only a guaranteed failed round-trip per request.
+
+**Consequences.** The receiver keeps `RequireAndVerifyClientCert` and CN
+pinning unchanged. `olaitan certgen` no longer patches a
+ValidatingWebhookConfiguration (`--validating-webhook` is accepted and
+ignored with a warning, so an older chart's Job on a newer image does not
+fail), and its ClusterRole no longer names a ValidatingWebhookConfiguration (it renders
+only when the applog injector needs one). A render test pins that no
+admission webhook in any shipped profile dials the audit receiver. `helm
+upgrade` deletes the old object; an install.yaml user who enabled the audit
+webhook deletes `validatingwebhookconfiguration/<fullname>-audit` by hand
+(AUDIT.md). Leaving certgen to delete it was rejected: it would need a
+cluster-scoped delete verb in every install for a leftover that only a
+`kubectl apply` upgrade over an unreleased (Story 12.7) default can leave. Admission-time policy, if it is ever built, gets its own
+handler, Service and certificate.

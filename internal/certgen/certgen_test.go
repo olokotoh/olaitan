@@ -32,23 +32,29 @@ func fullSpec() Spec {
 		ApplogSecret:          "olaitan-applog-injector-tls",
 		ApplogDNSNames:        []string{"olaitan-applog-injector", "olaitan-applog-injector.olaitan.svc"},
 		MutatingWebhook:       "olaitan-applog-injector",
-		ValidatingWebhook:     "olaitan-audit",
 		Labels:                map[string]string{"app.kubernetes.io/instance": "olaitan"},
 		Validity:              24 * time.Hour,
 		WaitForWebhooks:       time.Second,
 	}
 }
 
-func webhookObjects() (*admissionv1.MutatingWebhookConfiguration, *admissionv1.ValidatingWebhookConfiguration) {
-	m := &admissionv1.MutatingWebhookConfiguration{
+func webhookObjects() *admissionv1.MutatingWebhookConfiguration {
+	return &admissionv1.MutatingWebhookConfiguration{
 		ObjectMeta: metav1.ObjectMeta{Name: "olaitan-applog-injector"},
 		Webhooks:   []admissionv1.MutatingWebhook{{Name: "applog.olaitan.io"}},
 	}
-	v := &admissionv1.ValidatingWebhookConfiguration{
+}
+
+// leftoverAuditStub is the ValidatingWebhookConfiguration an install from
+// before #155 may still carry. certgen must leave it exactly as it is.
+func leftoverAuditStub() *admissionv1.ValidatingWebhookConfiguration {
+	return &admissionv1.ValidatingWebhookConfiguration{
 		ObjectMeta: metav1.ObjectMeta{Name: "olaitan-audit"},
-		Webhooks:   []admissionv1.ValidatingWebhook{{Name: "audit.olaitan.io"}},
+		Webhooks: []admissionv1.ValidatingWebhook{{
+			Name:         "audit.olaitan.io",
+			ClientConfig: admissionv1.WebhookClientConfig{CABundle: []byte("old-bundle")},
+		}},
 	}
-	return m, v
 }
 
 func parseCert(t *testing.T, b []byte) *x509.Certificate {
@@ -74,8 +80,8 @@ func pool(t *testing.T, ca []byte) *x509.CertPool {
 }
 
 func TestRunCreatesTheMaterialAndPatchesTheWebhooks(t *testing.T) {
-	m, v := webhookObjects()
-	cs := fake.NewSimpleClientset(m, v)
+	m := webhookObjects()
+	cs := fake.NewSimpleClientset(m, leftoverAuditStub())
 	ctx := context.Background()
 	if err := Run(ctx, cs, fullSpec(), quietLog()); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -150,9 +156,14 @@ func TestRunCreatesTheMaterialAndPatchesTheWebhooks(t *testing.T) {
 	if string(gm.Webhooks[0].ClientConfig.CABundle) != string(applog.Data["ca.crt"]) {
 		t.Error("mutating webhook caBundle is not the applog CA")
 	}
-	gv, _ := cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(ctx, "olaitan-audit", metav1.GetOptions{})
-	if string(gv.Webhooks[0].ClientConfig.CABundle) != string(ca) {
-		t.Error("validating webhook caBundle is not the audit CA")
+	// #155: the audit CA goes into no admission webhook. A leftover stub
+	// from an older install is left untouched.
+	gv, err := cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(ctx, "olaitan-audit", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(gv.Webhooks[0].ClientConfig.CABundle); got != "old-bundle" {
+		t.Errorf("certgen touched a leftover ValidatingWebhookConfiguration (#155): caBundle now %q", got)
 	}
 	for _, b := range [][]byte{audit.Data["tls.crt"], kc.Data["webhook-kubeconfig.yaml"], applog.Data["tls.crt"]} {
 		if strings.Contains(string(b), "BEGIN RSA") {
@@ -162,8 +173,8 @@ func TestRunCreatesTheMaterialAndPatchesTheWebhooks(t *testing.T) {
 }
 
 func TestRunIsIdempotentAndNeverReplacesMaterial(t *testing.T) {
-	m, v := webhookObjects()
-	cs := fake.NewSimpleClientset(m, v)
+	m := webhookObjects()
+	cs := fake.NewSimpleClientset(m)
 	ctx := context.Background()
 	if err := Run(ctx, cs, fullSpec(), quietLog()); err != nil {
 		t.Fatal(err)
@@ -175,7 +186,7 @@ func TestRunIsIdempotentAndNeverReplacesMaterial(t *testing.T) {
 	}
 	// An apply of the chart resets nothing (caBundle is not rendered), but a
 	// webhook configuration recreated from scratch must be patched again.
-	m2, _ := webhookObjects()
+	m2 := webhookObjects()
 	_ = cs.AdmissionregistrationV1().MutatingWebhookConfigurations().Delete(ctx, m2.Name, metav1.DeleteOptions{})
 	if _, err := cs.AdmissionregistrationV1().MutatingWebhookConfigurations().Create(ctx, m2, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
@@ -197,7 +208,7 @@ func TestRunIsIdempotentAndNeverReplacesMaterial(t *testing.T) {
 }
 
 func TestRunOnlyTouchesWhatItIsGiven(t *testing.T) {
-	m, _ := webhookObjects()
+	m := webhookObjects()
 	cs := fake.NewSimpleClientset(m)
 	spec := Spec{
 		Namespace:       ns,
@@ -247,8 +258,8 @@ func TestSpecValidate(t *testing.T) {
 // and reusing the old material would leave a cert without the new name and
 // a kubeconfig pointing at the old server.
 func TestRunRegeneratesWhenTheSpecMoved(t *testing.T) {
-	m, v := webhookObjects()
-	cs := fake.NewSimpleClientset(m, v)
+	m := webhookObjects()
+	cs := fake.NewSimpleClientset(m)
 	ctx := context.Background()
 	if err := Run(ctx, cs, fullSpec(), quietLog()); err != nil {
 		t.Fatal(err)
@@ -272,23 +283,19 @@ func TestRunRegeneratesWhenTheSpecMoved(t *testing.T) {
 	if _, err := parseCert(t, applog.Data["tls.crt"]).Verify(x509.VerifyOptions{DNSName: "olaitan-applog-injector.olaitan.svc.cluster.local", Roots: pool(t, applog.Data["ca.crt"])}); err != nil {
 		t.Errorf("applog cert was not regenerated for the new name: %v", err)
 	}
-	gv, _ := cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(ctx, "olaitan-audit", metav1.GetOptions{})
-	if string(gv.Webhooks[0].ClientConfig.CABundle) != string(audit.Data["ca.crt"]) {
-		t.Error("validating webhook caBundle was not moved to the new CA")
-	}
 }
 
 // Review (Edge Case Hunter E4): a complete Secret certgen did not make (an
 // operator-mode Secret left behind on a switch to auto mode, whose ca.crt is
 // the apiserver CLIENT CA, not a serving CA) must not be adopted.
 func TestRunReplacesASecretItDidNotMake(t *testing.T) {
-	m, v := webhookObjects()
+	m := webhookObjects()
 	foreign := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "olaitan-applog-injector-tls", Namespace: ns},
 		Type:       corev1.SecretTypeTLS,
 		Data:       map[string][]byte{"tls.crt": []byte("x"), "tls.key": []byte("y"), "ca.crt": []byte("operator-ca")},
 	}
-	cs := fake.NewSimpleClientset(m, v, foreign)
+	cs := fake.NewSimpleClientset(m, foreign)
 	ctx := context.Background()
 	if err := Run(ctx, cs, fullSpec(), quietLog()); err != nil {
 		t.Fatal(err)

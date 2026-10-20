@@ -385,10 +385,10 @@ networkPolicy:
 # incorrect Kubernetes terminology. Audit webhook backends are NOT
 # ValidatingWebhookConfiguration resources; they are configured via
 # the apiserver's --audit-webhook-config-file flag pointing at a
-# kubeconfig Secret. The existing
-# deploy/helm/olaitan/templates/validatingwebhookconfiguration.yaml is
-# an admission-webhook stub from Story 1.1 (a separate feature) and is
-# left alone by this story. See AUDIT.md for the full reconciliation.
+# kubeconfig Secret. The chart renders no admission webhook for audit:
+# the Story 1.1 ValidatingWebhookConfiguration stub dialled this mTLS
+# receiver with no client certificate and failed every call, so #155
+# removed it (ADR-2026-10-19-03). See AUDIT.md.
 # [Source: epics.md Story 1.7, architecture.md:§Audit Webhook TLS]
 auditWebhook:
   # @schema type:boolean effect:"run the Kubernetes audit webhook receiver in the collector (TLS generated in-cluster unless supplied); bridges detection.sources.audit.enabled" ref:FR5

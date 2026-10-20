@@ -1750,7 +1750,9 @@ spec:
     requests:
       storage: "1Gi"
 ---
-# Cluster-scoped: only the release's own webhook configurations, by name.
+# Cluster-scoped: only the release's own applog MutatingWebhookConfiguration,
+# by name. Nothing cluster-scoped is needed when only the audit part is
+# generated (#155: no ValidatingWebhookConfiguration to patch).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -1766,10 +1768,6 @@ rules:
   - apiGroups: ["admissionregistration.k8s.io"]
     resources: ["mutatingwebhookconfigurations"]
     resourceNames: ["olaitan-applog-injector"]
-    verbs: ["get", "update"]
-  - apiGroups: ["admissionregistration.k8s.io"]
-    resources: ["validatingwebhookconfigurations"]
-    resourceNames: ["olaitan-audit"]
     verbs: ["get", "update"]
 ---
 # Aggregator: cluster-wide. NetworkPolicy writes and pod annotation
@@ -3393,7 +3391,7 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: olaitan-certgen-d61f3fa692
+  name: olaitan-certgen-4e87d573d0
   namespace: default
   labels:
     helm.sh/chart: olaitan-CHART_VERSION_REDACTED
@@ -3434,7 +3432,6 @@ spec:
             - "--audit-kubeconfig-secret=olaitan-audit-webhook-kubeconfig"
             - "--audit-dns=olaitan-audit-webhook,olaitan-audit-webhook.default,olaitan-audit-webhook.default.svc,olaitan-audit-webhook.default.svc.cluster.local"
             - "--audit-server=olaitan-audit-webhook.default.svc.cluster.local:8443"
-            - "--validating-webhook=olaitan-audit"
             - "--applog-secret=olaitan-applog-injector-tls"
             - "--applog-dns=olaitan-applog-injector,olaitan-applog-injector.default,olaitan-applog-injector.default.svc,olaitan-applog-injector.default.svc.cluster.local"
             - "--mutating-webhook=olaitan-applog-injector"
@@ -3588,59 +3585,6 @@ webhooks:
         namespace: default
         path: /mutate
         port: 443
----
-apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingWebhookConfiguration
-metadata:
-  name: olaitan-audit
-  labels:
-    helm.sh/chart: olaitan-CHART_VERSION_REDACTED
-    app.kubernetes.io/name: olaitan
-    app.kubernetes.io/instance: olaitan
-    app.kubernetes.io/version: "APP_VERSION_REDACTED"
-    app.kubernetes.io/managed-by: Helm
-webhooks:
-  - name: audit.olaitan.io
-    admissionReviewVersions: ["v1"]
-    sideEffects: None
-    failurePolicy: Ignore
-    timeoutSeconds: 5
-    namespaceSelector:
-      matchExpressions:
-        - key: kubernetes.io/metadata.name
-          operator: NotIn
-          values:
-            - default
-            - kube-system
-            - kube-public
-            - kube-node-lease
-    clientConfig:
-      service:
-        name: olaitan-audit-webhook
-        namespace: default
-        port: 8443
-        path: /audit
-    rules:
-      - operations: ["CREATE", "UPDATE", "DELETE"]
-        apiGroups: [""]
-        apiVersions: ["v1"]
-        resources: ["pods", "services", "configmaps", "secrets"]
-        scope: "Namespaced"
-      - operations: ["CREATE", "UPDATE", "DELETE"]
-        apiGroups: ["apps"]
-        apiVersions: ["v1"]
-        resources: ["deployments", "daemonsets", "statefulsets"]
-        scope: "Namespaced"
-      - operations: ["CREATE", "UPDATE", "DELETE"]
-        apiGroups: ["networking.k8s.io"]
-        apiVersions: ["v1"]
-        resources: ["networkpolicies"]
-        scope: "Namespaced"
-      - operations: ["CREATE", "UPDATE", "DELETE"]
-        apiGroups: ["rbac.authorization.k8s.io"]
-        apiVersions: ["v1"]
-        resources: ["rolebindings", "clusterrolebindings"]
-        scope: "*"
 ---
 apiVersion: v1
 kind: Pod

@@ -13,7 +13,7 @@ address is not knowable at render time. So: no ingress at all, and egress
 to any address on the API server ports only (443, 6443, 8443). No DNS: the
 in-cluster client dials KUBERNETES_SERVICE_HOST, an IP. The pod lives for
 seconds, runs one binary, and its ServiceAccount can only write its own
-Secrets and the two webhook caBundles.
+Secrets and the applog injector's webhook caBundle (#155: no audit one).
 */}}
 {{- if and .Values.networkPolicy.enabled (include "olaitan.certgen.enabled" .) }}
 apiVersion: networking.k8s.io/v1

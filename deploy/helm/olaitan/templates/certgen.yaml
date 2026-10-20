@@ -9,9 +9,12 @@ would be one private key in a public release asset, shared by every install
 (Story 12.4 D5 forbids exactly that). This Job runs `olaitan certgen` on the
 Olaitan image (no new third-party image to pin) INSIDE the cluster: it
 creates the Secrets that do not exist yet, per install, never replaces one
-that does, and writes the CA into the caBundle of the webhook
-configurations, which the templates leave out in this mode so a later
-upgrade or re-apply does not wipe it.
+that does, and writes the applog CA into the caBundle of the applog
+MutatingWebhookConfiguration, which the template leaves out in this mode so
+a later upgrade or re-apply does not wipe it. The audit CA goes into no
+webhook configuration: the audit receiver is an audit backend reached through
+the apiserver kubeconfig, and the admission stub that dialled it is gone
+(#155, ADR-2026-10-19-03).
 
 Rendered only when a part needs generated material (no operator material,
 no cert-manager). The name carries a hash of the image and the arguments,
@@ -37,7 +40,7 @@ them with `kubectl -n <ns> get secret -l app.kubernetes.io/managed-by=olaitan-ce
        serving cert too, or the apiserver's handshake fails. */ -}}
 {{- $host := regexFind "^(\\[[^\\]]*\\]|[^:]+)" $server | trimPrefix "[" | trimSuffix "]" -}}
 {{- if regexMatch "^[0-9.]+$|:" $host -}}{{- $ips = append $ips $host -}}{{- else if not (has $host $dns) -}}{{- $dns = append $dns $host -}}{{- end -}}
-{{- $args = concat $args (list (printf "--audit-secret=%s-audit-tls" $full) (printf "--audit-kubeconfig-secret=%s-audit-webhook-kubeconfig" $full) (printf "--audit-dns=%s" (join "," $dns)) (printf "--audit-server=%s" $server) (printf "--validating-webhook=%s-audit" $full)) -}}
+{{- $args = concat $args (list (printf "--audit-secret=%s-audit-tls" $full) (printf "--audit-kubeconfig-secret=%s-audit-webhook-kubeconfig" $full) (printf "--audit-dns=%s" (join "," $dns)) (printf "--audit-server=%s" $server)) -}}
 {{- if $ips }}{{- $args = append $args (printf "--audit-ip=%s" (join "," $ips)) -}}{{- end -}}
 {{- end -}}
 {{- if $applog -}}
@@ -100,8 +103,11 @@ subjects:
   - kind: ServiceAccount
     name: {{ $full }}-certgen
     namespace: {{ $ns }}
+{{- if $applog }}
 ---
-# Cluster-scoped: only the release's own webhook configurations, by name.
+# Cluster-scoped: only the release's own applog MutatingWebhookConfiguration,
+# by name. Nothing cluster-scoped is needed when only the audit part is
+# generated (#155: no ValidatingWebhookConfiguration to patch).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -110,18 +116,10 @@ metadata:
     {{- include "olaitan.labels" . | nindent 4 }}
     app.kubernetes.io/component: certgen
 rules:
-  {{- if $applog }}
   - apiGroups: ["admissionregistration.k8s.io"]
     resources: ["mutatingwebhookconfigurations"]
     resourceNames: [{{ printf "%s-applog-injector" $full | quote }}]
     verbs: ["get", "update"]
-  {{- end }}
-  {{- if $audit }}
-  - apiGroups: ["admissionregistration.k8s.io"]
-    resources: ["validatingwebhookconfigurations"]
-    resourceNames: [{{ printf "%s-audit" $full | quote }}]
-    verbs: ["get", "update"]
-  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -138,6 +136,7 @@ subjects:
   - kind: ServiceAccount
     name: {{ $full }}-certgen
     namespace: {{ $ns }}
+{{- end }}
 ---
 apiVersion: batch/v1
 kind: Job

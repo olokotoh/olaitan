@@ -65,12 +65,19 @@ func parseCertgenFlags(args []string, stderr io.Writer) (certgen.Spec, error) {
 	fs.StringVar(&spec.ApplogSecret, "applog-secret", "", "applog injector TLS Secret (tls.crt, tls.key, ca.crt)")
 	fs.StringVar(&applogDNS, "applog-dns", "", "comma-separated DNS names for the applog serving cert")
 	fs.StringVar(&spec.MutatingWebhook, "mutating-webhook", "", "MutatingWebhookConfiguration whose caBundle gets the applog CA")
-	fs.StringVar(&spec.ValidatingWebhook, "validating-webhook", "", "ValidatingWebhookConfiguration whose caBundle gets the audit CA")
+	// #155: the audit admission stub is gone, so there is no
+	// ValidatingWebhookConfiguration to patch. The flag is still accepted,
+	// and ignored with a warning, so a Job rendered by an older chart that
+	// runs this image (an image.tag override) does not fail on it.
+	deprecatedValidating := fs.String("validating-webhook", "", "deprecated and ignored (#155): the chart renders no ValidatingWebhookConfiguration")
 	fs.Var(&labels, "label", "key=value label for every Secret created (repeatable)")
 	fs.DurationVar(&validity, "validity", 0, "certificate validity (default ten years)")
 	fs.DurationVar(&waitForWebhooks, "wait-for-webhooks", 0, "how long to wait for a webhook configuration to exist (default 2m)")
 	if err := fs.Parse(args); err != nil {
 		return certgen.Spec{}, err
+	}
+	if *deprecatedValidating != "" {
+		_, _ = fmt.Fprintf(stderr, "certgen: --validating-webhook=%s is deprecated and ignored (#155); no webhook configuration carries the audit CA\n", *deprecatedValidating)
 	}
 	spec.AuditDNSNames = splitList(auditDNS)
 	spec.AuditIPs = splitList(auditIPs)
