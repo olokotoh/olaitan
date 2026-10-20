@@ -65,7 +65,6 @@ func parseCertgenFlags(args []string, stderr io.Writer) (certgen.Spec, error) {
 	fs.StringVar(&spec.ApplogSecret, "applog-secret", "", "applog injector TLS Secret (tls.crt, tls.key, ca.crt)")
 	fs.StringVar(&applogDNS, "applog-dns", "", "comma-separated DNS names for the applog serving cert")
 	fs.StringVar(&spec.MutatingWebhook, "mutating-webhook", "", "MutatingWebhookConfiguration whose caBundle gets the applog CA")
-	fs.StringVar(&spec.ValidatingWebhook, "validating-webhook", "", "ValidatingWebhookConfiguration whose caBundle gets the audit CA")
 	fs.Var(&labels, "label", "key=value label for every Secret created (repeatable)")
 	fs.DurationVar(&validity, "validity", 0, "certificate validity (default ten years)")
 	fs.DurationVar(&waitForWebhooks, "wait-for-webhooks", 0, "how long to wait for a webhook configuration to exist (default 2m)")

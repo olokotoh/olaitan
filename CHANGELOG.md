@@ -154,6 +154,22 @@ and false-positive numbers; see [Unreleased](#unreleased).
 
 ### Fixed
 
+- **Every admission request in a covered namespace paid a failed TLS
+  handshake** (#155). The chart rendered a ValidatingWebhookConfiguration
+  (`<fullname>-audit`, webhook `audit.olaitan.io`) aimed at the audit
+  receiver's `:8443/audit`. The receiver requires a client certificate from
+  the API server's audit backend (mTLS, CN `kube-apiserver`); the API
+  server's admission client presents none, so each call failed with
+  `tls: certificate required` and failed open, and the apiserver log filled
+  with the line. The receiver also has no AdmissionReview handler, so the
+  stub could never have worked. The stub is removed (ADR-2026-10-19-02):
+  the audit backend already receives every request it covered, with more
+  detail. The audit receiver keeps mTLS unchanged. `olaitan certgen` loses
+  `--validating-webhook` and its ClusterRole no longer names a
+  ValidatingWebhookConfiguration. `helm upgrade` deletes the old object; an
+  install.yaml user who enabled the audit webhook removes it with
+  `kubectl delete validatingwebhookconfiguration <fullname>-audit`.
+
 - **The quickstart's score was not the read's** (follows up #177 and #181).
   The README and `make quickstart` showed "CLEAN to SUSPICIOUS at score 36"
   as the result of `cat /etc/shadow`. The read trips Falco's Warning rule

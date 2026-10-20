@@ -297,7 +297,7 @@ func TestDefaultRenderHoldsNoKeyMaterial(t *testing.T) {
 	}
 	args := strings.Join(toStrings(asList(c["args"])), " ")
 	for _, want := range []string{"certgen", "--audit-secret=olaitan-audit-tls", "--audit-kubeconfig-secret=olaitan-audit-webhook-kubeconfig",
-		"--applog-secret=olaitan-applog-injector-tls", "--mutating-webhook=olaitan-applog-injector", "--validating-webhook=olaitan-audit"} {
+		"--applog-secret=olaitan-applog-injector-tls", "--mutating-webhook=olaitan-applog-injector"} {
 		if !strings.Contains(args, want) {
 			t.Errorf("certgen args %q lack %q", args, want)
 		}

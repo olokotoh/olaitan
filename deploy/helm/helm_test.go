@@ -263,12 +263,14 @@ func TestSubchartsDisabled(t *testing.T) {
 		"ConfigMap":             4,
 		"PersistentVolumeClaim": 2,
 		// release + ollama + ollama-pull + certgen (12.7 round 2).
-		"NetworkPolicy":                  4,
-		"DaemonSet":                      1,
-		"Deployment":                     3,
-		"Job":                            2,
-		"MutatingWebhookConfiguration":   1,
-		"ValidatingWebhookConfiguration": 1,
+		"NetworkPolicy":                4,
+		"DaemonSet":                    1,
+		"Deployment":                   3,
+		"Job":                          2,
+		"MutatingWebhookConfiguration": 1,
+		// #155: no ValidatingWebhookConfiguration (the audit admission
+		// stub could never authenticate to the mTLS receiver).
+		"ValidatingWebhookConfiguration": 0,
 		// Story 10.2: the falco-ingest Service renders even with the
 		// Falco subchart off; it is where an operator's own Falco posts.
 		"Service": 4,
@@ -861,7 +863,7 @@ func auditWebhookEnabledArgs() []string {
 }
 
 // TestAuditWebhookGate_AllResourcesGated asserts every audit-webhook
-// resource (Service, ValidatingWebhookConfiguration stub, audit-policy
+// resource (Service, audit-policy
 // ConfigMap, kubeconfig Secret, TLS Secret) is absent by default and
 // present when the gate is flipped. All gated resources must come and
 // go together — a partial render is a chart-rot signal.
@@ -905,9 +907,9 @@ func TestAuditWebhookGate_AllResourcesGated(t *testing.T) {
 	if !svcFound {
 		t.Errorf("audit-webhook Service not rendered with auditWebhook.enabled=true")
 	}
-	if len(findByKind(enabledMs, "ValidatingWebhookConfiguration")) != 1 {
-		t.Errorf("ValidatingWebhookConfiguration: got %d, want 1 with auditWebhook.enabled=true",
-			len(findByKind(enabledMs, "ValidatingWebhookConfiguration")))
+	// #155: the admission stub that used to ride on this gate is gone.
+	if n := len(findByKind(enabledMs, "ValidatingWebhookConfiguration")); n != 0 {
+		t.Errorf("ValidatingWebhookConfiguration: got %d, want 0 with auditWebhook.enabled=true (#155)", n)
 	}
 
 	policyCMFound := false
@@ -1132,28 +1134,9 @@ func TestDaemonsetMountsAuditTLSSecret_WhenEnabled(t *testing.T) {
 	}
 }
 
-// TestValidatingWebhookConfigurationUntouched is the negative
-// regression test the Story 1.7 ACs require: enabling audit-webhook
-// must NOT change the existing admission-webhook stub from Story 1.1.
-// Specifically, the rule list (pods/services/configmaps/secrets +
-// deployments/daemonsets/statefulsets + networkpolicies +
-// rolebindings/clusterrolebindings) and the namespaceSelector
-// exclusions must remain intact.
-func TestValidatingWebhookConfigurationUntouched(t *testing.T) {
-	args := append([]string{"falco.enabled=false", "nats.enabled=false", "redis.enabled=false"}, auditWebhookEnabledArgs()...)
-	rendered := helmTemplate(t, args)
-	for _, want := range []string{
-		"audit.olaitan.io",
-		"sideEffects: None",
-		"failurePolicy: Ignore",
-		"rolebindings",
-		"clusterrolebindings",
-	} {
-		if !strings.Contains(rendered, want) {
-			t.Errorf("ValidatingWebhookConfiguration stub from Story 1.1 missing %q (Story 1.7 must NOT modify it)", want)
-		}
-	}
-}
+// TestValidatingWebhookConfigurationUntouched (Story 1.7) pinned the Story
+// 1.1 admission stub. #155 removed the stub on purpose (ADR-2026-10-19-02);
+// admission_webhook_test.go pins its absence in every shipped profile.
 
 // TestContainerdSensorAbsent_WhenDisabled is the negative-default
 // regression test for Story 1.8: with containerdSensor.enabled=false

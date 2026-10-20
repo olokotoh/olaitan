@@ -77,11 +77,11 @@ type Spec struct {
 	ApplogSecret   string
 	ApplogDNSNames []string
 
-	// Webhook configurations whose caBundle is set: the applog injector's
-	// MutatingWebhookConfiguration (applog CA) and the audit admission stub's
-	// ValidatingWebhookConfiguration (audit CA).
-	MutatingWebhook   string
-	ValidatingWebhook string
+	// MutatingWebhook is the applog injector's MutatingWebhookConfiguration,
+	// whose caBundle gets the applog CA. The audit CA goes into no webhook
+	// configuration: the audit receiver is an audit backend, dialled through
+	// the kubeconfig, and no admission webhook may dial it (#155).
+	MutatingWebhook string
 
 	// Labels added to every Secret created (plus the managed-by label).
 	Labels map[string]string
@@ -113,9 +113,6 @@ func (s Spec) Validate() error {
 	if s.ApplogSecret != "" && len(s.ApplogDNSNames) == 0 {
 		return errors.New("certgen: the applog serving cert needs at least one DNS name")
 	}
-	if s.ValidatingWebhook != "" && s.AuditSecret == "" {
-		return errors.New("certgen: the validating webhook takes the audit CA; set the audit Secret")
-	}
 	if s.MutatingWebhook != "" && s.ApplogSecret == "" {
 		return errors.New("certgen: the mutating webhook takes the applog CA; set the applog Secret")
 	}
@@ -146,15 +143,8 @@ func Run(ctx context.Context, cs kubernetes.Interface, spec Spec, log *slog.Logg
 	g := generator{cs: cs, spec: spec, log: log, validity: validity}
 
 	if spec.AuditSecret != "" {
-		auditCA, err := g.ensureAudit(ctx)
-		if err != nil {
+		if _, err := g.ensureAudit(ctx); err != nil {
 			return err
-		}
-		if spec.ValidatingWebhook != "" {
-			if err := patchValidating(ctx, cs, spec.ValidatingWebhook, auditCA, wait); err != nil {
-				return err
-			}
-			log.Info("certgen: caBundle set", "validatingwebhookconfiguration", spec.ValidatingWebhook)
 		}
 	}
 	if spec.ApplogSecret != "" {
@@ -361,33 +351,11 @@ func (g generator) labels() map[string]string {
 	return out
 }
 
-// patchMutating and patchValidating set the caBundle of every webhook in the
-// named configuration, retrying while the configuration does not exist yet.
+// patchMutating sets the caBundle of every webhook in the named
+// configuration, retrying while the configuration does not exist yet.
 func patchMutating(ctx context.Context, cs kubernetes.Interface, name string, ca []byte, wait time.Duration) error {
 	api := cs.AdmissionregistrationV1().MutatingWebhookConfigurations()
 	return untilFound(ctx, wait, "mutatingwebhookconfiguration "+name, func() error {
-		w, err := api.Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			return err
-		}
-		changed := false
-		for i := range w.Webhooks {
-			if !bytes.Equal(w.Webhooks[i].ClientConfig.CABundle, ca) {
-				w.Webhooks[i].ClientConfig.CABundle = ca
-				changed = true
-			}
-		}
-		if !changed {
-			return nil
-		}
-		_, err = api.Update(ctx, w, metav1.UpdateOptions{})
-		return err
-	})
-}
-
-func patchValidating(ctx context.Context, cs kubernetes.Interface, name string, ca []byte, wait time.Duration) error {
-	api := cs.AdmissionregistrationV1().ValidatingWebhookConfigurations()
-	return untilFound(ctx, wait, "validatingwebhookconfiguration "+name, func() error {
 		w, err := api.Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return err

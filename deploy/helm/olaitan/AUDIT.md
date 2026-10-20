@@ -55,9 +55,23 @@ is incorrect Kubernetes terminology -- admission webhooks (synchronous
 gates on incoming API requests via `AdmissionReview`) and audit-webhook
 backends (asynchronous post-request push of audit `EventList` JSON via
 `--audit-webhook-config-file`) are distinct features. Story 1.7 builds
-the latter; the existing
-`templates/validatingwebhookconfiguration.yaml` (a stub from Story 1.1
-for a future admission-control feature) is left alone.
+the latter. The chart renders no audit admission webhook.
+
+Until #155 the chart also shipped a Story 1.1
+`ValidatingWebhookConfiguration` stub (`<fullname>-audit`, webhook
+`audit.olaitan.io`) aimed at this receiver. The receiver requires a client
+certificate signed by its CA with CN `kube-apiserver`, which only the
+audit backend's kubeconfig carries; the API server's admission client
+presents none, so every call failed with `tls: certificate required` and
+failed open. The receiver also decodes audit `EventList` batches, not
+`AdmissionReview`. The audit backend already receives every request the
+stub covered, so the stub was removed rather than given its own
+unauthenticated listener (ADR-2026-10-19-02). After upgrading through
+`install.yaml` rather than helm, delete the leftover object:
+
+```bash
+kubectl delete validatingwebhookconfiguration olaitan-audit --ignore-not-found
+```
 
 ## Wiring overview
 

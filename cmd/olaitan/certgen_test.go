@@ -20,7 +20,6 @@ func TestParseCertgenFlags(t *testing.T) {
 		"--applog-secret=olaitan-applog-injector-tls",
 		"--applog-dns=b,b.olaitan.svc",
 		"--mutating-webhook=olaitan-applog-injector",
-		"--validating-webhook=olaitan-audit",
 		"--label=app.kubernetes.io/instance=olaitan",
 		"--validity=87600h",
 	}, &stderr)
@@ -37,6 +36,13 @@ func TestParseCertgenFlags(t *testing.T) {
 	}
 	if _, err := parseCertgenFlags([]string{"--namespace=olaitan"}, &stderr); err == nil {
 		t.Error("a certgen run with nothing to do parsed")
+	}
+	// #155: the audit admission stub is gone, so certgen has no
+	// ValidatingWebhookConfiguration to patch and must not accept the flag.
+	if _, err := parseCertgenFlags([]string{"--namespace=olaitan",
+		"--audit-secret=a", "--audit-kubeconfig-secret=k", "--audit-dns=a", "--audit-server=a:8443",
+		"--validating-webhook=olaitan-audit"}, &stderr); err == nil {
+		t.Error("--validating-webhook still parses (#155)")
 	}
 	if _, err := parseCertgenFlags([]string{"--namespace=olaitan", "--applog-secret=x", "--label=novalue"}, &stderr); err == nil {
 		t.Error("a malformed --label parsed")
