@@ -142,8 +142,29 @@ func (s *Store) Add(workloadID string, ev schema.Event) (Snapshot, error) {
 // count drops below minSources, so a workload that expires below the
 // threshold and later climbs back re-fires once.
 func (s *Store) AddAndCheckRisingEdge(workloadID string, ev schema.Event, minSources int) (Snapshot, bool, error) {
+	r, err := s.AddAndCheck(workloadID, ev, minSources)
+	return r.Snapshot, r.Transitioned, err
+}
+
+// AddResult is what AddAndCheck reports about one insert.
+type AddResult struct {
+	Snapshot Snapshot
+	// Transitioned is the Story 1.14 D1 rising edge: the multi-signal
+	// predicate went from false to true with this event.
+	Transitioned bool
+	// AlreadyFired reports that the workload's window had ALREADY fired
+	// before this event and is still converged after it, so no new
+	// multi-signal package is published for it (D1 is unchanged). The
+	// correlator uses it to evaluate the single late event against the
+	// rule corpus instead (Story 11.2b, the Story 1.15 per-event path).
+	AlreadyFired bool
+}
+
+// AddAndCheck is AddAndCheckRisingEdge plus AlreadyFired. The rising-edge
+// semantics are identical; AlreadyFired is purely additional information.
+func (s *Store) AddAndCheck(workloadID string, ev schema.Event, minSources int) (AddResult, error) {
 	if workloadID == "" {
-		return Snapshot{}, false, errors.New("window: workload id is empty")
+		return AddResult{}, errors.New("window: workload id is empty")
 	}
 	if ev.Timestamp.IsZero() {
 		ev.Timestamp = time.Now().UTC()
@@ -164,11 +185,12 @@ func (s *Store) AddAndCheckRisingEdge(workloadID string, ev schema.Event, minSou
 	if len(kept) == 0 {
 		delete(s.workload, workloadID)
 		delete(s.fired, workloadID)
-		return makeSnapshotLocked(workloadID, kept), false, nil
+		return AddResult{Snapshot: makeSnapshotLocked(workloadID, kept)}, nil
 	}
 	s.workload[workloadID] = kept
 
 	transitioned := false
+	alreadyFired := false
 	if minSources > 0 {
 		current := meetsMinSources(kept, minSources)
 		prior := s.fired[workloadID]
@@ -176,6 +198,8 @@ func (s *Store) AddAndCheckRisingEdge(workloadID string, ev schema.Event, minSou
 		case current && !prior:
 			s.fired[workloadID] = true
 			transitioned = true
+		case current && prior:
+			alreadyFired = true
 		case !current && prior:
 			// Re-arm: the distinct-source set dropped below the
 			// threshold, the next time we climb back we should fire
@@ -183,7 +207,7 @@ func (s *Store) AddAndCheckRisingEdge(workloadID string, ev schema.Event, minSou
 			delete(s.fired, workloadID)
 		}
 	}
-	return makeSnapshotLocked(workloadID, kept), transitioned, nil
+	return AddResult{Snapshot: makeSnapshotLocked(workloadID, kept), Transitioned: transitioned, AlreadyFired: alreadyFired}, nil
 }
 
 // Snapshot returns a copy of workloadID's current buffer.

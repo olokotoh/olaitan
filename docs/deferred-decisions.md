@@ -1639,3 +1639,19 @@ webhook deletes `validatingwebhookconfiguration/<fullname>-audit` by hand
 cluster-scoped delete verb in every install for a leftover that only a
 `kubectl apply` upgrade over an unreleased (Story 12.7) default can leave. Admission-time policy, if it is ever built, gets its own
 handler, Service and certificate.
+
+---
+
+---
+
+## ADR-2026-10-20-01: Per-event rule evaluation for late events (an ADDITION to Story 1.14 D1; Story 1.15 realised)
+
+**Context.** The 2026-10-19 live gate (kind-full, Falco ON) showed that a Goldmane flow reaches the correlator 15-30s after the Falco, runtime and audit events of the same attack. By then the workload's window has usually already crossed the multi-signal threshold and published its package. Under Story 1.14 D1 (rising edge: fire once per climb, re-arm only when the source set drops below the threshold) the late flow publishes nothing, and the rules engine evaluates only published packages. A single-event OLT rule on a flow (OLT-NET-002 for S4, OLT-IMPACT-006 for S5) could therefore never match. The rules engine's re-entrancy guard was not the cause: it already evaluates Falco-only packages (Story 10.3).
+
+**Decision** (BMad party mode, Winston / Amelia / Murat / Dr. Quinn; option D, resolved by the Chief of Staff under Aslim's delegation). D1 stays exactly as written. In addition, when an event joins a window that has ALREADY fired, the correlator evaluates the OLT corpus against that one event (`rules.Engine.EvaluateEvent`, through `correlator.EventRuleEvaluator`) and, on a match, publishes ONE `rule_match` package for that workload holding only that event, deduplicated per (workload, rule) per window with the Story 10.3 claim pattern. The rules a published snapshot will match are pre-claimed, so this path never repeats a match the rules engine already makes. The trigger carries `origin: "late_event"` (EvidencePackage `trigger.origin`, additive optional) and is counted in `olaitan_correlator_late_event_rule_packages_total{rule_id}`, so MTTD for flow-dependent detections is measured to this package. The FireRuleMatch hook Story 1.14 reserved for Story 1.15 is the publish path.
+
+**Rejected.** (a) Re-fire the whole window when a new source joins: re-publishes old events, so the baseline and the analyst chain re-score them, and it amends D1. (b) Give each scenario its own Deployment and wait out the window: fixes the harness, not the detector. (c) Rules engine consumes EVENTS_RAW directly: duplicates the correlator's identity and window logic.
+
+**Guarantees (tests).** A late real S4 flow yields exactly one OLT-NET-002 package and a pool flow one OLT-IMPACT-006 package; a second same-rule event in the window yields none (`TestIntegration_LateFlowAfterFiredWindowYieldsOneRuleMatch`). A rule already matched on a snapshot is not repeated (`TestIntegration_SnapshotMatchedRuleIsNotRepeatedByLatePath`). Replaying the real S1-S3 events of the live run publishes byte-identical packages with the path on or off (`TestIntegration_S1S3ReplayIsUnchangedByLatePath`). The risk window keeps the max, so a repeated rule does not inflate the score; a late package during an in-flight analyst chain is coalesced, scored and acked, never dropped (`cmd/olaitan/late_event_driver_test.go`). Window eviction is by event time (Story 1.14); at the observed 15-30s lag a flow is not evicted on arrival (`TestStoreAddAndCheckReportsAlreadyFired`), but its retention is shortened by its lag.
+
+**Risk inherited.** The per-event path evaluates with the identity half of the posture (the corpus reads only `k8s.pod.namespace` and `k8s.workload.owner_kind` today); a future rule on a non-identity posture field would not match on this path until posture is fetched for it. Excluded namespaces get no late-event package, as they get no single-alert Falco package (Story 10.3).

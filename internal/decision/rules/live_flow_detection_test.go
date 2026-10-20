@@ -190,3 +190,23 @@ func rawField(t *testing.T, ev schema.Event, field string) string {
 	}
 	return "?"
 }
+
+// Story 11.2b per-event path: EvaluateEvent matches one real S4 flow against
+// the corpus with the identity-only posture the correlator passes.
+func TestEvaluateEvent_LiveS4FlowMatchesOLTNet002(t *testing.T) {
+	l := loader.New(corpusRoot(t), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := l.Load(); err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{loader: l, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	posture := &schema.WorkloadPosture{Identity: schema.WorkloadIdentity{Namespace: "tenant-acme", OwnerKind: "Deployment", OwnerName: "web"}}
+	flow := loadLiveFlows(t)[0]
+	got := matchedRules(e.EvaluateEvent(posture, flow), flow.ID)
+	if !got["OLT-NET-002"] || len(got) != 1 {
+		t.Fatalf("EvaluateEvent(live S4 flow) = %v, want exactly OLT-NET-002", sortedRuleIDs(got))
+	}
+	e.NoteEmitted(schema.RuleMatch{RuleID: "OLT-NET-002", Severity: "50"}) // nil metrics: must not panic
+	if e.matchesTotal.Load() != 1 {
+		t.Fatalf("NoteEmitted did not count the match")
+	}
+}

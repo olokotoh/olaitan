@@ -49,6 +49,9 @@ type Trigger struct {
 	FiredAt           time.Time
 	ResolvedIdentity  *schema.WorkloadIdentity
 	Pod               *corev1.Pod
+	// Origin is copied to EvidenceTrigger.Origin ("" or
+	// schema.TriggerOriginLateEvent).
+	Origin string
 }
 
 // RuleMatch constructs an external rule-match trigger.

@@ -133,6 +133,14 @@ type Correlator struct {
 	// neverScoredEventsDropped counts the events dropped for them.
 	neverScored              atomic.Value // map[string]struct{}
 	neverScoredEventsDropped atomic.Int64
+
+	// Story 11.2b, the per-event rule path (Story 1.15 realised; an
+	// ADDITION to Story 1.14 D1, which is unchanged). evaluator is the
+	// rule corpus (nil = path off); ruleFired dedupes one late-event
+	// rule_match package per (workload, OLT rule) per window, including
+	// rules the rules engine already matches on a published snapshot.
+	evaluator atomic.Pointer[evaluatorHolder]
+	ruleFired sync.Map // key workloadID + "\x00" + ruleID -> time.Time
 }
 
 type identityCacheEntry struct {
@@ -367,10 +375,11 @@ func (c *Correlator) AddEvent(ctx context.Context, ev schema.Event) (*schema.Evi
 		return nil, fmt.Errorf("correlator: resolve workload: %w", err)
 	}
 	minSources := int(c.minSources.Load())
-	snap, transitioned, err := c.window.AddAndCheckRisingEdge(workloadID, ev, minSources)
+	added, err := c.window.AddAndCheck(workloadID, ev, minSources)
 	if err != nil {
 		return nil, err
 	}
+	snap, transitioned := added.Snapshot, added.Transitioned
 	var multi *schema.EvidencePackage
 	if transitioned {
 		tr := trigger.MultiSignal(snap, distinctSources(snap.Events), time.Now().UTC())
@@ -383,12 +392,27 @@ func (c *Correlator) AddEvent(ctx context.Context, ev schema.Event) (*schema.Evi
 		if multi, err = c.publishTrigger(ctx, tr, snap); err != nil {
 			return nil, err
 		}
+		// The rules engine evaluates this snapshot; claim what it will
+		// match so the per-event path never repeats it in this window.
+		c.preclaimSnapshotRules(workloadID, identity, snap)
 	}
 	// Story 10.3: a serious Falco alert starts an investigation on its own,
 	// once per (workload, rule) per window.
 	floor, _ := c.falcoFloor.Load().(string)
 	match, ok := trigger.FalcoRuleMatch(ev, floor)
 	if !ok || c.isExcluded(ev.Pod.Namespace) || !c.claimFalcoTrigger(workloadID, match.RuleID) {
+		// Story 11.2b (Story 1.15 per-event path, an ADDITION to D1): an
+		// event that joined a window which had ALREADY fired publishes no
+		// package of its own, so a single-event OLT rule (OLT-NET-002 on a
+		// Goldmane flow that arrives 15-30s after Falco) could never be
+		// evaluated. Evaluate that one event now.
+		if !transitioned && added.AlreadyFired && !c.isExcluded(ev.Pod.Namespace) {
+			late, lerr := c.fireLateEventRules(ctx, workloadID, identity, pod, ev)
+			if multi == nil {
+				return late, lerr
+			}
+			return multi, lerr
+		}
 		return multi, nil
 	}
 	tr := trigger.RuleMatch(workloadID, match, time.Now().UTC())
@@ -400,6 +424,9 @@ func (c *Correlator) AddEvent(ctx context.Context, ev schema.Event) (*schema.Evi
 		c.falcoFired.Delete(workloadID + "\x00" + match.RuleID)
 		return multi, err
 	}
+	// A Falco-only rule_match package is evaluated by the rules engine
+	// (Story 10.3 guard), snapshot included: claim what it will match.
+	c.preclaimSnapshotRules(workloadID, identity, snap)
 	if multi != nil {
 		return multi, nil
 	}
@@ -411,18 +438,23 @@ func (c *Correlator) AddEvent(ctx context.Context, ev schema.Event) (*schema.Evi
 // the window is part of the same investigation. Stale entries are pruned
 // on the way.
 func (c *Correlator) claimFalcoTrigger(workloadID, ruleID string) bool {
+	return c.claimIn(&c.falcoFired, workloadID, ruleID)
+}
+
+// claimIn is the Story 10.3 per-(workload, rule)-per-window claim on fired.
+func (c *Correlator) claimIn(fired *sync.Map, workloadID, ruleID string) bool {
 	now := time.Now()
 	win := time.Duration(c.windowNanos.Load())
 	key := workloadID + "\x00" + ruleID
-	if prev, loaded := c.falcoFired.LoadOrStore(key, now); loaded {
+	if prev, loaded := fired.LoadOrStore(key, now); loaded {
 		if t, _ := prev.(time.Time); now.Sub(t) < win {
 			return false
 		}
-		c.falcoFired.Store(key, now)
+		fired.Store(key, now)
 	}
-	c.falcoFired.Range(func(k, v any) bool {
+	fired.Range(func(k, v any) bool {
 		if t, _ := v.(time.Time); now.Sub(t) >= win {
-			c.falcoFired.Delete(k)
+			fired.Delete(k)
 		}
 		return true
 	})
