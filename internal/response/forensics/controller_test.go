@@ -122,7 +122,7 @@ func killTransition(workloadID string) respschema.StateTransition {
 // observations are deterministic.
 func newController(t *testing.T, cs *fake.Clientset, up Uploader, reg *metrics.Registry) *Controller {
 	t.Helper()
-	c, err := New(Config{KMSKeyAlias: "alias/forensics"}, cs, up, reg, discardLog())
+	c, err := New(Config{KMSKeyAlias: "alias/forensics", KillAfterCapture: true}, cs, up, reg, discardLog())
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -735,4 +735,43 @@ func readBundle(t *testing.T, gz []byte) map[string][]byte {
 		out[hdr.Name] = data
 	}
 	return out
+}
+
+// TestHandle_BlockingOffCapturesButNeverDeletes is Story 12.7 D6: forensic
+// capture is on by default, blocking is not. With KillAfterCapture false (the
+// zero value, and what the aggregator wires while
+// response.network_policy.enabled is false) the evidence is captured and
+// uploaded and the pod is left running.
+func TestHandle_BlockingOffCapturesButNeverDeletes(t *testing.T) {
+	reg := metrics.NewRegistry()
+	sel := map[string]string{"app": "web"}
+	cs := fake.NewSimpleClientset(
+		runtime.Object(deployment("ns", "web", sel)),
+		runtime.Object(pod("ns", "web-abc", sel)),
+	)
+	up := &fakeUploader{}
+	c, err := New(Config{KMSKeyAlias: "alias/forensics"}, cs, up, reg, discardLog())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	c.handle(context.Background(), killTransition("ns/Deployment/web"))
+
+	if up.callCount() != 1 {
+		t.Fatalf("upload calls = %d, want 1: capture must still run with blocking off", up.callCount())
+	}
+	if _, err := cs.CoreV1().Pods("ns").Get(context.Background(), "web-abc", metav1.GetOptions{}); err != nil {
+		t.Fatalf("pod was deleted with blocking off: %v", err)
+	}
+	for _, a := range cs.Actions() {
+		if a.GetVerb() == "delete" {
+			t.Fatalf("a delete was issued with blocking off: %v", a)
+		}
+	}
+	if got := testutil.ToFloat64(c.captureTotal.WithLabelValues("captured_no_kill")); got != 1 {
+		t.Fatalf("captured_no_kill counter = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(c.captureTotal.WithLabelValues("captured")); got != 0 {
+		t.Fatalf("captured counter = %v, want 0 (that label means captured AND killed)", got)
+	}
 }

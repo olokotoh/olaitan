@@ -1,9 +1,9 @@
 {{/*
 Story 3.4 (FR48): optional in-cluster Ollama for air-gapped /
-data-residency-restricted deployments. Default OFF (ollama.enabled:
-false) so the default render, the goldens, and every existing
-deployment are unchanged unless an operator opts in; Story 3.16 wires
-this surface into the evaluation modes.
+data-residency-restricted deployments. Story 12.7: ON by default (the
+self-contained LLM of the default install); values-minimal.yaml and
+analyst.provider=none switch it off. Story 3.16 wires this surface into
+the evaluation modes.
 
 Model provisioning is OPERATOR-OWNED: the chart deploys the server
 only. In a true air-gapped cluster the model arrives via a baked image
@@ -66,7 +66,15 @@ spec:
         {{- include "olaitan.ollama.selectorLabels" . | nindent 8 }}
     spec:
       automountServiceAccountToken: false
-      {{- if $pullModels }}
+      {{- /* Story 12.7 review: only when ollama.pull.waitForModels. In the
+             default install the server starts at once and serves the model
+             as soon as the pull Job has written it; until then a chain call
+             gets "model not found", the chain degrades to llm_unavailable and
+             rules and baselines keep scoring. Gating the pod on the download
+             made a plain `helm install --wait` wait for 1.9 GB, and with no
+             internet it ended in Init:CrashLoopBackOff. values-full.yaml
+             keeps the wait (Story 10.6). */}}
+      {{- if and $pullModels (default (dict) .Values.ollama.pull).waitForModels }}
       initContainers:
         - name: wait-for-models
           image: {{ $image | quote }}

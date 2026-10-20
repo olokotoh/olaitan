@@ -36,8 +36,8 @@ model, cannot escalate a workload on its own say-so.
                                     generated NetworkPolicies
 ```
 
-Tier 1 and tier 2 are deterministic. Tier 3 is optional, off by default, and
-capped. The analyst's contribution to a workload's score is bounded, and the
+Tier 1 and tier 2 are deterministic. Tier 3 is on by default (a small model
+running inside your cluster, no API key) and capped. The analyst's contribution to a workload's score is bounded, and the
 bound is chosen so that, on the shipped defaults, the model **on its own cannot
 escalate anything**: with no deterministic signal the most it can contribute is
 10.5, below the score of 20 that reaches the first non-CLEAN state. See
@@ -75,6 +75,48 @@ the `olaitan` namespace. Releases get it from the first one cut after
 v1.0.0-rc4; rc4 itself has none, so until the next release that URL returns
 404 and the helm command is the way in. It is not for OpenShift: there, use
 the helm command with `-f values-openshift.yaml`.
+
+Either way, the default turns every part on (from the first release after
+v1.0.0-rc4): all five sources (Falco, the Kubernetes audit webhook, the
+containerd runtime sensor, the Calico flow sensor, the application log
+sidecar injector), rules and baselines, the LLM analyst chain (L1, L2,
+Senior) on a model the chart runs in your cluster (`qwen2.5:3b-instruct`,
+pulled on install, no API key), the SIEM audit trail, forensic capture,
+settling, the DFIR report and the report archive. A part whose platform
+prerequisite is missing comes up DEGRADED rather than failing the install:
+the install notes list every part as ON or DEGRADED with the reason and the
+fix (no Calico, no object store for evidence, a managed control plane that
+cannot send audit events, and so on), and the collector logs the same.
+
+Blocking is off, and it is one flag. Out of the box Olaitan detects, scores,
+captures evidence and writes reports, but cuts no traffic and deletes no
+pod. This turns on NetworkPolicy isolation and the post-capture kill:
+
+```bash
+helm upgrade olaitan oci://ghcr.io/olokotoh/charts/olaitan \
+  --version 1.0.0-rc4 --namespace olaitan --reuse-values \
+  --set response.networkPolicy.enabled=true
+```
+
+What blocking does at each state: RESTRICTED blocks only egress outside the
+private ranges (RFC 1918 and the cluster CIDRs stay open, so in-cluster
+traffic and DNS keep flowing, by design), QUARANTINED blocks all traffic in
+and out, and PRESERVED_KILLED deletes the pods once their evidence is
+uploaded. A workload gets there through the risk window, on by default
+(`aggregator.riskWindowSeconds`, 900 s): it adds up a workload's rule,
+baseline and capped LLM signals across packages. Without it each package is
+scored alone and none scores high enough for RESTRICTED (the rule term tops
+out at 38), so blocking would never trigger. The evaluation overlays and
+`values-minimal.yaml` set it to 0, to reproduce campaigns recorded before.
+
+On v1.0.0-rc4 itself (the version the commands above name until the next
+release) the flag turns on isolation only: the forensic-kill gate, the risk
+window default and everything above arrive with the first release after it.
+
+Prove your CNI enforces NetworkPolicy before you rely on it
+(`hack/check-netpol-enforcement.sh`): stock kind accepts every policy and
+enforces none. `install.yaml` is the default values, so it is observe-only;
+blocking there means installing with helm and the flag above.
 
 ### Installing with install.yaml
 
@@ -156,8 +198,8 @@ kind create cluster --name olaitan
 helm install olaitan oci://ghcr.io/olokotoh/charts/olaitan \
   --version 1.0.0-rc4 \
   -f https://raw.githubusercontent.com/olokotoh/olaitan/v1.0.0-rc4/deploy/helm/olaitan/values-kind.yaml \
-  --namespace olaitan --create-namespace --wait --timeout 10m
-kubectl -n olaitan wait pod --all --for=condition=Ready --timeout=10m
+  --namespace olaitan --create-namespace --wait --timeout 20m
+kubectl -n olaitan wait pod -l '!batch.kubernetes.io/job-name' --for=condition=Ready --timeout=10m
 ```
 
 The `-f` line is the kind overlay of the same release, which helm reads
@@ -176,15 +218,20 @@ since real nodes do not run the hook.
 
 Both waits are needed. `kubectl wait` only sees pods that already exist, so
 straight after a plain `helm install` it fails with `no matching resources
-found`. `helm --wait` makes sure every pod exists, but it counts a DaemonSet
+found`. Its selector skips the pods of Jobs (from the first release after
+v1.0.0-rc4 the install runs two: one makes the webhook certificates in the
+cluster, one downloads the model), because a finished Job's pod is never
+Ready. The helm timeout covers the model download, about 1.9 GB, since the
+model server is Ready only once its model is on disk. `helm --wait` makes sure every pod exists, but it counts a DaemonSet
 as ready with one pod unavailable, so on one node it can return while the
 collector is still restarting (the collector and the aggregator restart a
 few times until NATS is up). The `kubectl wait` after it is the real check.
 
 That is the default install plus that one kind exception (and
 `platform: kind`, notes text only), Falco included:
-on a single-node cluster, six pods (Falco and the collector, one each per node; the aggregator; NATS;
-nats-box; Redis). Before release, this sequence
+on a single-node cluster, six pods with v1.0.0-rc4 (Falco and the collector, one each per node; the aggregator; NATS;
+nats-box; Redis). From the next release the default adds the applog injector
+(two pods), the in-cluster model server, and the two Jobs above. Before release, this sequence
 was run word for word on a fresh single-node kind (kind v0.30.0, node image
 v1.34.0, a 4 vCPU Ubuntu 24.04 host on kernel 7.0 with BTF), with the chart
 packaged the way the release packages it and the image loaded into kind
@@ -216,9 +263,15 @@ infrastructure.
 
 Enforcement is **observe-only by default**. `response.networkPolicy.enabled` is
 `false`, so out of the box Olaitan detects and records but writes no
-NetworkPolicies. Turning it on is a deliberate act, and you should set
-`response.networkPolicy.clusterCidrs` to your cluster's real CIDRs first or
-egress blocking under RESTRICTED will take DNS with it.
+NetworkPolicies and deletes no pod. It is the single blocking switch (see
+[Install](#install)), and turning it on is a deliberate act. Under RESTRICTED
+the RFC 1918 ranges are always allowed, so in-cluster traffic and DNS
+survive on the usual private CIDRs; set `response.networkPolicy.clusterCidrs`
+if your pod or service CIDR is outside them.
+
+On a small cluster, or to keep the footprint of earlier releases,
+`-f values-minimal.yaml` turns everything but Falco, rules and baselines
+off again.
 
 To check a cluster before installing, clone this repository and run, against
 whatever cluster you are pointed at:
@@ -557,8 +610,9 @@ The other two optional sources are often described as needing a self-managed
 control plane. They do not. The containerd CRI sensor needs a **host socket**
 at a path that matches your runtime (see `values-k3s.yaml` and
 `values-eks.yaml`, which ship the right paths for those platforms), and the
-Calico flow adapter needs **Calico**. Both are off by default, and both are
-available on managed platforms.
+Calico flow adapter needs **Calico**. Both are on by default from the first
+release after v1.0.0-rc4 (DEGRADED, and saying so, where their prerequisite is
+missing), and both are available on managed platforms.
 
 A default install mounts nothing from the host in Olaitan's own templates.
 Falco posts its alerts to the collector over HTTP (`http_output`, through the
@@ -576,7 +630,7 @@ what happens after a rule fires.
 | --- | --- | --- |
 | Signal sources | eBPF syscalls | eBPF, K8s audit, CRI, CNI flows, app logs, correlated |
 | Output | an alert stream | an evidence package with a score and a workload state |
-| Repeated weak signals | each alert stands alone | correlated into one evidence package; an optional rolling risk window (off by default) also lets them accumulate over time |
+| Repeated weak signals | each alert stands alone | correlated into one evidence package; a rolling risk window (on by default in the chart from the first release after v1.0.0-rc4) also lets them accumulate over time |
 | Statistical drift | not modelled | Welford baselines per workload |
 | Response | left to you (Talon and falcosidekick are separate components) | graduated NetworkPolicy isolation, cooldown-gated de-escalation |
 | Explanation | the rule text | optional LLM analyst, score-capped and schema-validated |
@@ -614,10 +668,12 @@ Read this section before trusting it with anything.
 - **Targets Kubernetes 1.29 and newer.** The chart's `kubeVersion` floor is
   `>=1.29.0`: the optional applog sidecar defaults to the native sidecar form,
   which needs 1.29.
-- **The LLM tier costs money and adds latency.** It is off by default for both
-  reasons. Everything except tier-3 reasoning works with it disabled. The
-  kind-full reference profile turns it on with an in-cluster CPU model: no
-  money, but minutes of latency per investigation.
+- **The LLM tier adds latency.** From the first release after v1.0.0-rc4 it is
+  on by default with an in-cluster CPU model: no money and no API key, but
+  minutes of latency per investigation, and the default model's weights are
+  under the Qwen Research licence (pick another for commercial use).
+  Everything except tier-3 reasoning works with it off
+  (`--set analyst.provider=none`, or `-f values-minimal.yaml`).
 - **The agent writes NetworkPolicies into your cluster when enforcement is on.**
   Review [SECURITY.md](SECURITY.md) for the blast radius and the guards that
   bound it.

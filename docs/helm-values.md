@@ -26,7 +26,9 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 | Value | Type | Default | Valid range | Effect | Ref |
 |-------|------|---------|-------------|--------|-----|
 | `aggregator.replicas` | integer | `1` | 1 to 1 | aggregator replica count and the chart's worker-pool surface; HARD CONSTRAINT at 1 (rings are cooperative goroutines in one process) until leader election lands | NFR20 |
-| `aggregator.extraEnv` | array | `[]` | - | operator-supplied aggregator environment as {name, value} pairs; the committed mechanism for OLT_RISK_WINDOW_SECONDS, OLT_LLM_ROLE_TIMEOUT_MULTIPLIER, OLT_LLM_CHAIN_WORKERS and OLT_LLM_CHAIN_QUEUE | FR30 |
+| `aggregator.extraEnv` | array | `[]` | - | operator-supplied aggregator environment as {name, value} pairs; the committed mechanism for OLT_RISK_WINDOW_SECONDS, OLT_LLM_ROLE_TIMEOUT_MULTIPLIER, OLT_LLM_CHAIN_WORKERS and OLT_LLM_CHAIN_QUEUE; an entry wins over the chart's own | FR30 |
+| `aggregator.llmRoleTimeoutMultiplier` | number | `30` | minimum 0 | LLM per-role timeout multiplier for the in-cluster CPU model (OLT_LLM_ROLE_TIMEOUT_MULTIPLIER, rendered with analyst.provider=local only); 0 renders none | FR30 |
+| `aggregator.riskWindowSeconds` | integer | `900` | 0 to 604800 | rolling per-workload risk window in seconds (OLT_RISK_WINDOW_SECONDS); 0 is per-package scoring | FR30 |
 
 ## `correlator`
 
@@ -72,6 +74,7 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 
 | Value | Type | Default | Valid range | Effect | Ref |
 |-------|------|---------|-------------|--------|-----|
+| `auditWebhook.enabled` | boolean | `true` | - | run the Kubernetes audit webhook receiver in the collector (TLS generated in-cluster unless supplied); bridges detection.sources.audit.enabled | FR5 |
 | `auditWebhook.serverAddress` | string | `""` | - | address the kube-apiserver dials for the audit webhook (empty: the in-cluster Service FQDN) | FR5 |
 | `auditWebhook.hostPort` | integer | `0` | 0 to 65535 | publish the audit receiver on the node at this hostPort (0: off) | FR5 |
 | `auditWebhook.hostIP` | string | `"127.0.0.1"` | - | node address the audit hostPort binds to (empty: every interface) | FR5 |
@@ -80,13 +83,14 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 
 | Value | Type | Default | Valid range | Effect | Ref |
 |-------|------|---------|-------------|--------|-----|
+| `containerdSensor.enabled` | boolean | `true` | - | run the containerd CRI lifecycle sensor (hostPath mount of the socket directory); bridges detection.sources.containerd.enabled | FR3 |
 | `containerdSensor.socketGroup` | integer | `0` | minimum 0 | supplemental group the collector joins to open the containerd socket | FR3 |
 
 ## `calicoSensor`
 
 | Value | Type | Default | Valid range | Effect | Ref |
 |-------|------|---------|-------------|--------|-----|
-| `calicoSensor.enabled` | boolean | `false` | - | enable the Calico Goldmane flow sensor; bridges detection.sources.calico.enabled too | FR4 |
+| `calicoSensor.enabled` | boolean | `true` | - | enable the Calico Goldmane flow sensor; bridges detection.sources.calico.enabled too | FR4 |
 | `calicoSensor.goldmaneAddr` | string | `"goldmane.calico-system.svc:7443"` | - | host:port of the Calico Goldmane gRPC Service | FR4 |
 | `calicoSensor.serverName` | string | `"goldmane.calico-system.svc"` | - | TLS SNI / verify name presented during the Goldmane mTLS handshake | FR4 |
 | `calicoSensor.startTimeGte` | integer | `-60` | maximum 0 | stream start offset in seconds; negative replays that many seconds, 0 means now | FR4 |
@@ -116,6 +120,7 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 
 | Value | Type | Default | Valid range | Effect | Ref |
 |-------|------|---------|-------------|--------|-----|
+| `applogSidecar.enabled` | boolean | `true` | - | deploy the applog sidecar injector and its MutatingWebhookConfiguration (injection stays opt-in per pod) | FR9 |
 | `applogSidecar.useNativeSidecar` | boolean | `true` | - | inject the applog sidecar as a native sidecar (initContainer with restartPolicy: Always) rather than a regular container | FR9 |
 
 ## `metrics`
@@ -158,6 +163,7 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 
 | Value | Type | Default | Valid range | Effect | Ref |
 |-------|------|---------|-------------|--------|-----|
+| `response.networkPolicy.enabled` | boolean | `false` | - | THE blocking switch: NetworkPolicy isolation plus the forensic post-capture pod kill, and their RBAC; off by default | FR33 |
 | `response.audit.retentionTransitionsDays` | integer | `90` | minimum 1 | Redis/JetStream AUDIT_TRANSITIONS stream retention in days (append-only SIEM audit) | NFR16 |
 | `response.audit.retentionOverridesDays` | integer | `365` | minimum 1 | AUDIT_OVERRIDES stream retention in days | NFR16 |
 | `response.audit.retentionPoliciesDays` | integer | `365` | minimum 1 | AUDIT_POLICIES stream retention in days | NFR16 |
@@ -178,7 +184,7 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 
 | Value | Type | Default | Valid range | Effect | Ref |
 |-------|------|---------|-------------|--------|-----|
-| `analyst.provider` | string | `"none"` | one of: none, api, local | LLM analyst tier provider; none bypasses the multi-agent chain (chain-enable flag), api routes to claude/openai, local routes to Ollama | FR25 |
+| `analyst.provider` | string | `"local"` | one of: none, api, local | LLM analyst tier provider; none bypasses the multi-agent chain (chain-enable flag), api routes to claude/openai, local routes to Ollama | FR25 |
 | `analyst.l1_provider` | string | `""` | one of: claude, openai, ollama (or empty to inherit) | L1 analyst provider family; empty inherits the top-level provider mapping | FR25 |
 | `analyst.l1_model` | string | `""` | - | L1 analyst model name; empty keeps the file-side default | FR25 |
 | `analyst.l2_provider` | string | `""` | one of: claude, openai, ollama (or empty to inherit) | L2 analyst provider family; empty inherits the top-level provider mapping | FR25 |
@@ -194,20 +200,21 @@ rerun `make helm-values-doc` (see `docs/contributing.md`).
 | `analyst.api.endpoint` | string | `""` | - | external LLM API endpoint for the api provider; empty uses the vendor default | FR25 |
 | `analyst.api.model` | string | `""` | - | external LLM model for the api provider; empty keeps the file-side default | FR25 |
 | `analyst.local.endpoint` | string | `""` | - | Ollama endpoint for the local provider (air-gapped); empty keeps file-side default http://ollama:11434 | FR48 |
-| `analyst.local.model` | string | `""` | - | Ollama model for the local provider; must be a model the operator provisioned (no cross-model default) | FR48 |
+| `analyst.local.model` | string | `"qwen2.5:3b-instruct"` | - | Ollama model for the local provider; must be a model the operator provisioned (no cross-model default) | FR48 |
 
 ## `ollama`
 
 | Value | Type | Default | Valid range | Effect | Ref |
 |-------|------|---------|-------------|--------|-----|
 | `ollama.image.digest` | string | `"sha256:2ea3b768a8f2dcd4d910f838d79702bb952089414dd578146619c0a939647ac6"` | sha256:<64 hex>, or empty for tag-only | image digest the in-cluster Ollama is pinned to | NFR31 |
-| `ollama.persistence.create` | boolean | `false` | - | create the Ollama model claim in the chart when no existingClaim is named | FR48 |
+| `ollama.persistence.create` | boolean | `true` | - | create the Ollama model claim in the chart when no existingClaim is named | FR48 |
 | `ollama.persistence.size` | string | `"10Gi"` | - | size of the chart-created Ollama model claim | FR48 |
 | `ollama.persistence.storageClassName` | string | `""` | - | storageClassName of the chart-created Ollama model claim; empty uses the cluster default | FR48 |
-| `ollama.pull.models` | array | `[]` | - | Ollama models the chart pulls into the model volume; empty pulls nothing (operator-provisioned, air-gapped) | FR48 |
+| `ollama.pull.models` | array | `["qwen2.5:3b-instruct"]` | - | Ollama models the chart pulls into the model volume; empty pulls nothing (operator-provisioned, air-gapped) | FR48 |
 | `ollama.pull.backoffLimit` | integer | `4` | minimum 0 | retries of the model pull Job before it is marked failed | FR48 |
 | `ollama.pull.activeDeadlineSeconds` | integer | `1800` | minimum 1 | seconds the model pull Job may run before it is killed; the server's wait for the models gives up 300s after it | FR48 |
-| `ollama.pull.expectedIds` | object | `{}` | - | expected `ollama list` ID per pulled model; the pull Job fails on drift | NFR31 |
+| `ollama.pull.expectedIds` | object | `{qwen2.5:3b-instruct: "357c53fb659c"}` | - | expected `ollama list` ID per pulled model; the pull Job fails on drift | NFR31 |
+| `ollama.pull.waitForModels` | boolean | `false` | - | hold the model server until the pulled models are on disk (helm --wait then waits for the download) | FR48 |
 
 ## `openshift`
 

@@ -65,7 +65,10 @@ data:
     diff minimal and preserves the chart's single-source `.Files.Get`
     contract: the rest of olaitan.yaml is rendered verbatim.
     */ -}}
-    {{- if .Values.containerdSensor.enabled }}
+    {{- /* Story 12.7: olaitan.containerd.enabled is off on OpenShift (CRI-O),
+           and olaitan.containerd.socketPath follows k3s/RKE2, so the adapter
+           and the hostPath mount always agree. */ -}}
+    {{- if include "olaitan.containerd.enabled" . }}
     {{- $cs := .Values.containerdSensor }}
     {{- /* Top-level scalars under detection.sources.containerd. The
            containerd block sits below detection.sources.audit so each
@@ -73,7 +76,7 @@ data:
            block when matched alongside the literal `containerd:`
            prefix; we use a non-greedy lookahead window to anchor. */}}
     {{- $cfg = regexReplaceAll "(containerd:[[:space:]]*\\n[[:space:]]+)enabled:[[:space:]]+false" $cfg "${1}enabled: true" }}
-    {{- $cfg = regexReplaceAll "(?s)(containerd:.{0,256}?\\n[[:space:]]+)socket_path:[[:space:]]+\"[^\"]*\"" $cfg (printf "${1}socket_path: %q" $cs.socketPath) }}
+    {{- $cfg = regexReplaceAll "(?s)(containerd:.{0,256}?\\n[[:space:]]+)socket_path:[[:space:]]+\"[^\"]*\"" $cfg (printf "${1}socket_path: %q" (include "olaitan.containerd.socketPath" .)) }}
     {{- if $cs.dialTimeout }}
     {{- $cfg = regexReplaceAll "(?s)(containerd:.{0,512}?\\n[[:space:]]+)dial_timeout:[[:space:]]+\"[^\"]*\"" $cfg (printf "${1}dial_timeout: %q" $cs.dialTimeout) }}
     {{- end }}
@@ -712,10 +715,17 @@ data:
     {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.report_archive.deferred_enabled anchor not found (pattern %q)" $p) }}{{- end }}
     {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%v${2}" $ra.deferredEnabled) }}
     {{- end }}
-    {{- if hasKey $ra "deferredRedisAddr" }}
+    {{- /* Story 12.7 review (E7): bridged whenever the queue is on, even
+           when the key was deleted (--set ...deferredRedisAddr=null), so the
+           auto-fill below always applies. */ -}}
+    {{- if or (hasKey $ra "deferredRedisAddr") $ra.deferredEnabled }}
     {{- $p := "(\\n    deferred_redis_addr: )\"[^\"]*\"" -}}
     {{- if not (mustRegexFind $p $cfg) }}{{- fail (printf "helm bridge: response.report_archive.deferred_redis_addr anchor not found (pattern %q)" $p) }}{{- end }}
-    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%q" $ra.deferredRedisAddr) }}
+    {{- /* Story 12.7: the deferred queue is on by default; an empty address
+           means the bundled Redis, so the default needs nothing set. */ -}}
+    {{- $addr := $ra.deferredRedisAddr -}}
+    {{- if and (not $addr) $ra.deferredEnabled -}}{{- $addr = include "olaitan.endpoints.redis" $ -}}{{- end -}}
+    {{- $cfg = regexReplaceAll $p $cfg (printf "${1}%q" $addr) }}
     {{- end }}
     {{- if hasKey $ra "deferredMaxLen" }}
     {{- $p := "(\\n    deferred_max_len: )[0-9]+" -}}

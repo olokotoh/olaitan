@@ -83,9 +83,16 @@ metadata:
     app.kubernetes.io/component: aggregator
 rules:
   # Ring 4: response engine writes NetworkPolicy into every pod's ns.
+  # Story 12.7 review: only with THE blocking switch
+  # (response.networkPolicy.enabled); with it off the NetworkPolicy manager
+  # is not wired and the aggregator holds no write power over traffic.
+  # Turning the switch off later leaves any policy it wrote in place:
+  # kubectl delete networkpolicy -A -l app.kubernetes.io/managed-by=olaitan
+  {{- if include "olaitan.blocking" . }}
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "update", "delete"]
+  {{- end }}
   # Ring 4a: annotation-based FSM state transitions — patch only, no
   # delete, no exec. The agent flips pod labels/annotations to mark FSM
   # state; it never kills pods directly (that is kubelet's job via the
@@ -133,9 +140,16 @@ rules:
   # narrower posture (architecture.md RBAC errata: pod delete is a Story 4.2
   # addition gated on the forensic controller). Kubernetes RBAC unions verbs
   # per resource, so this composes additively with the patch/get/list rules.
+  #
+  # Story 12.7 (D6): forensics is on by default, blocking is not. The pod
+  # delete is the post-capture kill, so it renders only with THE blocking
+  # switch (response.networkPolicy.enabled); reading logs for the capture
+  # stays with forensics.
+  {{- if include "olaitan.blocking" . }}
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["delete"]
+  {{- end }}
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]

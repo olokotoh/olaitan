@@ -32,10 +32,20 @@ ollama:
   enabled: true
   # resources: size for the model you provisioned; a 70b-class model
   # wants tens of GiB of memory. Left unset here deliberately -- sizing
-  # is cluster-specific.
-  # persistence:
-  #   enabled: true
-  #   existingClaim: ollama-models
+  # is cluster-specific. null clears the chart default (sized for the
+  # 3B default model; Story 12.7).
+  resources: null
+  # Story 12.7: the chart default pulls qwen2.5:3b-instruct from the
+  # internet into a chart-made volume. Air-gapped there is nowhere to pull
+  # from: pull nothing, check nothing, and let the operator provide the
+  # model on a claim (existingClaim) or in the image.
+  pull:
+    models: []
+    expectedIds: null
+  persistence:
+    enabled: false
+    create: false
+  #   existingClaim: ollama-models   (with enabled: true)
 
 analyst:
   # "local" is the config-side selector for the in-cluster Ollama path

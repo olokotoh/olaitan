@@ -465,6 +465,8 @@ The `OVERRIDES.applied` NATS subject (365-day JetStream retention) carries one e
 
 When a workload reaches `PRESERVED_KILLED`, the forensic capture controller (`internal/response/forensics/`) preserves a forensic record of the doomed pod(s) to S3 BEFORE deleting them. It is a non-blocking FSM `MultiSink` member: `Publish` filters to the kill transition and enqueues, and a background worker runs capture -> upload -> delete off the FSM hot path. It is OFF by default; enable with `response.forensics.enabled=true`.
 
+**Story 12.7.** The chart turns forensic capture on by default, and the delete is now the blocking half: the controller deletes the captured pods only when `response.network_policy.enabled` is true (`--set response.networkPolicy.enabled=true`, the single blocking switch, which also grants the aggregator `delete` on pods). Otherwise it captures and uploads the evidence, leaves the pod running, logs that, and counts `olaitan_forensic_capture_total{result="captured_no_kill"}`. With no object store configured at all (endpoint, bucket and KMS alias all empty) the aggregator logs `forensic capture DEGRADED: no object store configured` at startup and does not wire the controller; the same holds for the report archive. A partial store is still a startup error.
+
 **Chosen path: documented fallback (Path A), not CRIU.** Per ADR-2026-05-02-01, CRIU is infeasible on the pinned containerd 1.7 substrate (no `CheckpointContainer` CRI RPC) and the kernel substrate (CRIU vDSO init failure), so Story 4.2 ships `kubectl_fallback.go`: per-container logs (current and the terminated container's `--previous`), the pod spec/status, and recent events, assembled into a content-addressed `forensic-bundle.tar.gz`. CRIU (`criu.go`) is a dormant, rejected alternative and is never wired live.
 
 **Capture-before-delete with S3-ack gating (the load-bearing invariant).** The pod is deleted ONLY after the object store acknowledges a durable, SSE-KMS-encrypted PUT of the bundle under `forensic-bundles/<sha256>/forensic-bundle.tar.gz`. If the upload fails after the in-line retry, the pod is NOT deleted (forensic preservation has priority over the kill), `olaitan_forensic_writes_deferred_total` increments, and the pod stays network-isolated by virtue of the retained QUARANTINED deny-all (Story 4.1). The deferred-write retry queue is Story 4.7; Story 4.2 only signals the deferral.
@@ -475,7 +477,7 @@ When a workload reaches `PRESERVED_KILLED`, the forensic capture controller (`in
 
 **Metrics (FR36/NFR7/NFR28).**
 - `olaitan_forensic_capture_seconds` (histogram): capture-to-S3-to-delete latency, observed only on full success; NFR7 budget is `histogram_quantile(0.99, ...) <= 10`.
-- `olaitan_forensic_capture_total{result}`: `captured` (full success), `deferred` (S3 failed after retry, pod retained), `skipped` (excluded namespace / no pods / no longer PRESERVED_KILLED), `error` (capture failure or workload-id parse error), `delete_failed` (upload acked but the pod delete failed; pod alive + QUARANTINED, deferred to the Story 4.7 delete-retry), `dropped` (Publish queue full -- the dropped kill ALSO increments `writes_deferred_total` and is owned by the Story 4.7 replay).
+- `olaitan_forensic_capture_total{result}`: `captured` (full success: captured, uploaded and the pod deleted), `captured_no_kill` (captured and uploaded, pod left running because blocking is off; Story 12.7), `deferred` (S3 failed after retry, pod retained), `skipped` (excluded namespace / no pods / no longer PRESERVED_KILLED), `error` (capture failure or workload-id parse error), `delete_failed` (upload acked but the pod delete failed; pod alive + QUARANTINED, deferred to the Story 4.7 delete-retry), `dropped` (Publish queue full -- the dropped kill ALSO increments `writes_deferred_total` and is owned by the Story 4.7 replay).
 - `olaitan_forensic_writes_deferred_total`: deferred forensic writes; incremented on a real S3 failure after retry, a delete failure after a successful upload (`delete_failed`), and a Publish-queue-full drop (`dropped`). NOT incremented on a clean shutdown/abort (context cancellation). A non-zero rate means evidence-bearing pods are accumulating undeleted-but-isolated. Alert on it.
 
 **Operator actions on a deferred write.** A rising `olaitan_forensic_writes_deferred_total` indicates S3/MinIO is unreachable or misconfigured. The pods are safe (still QUARANTINED, deny-all). Restore S3 reachability and KMS-key validity; until Story 4.7's retry queue lands, a re-kill is not re-triggered automatically, so verify the bundle landed in the bucket and manually delete the pod only after confirming a durable upload, OR leave the pod isolated pending the Story 4.7 drain.
@@ -593,6 +595,8 @@ Story 4.10 ships the operator-facing Helm wiring that closes the Epic-4 vertical
 ### Append-only SIEM audit subjects (Story 2.8, FR40/NFR16)
 
 When `response.audit.enabled=true` (off by default; one flag gates all three), the agent publishes three append-only NATS audit subjects for SIEM consumption (Splunk / Elastic / Datadog). Each rides a dedicated `LimitsPolicy` JetStream stream (append-only by retention: NFR16 means consumers cannot delete events) with Helm-tunable per-subject retention:
+
+**Story 12.7.** "Off by default" above is the config-file default; the Helm chart turns the audit trail on by default (`response.audit.enabled: true` in values.yaml), as it does every other part except blocking.
 
 | Subject | Stream | Default retention | Records |
 |---|---|---|---|
@@ -1655,6 +1659,8 @@ eval_run_ids:   TBD (Epic 5 evaluation harness wires the metric surface into per
 ---
 
 ### The rolling per-workload risk window (PR #92, ADR-2026-08-17-01)
+
+**Story 12.7.** The Helm chart now turns the window ON by default (`aggregator.riskWindowSeconds: 900`, rendered as `OLT_RISK_WINDOW_SECONDS`): without it no single package reaches RESTRICTED, so the blocking switch (`response.networkPolicy.enabled`) would never block. "Off by default" below is the binary's own default (the env var unset); the evaluation overlays and `values-minimal.yaml` set `riskWindowSeconds: 0` to keep that per-package scoring for reproducible campaigns. A config or env change now rolls the aggregator (a `checksum/config` pod annotation), so a value change takes effect on `helm upgrade` with no manual restart.
 
 **What it is.** Off by default, the FSM consumer scores each package's own
 signals in isolation (the pre-window behaviour, byte-identical). With

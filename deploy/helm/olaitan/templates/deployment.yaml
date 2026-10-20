@@ -46,13 +46,16 @@ spec:
       {{- /* Story 1.12: Prometheus scrape annotations, gated by
              metrics.scrapeAnnotations so a Prometheus-Operator-driven
              deployment can disable them and rely on a ServiceMonitor
-             resource (future Story 1.18 follow-up). */ -}}
-      {{- if and .Values.metrics .Values.metrics.scrapeAnnotations }}
+             resource (future Story 1.18 follow-up). */}}
       annotations:
+        {{- if and .Values.metrics .Values.metrics.scrapeAnnotations }}
         prometheus.io/scrape: "true"
         prometheus.io/port: {{ .Values.metrics.containerPort | quote }}
         prometheus.io/path: "/metrics"
-      {{- end }}
+        {{- end }}
+        # Story 12.7: a config change rolls the aggregator (restart-required
+        # settings such as analyst.provider are read at startup).
+        checksum/config: {{ include "olaitan.configChecksum" . | quote }}
     spec:
       serviceAccountName: {{ include "olaitan.aggregator.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
@@ -154,11 +157,23 @@ spec:
                 secretKeyRef:
                   name: {{ include "olaitan.fullname" . }}-secrets
                   key: s3-access-key
+                  # Story 12.7: optional, so a Secret made without this key
+                  # (the install.yaml recipe) does not stop the pod. With no
+                  # object store configured the consumer is DEGRADED and
+                  # never reads it; with a store configured, missing S3
+                  # credentials are still a startup error (half a store).
+                  optional: true
             - name: S3_SECRET_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ include "olaitan.fullname" . }}-secrets
                   key: s3-secret-key
+                  # Story 12.7: optional, so a Secret made without this key
+                  # (the install.yaml recipe) does not stop the pod. With no
+                  # object store configured the consumer is DEGRADED and
+                  # never reads it; with a store configured, missing S3
+                  # credentials are still a startup error (half a store).
+                  optional: true
             {{- end }}
             {{- if or (and .Values.response .Values.response.notifications .Values.response.notifications.enabled) (and .Values.notifications .Values.notifications.enabled) }}
             # Story 4.8 (NFR8): project the OPTIONAL incident notification webhook
@@ -176,6 +191,12 @@ spec:
                 secretKeyRef:
                   name: {{ include "olaitan.fullname" . }}-secrets
                   key: notifications-webhook-url
+                  # Story 12.7: optional, so a Secret made without this key
+                  # (the install.yaml recipe) does not stop the pod. With no
+                  # object store configured the consumer is DEGRADED and
+                  # never reads it; with a store configured, missing S3
+                  # credentials are still a startup error (half a store).
+                  optional: true
             {{- end }}
             {{- with .Values.nats.streamMaxBytesOverride }}
             # Story 1.19 D6: caps every JetStream stream's MaxBytes at
@@ -185,6 +206,41 @@ spec:
             # this empty and size the NATS PVC instead.
             - name: OLT_NATS_STREAM_MAXBYTES_OVERRIDE
               value: {{ include "olaitan.natsStreamMaxBytesOverride" $ | quote }}
+            {{- end }}
+            {{- $extraNames := list }}
+            {{- range .Values.aggregator.extraEnv }}{{ $extraNames = append $extraNames .name }}{{ end }}
+            {{- $provider := include "olaitan.evaluation.effectiveAnalystProvider" . | lower }}
+            {{- $mult := toString (default 0 .Values.aggregator.llmRoleTimeoutMultiplier) }}
+            {{- if not (regexMatch "^[0-9]+(\\.[0-9]+)?$" $mult) }}
+            {{- fail (printf "aggregator.llmRoleTimeoutMultiplier is %q: want a positive number, or 0 to render none" $mult) }}
+            {{- end }}
+            {{- if and (eq $provider "local") (ne $mult "0") (not (has "OLT_LLM_ROLE_TIMEOUT_MULTIPLIER" $extraNames)) }}
+            # Story 12.7: role budgets for the in-cluster CPU model
+            # (aggregator.llmRoleTimeoutMultiplier).
+            - name: OLT_LLM_ROLE_TIMEOUT_MULTIPLIER
+              value: {{ $mult | quote }}
+            {{- end }}
+            {{- if and (eq $provider "local") (not (has "OLT_LLM_CHAIN_WORKERS" $extraNames)) }}
+            {{- /* Story 12.7 review round 2: as many concurrent chain runs
+                   as the in-cluster Ollama serves (OLLAMA_NUM_PARALLEL, the
+                   last entry wins as in the kubelet; 1 by default). More
+                   would queue inside Ollama and spend the role timeout
+                   waiting. Read by the async chain (Story 7.4). */}}
+            {{- $par := "1" }}
+            {{- range (default (list) (default (dict) .Values.ollama).extraEnv) }}
+            {{- if eq .name "OLLAMA_NUM_PARALLEL" }}{{ $par = toString .value }}{{ end }}
+            {{- end }}
+            - name: OLT_LLM_CHAIN_WORKERS
+              value: {{ $par | quote }}
+            {{- end }}
+            {{- with include "olaitan.riskWindowSeconds" . }}
+            {{- if not (has "OLT_RISK_WINDOW_SECONDS" $extraNames) }}
+            # Story 12.7: the rolling per-workload risk window, on by default
+            # (aggregator.riskWindowSeconds; 0 turns it off). An
+            # OLT_RISK_WINDOW_SECONDS in aggregator.extraEnv wins.
+            - name: OLT_RISK_WINDOW_SECONDS
+              value: {{ . | quote }}
+            {{- end }}
             {{- end }}
             {{- range .Values.aggregator.extraEnv }}
             # Operator-supplied aggregator environment (PR #92 review: the

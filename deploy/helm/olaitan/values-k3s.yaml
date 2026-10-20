@@ -11,16 +11,17 @@ platform: k3s
 containerdSensor:
   # THE k3s delta. k3s bundles its own containerd and puts the socket under
   # /run/k3s/, not the standard path the chart defaults to. With the default
-  # path the hostPath mount (type: Directory) fails and the collector never
-  # schedules. Only relevant if you enable this sensor; it is off by default.
+  # path the adapter finds no socket and the source stays DEGRADED. Story
+  # 12.7: the sensor is on by default, and the chart also switches to this
+  # path by itself when it detects k3s; this line makes it explicit (and
+  # covers a k3s the chart cannot detect).
   socketPath: /run/k3s/containerd/containerd.sock
 
-auditWebhook:
-  # AVAILABLE here, unlike the managed platforms: k3s runs its own API server
-  # and you can pass --audit-webhook-config-file via
-  # --kube-apiserver-arg. Still off by default because it needs the API server
-  # reconfigured; see hack/audit-apiserver-patch.yaml.
-  enabled: false
+# AUDIT WEBHOOK. AVAILABLE here, unlike the managed platforms: k3s runs its
+# own API server and you can pass --audit-webhook-config-file via
+# --kube-apiserver-arg. Story 12.7: on by default, so the receiver is up and
+# its kubeconfig is in Secret <fullname>-audit-webhook-kubeconfig; it stays
+# DEGRADED until the API server is pointed at it (hack/audit-apiserver-patch.yaml).
 
 # STORAGE. k3s ships local-path as the default StorageClass, so no override is
 # needed. It is node-local: a rescheduled NATS pod will not find its data on

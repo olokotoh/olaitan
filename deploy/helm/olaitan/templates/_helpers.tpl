@@ -148,7 +148,7 @@ and each ID the 12 hex characters of the `ollama list` ID column.
 {{- range $m := keys $ids | sortAlpha -}}
 {{- $id := toString (get $ids $m) -}}
 {{- if not (has $m $models) -}}
-{{- fail (printf "ollama.pull.expectedIds names %q, which is not in ollama.pull.models" $m) -}}
+{{- fail (printf "ollama.pull.expectedIds names %q, which is not in ollama.pull.models. The chart default pins the ID of its default model; when you change the model, set ollama.pull.expectedIds to your models' IDs, or to null (--set ollama.pull.expectedIds=null) to check nothing" $m) -}}
 {{- end -}}
 {{- if not (regexMatch "^[a-f0-9]{12}$" $id) -}}
 {{- fail (printf "ollama.pull.expectedIds[%q] must be the 12 lowercase hex characters of the `ollama list` ID column, quoted (got %q)" $m $id) -}}
@@ -914,4 +914,160 @@ Fail on values the chart-owned Redis cannot honour (review round 1 of Story
 
 {{- define "olaitan.redis.secretName" -}}
 {{- default (printf "%s-secrets" (include "olaitan.fullname" .)) .Values.redis.auth.existingSecret -}}
+{{- end -}}
+
+{{/*
+Story 12.7 (live finding, 2026-10-19): checksum of the rendered config, the
+`data` of every ConfigMap in templates/configmap.yaml (olaitan.yaml and the
+rules). A helm upgrade that changed only the config (analyst.provider, say)
+left the aggregator on the old config, because restart-required settings are
+read at startup and the pod template did not move. With this on the pod
+templates, a config change rolls the aggregator and the collector, and a
+no-change upgrade rolls nothing. Only `data` is hashed: the labels carry the
+chart version, and hashing them would roll on every version bump.
+*/}}
+{{- define "olaitan.configChecksum" -}}
+{{- $data := list -}}
+{{- range $doc := splitList "\n---" (include (print .Template.BasePath "/configmap.yaml") .) -}}
+{{- $m := fromYaml $doc -}}
+{{- if hasKey $m "Error" -}}{{- fail (printf "olaitan.configChecksum: a document in templates/configmap.yaml did not parse: %s" $m.Error) -}}{{- end -}}
+{{- if $m.data -}}{{- $data = append $data $m.data -}}{{- end -}}
+{{- end -}}
+{{- if not $data -}}{{- fail "olaitan.configChecksum: templates/configmap.yaml rendered no ConfigMap data" -}}{{- end -}}
+{{- $data | toJson | sha256sum -}}
+{{- end -}}
+
+{{/*
+Story 12.7 (live finding): the risk window TTL, validated. Prints the seconds
+as plain digits, or nothing when it is 0 (off). Without the window no single
+evidence package reaches RESTRICTED (the rule term alone tops out at 0.4 x 95
+= 38), so the blocking switch would never block.
+*/}}
+{{- define "olaitan.riskWindowSeconds" -}}
+{{- $v := toString (default 0 .Values.aggregator.riskWindowSeconds) -}}
+{{- if not (regexMatch "^(0|[1-9][0-9]*)$" $v) -}}
+{{- fail (printf "aggregator.riskWindowSeconds is %q: want whole seconds, 0 to 604800 (0 turns the risk window off)" $v) -}}
+{{- end -}}
+{{- if gt (int64 $v) 604800 -}}
+{{- fail (printf "aggregator.riskWindowSeconds is %s: the aggregator caps the window at 604800 (7 days)" $v) -}}
+{{- end -}}
+{{- if ne $v "0" -}}{{- $v -}}{{- end -}}
+{{- end -}}
+
+{{/*
+Story 12.7: everything on by default. These helpers decide, per part, how
+the chart renders it on THIS cluster, so the templates, the config bridge
+and NOTES.txt can never disagree.
+*/}}
+
+{{/*
+TLS mode of the audit webhook receiver: "operator" when any of the six
+material values is set (all six are then required, see
+olaitan.auditWebhook.validateMaterial), "auto" when none is (the certgen
+Job generates the material in the cluster).
+*/}}
+{{- define "olaitan.auditWebhook.tlsMode" -}}
+{{- $a := .Values.auditWebhook -}}
+{{- if or $a.caBundle $a.clusterCAData $a.apiserverClientCert $a.apiserverClientKey $a.servingCert $a.servingKey -}}operator{{- else -}}auto{{- end -}}
+{{- end -}}
+
+{{/*
+Half a set of audit TLS values fails the render and names what is missing:
+silently generating the rest would pair the operator's CA with a key the
+operator never sees.
+*/}}
+{{- define "olaitan.auditWebhook.validateMaterial" -}}
+{{- if and .Values.auditWebhook.enabled (eq (include "olaitan.auditWebhook.tlsMode" .) "operator") -}}
+{{- $a := .Values.auditWebhook -}}
+{{- $missing := list -}}
+{{- range $k := list "caBundle" "clusterCAData" "apiserverClientCert" "apiserverClientKey" "servingCert" "servingKey" -}}
+{{- if not (index $a $k) -}}{{- $missing = append $missing (printf "auditWebhook.%s" $k) -}}{{- end -}}
+{{- end -}}
+{{- if $missing -}}
+{{- fail (printf "audit webhook TLS: some material is set but %s is empty. Set all six values (your own material, Path B: see AUDIT.md), or none of them and the certgen Job generates them in the cluster." (join ", " $missing)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+TLS mode of the applog injector: "certmanager" (Path A), "operator" when any
+Path B value is set (all three then required), "auto" otherwise (certgen).
+*/}}
+{{- define "olaitan.applog.tlsMode" -}}
+{{- $t := .Values.applogSidecar.tls -}}
+{{- if $t.certManagerEnabled -}}certmanager
+{{- else if or $t.servingCert $t.servingKey $t.caBundle -}}operator
+{{- else -}}auto
+{{- end -}}
+{{- end -}}
+
+{{/*
+Goldmane client material for the Calico sensor: "certmanager" (Path A),
+"operator" (Path B, all three values required), or "none" (the source runs
+DEGRADED: Goldmane only accepts a client cert signed by the Tigera CA, which
+the chart will not read out of calico-system on its own).
+*/}}
+{{- define "olaitan.calico.tlsMode" -}}
+{{- $t := .Values.calicoSensor.tls -}}
+{{- if $t.certManagerSecretName -}}certmanager
+{{- else if or $t.caBundle $t.clientCert $t.clientKey -}}operator
+{{- else -}}none
+{{- end -}}
+{{- end -}}
+
+{{/*
+Whether the containerd sensor is rendered on this cluster: on unless it is
+switched off or the cluster is OpenShift, which runs CRI-O and has no
+containerd socket to mount. "true" or "".
+*/}}
+{{- define "olaitan.containerd.enabled" -}}
+{{- if and .Values.containerdSensor.enabled (ne (include "olaitan.platform" .) "openshift") -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+The containerd socket path. The chart default moves to k3s's own containerd
+on a detected (or declared) k3s or RKE2; an explicitly different value wins.
+*/}}
+{{- define "olaitan.containerd.socketPath" -}}
+{{- $p := .Values.containerdSensor.socketPath -}}
+{{- if and (eq $p "/run/containerd/containerd.sock") (has (include "olaitan.platform" .) (list "k3s" "rke2")) -}}
+/run/k3s/containerd/containerd.sock
+{{- else -}}
+{{- $p -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+THE blocking switch (Story 12.7, AC2): response.networkPolicy.enabled turns
+on NetworkPolicy isolation and the forensic post-capture kill, and the RBAC
+both need. "true" or "".
+*/}}
+{{- define "olaitan.blocking" -}}
+{{- if (default (dict) (default (dict) .Values.response).networkPolicy).enabled -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+Whether the certgen Job renders: the audit receiver or the applog injector is
+on and needs generated material.
+*/}}
+{{- define "olaitan.certgen.enabled" -}}
+{{- $audit := and .Values.auditWebhook.enabled (eq (include "olaitan.auditWebhook.tlsMode" .) "auto") -}}
+{{- $applog := and .Values.applogSidecar.enabled (eq (include "olaitan.applog.tlsMode" .) "auto") -}}
+{{- if or $audit $applog -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+Whether an object store is configured for forensics / the report archive:
+the facade bucket or kms alias, or any of the response.* store fields.
+Mirrors config.StoreConfigured (all empty = no store, DEGRADED).
+*/}}
+{{- define "olaitan.forensics.storeConfigured" -}}
+{{- $f := default (dict) (default (dict) .Values.forensics).s3 -}}
+{{- $r := default (dict) (default (dict) .Values.response).forensics -}}
+{{- if or $f.bucket $f.kms_key_alias $r.s3Endpoint $r.s3Bucket $r.kmsKeyAlias -}}true{{- end -}}
+{{- end -}}
+{{- define "olaitan.reportArchive.storeConfigured" -}}
+{{- $f := default (dict) (default (dict) .Values.forensics).s3 -}}
+{{- $r := default (dict) (default (dict) .Values.response).reportArchive -}}
+{{- if or $f.bucket $f.kms_key_alias $r.s3Endpoint $r.s3Bucket $r.kmsKeyAlias -}}true{{- end -}}
 {{- end -}}

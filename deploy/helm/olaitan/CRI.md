@@ -43,7 +43,13 @@ Downstream consumers:
    sudo ls -l /run/containerd/containerd.sock
    ```
 
-2. Set the chart value (default is disabled):
+2. Story 12.7: the sensor is on by default. On a detected k3s or RKE2 the
+   chart switches to `/run/k3s/containerd/containerd.sock`; on OpenShift
+   (CRI-O) it renders no mount and the install notes report it DEGRADED.
+   The socket directory is mounted `DirectoryOrCreate`, so a node without
+   it never keeps the collector (and Falco ingest) from starting: the
+   source stays unhealthy and the collector logs "source DEGRADED" with
+   the path. To set it explicitly:
 
    ```yaml
    containerdSensor:

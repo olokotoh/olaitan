@@ -1449,7 +1449,12 @@ func (f ForensicsConfig) S3UseSSLOrDefault() bool {
 // boundary only; the MinioUploader itself still accepts an empty alias so the
 // no-KES MinIO integration test can construct it directly with an empty alias.
 func (f ForensicsConfig) validate() error {
-	if f.Enabled != nil && *f.Enabled {
+	// Story 12.7 (D5): forensics is on by default, and an object store is a
+	// platform prerequisite the chart cannot provide. With endpoint, bucket
+	// and KMS alias ALL empty there is simply no store yet: valid, and the
+	// aggregator logs the controller DEGRADED and leaves it unwired. A
+	// partial store is still an error, so a typo never degrades silently.
+	if f.Enabled != nil && *f.Enabled && f.StoreConfigured() {
 		if f.S3Endpoint == "" {
 			return errors.New("response.forensics.s3_endpoint: required when forensics.enabled=true")
 		}
@@ -1461,6 +1466,12 @@ func (f ForensicsConfig) validate() error {
 		}
 	}
 	return nil
+}
+
+// StoreConfigured reports whether any of the object-store fields is set.
+// All empty means "no store configured" (Story 12.7, D5).
+func (f ForensicsConfig) StoreConfigured() bool {
+	return f.S3Endpoint != "" || f.S3Bucket != "" || f.KMSKeyAlias != ""
 }
 
 // ReportArchiveConfig configures the Story 4.6 durable report writer (FR45).
@@ -1646,7 +1657,13 @@ func (r ReportArchiveConfig) validate() error {
 	if r.DeferredDrainSeconds != nil && *r.DeferredDrainSeconds < 1 {
 		return fmt.Errorf("response.report_archive.deferred_drain_seconds: must be >= 1 (got %d)", *r.DeferredDrainSeconds)
 	}
-	if r.Enabled != nil && *r.Enabled {
+	// Story 12.7 (D5): no store at all is valid (DEGRADED at wiring); a
+	// partial store is still an error. The deferred queue is part of the
+	// writer, so it is checked whenever the archive is on.
+	if r.Enabled != nil && *r.Enabled && r.DeferredEnabledOrDefault() && r.DeferredRedisAddr == "" {
+		return errors.New("response.report_archive.deferred_redis_addr: required when report_archive.deferred_enabled=true (the deferred-write queue is a Redis LIST; the REDIS_PASSWORD env var supplies the password)")
+	}
+	if r.Enabled != nil && *r.Enabled && r.StoreConfigured() {
 		if r.S3Endpoint == "" {
 			return errors.New("response.report_archive.s3_endpoint: required when report_archive.enabled=true")
 		}
@@ -1656,12 +1673,14 @@ func (r ReportArchiveConfig) validate() error {
 		if r.KMSKeyAlias == "" {
 			return errors.New("response.report_archive.kms_key_alias: required when report_archive.enabled=true (the writer applies SSE-KMS per PUT; an empty alias would persist reports with no agent-applied encryption)")
 		}
-		// The deferred queue, when enabled, needs a Redis address to enqueue to.
-		if r.DeferredEnabledOrDefault() && r.DeferredRedisAddr == "" {
-			return errors.New("response.report_archive.deferred_redis_addr: required when report_archive.deferred_enabled=true (the deferred-write queue is a Redis LIST; the REDIS_PASSWORD env var supplies the password)")
-		}
 	}
 	return nil
+}
+
+// StoreConfigured reports whether any of the object-store fields is set.
+// All empty means "no store configured" (Story 12.7, D5).
+func (r ReportArchiveConfig) StoreConfigured() bool {
+	return r.S3Endpoint != "" || r.S3Bucket != "" || r.KMSKeyAlias != ""
 }
 
 // NetworkPolicyConfig configures the Story 2.4 RESTRICTED-state

@@ -47,21 +47,30 @@ spec:
     aggregator-only-11434 ingress and declared-empty egress. Gated so
     the default render is byte-identical when ollama is disabled.
     */}}
-    {{- if (default (dict) .Values.ollama).enabled }}
     {{- /*
     Story 10.6: the model pull Job's pod carries the same shared labels, so
     it is excluded for the same reason; its own policy
     (ollama-pull-job.yaml) is the whole of what it may do. Only added when
     a pull is configured, so the air-gapped render is unchanged.
+
+    Story 12.7 review round 2: the certgen Job's pod too. This policy's
+    API-server egress comes from `lookup`, which is empty under `helm
+    template` (install.yaml), leaving only 10.96.0.1/32; on k3s, EKS or a
+    CNI that matches after DNAT certgen could not reach the API server and
+    the audit and applog TLS would never exist. certgen-networkpolicy.yaml
+    is its whole policy.
     */}}
+    {{- $notIn := list }}
+    {{- if (default (dict) .Values.ollama).enabled }}
+    {{- $notIn = append $notIn "ollama" }}
+    {{- if include "olaitan.ollama.pullModels" . }}{{- $notIn = append $notIn "ollama-pull" }}{{- end }}
+    {{- end }}
+    {{- if include "olaitan.certgen.enabled" . }}{{- $notIn = append $notIn "certgen" }}{{- end }}
+    {{- if $notIn }}
     matchExpressions:
       - key: app.kubernetes.io/component
         operator: NotIn
-        {{- if include "olaitan.ollama.pullModels" . }}
-        values: ["ollama", "ollama-pull"]
-        {{- else }}
-        values: ["ollama"]
-        {{- end }}
+        values: {{ toJson $notIn }}
     {{- end }}
 {{- /*
   Story 10.5: the API server CIDR discovery is computed ONCE here because

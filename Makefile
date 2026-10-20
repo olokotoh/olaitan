@@ -307,6 +307,13 @@ scenarios-validate:
 
 KIND_CLUSTER_NAME ?= olaitan-e2e
 
+# Story 12.7: every part is on in the chart default. The ring-level e2e
+# targets below (e2e-local, -rslt, -forensics, -overlays, eval-smoke,
+# scenarios-smoke) each test one ring on a small kindnetd cluster, so they
+# layer values-minimal.yaml (the pre-12.7 observe-only core) after
+# values-kind.yaml: no 1.9 GB model pull, no FR28 fallback they do not
+# assert. Any part a target needs is --set back on explicitly, and --set
+# beats every -f. The full system is exercised by make up and e2e-full.
 e2e-local: helm-prepare helm-deps docker-build
 	# Skip cluster create when one with this name already exists so a
 	# repeated `make e2e-local` reuses the previous cluster instead of
@@ -328,6 +335,7 @@ e2e-local: helm-prepare helm-deps docker-build
 		--set baselines.warmupDuration=5s \
 		--set secrets.redisPassword=ci-test \
 		-f $(CHART_DIR)/values-kind.yaml \
+		-f $(CHART_DIR)/values-minimal.yaml \
 		--set-string nats.streamMaxBytesOverride=536870912 \
 		--wait --timeout 5m
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) go test -tags=e2e -v -count=1 ./tests/e2e/...
@@ -360,6 +368,7 @@ e2e-local-rslt: helm-prepare helm-deps docker-build
 		--set baselines.warmupDuration=5s \
 		--set secrets.redisPassword=ci-test \
 		-f $(CHART_DIR)/values-kind.yaml \
+		-f $(CHART_DIR)/values-minimal.yaml \
 		--set-string nats.streamMaxBytesOverride=536870912 \
 		--wait --timeout 5m
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) OLT_E2E_RSLT=1 go test -tags=e2e -v -count=1 ./tests/e2e/...
@@ -421,6 +430,7 @@ e2e-local-forensics: helm-prepare helm-deps docker-build
 		--set baselines.warmupDuration=5s \
 		--set secrets.redisPassword=ci-test \
 		-f $(CHART_DIR)/values-kind.yaml \
+		-f $(CHART_DIR)/values-minimal.yaml \
 		--set-string nats.streamMaxBytesOverride=536870912 \
 		--wait --timeout 5m
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) OLT_E2E_FORENSICS=1 go test -tags=e2e -v -count=1 -run 'TestKindSmoke_Forensics_FullSlice|TestFalcoSourceIsLive' ./tests/e2e/...
@@ -495,6 +505,7 @@ e2e-local-overlays: helm-prepare helm-deps docker-build
 		--set image.pullPolicy=Never \
 		--set secrets.redisPassword=ci-test \
 		-f $(CHART_DIR)/values-kind.yaml \
+		-f $(CHART_DIR)/values-minimal.yaml \
 		--set-string nats.streamMaxBytesOverride=536870912 \
 		-f $(CHART_DIR)/values-$(OVERLAY).yaml \
 		--wait --timeout 5m
@@ -537,6 +548,7 @@ eval-smoke: helm-prepare helm-deps docker-build
 		--set baselines.warmupDuration=5s \
 		--set secrets.redisPassword=ci-test \
 		-f $(CHART_DIR)/values-kind.yaml \
+		-f $(CHART_DIR)/values-minimal.yaml \
 		--set-string nats.streamMaxBytesOverride=536870912 \
 		--wait --timeout 5m
 	go build $(LDFLAGS) -o bin/olaitan-eval ./cmd/olaitan-eval
@@ -573,6 +585,7 @@ scenarios-smoke: helm-prepare helm-deps docker-build
 		--set baselines.warmupDuration=5s \
 		--set secrets.redisPassword=ci-test \
 		-f $(CHART_DIR)/values-kind.yaml \
+		-f $(CHART_DIR)/values-minimal.yaml \
 		--set-string nats.streamMaxBytesOverride=536870912 \
 		--wait --timeout 5m
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) go test -tags=e2e -v -count=1 -run 'TestKindSmoke_Scenarios|TestFalcoSourceIsLive' ./tests/e2e/...

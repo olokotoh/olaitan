@@ -84,7 +84,9 @@ spec:
              webhook (failurePolicy Ignore) silently stops injecting.
              Path A's Secret is written by cert-manager, not by helm, so
              no render-time checksum can track it. */ -}}
-      {{- if not .Values.applogSidecar.tls.certManagerEnabled }}
+      {{- /* Story 12.7: in the certgen (auto) mode helm does not render the
+             Secret either, and certgen never replaces it once made. */ -}}
+      {{- if eq (include "olaitan.applog.tlsMode" .) "operator" }}
       annotations:
         checksum/applog-tls: {{ include "olaitan.tlsSecretChecksum" (dict "root" . "template" "applog-webhook-tls-secret.yaml") | quote }}
       {{- end }}

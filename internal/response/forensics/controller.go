@@ -76,6 +76,12 @@ type Config struct {
 	// (NFR7 p99 <= 10s). The per-leg timeouts are sub-deadlines of this; zero ->
 	// default (10s).
 	NFR7Budget time.Duration
+	// KillAfterCapture deletes the captured pods once their evidence is
+	// durably uploaded. Story 12.7 (D6): deleting a workload is blocking, and
+	// blocking has one switch, response.network_policy.enabled; the aggregator
+	// wires this from it. False (the zero value) captures and uploads the
+	// evidence and leaves the pod running.
+	KillAfterCapture bool
 }
 
 // Controller is the forensic capture sink + background drainer (BI-3/BI-4). It
@@ -97,6 +103,7 @@ type Controller struct {
 	deleteTimeout  time.Duration
 	uploadRetries  int
 	nfr7Budget     time.Duration
+	kill           bool
 
 	// oracle is the optional PRESERVED_KILLED confirmation seam (BI-5). Set once
 	// via SetStateOracle before Run; read-only for the worker thereafter.
@@ -163,6 +170,7 @@ func New(cfg Config, cs kubernetes.Interface, uploader Uploader, registry *metri
 		deleteTimeout:  deleteTimeout,
 		uploadRetries:  uploadRetries,
 		nfr7Budget:     nfr7Budget,
+		kill:           cfg.KillAfterCapture,
 	}
 	if registry != nil {
 		if err := c.registerMetrics(registry); err != nil {
@@ -197,14 +205,14 @@ func (c *Controller) registerMetrics(r *metrics.Registry) error {
 
 	cv, err := r.RegisterCounterVec(
 		"olaitan_forensic_capture_total",
-		"Cumulative forensic capture outcomes labelled by result: captured (full success: capture+upload+delete), deferred (upload failed after retry; pod NOT deleted), skipped (excluded namespace, no pods, or no longer PRESERVED_KILLED), error (capture failure or workload-id parse error), delete_failed (upload acked but the pod delete failed; pod alive + QUARANTINED, deferred to Story 4.7 delete-retry), dropped (Publish queue full) (Story 4.2, FR36/AC5).",
+		"Cumulative forensic capture outcomes labelled by result: captured (full success: capture+upload+delete), deferred (upload failed after retry; pod NOT deleted), skipped (excluded namespace, no pods, or no longer PRESERVED_KILLED), error (capture failure or workload-id parse error), delete_failed (upload acked but the pod delete failed; pod alive + QUARANTINED, deferred to Story 4.7 delete-retry), dropped (Publish queue full), captured_no_kill (capture+upload acked, pod left running because blocking is off, Story 12.7) (Story 4.2, FR36/AC5).",
 		[]string{"result"},
 	)
 	if err != nil {
 		return err
 	}
 	c.captureTotal = cv
-	for _, result := range []string{"captured", "deferred", "skipped", "error", "delete_failed", "dropped"} {
+	for _, result := range []string{"captured", "captured_no_kill", "deferred", "skipped", "error", "delete_failed", "dropped"} {
 		cv.WithLabelValues(result).Add(0)
 	}
 
@@ -405,6 +413,16 @@ func (c *Controller) captureUploadDelete(ctx context.Context, st schema.StateTra
 			c.writesDeferred.Inc()
 		}
 		c.count("deferred")
+		return
+	}
+
+	// Story 12.7 (D6): with blocking off the evidence is preserved and the
+	// pod is left running. Counted apart from "captured" (which means
+	// captured AND killed) so a dashboard never reads a capture as a kill.
+	if !c.kill {
+		c.log.Info("forensics: evidence captured; pod left running because blocking is off (response.network_policy.enabled=false)",
+			"namespace", namespace, "pod", podName, "key", key, "sha256", sum)
+		c.count("captured_no_kill")
 		return
 	}
 

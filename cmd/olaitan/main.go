@@ -25,6 +25,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -76,6 +77,7 @@ import (
 	"github.com/olokotoh/olaitan/internal/response/settling"
 	"github.com/olokotoh/olaitan/internal/retry"
 	"github.com/olokotoh/olaitan/internal/schema"
+	"github.com/olokotoh/olaitan/internal/sourcehealth"
 	"github.com/olokotoh/olaitan/internal/subjects"
 )
 
@@ -111,6 +113,12 @@ func run(args []string, stderr io.Writer) int {
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
 		return runApplogWebhook(ctx, args[1:], stderr)
+	case "certgen":
+		// Story 12.7 (D1): the chart's certgen Job. Generates the audit
+		// webhook and applog injector TLS material in the cluster.
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		return runCertgen(ctx, args[1:], stderr)
 	case "fake-llm":
 		// Story 3.16 (AC7): the OpenAI-compatible canned-verdict server the
 		// RSLT-full kind e2e routes the analyst at. Test fixture only.
@@ -1016,6 +1024,15 @@ func startAggregatorRing(ctx context.Context, g *errgroup.Group, log *slog.Logge
 	// after SetStateOracle) performs capture -> S3 upload -> pod delete off the
 	// FSM hot path. Gated by response.forensics.enabled (off by default).
 	forensicsEnabled := cfg.Response.Forensics.EnabledOrDefault()
+	// Story 12.7 (D5): forensics is on by default, but an object store is a
+	// platform prerequisite. With no store configured at all the controller is
+	// DEGRADED: said loudly here, and left unwired, rather than a startup
+	// error that would crash-loop the aggregator.
+	if forensicsEnabled && !cfg.Response.Forensics.StoreConfigured() {
+		log.Warn("aggregator: forensic capture DEGRADED: no object store configured; evidence is not captured until one is set (forensics.s3.bucket, forensics.s3.kms_key_alias, response.forensics.s3Endpoint and the S3 credentials)",
+			"part", "forensics")
+		forensicsEnabled = false
+	}
 	var forensicCtrl *forensics.Controller
 	if forensicsEnabled {
 		var ferr error
@@ -1400,9 +1417,16 @@ func wireForensicsController(cfg *config.Config, cs kubernetes.Interface, log *s
 	if err != nil {
 		return nil, fmt.Errorf("s3 uploader: %w", err)
 	}
+	// Story 12.7 (D6): deleting the captured pods is blocking, and blocking
+	// has one switch, response.network_policy.enabled.
+	kill := cfg.Response.NetworkPolicy.EnabledOrDefault()
+	if !kill {
+		log.Info("aggregator: forensic capture runs observe-only: evidence is captured and uploaded, pods are never deleted (blocking is off; response.networkPolicy.enabled=true turns it on)")
+	}
 	return forensics.New(forensics.Config{
 		KMSKeyAlias:        fc.KMSKeyAlias,
 		ExcludedNamespaces: cfg.Response.ExcludedNamespaces,
+		KillAfterCapture:   kill,
 	}, cs, uploader, metricsReg, log)
 }
 
@@ -1616,6 +1640,13 @@ func wireNotificationWebhook(cfg *config.Config, reg *metrics.Registry, log *slo
 func wireReportArchive(cfg *config.Config, log *slog.Logger) (archive.ReportArchive, error) {
 	ra := cfg.Response.ReportArchive
 	if !ra.EnabledOrDefault() {
+		return nil, nil
+	}
+	// Story 12.7 (D5): on by default; no object store configured is DEGRADED
+	// (reports are still generated and announced, just not archived).
+	if !ra.StoreConfigured() {
+		log.Warn("aggregator: report archive DEGRADED: no object store configured; DFIR reports are generated and announced but not archived until one is set (forensics.s3.bucket, forensics.s3.kms_key_alias, response.reportArchive.s3Endpoint and the S3 credentials)",
+			"part", "report_archive")
 		return nil, nil
 	}
 	accessKey := strings.TrimRight(os.Getenv("S3_ACCESS_KEY"), "\r\n")
@@ -2102,11 +2133,12 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 			return fmt.Errorf("collector: audit adapter: %w", aerr)
 		}
 		metricsSources[string(schema.SourceAudit)] = auditAdapter
+		// Story 12.7 (D4): the receiver is on by default and its TLS material
+		// may not exist yet (the certgen Job has not run) or at all. Its
+		// failure must not take the collector, and Falco ingest with it,
+		// down: it runs as an optional source and is retried.
 		g.Go(func() error {
-			if err := auditAdapter.Run(ctx); err != nil {
-				return fmt.Errorf("collector: audit run: %w", err)
-			}
-			return nil
+			return runOptionalSource(ctx, log, string(schema.SourceAudit), auditAdapter.Run)
 		})
 		log.Info("collector: ring 1 wired (audit)",
 			"listen_addr", auditCfg.ListenAddr,
@@ -2197,14 +2229,12 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 			return fmt.Errorf("collector: cni adapter: %w", nerr)
 		}
 		metricsSources[string(schema.SourceNetwork)] = cniAdapter
+		// Story 12.7 (D4): on by default; with no Goldmane client
+		// certificate (no Calico, or no Path A/B material) the adapter's
+		// TLS load is terminal. Optional source: logged, retried, and the
+		// collector keeps running.
 		g.Go(func() error {
-			if err := cniAdapter.Run(ctx); err != nil {
-				if errors.Is(err, context.Canceled) {
-					return nil
-				}
-				return fmt.Errorf("collector: cni run: %w", err)
-			}
-			return nil
+			return runOptionalSource(ctx, log, string(schema.SourceNetwork), cniAdapter.Run)
 		})
 		log.Info("collector: ring 1 wired (calico cni)",
 			"goldmane_addr", cniCfg.GoldmaneAddr)
@@ -2224,6 +2254,28 @@ func startCollectorRing(ctx context.Context, g *errgroup.Group, log *slog.Logger
 		closeNATS()
 		return fmt.Errorf("collector: metrics: %w", merr)
 	}
+
+	// Story 12.7 (D4): every source is on by default, and a source whose
+	// platform prerequisite is missing stays unhealthy. source_healthy says
+	// that, but not why, and the containerd adapter retries a missing socket
+	// without ever returning an error. A WARN per unhealthy source, with its
+	// last error, once a minute after start and every five minutes after.
+	healthReaders := make(map[string]sourcehealth.Reader, len(metricsSources))
+	for name, src := range metricsSources {
+		healthReaders[name] = src.Health()
+	}
+	g.Go(func() error {
+		wait := degradedSummaryFirst
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(wait):
+			}
+			logDegradedSources(log, healthReaders)
+			wait = degradedSummaryEvery
+		}
+	})
 
 	// Story 1.13: hot-reload rate-limit knobs via config.Manager.
 	// Subscribe per FR49. The callback runs synchronously on the
@@ -2323,6 +2375,7 @@ Commands:
   aggregator       Run the aggregator (correlator + decision + response)
   applog-sidecar   Run the application log sidecar (in-pod, opt-in)
   applog-webhook   Run the application log MutatingAdmissionWebhook server
+  certgen          Create the in-cluster TLS material for the audit and applog webhooks (the chart's certgen Job)
   version          Print version
   help             Show this help
 
@@ -2430,6 +2483,37 @@ func envNonNegativeInt(name string) (int, error) {
 		return 0, fmt.Errorf("%s=%q is not a non-negative integer", name, v)
 	}
 	return n, nil
+}
+
+// degradedSummaryFirst and degradedSummaryEvery pace the collector's
+// "source DEGRADED" summary log (Story 12.7, D4). Vars so tests can shorten
+// them.
+var (
+	degradedSummaryFirst = time.Minute
+	degradedSummaryEvery = 5 * time.Minute
+)
+
+// logDegradedSources logs one WARN per source that is not healthy, with the
+// last error its adapter recorded (or that it has not connected yet). Healthy
+// sources are not logged. Sorted, so the lines are stable across runs.
+func logDegradedSources(log *slog.Logger, sources map[string]sourcehealth.Reader) {
+	names := make([]string, 0, len(sources))
+	for name := range sources {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		healthy, lastErr := sources[name].Status()
+		if healthy {
+			continue
+		}
+		reason := "no event or connection yet"
+		if lastErr != nil {
+			reason = lastErr.Error()
+		}
+		log.Warn("collector: source DEGRADED: it is on but not healthy (a missing prerequisite, or on and idle: no event yet); see the reason, and the helm NOTES for what this source needs",
+			"source", name, "reason", reason)
+	}
 }
 
 // optionalSourceBackoff is the wait before restarting a failed optional

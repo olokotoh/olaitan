@@ -1265,6 +1265,11 @@ demonstrated mechanism plus future work. The degree completed on
 2026-08-15; the reserved supervision gate is thereby discharged, and
 decision authority rests with the project owner.
 
+**Superseded in part by ADR-2026-10-19-02 (Story 12.7):** the Helm chart
+now turns the window on by default (900 s); the evaluation overlays and
+values-minimal.yaml pin it to 0, so the reproducibility argument below
+still holds for every evaluation run.
+
 **Decision.** The project owner ratifies **Option B**, the rolling
 per-workload risk window (`internal/response/risk`), as the shipped
 scoring model, off by default (`OLT_RISK_WINDOW_SECONDS` unset = the
@@ -1503,3 +1508,79 @@ same `package_id` on a later transition, and by that package's
 
 **Provenance.** Story 7.4, issue #186; traceability row
 `c3.6.4-async-analyst-chain`.
+
+---
+
+## ADR-2026-10-19-02: Everything on by default; webhook TLS made in the cluster; blocking is one switch
+
+**Status.** Accepted (Story 12.7, #208). **Supersedes ADR-2026-08-17-01 in
+part:** that ADR shipped the rolling risk window "off by default
+(`OLT_RISK_WINDOW_SECONDS` unset), so the pre-window behaviour remains the
+default and reproducible". From Story 12.7 the Helm chart turns it ON by
+default (`aggregator.riskWindowSeconds: 900`, rendered as
+`OLT_RISK_WINDOW_SECONDS`), because without it no single evidence package
+reaches RESTRICTED (the rule term tops out at 0.4 x 95 = 38) and the one
+blocking switch would never block (live run, 2026-10-19). Reproducibility
+is kept where it is needed: every evaluation arm overlay
+(`values-eval*.yaml`) and `values-minimal.yaml` pin
+`aggregator.riskWindowSeconds: 0`, the binary's own default is unchanged
+(env unset = per-package scoring), and the Option B model itself, the
+trust bound and the evaluation decisions recorded there stand. Decision owner: Aslim, 2026-10-19:
+a plain `helm install` and the release `install.yaml` turn every part on;
+blocking (`response.networkPolicy.enabled`) stays off behind one flag.
+
+**TLS material (D1).** The audit receiver and the applog injector need TLS
+material the chart used to require as values. Generating it in the template
+(`genCA`/`genSignedCert`, reused through `lookup`) was rejected: `helm
+template` renders `install.yaml`, so one private key would ship in a public
+release asset and be shared by every install (Story 12.4 D5). Requiring
+cert-manager was rejected: most fresh clusters lack it, and "everything on"
+would fail there. Chosen: a one-shot Job, `olaitan certgen`, on the Olaitan
+image (no new third-party image to pin). It creates the missing Secrets in
+the cluster, per install, never replaces existing ones, and writes the CA
+into the two webhook configurations' caBundle, which the templates leave out
+in this mode so an upgrade or re-apply keeps it. Its RBAC is limited by
+resource name. Operator material and cert-manager keep their paths; half a
+set fails the render. The Goldmane client certificate is not generated: it
+must be signed by the Tigera CA, and reading Tigera's keys out of
+`calico-system` by default is not acceptable, so the Calico sensor runs
+DEGRADED until Path A or B is configured.
+
+**Degraded, never broken.** Audit and Calico adapters became optional
+sources (as containerd did in Story 10.9); the collector logs a `source
+DEGRADED` line per unhealthy source with its last error. Forensics and the
+report archive with no object store at all are DEGRADED rather than a
+startup error (a partial store still fails). The containerd socket mount
+became `DirectoryOrCreate`, superseding the Story 1.8 P3 review choice of
+`Directory`: `Directory` stopped the whole collector pod, Falco ingest
+included, on any node without the directory; the cost is an empty directory
+on a tmpfs `/run`. In-cluster object storage (bundling MinIO) was rejected:
+evidence kept on the cluster under investigation is weak evidence, and it
+adds a stateful component and a KMS story.
+
+**Blocking.** Forensic capture deleted pods on every `PRESERVED_KILLED`
+transition regardless of enforcement. With forensics on by default that
+would have deleted workloads with blocking off, so the delete and its RBAC
+now follow `response.network_policy.enabled`.
+
+**Review round 1 additions.** The model server no longer waits in Init for
+the download by default (`ollama.pull.waitForModels`, kept by values-full):
+gating it made a plain `helm install --wait` wait on 1.9 GB and, with no
+internet, end in Init:CrashLoopBackOff. The default model is CPU-limited to
+2 cores so inference cannot take every core from Falco, NATS and the
+aggregator on a small node (a judgement; values-full lifts it). The NetworkPolicy write verbs follow the blocking switch too.
+The CPU-model role budget became a first-class value
+(`aggregator.llmRoleTimeoutMultiplier`, rendered with provider local only),
+so an operator's `extraEnv` list does not drop it and hosted-provider arms
+keep their own budgets.
+
+**Deferred** (#213). Rotation of certgen material that rolls the pods
+(today: delete the Secrets and the Job, re-run the install); running the
+in-cluster Ollama as non-root; the evaluation-posture decision (EVAL.md);
+the audit admission stub (#155); certgen's namespace-wide `create secrets`
+(Kubernetes cannot limit create by name; the alternative, helm-rendered
+empty placeholder Secrets, collides with the immutable `kubernetes.io/tls`
+type of operator-mode Secrets on a mode switch); Secret and prompt changes
+in the config checksum; an SCC binding for certgen on OpenShift; and the
+default model's Qwen Research licence (a commercial default would be a
+different model and a new live measurement).

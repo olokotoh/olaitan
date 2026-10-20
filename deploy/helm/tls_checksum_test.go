@@ -374,7 +374,8 @@ func TestAuditChecksumWithCalicoPathA(t *testing.T) {
 		"calicoSensor.tls.certManagerSecretName=external-cni-tls",
 		"metrics.scrapeAnnotations=false")
 	ann := podTemplateAnnotations(t, helmTemplate(t, args), "DaemonSet", "olaitan-collector")
-	if len(ann) != 1 || ann["checksum/audit-tls"] == "" {
-		t.Errorf("collector annotations = %v, want exactly checksum/audit-tls", ann)
+	// Story 12.7: checksum/config is on every collector pod template.
+	if len(ann) != 2 || ann["checksum/audit-tls"] == "" || ann["checksum/config"] == "" {
+		t.Errorf("collector annotations = %v, want exactly checksum/audit-tls and checksum/config", ann)
 	}
 }

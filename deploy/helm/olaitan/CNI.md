@@ -11,6 +11,15 @@ For the design rationale (why Goldmane, why operator-install) see
 record export mechanism) and **ADR-2026-05-12-01** (Calico bootstrap
 migration to Tigera operator install).
 
+**Story 12.7: on by default, DEGRADED until it has a client certificate.**
+Goldmane accepts only a client cert signed by the Tigera CA, and the chart
+does not read Tigera's keys out of `calico-system` by itself. With neither
+Path A nor Path B below configured, the chart mounts nothing, the adapter's
+TLS load fails, the collector keeps running (the source is retried with
+backoff), and the install notes and the collector log say what is missing:
+Calico and Goldmane, or only the certificate. Half a Path B set fails the
+render.
+
 ## Pre-requisite: Tigera operator install on Calico v3.31.5+
 
 Goldmane is shipped only under Calico's Tigera operator install path

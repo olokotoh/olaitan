@@ -1,0 +1,44 @@
+{{/*
+Story 12.7 review round 2: the certgen Job's own NetworkPolicy. The release
+policy (networkpolicy.yaml) excludes the certgen pod because its API-server
+egress is discovered with `lookup`, which is empty under `helm template`
+(the release install.yaml), and the 10.96.0.1/32 fallback is wrong on k3s
+(10.43.0.1), on minikube (port 8443) and under any CNI that matches egress
+after the Service IP is translated to the API server's own address (Calico,
+Cilium). Without the API server certgen cannot create the audit and applog
+TLS, and both stay DEGRADED.
+
+What certgen needs is the API server and nothing else, and the API server's
+address is not knowable at render time. So: no ingress at all, and egress
+to any address on the API server ports only (443, 6443, 8443). No DNS: the
+in-cluster client dials KUBERNETES_SERVICE_HOST, an IP. The pod lives for
+seconds, runs one binary, and its ServiceAccount can only write its own
+Secrets and the two webhook caBundles.
+*/}}
+{{- if and .Values.networkPolicy.enabled (include "olaitan.certgen.enabled" .) }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "olaitan.fullname" . }}-certgen
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "olaitan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: certgen
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "olaitan.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: certgen
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+        - protocol: TCP
+          port: 8443
+{{- end }}

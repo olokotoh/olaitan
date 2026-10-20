@@ -48,6 +48,17 @@ deviate from the canonical arms (e.g. a one-off experiment), leave
 
 ## Install recipes
 
+**Story 12.7.** The chart default now turns every part on, including the
+in-cluster model, which an RSL or RSLT arm then has configured as its FR28
+fallback. To keep an evaluation comparable with runs made before 12.7,
+install the base with `-f values-minimal.yaml` (the earlier observe-only
+core) before applying an arm overlay; the arm overlays themselves are
+unchanged except one line: each arm overlay (and `values-eval.yaml`) pins
+`aggregator.riskWindowSeconds: 0`, because the chart now turns the risk
+window on by default and the recorded campaigns scored each package on its
+own. Whether the thesis campaign should run on the minimal or the full
+default posture is an open decision for the evaluation owner.
+
 The examples set the bundled Redis password (`secrets.redisPassword`)
 explicitly. It is optional: without it the chart generates one on first
 install and reuses it on upgrade.
@@ -225,6 +236,10 @@ correlator's identity resolution) and `preseed_transitions` (whether the
 preseed itself escalated the workload during setup; the driver drains and
 re-purges the measurement streams after preseeding so settle/capture see only
 scenario-driven signals, but the FSM state in Redis survives the purge).
-To enable the risk window for a campaign, set `OLT_RISK_WINDOW_SECONDS` via
-`aggregator.extraEnv` (see `docs/runbook.md`, "The rolling per-workload risk
-window"); the value is recorded per run as `risk_window_seconds`.
+The chart turns the risk window on by default (Story 12.7,
+`aggregator.riskWindowSeconds: 900`) and every arm overlay sets it to 0, so a
+campaign scores each package on its own unless you choose otherwise. To run a
+campaign WITH the window, set `aggregator.riskWindowSeconds` (or
+`OLT_RISK_WINDOW_SECONDS` via `aggregator.extraEnv`, which wins) after the
+arm overlay (see `docs/runbook.md`, "The rolling per-workload risk window");
+the value is recorded per run as `risk_window_seconds`.

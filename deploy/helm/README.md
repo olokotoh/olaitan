@@ -120,9 +120,14 @@ Epic 4 adds DFIR forensic reporting: forensic capture on a kill, a
 settling window before a post-mortem, a DFIR report agent, a durable
 content-addressed + KMS-encrypted report write to an S3-compatible
 store, an optional incident webhook, and the supporting RBAC + Secret
-slots. Every controller is ADDITIVE and OFF by default, so a default
-`helm upgrade` from an Epic 3 deployment changes nothing until an
-operator opts in (see "Upgrade safety" below).
+slots. Story 12.7: every one of these controllers is ON by default.
+Forensic capture and the report archive are DEGRADED (the aggregator
+logs it, the install notes say it) until an object store is set with the
+values below; settling and the DFIR agent need nothing. The pod delete
+after a capture runs only with `response.networkPolicy.enabled=true`, the
+single blocking switch; without it the evidence is uploaded and the pod is
+left running. (Before 12.7 every controller was off by default; see
+"Upgrade safety" below.)
 
 ### The `forensics.*` / `notifications.*` values facade
 
@@ -152,10 +157,11 @@ use fallback" message rather than silently running the fallback under a
 
 ### Enable recipe
 
-The facade sets PARAMETERS only; it does NOT enable any capture
-controller (collapsing the four gates into one would risk enabling a
-write with no settling). Flip the four `response.*` gates AND set the
-facade params:
+Story 12.7: the four `response.*` gates are on by default, so only the
+store parameters are needed; they are shown below as well for an install
+that set them off. The facade sets PARAMETERS only; it does NOT enable
+any capture controller (collapsing the four gates into one would risk
+enabling a write with no settling).
 
 ```bash
 helm upgrade olaitan deploy/helm/olaitan \
@@ -186,8 +192,10 @@ investigations:
 
 - Every Epic-4 controller gate
   (`response.{forensics,settling,dfir,reportArchive,notifications}.enabled`)
-  defaults `false`, so the default upgrade renders an exact superset of
-  the Epic-3 manifests (no behaviour change unless an operator opts in).
+  defaulted `false` until Story 12.7, so that upgrade rendered an exact
+  superset of the Epic-3 manifests. Since 12.7 they default `true`; an
+  upgrade that must not change behaviour keeps them off with
+  `-f values-minimal.yaml`.
 - There is NO FSM-persistence-key rename (`fsm:{workload_id}`, Redis, no
   TTL, restart-recovered) and NO JetStream stream rename; the new
   INCIDENTS / REPORTS streams are new append-only streams.
@@ -220,10 +228,10 @@ kubectl delete pvc olaitan-reports
 ## Scope — what this chart does NOT do
 
 - **CRDs** — `OlaitanStatus` (Target tier, Story 10.5) is not scaffolded here.
-- **Audit webhook** — Story 2.3's concern.
-- **TLS material** — this chart creates the Secret *key slots* for
-  `redis-password`, `nats-creds`, and `llm-api-key`, but does not
-  generate TLS certificates. Provision via external-secrets-operator or
-  a SOPS-encrypted values overlay.
+- **Audit webhook**: rendered by the chart (on by default since Story 12.7); wiring the kube-apiserver to it is operator-side, see AUDIT.md.
+- **TLS material for Calico**: the audit webhook and applog injector
+  certificates are generated in the cluster by the certgen Job (Story
+  12.7), but the Goldmane client certificate must come from the Tigera CA
+  (CNI.md Path A or B).
 - **Live-cluster integration tests** — Story 7.1 owns the full-stack
   cluster smoke test; this chart gates on template + schema validation.

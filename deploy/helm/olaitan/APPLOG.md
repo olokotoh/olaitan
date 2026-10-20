@@ -7,7 +7,20 @@ to troubleshoot a stuck injection.
 
 ## What ships with the chart
 
-When `applogSidecar.enabled=true` the chart deploys four resources
+**Story 12.7: on by default.** The injector, its Service and its webhook
+are deployed by a plain install. Injection is still opt-in per pod (the
+`olaitan.io/log-sidecar: "enabled"` annotation). With neither Path A nor
+Path B set, the chart's certgen Job creates the serving-cert Secret in the
+cluster, per install, and writes its CA into the webhook's caBundle (the
+template leaves caBundle out in that mode, so an upgrade or a re-apply does
+not reset it). `applogSidecar.webhook.failurePolicy=Fail` needs Path A or
+Path B: with a generated certificate the render fails, because every pod
+create (the certgen pod's included) would be refused until the Job ran.
+Rotation, recovery of a recreated webhook, and switching paths work as for
+the audit receiver (AUDIT.md, Story 12.7 paragraph). Known issues on this
+path are tracked in #156, #157 and #159.
+
+When `applogSidecar.enabled=true` (the default) the chart deploys four resources
 beyond the agent DaemonSet:
 
 1. `Deployment <fullname>-applog-injector` running the multi-call

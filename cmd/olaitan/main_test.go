@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +24,7 @@ import (
 
 	"github.com/olokotoh/olaitan/internal/config"
 	"github.com/olokotoh/olaitan/internal/metrics"
+	"github.com/olokotoh/olaitan/internal/sourcehealth"
 )
 
 // writeTestConfig drops a minimal valid olaitan.yaml into t.TempDir()
@@ -779,5 +782,133 @@ func TestEnvNonNegativeInt(t *testing.T) {
 		if (err != nil) != tc.wantErr || got != tc.want {
 			t.Errorf("%q: got %d, %v; want %d, err=%v", tc.val, got, err, tc.want, tc.wantErr)
 		}
+	}
+}
+
+// TestStartCollectorRing_MissingTLSDegradesAuditAndCalico is Story 12.7 D4:
+// the audit receiver and the Calico adapter are on by default, and their TLS
+// material can be missing (certgen has not run yet, or there is no Calico
+// material at all). Before 12.7 either failure ended the collector's
+// errgroup, so the whole collector, Falco ingest included, crash-looped. Now
+// both run as optional sources: the collector keeps running and the sources
+// stay unhealthy.
+func TestStartCollectorRing_MissingTLSDegradesAuditAndCalico(t *testing.T) {
+	orig := optionalSourceBackoff
+	optionalSourceBackoff = func(int) time.Duration { return 10 * time.Millisecond }
+	t.Cleanup(func() { optionalSourceBackoff = orig })
+
+	natsSrv := startTestNATSForMain(t)
+	t.Setenv("NATS_URL", natsSrv.ClientURL())
+	t.Setenv("FALCO_LISTEN_ADDR", "127.0.0.1:0")
+	tokFile := filepath.Join(t.TempDir(), "falco-http-token")
+	if err := os.WriteFile(tokFile, []byte("0123456789abcdef0123456789abcdef\n"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FALCO_HTTP_TOKEN_FILE", tokFile)
+	t.Setenv("K8S_NODE_NAME", "test-node")
+
+	cfg, err := config.Load(writeTestConfig(t))
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	missing := t.TempDir()
+	cfg.Detection.Sources.Audit.Enabled = true
+	cfg.Detection.Sources.Audit.ListenAddr = "127.0.0.1:0"
+	cfg.Detection.Sources.Audit.TLSCertFile = filepath.Join(missing, "tls.crt")
+	cfg.Detection.Sources.Audit.TLSKeyFile = filepath.Join(missing, "tls.key")
+	cfg.Detection.Sources.Audit.ClientCAFile = filepath.Join(missing, "ca.crt")
+	if cfg.Detection.Sources.Audit.MaxPayloadBytes == 0 {
+		cfg.Detection.Sources.Audit.MaxPayloadBytes = 1 << 20
+	}
+	cfg.Detection.Sources.Calico = config.CalicoSourceConfig{
+		Enabled:        true,
+		GoldmaneAddr:   "127.0.0.1:1",
+		CABundlePath:   filepath.Join(missing, "cni-ca.crt"),
+		ClientCertPath: filepath.Join(missing, "client.crt"),
+		ClientKeyPath:  filepath.Join(missing, "client.key"),
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	g, gctx := errgroup.WithContext(ctx)
+	var buf safeBuffer
+	log := slog.New(slog.NewJSONHandler(&buf, nil))
+	if err := startCollectorRing(gctx, g, log, cfg, nil); err != nil {
+		if strings.Contains(err.Error(), "insufficient storage resources available") {
+			t.Skipf("skipping: embedded NATS: %v", err)
+		}
+		t.Fatalf("startCollectorRing: %v", err)
+	}
+	select {
+	case <-gctx.Done():
+		t.Fatalf("the collector's errgroup ended because a source had no TLS material: %v\n%s", g.Wait(), buf.String())
+	case <-time.After(1500 * time.Millisecond):
+	}
+	out := buf.String()
+	for _, src := range []string{`"source":"audit"`, `"source":"network"`} {
+		var found bool
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, src) && strings.Contains(line, `"level":"ERROR"`) && strings.Contains(line, "optional source failed") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no optional-source ERROR log for %s:\n%s", src, out)
+		}
+	}
+	cancel()
+	done := make(chan struct{})
+	go func() { _ = g.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("collector did not unwind after cancel")
+	}
+}
+
+// safeBuffer is a bytes.Buffer safe for the concurrent writes of an slog
+// handler shared by several goroutines.
+type safeBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *safeBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// TestLogDegradedSources is Story 12.7 D4's summary: olaitan_source_healthy
+// carries no reason, and the containerd adapter retries a missing socket
+// without returning, so nothing in the log said which source was down or
+// why. One WARN per unhealthy source, with the last error; nothing for a
+// healthy one.
+func TestLogDegradedSources(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, nil))
+	var down, up, never sourcehealth.Tracker
+	down.MarkUnhealthy(errors.New("dial unix /run/containerd/containerd.sock: no such file"))
+	up.MarkHealthy()
+	logDegradedSources(log, map[string]sourcehealth.Reader{
+		"runtime": &down,
+		"falco":   &up,
+		"network": &never,
+	})
+	out := buf.String()
+	if !strings.Contains(out, `"source":"runtime"`) || !strings.Contains(out, "no such file") || !strings.Contains(out, "DEGRADED") {
+		t.Errorf("unhealthy source not reported with its reason: %s", out)
+	}
+	if !strings.Contains(out, `"source":"network"`) || !strings.Contains(out, "no event or connection yet") {
+		t.Errorf("a never-connected source is not reported: %s", out)
+	}
+	if strings.Contains(out, `"source":"falco"`) {
+		t.Errorf("a healthy source was reported as degraded: %s", out)
 	}
 }
