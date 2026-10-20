@@ -225,7 +225,7 @@ spec:
                    as the in-cluster Ollama serves (OLLAMA_NUM_PARALLEL, the
                    last entry wins as in the kubelet; 1 by default). More
                    would queue inside Ollama and spend the role timeout
-                   waiting. Read by the async chain (#209); unused before. */}}
+                   waiting. Read by the async chain (Story 7.4). */}}
             {{- $par := "1" }}
             {{- range (default (list) (default (dict) .Values.ollama).extraEnv) }}
             {{- if eq .name "OLLAMA_NUM_PARALLEL" }}{{ $par = toString .value }}{{ end }}

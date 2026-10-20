@@ -1265,7 +1265,7 @@ demonstrated mechanism plus future work. The degree completed on
 2026-08-15; the reserved supervision gate is thereby discharged, and
 decision authority rests with the project owner.
 
-**Superseded in part by ADR-2026-10-19-01 (Story 12.7):** the Helm chart
+**Superseded in part by ADR-2026-10-19-02 (Story 12.7):** the Helm chart
 now turns the window on by default (900 s); the evaluation overlays and
 values-minimal.yaml pin it to 0, so the reproducibility argument below
 still holds for every evaluation run.
