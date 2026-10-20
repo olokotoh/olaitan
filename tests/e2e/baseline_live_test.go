@@ -85,10 +85,12 @@ func TestBaselineLive_RealWorkload(t *testing.T) {
 	mustRun(t, "peer ready", "kubectl", "-n", ns, "rollout", "status", "deploy/peer", "--timeout=3m")
 	mustRun(t, "steady ready", "kubectl", "-n", ns, "rollout", "status", "deploy/steady", "--timeout=3m")
 	// Fail now, not after an hour, if the workload cannot reach the
-	// apiserver: its first cycle must have every GET answered 200. This one
-	// log read falls inside the warm-up, so it cannot move the baseline.
+	// apiserver: its first cycle must have every GET answered 200. These log
+	// reads (one every 10 s, about a minute of them) fall inside the
+	// warm-up, so they cannot move the baseline.
 	if c, logs := waitSteadyCycle(t, ns, 3*time.Minute, func(c steadyCycle) bool { return true }); c == nil || c.OK != c.Gets || c.Gets == 0 || strings.Contains(logs, "apiserver_get_failed") {
-		t.Fatalf("steady workload's API calls do not reach kube-apiserver (first cycle %+v); the audit_events_per_min check would be meaningless. Workload log:\n%s", c, logs)
+		netpol, _ := exec.Command("kubectl", "-n", ns, "get", "networkpolicy", "-o", "name").CombinedOutput()
+		t.Fatalf("steady workload's API calls do not reach kube-apiserver (first cycle %+v); the audit_events_per_min check would be meaningless. NetworkPolicies in %s (Olaitan's own isolation would show here): %q. Workload log:\n%s", c, ns, strings.TrimSpace(string(netpol)), logs)
 	}
 	t.Logf("steady workload %s up at %s; benign window %s (warm-up %s)", workloadID, time.Now().UTC().Format(time.RFC3339), benign, warmup)
 
@@ -159,7 +161,7 @@ func parseSteadyLog(logs string) []steadyCycle {
 	var out []steadyCycle
 	for _, line := range strings.Split(logs, "\n") {
 		var c steadyCycle
-		seen := 0
+		seen := map[string]bool{}
 		for _, f := range strings.Fields(line) {
 			k, v, ok := strings.Cut(f, "=")
 			if !ok {
@@ -169,19 +171,19 @@ func parseSteadyLog(logs string) []steadyCycle {
 			switch {
 			case k == "cycle" && err == nil:
 				c.Cycle = n
-				seen++
-			case k == "mode":
+				seen[k] = true
+			case k == "mode" && v != "":
 				c.Mode = v
-				seen++
+				seen[k] = true
 			case k == "gets" && err == nil:
 				c.Gets = n
-				seen++
+				seen[k] = true
 			case k == "ok" && err == nil:
 				c.OK = n
-				seen++
+				seen[k] = true
 			}
 		}
-		if seen == 4 {
+		if len(seen) == 4 {
 			out = append(out, c)
 		}
 	}
@@ -222,7 +224,9 @@ func waitSteadyCycle(t *testing.T, ns string, timeout time.Duration, match func(
 // audit_events_per_min deviation says nothing about the baseline engine.
 func requireDeviateBurstLanded(t *testing.T, ns string) {
 	t.Helper()
-	c, logs := waitSteadyCycle(t, ns, 2*time.Minute, func(c steadyCycle) bool { return c.Mode == "deviate" })
+	// A cycle is 60 s plus the burst, and the ConfigMap reaches the pod
+	// within a kubelet sync period: 3 minutes covers both.
+	c, logs := waitSteadyCycle(t, ns, 3*time.Minute, func(c steadyCycle) bool { return c.Mode == "deviate" })
 	if c == nil {
 		t.Fatalf("AC2: the steady workload logged no deviate cycle after the switch. Workload log:\n%s", logs)
 	}
@@ -454,6 +458,10 @@ spec:
                 last=none
                 while [ $i -lt $n ]; do
                   code=$(curl -sS -m 10 --cacert "$CA" -H "Authorization: Bearer $T" -o /dev/null -w '%%{http_code}' "$U" 2>/tmp/curl.err)
+                  if [ "$code" = 401 ]; then
+                    T=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+                    code=$(curl -sS -m 10 --cacert "$CA" -H "Authorization: Bearer $T" -o /dev/null -w '%%{http_code}' "$U" 2>/tmp/curl.err)
+                  fi
                   if [ "$code" = 200 ]; then ok=$((ok+1)); else last="code=$code err=$(head -c 200 /tmp/curl.err | tr '\n' ' ')"; fi
                   i=$((i+1))
                 done

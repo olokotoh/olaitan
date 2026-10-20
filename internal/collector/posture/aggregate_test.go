@@ -145,6 +145,8 @@ func TestGoldmaneAggregatePrefix(t *testing.T) {
 		"we*b-*":             {"", false},
 		"web-*-x":            {"", false},
 		"":                   {"", false},
+		"**":                 {"", false},
+		"-*":                 {"-", true}, // CheckAggregateRef rejects it
 	}
 	for name, want := range cases {
 		got, ok := posture.GoldmaneAggregatePrefix(name)
@@ -170,4 +172,85 @@ func TestGet_NonPodGoldmaneEndpointIsPermanentNotAnAPIError(t *testing.T) {
 		t.Errorf("api errors = %d, want 0 (no apiserver call was made)", c.PostureAPIErrors())
 	}
 	assertNoKeyRejection(t, buf.String())
+}
+
+// Review round 1 (Story 12.8): a pod that only shares the GenerateName (no
+// controller, or a controller of another name) is never the representative,
+// so it can neither make the set unresolvable nor lend its ServiceAccount to
+// the workload's posture. A web- set never matches a web-canary- pod, and a
+// finished pod is used only when nothing live is left.
+func TestResolveGoldmaneAggregate_PicksOnlyALivePodOfTheNamedController(t *testing.T) {
+	ctrl := func(kind, name string) []metav1.OwnerReference {
+		return []metav1.OwnerReference{{Kind: kind, Name: name, Controller: boolPtrLocal(true)}}
+	}
+	pod := func(name, gen, sa string, owners []metav1.OwnerReference, phase corev1.PodPhase) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, GenerateName: gen, Namespace: "olt-bl", OwnerReferences: owners},
+			Spec:       corev1.PodSpec{ServiceAccountName: sa},
+			Status:     corev1.PodStatus{Phase: phase},
+		}
+	}
+	cs := fake.NewSimpleClientset(
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "steady", Namespace: "olt-bl"}},
+		newReplicaSetOwnedByDeployment("steady-6c8f4c97cc", "olt-bl", "steady"),
+		// Sorted before the real pod; LIST order is by name.
+		pod("steady-6c8f4c97cc-aaaaa", "steady-6c8f4c97cc-", "bare", nil, corev1.PodRunning),
+		pod("steady-6c8f4c97cc-aaaab", "steady-6c8f4c97cc-", "forged", ctrl("ReplicaSet", "other-rs"), corev1.PodRunning),
+		pod("steady-6c8f4c97cc-aaaac", "steady-6c8f4c97cc-", "finished", ctrl("ReplicaSet", "steady-6c8f4c97cc"), corev1.PodSucceeded),
+		pod("steady-6c8f4c97cc-canary-x", "steady-6c8f4c97cc-canary-", "canary", ctrl("ReplicaSet", "steady-6c8f4c97cc-canary"), corev1.PodRunning),
+		pod("steady-6c8f4c97cc-zzzzz", "steady-6c8f4c97cc-", "steady", ctrl("ReplicaSet", "steady-6c8f4c97cc"), corev1.PodRunning),
+	)
+	id, rep, err := posture.ResolveGoldmaneAggregate(context.Background(), cs, "olt-bl", "steady-6c8f4c97cc-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep == nil || rep.Spec.ServiceAccountName != "steady" || id.OwnerKind != "Deployment" || id.OwnerName != "steady" {
+		t.Fatalf("got %+v from pod %+v, want Deployment/steady from the live steady pod", id, rep)
+	}
+
+	// With only the finished pod of the set left, it still names the owner.
+	cs2 := fake.NewSimpleClientset(
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "steady", Namespace: "olt-bl"}},
+		newReplicaSetOwnedByDeployment("steady-6c8f4c97cc", "olt-bl", "steady"),
+		pod("steady-6c8f4c97cc-aaaaa", "steady-6c8f4c97cc-", "bare", nil, corev1.PodRunning),
+		pod("steady-6c8f4c97cc-aaaac", "steady-6c8f4c97cc-", "finished", ctrl("ReplicaSet", "steady-6c8f4c97cc"), corev1.PodSucceeded),
+	)
+	if _, rep, err := posture.ResolveGoldmaneAggregate(context.Background(), cs2, "olt-bl", "steady-6c8f4c97cc-"); err != nil || rep == nil || rep.Spec.ServiceAccountName != "finished" {
+		t.Fatalf("finished-only set: rep %+v err %v, want the finished pod", rep, err)
+	}
+}
+
+// Review round 1: a late flow whose pods are gone still gets the owner's
+// posture while the cache holds it.
+func TestGet_GoldmaneAggregateWithNoPodUsesTheOwnersCachedPosture(t *testing.T) {
+	cs := steadyDeployment(true)
+	c, err := posture.New(defaultCfg(time.Date(2026, 10, 20, 14, 2, 0, 0, time.UTC)), cs, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Get(context.Background(), aggregateStub()); err != nil {
+		t.Fatal(err)
+	}
+	if err := cs.CoreV1().Pods("olt-bl").Delete(context.Background(), "steady-6c8f4c97cc-q2w9z", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.Get(context.Background(), aggregateStub())
+	if err != nil || got == nil || got.Unavailable || got.ServiceAccount != "steady" {
+		t.Fatalf("got %+v, %v; want the cached Deployment posture", got, err)
+	}
+	// A bypass asks for a fresh posture, which needs a live pod.
+	if got, err := c.Get(context.Background(), aggregateStub(), posture.WithBypassCache()); err == nil || got == nil || !got.Unavailable {
+		t.Fatalf("bypass with no live pod: got %+v, %v; want Unavailable and an error", got, err)
+	}
+}
+
+func TestCheckAggregateRefRejectsWhatCannotBeAPodSet(t *testing.T) {
+	for _, tc := range []struct{ ns, prefix string }{{"-", "pub-"}, {"olt-bl", "-"}, {"olt-bl", ""}} {
+		if err := posture.CheckAggregateRef(tc.ns, tc.prefix); err == nil {
+			t.Errorf("CheckAggregateRef(%q, %q) = nil, want an error", tc.ns, tc.prefix)
+		}
+	}
+	if err := posture.CheckAggregateRef("olt-bl", "steady-6c8f4c97cc-"); err != nil {
+		t.Errorf("valid ref rejected: %v", err)
+	}
 }

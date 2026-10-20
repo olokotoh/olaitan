@@ -202,7 +202,8 @@ correlator:
   # install into `default` scored its own pods and restricted its own
   # model-pull Job. The cost: nothing else in the release namespace is
   # scored either, so run the workloads you want watched elsewhere (or
-  # install into `olaitan`, where this is a no-op). Set false to score the
+  # install into `olaitan`, where this is a no-op). kube-system is never
+  # added, whatever this says. Set false to score the
   # release namespace again; Olaitan can then score, and with enforcement
   # on isolate, its own pods. This is not response.excluded_namespaces
   # (config-file only): that list is never isolated but still detected,

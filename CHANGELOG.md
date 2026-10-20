@@ -114,8 +114,11 @@ and false-positive numbers; see [Unreleased](#unreleased).
   scores or isolates its own pods (the 2026-10-20 live run restricted its
   own model-pull Job in `default`). Nothing else in that namespace is scored
   either; NOTES say so and name the override (`=false`). `values-minimal.yaml`
-  and the evaluation arm overlays keep `false` for comparability;
-  `values-full.yaml` no longer sets it.
+  and the evaluation arm overlays keep `false` for comparability. kube-system
+  is never added, whatever the setting. **Upgrade note:** a release already
+  installed outside `olaitan` stops scoring its own namespace on `helm
+  upgrade` unless the value is set; set
+  `correlator.neverScoreReleaseNamespace=false` to keep the old behaviour.
 
 - **The default install turns every part on; blocking is one flag** (Story
   12.7, #208). A plain `helm install` of the chart, and the release

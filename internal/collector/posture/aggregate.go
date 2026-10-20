@@ -89,11 +89,20 @@ func ResolveGoldmaneAggregate(ctx context.Context, cs kubernetes.Interface, name
 		return schema.WorkloadIdentity{}, nil, fmt.Errorf("goldmane aggregate %s/%s*: list pods: %w", namespace, prefix, err)
 	}
 	if rep := representativePod(pods.Items, prefix); rep != nil {
+		// Unlike a single pod's own event, an aggregate must NOT fall back to
+		// the representative's orphan-pod ID when the owner walk fails: that ID
+		// would be cached under the aggregate key and split every replica's
+		// flows away from the Deployment window Falco events use (Story 11.2b
+		// review round 1). A failed walk is a miss, retried by the caller.
 		identity, err := ResolveWorkloadIdentity(ctx, cs, rep)
 		if err != nil {
 			return schema.WorkloadIdentity{}, nil, fmt.Errorf("goldmane aggregate %s/%s*: owner walk of %s: %w", namespace, prefix, rep.Name, err)
 		}
 		if identity.OwnerKind == "Pod" {
+			// Defensive: representativePod only returns controller-owned
+			// pods. Bare pods that merely share a GenerateName are separate
+			// orphan workloads; picking one would attribute every flow of
+			// the set to that one pod (Story 11.2b review round 1).
 			return schema.WorkloadIdentity{}, nil, fmt.Errorf("goldmane aggregate %s/%s*: pods have no controller: %w", namespace, prefix, ErrAggregateUnresolved)
 		}
 		return identity, rep, nil
@@ -119,17 +128,29 @@ func ResolveGoldmaneAggregate(ctx context.Context, cs kubernetes.Interface, name
 	return identity, nil, nil
 }
 
-// representativePod picks a pod of the aggregate: GenerateName must equal the
-// prefix exactly (so "web-" never matches a "web-canary-" pod). A pod that is
-// not terminating is preferred; a terminating one still names the right owner.
+// representativePod picks a pod of the aggregate. GenerateName must equal the
+// prefix exactly (so "web-" never matches a "web-canary-" pod), and the pod's
+// controller must be the object the prefix is named after (the ReplicaSet,
+// DaemonSet, StatefulSet or Job whose name is the prefix without its trailing
+// "-"; Story 12.8 review). That skips a bare pod, or one owned by something
+// else, that merely shares the GenerateName: it would otherwise make the set
+// unresolvable, or lend its ServiceAccount and security context to the
+// workload's posture. A running pod (not terminating, not Succeeded or
+// Failed) is preferred, so a posture is taken from a live pod; a terminating
+// or finished one still names the right owner and is used only when nothing
+// else is left.
 func representativePod(pods []corev1.Pod, prefix string) *corev1.Pod {
+	owner := strings.TrimSuffix(prefix, "-")
 	var fallback *corev1.Pod
 	for i := range pods {
 		p := &pods[i]
 		if p.GenerateName != prefix {
 			continue
 		}
-		if p.DeletionTimestamp == nil {
+		if ctrl := metav1.GetControllerOf(p); ctrl == nil || ctrl.Name != owner {
+			continue
+		}
+		if p.DeletionTimestamp == nil && p.Status.Phase != corev1.PodSucceeded && p.Status.Phase != corev1.PodFailed {
 			return p.DeepCopy()
 		}
 		if fallback == nil {

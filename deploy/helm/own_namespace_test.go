@@ -4,6 +4,7 @@ package helm_test
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -49,6 +50,23 @@ func TestDefaultInstallNeverScoresItsReleaseNamespace(t *testing.T) {
 		if got := neverScoredIn(t, helmTemplateValues(t, filepath.Join(chartDir(t), f))); got != "olaitan" {
 			t.Errorf("%s never_scored_namespaces = %q, want olaitan (pinned for comparability)", f, got)
 		}
+	}
+}
+
+// Review round 1: kube-system is never put on the never-scored list, even
+// with the release there (SECURITY.md: a compromised CoreDNS or CNI agent
+// would go unseen), and NOTES say why.
+func TestKubeSystemIsNeverAddedToTheNeverScoredList(t *testing.T) {
+	out, err := exec.Command("helm", "template", "olaitan", chartDir(t), "-n", "kube-system", "--set", "secrets.redisPassword=test-password").CombinedOutput()
+	if err != nil {
+		t.Fatalf("helm template -n kube-system: %v\n%s", err, out)
+	}
+	if got := neverScoredIn(t, string(out)); got != "olaitan" {
+		t.Errorf("-n kube-system never_scored_namespaces = %q, want olaitan", got)
+	}
+	notes := renderNotesInNamespace(t, "kube-system")
+	if !strings.Contains(notes, "kube-system is never added to that list") || strings.Contains(notes, "NOTHING in") {
+		t.Errorf("kube-system notes do not explain that it stays scored; notes:\n%s", notes)
 	}
 }
 

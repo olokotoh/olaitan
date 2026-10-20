@@ -219,15 +219,22 @@ func (c *Client) Get(ctx context.Context, pod *corev1.Pod, opts ...Option) (*sch
 	// pod, so a flow-led package gets the same posture (and cache entry) as
 	// a Falco-led one. Without this the owner walk of the stub found no
 	// owner and keys.PodFallbackID rejected the "*".
+	// The aggregate's owner walk is reused rather than repeated on the
+	// representative pod, so a ReplicaSet deleted in between cannot turn
+	// it into an orphan-pod identity (review round 1).
+	var (
+		identity schema.WorkloadIdentity
+		err      error
+	)
 	if prefix, ok := GoldmaneAggregatePrefix(pod.Name); ok {
-		rep, partial, aggErr := c.resolveAggregatePod(fetchCtx, pod.Namespace, prefix)
-		if aggErr != nil {
+		rep, aggIdentity, partial, aggErr := c.resolveAggregatePod(fetchCtx, pod.Namespace, prefix, options)
+		if aggErr != nil || rep == nil {
 			return partial, aggErr
 		}
-		pod = rep
+		pod, identity = rep, aggIdentity
+	} else {
+		identity, err = ResolveWorkloadIdentity(fetchCtx, c.cs, pod)
 	}
-
-	identity, err := ResolveWorkloadIdentity(fetchCtx, c.cs, pod)
 	if err != nil && !errors.Is(err, ErrControllerNotFound) {
 		c.apiErrors.Add(1)
 		c.unavailable.Add(1)
@@ -327,14 +334,18 @@ func (c *Client) Get(ctx context.Context, pod *corev1.Pod, opts ...Option) (*sch
 }
 
 // resolveAggregatePod maps a Goldmane aggregate to a representative live pod
-// (ResolveGoldmaneAggregate, the resolver the correlator uses). When there is
-// no pod to take a posture from it returns a partial Unavailable posture and
-// an error: not_found with the resolved owner identity when only a
-// ReplicaSet backs the set (a late flow), not_found with just the namespace
-// when nothing does, and the classified apiserver error otherwise. The cost
-// is one pod LIST per Get of an aggregate, inside the fetch budget; Get runs
-// per evidence package, not per event.
-func (c *Client) resolveAggregatePod(ctx context.Context, namespace, prefix string) (*corev1.Pod, *schema.WorkloadPosture, error) {
+// and its owner identity (ResolveGoldmaneAggregate, the resolver the
+// correlator uses). With no live pod but a resolved owner (a late flow after
+// the ReplicaSet scaled down) it returns that owner's cached posture when the
+// cache still holds one and no bypass was asked for (rep nil, err nil).
+// Otherwise, when there is no pod to take a posture from, it returns a partial
+// Unavailable posture and an error: not_found with the resolved owner identity
+// when only a ReplicaSet backs the set, not_found with just the namespace when
+// nothing does, permanent for a ref that is no pod set at all, and the
+// classified apiserver error otherwise. The cost is one pod LIST per Get of an
+// aggregate, inside the fetch budget; Get runs per evidence package, not per
+// event.
+func (c *Client) resolveAggregatePod(ctx context.Context, namespace, prefix string, options *getOptions) (*corev1.Pod, schema.WorkloadIdentity, *schema.WorkloadPosture, error) {
 	refErr := CheckAggregateRef(namespace, prefix)
 	var (
 		identity schema.WorkloadIdentity
@@ -344,7 +355,15 @@ func (c *Client) resolveAggregatePod(ctx context.Context, namespace, prefix stri
 	if refErr == nil {
 		identity, rep, err = ResolveGoldmaneAggregate(ctx, c.cs, namespace, prefix)
 		if err == nil && rep != nil {
-			return rep, nil, nil
+			return rep, identity, nil, nil
+		}
+		if err == nil && !options.bypassCache {
+			if id, idErr := c.workloadIDFor(identity); idErr == nil && options.bypassCacheFor != id {
+				if cached, ok := c.cache.Get(id, c.nowFn); ok {
+					c.cacheHits.Add(1)
+					return nil, identity, cloneWorkloadPosture(cached), nil
+				}
+			}
 		}
 	}
 	c.unavailable.Add(1)
@@ -370,7 +389,7 @@ func (c *Client) resolveAggregatePod(ctx context.Context, namespace, prefix stri
 		slog.String("unavailable_reason", partial.UnavailableReason),
 		slog.String("error", err.Error()),
 	)
-	return nil, partial, err
+	return nil, identity, partial, err
 }
 
 // workloadIDFor builds the canonical cache key for an identity,

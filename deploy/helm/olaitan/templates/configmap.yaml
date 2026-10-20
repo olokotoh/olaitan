@@ -218,8 +218,10 @@ data:
     namespace to detection.correlator.never_scored_namespaces unless it is
     already listed. Deliberately NOT response.excluded_namespaces: that is
     the never-enforced list and still detected (review round 1, D3).
+    Story 12.8: never kube-system, even when the release lives there: a
+    compromised CoreDNS or CNI agent must stay scored (SECURITY.md).
     */ -}}
-    {{- if $co.neverScoreReleaseNamespace }}
+    {{- if and $co.neverScoreReleaseNamespace (ne .Release.Namespace "kube-system") }}
     {{- $p := "(\\n    never_scored_namespaces:\\n(?:      - [^\\n]+\\n)+)" -}}
     {{- $list := mustRegexFind $p $cfg }}
     {{- if not $list }}{{- fail (printf "helm bridge: detection.correlator.never_scored_namespaces anchor not found (pattern %q)" $p) }}{{- end }}

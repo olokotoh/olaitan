@@ -18,15 +18,16 @@ func TestBaselineLiveManifestAPIBurstUsesAVerifyingTLSClient(t *testing.T) {
 	if !regexp.MustCompile(`(?m)^\s+image: curlimages/curl:[0-9.]+@sha256:[0-9a-f]{64}$`).MatchString(m) {
 		t.Errorf("steady workload image is not curl pinned by tag and digest:\n%s", m)
 	}
+	// Nowhere in the manifest may certificate checks be skipped.
+	if strings.Contains(m, "--no-check-certificate") || regexp.MustCompile(`\s-k(\s|$)|--insecure|-[a-zA-Z]*k[a-zA-Z]*\s+--cacert`).MatchString(m) {
+		t.Error("the manifest skips certificate verification somewhere")
+	}
 	for _, line := range strings.Split(m, "\n") {
 		if !strings.Contains(line, "kubernetes.default.svc") && !strings.Contains(line, `"$U"`) {
 			continue
 		}
 		if strings.Contains(line, "|| true") {
 			t.Errorf("the apiserver call swallows its error: %s", strings.TrimSpace(line))
-		}
-		if strings.Contains(line, "--no-check-certificate") || regexp.MustCompile(`\s-k\s|--insecure`).MatchString(line) {
-			t.Errorf("the apiserver call skips certificate verification: %s", strings.TrimSpace(line))
 		}
 	}
 	for _, want := range []string{`--cacert "$CA"`, "serviceaccount/ca.crt", "apiserver_get_failed", "gets=$n ok=$ok", "%{http_code}"} {
@@ -42,6 +43,8 @@ func TestBaselineLiveSteadyLogParse(t *testing.T) {
 		"apiserver_get_failed cycle=2 code=000 err=curl: (35) TLS connect error",
 		"2026-10-20T13:02:00Z cycle=2 mode=steady gets=3 ok=0",
 		"some unrelated line ok=1",
+		"cycle=3 cycle=4 gets=3 ok=0",
+		"2026-10-20T13:03:00Z cycle=3 mode= gets=3 ok=3",
 		"2026-10-20T14:02:00Z cycle=61 mode=deviate gets=80 ok=80",
 		"",
 	}, "\n")

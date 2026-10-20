@@ -40,7 +40,7 @@ This tool decides that a workload is compromised and can cut its network. What
 follows is what it concluded about THIS cluster, so you know what it can and
 cannot see before you trust it.
 {{- if ne $ns "olaitan" }}
-{{- if (default (dict) .Values.correlator).neverScoreReleaseNamespace }}
+{{- if and (default (dict) .Values.correlator).neverScoreReleaseNamespace (ne $ns "kube-system") }}
 
 ! NAMESPACE
 !
@@ -65,6 +65,11 @@ cannot see before you trust it.
 !   correlator.neverScoreReleaseNamespace=true to add "{{ $ns }}" to
 !   detection.correlator.never_scored_namespaces (nothing else in it is
 !   scored then either).
+{{- if eq $ns "kube-system" }}
+!   kube-system is never added to that list, whatever the setting: a
+!   compromised CoreDNS or CNI agent must stay visible. Install into the
+!   `olaitan` namespace instead.
+{{- end }}
 {{- end }}
 {{- end }}
 
