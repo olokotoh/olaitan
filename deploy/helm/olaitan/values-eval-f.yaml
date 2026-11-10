@@ -42,3 +42,9 @@ evaluation:
 # it off to stay comparable with them.
 aggregator:
   riskWindowSeconds: 0
+
+# Story 12.8: the chart now never scores its release namespace by default
+# (ADR-2026-10-20-02). The recorded campaigns installed into `default` with
+# it scored, so this arm pins the earlier behaviour to stay comparable.
+correlator:
+  neverScoreReleaseNamespace: false

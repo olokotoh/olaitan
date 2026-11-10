@@ -39,7 +39,31 @@ Olaitan {{ .Chart.AppVersion }} is installed as "{{ .Release.Name }}" in namespa
 This tool decides that a workload is compromised and can cut its network. What
 follows is what it concluded about THIS cluster, so you know what it can and
 cannot see before you trust it.
-{{- if and (ne $ns "olaitan") (not (default (dict) .Values.correlator).neverScoreReleaseNamespace) }}
+{{- if ne $ns "olaitan" }}
+{{- if and (default (dict) .Values.correlator).neverScoreReleaseNamespace (ne $ns "kube-system") }}
+
+! NAMESPACE
+!
+!   You installed into "{{ $ns }}", not "olaitan". So that Olaitan never
+!   scores, or with enforcement on isolates, its own pods, "{{ $ns }}" is on
+!   detection.correlator.never_scored_namespaces
+!   (correlator.neverScoreReleaseNamespace, on by default).
+!   NOTHING in "{{ $ns }}" is scored, your own workloads there included.
+!   Run the workloads you want watched in another namespace, or reinstall
+!   into the `olaitan` namespace. Setting
+!   correlator.neverScoreReleaseNamespace=false scores "{{ $ns }}" again,
+!   and then Olaitan can score its own pods too.
+{{- else if eq $ns "kube-system" }}
+
+! NAMESPACE
+!
+!   You installed into "kube-system", not "olaitan". kube-system is never
+!   added to detection.correlator.never_scored_namespaces, whatever
+!   correlator.neverScoreReleaseNamespace says: a compromised CoreDNS or CNI
+!   agent must stay visible. So Olaitan can score, and if enforcement is on
+!   isolate, its own aggregator and collector here. Install into the
+!   `olaitan` namespace instead.
+{{- else }}
 
 ! NAMESPACE
 !
@@ -51,6 +75,7 @@ cannot see before you trust it.
 !   correlator.neverScoreReleaseNamespace=true to add "{{ $ns }}" to
 !   detection.correlator.never_scored_namespaces (nothing else in it is
 !   scored then either).
+{{- end }}
 {{- end }}
 
 DETECTION SOURCES

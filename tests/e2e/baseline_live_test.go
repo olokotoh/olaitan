@@ -84,6 +84,14 @@ func TestBaselineLive_RealWorkload(t *testing.T) {
 	applyIn(t, ns, baselineLiveManifest(ns))
 	mustRun(t, "peer ready", "kubectl", "-n", ns, "rollout", "status", "deploy/peer", "--timeout=3m")
 	mustRun(t, "steady ready", "kubectl", "-n", ns, "rollout", "status", "deploy/steady", "--timeout=3m")
+	// Fail now, not after an hour, if the workload cannot reach the
+	// apiserver: its first cycle must have every GET answered 200. These log
+	// reads (one every 10 s, about a minute of them) fall inside the
+	// warm-up, so they cannot move the baseline.
+	if c, logs := waitSteadyCycle(t, ns, 3*time.Minute, func(c steadyCycle) bool { return true }); c == nil || c.OK != c.Gets || c.Gets == 0 || strings.Contains(logs, "apiserver_get_failed") {
+		netpol, _ := exec.Command("kubectl", "-n", ns, "get", "networkpolicy", "-o", "name").CombinedOutput()
+		t.Fatalf("steady workload's API calls do not reach kube-apiserver (first cycle %+v); the audit_events_per_min check would be meaningless. NetworkPolicies in %s (Olaitan's own isolation would show here): %q. Workload log:\n%s", c, ns, strings.TrimSpace(string(netpol)), logs)
+	}
 	t.Logf("steady workload %s up at %s; benign window %s (warm-up %s)", workloadID, time.Now().UTC().Format(time.RFC3339), benign, warmup)
 
 	time.Sleep(benign)
@@ -123,6 +131,11 @@ func TestBaselineLive_RealWorkload(t *testing.T) {
 		for _, ok := range want {
 			done = done && ok
 		}
+		if done || time.Now().After(deadline) {
+			// Read the workload log only now, so the read adds no audit
+			// event to the deviate minutes being judged.
+			requireDeviateBurstLanded(t, ns)
+		}
 		if done {
 			return
 		}
@@ -130,6 +143,100 @@ func TestBaselineLive_RealWorkload(t *testing.T) {
 			t.Fatalf("AC2: after the real behavioural change, deviations seen per metric: %v", want)
 		}
 	}
+}
+
+// steadyCycle is one `cycle=N mode=M gets=G ok=K` line of the steady
+// workload's log.
+type steadyCycle struct {
+	Cycle int
+	Mode  string
+	Gets  int
+	OK    int
+}
+
+// parseSteadyLog returns every cycle line of the steady workload's log, in
+// order. Lines that are not cycle lines (apiserver_get_failed, curl noise)
+// are skipped; callers look for those in the raw log.
+func parseSteadyLog(logs string) []steadyCycle {
+	var out []steadyCycle
+	for _, line := range strings.Split(logs, "\n") {
+		var c steadyCycle
+		seen := map[string]bool{}
+		for _, f := range strings.Fields(line) {
+			k, v, ok := strings.Cut(f, "=")
+			if !ok {
+				continue
+			}
+			n, err := strconv.Atoi(v)
+			switch {
+			case k == "cycle" && err == nil:
+				c.Cycle = n
+				seen[k] = true
+			case k == "mode" && v != "":
+				c.Mode = v
+				seen[k] = true
+			case k == "gets" && err == nil:
+				c.Gets = n
+				seen[k] = true
+			case k == "ok" && err == nil:
+				c.OK = n
+				seen[k] = true
+			}
+		}
+		if len(seen) == 4 {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// steadyLogs returns the steady workload's whole log.
+func steadyLogs(t *testing.T, ns string) string {
+	t.Helper()
+	out, err := exec.Command("kubectl", "-n", ns, "logs", "deploy/steady", "--tail=-1").CombinedOutput()
+	if err != nil {
+		t.Fatalf("kubectl logs deploy/steady: %v\n%s", err, out)
+	}
+	return string(out)
+}
+
+// waitSteadyCycle polls the workload log until a cycle line matches, and
+// returns it with the log. A nil cycle means none matched in time.
+func waitSteadyCycle(t *testing.T, ns string, timeout time.Duration, match func(steadyCycle) bool) (*steadyCycle, string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		logs := steadyLogs(t, ns)
+		for _, c := range parseSteadyLog(logs) {
+			if match(c) {
+				return &c, logs
+			}
+		}
+		if time.Now().After(deadline) {
+			return nil, logs
+		}
+		time.Sleep(10 * time.Second)
+	}
+}
+
+// requireDeviateBurstLanded fails the test unless a deviate cycle had all
+// 80 of its GETs answered 200: without that, a missing (or present)
+// audit_events_per_min deviation says nothing about the baseline engine.
+func requireDeviateBurstLanded(t *testing.T, ns string) {
+	t.Helper()
+	// A cycle is 60 s plus the burst, and the ConfigMap reaches the pod
+	// within a kubelet sync period: 3 minutes covers both.
+	c, logs := waitSteadyCycle(t, ns, 3*time.Minute, func(c steadyCycle) bool { return c.Mode == "deviate" })
+	if c == nil {
+		t.Fatalf("AC2: the steady workload logged no deviate cycle after the switch. Workload log:\n%s", logs)
+	}
+	for _, c := range parseSteadyLog(logs) {
+		if c.Mode == "deviate" && c.Gets == 80 && c.OK == 80 {
+			t.Logf("AC2: deviate burst landed: cycle %d, %d of %d GETs answered 200", c.Cycle, c.OK, c.Gets)
+			return
+		}
+	}
+	t.Fatalf("AC2: no deviate cycle had all 80 apiserver GETs answered 200; the API burst did not reach kube-apiserver. Workload log:\n%s", logs)
 }
 
 type liveDeviation struct {
@@ -243,11 +350,24 @@ func applyIn(t *testing.T, ns, manifest string) {
 	}
 }
 
+// baselineClientImage runs the steady workload (Story 12.8, #230). The
+// 2026-10-20 live run showed busybox 1.36 wget cannot complete a TLS
+// handshake with kube-apiserver (alert 40), and the `|| true` after it hid
+// that, so the API burst never reached the apiserver and
+// audit_events_per_min could not deviate. curl verifies the cluster CA, so a
+// 200 proves the GET really landed. Same tag and digest as the S2 target
+// (deploy/demo/scenarios/s2-credential-exfil), pinned per Story 12.6.
+const baselineClientImage = "curlimages/curl:8.11.1@sha256:c1fe1679c34d9784c1b0d1e5f62ac0a79fca01fb6377cdd33e90473c6f9f9a69"
+
 // baselineLiveManifest is the steady workload of the 2026-10-19 live run
-// (busybox, its own ServiceAccount allowed to GET its own pod), on a
-// one-minute cycle so the baseline gets a busy sample every minute, plus
-// a peer it talks to. mode=deviate (ConfigMap, re-read every cycle) turns
-// on the real behavioural change.
+// (its own ServiceAccount allowed to GET its own pod), on a one-minute
+// cycle so the baseline gets a busy sample every minute, plus a peer it
+// talks to. mode=deviate (ConfigMap, re-read every cycle) turns on the real
+// behavioural change. Each cycle logs `gets=N ok=M`, the GETs sent and the
+// ones the apiserver answered 200, and an `apiserver_get_failed` line when
+// any failed; the test reads that log instead of trusting the burst.
+// Peer calls keep `|| true`: a refused or restricted connection still makes
+// the flow the destination metric counts, and Olaitan may restrict the pod.
 func baselineLiveManifest(ns string) string {
 	return fmt.Sprintf(`apiVersion: v1
 kind: ServiceAccount
@@ -320,12 +440,13 @@ spec:
           configMap: {name: steady-mode}
       containers:
         - name: app
-          image: busybox:1.36
+          image: `+baselineClientImage+`
           volumeMounts: [{name: mode, mountPath: /etc/steady}]
           command: ["/bin/sh", "-c"]
           args:
             - |
               T=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+              CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
               U=https://kubernetes.default.svc/api/v1/namespaces/%[1]s/pods/$HOSTNAME
               c=0
               while true; do
@@ -333,16 +454,24 @@ spec:
                 mode=$(cat /etc/steady/mode 2>/dev/null)
                 if [ "$mode" = deviate ]; then n=80; else n=$((1 + RANDOM %% 3)); fi
                 i=0
+                ok=0
+                last=none
                 while [ $i -lt $n ]; do
-                  wget -q --no-check-certificate --header "Authorization: Bearer $T" -O /dev/null "$U" || true
+                  code=$(curl -sS -m 10 --cacert "$CA" -H "Authorization: Bearer $T" -o /dev/null -w '%%{http_code}' "$U" 2>/tmp/curl.err)
+                  if [ "$code" = 401 ]; then
+                    T=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+                    code=$(curl -sS -m 10 --cacert "$CA" -H "Authorization: Bearer $T" -o /dev/null -w '%%{http_code}' "$U" 2>/tmp/curl.err)
+                  fi
+                  if [ "$code" = 200 ]; then ok=$((ok+1)); else last="code=$code err=$(head -c 200 /tmp/curl.err | tr '\n' ' ')"; fi
                   i=$((i+1))
                 done
+                if [ $ok -ne $n ]; then echo "apiserver_get_failed cycle=$c $last"; fi
                 wget -q -T 5 -O /dev/null http://peer.%[1]s.svc:8080/ || true
                 if [ "$mode" = deviate ]; then
                   for p in 8081 8082 8083 8084 8085 8086; do wget -q -T 5 -O /dev/null http://peer.%[1]s.svc:$p/ || true; done
-                  for b in 1 2 3 4 5 6; do cp /bin/busybox /tmp/dropped$b; /tmp/dropped$b true; done
+                  for b in 1 2 3 4 5 6; do cp /usr/bin/curl /tmp/dropped$b; /tmp/dropped$b --version >/dev/null; done
                 fi
-                echo "$(date -u +%%FT%%TZ) cycle=$c mode=$mode gets=$n"
+                echo "$(date -u +%%FT%%TZ) cycle=$c mode=$mode gets=$n ok=$ok"
                 sleep 60
               done
 `, ns)

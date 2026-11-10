@@ -82,7 +82,7 @@ The catalogue is organised by registering ring + story, in commit chronology so 
 - **Type:** counter
 - **Unit:** count
 - **Labels:** none
-- **Help:** Events dropped by the correlator because their pod is in a namespace listed in `detection.correlator.never_scored_namespaces` (by default `olaitan`, plus the release namespace when `correlator.neverScoreReleaseNamespace` is on). Such a workload is never scored by any path: no multi-signal package, no rule or baseline match, no Falco trigger. A steady non-zero rate is normal; it is Olaitan's own pods talking. kube-system is not on this list: it is in `response.excluded_namespaces`, which means never isolated, and it is still correlated and scored.
+- **Help:** Events dropped by the correlator because their pod is in a namespace listed in `detection.correlator.never_scored_namespaces` (by default `olaitan`, plus the release namespace while `correlator.neverScoreReleaseNamespace` is on, the chart default since Story 12.8). Such a workload is never scored by any path: no multi-signal package, no rule or baseline match, no Falco trigger. A steady non-zero rate is normal; it is Olaitan's own pods talking. kube-system is not on this list: it is in `response.excluded_namespaces`, which means never isolated, and it is still correlated and scored.
 - **Sample PromQL (aggregate):** `rate(olaitan_correlator_never_scored_events_dropped_total[5m])`.
 
 #### `olaitan_sensor_falco_http_requests_total` (Story 10.2)
@@ -1253,7 +1253,8 @@ client (no SDK, no external egress).
   (DW10.6-1). `make e2e-full-real-llm-deepseek` runs the real-attack
   proof this way.
 - **Self-exclusion on kind-full (Story 10.6).** The profile installs into
-  `default` and sets `correlator.neverScoreReleaseNamespace: true`, which
+  `default` with `correlator.neverScoreReleaseNamespace: true` (the chart
+  default since Story 12.8, ADR-2026-10-20-02), which
   adds the release namespace to `detection.correlator.never_scored_namespaces`.
   The correlator drops every event from a never-scored namespace before it
   is windowed, so no path (multi-signal, rule, baseline, Falco trigger)

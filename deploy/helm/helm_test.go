@@ -6191,11 +6191,13 @@ func TestNotesSurfaceTheEnforcementRiskAtInstallTime(t *testing.T) {
 
 // TestNotesWarnWhenInstalledOutsideTheExcludedNamespace: the agent's
 // excluded_namespaces list is literally `kube-system` and `olaitan`, so
-// installing anywhere else leaves Olaitan able to score -- and, with
-// enforcement on, isolate -- its own aggregator and collector.
+// installing anywhere else with correlator.neverScoreReleaseNamespace=false
+// leaves Olaitan able to score -- and, with enforcement on, isolate -- its
+// own aggregator and collector. (Story 12.8 made true the default; the
+// default case is TestNotesSayTheReleaseNamespaceIsNotScored.)
 func TestNotesWarnWhenInstalledOutsideTheExcludedNamespace(t *testing.T) {
 	// helm template defaults the namespace to "default".
-	notes := renderNotes(t, nil)
+	notes := renderNotes(t, []string{"correlator.neverScoreReleaseNamespace=false"})
 	if !strings.Contains(notes, "excluded_namespaces") {
 		t.Errorf("installing outside the olaitan namespace produced no warning; notes:\n%s", notes)
 	}

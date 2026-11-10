@@ -603,9 +603,11 @@ func TestFullProfileNeverScoresItsOwnNamespace(t *testing.T) {
 	if ex != "kube-system,olaitan" {
 		t.Errorf("values-full excluded_namespaces = %q, want the shipped kube-system,olaitan (never-enforced is not never-scored)", ex)
 	}
+	// Story 12.8: the chart default now never scores the release namespace
+	// too (helm template renders into "default"); excluded stays shipped.
 	ns, ex = load(helmTemplate(t, nil))
-	if ns != "olaitan" || ex != "kube-system,olaitan" {
-		t.Errorf("default render: never_scored %q excluded %q, want olaitan and kube-system,olaitan", ns, ex)
+	if ns != "olaitan,default" || ex != "kube-system,olaitan" {
+		t.Errorf("default render: never_scored %q excluded %q, want olaitan,default and kube-system,olaitan", ns, ex)
 	}
 	// Installed into olaitan, the release namespace is already listed:
 	// no duplicate.

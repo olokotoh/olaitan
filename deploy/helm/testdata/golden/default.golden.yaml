@@ -879,6 +879,7 @@ data:
         # response.excluded_namespaces (never isolated) but still detected.
         never_scored_namespaces:
           - olaitan
+          - default
       # Story 1.7: per-source adapter configuration. The audit-webhook
       # receiver is gated on enabled; chart deploys with
       # auditWebhook.enabled=false leave this block at its zero value and
@@ -2425,7 +2426,7 @@ spec:
       annotations:
         # Story 12.7: a config change rolls the collector (the source
         # adapters are wired at startup).
-        checksum/config: "a42ec39112c4f2a236ba1fd6da4c92f1416d50838447078cad9b88184a4869d2"
+        checksum/config: "caa6e9116ad934ad16042805fe42df2bb38f445810e083a32d81b091768b81e2"
         prometheus.io/scrape: "true"
         prometheus.io/port: "9090"
         prometheus.io/path: "/metrics"
@@ -2872,7 +2873,7 @@ spec:
         prometheus.io/path: "/metrics"
         # Story 12.7: a config change rolls the aggregator (restart-required
         # settings such as analyst.provider are read at startup).
-        checksum/config: "a42ec39112c4f2a236ba1fd6da4c92f1416d50838447078cad9b88184a4869d2"
+        checksum/config: "caa6e9116ad934ad16042805fe42df2bb38f445810e083a32d81b091768b81e2"
     spec:
       serviceAccountName: olaitan-aggregator
       securityContext:
