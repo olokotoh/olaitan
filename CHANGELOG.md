@@ -163,6 +163,10 @@ and false-positive numbers; see [Unreleased](#unreleased).
 
 ### Security
 
+- Upgrade `github.com/klauspost/compress` to v1.18.7 (CVE-2026-63209) and
+  `golang.org/x/net` to v0.62.0 (CVE-2026-78661) to resolve the two HIGH
+  dependency findings blocking the image vulnerability scan.
+
 - **golang.org/x/net bumped to v0.61.0** (CVE-2026-78669, PR #207).
 
 ### Fixed
